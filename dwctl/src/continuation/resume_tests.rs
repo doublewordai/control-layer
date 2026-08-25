@@ -396,7 +396,7 @@ async fn the_resume_leg_asks_for_exactly_the_right_thing(pool: PgPool) {
     assert_eq!(leg.body["model"], MODEL);
     assert_eq!(leg.body["stream"], true);
     assert_eq!(leg.body["stream_options"]["include_usage"], true);
-    assert_eq!(leg.body["priority"], 100);
+    assert_eq!(leg.body["nvext"]["agent_hints"]["priority"], 100, "the dynamo priority carrier");
     assert_eq!(leg.body["max_tokens"], 488, "500 requested minus the 12 already generated");
     assert_eq!(leg.body["temperature"], 0.7, "sampling parameters carry over");
     assert!(leg.body.get("messages").is_none(), "a completions leg never carries chat messages");

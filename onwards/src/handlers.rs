@@ -745,26 +745,33 @@ pub async fn target_message_handler<T: HttpClient>(
         // Prepare body for this attempt (may need model rewrite)
         let mut attempt_body = body_bytes.clone();
 
-        // Within a non-default pool, `priority` (the dynamo scheduler's queue
-        // field) is only meaningful to a member whose serving stack understands
-        // it (`accepts_scheduling_priority` — the dynamo frontend); third-party
+        // Within a non-default pool, scheduling fields are only meaningful to
+        // a member whose serving stack understands them
+        // (`accepts_scheduling_priority` — the dynamo frontend); third-party
         // members reject unknown fields outright (Fireworks: "Extra inputs are
-        // not permitted"). Strip it from every attempt whose provider lacks
+        // not permitted"). Strip them from every attempt whose provider lacks
         // the capability, REGARDLESS of position: keying on member index broke
         // the moment the dynamo member was disabled during an incident and a
-        // third party became index 0 (every resume 400'd). Default-pool
+        // third party became index 0 (every resume 400'd). Two carriers:
+        // `nvext` (the self-hosted stack's vendor extension — the WHOLE object
+        // goes, since no third party understands any of it and Fireworks 400s
+        // on its presence) and a legacy top-level `priority`. Default-pool
         // traffic is untouched: batch/flex deadline priorities must keep
         // reaching dynamo exactly as today.
         if resolved_pool_name.is_some()
             && !target.accepts_scheduling_priority
-            && attempt_body.windows(10).any(|w| w == b"\"priority\"")
+            && (attempt_body.windows(10).any(|w| w == b"\"priority\"")
+                || attempt_body.windows(7).any(|w| w == b"\"nvext\""))
             && let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
             && let Some(obj) = parsed.as_object_mut()
-            && obj.remove("priority").is_some()
-            && let Ok(stripped) = serde_json::to_vec(&parsed)
         {
-            debug!("Stripped scheduler priority for a pool member that does not accept it");
-            attempt_body = stripped.into();
+            let removed = [obj.remove("priority"), obj.remove("nvext")];
+            if removed.iter().any(Option::is_some)
+                && let Ok(stripped) = serde_json::to_vec(&parsed)
+            {
+                debug!("Stripped scheduling fields for a pool member that does not accept them");
+                attempt_body = stripped.into();
+            }
         }
 
         // Rewrite model field if configured

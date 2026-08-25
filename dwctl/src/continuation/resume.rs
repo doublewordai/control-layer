@@ -99,8 +99,14 @@ pub fn build_leg_body(ctx: &RequestContext, token_ids: &[u32], max_tokens: Optio
         "stream_options": {"include_usage": true},
         // Positive priority jumps the dynamo queue ahead of new realtime work:
         // this finishes a stream we already accepted, on a strict seam budget.
-        // Providers ignore the field.
-        "priority": priority,
+        // The dynamo frontend's ONLY priority carrier is `nvext.agent_hints.
+        // priority` (the same shape fusillade injects for batch deadlines) — a
+        // top-level `priority` field is REJECTED by its validation
+        // ("Unsupported parameter(s)"), found live in the 0731 wild window.
+        // Onwards strips the whole `nvext` object for pool members whose
+        // endpoint does not accept scheduling priority (third parties reject
+        // unknown fields).
+        "nvext": {"agent_hints": {"priority": priority}},
     });
     if let Some(max_tokens) = max_tokens {
         body["max_tokens"] = json!(max_tokens);
@@ -247,7 +253,10 @@ mod tests {
         assert_eq!(body["prompt"], json!([1, 2, 3]), "a flat token-id array, never a string prompt");
         assert_eq!(body["stream"], true);
         assert_eq!(body["stream_options"]["include_usage"], true);
-        assert_eq!(body["priority"], 100);
+        // The dynamo frontend's only priority carrier — a top-level `priority`
+        // is rejected by its completions validation.
+        assert_eq!(body["nvext"]["agent_hints"]["priority"], 100);
+        assert!(body.get("priority").is_none(), "top-level priority is not a dynamo field");
         assert_eq!(body["max_tokens"], 400);
     }
 

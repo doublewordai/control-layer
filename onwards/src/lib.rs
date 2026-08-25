@@ -1305,7 +1305,8 @@ mod tests {
         let response = server
             .post("/v1/completions")
             .json(&json!({
-                "model": "gpt-4", "prompt": [1, 2, 3], "stream": true, "priority": 100
+                "model": "gpt-4", "prompt": [1, 2, 3], "stream": true, "priority": 100,
+                "nvext": {"agent_hints": {"priority": 100}}
             }))
             .await;
 
@@ -1315,12 +1316,13 @@ mod tests {
         let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
         assert_eq!(
-            first["priority"], 100,
-            "a member that accepts the field receives the scheduler priority"
+            first["nvext"]["agent_hints"]["priority"], 100,
+            "a member that accepts scheduling fields receives the nvext carrier"
         );
+        assert_eq!(first["priority"], 100, "and the legacy top-level field");
         assert!(
-            second.get("priority").is_none(),
-            "a member that does not accept it must never see the dynamo-only field"
+            second.get("priority").is_none() && second.get("nvext").is_none(),
+            "a member that does not accept them must see neither carrier"
         );
         assert_eq!(
             second["prompt"],
@@ -1343,7 +1345,8 @@ mod tests {
         let response = server
             .post("/v1/completions")
             .json(&json!({
-                "model": "gpt-4", "prompt": [1, 2, 3], "stream": true, "priority": 100
+                "model": "gpt-4", "prompt": [1, 2, 3], "stream": true,
+                "nvext": {"agent_hints": {"priority": 100}}
             }))
             .await;
 
@@ -1352,7 +1355,7 @@ mod tests {
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
         assert!(
-            body.get("priority").is_none(),
+            body.get("nvext").is_none(),
             "index 0 is not 'dynamo'; a non-accepting primary is stripped too"
         );
         assert_eq!(body["prompt"], json!([1, 2, 3]));

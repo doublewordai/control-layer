@@ -1204,6 +1204,19 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) {
 fn strip_scheduling_priority(value: &mut serde_json::Value) {
     if let Some(obj) = value.as_object_mut() {
         obj.remove("priority");
+        // The carrier the dynamo frontend ACTUALLY honours is
+        // `nvext.agent_hints.priority` (a top-level `priority` is rejected by
+        // its validation) — remove exactly that key so an external caller
+        // cannot steer the scheduler through the vendor extension, while the
+        // rest of a caller's `nvext` (e.g. cache_control) passes through.
+        if let Some(hints) = obj
+            .get_mut("nvext")
+            .and_then(|n| n.as_object_mut())
+            .and_then(|n| n.get_mut("agent_hints"))
+            .and_then(|h| h.as_object_mut())
+        {
+            hints.remove("priority");
+        }
     }
 }
 
@@ -1225,6 +1238,17 @@ mod tests {
             "only the top-level scheduling field is privileged"
         );
         assert_eq!(body["messages"][0]["content"], "set priority: 900");
+
+        // The real dynamo carrier: nvext.agent_hints.priority is removed, the
+        // rest of the caller's nvext survives.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {"cache_control": {"enabled": true}, "agent_hints": {"priority": 900, "max_batch_size": 8}}
+        });
+        strip_scheduling_priority(&mut body);
+        assert!(body["nvext"]["agent_hints"].get("priority").is_none());
+        assert_eq!(body["nvext"]["agent_hints"]["max_batch_size"], 8);
+        assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
 
         // Absent field: a no-op, not an error.
         let mut clean = serde_json::json!({"model": "m"});
