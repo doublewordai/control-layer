@@ -92,8 +92,9 @@ struct BillingTarget {
     invoicing_enabled: bool,
     /// Name to put on the payment-provider customer. Set for organizations
     /// (a real, user-provided org name), but `None` for individuals: their
-    /// display_name is only ever a randomly generated placeholder, never the
-    /// real IdP name, so we don't want it on Stripe customers / receipts.
+    /// display_name is only ever a placeholder derived from the email prefix,
+    /// never the real IdP name, so we don't want it on Stripe customers /
+    /// receipts.
     display_name: Option<String>,
 }
 
@@ -145,7 +146,8 @@ async fn resolve_billing_target(user: &CurrentUser, conn: &mut sqlx::PgConnectio
             email: user.email.clone(),
             invoicing_enabled,
             // Intentionally omitted: an individual's display_name is a
-            // generated placeholder, not their real name (see BillingTarget).
+            // placeholder derived from the email prefix, not their real name
+            // (see BillingTarget).
             display_name: None,
         })
     }
@@ -494,6 +496,31 @@ pub async fn webhook_handler<P: PoolProvider>(
         }
         Err(payment_providers::PaymentError::AlreadyProcessed) => {
             tracing::trace!("Webhook event already processed (idempotent): {}", event.event_type);
+            StatusCode::OK
+        }
+        Err(payment_providers::PaymentError::UnknownReference(reference)) => {
+            // Routine in a multi-region deployment, not a fault: one Stripe
+            // account serves both regional planes, and Stripe fans every
+            // account-level event out to every configured endpoint, so each
+            // plane sees the other's sessions.
+            //
+            // Acked explicitly here rather than by the catch-all below, and
+            // deliberately NOT via the shared StatusCode mapping, which returns
+            // 404 for the front-channel caller. Retrying cannot make a user
+            // this plane does not own appear, so the webhook must tell Stripe
+            // to stop.
+            //
+            // warn rather than error because it is expected, and rather than
+            // info because a genuinely orphaned *local* session is
+            // indistinguishable from here and must stay visible. The volume is
+            // the other region's payment count — events, not requests — so this
+            // stays quiet. `client_reference_id` is structured for alerting if
+            // orphans ever need chasing.
+            tracing::warn!(
+                event_type = %event.event_type,
+                client_reference_id = %reference,
+                "Ignoring payment webhook for a user unknown to this plane (expected for another region's events)"
+            );
             StatusCode::OK
         }
         Err(payment_providers::PaymentError::Database(_)) => {

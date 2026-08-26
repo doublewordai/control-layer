@@ -1,5 +1,47 @@
 # Changelog
 
+## [10.14.2](https://github.com/doublewordai/control-layer/compare/v10.14.1...v10.14.2) (2026-08-25)
+
+
+### Performance Improvements
+
+* **fusillade:** index the batchless branch of the demand query ([#1516](https://github.com/doublewordai/control-layer/issues/1516)) ([6833cb0](https://github.com/doublewordai/control-layer/commit/6833cb08f464b0df14782d3b3eeb1fc4126c7c9c))
+
+## [10.14.1](https://github.com/doublewordai/control-layer/compare/v10.14.0...v10.14.1) (2026-08-25)
+
+
+### Bug Fixes
+
+* **fusillade:** give the memory gate an exit that can actually be reached ([#1513](https://github.com/doublewordai/control-layer/issues/1513)) ([9c8e57c](https://github.com/doublewordai/control-layer/commit/9c8e57caedd22957b5859accc01f66847aeabcc5))
+* **onwards:** retry slow empty SSE streams ([#1510](https://github.com/doublewordai/control-layer/issues/1510)) ([4df7a30](https://github.com/doublewordai/control-layer/commit/4df7a30f657dd3f87bfc6cf9c07c0a33180cd3a5))
+
+## [10.14.0](https://github.com/doublewordai/control-layer/compare/v10.13.1...v10.14.0) (2026-08-23)
+
+
+### Features
+
+* **fusillade:** discover per-model concurrency from 529 backpressure ([#1486](https://github.com/doublewordai/control-layer/issues/1486)) ([c26e0de](https://github.com/doublewordai/control-layer/commit/c26e0dea90476bad29cc9b49c2dc36caf7c2e246))
+
+## [10.13.1](https://github.com/doublewordai/control-layer/compare/v10.13.0...v10.13.1) (2026-08-21)
+
+
+### Bug Fixes
+
+* fold SSE streams incrementally and drop async-openai from dwctl ([#1503](https://github.com/doublewordai/control-layer/issues/1503)) ([2995d73](https://github.com/doublewordai/control-layer/commit/2995d734bd966070ca337e61e50cd2dc7cd5392e))
+* **payments:** ack webhooks for users this plane does not own (COR-594) ([#1506](https://github.com/doublewordai/control-layer/issues/1506)) ([068455c](https://github.com/doublewordai/control-layer/commit/068455c2f530bfe0fa645e502876653aa3471ae1))
+
+## [10.13.0](https://github.com/doublewordai/control-layer/compare/v10.12.0...v10.13.0) (2026-08-18)
+
+
+### Features
+
+* **analytics:** record when work was submitted, not just dispatched ([#1478](https://github.com/doublewordai/control-layer/issues/1478)) ([e54f08d](https://github.com/doublewordai/control-layer/commit/e54f08d8b1e0ff0f09aa450ef4fa448ece121ba2))
+* **dwctl:** default display name to email prefix instead of random words ([#1469](https://github.com/doublewordai/control-layer/issues/1469)) ([b9043bb](https://github.com/doublewordai/control-layer/commit/b9043bb81c914814a5c5b4594b4b70c13581cf39))
+* **payments:** scaffold invoice billing for enterprise accounts ([#1429](https://github.com/doublewordai/control-layer/issues/1429)) ([ca2da40](https://github.com/doublewordai/control-layer/commit/ca2da40f15b2c661f3a5f9923e14c1110593a464))
+* **recompute:** add the read-only dry-run endpoint ([#1492](https://github.com/doublewordai/control-layer/issues/1492)) ([840484d](https://github.com/doublewordai/control-layer/commit/840484d0eb55f69faaa538936f8180bd47782909))
+* **recompute:** reconstruct the cache split as of a past instant ([#1494](https://github.com/doublewordai/control-layer/issues/1494)) ([f42548c](https://github.com/doublewordai/control-layer/commit/f42548ca6e54ca9bebb39fe689d02826706f9656))
+* **recompute:** surface reasoning and total tokens ([#1491](https://github.com/doublewordai/control-layer/issues/1491)) ([2493605](https://github.com/doublewordai/control-layer/commit/2493605da41313e8ce383f987e8b92ed05f9acdb))
+
 ## [10.12.0](https://github.com/doublewordai/control-layer/compare/v10.11.2...v10.12.0) (2026-08-14)
 
 
