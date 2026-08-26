@@ -576,6 +576,17 @@ pub async fn target_message_handler<T: HttpClient>(
     // This runs after routing rules so that redirects get a chance to replace the pool.
     if pool.is_empty() {
         debug!("Pool for model '{}' has no providers", model_name);
+        // Counted, not just logged: this is a debug line on a hot path, so under
+        // load it is exactly the signal a log pipeline sheds, and the 503 it
+        // produces is indistinguishable downstream from every other 503.
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "no_providers",
+            "status" => "503",
+            "model" => model_name.to_string(),
+        )
+        .increment(1);
+        record_response_status(503);
         return Err(OnwardsErrorResponse::service_unavailable());
     }
 
@@ -652,6 +663,12 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Track last error for fallback scenarios
     let mut last_error: Option<OnwardsErrorResponse> = None;
+    // The status the UPSTREAM returned on the most recent attempt, before any
+    // sanitization. `last_error` cannot serve this purpose: by the time an
+    // attempt is recorded there it has already been mapped onto a gateway
+    // response, so an upstream 529 and an upstream 500 are both 503 and the
+    // distinction that matters for backpressure is gone.
+    let mut last_upstream_status: Option<u16> = None;
 
     // Iterate through providers (with fallback support).
     // select_iter() uses weighted least connections: picks the provider with the
@@ -940,6 +957,7 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         let status = response.status().as_u16();
+        last_upstream_status = Some(status);
         upstream_span.record("http.response.status_code", status);
         tracing::Span::current().record("http.response.status_code", status);
 
@@ -1223,6 +1241,9 @@ pub async fn target_message_handler<T: HttpClient>(
                 );
                 upstream_span.record("http.response.status_code", embedded);
                 tracing::Span::current().record("http.response.status_code", embedded);
+                // A 200 carrying an embedded error IS that error for our
+                // purposes, so it overrides the 200 recorded above.
+                last_upstream_status = Some(embedded);
 
                 let retryable = pool.should_fallback_on_status(embedded)
                     || (embedded == 429 && pool.should_fallback_on_rate_limit());
@@ -1531,16 +1552,48 @@ pub async fn target_message_handler<T: HttpClient>(
         // We tried at least one provider but all failed
         let final_error = last_error
             .unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str()));
-        record_response_status(final_error.status.as_u16());
+        // `status` carries the PRE-sanitization status of the last attempt, which
+        // the response itself discards: a 529 and a 500 both leave here as 503,
+        // so without this the caller cannot tell saturation from failure. This is
+        // the single exit where a candidate error actually becomes the response,
+        // so counting here counts outcomes rather than attempts.
+        let status = final_error.status.as_u16();
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "retries_exhausted",
+            // The upstream's own status on the final attempt, NOT the gateway
+            // response above: both a 529 and a 500 sanitize to 503, and only
+            // the former is backpressure. Falls back to the response status
+            // when no attempt got far enough to see one.
+            "status" => last_upstream_status.unwrap_or(status).to_string(),
+            "model" => model_name.to_string(),
+        )
+        .increment(1);
+        record_response_status(status);
         Err(final_error)
     } else if !pool.is_empty() {
         // Pool has providers but select_iter() yielded nothing — all at capacity
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "all_at_capacity",
+            "status" => "429",
+            "model" => model_name.to_string(),
+        )
+        .increment(1);
         record_response_status(429);
         Err(OnwardsErrorResponse::concurrency_limited())
     } else {
         // Empty pool (shouldn't normally happen, targets resolved earlier)
         let err = OnwardsErrorResponse::model_not_found(model_name.as_str());
-        record_response_status(err.status.as_u16());
+        let status = err.status.as_u16();
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "empty_pool_late",
+            "status" => status.to_string(),
+            "model" => model_name.to_string(),
+        )
+        .increment(1);
+        record_response_status(status);
         Err(err)
     }
     }
