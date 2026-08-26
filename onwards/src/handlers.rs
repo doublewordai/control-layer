@@ -671,6 +671,12 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Track last error for fallback scenarios
     let mut last_error: Option<OnwardsErrorResponse> = None;
+    // The status the UPSTREAM returned on the most recent attempt, before any
+    // sanitization. `last_error` cannot serve this purpose: by the time an
+    // attempt is recorded there it has already been mapped onto a gateway
+    // response, so an upstream 529 and an upstream 500 are both 503 and the
+    // distinction that matters for backpressure is gone.
+    let mut last_upstream_status: Option<u16> = None;
 
     // Iterate through providers (with fallback support).
     // select_iter() uses weighted least connections: picks the provider with the
@@ -959,6 +965,7 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         let status = response.status().as_u16();
+        last_upstream_status = Some(status);
         upstream_span.record("http.response.status_code", status);
         tracing::Span::current().record("http.response.status_code", status);
 
@@ -1242,6 +1249,9 @@ pub async fn target_message_handler<T: HttpClient>(
                 );
                 upstream_span.record("http.response.status_code", embedded);
                 tracing::Span::current().record("http.response.status_code", embedded);
+                // A 200 carrying an embedded error IS that error for our
+                // purposes, so it overrides the 200 recorded above.
+                last_upstream_status = Some(embedded);
 
                 let retryable = pool.should_fallback_on_status(embedded)
                     || (embedded == 429 && pool.should_fallback_on_rate_limit());
@@ -1559,7 +1569,11 @@ pub async fn target_message_handler<T: HttpClient>(
         metrics::counter!(
             "onwards_upstream_failed_total",
             "reason" => "retries_exhausted",
-            "status" => status.to_string(),
+            // The upstream's own status on the final attempt, NOT the gateway
+            // response above: both a 529 and a 500 sanitize to 503, and only
+            // the former is backpressure. Falls back to the response status
+            // when no attempt got far enough to see one.
+            "status" => last_upstream_status.unwrap_or(status).to_string(),
             "model" => model_name.to_string(),
         )
         .increment(1);
