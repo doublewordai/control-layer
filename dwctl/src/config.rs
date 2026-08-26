@@ -1239,9 +1239,14 @@ pub struct ContinuationConfig {
     /// Set via environment: `DWCTL_CONTINUATION__STALL_TIMEOUT_SECS=540`
     pub stall_timeout_secs: u64,
 
-    /// Per-stream cap on the accumulated-generation buffer. A stream that exceeds
-    /// it is marked non-resumable and its buffer dropped (outlet's own capture is
-    /// unaffected); the outcome metric records `cap_exceeded`.
+    /// Per-stream cap applied SEPARATELY to each retained allocation: the
+    /// request body (eligibility gate) and the accumulated generation
+    /// (accumulator cap) — worst case an armed stream retains ~2x this value.
+    /// Deliberately not a shared budget: deducting a large body from the
+    /// generation allowance would disarm long generations on big-prompt
+    /// requests, exactly the streams most worth rescuing. Exceeding either
+    /// bound marks the stream non-resumable and drops the buffer (outlet's own
+    /// capture is unaffected); the outcome metric records `cap_exceeded`.
     ///
     /// Set via environment: `DWCTL_CONTINUATION__MAX_BUFFER_BYTES=2097152`
     pub max_buffer_bytes: usize,

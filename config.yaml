@@ -536,7 +536,8 @@ continuation:
   # the daemon aborts. Arms only after the first generated text.
   # Set via environment: DWCTL_CONTINUATION__STALL_TIMEOUT_SECS=540
   stall_timeout_secs: 540
-  # Cap on the retained request body + accumulated generation per stream.
+  # Cap applied separately to each retained allocation per armed stream (the
+  # request body, and the accumulated generation) - worst case ~2x this value.
   # Exceeded -> the stream is marked non-resumable (outcome cap_exceeded) and
   # the buffer dropped; the stream itself is unaffected.
   # Set via environment: DWCTL_CONTINUATION__MAX_BUFFER_BYTES=2097152
