@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.16.1](https://github.com/doublewordai/control-layer/compare/v10.16.0...v10.16.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **dwctl:** export malloc_conf under jemalloc's prefixed symbol name ([#1524](https://github.com/doublewordai/control-layer/issues/1524)) ([b889e88](https://github.com/doublewordai/control-layer/commit/b889e889f79b3c3a575d36c710d49870cfd771e3))
+
 ## [10.16.0](https://github.com/doublewordai/control-layer/compare/v10.15.0...v10.16.0) (2026-08-26)
 
 
