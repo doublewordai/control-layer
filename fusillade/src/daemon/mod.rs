@@ -163,7 +163,7 @@ fn is_downstream_overload(reason: &FailureReason) -> bool {
     }
 }
 
-fn emit_concurrency_decrease(model: &str, adjustment: ConcurrencyAdjustment) {
+fn emit_concurrency_decrease(model: &str, adjustment: ConcurrencyAdjustment, status: &str) {
     counter!("fusillade_adaptive_concurrency_decreases_total", "model" => model.to_owned())
         .increment(1);
     gauge!("fusillade_adaptive_concurrency_limit", "model" => model.to_owned())
@@ -172,7 +172,9 @@ fn emit_concurrency_decrease(model: &str, adjustment: ConcurrencyAdjustment) {
         model,
         previous_limit = adjustment.previous_limit,
         new_limit = adjustment.new_limit,
-        status = 529,
+        // Carried from the failure rather than assumed: more than one status
+        // now cuts the limit, so hard-coding one would misreport the others.
+        status,
         "Reduced model concurrency after downstream overload"
     );
 }
@@ -1427,7 +1429,11 @@ where
                                 && let Some(adjustment) = adaptive_concurrency
                                     .record_overload(&capacity_model_clone, generation)
                             {
-                                emit_concurrency_decrease(&capacity_model_clone, adjustment);
+                                emit_concurrency_decrease(
+                                    &capacity_model_clone,
+                                    adjustment,
+                                    &failed.state.reason.status_code_label(),
+                                );
                             }
                             let retry_attempt = failed.state.retry_attempt;
                             let reason_label = failed.state.reason.metric_label();
