@@ -151,7 +151,7 @@ jobs:
             -e POSTGRES_PASSWORD=postgres \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p 5432:5432 \
-            postgres:latest \
+            postgres:17 \
             -c max_connections=300
           for _ in $(seq 1 30); do
             docker exec postgres pg_isready -U postgres && break
@@ -287,7 +287,7 @@ jobs:
             -e POSTGRES_PASSWORD=postgres \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p 5432:5432 \
-            postgres:latest \
+            postgres:17 \
             -c max_connections=300
           for _ in $(seq 1 30); do
             docker exec postgres pg_isready -U postgres && break
@@ -368,7 +368,7 @@ jobs:
             -e POSTGRES_PASSWORD=postgres \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p 5432:5432 \
-            postgres:latest \
+            postgres:17 \
             -c max_connections=300
           for _ in $(seq 1 30); do
             docker exec postgres pg_isready -U postgres && break
@@ -931,7 +931,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:latest
+        image: postgres:17
         env:
           POSTGRES_DB: dwctl
           POSTGRES_USER: postgres

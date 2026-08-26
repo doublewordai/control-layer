@@ -13,9 +13,11 @@ get-admin-email:
 # - macOS or Linux
 # - Homebrew (recommended for tool installation)
 #
-# First-time setup:
-#   brew install docker hurl postgresql
-#   just setup
+# First-time setup (cargo comes from rustup, not Homebrew):
+#   brew install hurl postgresql pnpm
+#   brew install --cask docker
+#   cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
+#   just check
 check:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -26,7 +28,7 @@ check:
     missing_tools=()
 
     # Required tools
-    required_tools=("docker" "hurl" "psql" "createdb" "cargo" "pnpm")
+    required_tools=("docker" "hurl" "psql" "createdb" "cargo" "pnpm" "sqlx")
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
@@ -178,26 +180,88 @@ db-setup:
     echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic%2Cfusillade"
     echo "  fusillade: postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade"
 
-# Start the full development stack with hot reload
+# Run dwctl from source: 'just dev-native'
+#
+# The inner loop for Rust work. Compiles dwctl on the host and runs it against
+# the Postgres that 'just db-start' provides, so a change is a cargo rebuild.
+# This is also the only mode SQLx's compile-time query verification is set up for.
+# It reads the DATABASE_URL that 'just db-setup' writes into .env.
+#
+# Both cookie overrides below are necessary for local work. config.yaml
+# ships cookie_secure: true and cookie_same_site: "strict", are for
+# production, but impossible on http://localhost.
+#
+# Extra arguments are passed to cargo, e.g. 'just dev-native --release'.
+#
+# Examples:
+#   just dev-native                              # Debug build, native auth on localhost
+#   just dev-native --release                    # Optimised build
+#   RUST_LOG=info,dwctl=debug,sqlx=debug just dev-native   # Log every SQL statement and its timing
+
+# Build and run dwctl on the host, against 'just db-start' Postgres
+dev-native *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    DB_HOST="${DB_HOST:-localhost}"
+    DB_PORT="${DB_PORT:-5432}"
+
+    if ! command -v pg_isready >/dev/null 2>&1; then
+        echo "❌ pg_isready not found - install the PostgreSQL client tools"
+        exit 1
+    fi
+
+    if ! pg_isready -h "$DB_HOST" -p "$DB_PORT" >/dev/null 2>&1; then
+        echo "❌ No PostgreSQL on $DB_HOST:$DB_PORT"
+        echo ""
+        echo "   Start it and create the databases:"
+        echo ""
+        echo "     just db-start && just db-setup"
+        echo ""
+        exit 1
+    fi
+
+    # db-setup writes this; without it SQLx has no DATABASE_URL to verify
+    # queries against and the build fails with errors that point at the SQL
+    # rather than at the missing file.
+    if [ ! -f dwctl/.env ]; then
+        echo "❌ dwctl/.env is missing - SQLx needs it to verify queries at compile time"
+        echo ""
+        echo "     just db-setup"
+        echo ""
+        exit 1
+    fi
+
+    echo "▸ PostgreSQL up on $DB_HOST:$DB_PORT"
+    echo "▸ Native auth relaxed for http://localhost (Secure off, SameSite=lax)"
+    echo ""
+
+    DWCTL_AUTH__NATIVE__SESSION__COOKIE_SECURE=false \
+    DWCTL_AUTH__NATIVE__SESSION__COOKIE_SAME_SITE=lax \
+    cargo run {{args}}
+
+# Start the containerised development stack: 'just dev'
 #
 # Uses docker-compose.yml (base) + docker-compose.override.yml (dev overrides):
 # - docker-compose.yml: Production-ready service definitions
-# - docker-compose.override.yml: Development-specific settings (ports, volumes, hot reload)
+# - docker-compose.override.yml: Development-specific settings (ports, volumes)
 #
 # Services running in development mode:
-# - control-layer: Rust API server (port 3001) - hot reloads via volume mounts
+# - control-layer: published dwctl image (port 3001) - NOT built from source
 # - control-layer-frontend: React dev server (port 5173) - Vite HMR enabled
-# - postgres: Database (port 5432) - exposed for direct access
+# - postgres: Database (port 5433 on the host) - exposed for direct access
 #
-# The --watch flag enables hot reload. File changes trigger container rebuilds.
+# The --watch flag rebuilds the frontend container on dependency changes.
+# Editing Rust here does nothing: dwctl is an image. Use 'just dev-native'
+# when the change lives in Rust.
 #
-# Access the app at: https://localhost
 # Direct API access: http://localhost:3001
-# Database: postgres://control_layer:control_layer_password@localhost:5432/control_layer
-#
+# Database: postgres://control_layer:control_layer_password@localhost:5433/control_layer
 #
 # Examples:
 #   just dev                    # Standard development stack
+
+# Containerised stack: dwctl image + dashboard dev server + Postgres
 dev *args="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -893,12 +957,18 @@ db-start:
         # 57 in 7 seconds. Raising the ceiling means you no longer have to think about it.
         # Create volume if it doesn't exist
         docker volume create test-postgres-data >/dev/null 2>&1 || true
+        # PGDATA is set explicitly, and the volume is mounted at exactly that
+        # path. Postgres 18 moved its default PGDATA to a versioned directory,
+        # so mounting the parent instead lets two majors write side by side in
+        # one volume: switching version silently yields an empty database
+        # rather than an error.
         docker run --name test-postgres \
           -e POSTGRES_PASSWORD=password \
           -e POSTGRES_HOST_AUTH_METHOD=trust \
+          -e PGDATA=/var/lib/postgresql/data \
           -p 5432:5432 \
-          -v test-postgres-data:/var/lib/postgresql/ \
-          -d postgres:latest \
+          -v test-postgres-data:/var/lib/postgresql/data \
+          -d postgres:17 \
           postgres -c max_connections=400 \
           -c fsync=off \
           -c full_page_writes=off \
@@ -913,15 +983,32 @@ db-start:
     fi
 
     echo "Waiting for postgres to be ready..."
-    sleep 3
 
-    # Verify it's up
-    if pg_isready -h localhost -p 5432 >/dev/null 2>&1; then
-        echo "✅ PostgreSQL is ready on localhost:5432"
-    else
-        echo "❌ PostgreSQL not responding"
-        exit 1
-    fi
+    for _ in $(seq 30); do
+        if pg_isready -h localhost -p 5432 >/dev/null 2>&1; then
+            echo "✅ PostgreSQL is ready on localhost:5432"
+            exit 0
+        fi
+
+        # Usually a volume left over from a different PostgreSQL major: the
+        # server refuses the data directory and the container exits.
+        if ! docker ps --format '{{{{.Names}}' | grep -q "^test-postgres$"; then
+            echo "❌ test-postgres exited during startup"
+            echo ""
+            echo "   If the pinned PostgreSQL version changed, recreate the"
+            echo "   volume - it holds local test data only:"
+            echo ""
+            echo "     just db-stop --remove && just db-start && just db-setup"
+            echo ""
+            docker logs --tail 15 test-postgres 2>&1 || true
+            exit 1
+        fi
+
+        sleep 1
+    done
+
+    echo "❌ PostgreSQL not responding after 30s - check 'docker logs test-postgres'"
+    exit 1
 
 # Stop Docker PostgreSQL container
 #
