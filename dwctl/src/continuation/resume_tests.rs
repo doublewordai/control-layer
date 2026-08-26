@@ -482,6 +482,7 @@ async fn a_stalled_stream_is_resumed_at_the_last_frame_boundary(pool: PgPool) {
     let cfg = ContinuationConfig {
         // The behaviour under test: silence for this long is a death.
         resume_deadline_secs: 1,
+        stall_timeout_secs: 1,
         ..test_config()
     };
     let st = state(pool, &fake, tokenizer.uri(), cfg);
@@ -542,6 +543,7 @@ async fn a_slow_first_token_is_never_severed(pool: PgPool) {
         let tokenizer = render_stub(vec![1], 4, 1).await;
         let cfg = ContinuationConfig {
             resume_deadline_secs: 1,
+            stall_timeout_secs: 1,
             ..test_config()
         };
         let st = state(pool.clone(), &fake, tokenizer.uri(), cfg);
@@ -567,6 +569,7 @@ async fn a_stall_after_finish_reason_is_a_lost_trailer_not_a_resume(pool: PgPool
     let tokenizer = render_stub(vec![1], 4, 1).await;
     let cfg = ContinuationConfig {
         resume_deadline_secs: 1,
+        stall_timeout_secs: 1,
         ..test_config()
     };
     let st = state(pool, &fake, tokenizer.uri(), cfg);

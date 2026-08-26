@@ -523,13 +523,19 @@ continuation:
   # the chain). Exhausted -> the ORIGINAL death surfaces, exactly as unresumed.
   # Set via environment: DWCTL_CONTINUATION__MAX_ATTEMPTS=2
   max_attempts: 2
-  # Seconds per resume attempt (render + continuation-target time-to-first-byte)
-  # AND the inter-frame stall timer. The stall timer arms only after leg 1's
-  # first event — pre-first-token time is admission/prefill and is never bounded
-  # here. Cold provider prefill dominates on long prompts; harness TTFB curves
-  # inform the value.
+  # Seconds per resume attempt (render + continuation-target time-to-first-byte).
+  # Crossed -> that leg is abandoned; attempts exhausted -> the original death
+  # surfaces. Cold provider prefill dominates on long prompts.
   # Set via environment: DWCTL_CONTINUATION__RESUME_DEADLINE_SECS=20
   resume_deadline_secs: 20
+  # Inter-frame silence after which an armed stream is declared stalled and
+  # rescued. Rescue CANCELS the original leg, so this must never undercut the
+  # platform's own liveness judgment (fusillade allows 600s between SSE events
+  # in prod): a preempted-but-progressing stream must be left alone. 540 sits
+  # just inside fusillade's 600s so batch-origin stalls remain rescuable before
+  # the daemon aborts. Arms only after the first generated text.
+  # Set via environment: DWCTL_CONTINUATION__STALL_TIMEOUT_SECS=540
+  stall_timeout_secs: 540
   # Cap on the retained request body + accumulated generation per stream.
   # Exceeded -> the stream is marked non-resumable (outcome cap_exceeded) and
   # the buffer dropped; the stream itself is unaffected.

@@ -124,6 +124,10 @@ impl ContinuationState {
     fn attempt_deadline(&self) -> Duration {
         Duration::from_secs(self.cfg.resume_deadline_secs)
     }
+
+    fn stall_timeout(&self) -> Duration {
+        Duration::from_secs(self.cfg.stall_timeout_secs)
+    }
 }
 
 /// The retained request: everything a resume leg needs to rebuild the prompt.
@@ -445,7 +449,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
     // torn final frame is discarded, which is safe precisely because the client
     // never saw it either.
     let leg_one = BodyExt::into_data_stream(body).map(|r| r.map_err(std::io::Error::other));
-    let stall = state.attempt_deadline();
+    let stall = state.stall_timeout();
 
     let stream = async_stream::stream! {
         let mut outcome = OutcomeGuard::new(ctx.origin);

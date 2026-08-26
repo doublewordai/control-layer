@@ -1226,6 +1226,19 @@ pub struct ContinuationConfig {
     /// Set via environment: `DWCTL_CONTINUATION__RESUME_DEADLINE_SECS=20`
     pub resume_deadline_secs: u64,
 
+    /// Inter-frame silence after which an armed stream is declared STALLED and
+    /// rescued — which CANCELS the original leg and re-prefills, so this must
+    /// never undercut the platform's own liveness judgment: fusillade's SSE
+    /// clients allow 600s between events (prod `chunk_timeout_ms`), and a
+    /// preempted/kv-thrashed but progressing stream must be allowed to
+    /// continue. Default 540 = just inside fusillade's 600s so batch-origin
+    /// stalls are still rescuable before the daemon aborts the request.
+    /// Arms only after the first generated text (admission/prefill silence is
+    /// never bounded here).
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__STALL_TIMEOUT_SECS=540`
+    pub stall_timeout_secs: u64,
+
     /// Per-stream cap on the accumulated-generation buffer. A stream that exceeds
     /// it is marked non-resumable and its buffer dropped (outlet's own capture is
     /// unaffected); the outcome metric records `cap_exceeded`.
@@ -1277,6 +1290,7 @@ impl Default for ContinuationConfig {
             origins: ContinuationOriginsConfig::default(),
             max_attempts: 2,
             resume_deadline_secs: 20,
+            stall_timeout_secs: 540,
             max_buffer_bytes: 2 * 1024 * 1024,
             priority: 100,
             max_inflight_per_model: 8,
