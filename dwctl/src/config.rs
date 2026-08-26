@@ -628,7 +628,13 @@ pub struct DummyConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Metadata {
-    /// Region name displayed in the UI (e.g., "UK South", "US East")
+    /// Region name displayed in the UI (e.g., "UK South", "US East").
+    ///
+    /// Surfaced verbatim on `GET /admin/api/v1/config`. Both dashboards hide
+    /// the region indicator entirely when this is `None`, rather than showing
+    /// an "unknown" placeholder — a deployment that serves one region has no
+    /// use for the label, and an account's region is where its data lives, so
+    /// displaying a guess is worse than displaying nothing.
     pub region: Option<String>,
     /// Organization name displayed in the UI
     pub organization: Option<String>,
