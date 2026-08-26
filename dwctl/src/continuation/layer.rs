@@ -121,10 +121,6 @@ impl ContinuationState {
         })
     }
 
-    fn attempt_deadline(&self) -> Duration {
-        Duration::from_secs(self.cfg.resume_deadline_secs)
-    }
-
     fn stall_timeout(&self) -> Duration {
         Duration::from_secs(self.cfg.stall_timeout_secs)
     }
