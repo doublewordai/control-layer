@@ -595,6 +595,7 @@ pub async fn target_message_handler<T: HttpClient>(
             "model" => model_name.to_string(),
         )
         .increment(1);
+        record_response_status(503);
         return Err(OnwardsErrorResponse::service_unavailable());
     }
 
