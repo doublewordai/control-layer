@@ -1120,9 +1120,13 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
       queryClient.getQueryData<ModelComponent[]>(queryKey);
 
     // Create optimistically updated components with new sort_order. Built from
-    // the UNFILTERED list: the query cache holds every pool's memberships, and
-    // the updates only ever address default-pool rows.
+    // the UNFILTERED list (the query cache holds every pool's memberships) but
+    // scoped to default-pool rows: the same deployment can also hold a
+    // completions membership whose sort_order must not be touched.
+    const isDefaultPool = (c: ModelComponent) =>
+      (c.pool ?? "default") === "default";
     const optimisticComponents = (allComponents ?? []).map((component) => {
+      if (!isDefaultPool(component)) return component;
       const update = updates.find(
         (u) => u.componentModelId === component.model.id,
       );
@@ -1140,7 +1144,8 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     try {
       for (const update of updates) {
         const currentComponent = previousComponents?.find(
-          (c) => c.model.id === update.componentModelId,
+          (c) =>
+            isDefaultPool(c) && c.model.id === update.componentModelId,
         );
         // Only update if sort_order actually changed
         if (

@@ -39,6 +39,7 @@ pub fn record_layer_wired(wired: bool) {
 /// `cap_exceeded` | `multi_choice` | `no_route` | `origin_disabled` | `throttled`
 /// | `deadline` | `attempts_exhausted` | `client_disconnect` |
 /// `not_streaming` | `unparseable` | `no_model` | `render_failed` | `no_envelope`
+/// | `needs_forward_parser` | `logprobs`
 /// | death families from [`super::detect`] (`transport_error`, `truncated`,
 /// `error_envelope`, `error_envelope_4xx`, `cancelled_499`, `stall`) | `ok` for
 /// a clean completion.

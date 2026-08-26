@@ -336,6 +336,13 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
         metrics::record_outcome("ineligible", "structured_output", "unknown");
         return next.run(forward(parts, body_bytes)).await;
     }
+    // `logprobs` never arms: a resume leg's chunks carry no chat-shaped
+    // logprobs, so a rescued stream would violate the response shape the
+    // client asked for from the seam onward.
+    if body.get("logprobs").and_then(Value::as_bool) == Some(true) {
+        metrics::record_outcome("ineligible", "logprobs", "unknown");
+        return next.run(forward(parts, body_bytes)).await;
+    }
     // `n > 1` never arms: providers stream multiple choices as alternating
     // single-choice chunks, which the accumulator would concatenate into one
     // interleaved prefix. The accumulator's own `choice.index != 0` disarm is
@@ -658,6 +665,17 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                 Verdict::Resume(reason) => {
                     if first_death_reason.is_none() {
                         first_death_reason = Some(reason);
+                    }
+                    // A structured reconstructor may hold a perfect prefix the
+                    // PLAIN reframer still cannot faithfully continue (seam
+                    // inside reasoning/tool syntax). Surface the death as
+                    // today; v2's forward parser lifts this per model.
+                    if !acc.plain_resume_ok() {
+                        if let Some(frame) = first_death.take() {
+                            yield Ok(frame);
+                        }
+                        outcome.record("failed", "needs_forward_parser");
+                        break 'chain;
                     }
                     let Some(text) = acc.continuation_text() else {
                         // Disarmed, or nothing generated yet: resume-from-zero is

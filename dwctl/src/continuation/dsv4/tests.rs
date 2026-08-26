@@ -521,3 +521,34 @@ fn disarm_is_sticky_and_keeps_the_first_cause() {
     );
     assert_eq!(acc.disarmed(), Some(AccumulateError::UnsupportedDelta));
 }
+
+/// Plain (`delta.content`-only) reframing is faithful only when the
+/// continuation can produce nothing but content — the v1 guard that keeps raw
+/// DSML/`</think>` out of answer text until the forward parser pairs in v2.
+#[test]
+fn plain_resume_ok_tracks_the_seam_phase() {
+    let chunk = |delta: serde_json::Value| {
+        serde_json::json!({"id": "c", "object": "chat.completion.chunk",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": null}]})
+    };
+
+    // Thinking-mode turn, seam inside the open think block: not plain-safe.
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
+    acc.ingest(&chunk(serde_json::json!({"reasoning_content": "let me think"})))
+        .unwrap();
+    assert!(!acc.plain_resume_ok(), "mid-reasoning seam would leak raw </think> into content");
+
+    // Content began (think closed for this family): plain-safe.
+    acc.ingest(&chunk(serde_json::json!({"content": "Answer: "}))).unwrap();
+    assert!(acc.plain_resume_ok());
+
+    // A tool block anywhere in the turn: never plain-safe.
+    acc.ingest(&chunk(serde_json::json!({"tool_calls": [{"index": 0,
+        "function": {"name": "f", "arguments": "{"}}]})))
+        .unwrap();
+    assert!(!acc.plain_resume_ok(), "the continuation may emit DSML tool markup");
+
+    // Chat-mode turn (no think block rendered): plain-safe from the start.
+    let acc = Dsv4Reconstructor::new(CAP, false);
+    assert!(acc.plain_resume_ok());
+}

@@ -587,8 +587,13 @@ impl StreamAccumulator for Dsv4Reconstructor {
         }
         capture_envelope(&mut self.envelope, chunk);
 
-        let Some(choice) = single_choice(chunk)? else {
-            return Ok(());
+        let choice = match single_choice(chunk) {
+            Ok(Some(choice)) => choice,
+            Ok(None) => return Ok(()),
+            // Sticky, like PlainContent: after a multi-choice frame the
+            // accumulated prefix can interleave generations — later frames
+            // must not quietly re-arm it.
+            Err(cause) => return self.disarm(cause),
         };
         if choice.get("finish_reason").is_some_and(|f| !f.is_null()) {
             self.finish_reason = true;
@@ -695,6 +700,15 @@ impl StreamAccumulator for Dsv4Reconstructor {
 
     fn disarm_externally(&mut self, cause: AccumulateError) {
         let _ = self.disarm(cause);
+    }
+
+    /// Plain reframing is faithful only when the continuation can produce
+    /// nothing but content: no tool syntax anywhere in the turn, and the
+    /// think block (if the turn has one) already closed — for this family
+    /// content only begins after `</think>`, so non-empty content is that
+    /// proof. Anything else waits for the paired forward parser (v2).
+    fn plain_resume_ok(&self) -> bool {
+        !self.saw_any_tool_frame && (!self.thinking || !self.content.is_empty())
     }
 }
 
