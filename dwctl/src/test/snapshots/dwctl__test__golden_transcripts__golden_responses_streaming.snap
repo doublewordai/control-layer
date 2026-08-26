@@ -1,0 +1,258 @@
+---
+source: dwctl/src/test/golden_transcripts.rs
+expression: "transcript(status, &body, &upstream, &outlet, &fusillade, &f)"
+---
+=== client ===
+status: 200
+body: event: response.created
+data: {"type":"response.created","response":{"id":"resp_<uuid>","object":"response","created_at":0,"completed_at":null,"status":"in_progress","incomplete_details":null,"model":"gpt-4o","previous_response_id":null,"instructions":null,"output":[],"error":null,"tools":[],"tool_choice":"auto","truncation":"disabled","parallel_tool_calls":true,"text":{"format":{"type":"text"}},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"usage":null,"max_output_tokens":null,"max_tool_calls":null,"store":false,"background":false,"service_tier":"default","metadata":null,"safety_identifier":null,"prompt_cache_key":null},"sequence_number":0}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","output_index":0,"item":{"content":[],"id":"item_0","role":"assistant","status":"in_progress","type":"message"},"sequence_number":1}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","item_id":"item_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"","annotations":[],"logprobs":[]},"sequence_number":2}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","item_id":"item_0","output_index":0,"content_index":0,"delta":"Hello","logprobs":[],"sequence_number":3}
+
+event: response.content_part.done
+data: {"type":"response.content_part.done","item_id":"item_0","output_index":0,"content_index":0,"part":{"type":"output_text","text":"Hello","annotations":[],"logprobs":[]},"sequence_number":4}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","output_index":0,"item":{"content":[{"annotations":[],"logprobs":[],"text":"Hello","type":"output_text"}],"id":"item_0","role":"assistant","status":"completed","type":"message"},"sequence_number":5}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_<uuid>","object":"response","created_at":0,"completed_at":0,"status":"completed","incomplete_details":null,"model":"gpt-4o","previous_response_id":null,"instructions":null,"output":[{"content":[{"annotations":[],"logprobs":[],"text":"Hello","type":"output_text"}],"id":"item_0","role":"assistant","status":"completed","type":"message"}],"error":null,"tools":[],"tool_choice":"auto","truncation":"disabled","parallel_tool_calls":true,"text":{"format":{"type":"text"}},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"usage":{"input_tokens":10,"output_tokens":1,"total_tokens":11,"input_tokens_details":{"cached_tokens":0},"output_tokens_details":{"reasoning_tokens":0}},"max_output_tokens":null,"max_tool_calls":null,"store":false,"background":false,"service_tier":"default","metadata":null,"safety_identifier":null,"prompt_cache_key":null},"sequence_number":6}
+
+
+
+=== upstream ===
+--- upstream request 0 ---
+POST /chat/completions
+authorization: <absent>
+content-type: application/json
+x-fusillade-request-id: <uuid>
+x-onwards-response-id: resp_<uuid>
+x-onwards-endpoint: /v1/responses
+x-onwards-model: gpt-4o
+x-fusillade-stream: <absent>
+x-fusillade-batch-zdr: <absent>
+body: {"messages":[{"content":"golden-responses-streaming-sentinel","role":"user"}],"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true}}
+
+=== outlet ===
+--- outlet http_requests ---
+{
+  "body": {
+    "headers": {
+      "authorization": "Bearer <api-key>",
+      "content-type": "application/json",
+      "x-fusillade-request-id": "<uuid>",
+      "x-onwards-endpoint": "/v1/responses",
+      "x-onwards-model": "gpt-4o",
+      "x-onwards-response-id": "resp_<uuid>"
+    },
+    "request": {
+      "input": "golden-responses-streaming-sentinel",
+      "model": "gpt-4o",
+      "stream": true
+    }
+  },
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "method": "POST",
+  "span_id": null,
+  "trace_id": null,
+  "uri": "http://localhost/responses"
+}
+--- outlet http_responses ---
+{
+  "body": [
+    {
+      "response": {
+        "background": false,
+        "completed_at": null,
+        "created_at":0,
+        "error": null,
+        "frequency_penalty": 0.0,
+        "id": "resp_<uuid>",
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "max_tool_calls": null,
+        "metadata": null,
+        "model": "gpt-4o",
+        "object": "response",
+        "output": [],
+        "parallel_tool_calls": true,
+        "presence_penalty": 0.0,
+        "previous_response_id": null,
+        "prompt_cache_key": null,
+        "reasoning": null,
+        "safety_identifier": null,
+        "service_tier": "default",
+        "status": "in_progress",
+        "store": false,
+        "temperature": 1.0,
+        "text": {
+          "format": {
+            "type": "text"
+          }
+        },
+        "tool_choice": "auto",
+        "tools": [],
+        "top_logprobs": 0,
+        "top_p": 1.0,
+        "truncation": "disabled",
+        "usage": null
+      },
+      "sequence_number": 0,
+      "type": "response.created"
+    },
+    {
+      "item": {
+        "content": [],
+        "id": "item_0",
+        "role": "assistant",
+        "status": "in_progress",
+        "type": "message"
+      },
+      "output_index": 0,
+      "sequence_number": 1,
+      "type": "response.output_item.added"
+    },
+    {
+      "content_index": 0,
+      "item_id": "item_0",
+      "output_index": 0,
+      "part": {
+        "annotations": [],
+        "logprobs": [],
+        "text": "",
+        "type": "output_text"
+      },
+      "sequence_number": 2,
+      "type": "response.content_part.added"
+    },
+    {
+      "content_index": 0,
+      "delta": "Hello",
+      "item_id": "item_0",
+      "logprobs": [],
+      "output_index": 0,
+      "sequence_number": 3,
+      "type": "response.output_text.delta"
+    },
+    {
+      "content_index": 0,
+      "item_id": "item_0",
+      "output_index": 0,
+      "part": {
+        "annotations": [],
+        "logprobs": [],
+        "text": "Hello",
+        "type": "output_text"
+      },
+      "sequence_number": 4,
+      "type": "response.content_part.done"
+    },
+    {
+      "item": {
+        "content": [
+          {
+            "annotations": [],
+            "logprobs": [],
+            "text": "Hello",
+            "type": "output_text"
+          }
+        ],
+        "id": "item_0",
+        "role": "assistant",
+        "status": "completed",
+        "type": "message"
+      },
+      "output_index": 0,
+      "sequence_number": 5,
+      "type": "response.output_item.done"
+    },
+    {
+      "response": {
+        "background": false,
+        "completed_at":0,
+        "created_at":0,
+        "error": null,
+        "frequency_penalty": 0.0,
+        "id": "resp_<uuid>",
+        "incomplete_details": null,
+        "instructions": null,
+        "max_output_tokens": null,
+        "max_tool_calls": null,
+        "metadata": null,
+        "model": "gpt-4o",
+        "object": "response",
+        "output": [
+          {
+            "content": [
+              {
+                "annotations": [],
+                "logprobs": [],
+                "text": "Hello",
+                "type": "output_text"
+              }
+            ],
+            "id": "item_0",
+            "role": "assistant",
+            "status": "completed",
+            "type": "message"
+          }
+        ],
+        "parallel_tool_calls": true,
+        "presence_penalty": 0.0,
+        "previous_response_id": null,
+        "prompt_cache_key": null,
+        "reasoning": null,
+        "safety_identifier": null,
+        "service_tier": "default",
+        "status": "completed",
+        "store": false,
+        "temperature": 1.0,
+        "text": {
+          "format": {
+            "type": "text"
+          }
+        },
+        "tool_choice": "auto",
+        "tools": [],
+        "top_logprobs": 0,
+        "top_p": 1.0,
+        "truncation": "disabled",
+        "usage": {
+          "input_tokens": 10,
+          "input_tokens_details": {
+            "cached_tokens": 0
+          },
+          "output_tokens": 1,
+          "output_tokens_details": {
+            "reasoning_tokens": 0
+          },
+          "total_tokens": 11
+        }
+      },
+      "sequence_number": 6,
+      "type": "response.completed"
+    }
+  ],
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "status_code": 200
+}
+
+=== fusillade ===
+--- fusillade row ---
+state: completed
+service_tier: priority
+model: gpt-4o
+method: POST
+path: /v1/responses
+endpoint: 
+body: {"input":"golden-responses-streaming-sentinel","model":"gpt-4o","stream":true}

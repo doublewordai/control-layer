@@ -1,0 +1,87 @@
+---
+source: dwctl/src/test/golden_transcripts.rs
+expression: "transcript(status, &body, &upstream, &outlet, &fusillade, &f)"
+---
+=== client ===
+status: 200
+body: {"id":"resp_<uuid>","object":"chat.completion","created":1,"model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"Hello from the gateway"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}}
+
+=== upstream ===
+--- upstream request 0 ---
+POST /chat/completions
+authorization: <absent>
+content-type: application/json
+x-fusillade-request-id: <uuid>
+x-onwards-response-id: resp_<uuid>
+x-onwards-endpoint: /v1/chat/completions
+x-onwards-model: gpt-4o
+x-fusillade-stream: <absent>
+x-fusillade-batch-zdr: <absent>
+body: {"messages":[{"content":"golden-chat-blocking-sentinel","role":"user"}],"model":"gpt-4o"}
+
+=== outlet ===
+--- outlet http_requests ---
+{
+  "body": {
+    "headers": {
+      "authorization": "Bearer <api-key>",
+      "content-type": "application/json",
+      "x-fusillade-request-id": "<uuid>",
+      "x-onwards-endpoint": "/v1/chat/completions",
+      "x-onwards-model": "gpt-4o",
+      "x-onwards-response-id": "resp_<uuid>"
+    },
+    "request": {
+      "messages": [
+        {
+          "content": "golden-chat-blocking-sentinel",
+          "role": "user"
+        }
+      ],
+      "model": "gpt-4o"
+    }
+  },
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "method": "POST",
+  "span_id": null,
+  "trace_id": null,
+  "uri": "http://localhost/chat/completions"
+}
+--- outlet http_responses ---
+{
+  "body": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "content": "Hello from the gateway",
+          "role": "assistant"
+        }
+      }
+    ],
+    "created": 1,
+    "id": "resp_<uuid>",
+    "model": "gpt-4o",
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 4,
+      "prompt_tokens": 10,
+      "total_tokens": 14
+    }
+  },
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "status_code": 200
+}
+
+=== fusillade ===
+--- fusillade row ---
+state: completed
+service_tier: priority
+model: gpt-4o
+method: POST
+path: /v1/chat/completions
+endpoint: 
+body: {"messages":[{"content":"golden-chat-blocking-sentinel","role":"user"}],"model":"gpt-4o"}

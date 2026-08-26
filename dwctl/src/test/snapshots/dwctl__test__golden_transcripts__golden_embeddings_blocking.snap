@@ -1,0 +1,80 @@
+---
+source: dwctl/src/test/golden_transcripts.rs
+expression: "transcript(status, &body, &upstream, &outlet, &fusillade, &f)"
+---
+=== client ===
+status: 200
+body: {"object":"list","data":[{"object":"embedding","embedding":[0.1,0.2,0.3],"index":0}],"model":"gpt-4o","usage":{"prompt_tokens":3,"total_tokens":3}}
+
+=== upstream ===
+--- upstream request 0 ---
+POST /embeddings
+authorization: <absent>
+content-type: application/json
+x-fusillade-request-id: <uuid>
+x-onwards-response-id: resp_<uuid>
+x-onwards-endpoint: /v1/embeddings
+x-onwards-model: gpt-4o
+x-fusillade-stream: <absent>
+x-fusillade-batch-zdr: <absent>
+body: {"input":"golden-embeddings-sentinel","model":"gpt-4o"}
+
+=== outlet ===
+--- outlet http_requests ---
+{
+  "body": {
+    "headers": {
+      "authorization": "Bearer <api-key>",
+      "content-type": "application/json",
+      "x-fusillade-request-id": "<uuid>",
+      "x-onwards-endpoint": "/v1/embeddings",
+      "x-onwards-model": "gpt-4o",
+      "x-onwards-response-id": "resp_<uuid>"
+    },
+    "request": {
+      "input": "golden-embeddings-sentinel",
+      "model": "gpt-4o"
+    }
+  },
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "method": "POST",
+  "span_id": null,
+  "trace_id": null,
+  "uri": "http://localhost/embeddings"
+}
+--- outlet http_responses ---
+{
+  "body": {
+    "data": [
+      {
+        "embedding": [
+          0.10000000149011612,
+          0.20000000298023224,
+          0.30000001192092896
+        ],
+        "index": 0,
+        "object": "embedding"
+      }
+    ],
+    "model": "gpt-4o",
+    "object": "list",
+    "usage": {
+      "prompt_tokens": 3,
+      "total_tokens": 3
+    }
+  },
+  "body_parsed": true,
+  "instance_id": "<uuid>",
+  "status_code": 200
+}
+
+=== fusillade ===
+--- fusillade row ---
+state: completed
+service_tier: priority
+model: gpt-4o
+method: POST
+path: /v1/embeddings
+endpoint: 
+body: {"input":"golden-embeddings-sentinel","model":"gpt-4o"}
