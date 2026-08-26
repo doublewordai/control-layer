@@ -421,16 +421,24 @@ impl PurposeResolver {
         if let Some(cached) = self.l1.get(token).await {
             return cached;
         }
-        let mut conn = self.pool.acquire().await.ok()?;
-        let purpose = ApiKeys::new(&mut conn)
-            .get_user_info_by_secret(token)
-            .await
-            .ok()
-            .flatten()
-            .map(|(_, _, purpose)| purpose);
+        // Only a SUCCESSFUL lookup is cached. A transient DB failure must not
+        // pin `None` (= treated as realtime) for the TTL — a batch key would
+        // sail past a disabled batch gate for an hour. The failed request
+        // still resolves to None (one-off misclassification, fail-open on the
+        // origin gate only); the next request retries the lookup.
+        let Ok(mut conn) = self.pool.acquire().await else {
+            return None;
+        };
+        let looked_up = ApiKeys::new(&mut conn).get_user_info_by_secret(token).await;
         drop(conn);
-        self.l1.insert(token.to_string(), purpose.clone()).await;
-        purpose
+        match looked_up {
+            Ok(found) => {
+                let purpose = found.map(|(_, _, purpose)| purpose);
+                self.l1.insert(token.to_string(), purpose.clone()).await;
+                purpose
+            }
+            Err(_) => None,
+        }
     }
 }
 

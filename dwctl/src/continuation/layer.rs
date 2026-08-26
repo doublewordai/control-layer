@@ -488,9 +488,10 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                 // exactly the pre-continuation passthrough.) Resume legs are
                 // timed from their first read: their time-to-first-token IS
                 // the seam the deadline exists to bound.
+                let finished = acc.saw_finish_reason() || saw_usage;
                 let next_item = if resuming || acc.len_bytes() > 0 {
                     match tokio::time::timeout(stall, current.next()).await {
-                        Err(_) => break detect::classify(&DeathEvent::Stall),
+                        Err(_) => break detect::classify(&DeathEvent::Stall { finished }),
                         Ok(item) => item,
                     }
                 } else {
@@ -508,7 +509,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                         saw_finish_reason: acc.saw_finish_reason() || saw_usage,
                         saw_done: false,
                     }),
-                    Some(Err(_)) => break detect::classify(&DeathEvent::TransportError),
+                    Some(Err(_)) => break detect::classify(&DeathEvent::TransportError { finished }),
                     Some(Ok(bytes)) => bytes,
                 };
 

@@ -29,8 +29,10 @@ use serde_json::Value;
 #[derive(Debug)]
 pub enum DeathEvent<'a> {
     /// The inner body stream yielded `Err` — hyper reset, incomplete body, a
-    /// truncated chunked encoding.
-    TransportError,
+    /// truncated chunked encoding. `finished` = a terminal `finish_reason` (or
+    /// usage frame) had already been seen: the generation is over and only the
+    /// trailer was lost.
+    TransportError { finished: bool },
     /// The inner body stream ended (`None`). `saw_finish_reason` is whether every
     /// choice seen so far carried a `finish_reason`; `saw_done` whether a
     /// `[DONE]` sentinel arrived.
@@ -38,8 +40,9 @@ pub enum DeathEvent<'a> {
     /// A complete, parsed SSE data frame. Ordinary content frames classify as
     /// [`Verdict::Alive`]; error envelopes carry the interesting rows.
     Frame(&'a Value),
-    /// No frames for the resume deadline after the first byte.
-    Stall,
+    /// No frames for the resume deadline after the first byte. `finished` as
+    /// on [`DeathEvent::TransportError`].
+    Stall { finished: bool },
     /// The client went away (our forward-write failed, or the body was dropped).
     ClientDisconnect,
 }
@@ -67,8 +70,13 @@ pub enum Verdict {
 pub fn classify(event: &DeathEvent) -> Verdict {
     match event {
         // A mid-stream transport failure says nothing about the request's
-        // validity: the generation was in flight and the bytes stopped.
-        DeathEvent::TransportError => Verdict::Resume("transport_error"),
+        // validity: the generation was in flight and the bytes stopped. But a
+        // FINISHED generation must never be resumed — a stall or reset while
+        // waiting for the usage/[DONE] trailer is a lost trailer, and
+        // continuing past a terminal finish_reason would append output after a
+        // valid stop.
+        DeathEvent::TransportError { finished: true } => Verdict::LostTrailer,
+        DeathEvent::TransportError { finished: false } => Verdict::Resume("transport_error"),
 
         // A clean EOF is only clean if the model actually said it was done.
         DeathEvent::Eof { saw_done: true, .. } => Verdict::Complete,
@@ -82,7 +90,8 @@ pub fn classify(event: &DeathEvent) -> Verdict {
 
         // Treated as a death at the last received frame boundary: the partial
         // generation is intact, so the resume prefix is exact.
-        DeathEvent::Stall => Verdict::Resume("stall"),
+        DeathEvent::Stall { finished: true } => Verdict::LostTrailer,
+        DeathEvent::Stall { finished: false } => Verdict::Resume("stall"),
 
         // Nobody is listening. Disarm, drop the accumulator, never dispatch a
         // resume leg that would generate tokens into a closed socket.
@@ -157,8 +166,13 @@ mod tests {
         let cases: Vec<(&str, DeathEvent, Verdict)> = vec![
             (
                 "transport error mid-stream",
-                DeathEvent::TransportError,
+                DeathEvent::TransportError { finished: false },
                 Verdict::Resume("transport_error"),
+            ),
+            (
+                "transport error after the generation finished",
+                DeathEvent::TransportError { finished: true },
+                Verdict::LostTrailer,
             ),
             (
                 "stream ends with no finish_reason and no [DONE]",
@@ -193,7 +207,16 @@ mod tests {
                 DeathEvent::ClientDisconnect,
                 Verdict::NoResume("client_disconnect"),
             ),
-            ("stall past the deadline", DeathEvent::Stall, Verdict::Resume("stall")),
+            (
+                "stall past the deadline",
+                DeathEvent::Stall { finished: false },
+                Verdict::Resume("stall"),
+            ),
+            (
+                "stall while waiting for the trailer of a finished generation",
+                DeathEvent::Stall { finished: true },
+                Verdict::LostTrailer,
+            ),
             ("ordinary content frame", DeathEvent::Frame(&content), Verdict::Alive),
             (
                 "finished, then [DONE]",

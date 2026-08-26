@@ -196,6 +196,13 @@ pub async fn attempt(state: &ContinuationState, ctx: &RequestContext, continuati
     let body = build_leg_body(ctx, &render.token_ids, max_tokens, state.cfg.priority);
     let request = build_leg_request(&ctx.path, &state.key_secret, &body);
 
+    // Dispatch accounting happens BEFORE the await: a leg that times out,
+    // 4xxs, or comes back non-streaming still re-prefilled the prompt
+    // upstream and still counts as an attempt — those are exactly the legs
+    // whose cost and rate incidents need visible.
+    metrics::record_resume_leg(&ctx.model, attempt_no);
+    metrics::record_eaten_prompt_tokens(&ctx.model, render.token_ids.len() as u64);
+
     let response = match tokio::time::timeout_at(deadline, state.resume_target.clone().oneshot(request)).await {
         Err(_) => return Err(LegError::Deadline),
         // The router's error type is Infallible, so this arm cannot be taken.
@@ -209,13 +216,6 @@ pub async fn attempt(state: &ContinuationState, ctx: &RequestContext, continuati
     if !is_sse(&response) {
         return Err(LegError::NotStreaming);
     }
-
-    metrics::record_resume_leg(&ctx.model, attempt_no);
-    // Every leg re-prefills the WHOLE prompt; that is what resuming costs us.
-    // Counted here, at dispatch, from the prefix we actually sent — not from
-    // the leg's own usage frame, which a leg that dies mid-stream never emits.
-    // Those are exactly the legs whose cost we most need to see.
-    metrics::record_eaten_prompt_tokens(&ctx.model, render.token_ids.len() as u64);
     let body = BodyExt::into_data_stream(response.into_body()).map(|r| r.map_err(std::io::Error::other));
     Ok(Leg {
         render,

@@ -553,6 +553,31 @@ async fn a_slow_first_token_is_never_severed(pool: PgPool) {
     }
 }
 
+/// A stall AFTER the generation finished (terminal finish_reason seen, trailer
+/// never arrives) is a LOST TRAILER, not a death: resuming would append output
+/// past a valid stop. The stream completes with a synthesized usage frame and
+/// `[DONE]`, and no leg is ever dispatched.
+#[sqlx::test]
+async fn a_stall_after_finish_reason_is_a_lost_trailer_not_a_resume(pool: PgPool) {
+    let finished = frame(json!({
+        "id": "chatcmpl-1", "object": "chat.completion.chunk", "created": 1_700_000_000, "model": MODEL,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    }));
+    let fake = Fake::new(vec![content("chatcmpl-1", "Hello"), finished, Chunk::Hang], vec![]);
+    let tokenizer = render_stub(vec![1], 4, 1).await;
+    let cfg = ContinuationConfig {
+        resume_deadline_secs: 1,
+        ..test_config()
+    };
+    let st = state(pool, &fake, tokenizer.uri(), cfg);
+
+    let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await;
+    assert!(fake.resume_requests().is_empty(), "a finished generation is never resumed");
+    assert_eq!(contents(&parsed(&payloads)), "Hello");
+    assert_eq!(usage_frames(&parsed(&payloads)).len(), 1, "usage synthesized from a render");
+    assert_eq!(payloads.last().unwrap(), "[DONE]");
+}
+
 /// An unparseable `data:` frame on leg 1 is forwarded to the client — we never
 /// re-serialize their stream — but it DISARMS resume.
 ///

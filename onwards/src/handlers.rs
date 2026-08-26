@@ -458,7 +458,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // the map guard so only the chosen pool is cloned: KeySets are owned, so a
     // whole-TargetPools clone would deep-copy every pool's keys per request.
     let request_class = RequestClass::from_path(&canonical_request_path);
-    let (resolved_pool_name, mut pool) = match state.targets.targets.get(&model_name) {
+    let (mut resolved_pool_name, mut pool) = match state.targets.targets.get(&model_name) {
         Some(pools) => {
             // Now that the model is known to be a configured target, tag the
             // in-flight guard so `onwards_model_inflight{model=…}` tracks this
@@ -547,8 +547,14 @@ pub async fn target_message_handler<T: HttpClient>(
                         pool = match state.targets.targets.get(redirect_alias) {
                             // The redirect names an alias, so its pools are
                             // resolved for this request's class just as the
-                            // original alias's were.
-                            Some(p) => p.resolve(request_class).clone(),
+                            // original alias's were — and `resolved_pool_name`
+                            // is recomputed with it: the capability strip and
+                            // the span field must describe the pool that
+                            // actually serves, not the source alias's.
+                            Some(p) => {
+                                resolved_pool_name = p.resolved_name(request_class);
+                                p.resolve(request_class).clone()
+                            }
                             None => {
                                 debug!("Redirect target '{}' not found", redirect_alias);
                                 return Err(OnwardsErrorResponse::bad_gateway());
