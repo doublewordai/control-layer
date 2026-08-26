@@ -118,9 +118,17 @@ pub(super) struct MemoryGate {
     /// the per-pod ceiling, measured rather than assumed, and it is what a
     /// replica count should be derived from.
     peak_in_flight_at_gate: AtomicU64,
-    /// In-flight at the most recent engagement, and the fraction of it that
-    /// in-flight must fall to before claiming resumes regardless of the memory
-    /// reading. See `should_block` for why a memory-only release cannot work.
+    /// In-flight at the START of the current pressure episode, and the fraction
+    /// of it that in-flight must fall to before claiming resumes regardless of
+    /// the memory reading. See `should_block` for why a memory-only release
+    /// cannot work.
+    ///
+    /// Held for the whole episode rather than rewritten on each engagement. The
+    /// memory reading does not fall when work completes, so releasing on drain
+    /// is immediately followed by re-engagement; re-baselining there would adopt
+    /// the freshly-drained level as the new reference and require halving THAT,
+    /// so each cycle would admit half as much as the last and in-flight would
+    /// decay geometrically toward zero. Zero means no episode is in progress.
     in_flight_when_engaged: AtomicU64,
     release_in_flight_fraction: f64,
 }
@@ -211,11 +219,23 @@ impl MemoryGate {
         self.engaged.store(engaged, Ordering::Relaxed);
         gauge!("fusillade_memory_gate_engaged").set(u8::from(engaged));
 
+        // The episode ends only when usage genuinely recovers past the low mark.
+        // A release driven by the drain condition is not a recovery: the reading
+        // is still high and the gate will re-engage on the next cycle.
+        if !engaged && used <= self.low {
+            self.in_flight_when_engaged.store(0, Ordering::Relaxed);
+        }
+
         if engaged && !was_engaged {
             counter!("fusillade_memory_gate_engagements_total").increment(1);
             let in_flight = in_flight as u64;
-            self.in_flight_when_engaged
-                .store(in_flight, Ordering::Relaxed);
+            // Only the first engagement of an episode sets the reference.
+            let _ = self.in_flight_when_engaged.compare_exchange(
+                0,
+                in_flight,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             self.peak_in_flight_at_gate
                 .fetch_max(in_flight, Ordering::Relaxed);
             gauge!("fusillade_in_flight_at_gate").set(in_flight as f64);
@@ -334,6 +354,30 @@ mod tests {
         assert!(
             !gate.should_block(499),
             "released once in-flight halved, despite usage never falling"
+        );
+    }
+
+    /// The production failure this guards against: usage stays above the HIGH
+    /// mark, so every drain-driven release is followed immediately by
+    /// re-engagement. If the reference were re-read there, each cycle would
+    /// admit half as much as the last and in-flight would decay toward zero.
+    /// Holding it for the episode keeps the release level fixed instead.
+    #[test]
+    fn re_engaging_does_not_lower_the_release_level() {
+        let gate = MemoryGate::new(0.75, 0.65, 0.5, FixedSource::new(vec![at(0.9)])).unwrap();
+
+        assert!(gate.should_block(1000), "engages at 1000 in flight");
+        assert!(!gate.should_block(500), "releases once halved");
+        // Usage is still above the high mark, so this re-engages. The reference
+        // must stay 1000, not become 500.
+        assert!(gate.should_block(520), "re-engages while usage is high");
+        assert!(
+            !gate.should_block(500),
+            "still releases at half of the ORIGINAL level, not half of 500"
+        );
+        assert!(
+            gate.should_block(260),
+            "re-engages again without having ratcheted the level down"
         );
     }
 
