@@ -659,6 +659,16 @@ pub async fn target_message_handler<T: HttpClient>(
     let original_headers = req.headers().clone();
     let method = req.method().clone();
 
+    // Fusillade daemon loopback requests carry x-fusillade-request-id.
+    // These are batch/flex/background requests dispatched by the daemon back
+    // through the full dwctl stack. Fusillade's adaptive concurrency controller
+    // relies on receiving the raw 529 from the upstream to back off — if we
+    // fell over to an alternative provider on 529, that signal would never
+    // reach the daemon, breaking its overload backoff. So for fusillade
+    // loopback traffic we suppress 529 fallback and let it pass through.
+    let is_fusillade_loopback = original_headers
+        .contains_key("x-fusillade-request-id");
+
     // Track last error for fallback scenarios
     let mut last_error: Option<OnwardsErrorResponse> = None;
 
@@ -952,8 +962,12 @@ pub async fn target_message_handler<T: HttpClient>(
         upstream_span.record("http.response.status_code", status);
         tracing::Span::current().record("http.response.status_code", status);
 
-        // Check if we should fallback based on status code
-        if pool.should_fallback_on_status(status) {
+        // Check if we should fallback based on status code.
+        // Suppress 529 fallback for fusillade daemon loopback requests: the
+        // daemon needs the raw 529 to drive its adaptive concurrency backoff.
+        let should_fallback = pool.should_fallback_on_status(status)
+            && !(status == 529 && is_fusillade_loopback);
+        if should_fallback {
             debug!(
                 "Provider returned fallback status {}, trying next: {:?}",
                 status, target.url

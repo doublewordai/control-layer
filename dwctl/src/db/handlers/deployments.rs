@@ -247,7 +247,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             lb_strategy,
             fallback_enabled: m.fallback_enabled.unwrap_or(true),
             fallback_on_rate_limit: m.fallback_on_rate_limit.unwrap_or(true),
-            fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
+            fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504, 529]),
             fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
             fallback_max_attempts: m.fallback_max_attempts,
             backoff_enabled: m.backoff_enabled,
