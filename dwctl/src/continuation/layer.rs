@@ -355,29 +355,20 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
         metrics::record_outcome("ineligible", "multi_choice", "unknown");
         return next.run(forward(parts, body_bytes)).await;
     }
-    let origin = Origin::from_purpose(match token.as_deref() {
-        Some(t) => state.purposes.resolve(t).await,
-        None => None,
-    });
-    if !origin.is_enabled(&state.cfg) {
-        metrics::record_outcome("ineligible", "origin_disabled", origin.label());
-        return next.run(forward(parts, body_bytes)).await;
-    }
     if body_bytes.len() > state.cfg.max_buffer_bytes {
         // We would have to retain this body for the life of the stream.
-        metrics::record_outcome("ineligible", "cap_exceeded", origin.label());
+        metrics::record_outcome("ineligible", "cap_exceeded", "unknown");
         return next.run(forward(parts, body_bytes)).await;
     }
 
-    let ctx = RequestContext {
+    let mut ctx = RequestContext {
         model,
         body,
         path,
         response_id,
         route,
-        origin: origin.label(),
+        origin: "unknown",
     };
-    metrics::record_eligible_stream(&ctx.model, ctx.origin);
 
     let response = next.run(forward(parts, body_bytes)).await;
 
@@ -385,13 +376,29 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
     // generated, so there is nothing to continue, and error enrichment above
     // already gives those their final shape.
     if !response.status().is_success() {
-        metrics::record_outcome("disarmed", "non_2xx", ctx.origin);
+        metrics::record_outcome("disarmed", "non_2xx", "unknown");
         return response;
     }
     if !is_sse(&response) {
-        metrics::record_outcome("disarmed", "not_streaming", ctx.origin);
+        metrics::record_outcome("disarmed", "not_streaming", "unknown");
         return response;
     }
+
+    // The origin gate runs AFTER the response is known good: a 2xx from
+    // onwards means the bearer was AUTHENTICATED, so the (memoised) purpose
+    // lookup only ever runs for valid keys — an unauthenticated caller
+    // rotating garbage tokens gets its 401 from onwards without ever costing
+    // this layer a database query.
+    let origin = Origin::from_purpose(match token.as_deref() {
+        Some(t) => state.purposes.resolve(t).await,
+        None => None,
+    });
+    if !origin.is_enabled(&state.cfg) {
+        metrics::record_outcome("ineligible", "origin_disabled", origin.label());
+        return response;
+    }
+    ctx.origin = origin.label();
+    metrics::record_eligible_stream(&ctx.model, ctx.origin);
 
     tee(response, state, ctx)
 }
@@ -464,6 +471,10 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         // per leg; used to label seams and leg-token metrics so dashboards can
         // split the free dynamo hop from paid external rescues.
         let mut leg_provider: Option<&'static str> = None;
+        // The current resume leg's first-frame deadline (the attempt budget).
+        // Some(_) until the leg's first frame arrives, then None — reads fall
+        // through to the inter-frame stall timer.
+        let mut leg_deadline: Option<tokio::time::Instant> = None;
         let mut saw_usage = false;
         // The terminating frames, held rather than forwarded: we may need to put
         // a synthesized usage frame in front of `[DONE]`, and a death frame must
@@ -500,7 +511,14 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                 // timed from their first read: their time-to-first-token IS
                 // the seam the deadline exists to bound.
                 let finished = acc.saw_finish_reason() || saw_usage;
-                let next_item = if resuming || acc.len_bytes() > 0 {
+                let next_item = if let Some(deadline) = leg_deadline {
+                    // A resume leg that has not yet produced a frame is still
+                    // spending its attempt budget: headers are not a token.
+                    match tokio::time::timeout_at(deadline, current.next()).await {
+                        Err(_) => break detect::classify(&DeathEvent::Stall { finished }),
+                        Ok(item) => item,
+                    }
+                } else if resuming || acc.len_bytes() > 0 {
                     match tokio::time::timeout(stall, current.next()).await {
                         Err(_) => break detect::classify(&DeathEvent::Stall { finished }),
                         Ok(item) => item,
@@ -581,6 +599,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
 
                 // ── resume leg: reframe onto the client's original stream ──
                 if leg_provider.is_none() {
+                    leg_deadline = None;
                     let provider = if value.get("id").and_then(Value::as_str).is_some_and(|id| id.starts_with("dyn-")) {
                         "dynamo"
                     } else {
@@ -758,6 +777,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                             current = l.stream;
                             resuming = true;
                             leg_provider = None;
+                            leg_deadline = Some(l.deadline);
                             refusal = None;
                         }
                         None => {

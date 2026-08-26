@@ -555,6 +555,40 @@ async fn a_slow_first_token_is_never_severed(pool: PgPool) {
     }
 }
 
+/// A resume leg that answers with headers (and keep-alives) but never a data
+/// frame is bounded by the ATTEMPT deadline, not the minutes-scale stall
+/// timer: headers are not a token, and the seam budget must hold even against
+/// a held-open-empty leg. With attempts exhausted the ORIGINAL death surfaces.
+#[sqlx::test]
+async fn a_headers_only_leg_is_bounded_by_the_attempt_deadline(pool: PgPool) {
+    let fake = Fake::new(
+        vec![content("chatcmpl-1", "partial"), Chunk::Reset],
+        // Both legs: an SSE response that only ever sends a comment, then hangs.
+        vec![
+            vec![Chunk::Data(": keep-alive\n\n".to_string()), Chunk::Hang],
+            vec![Chunk::Data(": keep-alive\n\n".to_string()), Chunk::Hang],
+        ],
+    );
+    let tokenizer = render_stub(vec![1], 1007, 7).await;
+    let cfg = ContinuationConfig {
+        resume_deadline_secs: 1,
+        // Deliberately huge: the leg's first frame must NOT wait on this.
+        stall_timeout_secs: 3600,
+        ..test_config()
+    };
+    let st = state(pool, &fake, tokenizer.uri(), cfg);
+
+    let started = std::time::Instant::now();
+    let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "bounded by the per-attempt deadline, took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(fake.resume_requests().len(), 2, "both attempts spent");
+    assert_eq!(contents(&parsed(&payloads)), "partial", "leg-1 content only");
+}
+
 /// A stall AFTER the generation finished (terminal finish_reason seen, trailer
 /// never arrives) is a LOST TRAILER, not a death: resuming would append output
 /// past a valid stop. The stream completes with a synthesized usage frame and

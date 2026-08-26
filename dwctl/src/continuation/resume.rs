@@ -40,6 +40,11 @@ pub type LegStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + 
 pub struct Leg {
     pub render: RenderedPrefix,
     pub stream: LegStream,
+    /// The attempt's remaining budget. The tee applies it to the leg's FIRST
+    /// frame — response headers alone are not a first token (dynamo can hold
+    /// a 200 open with nothing behind it), and the inter-frame stall timer
+    /// (sized for platform liveness, minutes) must not become the seam bound.
+    pub deadline: tokio::time::Instant,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -220,6 +225,7 @@ pub async fn attempt(state: &ContinuationState, ctx: &RequestContext, continuati
     Ok(Leg {
         render,
         stream: Box::pin(SseBufferedStream::new(body)),
+        deadline,
     })
 }
 
