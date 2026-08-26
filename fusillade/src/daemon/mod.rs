@@ -143,6 +143,18 @@ fn is_downstream_overload(reason: &FailureReason) -> bool {
     match reason {
         FailureReason::RetriableHttpStatus { status: 529, .. }
         | FailureReason::NonRetriableHttpStatus { status: 529, .. } => true,
+        // 503 means the gateway could not place the request with any provider:
+        // the pool was empty, or every attempt failed. Either way there is no
+        // capacity to dispatch into right now, so continuing at the current
+        // limit just burns attempts against nothing.
+        //
+        // Included despite not being a saturation signal, because the increase
+        // side grows on demand and a failed request still fills a slot: a model
+        // whose capacity has gone away keeps filling every slot it is offered
+        // and ratchets its limit up throughout the outage. Cutting is what stops
+        // that, and the limit re-grows multiplicatively once capacity returns.
+        FailureReason::RetriableHttpStatus { status: 503, .. }
+        | FailureReason::NonRetriableHttpStatus { status: 503, .. } => true,
         FailureReason::RetriableHttpStatus { status: 429, body }
         | FailureReason::NonRetriableHttpStatus { status: 429, body } => {
             body.contains(ONWARDS_CONCURRENCY_LIMIT_CODE)
@@ -2346,6 +2358,26 @@ mod tests {
         }
     }
 
+    /// A 503 is the gateway reporting it could not place the request with any
+    /// provider. It is not saturation, but it must still cut: a failed request
+    /// fills a slot, so a model whose capacity has gone away keeps filling every
+    /// slot it is offered and ratchets its limit up for the whole outage.
+    #[test]
+    fn gateway_503_is_an_overload_signal() {
+        for reason in [
+            FailureReason::RetriableHttpStatus {
+                status: 503,
+                body: String::new(),
+            },
+            FailureReason::NonRetriableHttpStatus {
+                status: 503,
+                body: String::new(),
+            },
+        ] {
+            assert!(is_downstream_overload(&reason), "{reason:?}");
+        }
+    }
+
     /// Everything else must leave the limit alone. A bare 429 is a provider rate
     /// limit, usually tokens per minute, which fewer concurrent requests does not
     /// necessarily reduce; timeouts and resets happened to a request the model had
@@ -2359,10 +2391,6 @@ mod tests {
             },
             FailureReason::RetriableHttpStatus {
                 status: 429,
-                body: String::new(),
-            },
-            FailureReason::RetriableHttpStatus {
-                status: 503,
                 body: String::new(),
             },
             FailureReason::NetworkError {
