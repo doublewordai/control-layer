@@ -1,5 +1,17 @@
 # Changelog
 
+## [10.16.0](https://github.com/doublewordai/control-layer/compare/v10.15.0...v10.16.0) (2026-08-26)
+
+
+### Features
+
+* **onwards:** count gateway failures by reason and upstream status ([#1519](https://github.com/doublewordai/control-layer/issues/1519)) ([fce9cbd](https://github.com/doublewordai/control-layer/commit/fce9cbdc88cbdc81a850bd86660743e3e710758c))
+
+
+### Bug Fixes
+
+* **fusillade:** stop the memory gate ratcheting in-flight work to zero ([#1523](https://github.com/doublewordai/control-layer/issues/1523)) ([e169536](https://github.com/doublewordai/control-layer/commit/e16953622d4bc89f04e53b1db0ddb32c9156005f))
+
 ## [10.15.0](https://github.com/doublewordai/control-layer/compare/v10.14.2...v10.15.0) (2026-08-26)
 
 

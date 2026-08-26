@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "10.15.0" # x-release-please-version
+version = "10.16.0" # x-release-please-version
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
@@ -188,3 +188,6 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 tempfile = "3.0"
 wiremock = "0.6"
 serde_urlencoded = "0.7"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.7.0"
