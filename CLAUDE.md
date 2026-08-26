@@ -45,6 +45,9 @@ Handlers (API) → Repositories (db::handlers) → Models (db::models) → Postg
 ```
 
 - Migrations run automatically on startup from `dwctl/migrations/`
+- The `underway` crate (background task queue) ships its own SQLx migrations
+  that create the `underway` schema; `just db-setup` applies these too, but
+  they are also applied at runtime via `underway::run_migrations`
 - Schema uses PostgreSQL LISTEN/NOTIFY for real-time config updates
 - Advisory locks for leader election - leader election is used to choose who
 runs the probe service, and (configurably) the batch daemon
