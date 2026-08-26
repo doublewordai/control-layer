@@ -488,6 +488,11 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         let mut attempts = 0u32;
         let mut last_render: Option<RenderedPrefix> = None;
         let mut death_at: Option<Instant> = None;
+        // Inter-frame gap observation (armed streams): the empirical basis for
+        // stall_timeout_secs. Every yielded event — keep-alives included —
+        // counts as liveness, mirroring what the stall timer itself sees.
+        let mut last_frame_at = Instant::now();
+        let mut max_frame_gap = Duration::ZERO;
         // Held for the whole chain: one in-flight resume per stream.
         let mut _slot: Option<InflightGuard> = None;
 
@@ -537,6 +542,9 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     Some(Err(_)) => break detect::classify(&DeathEvent::TransportError { finished }),
                     Some(Ok(bytes)) => bytes,
                 };
+
+                max_frame_gap = max_frame_gap.max(last_frame_at.elapsed());
+                last_frame_at = Instant::now();
 
                 let payload = frame_payload(&item);
                 if payload == Some("[DONE]") {
@@ -789,6 +797,8 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                 }
             }
         }
+
+        metrics::record_max_frame_gap(&ctx.model, max_frame_gap.as_secs_f64());
     };
 
     let mut response = Response::from_parts(parts, Body::from_stream(stream));

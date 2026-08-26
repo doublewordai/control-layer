@@ -116,6 +116,16 @@ pub fn record_usage_anomaly(kind: &'static str) {
     counter!("dwctl_continuation_usage_anomaly_total", "kind" => kind).increment(1);
 }
 
+/// The largest inter-frame gap observed on an armed stream, recorded once at
+/// stream end. This is the empirical answer to "is N seconds of silence a
+/// death sentence?": before trusting any stall timeout, read this
+/// distribution's tail — a healthy population above a proposed timeout means
+/// the timeout would sever recovering streams. Keep-alive comments reset the
+/// gap (they are liveness).
+pub fn record_max_frame_gap(model: &str, seconds: f64) {
+    histogram!("dwctl_continuation_max_frame_gap_seconds", "model" => model.to_owned()).record(seconds);
+}
+
 /// tokenizer-svc `/v1/render` call for a resume prefix. `outcome` ∈ `ok` |
 /// `unmapped` | `unsupported` | `missing_segment_count` | `http_error` |
 /// `transport_error`. Deliberately unlabelled by model: a render failure is a
