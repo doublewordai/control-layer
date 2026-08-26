@@ -59,58 +59,11 @@ pub mod sse;
 pub mod strict;
 pub mod target;
 pub mod telemetry;
-pub mod traits;
 
 use client::{HttpClient, HyperClient};
 pub use handlers::ServedBy;
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
-pub use traits::{
-    NoOpResponseStore, NoOpToolExecutor, RequestContext, ResponseStore, StoreError, ToolError,
-    ToolExecutor, ToolKind, ToolSchema,
-};
-
-/// Type alias for body transformation function
-///
-/// Takes (path, headers, body_bytes) and returns transformed body_bytes or None if no transformation.
-/// This allows you to modify request bodies before they are forwarded to upstream services.
-///
-/// # Arguments
-///
-/// * `&str` - The request path (e.g., "/v1/chat/completions")
-/// * `&HeaderMap` - HTTP headers from the incoming request
-/// * `&[u8]` - The request body as raw bytes
-///
-/// # Returns
-///
-/// * `Some(Bytes)` - Transformed request body to forward
-/// * `None` - Use original request body unchanged
-///
-/// # Examples
-///
-/// ```
-/// use onwards::BodyTransformFn;
-/// use axum::http::HeaderMap;
-/// use std::sync::Arc;
-/// use serde_json::{json, Value};
-///
-/// // Transform function that adds stream_options to OpenAI streaming requests
-/// let transform: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-///     if path == "/v1/chat/completions" {
-///         if let Ok(mut json_body) = serde_json::from_slice::<Value>(body_bytes) {
-///             if json_body.get("stream") == Some(&json!(true)) {
-///                 json_body["stream_options"] = json!({"include_usage": true});
-///                 if let Ok(transformed) = serde_json::to_vec(&json_body) {
-///                     return Some(axum::body::Bytes::from(transformed));
-///                 }
-///             }
-///         }
-///     }
-///     None // No transformation
-/// });
-/// ```
-pub type BodyTransformFn =
-    Arc<dyn Fn(&str, &HeaderMap, &[u8]) -> Option<axum::body::Bytes> + Send + Sync>;
 
 /// Type alias for response transformation function
 ///
@@ -158,7 +111,6 @@ pub type ResponseTransformFn = Arc<
 /// This struct holds all the state needed to run the proxy server. It contains:
 /// - An HTTP client for making upstream requests
 /// - The collection of configured targets (destinations)
-/// - An optional body transformation function
 /// - An optional response transformation function
 ///
 /// # Examples
@@ -175,37 +127,11 @@ pub type ResponseTransformFn = Arc<
 /// # Ok(())
 /// # }
 /// ```
-///
-/// With request transformation:
-/// ```no_run
-/// use onwards::{AppState, BodyTransformFn, config::Config, target::Targets};
-/// use std::sync::Arc;
-/// use clap::Parser;
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = Config::parse();
-/// let targets = Targets::from_config_file(&config.targets).await?;
-///
-/// let transform: BodyTransformFn = Arc::new(|path, _headers, body| {
-///     // Custom transformation logic
-///     None
-/// });
-///
-/// let app_state = AppState::with_transform(targets, transform);
-/// # Ok(())
-/// # }
-/// ```
 #[derive(Clone)]
 pub struct AppState<T: HttpClient> {
     pub http_client: T,
     pub targets: target::Targets,
-    pub body_transform_fn: Option<BodyTransformFn>,
     pub response_transform_fn: Option<ResponseTransformFn>,
-    /// Header name that signals the request should be treated as streaming.
-    /// When set, the responses adapter checks this header to decide whether to
-    /// use the streaming path before forwarding (since the body transform runs
-    /// too late for that decision). Defaults to `None` (header check disabled).
-    pub streaming_header: Option<String>,
     /// Header name whose value overrides the generated `id` in Responses API
     /// responses. When set, the handler reads this header from the incoming
     /// request and uses its value (prefixed with `resp_` if not already) as the
@@ -213,8 +139,6 @@ pub struct AppState<T: HttpClient> {
     /// correlate responses with pre-created tracking records without needing to
     /// patch the response body after the fact.
     pub response_id_header: Option<String>,
-    pub tool_executor: Arc<dyn ToolExecutor>,
-    pub response_store: Arc<dyn ResponseStore>,
     /// Maximum request body size in bytes, enforced by both routers. Without
     /// this, the strict router's `Json` extractors fall back to Axum's 2 MB
     /// `DefaultBodyLimit`, which rejects large (e.g. long-context or base64
@@ -235,17 +159,10 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
             .field("http_client", &self.http_client)
             .field("targets", &self.targets)
             .field(
-                "body_transform_fn",
-                &self.body_transform_fn.as_ref().map(|_| "<function>"),
-            )
-            .field(
                 "response_transform_fn",
                 &self.response_transform_fn.as_ref().map(|_| "<function>"),
             )
-            .field("streaming_header", &self.streaming_header)
             .field("response_id_header", &self.response_id_header)
-            .field("tool_executor", &"<dyn ToolExecutor>")
-            .field("response_store", &"<dyn ResponseStore>")
             .field("body_limit", &self.body_limit)
             .finish()
     }
@@ -264,34 +181,8 @@ impl AppState<HyperClient> {
         Self {
             http_client,
             targets,
-            body_transform_fn: None,
             response_transform_fn: None,
-            streaming_header: None,
             response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
-            body_limit: DEFAULT_BODY_LIMIT,
-        }
-    }
-
-    /// Create a new AppState with the default Hyper client and a body transformation function
-    pub fn with_transform(targets: target::Targets, body_transform_fn: BodyTransformFn) -> Self {
-        let (max_idle, timeout) = targets
-            .http_pool_config
-            .as_ref()
-            .map(|p| (p.max_idle_per_host, p.idle_timeout_secs))
-            .unwrap_or((100, 90));
-
-        let http_client = client::create_hyper_client(max_idle, timeout);
-        Self {
-            http_client,
-            targets,
-            body_transform_fn: Some(body_transform_fn),
-            response_transform_fn: None,
-            streaming_header: None,
-            response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
         }
     }
@@ -303,40 +194,10 @@ impl<T: HttpClient> AppState<T> {
         Self {
             http_client,
             targets,
-            body_transform_fn: None,
             response_transform_fn: None,
-            streaming_header: None,
             response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
         }
-    }
-
-    /// Create a new AppState with a custom HTTP client and body transformation function
-    pub fn with_client_and_transform(
-        targets: target::Targets,
-        http_client: T,
-        body_transform_fn: BodyTransformFn,
-    ) -> Self {
-        Self {
-            http_client,
-            targets,
-            body_transform_fn: Some(body_transform_fn),
-            response_transform_fn: None,
-            streaming_header: None,
-            response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
-            body_limit: DEFAULT_BODY_LIMIT,
-        }
-    }
-
-    /// Set the header name that signals a request should use the streaming path.
-    /// Used by the responses adapter to decide streaming vs non-streaming before forwarding.
-    pub fn with_streaming_header(mut self, header: impl Into<String>) -> Self {
-        self.streaming_header = Some(header.into());
-        self
     }
 
     /// Set the header name whose value overrides the Responses API `id` field.
@@ -348,18 +209,6 @@ impl<T: HttpClient> AppState<T> {
     /// Set the response transformation function (builder pattern)
     pub fn with_response_transform(mut self, transform_fn: ResponseTransformFn) -> Self {
         self.response_transform_fn = Some(transform_fn);
-        self
-    }
-
-    /// Set the tool executor for server-side tool handling (builder pattern)
-    pub fn with_tool_executor(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
-        self.tool_executor = executor;
-        self
-    }
-
-    /// Set the response store for stateful conversations (builder pattern)
-    pub fn with_response_store(mut self, store: Arc<dyn ResponseStore>) -> Self {
-        self.response_store = store;
         self
     }
 
@@ -2652,398 +2501,6 @@ mod tests {
                 "an unknown model must NOT create a per-model series:\n{metrics_text}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_body_transformation_applied() {
-        use serde_json::json;
-
-        // Create a simple target
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "test-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create a body transformation function that adds a "transformed": true field
-        let transform_fn: BodyTransformFn = Arc::new(|_path, _headers, body_bytes| {
-            if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-                && let Some(obj) = json_body.as_object_mut()
-            {
-                obj.insert("transformed".to_string(), json!(true));
-                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                    return Some(axum::body::Bytes::from(transformed_bytes));
-                }
-            }
-            None
-        });
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Make a request
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "Hello"}]
-            }))
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        // Check that the request was transformed before forwarding
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body["transformed"], true);
-        assert_eq!(forwarded_body["model"], "test-model");
-        assert_eq!(forwarded_body["messages"][0]["content"], "Hello");
-    }
-
-    #[tokio::test]
-    async fn test_body_transformation_not_applied_when_none() {
-        use serde_json::json;
-
-        // Create a simple target
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "test-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state = AppState::with_client(targets, mock_client.clone()); // No transform function
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Make a request
-        let original_body = json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hello"}]
-        });
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&original_body)
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        // Check that the request was NOT transformed
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(forwarded_body.get("transformed").is_none());
-        assert_eq!(forwarded_body["model"], "test-model");
-        assert_eq!(forwarded_body["messages"][0]["content"], "Hello");
-    }
-
-    #[tokio::test]
-    async fn test_body_transformation_returns_none() {
-        use serde_json::json;
-
-        // Create a simple target
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "test-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create a transformation function that always returns None (no transformation)
-        let transform_fn: BodyTransformFn = Arc::new(|_path, _headers, _body_bytes| None);
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Make a request
-        let original_body = json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hello"}]
-        });
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&original_body)
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        // Check that the request was NOT transformed since function returned None
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body, original_body);
-    }
-
-    #[tokio::test]
-    async fn test_openai_streaming_include_usage_transformation() {
-        use serde_json::json;
-
-        // Create a target for OpenAI
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "gpt-4".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.openai.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create a transformation function that forces include_usage for streaming requests
-        let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            // Only transform requests to OpenAI chat completions endpoint
-            if path == "/v1/chat/completions"
-                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-                && let Some(obj) = json_body.as_object_mut()
-            {
-                // Check if this is a streaming request
-                if let Some(stream) = obj.get("stream")
-                    && stream.as_bool() == Some(true)
-                {
-                    // Force include_usage to true for streaming requests
-                    obj.insert(
-                        "stream_options".to_string(),
-                        json!({
-                            "include_usage": true
-                        }),
-                    );
-
-                    if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                        return Some(axum::body::Bytes::from(transformed_bytes));
-                    }
-                }
-            }
-            None
-        });
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Test streaming request - should add include_usage
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "gpt-4",
-                "messages": [{"role": "user", "content": "Hello"}],
-                "stream": true
-            }))
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body["model"], "gpt-4");
-        assert_eq!(forwarded_body["stream"], true);
-        assert_eq!(forwarded_body["stream_options"]["include_usage"], true);
-    }
-
-    #[tokio::test]
-    async fn test_openai_non_streaming_not_transformed() {
-        use serde_json::json;
-
-        // Create a target for OpenAI
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "gpt-4".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.openai.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create the same transformation function
-        let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            if path == "/v1/chat/completions"
-                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-                && let Some(obj) = json_body.as_object_mut()
-                && let Some(stream) = obj.get("stream")
-                && stream.as_bool() == Some(true)
-            {
-                obj.insert(
-                    "stream_options".to_string(),
-                    json!({
-                        "include_usage": true
-                    }),
-                );
-
-                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                    return Some(axum::body::Bytes::from(transformed_bytes));
-                }
-            }
-            None
-        });
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Test non-streaming request - should NOT be transformed
-        let original_body = json!({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "stream": false
-        });
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&original_body)
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body, original_body);
-        assert!(forwarded_body.get("stream_options").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_transformation_path_filtering() {
-        use serde_json::json;
-
-        // Create a target
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "test-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create a transformation function that only transforms specific paths
-        let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            if path == "/v1/chat/completions"
-                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-                && let Some(obj) = json_body.as_object_mut()
-            {
-                obj.insert("path_transformed".to_string(), json!(path));
-                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                    return Some(axum::body::Bytes::from(transformed_bytes));
-                }
-            }
-            None
-        });
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Test matching path - should be transformed
-        let response1 = server
-            .post("/v1/chat/completions")
-            .json(&json!({"model": "test-model", "test": "data"}))
-            .await;
-        assert_eq!(response1.status_code(), 200);
-
-        // Test non-matching path - should NOT be transformed
-        let response2 = server
-            .post("/v1/embeddings")
-            .json(&json!({"model": "test-model", "test": "data"}))
-            .await;
-        assert_eq!(response2.status_code(), 200);
-
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 2);
-
-        // First request should be transformed
-        let forwarded_body1: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body1["path_transformed"], "/v1/chat/completions");
-
-        // Second request should NOT be transformed
-        let forwarded_body2: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
-        assert!(forwarded_body2.get("path_transformed").is_none());
     }
 
     mod response_headers_pricing {

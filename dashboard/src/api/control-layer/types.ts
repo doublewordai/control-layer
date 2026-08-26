@@ -82,7 +82,6 @@ export interface ComponentModelSummary {
   model_type?: ModelType;
   endpoint?: ComponentEndpointSummary;
   trusted?: boolean;
-  open_responses_adapter?: boolean;
 }
 
 export interface ModelComponent {
@@ -327,7 +326,6 @@ export interface Model {
   components?: ModelComponent[]; // only present when include=components
   sanitize_responses?: boolean | null; // only present for virtual models
   trusted?: boolean; // Mark provider as trusted in strict mode (bypasses error sanitization)
-  open_responses_adapter?: boolean; // Enable adapter that converts /v1/responses to /v1/chat/completions
   reasoning_translation_overrides?: ReasoningTranslationOverrides | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
@@ -350,7 +348,6 @@ export interface StandardModelCreate {
   batch_capacity?: number;
   throughput?: number;
   trusted?: boolean;
-  open_responses_adapter?: boolean;
   reasoning_translation_overrides?: ReasoningTranslationOverrides;
   traffic_routing_rules?: TrafficRoutingRule[];
   allowed_batch_completion_windows?: string[];
@@ -666,7 +663,6 @@ export interface ModelUpdateRequest {
   backoff_max_total_ms?: number | null;
   sanitize_responses?: boolean | null;
   trusted?: boolean | null;
-  open_responses_adapter?: boolean | null;
   reasoning_translation_overrides?: ReasoningTranslationOverrides | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;

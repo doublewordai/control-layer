@@ -14,8 +14,6 @@ import {
   GripVertical,
   Shield,
   ShieldOff,
-  Zap,
-  ZapOff,
 } from "lucide-react";
 import {
   DndContext,
@@ -103,7 +101,6 @@ const ProviderRow: React.FC<{
   onRemove: () => void;
   onToggle: () => void;
   onToggleTrusted?: () => void;
-  onToggleAdapter?: () => void;
   canManage: boolean;
   isUpdating: boolean;
   strictModeEnabled?: boolean;
@@ -123,7 +120,6 @@ const ProviderRow: React.FC<{
   onRemove,
   onToggle,
   onToggleTrusted,
-  onToggleAdapter,
   canManage,
   isUpdating,
   strictModeEnabled,
@@ -274,30 +270,6 @@ const ProviderRow: React.FC<{
                   </TooltipContent>
                 </Tooltip>
               )}
-              {strictModeEnabled && onToggleAdapter && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={onToggleAdapter}
-                      disabled={isUpdating}
-                      className="h-8 w-8"
-                    >
-                      {(component.model.open_responses_adapter ?? true) ? (
-                        <Zap className="h-4 w-4 text-yellow-500 fill-yellow-100" />
-                      ) : (
-                        <ZapOff className="h-4 w-4 text-gray-400" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">
-                    {(component.model.open_responses_adapter ?? true)
-                      ? "Responses API adapter enabled"
-                      : "Responses API adapter disabled"}
-                  </TooltipContent>
-                </Tooltip>
-              )}
               {!isPriorityMode && (
                 <Button
                   variant="ghost"
@@ -353,7 +325,6 @@ const SortableProviderRow: React.FC<{
   onRemove: () => void;
   onToggle: () => void;
   onToggleTrusted?: () => void;
-  onToggleAdapter?: () => void;
   canManage: boolean;
   isUpdating: boolean;
   strictModeEnabled?: boolean;
@@ -1162,13 +1133,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     });
   };
 
-  const handleToggleAdapter = async (component: ModelComponent) => {
-    await updateModelMutation.mutateAsync({
-      id: component.model.id,
-      data: { open_responses_adapter: !(component.model.open_responses_adapter ?? true) },
-    });
-  };
-
   const handleRemove = async () => {
     if (!removingComponent) return;
 
@@ -1456,7 +1420,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                         onRemove={() => setRemovingComponent(component)}
                         onToggle={() => handleToggle(component)}
                         onToggleTrusted={() => handleToggleTrusted(component)}
-                        onToggleAdapter={() => handleToggleAdapter(component)}
                         canManage={canManage}
                         isUpdating={
                           updateComponentMutation.isPending ||
@@ -1483,7 +1446,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                     onRemove={() => setRemovingComponent(component)}
                     onToggle={() => handleToggle(component)}
                     onToggleTrusted={() => handleToggleTrusted(component)}
-                    onToggleAdapter={() => handleToggleAdapter(component)}
                     canManage={canManage}
                     isUpdating={
                       updateComponentMutation.isPending ||

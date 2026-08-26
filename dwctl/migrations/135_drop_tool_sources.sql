@@ -14,6 +14,10 @@
 --   * http_analytics.tool_iterations (migration 082) - server-side loop step count.
 --   * http_analytics.response_step_id and tool_call_analytics.response_step_id
 --     (migration 096) - correlation to the retired multi-step loop's step rows.
+--   * deployed_models.open_responses_adapter (migration 068) - toggled the onwards
+--     Responses adapter, which is removed alongside this: Responses requests are
+--     always translated at the dwctl edge before they reach onwards, so the flag
+--     has no reader and its admin API field goes with it.
 --
 -- Client-side tool use is unaffected: it is observed via http_analytics.finish_reason
 -- (migration 125), which never depended on any of the above.
@@ -26,3 +30,5 @@ DROP TABLE IF EXISTS tool_sources;
 DROP INDEX IF EXISTS idx_analytics_response_step_id;
 ALTER TABLE http_analytics DROP COLUMN IF EXISTS response_step_id;
 ALTER TABLE http_analytics DROP COLUMN IF EXISTS tool_iterations;
+
+ALTER TABLE deployed_models DROP COLUMN IF EXISTS open_responses_adapter;

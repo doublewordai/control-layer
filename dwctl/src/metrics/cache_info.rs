@@ -442,7 +442,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: true,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -597,7 +596,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: true,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -641,7 +639,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: true,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -748,7 +745,6 @@ mod tests {
             backoff_max_total_ms: None,
             sanitize_responses: false,
             trusted: false,
-            open_responses_adapter: true,
             reasoning_translation_overrides: None,
             allowed_batch_completion_windows: None,
             metadata: None,
@@ -850,7 +846,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: false,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -1001,7 +996,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: false,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -1045,7 +1039,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: false,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -1185,7 +1178,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: false,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -1318,7 +1310,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: false,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,

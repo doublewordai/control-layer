@@ -36,7 +36,6 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         capacity: None,
         sanitize_responses: true,
         trusted: false,
-        open_responses_adapter: true,
         reasoning_translation: None,
         endpoint_url: url::Url::parse(endpoint_url).unwrap(),
         routing_rules: Vec::new(),
@@ -1174,7 +1173,6 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             backoff_max_total_ms: None,
             sanitize_responses: true,
             trusted: false,
-            open_responses_adapter: true,
             reasoning_translation_overrides: None,
             allowed_batch_completion_windows: None,
             metadata: None,
@@ -1398,7 +1396,6 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             metadata: None,
             sanitize_responses: true,
             trusted: false,
-            open_responses_adapter: true,
             reasoning_translation_overrides: None,
         })
         .await
@@ -1442,7 +1439,6 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             metadata: None,
             sanitize_responses: true,
             trusted: false,
-            open_responses_adapter: true,
             reasoning_translation_overrides: None,
         })
         .await

@@ -22,7 +22,6 @@ metadata = json.loads(
 expected_packages = {
     "dwctl",
     "onwards",
-    "onwards-fusillade",
     "fusillade",
     "fusillade-core",
     "fusillade-arsenal",
@@ -60,11 +59,6 @@ local_dependencies = {
     "dwctl/Cargo.toml": {
         "fusillade": "../fusillade",
         "fusillade-arsenal": "../fusillade-arsenal",
-        "onwards": "../onwards",
-        "onwards-fusillade": "../onwards-fusillade",
-    },
-    "onwards-fusillade/Cargo.toml": {
-        "fusillade": "../fusillade",
         "onwards": "../onwards",
     },
     "fusillade/Cargo.toml": {
@@ -304,7 +298,7 @@ fi
 
 node .github/scripts/test-onwards-floating-tags.cjs
 
-for linted_package in dwctl fusillade fusillade-core fusillade-arsenal onwards-fusillade; do
+for linted_package in dwctl fusillade fusillade-core fusillade-arsenal; do
   if ! grep -Fq -- "--package $linted_package" "$justfile"; then
     echo "Rust linting must retain $linted_package" >&2
     exit 1
@@ -328,7 +322,7 @@ if ! grep -Fq 'USER ubuntu' onwards/Dockerfile; then
 fi
 
 onwards_image_job="$(
-  sed -n '/^  onwards-pr-image:/,/^  onwards-compliance-changes:/p' .github/workflows/ci.yaml
+  sed -n '/^  onwards-pr-image:/,/^  build:/p' .github/workflows/ci.yaml
 )"
 
 dwctl_image_job="$(
@@ -353,8 +347,6 @@ for scoped_check in \
   '    name: ${{ matrix.package }} / test' \
   '    name: workspace / rust lint' \
   '    name: workspace / rust gate' \
-  '    name: onwards / compliance changes' \
-  '    name: onwards / open responses (${{ matrix.mode }})' \
   '    name: dwctl / image' \
   '    name: dwctl / open responses' \
   '    name: dwctl / security' \
@@ -377,41 +369,11 @@ if ! grep -Fq 'cargo package --locked --package onwards --all-features' \
   exit 1
 fi
 
-onwards_compliance_job="$(
-  sed -n '/^  onwards-openresponses-compliance:/,/^  build:/p' .github/workflows/ci.yaml
-)"
-
-if ! grep -Fq 'onwards-openresponses-compliance:' <<< "$onwards_compliance_job" || \
-   ! grep -Fq 'mode: [adapter, passthrough]' <<< "$onwards_compliance_job" || \
-   ! grep -Fq 'GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}' <<< "$onwards_compliance_job" || \
-   ! grep -Fq 'https://generativelanguage.googleapis.com/v1beta/openai/' <<< "$onwards_compliance_job" || \
-   ! grep -Fq 'TEST_MODEL: gemini-2.5-flash' <<< "$onwards_compliance_job" || \
-   ! grep -Fq 'OPENRESPONSES_COMPLIANCE_FILTER:' <<< "$onwards_compliance_job" || \
-   ! grep -Fq -- '--port 3001' <<< "$onwards_compliance_job" || \
-   ! grep -Fq 'http://127.0.0.1:3001/v1' <<< "$onwards_compliance_job" || \
-   ! grep -Fq 'git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses' <<< "$onwards_compliance_job" || \
-   ! grep -Fq 'onwards-openresponses-${MODE}-retry.json' <<< "$onwards_compliance_job" || \
-   ! grep -Fq 'Malformed compliance output is always a failure.' <<< "$onwards_compliance_job"; then
-  echo "CI must run standalone Onwards adapter and passthrough compliance through the Gemini-backed local adapter" >&2
-  exit 1
-fi
-
-if grep -Fq 'OPENAI_API_KEY' <<< "$onwards_compliance_job" || \
-   grep -Fq 'git checkout fa29df5' <<< "$onwards_compliance_job"; then
-  echo "CI must reuse the existing current Gemini compliance harness for standalone Onwards" >&2
-  exit 1
-fi
-
 if [[ "$(grep -Fc 'COPY onwards/ onwards/' Dockerfile)" != 2 ]]; then
   echo "Docker planner and builder must both receive the local Onwards crate" >&2
   exit 1
 fi
 
-if [[ "$(grep -Fc 'COPY onwards-fusillade/ onwards-fusillade/' Dockerfile)" != 2 ]] || \
-   [[ "$(grep -Fc 'COPY onwards-fusillade/ onwards-fusillade/' onwards/Dockerfile)" != 1 ]]; then
-  echo "Workspace Docker builds must receive the private Onwards Fusillade crate" >&2
-  exit 1
-fi
 
 if grep -Eq '^/?onwards/$' .dockerignore; then
   echo "Docker context must not exclude the local Onwards crate" >&2
@@ -491,41 +453,7 @@ require_scoped_line "$crate_test_job" "      RUN_CI: \${{ needs.changes.outputs.
 crate_skip_step="$(extract_workflow_step "$crate_test_job" 'Skip crate tests for release-only changes')"
 require_scoped_line "$crate_skip_step" "        if: env.RUN_CI != 'true'" 'Crate tests must declare a release-only no-op path'
 
-onwards_compliance_job="$(extract_workflow_job .github/workflows/ci.yaml onwards-openresponses-compliance)"
-require_scoped_line "$onwards_compliance_job" '    if: always()' 'Onwards compliance matrix must expand for release-only changes'
 trusted_pull_request_condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'"
-require_scoped_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && ${trusted_pull_request_condition} }}" 'Onwards strict compliance must gate secret use to trusted pull requests'
-if grep -Fq "github.event_name == 'merge_group'" <<< "$onwards_compliance_job" || \
-   grep -Fq "github.actor != 'dependabot[bot]'" <<< "$onwards_compliance_job"; then
-  echo "Onwards compliance must classify trust from pull-request provenance" >&2
-  exit 1
-fi
-
-for step_name in \
-  'Checkout code' \
-  'Require Gemini API key' \
-  'Install Rust' \
-  'Build Onwards' \
-  'Install Bun' \
-  'Clone Open Responses' \
-  'Install Open Responses dependencies' \
-  'Write Gemini adapter config' \
-  'Start Gemini adapter upstream' \
-  'Write Onwards config' \
-  'Start Onwards' \
-  'Run compliance tests'; do
-  compliance_step="$(extract_workflow_step "$onwards_compliance_job" "$step_name")"
-  require_scoped_line "$compliance_step" "        if: env.RUN_STRICT_COMPLIANCE == 'true'" "Onwards compliance step '${step_name}' must use the trust gate"
-done
-
-for step_name in \
-  'Show Onwards logs' \
-  'Upload Onwards compliance artifacts' \
-  'Stop Onwards processes'; do
-  compliance_step="$(extract_workflow_step "$onwards_compliance_job" "$step_name")"
-  require_scoped_line "$compliance_step" "        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'" "Onwards compliance diagnostic step '${step_name}' must use the trust gate"
-done
-
 onwards_image_job="$(extract_workflow_job .github/workflows/ci.yaml onwards-pr-image)"
 dwctl_image_job="$(extract_workflow_job .github/workflows/ci.yaml build)"
 if ! grep -Fxq "    if: needs.changes.outputs.run-ci == 'true' && ${trusted_pull_request_condition}" <<< "$onwards_image_job" || \

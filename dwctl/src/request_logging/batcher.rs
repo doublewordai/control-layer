@@ -1898,7 +1898,6 @@ mod integration_tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: true,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
                 allowed_batch_completion_windows: None,
                 metadata: None,

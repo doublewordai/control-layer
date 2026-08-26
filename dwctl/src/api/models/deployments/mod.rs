@@ -238,9 +238,6 @@ pub struct StandardModelCreate {
     /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
     #[serde(default)]
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
-    #[serde(default)]
-    pub open_responses_adapter: Option<bool>,
     /// Per-surface overrides for the endpoint's provider reasoning translations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
@@ -347,9 +344,6 @@ pub struct CompositeModelCreate {
     /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
     #[serde(default)]
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
-    #[serde(default)]
-    pub open_responses_adapter: Option<bool>,
     /// Traffic routing rules evaluated against API key labels.
     /// Each rule matches on key labels (e.g., purpose) and either denies or redirects traffic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,9 +451,6 @@ pub struct DeployedModelUpdate {
     /// Whether to mark provider as trusted in strict mode (null = no change, used when strict_mode=true)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter (null = no change)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub open_responses_adapter: Option<bool>,
     /// Reasoning translation overrides (omitted = unchanged, null = inherit both endpoint defaults).
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub reasoning_translation_overrides: Option<Option<ReasoningTranslationOverrides>>,
@@ -575,9 +566,6 @@ pub struct DeployedModelResponse {
     /// Whether to mark provider as trusted in strict mode (used when strict_mode=true)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trusted: Option<bool>,
-    /// Whether the open_responses adapter is enabled (converts /v1/responses to /v1/chat/completions)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub open_responses_adapter: Option<bool>,
     /// Provider reasoning translation overrides. Omitted for composite models.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
@@ -650,7 +638,6 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             components: None, // By default, components are not included
             sanitize_responses: Some(db.sanitize_responses),
             trusted: Some(db.trusted),
-            open_responses_adapter: Some(db.open_responses_adapter),
             reasoning_translation_overrides: if db.is_composite {
                 None
             } else {
@@ -738,7 +725,6 @@ impl DeployedModelResponse {
     pub fn mask_response_config(mut self) -> Self {
         self.sanitize_responses = None;
         self.trusted = None;
-        self.open_responses_adapter = None;
         self.reasoning_translation_overrides = None;
         self
     }
@@ -894,8 +880,6 @@ pub struct ComponentModelSummary {
     pub endpoint: Option<ComponentEndpointSummary>,
     /// Whether to mark provider as trusted in strict mode
     pub trusted: bool,
-    /// Whether the open_responses adapter is enabled
-    pub open_responses_adapter: bool,
 }
 
 /// Summary of an endpoint hosting a component model

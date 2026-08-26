@@ -71,10 +71,6 @@ pub struct ProviderSpec {
     #[serde(default)]
     pub sanitize_response: bool,
 
-    /// Open Responses API configuration
-    #[serde(default)]
-    pub open_responses: Option<OpenResponsesConfig>,
-
     /// Request timeout in seconds. If specified, requests exceeding this duration
     /// will be cancelled and return a 504 Gateway Timeout error.
     /// If fallback is enabled, the next provider will be tried.
@@ -102,16 +98,6 @@ pub struct ProviderSpec {
     /// Translate canonical OpenAI reasoning controls into this provider's request shape.
     #[serde(default)]
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
-}
-
-/// Configuration for Open Responses API behavior
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct OpenResponsesConfig {
-    /// Enable the adapter to provide full Open Responses semantics over Chat Completions.
-    /// When true, /v1/responses requests are converted to /v1/chat/completions internally.
-    /// When false (default), requests are passed through to the upstream.
-    #[serde(default)]
-    pub adapter: bool,
 }
 
 /// Load balancing strategy for selecting providers
@@ -311,10 +297,6 @@ pub struct PoolSpec {
     #[builder(default)]
     pub sanitize_response: bool,
 
-    /// Open Responses API configuration for all providers in this pool
-    #[serde(default)]
-    pub open_responses: Option<OpenResponsesConfig>,
-
     /// Mark this pool as trusted to bypass strict mode sanitization.
     /// When strict_mode is enabled globally AND trusted is true for a pool,
     /// error response sanitization is skipped, but success responses are still sanitized.
@@ -362,10 +344,6 @@ pub struct TargetSpec {
     #[serde(default)]
     #[builder(default)]
     pub sanitize_response: bool,
-
-    /// Open Responses API configuration
-    #[serde(default)]
-    pub open_responses: Option<OpenResponsesConfig>,
 
     /// Mark this target as trusted to bypass strict mode sanitization.
     /// For single-provider configs, this becomes the pool-level trusted flag.
@@ -420,7 +398,6 @@ pub struct PoolConfig {
     pub fallback: Option<FallbackConfig>,
     pub strategy: LoadBalanceStrategy,
     pub sanitize_response: bool,
-    pub open_responses: Option<OpenResponsesConfig>,
     pub trusted: bool,
     pub routing_rules: Vec<RoutingRule>,
     pub providers: Vec<ProviderSpec>,
@@ -438,7 +415,6 @@ impl TargetSpecOrList {
                 fallback: pool.fallback,
                 strategy: pool.strategy,
                 sanitize_response: pool.sanitize_response,
-                open_responses: pool.open_responses,
                 trusted: pool.trusted,
                 routing_rules: pool.routing_rules,
                 providers: pool.providers,
@@ -470,7 +446,6 @@ impl TargetSpecOrList {
                         response_headers: t.response_headers,
                         weight: t.weight,
                         sanitize_response: t.sanitize_response,
-                        open_responses: t.open_responses,
                         request_timeout_secs: t.request_timeout_secs,
                         trusted: None, // pool-level trusted handles this for legacy format
                         // Carry each provider's explicit override. Unlike `trusted`
@@ -489,7 +464,6 @@ impl TargetSpecOrList {
                     fallback: None,
                     strategy: LoadBalanceStrategy::default(),
                     sanitize_response: false,
-                    open_responses: None,
                     trusted,
                     routing_rules: Vec::new(),
                     providers,
@@ -499,7 +473,6 @@ impl TargetSpecOrList {
                 // Single provider: use its keys and trusted as pool-level, convert to ProviderSpec
                 let keys = spec.keys.clone();
                 let sanitize_response = spec.sanitize_response;
-                let open_responses = spec.open_responses.clone();
                 let trusted = spec.trusted;
                 let provider = ProviderSpec {
                     url: spec.url,
@@ -512,7 +485,6 @@ impl TargetSpecOrList {
                     response_headers: spec.response_headers,
                     weight: spec.weight,
                     sanitize_response: false, // Will be OR'd with pool-level setting
-                    open_responses: open_responses.clone(),
                     request_timeout_secs: spec.request_timeout_secs,
                     trusted: None, // pool-level trusted handles this for single-provider format
                     // Carry the legacy spec's explicit override (if any). Without
@@ -529,7 +501,6 @@ impl TargetSpecOrList {
                     fallback: None,
                     strategy: LoadBalanceStrategy::default(),
                     sanitize_response,
-                    open_responses,
                     trusted,
                     routing_rules: Vec::new(),
                     providers: vec![provider],
@@ -570,7 +541,6 @@ impl From<TargetSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
-            open_responses: value.open_responses,
             request_timeout_secs: value.request_timeout_secs,
             trusted: None,
             propagate_trace_context: value.propagate_trace_context,
@@ -596,7 +566,6 @@ impl From<ProviderSpec> for Target {
             upstream_auth_header_prefix: value.upstream_auth_header_prefix,
             response_headers: value.response_headers,
             sanitize_response: value.sanitize_response,
-            open_responses: value.open_responses,
             request_timeout_secs: value.request_timeout_secs,
             trusted: value.trusted,
             propagate_trace_context: value.propagate_trace_context,
@@ -740,8 +709,6 @@ pub struct Target {
     /// Enable response sanitization to enforce strict OpenAI schema compliance
     #[builder(default)]
     pub sanitize_response: bool,
-    /// Open Responses API configuration
-    pub open_responses: Option<OpenResponsesConfig>,
     pub request_timeout_secs: Option<u64>,
     /// Per-provider override for strict mode error sanitization trust.
     /// None means inherit from the pool-level trusted setting.
@@ -2287,7 +2254,6 @@ mod tests {
             fallback: None,
             strategy: LoadBalanceStrategy::default(),
             sanitize_response: false,
-            open_responses: None,
             trusted: true,
             routing_rules: Vec::new(),
             providers: vec![ProviderSpec {
@@ -2301,7 +2267,6 @@ mod tests {
                 response_headers: None,
                 weight: 1,
                 sanitize_response: false,
-                open_responses: None,
                 request_timeout_secs: None,
                 trusted: None,
                 propagate_trace_context: None,

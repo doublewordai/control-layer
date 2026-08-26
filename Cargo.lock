@@ -1904,7 +1904,6 @@ dependencies = [
  "notify",
  "once_cell",
  "onwards",
- "onwards-fusillade",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -4317,21 +4316,6 @@ dependencies = [
  "tracing-opentelemetry",
  "tracing-subscriber",
  "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "onwards-fusillade"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "fusillade",
- "futures-util",
- "onwards",
- "serde_json",
- "tokio",
- "tracing",
  "uuid",
  "wiremock",
 ]

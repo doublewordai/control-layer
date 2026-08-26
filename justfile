@@ -564,7 +564,6 @@ lint target *args="":
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
-                --package onwards-fusillade \
                 --all-features \
                 --no-deps \
                 {{args}}
@@ -625,7 +624,6 @@ fmt target *args="":
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
-                --package onwards-fusillade \
                 {{args}}
             ;;
         *)

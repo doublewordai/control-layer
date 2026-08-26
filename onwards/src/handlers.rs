@@ -390,7 +390,7 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Extract the request body. TODO(fergus): make this step conditional: its not necessary if we
     // extract the model from the header.
-    let mut body_bytes =
+    let body_bytes =
         match axum::body::to_bytes(std::mem::take(req.body_mut()), state.body_limit).await {
             Ok(bytes) => bytes,
             // to_bytes only fails when the body exceeds the limit (or the
@@ -398,15 +398,6 @@ pub async fn target_message_handler<T: HttpClient>(
             // than an opaque 500.
             Err(_) => return Err(OnwardsErrorResponse::payload_too_large(state.body_limit)),
         };
-
-    // Apply body transformation if provided
-    if let Some(ref transform_fn) = state.body_transform_fn {
-        let path = req.uri().path();
-        if let Some(transformed_body) = transform_fn(path, req.headers(), &body_bytes) {
-            debug!("Applied body transformation for path: {}", path);
-            body_bytes = transformed_body;
-        }
-    }
 
     // Log incoming request metadata for debugging.
     // ZDR: never log the request body or headers — bodies carry prompt content
@@ -2437,12 +2428,8 @@ mod tests {
                 http_pool_config: None,
             },
             http_client: mock_client,
-            body_transform_fn: None,
             response_transform_fn: None,
-            streaming_header: None,
             response_id_header: None,
-            tool_executor: std::sync::Arc::new(crate::NoOpToolExecutor),
-            response_store: std::sync::Arc::new(crate::NoOpResponseStore),
             body_limit: crate::DEFAULT_BODY_LIMIT,
         };
 
@@ -2522,7 +2509,6 @@ mod tests {
             upstream_auth_header_prefix: None,
             response_headers: None,
             sanitize_response: false,
-            open_responses: None,
             request_timeout_secs: None,
             trusted,
             propagate_trace_context,

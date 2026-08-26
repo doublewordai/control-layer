@@ -443,7 +443,6 @@ impl<'a> DeployedModelEnricher<'a> {
                     name: c.endpoint_name.unwrap_or_default(),
                 }),
                 trusted: c.model_trusted,
-                open_responses_adapter: c.model_open_responses_adapter,
             },
         }
     }
@@ -492,7 +491,6 @@ mod tests {
             components: None,
             sanitize_responses: None,
             trusted: None,
-            open_responses_adapter: None,
             reasoning_translation_overrides: None,
             supported_reasoning_efforts: None,
             traffic_routing_rules: None,
@@ -650,14 +648,12 @@ mod tests {
         let mut model = create_test_model();
         model.sanitize_responses = Some(true);
         model.trusted = Some(false);
-        model.open_responses_adapter = Some(true);
 
         let masked = model.mask_response_config();
 
         // Response config fields should be masked
         assert_eq!(masked.sanitize_responses, None);
         assert_eq!(masked.trusted, None);
-        assert_eq!(masked.open_responses_adapter, None);
     }
 
     #[test]

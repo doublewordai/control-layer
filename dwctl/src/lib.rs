@@ -595,7 +595,6 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             provider_pricing: None,
                             sanitize_responses: None,
                             trusted: None,
-                            open_responses_adapter: None,
                             reasoning_translation_overrides: None,
                             backoff_enabled: false,
                             backoff_initial_ms: 100,
@@ -3350,7 +3349,6 @@ impl Application {
         // `outbound_request` middleware, so onwards needs no BodyTransformFn.
         let onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
-            .with_streaming_header("x-fusillade-stream")
             .with_response_id_header("x-fusillade-request-id")
             .with_body_limit(onwards_body_limit);
 

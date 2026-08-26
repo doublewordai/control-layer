@@ -166,7 +166,6 @@ const ModelInfo: React.FC = () => {
     capabilities: [] as string[],
     sanitize_responses: false,
     trusted: false,
-    open_responses_adapter: true,
     reasoning_translation_overrides: null as ReasoningTranslationOverrides | null,
     requests_per_second: null as number | null,
     burst_size: null as number | null,
@@ -297,7 +296,6 @@ const ModelInfo: React.FC = () => {
         capabilities: model.capabilities || [],
         sanitize_responses: model.sanitize_responses ?? false,
         trusted: model.trusted ?? false,
-        open_responses_adapter: model.open_responses_adapter ?? true,
         reasoning_translation_overrides:
           normalizeReasoningTranslationOverrides(
             model.reasoning_translation_overrides ?? null,
@@ -395,7 +393,6 @@ const ModelInfo: React.FC = () => {
           capabilities: updateData.capabilities,
           sanitize_responses: updateData.sanitize_responses,
           trusted: updateData.trusted,
-          open_responses_adapter: updateData.open_responses_adapter,
           ...(isStandard
             ? {
                 reasoning_translation_overrides:
@@ -448,7 +445,6 @@ const ModelInfo: React.FC = () => {
         capabilities: model.capabilities || [],
         sanitize_responses: model.sanitize_responses ?? false,
         trusted: model.trusted ?? false,
-        open_responses_adapter: model.open_responses_adapter ?? true,
         reasoning_translation_overrides:
           normalizeReasoningTranslationOverrides(
             model.reasoning_translation_overrides ?? null,
@@ -1315,37 +1311,6 @@ const ModelInfo: React.FC = () => {
                                       sanitization, allowing full error details
                                       to be returned. Non-trusted providers have
                                       sensitive error information removed.
-                                    </p>
-                                  </InfoTip>
-                                </label>
-                              </div>
-                              <div className="flex items-center space-x-2">
-                                <input
-                                  type="checkbox"
-                                  id="open-responses-adapter"
-                                  checked={
-                                    updateData.open_responses_adapter ?? true
-                                  }
-                                  onChange={(e) => {
-                                    setUpdateData((prev) => ({
-                                      ...prev,
-                                      open_responses_adapter: e.target.checked,
-                                    }));
-                                  }}
-                                  className="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
-                                />
-                                <label
-                                  htmlFor="open-responses-adapter"
-                                  className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 flex items-center gap-1"
-                                >
-                                  Responses API Adapter
-                                  <InfoTip>
-                                    <p className="text-sm text-muted-foreground">
-                                      Enable the adapter that converts OpenAI
-                                      Responses API requests (/v1/responses) to
-                                      Chat Completions (/v1/chat/completions)
-                                      for providers that don&apos;t natively
-                                      support the Responses API.
                                     </p>
                                   </InfoTip>
                                 </label>

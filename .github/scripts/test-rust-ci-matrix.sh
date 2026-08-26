@@ -60,7 +60,7 @@ require_text 'backend-crate-test:' 'define a per-crate test job'
 require_text 'name: ${{ matrix.package }} / test' 'scope every crate test check to its package'
 require_text 'fail-fast: false' 'allow every crate result to complete'
 
-for package in fusillade fusillade-core fusillade-arsenal onwards onwards-fusillade; do
+for package in fusillade fusillade-core fusillade-arsenal onwards; do
   require_text "- package: ${package}" "test ${package} in the matrix"
 done
 
@@ -89,13 +89,9 @@ require_exact_line '    name: workspace / rust gate' 'name the aggregate Rust ga
 require_text 'pattern: rust-coverage-*' 'download all per-package coverage artifacts'
 require_text 'MINIMUM_COVERAGE: "60"' 'preserve the aggregate line coverage threshold'
 require_text '.github/scripts/aggregate-rust-coverage.py' 'merge duplicate source lines before checking coverage'
-require_text 'Expected 9 coverage files' 'aggregate every workspace crate coverage artifact'
+require_text 'Expected 8 coverage files' 'aggregate every workspace crate coverage artifact'
 require_text 'cargo package --locked --package onwards --all-features' 'validate the publishable Onwards package'
-require_text 'onwards-openresponses-compliance:' 'define standalone Onwards compliance'
-require_text 'mode: [adapter, passthrough]' 'test Onwards adapter and passthrough modes'
 require_text 'name: onwards / image' 'scope the standalone image build to Onwards'
-require_text 'name: onwards / compliance changes' 'scope the compliance change detector to Onwards'
-require_text 'name: onwards / open responses (${{ matrix.mode }})' 'scope standalone compliance checks to Onwards'
 require_text 'name: dwctl / image' 'scope the control-layer image build to dwctl'
 require_text 'name: dwctl / open responses' 'scope embedded compliance to dwctl'
 require_text 'name: dwctl / security' 'scope image scanning to dwctl'
@@ -104,11 +100,7 @@ require_text 'GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}' 'reuse the control-
 require_text 'https://generativelanguage.googleapis.com/v1beta/openai/' 'target the proven Gemini OpenAI-compatible endpoint'
 require_text 'TEST_MODEL: gemini-2.5-flash' 'reuse the control-layer compliance model'
 require_text 'OPENRESPONSES_COMPLIANCE_FILTER:' 'reuse the supported Open Responses compliance filter'
-require_text '--port 3001' 'run a local adapter upstream for passthrough compliance'
-require_text 'http://127.0.0.1:3001/v1' 'route standalone passthrough compliance through the local adapter upstream'
 require_text 'git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses' 'track the current Open Responses compliance suite'
-require_text 'onwards-openresponses-${MODE}-retry.json' 'retry only transiently failing Open Responses filters'
-require_text 'Malformed compliance output is always a failure.' 'reject malformed compliance runner output'
 
 if grep -Fq 'workflow_dispatch' "$workflow"; then
   echo "Required-check CI must only run for pull requests and merge groups" >&2
@@ -119,7 +111,6 @@ merge_group_trigger="$(sed -n '/^  merge_group:/,/^jobs:/p' "$workflow")"
 require_block_line "$merge_group_trigger" '  merge_group:' 'listen for merge-group checks'
 require_block_line "$merge_group_trigger" '    types: [checks_requested]' 'only run CI for requested merge-group checks'
 
-onwards_compliance_job="$(extract_job onwards-openresponses-compliance)"
 onwards_image_job="$(extract_job onwards-pr-image)"
 dwctl_image_job="$(extract_job build)"
 crate_test_job="$(extract_job backend-crate-test)"
@@ -140,53 +131,7 @@ if ! grep -Fxq '    needs: changes' <<< "$onwards_image_job" || \
   exit 1
 fi
 
-if grep -Fq 'OPENAI_API_KEY' <<< "$onwards_compliance_job"; then
-  echo "Standalone Onwards compliance must reuse the existing Gemini provider" >&2
-  exit 1
-fi
-
-if grep -Fq 'git checkout fa29df5' <<< "$onwards_compliance_job"; then
-  echo "Standalone Onwards compliance must track the same current suite as control-layer compliance" >&2
-  exit 1
-fi
-
-require_block_line "$onwards_compliance_job" '    if: always()' 'expand the Onwards compliance matrix for release-only changes'
-require_block_line "$onwards_compliance_job" "    needs: [changes, onwards-compliance-changes]" 'wait for the change classifiers'
 trusted_pull_request_condition="github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'"
-require_block_line "$onwards_compliance_job" "      RUN_STRICT_COMPLIANCE: \${{ needs.onwards-compliance-changes.outputs.strict == 'true' && ${trusted_pull_request_condition} }}" 'only run strict compliance for trusted pull requests'
-if grep -Fq "github.event_name == 'merge_group'" <<< "$onwards_compliance_job" || \
-   grep -Fq "github.actor != 'dependabot[bot]'" <<< "$onwards_compliance_job"; then
-  echo "Onwards compliance must classify trust from pull-request provenance" >&2
-  exit 1
-fi
-
-skip_step="$(extract_step "$onwards_compliance_job" 'Skip strict compliance for untrusted or unchanged events')"
-require_block_line "$skip_step" "        if: env.RUN_STRICT_COMPLIANCE != 'true'" 'declare the no-op strict compliance path'
-
-for step_name in \
-  'Checkout code' \
-  'Require Gemini API key' \
-  'Install Rust' \
-  'Build Onwards' \
-  'Install Bun' \
-  'Clone Open Responses' \
-  'Install Open Responses dependencies' \
-  'Write Gemini adapter config' \
-  'Start Gemini adapter upstream' \
-  'Write Onwards config' \
-  'Start Onwards' \
-  'Run compliance tests'; do
-  compliance_step="$(extract_step "$onwards_compliance_job" "$step_name")"
-  require_block_line "$compliance_step" "        if: env.RUN_STRICT_COMPLIANCE == 'true'" "guard Onwards compliance step '${step_name}' with the trust gate"
-done
-
-for step_name in \
-  'Show Onwards logs' \
-  'Upload Onwards compliance artifacts' \
-  'Stop Onwards processes'; do
-  compliance_step="$(extract_step "$onwards_compliance_job" "$step_name")"
-  require_block_line "$compliance_step" "        if: always() && env.RUN_STRICT_COMPLIANCE == 'true'" "guard Onwards compliance diagnostic step '${step_name}' with the trust gate"
-done
 
 require_block_line "$onwards_image_job" "    if: needs.changes.outputs.run-ci == 'true' && ${trusted_pull_request_condition}" 'run Onwards image publishing only for relevant trusted pull requests'
 require_block_line "$onwards_image_job" "          tags: ghcr.io/doublewordai/onwards:sha-\${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}" 'tag Onwards images with the PR head or merge-group SHA'
@@ -229,9 +174,6 @@ required_check_names=(
   'workspace / rust lint'
   'workspace / rust gate'
   'onwards / image'
-  'onwards / compliance changes'
-  'onwards / open responses (adapter)'
-  'onwards / open responses (passthrough)'
   'dwctl / image'
   'dwctl / open responses'
   'dwctl / security'
@@ -256,12 +198,6 @@ while IFS= read -r name; do
     'release-only changes')
       # Change classification is an internal fan-out job, not a required
       # branch-protection context.
-      ;;
-    'onwards / open responses (${{ matrix.mode }})')
-      actual_check_names+=(
-        'onwards / open responses (adapter)'
-        'onwards / open responses (passthrough)'
-      )
       ;;
     *) actual_check_names+=("$name") ;;
   esac

@@ -35,13 +35,7 @@ struct StreamingFixture {
     group_id: Uuid,
 }
 
-async fn setup_streaming_fixture(
-    pool: &PgPool,
-    mock_endpoint_url: String,
-    model_name: &str,
-    alias: &str,
-    open_responses_adapter: Option<bool>,
-) -> StreamingFixture {
+async fn setup_streaming_fixture(pool: &PgPool, mock_endpoint_url: String, model_name: &str, alias: &str) -> StreamingFixture {
     let mut config = crate::test::utils::create_test_config();
     config.background_services.onwards_sync.enabled = true;
     config.enable_request_logging = true;
@@ -113,7 +107,6 @@ async fn setup_streaming_fixture(
             "alias": alias,
             "description": "Test model deployment",
             "hosted_on": endpoint.id,
-            "open_responses_adapter": open_responses_adapter,
             "tariffs": [{
                 "name": "batch",
                 "input_price_per_token": "0.001",
@@ -646,7 +639,7 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         .mount(&mock_server)
         .await;
 
-    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model", None).await;
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
 
     let inference_response = fixture
         .server
@@ -686,14 +679,7 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         .mount(&mock_server)
         .await;
 
-    let fixture = setup_streaming_fixture(
-        &pool,
-        format!("{}/v1", mock_server.uri()),
-        "gpt-3.5-turbo-instruct",
-        "test-model",
-        None,
-    )
-    .await;
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo-instruct", "test-model").await;
 
     let inference_response = fixture
         .server
