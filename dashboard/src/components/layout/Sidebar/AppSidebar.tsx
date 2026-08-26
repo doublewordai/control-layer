@@ -29,7 +29,7 @@ import {
   useUserBalance,
   useTransactions,
 } from "../../../api/control-layer/hooks";
-import { UserAvatar } from "../../ui";
+import { UserAvatar, Tooltip, TooltipContent, TooltipTrigger } from "../../ui";
 import { useAuthorization } from "../../../utils";
 import { useAuth } from "../../../contexts/auth";
 import { useSettings, useOrganizationContext } from "../../../contexts";
@@ -442,14 +442,46 @@ export function AppLayout({ children }: { children: React.ReactNode }) {
                 <>
                   {config.region && (
                     <>
-                      <div className="hidden lg:flex items-center gap-2">
-                        <span className="text-muted-foreground/70">
-                          Region:
-                        </span>
-                        <span className="font-medium text-foreground">
-                          {config.region}
-                        </span>
-                      </div>
+                      {/* Explains what the region label means. A deployment
+                          split across regions keeps each region's data in
+                          that region, so this is not a preference the user
+                          can toggle — reaching another region means signing
+                          in against that region's URL. Distinct from moving
+                          an existing account's data between regions, which
+                          is an operator-run transfer, so the copy promises
+                          only the sign-in.
+
+                          SidebarProvider already mounts a TooltipProvider
+                          above this, so Radix works here without one being
+                          added. The aria-describedby wiring comes from the
+                          trigger/content pair itself, which is why no
+                          sr-only span is needed.
+
+                          tabIndex makes the trigger reachable: Radix opens
+                          the tooltip on focus as well as hover, but a plain
+                          div is not a tab stop, so without this the
+                          explanation would be mouse-only. */}
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <div
+                            tabIndex={0}
+                            className="hidden lg:flex items-center gap-2 cursor-help rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                          >
+                            <span className="text-muted-foreground/70">
+                              Region:
+                            </span>
+                            <span className="font-medium text-foreground">
+                              {config.region}
+                            </span>
+                          </div>
+                        </TooltipTrigger>
+                        <TooltipContent className="max-w-xs">
+                          Your account and its data live in the{" "}
+                          {config.region} region. To use an account in a
+                          different region, sign out and sign in at that
+                          region's URL.
+                        </TooltipContent>
+                      </Tooltip>
                       <div className="hidden lg:block w-px h-4 bg-border"></div>
                     </>
                   )}

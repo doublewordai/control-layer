@@ -1,5 +1,17 @@
 # Changelog
 
+## [10.15.0](https://github.com/doublewordai/control-layer/compare/v10.14.2...v10.15.0) (2026-08-26)
+
+
+### Features
+
+* **dashboard:** explain what the region indicator means ([#1514](https://github.com/doublewordai/control-layer/issues/1514)) ([29c0da3](https://github.com/doublewordai/control-layer/commit/29c0da3f9ef4b8ce96e168c5b753ad8fdcb09357))
+
+
+### Bug Fixes
+
+* **db-setup:** apply underway crate migrations in just db-setup ([#1509](https://github.com/doublewordai/control-layer/issues/1509)) ([98b469f](https://github.com/doublewordai/control-layer/commit/98b469f3a9784667db90e11cc0aa3013dc3c289e))
+
 ## [10.14.2](https://github.com/doublewordai/control-layer/compare/v10.14.1...v10.14.2) (2026-08-25)
 
 

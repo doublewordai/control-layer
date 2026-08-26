@@ -146,6 +146,31 @@ db-setup:
         exit 1
     fi
 
+    echo "Running underway migrations..."
+    # The underway crate (a dependency) ships its own SQLx migrations that
+    # create the underway schema (underway.task, underway.task_attempt, etc.).
+    # These are applied at runtime by underway::run_migrations, but are not
+    # part of dwctl's migration set. They are needed at compile time for
+    # SQLx query verification when DATABASE_URL is set (e.g. when exported in
+    # the shell, as CLAUDE.md suggests). Without them, cargo clippy
+    # --all-features fails with "relation \"underway.task\" does not exist".
+    UNDERWAY_DIR=$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" \
+        -path "*/underway-*/migrations" -type d 2>/dev/null | head -1)
+    if [ -n "$UNDERWAY_DIR" ] && [ -d "$UNDERWAY_DIR" ]; then
+        PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d dwctl \
+            -c "CREATE SCHEMA IF NOT EXISTS underway" >/dev/null
+        UNDERWAY_DATABASE_URL="postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dunderway"
+        if DATABASE_URL="$UNDERWAY_DATABASE_URL" sqlx migrate run --source "$UNDERWAY_DIR"; then
+            echo "  ✅ underway migrations complete"
+        else
+            echo "  ❌ underway migrations failed"
+            exit 1
+        fi
+    else
+        echo "  ⚠️ underway crate not found in cargo registry, skipping"
+        echo "     Run 'cargo fetch' first, or these will be applied at runtime"
+    fi
+
     echo ""
     echo "✅ Database setup complete!"
     echo ""
