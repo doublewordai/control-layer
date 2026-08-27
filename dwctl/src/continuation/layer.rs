@@ -751,17 +751,11 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     if first_death_reason.is_none() {
                         first_death_reason = Some(reason);
                     }
-                    // A structured reconstructor may hold a perfect prefix the
-                    // PLAIN reframer still cannot faithfully continue (seam
-                    // inside reasoning/tool syntax). Surface the death as
-                    // today; v2's forward parser lifts this per model.
-                    if !acc.plain_resume_ok() {
-                        if let Some(frame) = first_death.take() {
-                            yield Ok(frame);
-                        }
-                        outcome.record("failed", "needs_forward_parser");
-                        break 'chain;
-                    }
+                    // A seam inside reasoning/tool syntax no longer blocks the
+                    // resume: the leg's raw output goes through the
+                    // accumulator's paired forward parser (seeded at dispatch
+                    // below), which re-frames `</think>`/DSML back into chat
+                    // deltas instead of leaking them as answer text.
                     let Some(text) = acc.continuation_text() else {
                         // Disarmed, or nothing generated yet: resume-from-zero is
                         // a plain retry, which is not this feature's job.
