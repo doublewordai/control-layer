@@ -16,11 +16,9 @@
 //! Two thresholds rather than one: without hysteresis the gate would sit on the
 //! boundary flipping every claim cycle.
 //!
-//! The low mark cannot be the only way out, though. Freed memory goes back to
-//! the allocator rather than to the OS, so the reading behaves as a high-water
-//! mark and does not fall when requests complete - which leaves no low mark that
-//! is both reachable and useful. Claiming therefore also resumes once enough of
-//! the work that was in flight at engagement has drained. See `should_block`.
+//! Both marks are only as good as the reading they are compared against, and
+//! the reading has to count what the OOM killer counts. See [`MemoryReading`]
+//! for what that excludes and why the exclusion is bounded.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -32,6 +30,10 @@ pub(super) struct MemoryReading {
     /// Working set in bytes: usage less reclaimable page cache, which is what
     /// the OOM killer effectively acts on and what `container_memory_working_set_bytes`
     /// reports. Raw usage would include cache and trip the gate on file IO.
+    ///
+    /// The exclusion is clamped to the page cache the cgroup actually holds.
+    /// See [`CgroupMemorySource::working_set`] - unclamped, it can hide
+    /// anonymous memory that still counts against the limit.
     pub working_set: u64,
     /// The cgroup limit in bytes.
     pub limit: u64,
@@ -66,32 +68,46 @@ impl CgroupMemorySource {
         })
     }
 
+    /// Usage less the page cache the cgroup is actually holding.
+    ///
+    /// The subtraction is clamped to `file` because `inactive_file` can exceed
+    /// it. Pages released with `MADV_FREE` stay charged to the cgroup, but the
+    /// kernel parks them on the inactive file LRU, so an allocator that frees
+    /// that way reports gigabytes of `inactive_file` in a process holding no
+    /// page cache at all. Subtracting it unclamped hides anonymous memory that
+    /// the OOM killer still counts, and the gate reads far below where the
+    /// process really is.
+    fn working_set(current: u64, inactive_file: u64, file: u64) -> u64 {
+        current.saturating_sub(inactive_file.min(file))
+    }
+
     fn read_v2() -> Option<MemoryReading> {
+        const STAT: &str = "/sys/fs/cgroup/memory.stat";
         let limit_raw = std::fs::read_to_string("/sys/fs/cgroup/memory.max").ok()?;
         let limit = match limit_raw.trim() {
             "max" => return None,
             other => other.parse::<u64>().ok()?,
         };
         let current = Self::read_u64("/sys/fs/cgroup/memory.current")?;
-        let inactive_file =
-            Self::read_stat_key("/sys/fs/cgroup/memory.stat", "inactive_file").unwrap_or(0);
+        let inactive_file = Self::read_stat_key(STAT, "inactive_file").unwrap_or(0);
+        let file = Self::read_stat_key(STAT, "file").unwrap_or(0);
         Some(MemoryReading {
-            working_set: current.saturating_sub(inactive_file),
+            working_set: Self::working_set(current, inactive_file, file),
             limit,
         })
     }
 
     fn read_v1() -> Option<MemoryReading> {
+        const STAT: &str = "/sys/fs/cgroup/memory/memory.stat";
         let limit = Self::read_u64("/sys/fs/cgroup/memory/memory.limit_in_bytes")?;
         if limit >= Self::UNLIMITED_ABOVE {
             return None;
         }
         let usage = Self::read_u64("/sys/fs/cgroup/memory/memory.usage_in_bytes")?;
-        let inactive_file =
-            Self::read_stat_key("/sys/fs/cgroup/memory/memory.stat", "total_inactive_file")
-                .unwrap_or(0);
+        let inactive_file = Self::read_stat_key(STAT, "total_inactive_file").unwrap_or(0);
+        let file = Self::read_stat_key(STAT, "total_cache").unwrap_or(0);
         Some(MemoryReading {
-            working_set: usage.saturating_sub(inactive_file),
+            working_set: Self::working_set(usage, inactive_file, file),
             limit,
         })
     }
@@ -128,9 +144,6 @@ impl MemoryGate {
         if high <= 0.0 || high > 1.0 || low <= 0.0 || low >= high {
             return None;
         }
-        // Out-of-range values would silently disable the in-flight release and
-        // reintroduce the deadlock, so clamp rather than reject: a bad number
-        // here should not take the gate's only reliable exit away.
         Some(Self {
             source,
             high,
@@ -338,6 +351,36 @@ mod tests {
         gate.should_block(10);
         gate.should_block(1200);
         assert_eq!(gate.peak_in_flight_at_gate.load(Ordering::Relaxed), 4000);
+    }
+
+    /// Real page cache is excluded, which is the point of reading a working set
+    /// rather than raw usage.
+    #[test]
+    fn cache_is_excluded_from_the_working_set() {
+        assert_eq!(
+            CgroupMemorySource::working_set(1000, 300, 400),
+            700,
+            "the inactive part of a real cache is not the process's memory"
+        );
+    }
+
+    /// `inactive_file` counts pages freed with `MADV_FREE`, which are anonymous
+    /// and still charged to the cgroup. Subtracting more than the cgroup's page
+    /// cache would hide memory the OOM killer acts on: a process holding no
+    /// cache at all reported gigabytes of `inactive_file` and read ~30 points
+    /// below its true position, so the gate never engaged before the kill.
+    #[test]
+    fn lazily_freed_anonymous_pages_are_not_mistaken_for_cache() {
+        assert_eq!(
+            CgroupMemorySource::working_set(1000, 300, 0),
+            1000,
+            "no page cache means nothing to exclude"
+        );
+        assert_eq!(
+            CgroupMemorySource::working_set(1000, 300, 100),
+            900,
+            "only the cache that exists is excluded"
+        );
     }
 
     /// Working set excludes reclaimable page cache; a process whose raw usage is
