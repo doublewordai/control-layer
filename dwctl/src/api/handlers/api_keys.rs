@@ -125,12 +125,15 @@ pub async fn create_user_api_key<P: PoolProvider>(
         }
     }
 
-    // Validate purpose: restrict batch/playground to system use only (purpose defaults to Realtime via serde)
+    // Validate purpose: restrict batch/playground/continuation to system use only
+    // (purpose defaults to Realtime via serde)
     match &data.purpose {
-        crate::db::models::api_keys::ApiKeyPurpose::Batch | crate::db::models::api_keys::ApiKeyPurpose::Playground => {
+        crate::db::models::api_keys::ApiKeyPurpose::Batch
+        | crate::db::models::api_keys::ApiKeyPurpose::Playground
+        | crate::db::models::api_keys::ApiKeyPurpose::Continuation => {
             return Err(Error::BadRequest {
                 message:
-                    "Cannot manually create API keys with 'batch' or 'playground' purpose. These are reserved for internal system use."
+                    "Cannot manually create API keys with 'batch', 'playground' or 'continuation' purpose. These are reserved for internal system use."
                         .to_string(),
             });
         }
@@ -1332,10 +1335,12 @@ mod tests {
             .unwrap();
         let has_key = |targets: &onwards::target::Targets, secret: &str| {
             let expected = ConstantTimeString::from(secret.to_string());
-            targets
-                .targets
-                .get("cap-e2e-model")
-                .is_some_and(|p| p.value().keys().is_some_and(|keys| keys.iter().any(|c| c == &expected)))
+            targets.targets.get("cap-e2e-model").is_some_and(|p| {
+                p.value()
+                    .default_pool()
+                    .keys()
+                    .is_some_and(|keys| keys.iter().any(|c| c == &expected))
+            })
         };
         assert!(has_key(&targets, &created.key));
         assert!(has_key(&targets, &child_secret));

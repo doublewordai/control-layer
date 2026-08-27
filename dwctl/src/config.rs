@@ -215,6 +215,10 @@ pub struct Config {
     /// tokenizer-svc URL, and the default pricing multipliers. See [`CacheConfig`].
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Mid-stream continuation (stream resume): the on/off flag, per-origin gates,
+    /// and resume-behavior knobs. See [`ContinuationConfig`].
+    #[serde(default)]
+    pub continuation: ContinuationConfig,
 }
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
@@ -1173,6 +1177,153 @@ impl Default for TelemetryBlockConfig {
         Self {
             strip_from_prompt: true,
             prefixes: vec!["x-anthropic-billing-header:".to_string()],
+        }
+    }
+}
+
+/// Mid-stream continuation (stream resume) configuration.
+///
+/// When a stream dies mid-generation on a continuation-enabled model, the resume
+/// middleware rebuilds prompt + partial output as token ids (tokenizer-svc
+/// `/v1/render`) and re-enters onwards as a `/v1/completions` request on the
+/// model's continuation composite, splicing the new stream into the client's
+/// still-open connection. Per-model activation additionally requires a
+/// `continuation`-purpose traffic rule + composite; with none attached, enabling
+/// this flag changes nothing.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContinuationConfig {
+    /// Global kill switch. When false (the default), the resume layer is not added
+    /// to the stack and the request path is byte-identical to today.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__ENABLED=true`
+    pub enabled: bool,
+
+    /// Base URL of the tokenizer-svc used to render resume prefixes. `None` (the
+    /// default) falls back to `cache.tokenizer_url` — the same service serves both
+    /// layers; set this only to split them.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__TOKENIZER_URL=http://tokenizer-svc:8088`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokenizer_url: Option<String>,
+
+    /// Per-origin gates. All origins ride the same middleware; these choose which
+    /// request populations are eligible for resume at all.
+    pub origins: ContinuationOriginsConfig,
+
+    /// Maximum resume legs for one logical stream (a resume leg that itself dies
+    /// mid-stream re-enters the flow). Exhausted → the error surfaces to the
+    /// client exactly as an unresumed death would.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__MAX_ATTEMPTS=2`
+    pub max_attempts: u32,
+
+    /// Budget for one resume attempt (render + continuation-target time-to-first-
+    /// byte). Crossed → give up on that leg and surface the original error. Cold
+    /// provider prefill dominates this budget on long prompts; per-provider
+    /// TTFB-vs-prefix-length curves from the onboarding harness inform the value.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__RESUME_DEADLINE_SECS=20`
+    pub resume_deadline_secs: u64,
+
+    /// Inter-frame silence after which an armed stream is declared STALLED and
+    /// rescued — which CANCELS the original leg and re-prefills, so this must
+    /// never undercut the platform's own liveness judgment: fusillade's SSE
+    /// clients allow 600s between events (prod `chunk_timeout_ms`), and a
+    /// preempted/kv-thrashed but progressing stream must be allowed to
+    /// continue. Default 540 = just inside fusillade's 600s so batch-origin
+    /// stalls are still rescuable before the daemon aborts the request.
+    /// Arms only after the first generated text (admission/prefill silence is
+    /// never bounded here).
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__STALL_TIMEOUT_SECS=540`
+    pub stall_timeout_secs: u64,
+
+    /// Per-stream cap applied SEPARATELY to each retained allocation: the
+    /// request body (eligibility gate) and the accumulated generation
+    /// (accumulator cap) — worst case an armed stream retains ~2x this value.
+    /// Deliberately not a shared budget: deducting a large body from the
+    /// generation allowance would disarm long generations on big-prompt
+    /// requests, exactly the streams most worth rescuing. Exceeding either
+    /// bound marks the stream non-resumable and drops the buffer (outlet's own
+    /// capture is unaffected); the outcome metric records `cap_exceeded`.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__MAX_BUFFER_BYTES=2097152`
+    pub max_buffer_bytes: usize,
+
+    /// Numeric scheduling priority injected into resume-leg request bodies. The
+    /// dynamo scheduler orders by this field: batch/flex run negative
+    /// (deadline-derived), realtime runs 0 — any positive value puts resume legs
+    /// ahead of new realtime work, which is intentional: a resume finishes a
+    /// stream we already accepted, on a strict seam budget. Third-party providers
+    /// ignore the field.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__PRIORITY=100`
+    pub priority: i32,
+
+    /// Cap on concurrently in-flight resume legs per model (middleware counter).
+    /// Mid-stream deaths cluster in incidents; this bounds the stampede a flapping
+    /// model can send at its continuation provider. Excess deaths surface as plain
+    /// errors (outcome `throttled`).
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__MAX_INFLIGHT_PER_MODEL=8`
+    pub max_inflight_per_model: u32,
+
+    /// Which reconstructor rebuilds the partial generation, per model alias.
+    ///
+    /// A stream is only resumable if we can rebuild the exact text the model had
+    /// already emitted. The default reconstructor handles plain `content` and
+    /// gives up on `reasoning_content` / `tool_calls`; a model whose family has a
+    /// byte-exactness verdict from the fidelity harness can name that family here
+    /// and stay resumable through reasoning and partial tool calls. Recognised
+    /// value: `dsv4` (DeepSeek-V4 / DSML). A model absent from the map — or
+    /// naming a family we do not know — keeps the default.
+    ///
+    /// This is deliberately a config map for the canary: it moves onto the
+    /// per-route DB row next to the `continuation` traffic rule once more than one
+    /// family is live.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__MODEL_RECONSTRUCTORS='{"deepseek-ai/DeepSeek-V4-Flash":"dsv4"}'`
+    pub model_reconstructors: HashMap<String, String>,
+}
+
+impl Default for ContinuationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tokenizer_url: None,
+            origins: ContinuationOriginsConfig::default(),
+            max_attempts: 2,
+            resume_deadline_secs: 20,
+            stall_timeout_secs: 540,
+            max_buffer_bytes: 2 * 1024 * 1024,
+            priority: 100,
+            max_inflight_per_model: 8,
+            model_reconstructors: HashMap::new(),
+        }
+    }
+}
+
+/// Which request origins are eligible for mid-stream resume. Realtime leads the
+/// rollout (user-visible failures); batch resumes are a pure GPU saving vs
+/// fusillade's full retry and follow once realtime has bedded in.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContinuationOriginsConfig {
+    /// Set via environment: `DWCTL_CONTINUATION__ORIGINS__REALTIME=true`
+    pub realtime: bool,
+    /// Set via environment: `DWCTL_CONTINUATION__ORIGINS__BATCH=true`
+    pub batch: bool,
+    /// Set via environment: `DWCTL_CONTINUATION__ORIGINS__PLAYGROUND=true`
+    pub playground: bool,
+}
+
+impl Default for ContinuationOriginsConfig {
+    fn default() -> Self {
+        Self {
+            realtime: true,
+            batch: false,
+            playground: false,
         }
     }
 }
@@ -2579,6 +2730,7 @@ impl Default for Config {
             keystore: None,
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
+            continuation: ContinuationConfig::default(),
         }
     }
 }

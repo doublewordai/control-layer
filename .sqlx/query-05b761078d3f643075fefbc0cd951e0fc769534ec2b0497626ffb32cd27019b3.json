@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE inference_endpoints SET\n                name = COALESCE($2, name),\n                description = CASE\n                    WHEN $3::text IS NOT NULL THEN $3\n                    ELSE description\n                END,\n                url = COALESCE($4, url),\n                api_key = CASE\n                    WHEN $5::text IS NOT NULL THEN $5\n                    ELSE api_key\n                END,\n                model_filter = CASE\n                    WHEN $6::text[] IS NOT NULL THEN $6\n                    ELSE model_filter\n                END,\n                auth_header_name = COALESCE($7, auth_header_name),\n                auth_header_prefix = COALESCE($8, auth_header_prefix),\n                reasoning_translation = CASE\n                    WHEN $9 THEN $10\n                    ELSE reasoning_translation\n                END,\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
+  "query": "\n            UPDATE inference_endpoints SET\n                name = COALESCE($2, name),\n                description = CASE\n                    WHEN $3::text IS NOT NULL THEN $3\n                    ELSE description\n                END,\n                url = COALESCE($4, url),\n                api_key = CASE\n                    WHEN $5::text IS NOT NULL THEN $5\n                    ELSE api_key\n                END,\n                model_filter = CASE\n                    WHEN $6::text[] IS NOT NULL THEN $6\n                    ELSE model_filter\n                END,\n                auth_header_name = COALESCE($7, auth_header_name),\n                auth_header_prefix = COALESCE($8, auth_header_prefix),\n                reasoning_translation = CASE\n                    WHEN $9 THEN $10\n                    ELSE reasoning_translation\n                END,\n                accepts_scheduling_priority = COALESCE($11, accepts_scheduling_priority),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -62,6 +62,11 @@
         "ordinal": 11,
         "name": "reasoning_translation",
         "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 12,
+        "name": "accepts_scheduling_priority",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -75,7 +80,8 @@
         "Varchar",
         "Varchar",
         "Bool",
-        "Jsonb"
+        "Jsonb",
+        "Bool"
       ]
     },
     "nullable": [
@@ -90,8 +96,9 @@
       false,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "8553e97a635c973cfdf3eb9b5e8709fbdc08e8980682aaa880c80a34f70e6b4b"
+  "hash": "05b761078d3f643075fefbc0cd951e0fc769534ec2b0497626ffb32cd27019b3"
 }

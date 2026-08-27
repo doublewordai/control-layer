@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT deployed_model_id FROM deployed_model_components\n             WHERE composite_model_id = $1 AND pool = $2\n             ORDER BY sort_order ASC, weight DESC, created_at ASC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "deployed_model_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9c68ad4ef3796cc70b1e8cf2397a3ad28c195703860c975853eb2092e42e5921"
+}

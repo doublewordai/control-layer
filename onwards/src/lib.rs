@@ -805,7 +805,7 @@ mod tests {
     use test_utils::MockHttpClient;
 
     /// Helper to create a single-provider pool from a target
-    fn pool(target: Target) -> ProviderPool {
+    fn pool(target: Target) -> target::TargetPools {
         target.into_pool()
     }
 
@@ -1083,7 +1083,7 @@ mod tests {
             Vec::new(),
         );
         let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(alias.to_string(), pool);
+        targets_map.insert(alias.to_string(), pool.into());
         target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
@@ -1097,6 +1097,184 @@ mod tests {
     /// Retry on an upstream 429. Used by the embedded-error tests below.
     fn embedded_error_targets(alias: &str, n: usize) -> target::Targets {
         fallback_targets(alias, n, vec![429])
+    }
+
+    /// A composite whose COMPLETIONS pool has one member per entry of
+    /// `accepts_priority` (Priority order, embedded-429 retry) alongside a
+    /// single-member default pool. Mirrors the continuation-pool shape; each
+    /// member's `accepts_scheduling_priority` capability is given explicitly.
+    fn completions_pool_targets(alias: &str, accepts_priority: &[bool]) -> target::Targets {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target, TargetPools};
+
+        let make_pool = |members: Vec<(String, bool)>| {
+            let providers = members
+                .into_iter()
+                .map(|(u, accepts)| {
+                    let t = Target::builder()
+                        .url(u.parse().unwrap())
+                        .request_timeout_secs(5)
+                        .accepts_scheduling_priority(accepts)
+                        .build();
+                    Provider::new(t, 1)
+                })
+                .collect();
+            ProviderPool::with_config(
+                providers,
+                None,
+                None,
+                None,
+                Some(FallbackConfig {
+                    enabled: true,
+                    on_status: vec![429],
+                    ..Default::default()
+                }),
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            )
+        };
+        let default_pool = make_pool(vec![("https://chat.example.com/".to_string(), false)]);
+        let completions_pool = make_pool(
+            accepts_priority
+                .iter()
+                .enumerate()
+                .map(|(i, accepts)| (format!("https://c{i}.example.com/"), *accepts))
+                .collect(),
+        );
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("completions".to_string(), completions_pool);
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            alias.to_string(),
+            TargetPools::with_pools(default_pool, extra),
+        );
+        target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        }
+    }
+
+    /// The dynamo scheduler's `priority` field reaches a non-default pool
+    /// member iff that member's serving stack accepts it
+    /// (`accepts_scheduling_priority`), regardless of position. Third-party
+    /// completions targets reject unknown fields outright (Fireworks: "Extra
+    /// inputs are not permitted, field: 'priority'"): keyed on position, the
+    /// cl-1453 canary 400'd on every fallback leg, and later — with the dynamo
+    /// member disabled — on every PRIMARY leg too.
+    #[tokio::test]
+    async fn completions_member_sees_priority_iff_it_accepts_it() {
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                vec![error_frame],                  // primary: embedded 429 → fallback
+                vec![OK_CONTENT_FRAME.to_string()], // fallback member serves
+            ],
+        );
+        // dynamo (accepts) first, third party (does not) second: the wave-1 shape.
+        let app_state =
+            AppState::with_client(completions_pool_targets("gpt-4", &[true, false]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({
+                "model": "gpt-4", "prompt": [1, 2, 3], "stream": true, "priority": 100,
+                "nvext": {"agent_hints": {"priority": 100}}
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2, "primary fails, fallback serves");
+        let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            first["nvext"]["agent_hints"]["priority"], 100,
+            "a member that accepts scheduling fields receives the nvext carrier"
+        );
+        assert_eq!(first["priority"], 100, "and the legacy top-level field");
+        assert!(
+            second.get("priority").is_none() && second.get("nvext").is_none(),
+            "a member that does not accept them must see neither carrier"
+        );
+        assert_eq!(
+            second["prompt"],
+            json!([1, 2, 3]),
+            "the rest of the body is untouched"
+        );
+    }
+
+    /// The incident shape: the dynamo member is disabled/removed and a third
+    /// party sits at index 0. Position must not decide — the field is stripped
+    /// for the first attempt too, or every resume leg 400s exactly when the
+    /// feature is needed most.
+    #[tokio::test]
+    async fn a_non_accepting_primary_never_sees_priority_either() {
+        let mock = MockHttpClient::new_streaming(StatusCode::OK, vec![OK_CONTENT_FRAME.to_string()]);
+        let app_state =
+            AppState::with_client(completions_pool_targets("gpt-4", &[false]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({
+                "model": "gpt-4", "prompt": [1, 2, 3], "stream": true,
+                "nvext": {"agent_hints": {"priority": 100}}
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("nvext").is_none(),
+            "index 0 is not 'dynamo'; a non-accepting primary is stripped too"
+        );
+        assert_eq!(body["prompt"], json!([1, 2, 3]));
+    }
+
+    /// Control: default-pool fallbacks keep `priority` on every attempt —
+    /// batch/flex deadline priorities must keep reaching dynamo exactly as
+    /// today, whichever member serves.
+    #[tokio::test]
+    async fn default_pool_fallback_keeps_priority_on_every_attempt() {
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![vec![error_frame], vec![OK_CONTENT_FRAME.to_string()]],
+        );
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true, "priority": -1754812800,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2);
+        for (i, req) in requests.iter().enumerate() {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(
+                body["priority"], -1754812800i64,
+                "attempt {i}: default-pool members all receive the deadline priority"
+            );
+        }
     }
 
     // Some upstreams return HTTP 200 and put the real error in the body. These
@@ -2100,7 +2278,7 @@ mod tests {
             .build();
         targets_map.insert(
             "limited-model".to_string(),
-            ProviderPool::new(vec![Provider::with_concurrency_limit(target, 1, 5)]),
+            ProviderPool::new(vec![Provider::with_concurrency_limit(target, 1, 5)]).into(),
         );
 
         let targets = Targets {
@@ -2153,7 +2331,8 @@ mod tests {
                 target::LoadBalanceStrategy::default(),
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
 
         let targets = Targets {
@@ -2305,7 +2484,7 @@ mod tests {
         #[fixture]
         #[once]
         fn get_shared_metrics_servers(
-            #[default(Arc::new(DashMap::new()))] targets: Arc<DashMap<String, ProviderPool>>,
+            #[default(Arc::new(DashMap::new()))] targets: Arc<DashMap<String, target::TargetPools>>,
         ) -> (TestServer, TestServer) {
             let targets = Targets {
                 targets,
@@ -2824,7 +3003,7 @@ mod tests {
             let pool = ProviderPool::new(providers);
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("test-model".to_string(), pool);
+            targets_map.insert("test-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
@@ -2880,7 +3059,7 @@ mod tests {
             let pool = ProviderPool::new(providers);
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("weighted-model".to_string(), pool);
+            targets_map.insert("weighted-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
@@ -2946,7 +3125,7 @@ mod tests {
             );
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("single-model".to_string(), pool);
+            targets_map.insert("single-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
@@ -3138,7 +3317,8 @@ mod tests {
                 target::LoadBalanceStrategy::Priority,
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
         let targets = Targets {
             targets: targets_map,
@@ -3305,7 +3485,8 @@ mod tests {
                 target::LoadBalanceStrategy::Priority,
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
         let targets = Targets {
             targets: targets_map,
@@ -3389,7 +3570,8 @@ mod tests {
                 target::LoadBalanceStrategy::Priority,
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
         let targets = Targets {
             targets: targets_map,
@@ -3827,7 +4009,7 @@ mod tests {
             ]);
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("test-model".to_string(), pool);
+            targets_map.insert("test-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
@@ -4035,6 +4217,193 @@ mod tests {
             // When sanitization is disabled, upstream error body should pass through
             let body: serde_json::Value = response.json();
             assert_eq!(body["error"]["message"], "provider-specific detail");
+        }
+    }
+
+    /// Per-request-class pools, end to end through the router.
+    ///
+    /// A composite with a `completions` pool must send `/v1/completions` into
+    /// that pool and everything else into `default`. Asserted on the URL the
+    /// upstream client actually received, under both routers.
+    mod completions_pool {
+        use super::*;
+        use crate::target::{COMPLETIONS_POOL, LoadBalanceStrategy, TargetPools};
+        use std::collections::HashMap;
+
+        fn priority_pool(urls: &[&str]) -> ProviderPool {
+            ProviderPool::with_config(
+                urls.iter()
+                    .map(|url| {
+                        Provider::new(Target::builder().url(url.parse().unwrap()).build(), 1)
+                    })
+                    .collect(),
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            )
+        }
+
+        /// dynamo sits at position 0 of BOTH pools — the same hosted model is a
+        /// member of each, with independent ordering behind it.
+        fn flash_pools() -> TargetPools {
+            TargetPools::with_pools(
+                priority_pool(&[
+                    "https://dynamo.example.com",
+                    "https://openrouter.example.com",
+                ]),
+                HashMap::from([(
+                    COMPLETIONS_POOL.to_string(),
+                    priority_pool(&[
+                        "https://dynamo.example.com",
+                        "https://fireworks.example.com",
+                    ]),
+                )]),
+            )
+        }
+
+        fn server_with(strict_mode: bool, pools: TargetPools) -> (TestServer, MockHttpClient) {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("dsv4-flash".to_string(), pools);
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+                key_labels: Arc::new(DashMap::new()),
+                strict_mode,
+                http_pool_config: None,
+            };
+            let mock_client = MockHttpClient::new(
+                StatusCode::OK,
+                r#"{"id":"cmpl-1","object":"text_completion","created":0,"model":"dsv4-flash","choices":[]}"#,
+            );
+            let app_state = AppState::with_client(targets, mock_client.clone());
+            let server = TestServer::new(build_router(app_state)).unwrap();
+            (server, mock_client)
+        }
+
+        /// The completions pool's first member answers — the on-prem one, which
+        /// is free for us; the validated third-party target is its failover.
+        #[tokio::test]
+        async fn completions_requests_are_served_by_the_completions_pool() {
+            for strict_mode in [false, true] {
+                let (server, client) = server_with(strict_mode, flash_pools());
+                let response = server
+                    .post("/v1/completions")
+                    .json(&json!({"model": "dsv4-flash", "prompt": [1, 2, 3]}))
+                    .await;
+                assert_eq!(
+                    response.status_code(),
+                    StatusCode::OK,
+                    "strict={strict_mode}"
+                );
+
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1, "strict={strict_mode}");
+                assert!(
+                    requests[0].uri.starts_with("https://dynamo.example.com/"),
+                    "strict={strict_mode}: got {}",
+                    requests[0].uri
+                );
+            }
+        }
+
+        /// "Never serves chat" is structural: the validated completions target
+        /// is not a member of the default pool, so chat traffic cannot reach it
+        /// even when the default pool fails over.
+        #[tokio::test]
+        async fn chat_requests_never_reach_the_completions_pool() {
+            for strict_mode in [false, true] {
+                let (server, client) = server_with(strict_mode, flash_pools());
+                let response = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({
+                        "model": "dsv4-flash",
+                        "messages": [{"role": "user", "content": "hi"}]
+                    }))
+                    .await;
+                assert!(
+                    response.status_code().is_success(),
+                    "strict={strict_mode}: {}",
+                    response.status_code()
+                );
+
+                let requests = client.requests.lock().unwrap();
+                assert!(
+                    requests.iter().all(|r| !r.uri.contains("fireworks")),
+                    "strict={strict_mode}: {:?}",
+                    requests.iter().map(|r| r.uri.clone()).collect::<Vec<_>>()
+                );
+            }
+        }
+
+        /// Rule 3: a composite with no completions pool serves completions from
+        /// its default pool, exactly as before named pools existed.
+        #[tokio::test]
+        async fn a_composite_without_a_completions_pool_serves_completions_from_default() {
+            for strict_mode in [false, true] {
+                let (server, client) = server_with(
+                    strict_mode,
+                    priority_pool(&["https://dynamo.example.com"]).into(),
+                );
+                let response = server
+                    .post("/v1/completions")
+                    .json(&json!({"model": "dsv4-flash", "prompt": "hi"}))
+                    .await;
+                assert_eq!(
+                    response.status_code(),
+                    StatusCode::OK,
+                    "strict={strict_mode}"
+                );
+
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1, "strict={strict_mode}");
+                assert!(
+                    requests[0].uri.starts_with("https://dynamo.example.com/"),
+                    "strict={strict_mode}: got {}",
+                    requests[0].uri
+                );
+            }
+        }
+
+        /// An EMPTY completions pool is treated as an absent one: the default
+        /// pool serves the class, exactly as it did before the pool existed.
+        ///
+        /// A pool whose members were all removed or disabled must not start
+        /// 503-ing traffic the default pool handled the day before. Resume legs
+        /// are kept off unvalidated members upstream of here — dwctl only calls
+        /// a model resumable while its completions pool has a member.
+        #[tokio::test]
+        async fn an_empty_completions_pool_falls_back_to_the_default() {
+            let pools = TargetPools::with_pools(
+                priority_pool(&["https://openrouter.example.com"]),
+                HashMap::from([(COMPLETIONS_POOL.to_string(), ProviderPool::new(vec![]))]),
+            );
+            assert!(
+                pools
+                    .resolved_name(crate::target::RequestClass::Completions)
+                    .is_none(),
+                "an empty pool is not a picked pool"
+            );
+            let (server, client) = server_with(false, pools);
+
+            let response = server
+                .post("/v1/completions")
+                .json(&json!({"model": "dsv4-flash", "prompt": "hi"}))
+                .await;
+            assert_eq!(response.status_code(), StatusCode::OK);
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0]
+                    .uri
+                    .starts_with("https://openrouter.example.com/"),
+                "got {}",
+                requests[0].uri
+            );
         }
     }
 }

@@ -8,8 +8,8 @@ use crate::{
     api::models::{
         cache_pricing::CachePricingResponse,
         deployments::{
-            ComponentEndpointSummary, ComponentModelSummary, DeployedModelResponse, ModelComponentResponse, ModelMetrics, ModelProbeStatus,
-            ModelType,
+            ComponentEndpointSummary, ComponentModelSummary, ComponentPool, DeployedModelResponse, ModelComponentResponse, ModelMetrics,
+            ModelProbeStatus, ModelType,
         },
         inference_endpoints::InferenceEndpointResponse,
     },
@@ -425,6 +425,7 @@ impl<'a> DeployedModelEnricher<'a> {
         ModelComponentResponse {
             weight: c.weight,
             enabled: c.enabled,
+            pool: ComponentPool::from_db(&c.pool),
             sort_order: c.sort_order,
             created_at: c.created_at,
             model: ComponentModelSummary {
@@ -674,6 +675,7 @@ mod tests {
                 auth_header_name: "Authorization".to_string(),
                 auth_header_prefix: "Bearer ".to_string(),
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: Uuid::new_v4(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),

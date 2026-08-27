@@ -19,7 +19,8 @@ pub struct ApiKeyCreate {
     pub name: String,
     pub description: Option<String>,
     /// Purpose of the API key. Defaults to 'realtime' if not specified.
-    /// 'platform' keys require PlatformManager role. 'batch' and 'playground' are reserved for internal system use.
+    /// 'platform' keys require PlatformManager role. 'batch', 'playground' and
+    /// 'continuation' are reserved for internal system use.
     #[serde(default = "default_api_key_purpose")]
     pub purpose: ApiKeyPurpose,
     /// Per-API-key rate limit: requests per second (null = no limit)

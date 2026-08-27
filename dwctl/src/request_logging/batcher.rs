@@ -1619,6 +1619,7 @@ fn parse_api_key_purpose(s: &str) -> ApiKeyPurpose {
         "platform" => ApiKeyPurpose::Platform,
         "batch" => ApiKeyPurpose::Batch,
         "playground" => ApiKeyPurpose::Playground,
+        "continuation" => ApiKeyPurpose::Continuation,
         _ => ApiKeyPurpose::Realtime,
     }
 }
@@ -1860,6 +1861,7 @@ mod integration_tests {
                 auth_header_name: Some("Authorization".to_string()),
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
             })
             .await
             .unwrap();

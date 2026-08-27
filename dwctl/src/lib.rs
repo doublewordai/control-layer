@@ -145,6 +145,7 @@ pub mod auth;
 pub mod config;
 mod config_watcher;
 pub mod connections;
+pub mod continuation;
 mod crypto;
 pub mod db;
 mod email;
@@ -962,6 +963,16 @@ async fn setup_database(
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
 
+    // Provision the global continuation key (hidden, SYSTEM-owned — system
+    // ownership is what admits it to every model's onwards keyset regardless of
+    // group gating or pricing) so it exists and has synced into the onwards key
+    // cache before the first resume attempt.
+    if config.continuation.enabled {
+        continuation::provision_global_key(&db_pools)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to provision continuation key: {}", e))?;
+    }
+
     // Seed database with initial configuration (only runs once)
     seed_database(&config.model_sources, &db_pools).await?;
 
@@ -1644,7 +1655,7 @@ pub async fn build_router(
     // outermost → innermost (i.e. reverse of the code order), is:
     //
     //   inference_mw  →  outlet (logging/billing)  →  translation
-    //                →  cache  →  error_enrichment  →  image_normalizer
+    //                →  cache  →  continuation  →  error_enrichment  →  image_normalizer
     //                →  models_route  →  onwards
     //
     // Why this order:
@@ -1730,6 +1741,65 @@ pub async fn build_router(
         state.db.write().clone(),
         error_enrichment::error_enrichment_middleware,
     ));
+
+    // Apply the mid-stream continuation (resume) layer. It sits between the cache
+    // layer and error enrichment for two reasons: outlet and the cache see ONE
+    // logical stream with the single merged usage frame it emits (no analytics or
+    // cache surgery), and — the load-bearing one — the router it resumes INTO is
+    // the clone taken right here, so a resume leg re-enters BELOW outlet and the
+    // cache and produces no second analytics row, billing record or classify.
+    // Added only when enabled; otherwise the stack is byte-identical to today.
+    let onwards_router = {
+        let cfg = state.current_config();
+        if cfg.continuation.enabled {
+            // The resume target: everything inner to this layer (error
+            // enrichment → image normaliser → tool injection → onwards).
+            // `with_state` here is the same binding the outer `nest` applies to
+            // this router — it only erases the state type so the clone is a
+            // ready-to-call service, it does not change routing.
+            let resume_target = onwards_router.clone().with_state(state.clone());
+            let body_limit = match cfg.limits.requests.max_body_size {
+                0 => usize::MAX,
+                n => usize::try_from(n).unwrap_or(usize::MAX),
+            };
+            match crate::continuation::ContinuationState::build(
+                &cfg.continuation,
+                &cfg.cache.tokenizer_url,
+                state.db.write().clone(),
+                resume_target,
+                body_limit,
+            )
+            .await
+            {
+                Ok(continuation_state) => {
+                    tracing::info!("Mid-stream continuation enabled - wiring resume layer into onwards stack");
+                    crate::continuation::metrics::record_layer_wired(true);
+                    onwards_router.layer(middleware::from_fn_with_state(
+                        continuation_state,
+                        crate::continuation::continuation_middleware,
+                    ))
+                }
+                Err(e) => {
+                    // A missing continuation key must not take the gateway down:
+                    // without the layer, streams die exactly as they do today.
+                    // The gauge + background error are the ONLY signals that a
+                    // deployment which asked for continuation is serving without
+                    // it — no request ever fails because of this.
+                    crate::background_error!(
+                        crate::metrics::errors::component::CONTINUATION,
+                        "state_build",
+                        Error,
+                        error = %e,
+                        "Failed to build continuation state - resume layer NOT wired"
+                    );
+                    crate::continuation::metrics::record_layer_wired(false);
+                    onwards_router
+                }
+            }
+        } else {
+            onwards_router
+        }
+    };
 
     // Apply the cached-input pricing layer (dwctl-owned). Placed inner
     // to outlet so the billing/analytics capture sees the injected `cache_*` usage
@@ -2379,7 +2449,7 @@ impl BackgroundServices {
         let expected: Vec<(String, Option<onwards::auth::KeySet>)> = new_targets
             .targets
             .iter()
-            .map(|entry| (entry.key().clone(), entry.value().keys().cloned()))
+            .map(|entry| (entry.key().clone(), entry.value().default_pool().keys().cloned()))
             .collect();
 
         // Kept so the update can be re-asserted below. `Targets` is a handle of
@@ -2426,7 +2496,7 @@ impl BackgroundServices {
             let applied = live.len() == expected.len()
                 && expected
                     .iter()
-                    .all(|(alias, keys)| live.get(alias).is_some_and(|pool| pool.keys() == keys.as_ref()));
+                    .all(|(alias, keys)| live.get(alias).is_some_and(|pool| pool.default_pool().keys() == keys.as_ref()));
 
             let now = std::time::Instant::now();
             if applied {
