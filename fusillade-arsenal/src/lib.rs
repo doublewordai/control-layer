@@ -370,7 +370,6 @@ mod tests {
             "idx_requests_pending_background_batchless",
             "idx_requests_pending_background_batched",
             "idx_requests_pending_batchless_sla",
-            "idx_requests_active_sla_counts",
         ] {
             let relation_exists =
                 sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
@@ -381,6 +380,27 @@ mod tests {
             assert!(
                 relation_exists,
                 "the pre-created relation {relation_name} must remain"
+            );
+        }
+
+        // idx_requests_active_sla_counts is pre-created above like the others,
+        // but a later migration (20260827) supersedes it with
+        // idx_requests_active_batched_demand and drops it, so after the full
+        // migration run it must be gone and its replacement present.
+        for (relation_name, must_exist) in [
+            ("idx_requests_active_sla_counts", false),
+            ("idx_requests_active_non_priority_counts", false),
+            ("idx_requests_active_batched_demand", true),
+        ] {
+            let relation_exists =
+                sqlx::query_scalar::<_, bool>("SELECT to_regclass($1) IS NOT NULL")
+                    .bind(relation_name)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                relation_exists, must_exist,
+                "{relation_name} presence after migrations must be {must_exist}"
             );
         }
 
