@@ -30,11 +30,23 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 //
 // `#[used]` is load-bearing: nothing in this crate reads the static, so without
 // it the symbol is dropped before linking and jemalloc silently keeps its
-// defaults. Verified by checking the symbol is present in the built binary.
+// defaults.
+//
+// The symbol name is equally load-bearing. tikv-jemalloc-sys builds jemalloc
+// with `--with-jemalloc-prefix=_rjem_` unless the
+// `unprefixed_malloc_on_supported_platforms` feature is on, so the global it
+// reads its options from is `_rjem_malloc_conf` (and the environment variable
+// is `_RJEM_MALLOC_CONF`). Exporting plain `malloc_conf` links fine and is
+// silently ignored: 10.16.0 shipped that way and ran with
+// `background_thread:false, dirty_decay_ms:10000, muzzy_decay_ms:0`.
+//
+// Verify against the built image rather than the symbol table:
+//   _RJEM_MALLOC_CONF=stats_print:true /app/dwctl --help 2>&1 | grep -E "background_thread|decay_ms"
+// must print `opt.background_thread: true` and 5000 for both decay values.
 #[cfg(target_os = "linux")]
 #[used]
 #[allow(non_upper_case_globals)]
-#[unsafe(export_name = "malloc_conf")]
+#[unsafe(export_name = "_rjem_malloc_conf")]
 pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
 
 /// Wait for shutdown signal (SIGTERM or Ctrl+C)
