@@ -2918,6 +2918,14 @@ export const handlers = [
     // confirm, and the response keeps the current email.
     const { email, ...rest } = body;
     const newEmail = email?.trim().toLowerCase();
+    // The backend validates the address before raising a pending change;
+    // an empty or malformed email is a 400, never a pending state.
+    if (newEmail !== undefined && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+      return HttpResponse.json(
+        { error: "Invalid email address" },
+        { status: 400 },
+      );
+    }
     const emailChanged =
       newEmail !== undefined && newEmail !== org.email.toLowerCase();
     return HttpResponse.json({
