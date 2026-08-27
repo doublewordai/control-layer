@@ -465,16 +465,7 @@ impl Request<Processing> {
                     FusilladeError::HttpClientTimeout(error) => FailureReason::Timeout {
                         error: error.clone(),
                     },
-                    FusilladeError::FirstChunkTimeout(msg) => {
-                        FailureReason::Timeout { error: msg.clone() }
-                    }
                     FusilladeError::UploadStallTimeout(msg) => {
-                        FailureReason::Timeout { error: msg.clone() }
-                    }
-                    FusilladeError::TokensTimeout(msg) => {
-                        FailureReason::Timeout { error: msg.clone() }
-                    }
-                    FusilladeError::BodyTimeout(msg) => {
                         FailureReason::Timeout { error: msg.clone() }
                     }
                     _ => FailureReason::NetworkError {

@@ -135,13 +135,9 @@ impl StoredExchange {
         // the row in front of a human, consistent with the other refusals here.
         let status = StatusCode::from_u16(self.status_code).map_err(|_| RecomputeError::BadStatus(self.status_code))?;
 
-        // The serializer reads `x-fusillade-stream` to know a streaming response is coming
-        // even when the captured body has no `stream:true` (onwards injects it downstream).
-        // Setting it here is how a replay reproduces that dispatch.
-        let mut headers: HashMap<String, Vec<Bytes>> = HashMap::new();
-        if self.streamed {
-            headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from_static(b"true")]);
-        }
+        // No dispatch headers to reproduce: the serializer decides whether a captured
+        // body is a stream by looking at the body, so a replay needs nothing but the row.
+        let headers: HashMap<String, Vec<Bytes>> = HashMap::new();
 
         let request_data = RequestData {
             correlation_id: 0,

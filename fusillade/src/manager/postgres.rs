@@ -62,7 +62,6 @@ where
                 Duration::from_millis(config.first_chunk_timeout_ms),
                 Duration::from_millis(config.chunk_timeout_ms),
                 Duration::from_millis(config.body_timeout_ms),
-                config.streamable_endpoints.clone(),
             )
             .with_upload_stall_timeout(Duration::from_millis(config.upload_stall_timeout_ms))
             .with_upload_chunk_bytes(config.upload_chunk_bytes)
