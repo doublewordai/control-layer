@@ -39,6 +39,9 @@ async fn setup_streaming_fixture(pool: &PgPool, mock_endpoint_url: String, model
     let mut config = crate::test::utils::create_test_config();
     config.background_services.onwards_sync.enabled = true;
     config.enable_request_logging = true;
+    // Batch traffic to these paths is forced to stream and reassembled on the way
+    // back, which is what these fixtures exercise.
+    config.background_services.batch_daemon.streamable_endpoints = vec!["/v1/chat/completions".to_string(), "/v1/completions".to_string()];
 
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
         .await
@@ -645,7 +648,7 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         .server
         .post("/ai/v1/chat/completions")
         .add_header("authorization", format!("Bearer {}", fixture.api_key))
-        .add_header("x-fusillade-stream", "true")
+        .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "Hello from E2E test"}]
@@ -653,7 +656,9 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         .await;
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
-    assert_eq!(inference_response.text(), sse_response);
+    let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(assembled["choices"][0]["message"]["content"], "Hello! How can I help you today?");
+    assert_eq!(assembled["usage"]["total_tokens"], 21);
     assert_usage_recorded(&fixture, "http://localhost/chat/completions", 9, 12).await;
     cleanup_fixture(fixture).await;
 }
@@ -685,7 +690,7 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         .server
         .post("/ai/v1/completions")
         .add_header("authorization", format!("Bearer {}", fixture.api_key))
-        .add_header("x-fusillade-stream", "true")
+        .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "prompt": "Hello from E2E test"
@@ -693,7 +698,8 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         .await;
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
-    assert_eq!(inference_response.text(), sse_response);
+    let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(assembled["usage"]["total_tokens"], 20);
     assert_usage_recorded(&fixture, "http://localhost/completions", 8, 12).await;
     cleanup_fixture(fixture).await;
 }

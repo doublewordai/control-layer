@@ -130,15 +130,6 @@ impl AnalyticsHandler {
             config,
         }
     }
-
-    fn is_fusillade_stream(request_data: &RequestData) -> bool {
-        request_data
-            .headers
-            .get("x-fusillade-stream")
-            .and_then(|values| values.first())
-            .and_then(|bytes| std::str::from_utf8(bytes).ok())
-            == Some("true")
-    }
 }
 
 impl RequestHandler for AnalyticsHandler {
@@ -164,8 +155,6 @@ impl RequestHandler for AnalyticsHandler {
         );
 
         async {
-            let fusillade_stream = Self::is_fusillade_stream(&request_data);
-
             // Whether this is a token-bearing generative endpoint. Gates the
             // parse / zero-token alarms only, so non-generative routes (e.g.
             // /models) never trip them.
@@ -187,7 +176,6 @@ impl RequestHandler for AnalyticsHandler {
                     ANALYTICS, "parse_error", Error,
                     correlation_id = correlation_id,
                     uri = %request_data.uri,
-                    fusillade_stream,
                     error = %zdr_safe_parse_error(e.error.as_ref()),
                     "Failed to parse a successful generative response"
                 );
@@ -209,7 +197,6 @@ impl RequestHandler for AnalyticsHandler {
                     correlation_id = correlation_id,
                     uri = %request_data.uri,
                     response_type = %metrics.response_type,
-                    fusillade_stream,
                     request_model = ?metrics.request_model,
                     response_model = ?metrics.response_model,
                     "Successful generative response recorded zero tokens"

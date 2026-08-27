@@ -14,7 +14,7 @@
 //! - **image_normalizer_middleware**: body-rewriting image normalisation shared
 //!   by the chat-completions and responses surfaces.
 //! - **outbound_request**: last-mile streaming usage-flag injection
-//!   (`stream_options` / `x-fusillade-stream`) before onwards. The id-scrub lives
+//!   (`stream_options`, and forcing `stream` on batch traffic) before onwards. The id-scrub lives
 //!   in this module's own request parse (`scrub_request_id_fields`), not here.
 //! - **engine**: the multi-step Open Responses orchestration loop and the
 //!   daemon-side request processor.
