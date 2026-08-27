@@ -656,7 +656,9 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         .await;
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
-    assert_eq!(inference_response.text(), sse_response);
+    let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(assembled["choices"][0]["message"]["content"], "Hello! How can I help you today?");
+    assert_eq!(assembled["usage"]["total_tokens"], 21);
     assert_usage_recorded(&fixture, "http://localhost/chat/completions", 9, 12).await;
     cleanup_fixture(fixture).await;
 }
@@ -696,7 +698,8 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         .await;
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
-    assert_eq!(inference_response.text(), sse_response);
+    let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(assembled["usage"]["total_tokens"], 20);
     assert_usage_recorded(&fixture, "http://localhost/completions", 8, 12).await;
     cleanup_fixture(fixture).await;
 }
