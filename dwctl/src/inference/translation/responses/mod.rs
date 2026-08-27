@@ -26,7 +26,7 @@ use self::types::ResponsesRequest;
 
 use super::{ProtocolTranslator, StreamReframer, TranslatedRequest, TranslationError};
 
-/// Translator for the OpenAI Responses API. Pure and stateless; see module docs.
+/// Translator for the OpenAI Responses API.
 pub struct OpenResponses;
 
 impl OpenResponses {

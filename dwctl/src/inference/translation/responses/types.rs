@@ -141,6 +141,10 @@ pub struct ResponsesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_response_id: Option<String>,
 
+    /// Additional response data to project into output items.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub include: Option<Vec<Include>>,
+
     /// Whether to store this response for future reference
     #[serde(skip_serializing_if = "Option::is_none")]
     pub store: Option<bool>,
@@ -156,6 +160,10 @@ pub struct ResponsesRequest {
     /// Nucleus sampling parameter
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
+
+    /// Number of most likely tokens to include for each sampled output token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_logprobs: Option<u32>,
 
     /// Maximum output tokens
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -211,6 +219,21 @@ pub struct ResponsesRequest {
     /// Additional fields not explicitly modeled
     #[serde(flatten)]
     pub extra: Option<serde_json::Value>,
+}
+
+impl ResponsesRequest {
+    pub fn includes(&self, value: Include) -> bool {
+        self.include.as_ref().is_some_and(|values| values.contains(&value))
+    }
+}
+
+/// Optional response projections defined by the Open Responses specification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Include {
+    #[serde(rename = "reasoning.encrypted_content")]
+    ReasoningEncryptedContent,
+    #[serde(rename = "message.output_text.logprobs")]
+    MessageOutputTextLogprobs,
 }
 
 /// Input to the model - either a string or array of items
@@ -957,6 +980,30 @@ mod tests {
 
         let request: ResponsesRequest = serde_json::from_str(json).unwrap();
         assert_eq!(request.previous_response_id, Some("resp_abc123".to_string()));
+    }
+
+    #[test]
+    fn standard_include_values_deserialize() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "include": ["reasoning.encrypted_content", "message.output_text.logprobs"]
+        }))
+        .unwrap();
+
+        assert!(request.includes(Include::ReasoningEncryptedContent));
+        assert!(request.includes(Include::MessageOutputTextLogprobs));
+    }
+
+    #[test]
+    fn unknown_include_value_is_rejected() {
+        let result = serde_json::from_value::<ResponsesRequest>(serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "include": ["not.a.real.projection"]
+        }));
+
+        assert!(result.is_err());
     }
 
     #[test]

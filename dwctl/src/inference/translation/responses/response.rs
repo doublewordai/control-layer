@@ -14,7 +14,7 @@ use onwards::strict::schemas::chat_completions::{
 };
 
 use super::types::{
-    ContentPart, FunctionCallItem, Item, ItemStatus, MessageContent as ResponseMessageContent, MessageItem, ReasoningContent,
+    ContentPart, FunctionCallItem, Include, Item, ItemStatus, MessageContent as ResponseMessageContent, MessageItem, ReasoningContent,
     ReasoningItem, ResponseStatus, ResponsesRequest, ResponsesResponse, SummaryContent, TextConfig, TextFormat, TruncationStrategy,
 };
 use super::util::{chat_usage_to_response_usage, merge_reasoning_text};
@@ -27,10 +27,18 @@ pub fn to_responses_response(
     request: &ResponsesRequest,
     response_id: Option<&str>,
 ) -> ResponsesResponse {
+    let include_logprobs = request.includes(Include::MessageOutputTextLogprobs);
     let output = chat_response
         .choices
         .iter()
-        .flat_map(|choice| message_to_items(&choice.message, choice.finish_reason.as_deref()))
+        .flat_map(|choice| {
+            message_to_items_with_projections(
+                &choice.message,
+                choice.finish_reason.as_deref(),
+                choice.logprobs.as_ref(),
+                include_logprobs,
+            )
+        })
         .collect();
 
     let status = determine_response_status(&chat_response.choices);
@@ -71,7 +79,7 @@ pub fn to_responses_response(
         top_p: request.top_p.unwrap_or(1.0),
         presence_penalty: 0.0,
         frequency_penalty: 0.0,
-        top_logprobs: 0,
+        top_logprobs: request.top_logprobs.unwrap_or(0),
         temperature: request.temperature.unwrap_or(1.0),
         reasoning: serde_json::to_value(&request.reasoning).unwrap_or(serde_json::Value::Null),
         usage: chat_response.usage.as_ref().map(chat_usage_to_response_usage),
@@ -89,6 +97,15 @@ pub fn to_responses_response(
 /// Convert a Chat Completions message to Responses output items: an optional
 /// leading reasoning item, the text message, then any function-call items.
 pub fn message_to_items(message: &ChatMessage, finish_reason: Option<&str>) -> Vec<Item> {
+    message_to_items_with_projections(message, finish_reason, None, false)
+}
+
+fn message_to_items_with_projections(
+    message: &ChatMessage,
+    finish_reason: Option<&str>,
+    chat_logprobs: Option<&serde_json::Value>,
+    include_logprobs: bool,
+) -> Vec<Item> {
     let mut items = Vec::new();
     let status = match finish_reason {
         Some("length") => Some(ItemStatus::Incomplete),
@@ -133,7 +150,7 @@ pub fn message_to_items(message: &ChatMessage, finish_reason: Option<&str>) -> V
                 content: ResponseMessageContent::Parts(vec![ContentPart::OutputText {
                     text: content_text,
                     annotations: vec![],
-                    logprobs: vec![],
+                    logprobs: projected_logprobs(chat_logprobs, include_logprobs),
                 }]),
                 status,
             }));
@@ -153,6 +170,17 @@ pub fn message_to_items(message: &ChatMessage, finish_reason: Option<&str>) -> V
     }
 
     items
+}
+
+fn projected_logprobs(chat_logprobs: Option<&serde_json::Value>, include: bool) -> Vec<serde_json::Value> {
+    if !include {
+        return Vec::new();
+    }
+    chat_logprobs
+        .and_then(|value| value.get("content"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// Determine the response status from Chat Completions choices.
@@ -339,5 +367,37 @@ mod tests {
         let ids: Vec<String> = (0..100).map(|_| generate_item_id()).collect();
         let unique: std::collections::HashSet<&String> = ids.iter().collect();
         assert_eq!(ids.len(), unique.len());
+    }
+
+    #[test]
+    fn output_text_logprobs_include_projects_chat_content_logprobs() {
+        let mut chat = chat_response_with_usage(10, 5);
+        let token_logprob = serde_json::json!({
+            "token": "done",
+            "logprob": -0.1,
+            "bytes": [100, 111, 110, 101],
+            "top_logprobs": []
+        });
+        chat.choices[0].logprobs = Some(serde_json::json!({"content": [token_logprob.clone()]}));
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "include": ["message.output_text.logprobs"],
+            "top_logprobs": 2
+        }))
+        .unwrap();
+
+        let response = to_responses_response(&chat, &request, None);
+        assert_eq!(response.top_logprobs, 2);
+        let Item::Message(message) = &response.output[0] else {
+            panic!("first output item should be a message");
+        };
+        let ResponseMessageContent::Parts(parts) = &message.content else {
+            panic!("message content should be parts");
+        };
+        let ContentPart::OutputText { logprobs, .. } = &parts[0] else {
+            panic!("message content should be output_text");
+        };
+        assert_eq!(logprobs, &vec![token_logprob]);
     }
 }

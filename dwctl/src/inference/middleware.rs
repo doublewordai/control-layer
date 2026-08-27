@@ -140,6 +140,58 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
 
+    // Stateful continuation requires the prior response body. Realtime ZDR
+    // deliberately never retains that body, while queued ZDR crypto-shreds it,
+    // so reject the contract before touching the response store. Besides being
+    // clearer for callers, this avoids turning an unavailable/minimal stored
+    // object into a hydration 5xx.
+    let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
+    if is_responses_api {
+        if let Some(include) = request_value.get("include")
+            && !include.is_null()
+        {
+            let Ok(include) = serde_json::from_value::<Vec<crate::inference::translation::responses::types::Include>>(include.clone())
+            else {
+                return invalid_request_response(
+                    "include must contain only supported Responses API projection values",
+                    "invalid_parameter",
+                    "include",
+                );
+            };
+            if include.contains(&crate::inference::translation::responses::types::Include::ReasoningEncryptedContent) {
+                return invalid_request_response(
+                    "reasoning.encrypted_content is not supported by this Responses API implementation",
+                    "unsupported_parameter",
+                    "include",
+                );
+            }
+        }
+
+        let has_encrypted_reasoning_replay = request_value
+            .get("input")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning")
+                        && item.get("encrypted_content").is_some_and(|value| !value.is_null())
+                })
+            });
+        if has_encrypted_reasoning_replay {
+            return invalid_request_response(
+                "encrypted reasoning item replay is not supported by this Responses API implementation",
+                "unsupported_parameter",
+                "input",
+            );
+        }
+    }
+    if is_responses_api && zdr && request_value.get("previous_response_id").is_some_and(|id| !id.is_null()) {
+        return invalid_request_response(
+            "previous_response_id is not supported when zero-data retention is enabled",
+            "zdr_state_not_supported",
+            "previous_response_id",
+        );
+    }
+
     // Inject server-side resolved tools into the request body so the
     // multi-step path's transition function (which reads `body["tools"]`
     // and forwards them to upstream model_call payloads) sees them.
@@ -415,7 +467,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // Realtime ZDR is non-persistence (no encryption): decided per-key
             // from the same policy map as flex, but without a keystore since we
             // suppress the stored copies rather than encrypt them.
-            let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
             let realtime_input = fusillade::CreateRealtimeInput {
                 request_id,
                 // ZDR: never persist the request body to `request_templates`
@@ -437,7 +488,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // retrieve key off the stored body's sentinel instead of re-checking.
             // The tool-using case is already rejected above, before the warm-path
             // branch, for both tiers.
-            let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
             // Flex encrypts the body at rest, which requires a configured
             // keystore. A ZDR account whose request cannot be encrypted must fail
             // loudly - never silently fall back to plaintext, and bail before we
@@ -1168,6 +1218,24 @@ pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool 
     // external key steer the dynamo scheduler queue.
     method == axum::http::Method::POST
         && (path.ends_with("/responses") || path.ends_with("/completions") || path.ends_with("/messages") || path.ends_with("/embeddings"))
+}
+
+fn invalid_request_response(message: &str, code: &str, param: &str) -> Response {
+    Response::builder()
+        .status(StatusCode::BAD_REQUEST)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "error": {
+                    "message": message,
+                    "type": "invalid_request_error",
+                    "code": code,
+                    "param": param,
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap()
 }
 
 /// Client-supplied completion/response id keys to strip from a request body
