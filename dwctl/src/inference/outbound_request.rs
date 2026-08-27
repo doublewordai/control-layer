@@ -115,7 +115,11 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
         None => next.run(Request::from_parts(parts, Body::from(bytes))).await,
     };
 
-    if force_stream { reassemble_stream(response, cfg.timeouts).await } else { response }
+    if force_stream {
+        reassemble_stream(response, cfg.timeouts).await
+    } else {
+        response
+    }
 }
 
 /// Inject the streaming usage flags into a JSON body, returning `Some(new_bytes)`
@@ -234,7 +238,10 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
             .filter(|c| (400..600).contains(c))
             .unwrap_or(500);
 
-        warn!(embedded_status = code, "provider returned an error inside the SSE stream, reclassifying");
+        warn!(
+            embedded_status = code,
+            "provider returned an error inside the SSE stream, reclassifying"
+        );
         let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         return json_body_response(status, data.clone());
     }

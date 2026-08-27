@@ -41,8 +41,7 @@ async fn setup_streaming_fixture(pool: &PgPool, mock_endpoint_url: String, model
     config.enable_request_logging = true;
     // Batch traffic to these paths is forced to stream and reassembled on the way
     // back, which is what these fixtures exercise.
-    config.background_services.batch_daemon.streamable_endpoints =
-        vec!["/v1/chat/completions".to_string(), "/v1/completions".to_string()];
+    config.background_services.batch_daemon.streamable_endpoints = vec!["/v1/chat/completions".to_string(), "/v1/completions".to_string()];
 
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
         .await

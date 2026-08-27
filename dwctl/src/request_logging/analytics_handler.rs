@@ -130,7 +130,6 @@ impl AnalyticsHandler {
             config,
         }
     }
-
 }
 
 impl RequestHandler for AnalyticsHandler {

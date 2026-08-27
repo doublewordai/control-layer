@@ -23,9 +23,7 @@ pub use fusillade_core::request::*;
 pub use fusillade_core::response_step::{
     CreateStepInput, ResponseStep, ResponseStepStore, StepId, StepKind, StepState,
 };
-pub use http::{
-    HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient,
-};
+pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient};
 #[cfg(feature = "postgres")]
 pub use manager::DaemonExecutor;
 #[cfg(feature = "postgres")]

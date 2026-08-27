@@ -40,7 +40,6 @@ pub trait HttpClient: Send + Sync + Clone {
     /// - The request times out (either waiting for headers or between body chunks)
     /// - The URL is invalid
     async fn execute(&self, request: &RequestData, api_key: &str) -> Result<HttpResponse>;
-
 }
 
 // ============================================================================
