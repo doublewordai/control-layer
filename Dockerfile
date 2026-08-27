@@ -14,10 +14,13 @@ RUN cargo chef prepare --recipe-path recipe.json
 # Backend build stage
 FROM chef AS builder
 
-# Install build dependencies including Node.js
+# Install build dependencies including Node.js.
+# `make` is required by tikv-jemalloc-sys, which builds jemalloc from its C
+# sources via autotools rather than shipping a prebuilt library.
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    make \
     curl \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
