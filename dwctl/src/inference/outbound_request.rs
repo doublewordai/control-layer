@@ -80,7 +80,29 @@ pub struct OutboundConfig {
 /// scoped to requests carrying that header on a configured path. The daemon
 /// itself knows nothing about any of this.
 fn should_force_stream(cfg: &OutboundConfig, parts: &axum::http::request::Parts) -> bool {
-    parts.headers.contains_key("x-fusillade-request-id") && cfg.streamable_endpoints.iter().any(|e| e == parts.uri.path())
+    if !parts.headers.contains_key("x-fusillade-request-id") {
+        return false;
+    }
+    let path = dispatch_path(parts);
+    cfg.streamable_endpoints.iter().any(|e| path.ends_with(e.as_str()))
+}
+
+/// The path as the daemon addressed it, rather than as this layer sees it.
+///
+/// `streamable_endpoints` is configured in the daemon's terms
+/// (`/v1/chat/completions`), but this layer runs inside a router nested under a
+/// mount prefix, and nesting strips that prefix before the inner layers run. So
+/// `parts.uri.path()` is only the tail (`/chat/completions`) and never equals a
+/// configured value. `OriginalUri` carries the pre-nesting path, which still has
+/// the mount prefix on the front (`/ai/v1/chat/completions`), hence a suffix
+/// match rather than equality: the configured value is the part both sides agree
+/// on. Comparing against the stripped path silently matched nothing, which left
+/// batch traffic un-forced and un-reassembled.
+fn dispatch_path(parts: &axum::http::request::Parts) -> &str {
+    parts
+        .extensions
+        .get::<axum::extract::OriginalUri>()
+        .map_or_else(|| parts.uri.path(), |original| original.0.path())
 }
 
 pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, request: Request, next: Next) -> Response {
@@ -243,11 +265,11 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
             "provider returned an error inside the SSE stream, reclassifying"
         );
         let status = StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        return json_body_response(status, data.clone());
+        return json_body_response(parts, status, data.clone());
     }
 
     match sink.finish() {
-        Ok(body) => json_body_response(status, body),
+        Ok(body) => json_body_response(parts, status, body),
         Err(e) => {
             warn!(error = %e, "failed to reassemble SSE stream into a response body");
             sse_parse_error(&e.to_string())
@@ -344,13 +366,25 @@ fn sse_parse_error(detail: &str) -> Response {
     (StatusCode::BAD_GATEWAY, "failed to read upstream stream").into_response()
 }
 
-/// Build a JSON response carrying an already-serialised body.
-fn json_body_response(status: StatusCode, body: String) -> Response {
-    let mut resp = Response::new(Body::from(body));
-    *resp.status_mut() = status;
-    resp.headers_mut()
+/// Swap a reassembled body into the upstream response, keeping its headers.
+///
+/// Only the headers the swap invalidates are touched. Everything else the
+/// upstream sent (rate limits, request ids, tracing headers) carries through,
+/// because this sits on the batch hot path and is the last thing to see them
+/// before request logging captures the response.
+///
+/// `Content-Length` and `Content-Encoding` go because the body is a different
+/// size and is no longer encoded as the upstream encoded it; leaving either
+/// would describe the old body. `Content-Type` becomes JSON because the response
+/// is no longer a stream.
+fn json_body_response(mut parts: axum::http::response::Parts, status: StatusCode, body: String) -> Response {
+    parts.status = status;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.remove(header::CONTENT_ENCODING);
+    parts
+        .headers
         .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
-    resp
+    Response::from_parts(parts, Body::from(body))
 }
 
 #[cfg(test)]
@@ -587,6 +621,45 @@ mod tests {
     }
 
     /// Batch traffic on a configured path is what gets forced to stream.
+    /// The layer is applied inside a router nested under a prefix, so the path it
+    /// sees is the nested one while the configured endpoints are absolute. A unit
+    /// test that builds `Parts` by hand cannot catch that, so this drives a real
+    /// request through a real nest.
+    #[tokio::test]
+    async fn the_configured_path_matches_what_the_nested_router_sees() {
+        use axum::{Router, routing::post};
+
+        let seen: Arc<std::sync::Mutex<Option<bool>>> = Arc::new(std::sync::Mutex::new(None));
+        let probe = seen.clone();
+
+        let cfg = config(&["/v1/chat/completions"]);
+        let inner = Router::new()
+            .route("/chat/completions", post(|| async { "{}" }))
+            .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
+                let cfg = cfg.clone();
+                let probe = probe.clone();
+                async move {
+                    let (parts, body) = req.into_parts();
+                    *probe.lock().unwrap() = Some(should_force_stream(&cfg, &parts));
+                    next.run(Request::from_parts(parts, body)).await
+                }
+            }));
+        let app = Router::new().nest("/ai/v1", inner);
+
+        let server = axum_test::TestServer::new(app).unwrap();
+        server
+            .post("/ai/v1/chat/completions")
+            .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
+            .json(&serde_json::json!({"model": "m", "messages": []}))
+            .await;
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(true),
+            "the configured endpoint must match the path the nested layer actually sees"
+        );
+    }
+
     #[test]
     fn batch_traffic_on_a_streamable_path_is_forced() {
         let cfg = config(&["/v1/chat/completions"]);
