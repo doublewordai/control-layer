@@ -60,6 +60,58 @@ describe("OrganizationDetail", () => {
     expect(within(container).getByText("$250.00")).toBeInTheDocument();
   });
 
+  it("flags a pending email change next to the current email", async () => {
+    server.use(
+      http.get("/admin/api/v1/organizations/:id", () =>
+        HttpResponse.json({
+          id: "org-550e8400-0001",
+          username: "acme-corp",
+          display_name: "Acme Corporation",
+          email: "admin@acme.com",
+          created_at: "2025-01-15T10:00:00Z",
+          member_count: 5,
+          pending_email_change: {
+            new_email: "new-contact@acme.com",
+            expires_at: "2025-06-02T12:00:00Z",
+            // The current mailbox has confirmed; only the new one is outstanding.
+            old_email_confirmed_at: "2025-06-01T13:00:00Z",
+            new_email_confirmed_at: null,
+          },
+        }),
+      ),
+    );
+
+    const { container } = render(<OrganizationDetail />, {
+      wrapper: createWrapper("org-550e8400-0001"),
+    });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByText("Acme Corporation"),
+      ).toBeInTheDocument();
+    });
+
+    // Current email is still shown — the change hasn't been applied yet.
+    expect(within(container).getByText("admin@acme.com")).toBeInTheDocument();
+    expect(container.textContent).toMatch(
+      /pending change to new-contact@acme.com · waiting on new-contact@acme.com to confirm/i,
+    );
+  });
+
+  it("shows no pending badge when no email change is in flight", async () => {
+    const { container } = render(<OrganizationDetail />, {
+      wrapper: createWrapper("org-550e8400-0001"),
+    });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByText("Acme Corporation"),
+      ).toBeInTheDocument();
+    });
+
+    expect(container.textContent).not.toMatch(/pending change/i);
+  });
+
   it("shows not found for missing organization", async () => {
     server.use(
       http.get("/admin/api/v1/organizations/:id", () => {

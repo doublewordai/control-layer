@@ -1720,9 +1720,27 @@ export interface OrganizationSummary {
   can_manage_keys: boolean;
 }
 
+/**
+ * An organization contact-email change that is still awaiting verification.
+ * The backend never applies an email change directly: both the current and
+ * the new mailbox must click a confirmation link before `email` updates.
+ */
+export interface PendingEmailChange {
+  /** The address `email` will become once both sides confirm. */
+  new_email: string;
+  /** When the confirmation links expire (ISO 8601). */
+  expires_at: string;
+  /** When the new mailbox confirmed; null/absent while still outstanding. */
+  new_email_confirmed_at?: string | null;
+  /** When the current mailbox confirmed; null/absent while still outstanding. */
+  old_email_confirmed_at?: string | null;
+}
+
 /** Organization response — flattened User with org-specific fields */
 export interface Organization extends User {
   member_count?: number;
+  /** Present while an email change is waiting on confirmation. */
+  pending_email_change?: PendingEmailChange;
 }
 
 export interface OrganizationMember {
