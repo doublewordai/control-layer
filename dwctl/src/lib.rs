@@ -1679,11 +1679,30 @@ pub async fn build_router(
         .route("/models", get(api::handlers::ai_models::list_ai_models))
         .fallback_service(onwards_router);
 
-    // Last-mile request-body prep, applied innermost so it runs right before onwards
-    // (inner to cache, which must hash the original body). Does the id-scrub and the
-    // streaming usage-flag injection that onwards / the BodyTransformFn hook used to
-    // do, so onwards can forward the body untouched.
-    let onwards_router = onwards_router.layer(middleware::from_fn(crate::inference::outbound_request::outbound_request_middleware));
+    // Last-mile request-body prep and the matching response-side stream reassembly,
+    // applied innermost so it runs right before onwards (inner to cache, which must
+    // hash the original body). Does the id-scrub and the streaming usage-flag
+    // injection that onwards / the BodyTransformFn hook used to do, so onwards can
+    // forward the body untouched.
+    //
+    // Innermost is load-bearing for the response half: request logging is applied
+    // outer to this, so reassembling here means it sees one complete body rather
+    // than every SSE frame retained for the life of the request.
+    let onwards_router = {
+        let daemon = &state.current_config().background_services.batch_daemon;
+        let outbound_config = crate::inference::outbound_request::OutboundConfig {
+            streamable_endpoints: std::sync::Arc::new(daemon.streamable_endpoints.clone()),
+            timeouts: crate::inference::outbound_request::StreamTimeouts {
+                first_chunk: std::time::Duration::from_millis(daemon.first_chunk_timeout_ms),
+                chunk: std::time::Duration::from_millis(daemon.chunk_timeout_ms),
+                body: std::time::Duration::from_millis(daemon.body_timeout_ms),
+            },
+        };
+        onwards_router.layer(middleware::from_fn_with_state(
+            outbound_config,
+            crate::inference::outbound_request::outbound_request_middleware,
+        ))
+    };
 
     // Apply the image-input normaliser middleware. For each `/chat/completions` and `/responses`
     // request, it walks the body for HTTP(S) `image_url` values, fetches +

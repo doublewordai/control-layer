@@ -1666,9 +1666,11 @@ pub struct DaemonConfig {
     /// exist. Default: 100.
     pub purge_throttle_ms: u64,
 
-    /// Request paths that should use SSE streaming for usage tracking.
-    /// When a request's path matches, an `X-Fusillade-Stream` header is sent
-    /// and the response is read as SSE, then reassembled into non-streaming JSON.
+    /// Request paths whose batch traffic is dispatched as a stream so the provider
+    /// reports token usage, then reassembled back into a single JSON body before it
+    /// is stored or returned. Batch traffic is identified by the correlation header
+    /// the daemon stamps on everything it sends; a real client's request to the same
+    /// path is untouched.
     /// Example: `["/v1/chat/completions", "/v1/completions"]`
     #[serde(default)]
     pub streamable_endpoints: Vec<String>,
@@ -2067,7 +2069,6 @@ impl DaemonConfig {
             purge_interval_ms: self.purge_interval_ms,
             purge_batch_size: self.purge_batch_size,
             purge_throttle_ms: self.purge_throttle_ms,
-            streamable_endpoints: self.streamable_endpoints.clone(),
             urgency_weight: self.urgency_weight,
             inject_deadline_priority: self.inject_deadline_priority,
             background_concurrency_limit: self.background_concurrency_limit,
