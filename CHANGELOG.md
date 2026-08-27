@@ -1,5 +1,12 @@
 # Changelog
 
+## [10.17.1](https://github.com/doublewordai/control-layer/compare/v10.17.0...v10.17.1) (2026-08-27)
+
+
+### Bug Fixes
+
+* **fusillade:** retry successful responses with reasoning but no fina… ([#1528](https://github.com/doublewordai/control-layer/issues/1528)) ([fea9a98](https://github.com/doublewordai/control-layer/commit/fea9a983965c682af3c7851a2cdb93098f316c95))
+
 ## [10.17.0](https://github.com/doublewordai/control-layer/compare/v10.16.1...v10.17.0) (2026-08-27)
 
 
