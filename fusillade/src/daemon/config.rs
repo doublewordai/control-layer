@@ -296,19 +296,21 @@ pub struct DaemonConfig {
     /// Maximum time to the first streaming response event, in milliseconds.
     ///
     /// This includes connection setup, request upload, response headers, and
-    /// the first event. For non-streaming requests it contributes to the
-    /// combined overall request timeout with `body_timeout_ms`.
+    /// the first event. The daemon itself no longer reads streams, so it applies
+    /// `first_chunk_timeout_ms + body_timeout_ms` as one overall request timeout
+    /// and the layer that does read them enforces this budget on its own.
     pub first_chunk_timeout_ms: u64,
     /// Maximum idle time between subsequent SSE events, in milliseconds.
     ///
-    /// This only applies to endpoints listed in `streamable_endpoints` and
-    /// starts after the first event has arrived.
+    /// Starts after the first event has arrived. This is the budget that catches
+    /// a stream which opens and then stalls, and it has no equivalent in an
+    /// overall request timeout, so it is enforced only where the stream is read.
+    /// A stream that trips it comes back to the daemon as a timeout error.
     pub chunk_timeout_ms: u64,
     /// Maximum total response-body collection time, in milliseconds.
     ///
-    /// For streaming requests this runs across the complete SSE collection
-    /// phase, alongside the per-event `chunk_timeout_ms`. For non-streaming
-    /// requests it contributes to the combined overall request timeout with
+    /// Enforced across the whole read where the stream is read, and contributing
+    /// to the daemon's combined overall request timeout with
     /// `first_chunk_timeout_ms`.
     pub body_timeout_ms: u64,
     pub status_log_interval_ms: Option<u64>,
@@ -396,8 +398,6 @@ pub struct DaemonConfig {
     #[serde(default = "default_batch_finalizer_cancelled_per_tick")]
     pub batch_finalizer_cancelled_per_tick: i64,
     pub throughput_log_interval_ms: Option<u64>,
-    #[serde(default)]
-    pub streamable_endpoints: Vec<String>,
     #[serde(default)]
     pub urgency_weight: f64,
     #[serde(default = "default_service_tier_completion_windows_ms")]
@@ -608,7 +608,6 @@ impl Default for DaemonConfig {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             throughput_log_interval_ms: Some(60_000),
-            streamable_endpoints: Vec::new(),
             urgency_weight: 0.0,
             service_tier_completion_windows_ms: default_service_tier_completion_windows_ms(),
             default_completion_window_ms: default_completion_window_ms(),
