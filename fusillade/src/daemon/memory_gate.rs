@@ -124,11 +124,7 @@ impl MemoryGate {
     /// Build a gate. Returns `None` when disabled (`high` of zero) or when the
     /// thresholds are not a usable pair, in which case claiming is never
     /// suppressed.
-    pub(super) fn new(
-        high: f64,
-        low: f64,
-        source: Box<dyn MemorySource>,
-    ) -> Option<Self> {
+    pub(super) fn new(high: f64, low: f64, source: Box<dyn MemorySource>) -> Option<Self> {
         if high <= 0.0 || high > 1.0 || low <= 0.0 || low >= high {
             return None;
         }
@@ -301,12 +297,6 @@ mod tests {
         assert!(!gate.should_block(100), "released once under the low mark");
     }
 
-
-
-
-
-
-
     /// A daemon outside a limited cgroup (local runs, tests) must not have its
     /// claiming suppressed by a source it cannot read.
     #[test]
@@ -319,10 +309,7 @@ mod tests {
     #[test]
     fn disabled_or_nonsensical_thresholds_produce_no_gate() {
         let src = || FixedSource::new(vec![at(0.9)]);
-        assert!(
-            MemoryGate::new(0.0, 0.0, src()).is_none(),
-            "zero disables"
-        );
+        assert!(MemoryGate::new(0.0, 0.0, src()).is_none(), "zero disables");
         assert!(
             MemoryGate::new(0.65, 0.75, src()).is_none(),
             "low above high"
