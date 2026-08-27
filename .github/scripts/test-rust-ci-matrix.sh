@@ -93,7 +93,10 @@ require_text 'Expected 8 coverage files' 'aggregate every workspace crate covera
 require_text 'cargo package --locked --package onwards --all-features' 'validate the publishable Onwards package'
 require_text 'name: onwards / image' 'scope the standalone image build to Onwards'
 require_text 'name: dwctl / image' 'scope the control-layer image build to dwctl'
-require_text 'name: dwctl / open responses' 'scope embedded compliance to dwctl'
+require_text 'check: dwctl / open responses' 'scope embedded compliance to dwctl'
+require_text 'check: onwards / open responses (passthrough)' 'exercise standalone Onwards passthrough against the dwctl edge'
+require_text 'name: ${{ matrix.check }}' 'name each compliance leg from its matrix entry'
+require_text 'http://127.0.0.1:3001/ai/v1/' 'route Onwards passthrough compliance through the dwctl edge'
 require_text 'name: dwctl / security' 'scope image scanning to dwctl'
 require_text 'name: workspace / e2e' 'scope end-to-end validation to the workspace'
 require_text 'GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}' 'reuse the control-layer Gemini compliance provider'
@@ -176,6 +179,7 @@ required_check_names=(
   'onwards / image'
   'dwctl / image'
   'dwctl / open responses'
+  'onwards / open responses (passthrough)'
   'dwctl / security'
   'workspace / e2e'
   'workspace / pull request title'
@@ -199,6 +203,12 @@ while IFS= read -r name; do
       # Change classification is an internal fan-out job, not a required
       # branch-protection context.
       ;;
+    '${{ matrix.check }}')
+      actual_check_names+=(
+        'dwctl / open responses'
+        'onwards / open responses (passthrough)'
+      )
+      ;;
     *) actual_check_names+=("$name") ;;
   esac
 done < <(awk '/^    name: / { sub(/^    name: /, ""); print }' "$workflow" "$pr_title_workflow")
@@ -206,7 +216,7 @@ done < <(awk '/^    name: / { sub(/^    name: /, ""); print }' "$workflow" "$pr_
 if ! diff -u \
   <(printf '%s\n' "${required_check_names[@]}") \
   <(printf '%s\n' "${actual_check_names[@]}"); then
-  echo "CI and PR-title workflows must declare exactly the 17 repository-required check contexts" >&2
+  echo "CI and PR-title workflows must declare exactly the 15 repository-required check contexts" >&2
   exit 1
 fi
 

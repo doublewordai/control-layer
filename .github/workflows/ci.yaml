@@ -605,7 +605,25 @@ jobs:
     if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
     runs-on: ubuntu-latest
     needs: [changes, build]
-    name: dwctl / open responses
+    # Two legs share the dwctl bring-up below. The dwctl leg runs the suite
+    # against dwctl's edge directly. The onwards leg puts a standalone onwards
+    # (strict mode, no adapter) in front of that same dwctl and runs the suite
+    # against onwards, so native /responses passthrough (schema validation,
+    # forwarding, sanitizers) is exercised with dwctl as the Responses-speaking
+    # upstream.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - surface: dwctl
+            check: dwctl / open responses
+            base_url: http://localhost:3001/ai/v1
+            api_key: sk-openresponses-compliance
+          - surface: onwards-passthrough
+            check: onwards / open responses (passthrough)
+            base_url: http://localhost:3000/v1
+            api_key: test
+    name: ${{ matrix.check }}
 
     permissions:
       contents: read
@@ -631,6 +649,8 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/dwctl
       TEST_API_KEY: sk-openresponses-compliance
       TEST_MODEL: gemini-2.5-flash
+      COMPLIANCE_BASE_URL: ${{ matrix.base_url }}
+      COMPLIANCE_API_KEY: ${{ matrix.api_key }}
       # Run currently supported HTTP /responses tests. Remove this filter once
       # WebSocket transport (#1178) and /responses/compact (#1179) are supported.
       OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
@@ -920,6 +940,55 @@ jobs:
           docker logs dwctl-openresponses-compliance
           exit 1
 
+      - name: Checkout code
+        if: matrix.surface == 'onwards-passthrough'
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        if: matrix.surface == 'onwards-passthrough'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build onwards
+        if: matrix.surface == 'onwards-passthrough'
+        run: cargo build --release --package onwards
+
+      - name: Write onwards passthrough config
+        if: matrix.surface == 'onwards-passthrough'
+        run: |
+          cat > /tmp/onwards-passthrough-config.json <<EOF
+          {
+            "strict_mode": true,
+            "targets": {
+              "${TEST_MODEL}": {
+                "url": "http://127.0.0.1:3001/ai/v1/",
+                "onwards_key": "${TEST_API_KEY}",
+                "onwards_model": "${TEST_MODEL}",
+                "trusted": true
+              }
+            }
+          }
+          EOF
+
+      - name: Start onwards
+        if: matrix.surface == 'onwards-passthrough'
+        run: |
+          ./target/release/onwards \
+            -f /tmp/onwards-passthrough-config.json \
+            > /tmp/onwards-passthrough.log 2>&1 &
+          echo "$!" > /tmp/onwards-passthrough.pid
+
+          for attempt in $(seq 1 30); do
+            if curl -sf http://localhost:3000/v1/models > /dev/null 2>&1; then
+              echo "onwards is ready"
+              exit 0
+            fi
+            echo "Waiting for onwards (${attempt}/30)"
+            sleep 1
+          done
+          echo "onwards failed to start" >&2
+          cat /tmp/onwards-passthrough.log
+          exit 1
+
       - name: Install bun
         uses: oven-sh/setup-bun@v2
 
@@ -938,15 +1007,16 @@ jobs:
         run: |
           cd /tmp/openresponses
           echo "Open Responses commit: $(git rev-parse HEAD)"
-          echo "Base URL: http://localhost:3001/ai/v1"
+          echo "Surface: ${{ matrix.surface }}"
+          echo "Base URL: ${COMPLIANCE_BASE_URL}"
           echo "Model: ${TEST_MODEL}"
           echo "Filter: ${OPENRESPONSES_COMPLIANCE_FILTER}"
           echo
 
           set +e
           bun run bin/compliance-test.ts \
-            --base-url http://localhost:3001/ai/v1 \
-            --api-key "${TEST_API_KEY}" \
+            --base-url "${COMPLIANCE_BASE_URL}" \
+            --api-key "${COMPLIANCE_API_KEY}" \
             --model "${TEST_MODEL}" \
             --filter "${OPENRESPONSES_COMPLIANCE_FILTER}" \
             --json > /tmp/openresponses-compliance-results.json
@@ -994,8 +1064,8 @@ jobs:
               echo "=== Retry failed test(s): ${failed_filters} ==="
               set +e
               bun run bin/compliance-test.ts \
-                --base-url http://localhost:3001/ai/v1 \
-                --api-key "${TEST_API_KEY}" \
+                --base-url "${COMPLIANCE_BASE_URL}" \
+                --api-key "${COMPLIANCE_API_KEY}" \
                 --model "${TEST_MODEL}" \
                 --filter "${failed_filters}" \
                 --json > /tmp/openresponses-compliance-retry-results.json
@@ -1027,8 +1097,8 @@ jobs:
                 echo
                 echo "=== Verbose rerun of failed test(s): ${failed_filters} ==="
                 bun run bin/compliance-test.ts \
-                  --base-url http://localhost:3001/ai/v1 \
-                  --api-key "${TEST_API_KEY}" \
+                  --base-url "${COMPLIANCE_BASE_URL}" \
+                  --api-key "${COMPLIANCE_API_KEY}" \
                   --model "${TEST_MODEL}" \
                   --filter "${failed_filters}" \
                   --verbose || true
@@ -1071,16 +1141,30 @@ jobs:
           echo "=== dwctl Server Logs ==="
           docker logs dwctl-openresponses-compliance 2>&1 | tee /tmp/dwctl-openresponses-compliance.log || echo "No dwctl container found"
 
+      - name: Show onwards logs
+        if: always() && matrix.surface == 'onwards-passthrough'
+        run: |
+          echo "=== onwards passthrough logs ==="
+          cat /tmp/onwards-passthrough.log || echo "No onwards log found"
+
       - name: Upload Open Responses compliance artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: openresponses-compliance-results
+          name: openresponses-compliance-results-${{ matrix.surface }}
           path: |
             /tmp/openresponses-compliance-results.json
             /tmp/openresponses-compliance-retry-results.json
             /tmp/dwctl-openresponses-compliance.log
+            /tmp/onwards-passthrough.log
           if-no-files-found: ignore
+
+      - name: Stop onwards
+        if: always() && matrix.surface == 'onwards-passthrough'
+        run: |
+          if [[ -f /tmp/onwards-passthrough.pid ]]; then
+            kill "$(cat /tmp/onwards-passthrough.pid)" || true
+          fi
 
       - name: Stop dwctl
         if: always()

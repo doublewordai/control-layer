@@ -348,7 +348,8 @@ for scoped_check in \
   '    name: workspace / rust lint' \
   '    name: workspace / rust gate' \
   '    name: dwctl / image' \
-  '    name: dwctl / open responses' \
+  '            check: dwctl / open responses' \
+  '            check: onwards / open responses (passthrough)' \
   '    name: dwctl / security' \
   '    name: workspace / e2e'; do
   if ! grep -Fxq "$scoped_check" .github/workflows/ci.yaml; then
