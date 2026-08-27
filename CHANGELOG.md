@@ -1,5 +1,17 @@
 # Changelog
 
+## [10.17.0](https://github.com/doublewordai/control-layer/compare/v10.16.1...v10.17.0) (2026-08-27)
+
+
+### Features
+
+* midstream retries ([#1453](https://github.com/doublewordai/control-layer/issues/1453)) ([48be316](https://github.com/doublewordai/control-layer/commit/48be3169869cad3344a01b9ee4c3952ca8f597d8))
+
+
+### Bug Fixes
+
+* **fusillade:** correct the memory gate's reading and remove its in-flight exit ([#1526](https://github.com/doublewordai/control-layer/issues/1526)) ([fbc8985](https://github.com/doublewordai/control-layer/commit/fbc8985d0b8972d07fe44049cc7ea96e44f5fc06))
+
 ## [10.16.1](https://github.com/doublewordai/control-layer/compare/v10.16.0...v10.16.1) (2026-08-26)
 
 
