@@ -672,6 +672,7 @@ impl StreamAccumulator for Dsv4Reconstructor {
         // reasoning text we have no measured position for in the sequence.
         let present = |k: &str| delta.get(k).is_some_and(|v| !v.is_null());
         if present("function_call") || (present("reasoning") && !present("reasoning_content")) {
+            super::metrics::record_unsupported_delta(if present("function_call") { "function_call" } else { "reasoning" });
             return self.disarm(AccumulateError::UnsupportedDelta);
         }
 

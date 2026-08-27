@@ -236,8 +236,10 @@ impl StreamAccumulator for PlainContent {
         // interleaved the two, and we only have one of them.
         let unsupported = ["reasoning_content", "reasoning", "tool_calls", "function_call"]
             .iter()
-            .any(|k| delta.get(*k).is_some_and(|v| !v.is_null()));
-        if unsupported {
+            .copied()
+            .find(|k| delta.get(*k).is_some_and(|v| !v.is_null()));
+        if let Some(kind) = unsupported {
+            super::metrics::record_unsupported_delta(kind);
             return self.disarm(AccumulateError::UnsupportedDelta);
         }
 

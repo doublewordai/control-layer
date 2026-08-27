@@ -116,6 +116,16 @@ pub fn record_usage_anomaly(kind: &'static str) {
     counter!("dwctl_continuation_usage_anomaly_total", "kind" => kind).increment(1);
 }
 
+/// Which delta key caused an `unsupported_delta` disarm. The outcome metric
+/// keeps its single stable `unsupported_delta` reason; this side counter is the
+/// per-kind split that sizes reconstructor work per family: `reasoning_content`
+/// / `tool_calls` (a family reconstructor lifts these), `reasoning` (foreign
+/// dialect — reasoning text with no measured position in the raw sequence),
+/// `function_call` (legacy encoding, never measured).
+pub fn record_unsupported_delta(kind: &'static str) {
+    counter!("dwctl_continuation_unsupported_delta_total", "kind" => kind).increment(1);
+}
+
 /// The largest inter-frame gap observed on an armed stream, recorded once at
 /// stream end. This is the empirical answer to "is N seconds of silence a
 /// death sentence?": before trusting any stall timeout, read this
