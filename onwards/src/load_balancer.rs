@@ -49,6 +49,8 @@ pub struct Provider {
     pub target: Target,
     /// Weight for load balancing (higher = more traffic)
     pub weight: u32,
+    /// Priority tier. Lower values are preferred; equal values form a pool.
+    priority: Option<i32>,
     /// Tracks active connections and enforces optional concurrency limit
     limiter: ConcurrencyLimiter,
 }
@@ -59,6 +61,7 @@ impl Provider {
         Self {
             target,
             weight,
+            priority: None,
             limiter: ConcurrencyLimiter::new(),
         }
     }
@@ -68,8 +71,20 @@ impl Provider {
         Self {
             target,
             weight,
+            priority: None,
             limiter: ConcurrencyLimiter::with_limit(limit),
         }
+    }
+
+    /// Assign this provider to an explicit priority tier.
+    pub fn with_priority(mut self, priority: i32) -> Self {
+        self.priority = Some(priority);
+        self
+    }
+
+    /// Return this provider's explicit priority tier, if configured.
+    pub fn priority(&self) -> Option<i32> {
+        self.priority
     }
 
     /// Get the current number of active connections to this provider
@@ -128,8 +143,9 @@ impl ProviderPool {
     /// `active_connections / weight` ratio, breaking ties with weighted random
     /// selection. Skips providers at their concurrency limit.
     ///
-    /// For Priority strategy: returns the first available provider in definition
-    /// order, skipping providers at their concurrency limit.
+    /// For Priority strategy with explicit tiers: load balances within the
+    /// highest-priority available tier. Legacy configurations without tiers use
+    /// definition order. Providers at their concurrency limit are skipped.
     ///
     /// Returns a ConcurrencyGuard that tracks the active connection. When dropped,
     /// the connection count is decremented.
@@ -144,18 +160,16 @@ impl ProviderPool {
     /// current pass (excluding previously tried providers, unless
     /// `with_replacement` is set for weighted-random).
     ///
-    /// The total number of attempts is controlled by `fallback.max_attempts`
-    /// (defaults to provider count) and sits *above* the LB strategy: when a pass
-    /// is exhausted, the cascade restarts (exclusions cleared) until the budget is
-    /// spent. So every strategy — including a single-provider `Priority` pool —
-    /// honors the configured retry count, rather than stopping after one cascade.
+    /// The total number of attempts defaults to one pass over the providers. An
+    /// explicit `fallback.max_attempts` sits *above* the LB strategy: when a pass
+    /// is exhausted, the cascade restarts (exclusions cleared) until that budget
+    /// is spent. This lets an explicitly configured retry count repeat providers
+    /// without making the default path retry a provider just because untried
+    /// providers are temporarily saturated.
     pub fn select_iter(&self) -> SelectIter<'_> {
         let with_replacement = self.fallback.as_ref().is_some_and(|f| f.with_replacement);
-        let max_attempts = self
-            .fallback
-            .as_ref()
-            .and_then(|f| f.max_attempts)
-            .unwrap_or(self.providers.len());
+        let configured_max_attempts = self.fallback.as_ref().and_then(|f| f.max_attempts);
+        let max_attempts = configured_max_attempts.unwrap_or(self.providers.len());
 
         SelectIter {
             pool: self,
@@ -163,6 +177,7 @@ impl ProviderPool {
             max_attempts,
             attempts: 0,
             with_replacement,
+            restart_passes: configured_max_attempts.is_some(),
         }
     }
 
@@ -181,11 +196,28 @@ impl ProviderPool {
         }
     }
 
-    /// Select using priority order: first available provider in definition order
+    /// Select from the highest-priority available tier. Configurations without
+    /// explicit tiers retain the legacy definition-order behavior.
     fn select_priority(
         &self,
         exclude: &HashSet<usize>,
     ) -> Option<(usize, &Target, ConcurrencyGuard)> {
+        if self
+            .providers
+            .iter()
+            .all(|provider| provider.priority.is_some())
+        {
+            let highest_available_priority = self
+                .providers
+                .iter()
+                .enumerate()
+                .filter(|(idx, provider)| !exclude.contains(idx) && !provider.limiter.at_capacity())
+                .filter_map(|(_, provider)| provider.priority)
+                .min()?;
+            return self
+                .select_least_connections_in_tier(exclude, Some(highest_available_priority));
+        }
+
         for (idx, provider) in self.providers.iter().enumerate() {
             if exclude.contains(&idx) {
                 continue;
@@ -203,12 +235,23 @@ impl ProviderPool {
         &self,
         exclude: &HashSet<usize>,
     ) -> Option<(usize, &Target, ConcurrencyGuard)> {
+        self.select_least_connections_in_tier(exclude, None)
+    }
+
+    fn select_least_connections_in_tier(
+        &self,
+        exclude: &HashSet<usize>,
+        priority: Option<i32>,
+    ) -> Option<(usize, &Target, ConcurrencyGuard)> {
         // Find the minimum active/weight score among available providers
         let mut best_score = f64::INFINITY;
         let mut candidates: Vec<usize> = Vec::new();
 
         for (idx, provider) in self.providers.iter().enumerate() {
             if exclude.contains(&idx) {
+                continue;
+            }
+            if priority.is_some_and(|priority| provider.priority != Some(priority)) {
                 continue;
             }
             // Skip providers at their concurrency limit
@@ -262,7 +305,10 @@ impl ProviderPool {
                 // Retry with this provider excluded.
                 let mut new_exclude = exclude.clone();
                 new_exclude.insert(selected);
-                self.select_least_connections(&new_exclude)
+                match priority {
+                    Some(_) => self.select_priority(&new_exclude),
+                    None => self.select_least_connections(&new_exclude),
+                }
             }
         }
     }
@@ -270,6 +316,11 @@ impl ProviderPool {
     /// Get all providers in the pool (for listing models, etc.)
     pub fn providers(&self) -> &[Provider] {
         &self.providers
+    }
+
+    /// Return the numerically lowest configured priority tier.
+    pub fn highest_priority(&self) -> Option<i32> {
+        self.providers.iter().filter_map(Provider::priority).min()
     }
 
     /// Get the number of providers in the pool
@@ -332,9 +383,10 @@ impl ProviderPool {
     /// The total attempt budget for the fallback/retry loop, sitting *above* the
     /// LB strategy: `fallback.max_attempts` if set, else the provider count (one
     /// pass through the pool). Unlike provider selection within a pass, this is
-    /// NOT clamped by provider count or strategy — `SelectIter` restarts the LB
-    /// cascade when a pass is exhausted, so e.g. a single-provider `Priority`
-    /// pool with `max_attempts = 3` retries that provider three times.
+    /// NOT clamped by provider count or strategy when explicitly configured —
+    /// `SelectIter` restarts the LB cascade when that configured pass is
+    /// exhausted, so e.g. a single-provider `Priority` pool with
+    /// `max_attempts = 3` retries that provider three times.
     pub fn fallback_max_attempts(&self) -> usize {
         self.fallback
             .as_ref()
@@ -417,6 +469,7 @@ pub struct SelectIter<'a> {
     max_attempts: usize,
     attempts: usize,
     with_replacement: bool,
+    restart_passes: bool,
 }
 
 impl<'a> Iterator for SelectIter<'a> {
@@ -445,7 +498,7 @@ impl<'a> Iterator for SelectIter<'a> {
         // iterator rather than re-running the same scan.
         let result = match self.pool.select_excluding(&self.excluded) {
             Some(result) => result,
-            None if self.excluded.is_empty() => return None,
+            None if self.excluded.is_empty() || !self.restart_passes => return None,
             None => {
                 self.excluded.clear();
                 self.pool.select_excluding(&self.excluded)?
@@ -465,6 +518,30 @@ impl<'a> Iterator for SelectIter<'a> {
         }
 
         Some(result)
+    }
+}
+
+impl SelectIter<'_> {
+    /// Whether another provider is currently eligible without acquiring and
+    /// holding its concurrency slot. This is a snapshot: capacity can still
+    /// change before [`Iterator::next`] is called.
+    pub fn has_next(&self) -> bool {
+        if self.attempts >= self.max_attempts {
+            return false;
+        }
+
+        let has_eligible = |excluded: &HashSet<usize>| {
+            self.pool
+                .providers
+                .iter()
+                .enumerate()
+                .any(|(index, provider)| {
+                    !excluded.contains(&index) && !provider.limiter.at_capacity()
+                })
+        };
+
+        has_eligible(&self.excluded)
+            || (self.restart_passes && !self.excluded.is_empty() && has_eligible(&HashSet::new()))
     }
 }
 
@@ -752,6 +829,144 @@ mod tests {
         assert_eq!(order[0].1.url.as_str(), "https://primary.example.com/");
         assert_eq!(order[1].1.url.as_str(), "https://secondary.example.com/");
         assert_eq!(order[2].1.url.as_str(), "https://tertiary.example.com/");
+    }
+
+    #[test]
+    fn test_priority_tier_uses_least_connections_before_lower_tier() {
+        let providers = vec![
+            Provider::new(create_test_target("https://primary-a.example.com"), 1).with_priority(1),
+            Provider::new(create_test_target("https://primary-b.example.com"), 1).with_priority(1),
+            Provider::new(create_test_target("https://backup.example.com"), 100).with_priority(2),
+        ];
+        let primary_a_guard = providers[0].limiter.try_acquire().unwrap();
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+
+        let (index, _, _guard) = pool.select().unwrap();
+
+        assert_eq!(index, 1);
+        drop(primary_a_guard);
+    }
+
+    #[test]
+    fn test_priority_tier_uses_weighted_connection_ratio() {
+        let providers = vec![
+            Provider::new(create_test_target("https://weight-one.example.com"), 1).with_priority(1),
+            Provider::new(create_test_target("https://weight-two.example.com"), 2).with_priority(1),
+            Provider::new(create_test_target("https://backup.example.com"), 100).with_priority(2),
+        ];
+        let weight_one_guard = providers[0].limiter.try_acquire().unwrap();
+        let weight_two_guard = providers[1].limiter.try_acquire().unwrap();
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+
+        let (index, _, _guard) = pool.select().unwrap();
+
+        assert_eq!(index, 1, "1/2 is a lower load score than 1/1");
+        drop((weight_one_guard, weight_two_guard));
+    }
+
+    #[test]
+    fn test_priority_tier_spills_when_every_provider_is_saturated() {
+        let providers = vec![
+            Provider::with_concurrency_limit(
+                create_test_target("https://primary-a.example.com"),
+                1,
+                1,
+            )
+            .with_priority(1),
+            Provider::with_concurrency_limit(
+                create_test_target("https://primary-b.example.com"),
+                1,
+                1,
+            )
+            .with_priority(1),
+            Provider::new(create_test_target("https://backup.example.com"), 1).with_priority(2),
+        ];
+        let primary_a_guard = providers[0].limiter.try_acquire().unwrap();
+        let primary_b_guard = providers[1].limiter.try_acquire().unwrap();
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+
+        let (index, _, _guard) = pool.select().unwrap();
+
+        assert_eq!(index, 2);
+        drop((primary_a_guard, primary_b_guard));
+    }
+
+    #[test]
+    fn test_priority_fallback_exhausts_tier_before_spilling() {
+        let providers = vec![
+            Provider::new(create_test_target("https://primary-a.example.com"), 1).with_priority(1),
+            Provider::new(create_test_target("https://primary-b.example.com"), 1).with_priority(1),
+            Provider::new(create_test_target("https://backup.example.com"), 1).with_priority(2),
+        ];
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+
+        let order: Vec<_> = pool.select_iter().map(|(index, _, _)| index).collect();
+
+        assert!(matches!(order.as_slice(), [0, 1, 2] | [1, 0, 2]));
+    }
+
+    #[test]
+    fn test_priority_extended_attempt_budget_restarts_at_first_tier() {
+        let providers = vec![
+            Provider::new(create_test_target("https://primary-a.example.com"), 1).with_priority(1),
+            Provider::new(create_test_target("https://primary-b.example.com"), 1).with_priority(1),
+            Provider::new(create_test_target("https://backup.example.com"), 1).with_priority(2),
+        ];
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                max_attempts: Some(4),
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+
+        let order: Vec<_> = pool.select_iter().map(|(index, _, _)| index).collect();
+
+        assert!(matches!(&order[..3], [0, 1, 2] | [1, 0, 2]));
+        assert!(matches!(order[3], 0 | 1));
     }
 
     #[test]
@@ -1105,6 +1320,47 @@ mod tests {
             order.iter().map(|(_, t, _)| t.url.as_str()).collect();
         assert!(urls.contains("https://api1.example.com/"));
         assert!(urls.contains("https://api2.example.com/"));
+    }
+
+    #[test]
+    fn test_select_iter_default_budget_does_not_restart_a_partial_cascade() {
+        use crate::target::LoadBalanceStrategy;
+
+        let providers = vec![
+            Provider::new(create_test_target("https://available.example.com"), 1).with_priority(0),
+            Provider::with_concurrency_limit(
+                create_test_target("https://busy-1.example.com"),
+                1,
+                1,
+            )
+            .with_priority(1),
+            Provider::with_concurrency_limit(
+                create_test_target("https://busy-2.example.com"),
+                1,
+                1,
+            )
+            .with_priority(1),
+        ];
+        let _busy_guards = [
+            providers[1].limiter.try_acquire().unwrap(),
+            providers[2].limiter.try_acquire().unwrap(),
+        ];
+        let pool = ProviderPool::with_config(
+            providers,
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+
+        let mut selections = pool.select_iter();
+        assert!(selections.has_next());
+        assert_eq!(selections.next().map(|(idx, _, _)| idx), Some(0));
+        assert!(!selections.has_next());
+        assert!(selections.next().is_none());
     }
 
     #[test]

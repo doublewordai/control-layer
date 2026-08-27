@@ -65,6 +65,11 @@ pub struct ProviderSpec {
     #[builder(default = default_weight())]
     pub weight: u32,
 
+    /// Priority tier used by the `priority` strategy. Lower values are preferred.
+    /// Providers with the same value are load balanced as a pool.
+    #[serde(default)]
+    pub priority: Option<i32>,
+
     /// Enable response sanitization to enforce strict OpenAI schema compliance.
     /// Removes provider-specific fields and rewrites the model field.
     /// Defaults to false.
@@ -121,7 +126,8 @@ pub enum LoadBalanceStrategy {
     /// Weighted random selection - distribute traffic proportionally based on weights (default)
     #[default]
     WeightedRandom,
-    /// Priority-based selection - always use the first available provider in order
+    /// Priority-based selection. Explicit equal priorities form weighted
+    /// least-connections tiers; configurations without priorities retain legacy order.
     Priority,
 }
 
@@ -469,6 +475,7 @@ impl TargetSpecOrList {
                         upstream_auth_header_prefix: t.upstream_auth_header_prefix,
                         response_headers: t.response_headers,
                         weight: t.weight,
+                        priority: None,
                         sanitize_response: t.sanitize_response,
                         open_responses: t.open_responses,
                         request_timeout_secs: t.request_timeout_secs,
@@ -511,6 +518,7 @@ impl TargetSpecOrList {
                     upstream_auth_header_prefix: spec.upstream_auth_header_prefix,
                     response_headers: spec.response_headers,
                     weight: spec.weight,
+                    priority: None,
                     sanitize_response: false, // Will be OR'd with pool-level setting
                     open_responses: open_responses.clone(),
                     request_timeout_secs: spec.request_timeout_secs,
@@ -1037,6 +1045,20 @@ impl Targets {
             // Extract pool-level config and provider specs
             let pool_config = target_spec_or_list.into_pool_config()?;
 
+            if pool_config.strategy == LoadBalanceStrategy::Priority {
+                let explicit_priorities = pool_config
+                    .providers
+                    .iter()
+                    .filter(|provider| provider.priority.is_some())
+                    .count();
+                if explicit_priorities != 0 && explicit_priorities != pool_config.providers.len() {
+                    return Err(anyhow!(
+                        "Priority target '{}' must set 'priority' on every provider or omit it from every provider",
+                        name
+                    ));
+                }
+            }
+
             for (index, provider) in pool_config.providers.iter().enumerate() {
                 if let Some(config) = provider.reasoning_translation.as_ref() {
                     config.validate().map_err(|error| {
@@ -1082,6 +1104,7 @@ impl Targets {
                 .into_iter()
                 .map(|mut spec| {
                     let weight = spec.weight;
+                    let priority = spec.priority;
                     let concurrency_limit = spec
                         .concurrency_limit
                         .as_ref()
@@ -1089,9 +1112,13 @@ impl Targets {
                     // Enable sanitization if either pool or provider level is true
                     spec.sanitize_response = pool_sanitize || spec.sanitize_response;
                     let target: Target = spec.into();
-                    match concurrency_limit {
+                    let provider = match concurrency_limit {
                         Some(limit) => Provider::with_concurrency_limit(target, weight, limit),
                         None => Provider::new(target, weight),
+                    };
+                    match priority {
+                        Some(priority) => provider.with_priority(priority),
+                        None => provider,
                     }
                 })
                 .collect();
@@ -2158,6 +2185,50 @@ mod tests {
     }
 
     #[test]
+    fn test_priority_pool_preserves_explicit_provider_tiers() {
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "strategy": "priority",
+                    "providers": [
+                        { "url": "https://primary-a.example.com", "priority": 1 },
+                        { "url": "https://primary-b.example.com", "priority": 1 },
+                        { "url": "https://backup.example.com", "priority": 2 }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+        let pool = targets.targets.get("gpt-4").unwrap();
+
+        let priorities: Vec<_> = pool.providers().iter().map(Provider::priority).collect();
+        assert_eq!(priorities, vec![Some(1), Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn test_priority_pool_rejects_mixed_explicit_and_implicit_tiers() {
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "strategy": "priority",
+                    "providers": [
+                        { "url": "https://primary.example.com", "priority": 1 },
+                        { "url": "https://backup.example.com" }
+                    ]
+                }
+            }
+        }"#;
+
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let error = Targets::from_config(config).unwrap_err();
+
+        assert!(error.to_string().contains("gpt-4"));
+        assert!(error.to_string().contains("priority"));
+    }
+
+    #[test]
     fn test_pool_config_weighted_random_strategy() {
         let json = r#"{
             "targets": {
@@ -2300,6 +2371,7 @@ mod tests {
                 upstream_auth_header_prefix: None,
                 response_headers: None,
                 weight: 1,
+                priority: None,
                 sanitize_response: false,
                 open_responses: None,
                 request_timeout_secs: None,

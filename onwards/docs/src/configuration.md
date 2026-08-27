@@ -29,6 +29,7 @@ Onwards is configured through a JSON file. Each key in the `targets` object defi
 | `strategy` | string | No | Load balancing strategy: `weighted_random` or `priority` |
 | `fallback` | object | No | Retry configuration (see [Load Balancing](load-balancing.md)) |
 | `providers` | array | No | Array of provider configurations for load balancing |
+| `priority` | integer | No | Provider priority tier inside a `priority` pool; lower values are preferred and equal values share traffic. Set on every provider or none. |
 
 ## Reasoning translation
 

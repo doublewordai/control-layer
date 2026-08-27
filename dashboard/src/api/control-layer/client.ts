@@ -67,6 +67,7 @@ import type {
   CachePricingUpdate,
   AddComponentRequest,
   UpdateComponentRequest,
+  ComponentLayoutUpdate,
   Webhook,
   WebhookWithSecret,
   WebhookCreateRequest,
@@ -532,7 +533,11 @@ const modelApi = {
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ weight: data.weight, enabled: data.enabled }),
+          body: JSON.stringify({
+            weight: data.weight,
+            enabled: data.enabled,
+            sort_order: data.sort_order,
+          }),
         },
       );
       if (!response.ok) {
@@ -561,6 +566,29 @@ const modelApi = {
         const errorText = await response.text();
         throw new Error(
           errorText || `Failed to update component: ${response.status}`,
+        );
+      }
+      return response.json();
+    },
+
+    async updateLayout(
+      modelId: string,
+      data: ComponentLayoutUpdate,
+    ): Promise<ModelComponent[]> {
+      const response = await fetch(
+        `/admin/api/v1/models/${modelId}/components/routing`,
+        {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(data),
+        },
+      );
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new ApiError(
+          response.status,
+          errorText || `Failed to update component layout: ${response.status}`,
+          response,
         );
       }
       return response.json();

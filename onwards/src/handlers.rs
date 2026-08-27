@@ -22,7 +22,7 @@ use axum::{
 };
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
-use tracing::{Instrument, debug, error, instrument, trace, warn};
+use tracing::{Instrument, debug, error, info, instrument, trace, warn};
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
 struct HeaderExtractor<'a>(&'a HeaderMap);
@@ -686,10 +686,25 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut any_attempted = false;
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
-    let pool_max_attempts = pool.fallback_max_attempts();
-    for (_idx, target, connection_guard) in pool.select_iter() {
+    let mut previous_priority = pool.highest_priority();
+    let mut provider_selections = pool.select_iter();
+    while let Some((provider_index, target, connection_guard)) = provider_selections.next() {
         any_attempted = true;
         attempt_number += 1;
+        let provider_priority = pool.providers()[provider_index].priority();
+
+        if let (Some(previous), Some(current)) = (previous_priority, provider_priority)
+            && current > previous
+        {
+            info!(
+                from_priority = previous,
+                to_priority = current,
+                attempt = attempt_number,
+                "Spilling request to a lower-priority provider tier"
+            );
+            metrics::counter!("onwards_priority_tier_spills_total").increment(1);
+        }
+        previous_priority = provider_priority;
 
         let attempt_span = tracing::info_span!(
             "onwards.provider_attempt",
@@ -697,10 +712,14 @@ pub async fn target_message_handler<T: HttpClient>(
             attempt = attempt_number,
             provider.url = %target.url,
             provider.model = target.onwards_model.as_deref().unwrap_or(""),
+            provider.priority = tracing::field::Empty,
             provider.timeout_secs = target.request_timeout_secs,
             http.response.status_code = tracing::field::Empty,
             onwards.fallback = tracing::field::Empty,
         );
+        if let Some(priority) = provider_priority {
+            attempt_span.record("provider.priority", i64::from(priority));
+        }
 
         // The loop body is wrapped in an instrumented async block so that
         // attempt_span is the "current" span for all logging / field recording,
@@ -1513,11 +1532,11 @@ pub async fn target_message_handler<T: HttpClient>(
         match action {
             LoopAction::Continue(err) => {
                 last_error = err;
-                // Sleep here — *after* the current connection_guard has gone
-                // out of scope but *before* select_iter().next() grabs the
-                // next one — so we don't pin a concurrency slot while waiting.
-                // Skip if this was the last attempt the iterator would yield.
-                if (attempt_number as usize) < pool_max_attempts
+                // Sleep here — after the current connection guard has gone out
+                // of scope but before the iterator acquires the next one — so
+                // backoff never pins a provider concurrency slot. Skip the
+                // delay when no untried provider is currently eligible.
+                if provider_selections.has_next()
                     && let Some(backoff) = pool.fallback().and_then(|f| f.backoff.as_ref())
                 {
                     // `attempt_number` is the count of the attempt that just

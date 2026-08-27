@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH ranked AS (\n                SELECT id, DENSE_RANK() OVER (ORDER BY sort_order ASC) - 1 AS new_order\n                FROM deployed_model_components\n                WHERE composite_model_id = $1\n            )\n            UPDATE deployed_model_components dmc\n            SET sort_order = ranked.new_order\n            FROM ranked\n            WHERE dmc.id = ranked.id\n              AND dmc.sort_order IS DISTINCT FROM ranked.new_order\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c05ed5f12e125e2108dc6d29596a625b73cb875feee2529306264d441d735a98"
+}
