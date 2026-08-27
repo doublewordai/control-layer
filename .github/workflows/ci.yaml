@@ -602,7 +602,11 @@ jobs:
       image-digest: ${{ steps.preview-image.outputs.digest }}
 
   openresponses-compliance:
-    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    # Runs unconditionally so the matrix expands and BOTH legs report under their
+    # static check names. A job skipped at this level reports once as the
+    # unexpanded `matrix.check`, which never satisfies the required contexts on
+    # release-only pull requests. The steps gate on RUN_COMPLIANCE instead.
+    if: always()
     runs-on: ubuntu-latest
     needs: [changes, build]
     # Two legs share the dwctl bring-up below. The dwctl leg runs the suite
@@ -647,6 +651,7 @@ jobs:
 
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/dwctl
+      RUN_COMPLIANCE: ${{ needs.changes.outputs.run-ci == 'true' && needs.build.result == 'success' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
       TEST_API_KEY: sk-openresponses-compliance
       TEST_MODEL: gemini-2.5-flash
       COMPLIANCE_BASE_URL: ${{ matrix.base_url }}
@@ -656,7 +661,12 @@ jobs:
       OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
 
     steps:
+      - name: Skip compliance for release-only changes
+        if: env.RUN_COMPLIANCE != 'true'
+        run: echo "Skipping Open Responses compliance because this event has no code changes."
+
       - name: Log in to GitHub Container Registry
+        if: env.RUN_COMPLIANCE == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -664,6 +674,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Select built image
+        if: env.RUN_COMPLIANCE == 'true'
         id: image
         run: |
           IMAGE_LIST="${{ needs.build.outputs.image-tag }}"
@@ -672,6 +683,7 @@ jobs:
           echo "Using image: $IMAGE"
 
       - name: Write config
+        if: env.RUN_COMPLIANCE == 'true'
         run: |
           cat > /tmp/dwctl-openresponses-compliance.yaml <<EOF
           host: "0.0.0.0"
@@ -711,6 +723,7 @@ jobs:
           EOF
 
       - name: Validate Gemini upstream
+        if: env.RUN_COMPLIANCE == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -738,6 +751,7 @@ jobs:
           JSON
 
       - name: Start dwctl
+        if: env.RUN_COMPLIANCE == 'true'
         run: |
           docker run \
             --detach \
@@ -760,6 +774,7 @@ jobs:
           exit 1
 
       - name: Seed compliance fixture
+        if: env.RUN_COMPLIANCE == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -890,6 +905,7 @@ jobs:
           SQL
 
       - name: Wait for compliance fixture
+        if: env.RUN_COMPLIANCE == 'true'
         run: |
           for attempt in $(seq 1 30); do
             models_response=$(curl -sf \
@@ -941,19 +957,19 @@ jobs:
           exit 1
 
       - name: Checkout code
-        if: matrix.surface == 'onwards-passthrough'
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
         uses: actions/checkout@v6
 
       - name: Install Rust
-        if: matrix.surface == 'onwards-passthrough'
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
         uses: dtolnay/rust-toolchain@stable
 
       - name: Build onwards
-        if: matrix.surface == 'onwards-passthrough'
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
         run: cargo build --release --package onwards
 
       - name: Write onwards passthrough config
-        if: matrix.surface == 'onwards-passthrough'
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
         run: |
           cat > /tmp/onwards-passthrough-config.json <<EOF
           {
@@ -970,7 +986,7 @@ jobs:
           EOF
 
       - name: Start onwards
-        if: matrix.surface == 'onwards-passthrough'
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
         run: |
           ./target/release/onwards \
             -f /tmp/onwards-passthrough-config.json \
@@ -990,9 +1006,11 @@ jobs:
           exit 1
 
       - name: Install bun
+        if: env.RUN_COMPLIANCE == 'true'
         uses: oven-sh/setup-bun@v2
 
       - name: Clone openresponses
+        if: env.RUN_COMPLIANCE == 'true'
         # Track upstream main so CI surfaces newly added compliance coverage.
         run: |
           git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses
@@ -1001,9 +1019,11 @@ jobs:
           git log -1 --oneline
 
       - name: Install openresponses dependencies
+        if: env.RUN_COMPLIANCE == 'true'
         run: cd /tmp/openresponses && bun install
 
       - name: Run compliance tests
+        if: env.RUN_COMPLIANCE == 'true'
         run: |
           cd /tmp/openresponses
           echo "Open Responses commit: $(git rev-parse HEAD)"
@@ -1136,19 +1156,19 @@ jobs:
           exit "$status"
 
       - name: Show dwctl logs
-        if: always()
+        if: always() && env.RUN_COMPLIANCE == 'true'
         run: |
           echo "=== dwctl Server Logs ==="
           docker logs dwctl-openresponses-compliance 2>&1 | tee /tmp/dwctl-openresponses-compliance.log || echo "No dwctl container found"
 
       - name: Show onwards logs
-        if: always() && matrix.surface == 'onwards-passthrough'
+        if: always() && env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
         run: |
           echo "=== onwards passthrough logs ==="
           cat /tmp/onwards-passthrough.log || echo "No onwards log found"
 
       - name: Upload Open Responses compliance artifacts
-        if: always()
+        if: always() && env.RUN_COMPLIANCE == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: openresponses-compliance-results-${{ matrix.surface }}
@@ -1160,14 +1180,14 @@ jobs:
           if-no-files-found: ignore
 
       - name: Stop onwards
-        if: always() && matrix.surface == 'onwards-passthrough'
+        if: always() && env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
         run: |
           if [[ -f /tmp/onwards-passthrough.pid ]]; then
             kill "$(cat /tmp/onwards-passthrough.pid)" || true
           fi
 
       - name: Stop dwctl
-        if: always()
+        if: always() && env.RUN_COMPLIANCE == 'true'
         run: docker rm -f dwctl-openresponses-compliance || true
 
   security-scan:
