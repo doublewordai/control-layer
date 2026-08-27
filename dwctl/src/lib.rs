@@ -596,7 +596,6 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             provider_pricing: None,
                             sanitize_responses: None,
                             trusted: None,
-                            open_responses_adapter: None,
                             reasoning_translation_overrides: None,
                             backoff_enabled: false,
                             backoff_initial_ms: 100,
@@ -1561,38 +1560,6 @@ pub async fn build_router(
         .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics))
         // Queue monitoring
         .route("/monitoring/demand", get(api::handlers::queue::get_demand))
-        // Tool sources CRUD
-        .route("/tool-sources", get(api::handlers::tool_sources::list_tool_sources))
-        .route("/tool-sources", post(api::handlers::tool_sources::create_tool_source))
-        .route("/tool-sources/{id}", get(api::handlers::tool_sources::get_tool_source))
-        .route("/tool-sources/{id}", patch(api::handlers::tool_sources::update_tool_source))
-        .route("/tool-sources/{id}", delete(api::handlers::tool_sources::delete_tool_source))
-        // Tool sources ↔ deployment attachment
-        .route(
-            "/deployments/{id}/tool-sources",
-            get(api::handlers::tool_sources::list_deployment_tool_sources),
-        )
-        .route(
-            "/deployments/{id}/tool-sources/{source_id}",
-            axum::routing::put(api::handlers::tool_sources::attach_tool_source_to_deployment),
-        )
-        .route(
-            "/deployments/{id}/tool-sources/{source_id}",
-            delete(api::handlers::tool_sources::detach_tool_source_from_deployment),
-        )
-        // Tool sources ↔ group attachment
-        .route(
-            "/groups/{id}/tool-sources",
-            get(api::handlers::tool_sources::list_group_tool_sources),
-        )
-        .route(
-            "/groups/{id}/tool-sources/{source_id}",
-            axum::routing::put(api::handlers::tool_sources::attach_tool_source_to_group),
-        )
-        .route(
-            "/groups/{id}/tool-sources/{source_id}",
-            delete(api::handlers::tool_sources::detach_tool_source_from_group),
-        )
         // Connections (external data sources)
         .route("/connections", post(api::handlers::connections::create_connection))
         .route("/connections", get(api::handlers::connections::list_connections))
@@ -1689,7 +1656,7 @@ pub async fn build_router(
     //
     //   inference_mw  →  outlet (logging/billing)  →  translation
     //                →  cache  →  continuation  →  error_enrichment  →  image_normalizer
-    //                →  tool_injection  →  models_route  →  onwards
+    //                →  models_route  →  onwards
     //
     // Why this order:
     //   • inference_mw outermost: it must see the RAW foreign request (e.g. `/responses`
@@ -1701,7 +1668,7 @@ pub async fn build_router(
     //     `GET /v1/responses/{id}` reads — is a Responses object. Everything inner to
     //     translation only ever sees Chat Completions.
     //   • outlet outermost (of the body editors): it logs the request **as the customer
-    //     sent it** (cache_control markers intact, original image URLs, pre tool-injection)
+    //     sent it** (cache_control markers intact, original image URLs)
     //     and captures the response **after** cache injection, so billing sees cache_* usage.
     //   • cache inner to outlet, but OUTER to the body-mutating layers: it must hash the
     //     ORIGINAL request body. The image normaliser rewrites image URLs to per-request
@@ -1709,9 +1676,8 @@ pub async fn build_router(
     //     after it would make every image request a unique key → zero cache hits. Sitting
     //     before the reject-capable layers also means a request they 4xx (unfetchable/
     //     forbidden image) never gets a committed write — the success gate vetoes it.
-    //   • image_normalizer before tool_injection: it fetches/sanitises external image URLs
-    //     (and can reject the request) before tools are spliced in.
-    //   • tool_injection innermost: the body onwards forwards upstream is fully resolved.
+    //   • image_normalizer innermost: it fetches/sanitises external image URLs (and can
+    //     reject the request), so the body onwards forwards upstream is fully resolved.
     //
     // Each block below adds one layer; the inline notes cover that layer's specifics.
 
@@ -1730,19 +1696,7 @@ pub async fn build_router(
     // do, so onwards can forward the body untouched.
     let onwards_router = onwards_router.layer(middleware::from_fn(crate::inference::outbound_request::outbound_request_middleware));
 
-    // Apply tool injection middleware to the onwards router so that per-request tool
-    // schemas are resolved and injected into the request body before onwards processes it.
-    let tool_injection_state = crate::inference::tools::ToolInjectionState {
-        db: state.db.write().clone(),
-    };
-    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        tool_injection_state,
-        crate::inference::tools::tool_injection_middleware,
-    ));
-
-    // Apply the image-input normaliser middleware. This runs BEFORE
-    // tool_injection in request flow (i.e. as an outer Tower layer added
-    // after the inner one). For each `/chat/completions` and `/responses`
+    // Apply the image-input normaliser middleware. For each `/chat/completions` and `/responses`
     // request, it walks the body for HTTP(S) `image_url` values, fetches +
     // stores them via `image_normalizer`, and substitutes signed URLs into
     // the body before the request reaches onwards.
@@ -1830,8 +1784,8 @@ pub async fn build_router(
 
     // Apply the cached-input pricing layer (dwctl-owned). Placed inner
     // to outlet so the billing/analytics capture sees the injected `cache_*` usage
-    // fields, but OUTER to the body-mutating layers (image normaliser, tool
-    // injection) so the classifier hashes the original user body — stable across
+    // fields, but OUTER to the body-mutating layer (image normaliser) so the
+    // classifier hashes the original user body — stable across
     // requests, which per-request signed image URLs would otherwise break. Added
     // only when enabled; otherwise the stack is byte-identical to today.
     let onwards_router = {
@@ -1883,7 +1837,7 @@ pub async fn build_router(
     //     writes is what `GET /v1/responses/{id}` reads back. On the response path
     //     inner layers run first, so translation reframes chat -> Responses before
     //     outlet persists it (matching the old onwards-side placement).
-    //   - cache / image_normalizer / tool_injection / onwards (inner) still only
+    //   - cache / image_normalizer / onwards (inner) still only
     //     ever see Chat Completions.
     // Native OpenAI requests match no translator and pass through untouched.
     let onwards_router = {
@@ -3465,7 +3419,6 @@ impl Application {
         // `outbound_request` middleware, so onwards needs no BodyTransformFn.
         let onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
-            .with_streaming_header("x-fusillade-stream")
             .with_response_id_header("x-fusillade-request-id")
             .with_body_limit(onwards_body_limit);
 

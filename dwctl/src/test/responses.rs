@@ -56,8 +56,7 @@ async fn setup_ai_test(
             "type": "standard",
             "model_name": "gpt-4o",
             "alias": "gpt-4o",
-            "hosted_on": endpoint_id,
-            "open_responses_adapter": true
+            "hosted_on": endpoint_id
         }))
         .await;
     let model: serde_json::Value = model_response.json();

@@ -16,7 +16,6 @@
 //! - **outbound_request**: last-mile streaming usage-flag injection
 //!   (`stream_options` / `x-fusillade-stream`) before onwards. The id-scrub lives
 //!   in this module's own request parse (`scrub_request_id_fields`), not here.
-//! - **tools**: server-side tool resolution (injection) and execution (executor).
 //! - **engine**: the multi-step Open Responses orchestration loop and the
 //!   daemon-side request processor.
 
@@ -29,6 +28,5 @@ pub mod store;
 pub mod streaming;
 
 pub mod engine;
-pub mod tools;
 pub mod translation;
 pub mod zdr;
