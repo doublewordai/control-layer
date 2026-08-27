@@ -168,7 +168,7 @@ pub async fn list_ai_models<P: PoolProvider>(
         WHERE ak.secret = $1
           AND ak.is_deleted = FALSE
           AND u.is_deleted = FALSE
-          AND ak.purpose IN ('realtime', 'batch', 'playground')
+          AND ak.purpose IN ('realtime', 'batch', 'playground', 'continuation')
         LIMIT 1
         "#,
     )

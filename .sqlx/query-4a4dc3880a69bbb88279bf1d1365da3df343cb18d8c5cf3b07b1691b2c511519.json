@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM deployed_model_components WHERE composite_model_id = $1",
+  "query": "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM deployed_model_components\n             WHERE composite_model_id = $1 AND pool = $2",
   "describe": {
     "columns": [
       {
@@ -11,12 +11,13 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Text"
       ]
     },
     "nullable": [
       null
     ]
   },
-  "hash": "efe95b13705fb81f70cecac0e1d9f85edc95dd492730380be9d79b8d035f043a"
+  "hash": "4a4dc3880a69bbb88279bf1d1365da3df343cb18d8c5cf3b07b1691b2c511519"
 }

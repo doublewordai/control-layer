@@ -9,7 +9,7 @@ use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::models::ListModelResponse;
 use crate::sse::SseBufferedStream;
-use crate::target::{ConcurrencyGuard, RoutingAction, Target};
+use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
 use axum::{
     Json,
     extract::Request,
@@ -448,8 +448,18 @@ pub async fn target_message_handler<T: HttpClient>(
             .collect::<Vec<_>>()
     );
 
-    let mut pool = match state.targets.targets.get(&model_name) {
-        Some(pool) => {
+    let canonical_request_path = req.uri().path().to_string();
+
+    // Resolve which of the composite's pools serves this request, once, from
+    // the path alone — before auth, limits or provider selection, all of which
+    // then run on the chosen pool exactly as they ran on the single pool
+    // before. A composite with no pool for this class resolves to its default,
+    // which is byte-identically today's behaviour. Resolution happens INSIDE
+    // the map guard so only the chosen pool is cloned: KeySets are owned, so a
+    // whole-TargetPools clone would deep-copy every pool's keys per request.
+    let request_class = RequestClass::from_path(&canonical_request_path);
+    let (mut resolved_pool_name, mut pool) = match state.targets.targets.get(&model_name) {
+        Some(pools) => {
             // Now that the model is known to be a configured target, tag the
             // in-flight guard so `onwards_model_inflight{model=…}` tracks this
             // request for its whole lifetime (the guard moves into GuardedStream on
@@ -459,7 +469,7 @@ pub async fn target_message_handler<T: HttpClient>(
             if let Some(guard) = inflight_guard.as_mut() {
                 guard.set_model(&model_name);
             }
-            pool.clone()
+            (pools.resolved_name(request_class), pools.resolve(request_class).clone())
         }
         None => {
             debug!("No target found for model: {}", model_name);
@@ -467,8 +477,6 @@ pub async fn target_message_handler<T: HttpClient>(
             return Err(OnwardsErrorResponse::model_not_found(model_name.as_str()));
         }
     };
-
-    let canonical_request_path = req.uri().path().to_string();
 
     // Extract bearer token for authentication and rate limiting
     let bearer_token = req
@@ -537,7 +545,16 @@ pub async fn target_message_handler<T: HttpClient>(
                             model_name, redirect_alias, labels
                         );
                         pool = match state.targets.targets.get(redirect_alias) {
-                            Some(p) => p.clone(),
+                            // The redirect names an alias, so its pools are
+                            // resolved for this request's class just as the
+                            // original alias's were — and `resolved_pool_name`
+                            // is recomputed with it: the capability strip and
+                            // the span field must describe the pool that
+                            // actually serves, not the source alias's.
+                            Some(p) => {
+                                resolved_pool_name = p.resolved_name(request_class);
+                                p.resolve(request_class).clone()
+                            }
                             None => {
                                 debug!("Redirect target '{}' not found", redirect_alias);
                                 return Err(OnwardsErrorResponse::bad_gateway());
@@ -687,7 +704,7 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
     let pool_max_attempts = pool.fallback_max_attempts();
-    for (_idx, target, connection_guard) in pool.select_iter() {
+    for (_member_idx, target, connection_guard) in pool.select_iter() {
         any_attempted = true;
         attempt_number += 1;
 
@@ -700,7 +717,13 @@ pub async fn target_message_handler<T: HttpClient>(
             provider.timeout_secs = target.request_timeout_secs,
             http.response.status_code = tracing::field::Empty,
             onwards.fallback = tracing::field::Empty,
+            onwards.pool = tracing::field::Empty,
         );
+        // Recorded only when a non-default pool served the request, so the
+        // field's presence answers "did per-class routing engage here?".
+        if let Some(pool_name) = resolved_pool_name {
+            attempt_span.record("onwards.pool", pool_name);
+        }
 
         // The loop body is wrapped in an instrumented async block so that
         // attempt_span is the "current" span for all logging / field recording,
@@ -744,6 +767,35 @@ pub async fn target_message_handler<T: HttpClient>(
 
         // Prepare body for this attempt (may need model rewrite)
         let mut attempt_body = body_bytes.clone();
+
+        // Within a non-default pool, scheduling fields are only meaningful to
+        // a member whose serving stack understands them
+        // (`accepts_scheduling_priority` — the dynamo frontend); third-party
+        // members reject unknown fields outright (Fireworks: "Extra inputs are
+        // not permitted"). Strip them from every attempt whose provider lacks
+        // the capability, REGARDLESS of position: keying on member index broke
+        // the moment the dynamo member was disabled during an incident and a
+        // third party became index 0 (every resume 400'd). Two carriers:
+        // `nvext` (the self-hosted stack's vendor extension — the WHOLE object
+        // goes, since no third party understands any of it and Fireworks 400s
+        // on its presence) and a legacy top-level `priority`. Default-pool
+        // traffic is untouched: batch/flex deadline priorities must keep
+        // reaching dynamo exactly as today.
+        if resolved_pool_name.is_some()
+            && !target.accepts_scheduling_priority
+            && (attempt_body.windows(10).any(|w| w == b"\"priority\"")
+                || attempt_body.windows(7).any(|w| w == b"\"nvext\""))
+            && let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
+            && let Some(obj) = parsed.as_object_mut()
+        {
+            let removed = [obj.remove("priority"), obj.remove("nvext")];
+            if removed.iter().any(Option::is_some)
+                && let Ok(stripped) = serde_json::to_vec(&parsed)
+            {
+                debug!("Stripped scheduling fields for a pool member that does not accept them");
+                attempt_body = stripped.into();
+            }
+        }
 
         // Rewrite model field if configured
         if let Some(ref rewrite) = target.onwards_model
@@ -1628,7 +1680,10 @@ pub async fn models<T: HttpClient>(
         .targets
         .iter()
         .filter(|entry| {
-            let pool = entry.value();
+            // Model listing is about the alias, not about a request class, and
+            // a non-default pool inherits the default's keys unless it states
+            // its own — so the default pool's keys are the alias's visibility.
+            let pool = entry.value().default_pool();
 
             // If pool has no keys configured, it's publicly accessible
             let Some(keys) = pool.keys() else {
@@ -2508,7 +2563,7 @@ mod tests {
             .unwrap();
 
         // Test the timeout logic directly (not the full handler)
-        let target = pool.first_target().unwrap();
+        let target = pool.default_pool().first_target().unwrap();
         let timeout_secs = target.request_timeout_secs.unwrap();
         let timeout_duration = std::time::Duration::from_secs(timeout_secs);
 
@@ -2580,6 +2635,7 @@ mod tests {
             trusted,
             propagate_trace_context,
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
         }
     }
 
