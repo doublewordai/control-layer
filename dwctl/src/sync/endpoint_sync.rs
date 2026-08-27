@@ -941,6 +941,7 @@ mod tests {
             auth_header_name: "Authorization".to_string(),
             auth_header_prefix: "Bearer ".to_string(),
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
             created_by: uuid::Uuid::nil(),
             created_at: Utc::now(),
             updated_at: Utc::now(),

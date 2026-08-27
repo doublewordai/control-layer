@@ -17,6 +17,9 @@ pub struct InferenceEndpointCreateDBRequest {
     pub auth_header_name: Option<String>,
     pub auth_header_prefix: Option<String>,
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
+    /// The endpoint's serving stack understands the scheduling `priority`
+    /// request field (dynamo frontend). See migration 136.
+    pub accepts_scheduling_priority: bool,
 }
 
 /// Database request for updating an inference endpoint
@@ -31,6 +34,8 @@ pub struct InferenceEndpointUpdateDBRequest {
     pub auth_header_prefix: Option<String>,
     /// None leaves the value unchanged; Some(None) clears it.
     pub reasoning_translation: Option<Option<ReasoningTranslationConfig>>,
+    /// None leaves the value unchanged.
+    pub accepts_scheduling_priority: Option<bool>,
 }
 
 /// Database response for an inference endpoint
@@ -45,6 +50,7 @@ pub struct InferenceEndpointDBResponse {
     pub auth_header_name: String,
     pub auth_header_prefix: String,
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
+    pub accepts_scheduling_priority: bool,
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

@@ -89,6 +89,12 @@ export interface ModelComponent {
   enabled: boolean;
   sort_order: number; // Lower = higher priority for priority-based routing
   created_at: string;
+  // Which routing pool this membership belongs to. "default" serves chat;
+  // "completions" holds validated continuation targets for /v1/completions.
+  // The same hosted model can be a member of both, with independent ordering,
+  // and component PATCH/DELETE endpoints address one membership at a time
+  // (server default: ?pool=default).
+  pool: "default" | "completions";
   model: ComponentModelSummary;
 }
 

@@ -741,4 +741,151 @@ mod tests {
         assert!(body_str.contains("\"text\":\" world\""));
         assert!(body_str.contains("[DONE]"));
     }
+
+    // ── scheduling priority policy ───────────────────────────────────────────
+    //
+    // `priority` steers the dynamo scheduler's queue, so it is tri-level on the
+    // authenticating key's purpose: `batch` and `continuation` pass through,
+    // everyone else is stripped from BOTH the typed field and (for chat) the
+    // flattened extras.
+
+    /// Build a strict app whose single key carries `purpose`, exactly as dwctl's
+    /// onwards sync stamps it.
+    fn app_with_key_purpose(purpose: Option<&str>) -> (AppState<MockHttpClient>, MockHttpClient) {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "dsv4-flash".to_string(),
+            Target::builder()
+                .url("https://api.example.com/v1/".parse().unwrap())
+                .build()
+                .into_pool(),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        if let Some(purpose) = purpose {
+            key_labels.insert(
+                "sk-test".to_string(),
+                std::collections::HashMap::from([("purpose".to_string(), purpose.to_string())]),
+            );
+        }
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels,
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(
+            StatusCode::OK,
+            r#"{"id":"cmpl-1","object":"text_completion","created":0,"model":"dsv4-flash","choices":[]}"#,
+        );
+        (
+            AppState::with_client(targets, mock_client.clone()),
+            mock_client,
+        )
+    }
+
+    async fn forwarded_body(
+        state: AppState<MockHttpClient>,
+        mock_client: &MockHttpClient,
+        uri: &str,
+        body: &str,
+    ) -> serde_json::Value {
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer sk-test")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = build_strict_router(state).oneshot(request).await.unwrap();
+        assert!(
+            response.status().is_success(),
+            "{uri}: {}",
+            response.status()
+        );
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1, "{uri}");
+        serde_json::from_slice(&requests[0].body).unwrap()
+    }
+
+    /// Onwards VALIDATES and then forwards the ORIGINAL bytes (COR-522) — it is
+    /// not the enforcement point for privileged fields. `priority` is stripped
+    /// from external traffic by dwctl's inference middleware (which fusillade
+    /// daemon requests bypass, and continuation resume legs enter below); this
+    /// test pins that onwards itself never eats the field, for any key, so
+    /// enforcement lives in exactly one place.
+    #[tokio::test]
+    async fn scheduling_fields_forward_verbatim_for_every_key() {
+        for purpose in [Some("realtime"), Some("continuation"), None] {
+            let (state, mock_client) = app_with_key_purpose(purpose);
+            let body = forwarded_body(
+                state,
+                &mock_client,
+                "/completions",
+                r#"{"model":"dsv4-flash","prompt":[1,2,3],"priority":100,"stream_options":{"include_usage":true}}"#,
+            )
+            .await;
+            assert_eq!(
+                body["priority"], 100,
+                "purpose={purpose:?}: onwards must not eat the field"
+            );
+            assert_eq!(body["stream_options"]["include_usage"], true);
+        }
+    }
+
+    /// REGRESSION: fusillade derives a NEGATIVE priority from each batch
+    /// request's deadline, so batch work sorts behind realtime traffic and,
+    /// within itself, by urgency. Stripping it would silently flatten batch
+    /// scheduling to one tier — a live behaviour change on the busiest path
+    /// through the platform, invisible from the response.
+    ///
+    /// Asserted on chat, which is what fusillade actually sends.
+    #[tokio::test]
+    async fn a_batch_keys_deadline_priority_survives_re_serialization() {
+        for (uri, body) in [
+            (
+                "/chat/completions",
+                r#"{"model":"dsv4-flash","messages":[{"role":"user","content":"hi"}],"priority":-1754812800}"#,
+            ),
+            (
+                "/completions",
+                r#"{"model":"dsv4-flash","prompt":[1,2,3],"priority":-1754812800}"#,
+            ),
+        ] {
+            let (state, mock_client) = app_with_key_purpose(Some("batch"));
+            let forwarded = forwarded_body(state, &mock_client, uri, body).await;
+            assert_eq!(
+                forwarded["priority"], -1754812800,
+                "{uri}: a batch key's deadline-derived priority must reach the scheduler"
+            );
+        }
+    }
+
+    /// Verbatim forwarding applies to unmodelled fields too, on BOTH endpoints:
+    /// the schema is a validation surface, not a filter (COR-522 moved body
+    /// manipulation to the dwctl edge). This pins the contract so nobody
+    /// reintroduces per-field dropping here and silently breaks engine knobs
+    /// that ride through today.
+    #[tokio::test]
+    async fn unmodelled_fields_forward_verbatim_after_validation() {
+        for (uri, body) in [
+            (
+                "/completions",
+                r#"{"model":"dsv4-flash","prompt":[1,2],"ignore_eos":true,"repetition_penalty":1.1,"custom_knob":true}"#,
+            ),
+            (
+                "/chat/completions",
+                r#"{"model":"dsv4-flash","messages":[{"role":"user","content":"hi"}],"custom_knob":true}"#,
+            ),
+        ] {
+            let (state, mock_client) = app_with_key_purpose(Some("realtime"));
+            let forwarded = forwarded_body(state, &mock_client, uri, body).await;
+            assert_eq!(
+                forwarded["custom_knob"], true,
+                "{uri}: original bytes forward untouched"
+            );
+        }
+    }
 }

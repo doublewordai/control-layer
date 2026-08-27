@@ -2510,3 +2510,137 @@ async fn test_read_pool_enforces_readonly(pool: PgPool) {
 
     assert!(result.is_ok(), "Write operation on write pool should succeed");
 }
+
+/// The components API round-trips a member's pool, and lets the SAME hosted
+/// model be a member of two pools with independent per-pool ordering — which is
+/// how the canary is wired (dynamo position 0 in both).
+#[sqlx::test]
+#[test_log::test]
+async fn test_component_pool_round_trips_and_allows_dual_membership(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    let endpoint: serde_json::Value = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"name": "Test Endpoint", "url": "https://api.example.com/v1"}))
+        .await
+        .json();
+
+    let mut members = Vec::new();
+    for name in ["dynamo-flash", "fireworks-flash", "novita-flash"] {
+        let model: serde_json::Value = server
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&serde_json::json!({"type": "standard", "model_name": name, "hosted_on": endpoint["id"]}))
+            .await
+            .json();
+        members.push(model["id"].as_str().unwrap().to_string());
+    }
+
+    let composite: serde_json::Value = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"type": "composite", "model_name": "dsv4-flash"}))
+        .await
+        .json();
+    let composite_id = composite["id"].as_str().unwrap().to_string();
+
+    let add = async |member: &str, body: serde_json::Value| {
+        server
+            .post(&format!("/admin/api/v1/models/{composite_id}/components/{member}"))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&body)
+            .await
+    };
+
+    // An add that names no pool keeps today's behaviour: the default pool.
+    let plain = add(&members[2], serde_json::json!({"weight": 50})).await;
+    assert_eq!(plain.status_code(), 200);
+    assert_eq!(plain.json::<serde_json::Value>()["pool"], "default");
+
+    let on_prem = add(&members[0], serde_json::json!({"weight": 50})).await;
+    assert_eq!(on_prem.status_code(), 200);
+    assert_eq!(on_prem.json::<serde_json::Value>()["pool"], "default");
+
+    // The same hosted model joins the completions pool too — position 0 there,
+    // independent of its position in the default pool.
+    let on_prem_completions = add(&members[0], serde_json::json!({"weight": 50, "pool": "completions"})).await;
+    assert_eq!(on_prem_completions.status_code(), 200, "a member may belong to more than one pool");
+    let on_prem_completions: serde_json::Value = on_prem_completions.json();
+    assert_eq!(on_prem_completions["pool"], "completions");
+    assert_eq!(on_prem_completions["sort_order"], 0, "ordering is per pool");
+
+    // The validated target sits behind it, in the completions pool only.
+    let validated = add(&members[1], serde_json::json!({"weight": 50, "pool": "completions"})).await;
+    assert_eq!(validated.status_code(), 200);
+    let validated_body: serde_json::Value = validated.json();
+    assert_eq!(validated_body["pool"], "completions");
+    assert_eq!(validated_body["sort_order"], 1);
+
+    // A pool name outside the CHECK constraint is refused at the schema.
+    let bogus = add(&members[1], serde_json::json!({"weight": 50, "pool": "chat"})).await;
+    assert!(
+        bogus.status_code().is_client_error(),
+        "unknown pool names must not reach the database: {}",
+        bogus.status_code()
+    );
+
+    // A PATCH addresses one membership, named by `?pool=`; the other is untouched.
+    let moved = server
+        .patch(&format!(
+            "/admin/api/v1/models/{composite_id}/components/{}?pool=completions",
+            members[1]
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"sort_order": 0}))
+        .await;
+    assert_eq!(moved.status_code(), 200);
+    assert_eq!(moved.json::<serde_json::Value>()["sort_order"], 0);
+
+    let listed: serde_json::Value = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    let pools: Vec<&str> = listed.as_array().unwrap().iter().map(|c| c["pool"].as_str().unwrap()).collect();
+    assert_eq!(pools.iter().filter(|p| **p == "completions").count(), 2);
+    assert_eq!(pools.iter().filter(|p| **p == "default").count(), 2);
+
+    // Removing a completions membership leaves the default one alone: the same
+    // model is still serving chat.
+    let removed = server
+        .delete(&format!(
+            "/admin/api/v1/models/{composite_id}/components/{}?pool=completions",
+            members[0]
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await;
+    assert_eq!(removed.status_code(), 200);
+
+    let listed: serde_json::Value = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    let remaining: Vec<(&str, &str)> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["model"]["id"].as_str().unwrap(), c["pool"].as_str().unwrap()))
+        .collect();
+    assert!(
+        remaining.contains(&(members[0].as_str(), "default")),
+        "the default-pool membership survives: {remaining:?}"
+    );
+    assert!(!remaining.contains(&(members[0].as_str(), "completions")));
+}
