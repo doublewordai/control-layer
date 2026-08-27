@@ -1,5 +1,22 @@
 # Changelog
 
+## [11.0.0](https://github.com/doublewordai/control-layer/compare/v10.17.1...v11.0.0) (2026-08-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* **dwctl:** move stream reassembly out of the batch daemon ([#1535](https://github.com/doublewordai/control-layer/issues/1535))
+* remove tool injection, tool_sources, and the onwards Responses adapter ([#1518](https://github.com/doublewordai/control-layer/issues/1518))
+
+### Features
+
+* remove tool injection, tool_sources, and the onwards Responses adapter ([#1518](https://github.com/doublewordai/control-layer/issues/1518)) ([4276d91](https://github.com/doublewordai/control-layer/commit/4276d91a4c320bf884ed3ba88004d1ca9265fe12))
+
+
+### Code Refactoring
+
+* **dwctl:** move stream reassembly out of the batch daemon ([#1535](https://github.com/doublewordai/control-layer/issues/1535)) ([e9c1795](https://github.com/doublewordai/control-layer/commit/e9c1795043f9de5aef1dc4d62b9915f5b8194f5f))
+
 ## [10.17.1](https://github.com/doublewordai/control-layer/compare/v10.17.0...v10.17.1) (2026-08-27)
 
 
