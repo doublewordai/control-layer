@@ -155,7 +155,7 @@ pub(super) fn parse_window_to_seconds(window: &str) -> i64 {
 // Shared capacity reservation — used by both API batch creation and sync activate
 // ---------------------------------------------------------------------------
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -193,6 +193,51 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
     use fusillade::Storage;
     use fusillade::request::ServiceTierFilter;
 
+    // Committed pending/claimed/processing rows are counted BEFORE the
+    // per-model advisory locks are taken. The count is the expensive part of
+    // admission — it scales with the active backlog of the requested models —
+    // and holding the locks across it head-of-line blocks every concurrent
+    // submission for the same model+window; a count that hit the statement
+    // timeout used to stall all of them for the full timeout.
+    //
+    // Reading pending rows before reservations reopens the swap-point race
+    // described on `reserve_capacity_for_batch`: a peer batch could commit its
+    // rows after this snapshot and release its reservation before the locked
+    // reservation read below, appearing in neither. `pending_counts_since`
+    // closes it: the reservation sum also includes reservations released at or
+    // after this instant, so a batch that swapped after the snapshot is still
+    // counted (at worst twice, which only errs towards under-acceptance). The
+    // instant is read from the dwctl database so it shares a clock with
+    // `released_at`, and it is read before the snapshot so that any release
+    // stamped earlier than it is guaranteed to have committed its rows before
+    // the snapshot was taken.
+    let mut pending_counts_since: Option<DateTime<Utc>> = None;
+    let pending_counts: HashMap<String, HashMap<String, i64>> = if input.include_pending_counts {
+        let since: DateTime<Utc> = sqlx::query_scalar!(r#"SELECT now() AS "now!""#)
+            .fetch_one(dwctl_pool)
+            .await
+            .map_err(|e| CapacityError::Internal(format!("read reservation clock: {e}")))?;
+        pending_counts_since = Some(since);
+
+        let windows = vec![(
+            input.completion_window.to_string(),
+            None,
+            parse_window_to_seconds(input.completion_window),
+        )];
+        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
+        let model_filter: Vec<String> = input.file_model_counts.keys().cloned().collect();
+
+        // Only count normal batch rows when admitting new batches. Flex and
+        // realtime rows are batchless service tiers and should not consume
+        // batch capacity.
+        request_manager
+            .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, &ServiceTierFilter::Include(vec![None]), true)
+            .await
+            .map_err(|e| CapacityError::Internal(format!("get pending counts: {e}")))?
+    } else {
+        HashMap::new()
+    };
+
     let mut tx = dwctl_pool
         .begin()
         .await
@@ -213,36 +258,16 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
         .map_err(|e| CapacityError::Internal(format!("lock reservation for {alias}: {e}")))?;
     }
 
-    // Sum active reservations
+    // Sum reservations under the lock: active ones, plus — when pending rows
+    // were counted — any released since that snapshot (see above).
     let model_ids: Vec<Uuid> = model_pairs.iter().map(|(_, id)| *id).collect();
     let id_to_alias: HashMap<Uuid, String> = model_pairs.iter().map(|(a, id)| (*id, a.clone())).collect();
     let mut reservations = BatchCapacityReservations::new(&mut tx);
 
     let reserved_rows = reservations
-        .sum_active_by_model_window(&model_ids, input.completion_window)
+        .sum_active_by_model_window(&model_ids, input.completion_window, pending_counts_since)
         .await
         .map_err(|e| CapacityError::Internal(format!("sum active reservations: {e}")))?;
-
-    let pending_counts: HashMap<String, HashMap<String, i64>> = if input.include_pending_counts {
-        // Fetch pending counts AFTER locks to avoid stale snapshots.
-        let windows = vec![(
-            input.completion_window.to_string(),
-            None,
-            parse_window_to_seconds(input.completion_window),
-        )];
-        let states = vec!["pending".to_string(), "claimed".to_string(), "processing".to_string()];
-        let model_filter: Vec<String> = input.file_model_counts.keys().cloned().collect();
-
-        // Only count normal batch rows when admitting new batches. Flex and
-        // realtime rows are batchless service tiers and should not consume
-        // batch capacity.
-        request_manager
-            .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, &ServiceTierFilter::Include(vec![None]), true)
-            .await
-            .map_err(|e| CapacityError::Internal(format!("get pending counts: {e}")))?
-    } else {
-        HashMap::new()
-    };
 
     // Active reservations are always counted; the pending-count query above is optional.
     let mut pending_with_reservations = pending_counts;

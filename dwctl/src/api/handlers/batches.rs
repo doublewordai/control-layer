@@ -1044,11 +1044,13 @@ async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_al
 /// ## Three-phase pipeline
 ///
 /// ```text
-/// Phase 1 — Reserve   (this fn, ~1 ms)
+/// Phase 1 — Reserve   (this fn)
+///   ├─ read pending request counts      (fusillade write pool, OUTSIDE the lock;
+///   │                                     the expensive read — scales with backlog)
 ///   ├─ BEGIN tx on dwctl write pool
 ///   ├─ pg_advisory_xact_lock per (model_id, window)  ← serialises concurrent reservations
-///   ├─ read active reservations         (dwctl write pool, inside tx)
-///   ├─ read pending request counts      (fusillade write pool, separate connection)
+///   ├─ read reservations                (dwctl write pool, inside tx: active ones plus
+///   │                                     any released since the pending snapshot)
 ///   ├─ check combined capacity
 ///   ├─ INSERT reservation rows
 ///   └─ COMMIT  ← lock released, reservation visible to peers
@@ -1065,32 +1067,38 @@ async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_al
 /// can read-check-then-insert at a time. Locks are acquired in deterministic UUID order
 /// to prevent deadlocks when a batch spans multiple models.
 ///
+/// The pending-count read is deliberately kept *outside* the lock. It is the only
+/// expensive step (it reads every active request of the requested models), so holding
+/// the lock across it would head-of-line block every concurrent submission for the same
+/// model+window behind the slowest count — and a count that hit its statement timeout
+/// stalled all of them for the full timeout. Outside the lock, a slow count degrades one
+/// submission instead of blocking all of them.
+///
 /// ## Read ordering and the fail-safe race window
 ///
 /// The two capacity reads come from **different connection pools** (dwctl vs. fusillade),
 /// so they hold independent PostgreSQL snapshots under `READ COMMITTED`. There is an
 /// unavoidable, tiny race window at the exact moment a concurrent batch finishes
 /// `create_batch` and its reservation is released — the "swap point" where requests
-/// transition from a reservation into committed pending rows. A new caller straddling
-/// this swap point could theoretically see inconsistent state across the two reads.
+/// transition from a reservation into committed pending rows.
 ///
-/// The read order here is deliberately chosen to make that race **fail-safe**:
+/// Because pending rows are read **first** (outside the lock) and reservations
+/// **second** (inside it), a batch swapping between the two reads would naively appear
+/// in **neither** — it wasn't committed when the rows were counted, and it was already
+/// released when the reservations were summed. To make the race fail-safe, the
+/// reservation read also counts reservations *released at or after* the instant the
+/// pending snapshot was taken (`released_since`). That instant is read from the dwctl
+/// database, so it shares a clock with `released_at`, and it is read before the pending
+/// snapshot, so any reservation released earlier than it belongs to a batch whose rows
+/// were already committed and therefore counted by the snapshot.
 ///
-/// - Reservations are read **first** (dwctl tx, inside the advisory lock).
-/// - Pending counts are read **second** (fusillade pool, outside the lock).
-///
-/// If the swap point falls between these two reads, the concurrent batch appears in
-/// **both** counts — as a reservation that hasn't been released yet, and as committed
-/// pending requests that have just landed. This double-counts the batch, causing a
-/// conservative over-estimate of load that leads to **under-acceptance** rather than
-/// over-acceptance.
-///
-/// The opposite ordering (pending first, reservations second) produces the dangerous
-/// case: the swap point could cause both reads to return zero, making the system
-/// appear completely idle and over-accepting the incoming batch.
+/// A batch that swaps during the window is then counted via its recently released
+/// reservation — and, if it committed just before the snapshot, possibly by both reads.
+/// That double count is a conservative over-estimate of load that leads to
+/// **under-acceptance** rather than over-acceptance.
 ///
 /// In short: the race is an inherent consequence of reading across two independent
-/// connections, but the read order ensures it always errs on the side of caution.
+/// connections, but the released-since rule ensures it always errs on the side of caution.
 /// Thin wrapper around the shared `reserve_capacity` for the API handler context.
 /// Converts `CapacityError` to the API's `Error` type.
 async fn reserve_capacity_for_batch<P: PoolProvider>(
