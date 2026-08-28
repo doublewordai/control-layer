@@ -1905,6 +1905,32 @@ mod openapi_access_control {
             !text.contains("api.doubleword.ai"),
             "401 copy must not enumerate regional base URLs"
         );
+        assert!(
+            !text.contains("api.us.doubleword.ai"),
+            "401 copy must not enumerate regional base URLs"
+        );
+    }
+
+    #[sqlx::test]
+    async fn ai_spec_error_example_matches_live_copy(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let headers = add_auth_headers(&user);
+
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+
+        // The documented error example in the AI spec description is a separate
+        // string literal; keep it from drifting away from the live 401 copy.
+        let text = response.text();
+        assert!(
+            text.contains(crate::errors::INVALID_API_KEY_MESSAGE),
+            "AI OpenAPI description should embed the live invalid-API-key copy"
+        );
     }
 
     #[sqlx::test]
