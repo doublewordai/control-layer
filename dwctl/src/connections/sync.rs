@@ -1120,13 +1120,29 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         tracing::info!(batch_id = %existing, "Reusing batch from previous attempt");
         existing
     } else {
-        let metadata = serde_json::json!({
+        // Cache the batch's model label (single alias or "mixed") at creation
+        // so list/get responses never aggregate over request_templates. Empty
+        // aliases are tier-2 invalid lines, failed after populate — skip them.
+        let model_label = {
+            let stats = state
+                .request_manager
+                .get_file_template_stats(fusillade::FileId(input.file_id))
+                .await
+                .map_err(|e| anyhow::anyhow!("get file template stats for model label: {e}"))?;
+            let models: Vec<String> = stats.into_iter().map(|s| s.model).filter(|m| !m.is_empty()).collect();
+            crate::api::handlers::batches::batch_model_label(&models)
+        };
+
+        let mut metadata = serde_json::json!({
             "request_source": "sync",
             "dw_source_id": input.connection_id.to_string(),
             "dw_source_name": connection_name,
             "dw_sync_id": input.sync_id.to_string(),
             "dw_external_key": external_key,
         });
+        if let Some(label) = model_label {
+            metadata["dw_model"] = serde_json::Value::String(label);
+        }
 
         let batch_input = fusillade::BatchInput {
             file_id: fusillade::FileId(input.file_id),

@@ -321,6 +321,10 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
         sync_id: raw_metadata.get("dw_sync_id").cloned(),
     };
 
+    // Model label cached on the batch at creation time: surfaced as the typed
+    // `model` field, stripped from caller-visible metadata below.
+    let model = raw_metadata.get("dw_model").cloned();
+
     // Build user-facing metadata: filter out internal dw_* keys.
     // Keep request_source, created_by_email, context_name, context_type for backwards compat.
     let internal_keys = [
@@ -332,6 +336,8 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
         // Recorded for analytics, not for the caller: echoing a client's own User-Agent
         // back at it tells it nothing it didn't just send us.
         "dw_user_agent",
+        // Surfaced as the typed `model` field instead.
+        "dw_model",
     ];
     let mut metadata: HashMap<String, String> = raw_metadata
         .into_iter()
@@ -464,7 +470,7 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
             failed: batch.failed_requests,
         },
         metadata: if metadata.is_empty() { None } else { Some(metadata) },
-        model: None,
+        model,
         analytics: None,
         dwext: if dwext.is_empty() { None } else { Some(dwext) },
     }
@@ -472,7 +478,9 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
 
 /// Collapse the distinct models behind a batch into the single label the
 /// public UI shows per batch: the alias when homogeneous, `"mixed"` otherwise.
-fn batch_model_label(models: &[String]) -> Option<String> {
+/// Cached on the batch as `dw_model` metadata at creation time so list/get
+/// responses never aggregate over `request_templates`.
+pub(crate) fn batch_model_label(models: &[String]) -> Option<String> {
     match models {
         [] => None,
         [only] => Some(only.clone()),
@@ -494,13 +502,14 @@ async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Opt
 /// Metadata keys the server owns. A caller-supplied value for any of these is dropped at
 /// creation rather than merged: they are either injected server-side during response
 /// enrichment, or they are provenance, which is worth nothing if the caller can set it.
-const RESERVED_METADATA_KEYS: [&str; 6] = [
+const RESERVED_METADATA_KEYS: [&str; 7] = [
     "created_by_email",
     "context_name",
     "context_type",
     "request_source",
     "created_by",
     "dw_user_agent",
+    "dw_model",
 ];
 
 /// Whether a caller-supplied metadata key collides with a reserved one, comparing the
@@ -837,6 +846,14 @@ pub async fn create_batch<P: PoolProvider>(
     if let Some(user_agent) = creator_user_agent {
         metadata_map.insert("dw_user_agent".to_string(), user_agent);
     }
+    // Cache the batch's model label at creation — the template counts are
+    // already loaded for validation, so this costs nothing. Response
+    // enrichment surfaces it as the typed `model` field; list/get never have
+    // to aggregate over request_templates.
+    let model_aliases_for_label: Vec<String> = file_model_counts.keys().cloned().collect();
+    if let Some(label) = batch_model_label(&model_aliases_for_label) {
+        metadata_map.insert("dw_model".to_string(), label);
+    }
     let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input — created_by uses org ID when in org context for ownership scoping
@@ -946,13 +963,12 @@ pub async fn create_batch<P: PoolProvider>(
     // which polls fusillade.batches for new records.
 
     // For create, we have the current user's email directly. The model label
-    // comes from the template counts already loaded for validation above.
-    let mut response = to_batch_response_with_email(batch, Some(&current_user.email));
-    let mut models: Vec<String> = file_model_counts.into_keys().collect();
-    models.sort();
-    response.model = batch_model_label(&models);
-
-    Ok((StatusCode::CREATED, Json(response)))
+    // rides on the batch's stored metadata (`dw_model`, injected above) and is
+    // surfaced by response enrichment.
+    Ok((
+        StatusCode::CREATED,
+        Json(to_batch_response_with_email(batch, Some(&current_user.email))),
+    ))
 }
 
 async fn load_and_validate_batch_models<P: PoolProvider>(
@@ -1280,25 +1296,7 @@ pub async fn get_batch<P: PoolProvider>(
         None
     };
 
-    // Resolve the model label from the input file's templates. Templates live
-    // in the fusillade database, so this uses the fusillade pool.
-    let model_label = if let Some(file_id) = batch.file_id {
-        let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
-            operation: format!("get fusillade connection for batch models: {e}"),
-        })?;
-        BatchTemplates::new(&mut templates_conn)
-            .get_file_models(&[file_id.0])
-            .await
-            .map_err(Error::Database)?
-            .remove(&file_id.0)
-            .as_deref()
-            .and_then(batch_model_label)
-    } else {
-        None
-    };
-
     let mut response = to_batch_response_enriched(batch, None, source_name.as_deref());
-    response.model = model_label;
 
     if let Some(email) = created_by_email {
         response
@@ -2096,27 +2094,6 @@ pub async fn list_batches<P: PoolProvider>(
         HashMap::new()
     };
 
-    // Bulk-resolve each batch's model label from its input file's templates.
-    // Templates live in the fusillade database, so this uses the fusillade
-    // pool rather than the control-layer connection above.
-    let file_ids: Vec<Uuid> = batches
-        .iter()
-        .filter_map(|b| b.file_id.map(|id| id.0))
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-    let file_models_map: HashMap<Uuid, Vec<String>> = if !file_ids.is_empty() {
-        let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
-            operation: format!("get fusillade connection for batch models: {e}"),
-        })?;
-        BatchTemplates::new(&mut templates_conn)
-            .get_file_models(&file_ids)
-            .await
-            .map_err(Error::Database)?
-    } else {
-        HashMap::new()
-    };
-
     // Fetch analytics in bulk if requested
     let analytics_map: HashMap<Uuid, BatchAnalytics> = if include_analytics && !batches.is_empty() {
         crate::db::handlers::analytics::get_batches_analytics_bulk(state.db.read(), &batch_ids)
@@ -2133,7 +2110,6 @@ pub async fn list_batches<P: PoolProvider>(
         .into_iter()
         .map(|batch| {
             let batch_id = batch.id;
-            let file_id = batch.file_id.map(|id| id.0);
 
             // Resolve individual creator email via api_key_id, with fallback
             // to batch owner for legacy batches without api_key_id
@@ -2210,10 +2186,6 @@ pub async fn list_batches<P: PoolProvider>(
                     .get_or_insert_with(HashMap::new)
                     .insert("context_type".to_string(), ctype);
             }
-
-            response.model = file_id
-                .and_then(|fid| file_models_map.get(&fid))
-                .and_then(|models| batch_model_label(models));
 
             if include_analytics {
                 response.analytics = analytics_map.get(&batch_id).cloned();
@@ -2760,10 +2732,13 @@ mod tests {
             "Dw-User-Agent",
             "request_source",
             "created_by",
+            "dw_model",
+            "dw-model",
+            "DW_MODEL",
         ] {
             assert!(is_reserved_metadata_key(reserved), "{reserved} should be reserved");
         }
-        for allowed in ["team", "dw_user_agent_note", "user_agent", "dwuseragent"] {
+        for allowed in ["team", "dw_user_agent_note", "user_agent", "dwuseragent", "model"] {
             assert!(!is_reserved_metadata_key(allowed), "{allowed} is the caller's to set");
         }
     }
@@ -3185,6 +3160,9 @@ mod tests {
         .await;
         let single_batch = create_batch(single_file_id).await;
         assert_eq!(single_batch["model"].as_str(), Some("gpt-4"));
+        // The label is stored as dw_model metadata but must surface only as
+        // the typed field, never in caller-visible metadata.
+        assert!(single_batch["metadata"]["dw_model"].is_null(), "dw_model leaked into metadata");
         let single_batch_id = single_batch["id"].as_str().unwrap().to_string();
 
         // Mixed-model file: labeled "mixed"
@@ -3214,6 +3192,9 @@ mod tests {
         };
         assert_eq!(model_of(&single_batch_id), Some("gpt-4".to_string()));
         assert_eq!(model_of(&mixed_batch_id), Some("mixed".to_string()));
+        for row in rows {
+            assert!(row["metadata"]["dw_model"].is_null(), "dw_model leaked into list metadata");
+        }
 
         // The detail endpoint carries the label too
         let get_resp = app

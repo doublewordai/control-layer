@@ -180,8 +180,8 @@ pub struct BatchResponse {
     pub metadata: Option<HashMap<String, String>>,
 
     /// Model alias used by this batch's requests, or `"mixed"` when the input
-    /// file spans multiple models. Absent when no templates are resolvable
-    /// (e.g. the input file was deleted).
+    /// file spans multiple models. Cached on the batch at creation time;
+    /// absent on batches created before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "Qwen/Qwen3-235B-A22B-Instruct-2507")]
     pub model: Option<String>,
