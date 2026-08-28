@@ -83,7 +83,7 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
 #[tracing::instrument(skip_all)]
 pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'static>(
     State(state): State<InferenceMiddlewareState<P>>,
-    mut req: Request<Body>,
+    req: Request<Body>,
     next: Next,
 ) -> Response {
     // Only intercept POST requests to inference endpoints.
@@ -91,16 +91,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         return next.run(req).await;
     }
 
-    // Skip if this is a fusillade daemon request (already tracked). Mark it
-    // with an extension while we are the one place that can still tell: this
-    // middleware later stamps the SAME header on every realtime dispatch as
-    // the response-id carrier, so header presence alone cannot distinguish
-    // daemon traffic anywhere inner to this layer (the outbound reassembly
-    // keyed on the raw header and force-reassembled every realtime stream).
-    // Safe as an authority for the same reason the early return is: the
-    // sso-stack ingress strips all external `x-fusillade-*` headers.
+    // Skip if this is a fusillade daemon request (already tracked)
     if req.headers().get("x-fusillade-request-id").is_some() {
-        req.extensions_mut().insert(crate::inference::outbound_request::FusilladeDispatch);
         return next.run(req).await;
     }
 
