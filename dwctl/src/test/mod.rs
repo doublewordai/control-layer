@@ -572,8 +572,14 @@ async fn ai_models_unknown_key_401_points_at_regional_endpoints_docs(pool: PgPoo
     // without enumerating regional API base URLs in the error body.
     let message = body["error"]["message"].as_str().unwrap();
     assert!(message.contains("https://docs.doubleword.ai/inference-api/regional-endpoints"));
-    assert!(!message.contains("api.doubleword.ai"), "401 copy must not enumerate regional base URLs");
-    assert!(!message.contains("api.us.doubleword.ai"), "401 copy must not enumerate regional base URLs");
+    assert!(
+        !message.contains("api.doubleword.ai"),
+        "401 copy must not enumerate regional base URLs"
+    );
+    assert!(
+        !message.contains("api.us.doubleword.ai"),
+        "401 copy must not enumerate regional base URLs"
+    );
 }
 
 async fn assert_usage_recorded(fixture: &StreamingFixture, expected_uri: &str, prompt_tokens: i64, completion_tokens: i64) {
@@ -1895,7 +1901,10 @@ mod openapi_access_control {
             text.contains(crate::errors::INVALID_API_KEY_MESSAGE),
             "unknown-key 401 should carry the regional-endpoints copy, got: {text}"
         );
-        assert!(!text.contains("api.doubleword.ai"), "401 copy must not enumerate regional base URLs");
+        assert!(
+            !text.contains("api.doubleword.ai"),
+            "401 copy must not enumerate regional base URLs"
+        );
     }
 
     #[sqlx::test]

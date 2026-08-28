@@ -719,7 +719,15 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         } else {
             debug!("Authentication failed: invalid credentials");
             trace!("All authentication attempts failed ({}): {:?}", auth_errors.len(), auth_errors);
-            Err(Error::Unauthenticated { message: None })
+            // Surface the most specific failure message rather than the generic
+            // "Authentication required" fallback. API-key auth is attempted (and
+            // therefore pushed) first, so an unknown bearer key surfaces its
+            // region-aware copy even when other credentials also failed.
+            let message = auth_errors.iter().find_map(|(_, e)| match e {
+                Error::Unauthenticated { message } => message.clone(),
+                _ => None,
+            });
+            Err(Error::Unauthenticated { message })
         }
     }
 }
