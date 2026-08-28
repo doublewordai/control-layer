@@ -464,8 +464,19 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
             failed: batch.failed_requests,
         },
         metadata: if metadata.is_empty() { None } else { Some(metadata) },
+        model: None,
         analytics: None,
         dwext: if dwext.is_empty() { None } else { Some(dwext) },
+    }
+}
+
+/// Collapse the distinct models behind a batch into the single label the
+/// public UI shows per batch: the alias when homogeneous, `"mixed"` otherwise.
+fn batch_model_label(models: &[String]) -> Option<String> {
+    match models {
+        [] => None,
+        [only] => Some(only.clone()),
+        _ => Some("mixed".to_string()),
     }
 }
 
@@ -934,11 +945,14 @@ pub async fn create_batch<P: PoolProvider>(
     // batch.created webhook deliveries are created by the notification poller
     // which polls fusillade.batches for new records.
 
-    // For create, we have the current user's email directly
-    Ok((
-        StatusCode::CREATED,
-        Json(to_batch_response_with_email(batch, Some(&current_user.email))),
-    ))
+    // For create, we have the current user's email directly. The model label
+    // comes from the template counts already loaded for validation above.
+    let mut response = to_batch_response_with_email(batch, Some(&current_user.email));
+    let mut models: Vec<String> = file_model_counts.into_keys().collect();
+    models.sort();
+    response.model = batch_model_label(&models);
+
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn load_and_validate_batch_models<P: PoolProvider>(
@@ -1266,7 +1280,25 @@ pub async fn get_batch<P: PoolProvider>(
         None
     };
 
+    // Resolve the model label from the input file's templates. Templates live
+    // in the fusillade database, so this uses the fusillade pool.
+    let model_label = if let Some(file_id) = batch.file_id {
+        let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get fusillade connection for batch models: {e}"),
+        })?;
+        BatchTemplates::new(&mut templates_conn)
+            .get_file_models(&[file_id.0])
+            .await
+            .map_err(Error::Database)?
+            .remove(&file_id.0)
+            .as_deref()
+            .and_then(batch_model_label)
+    } else {
+        None
+    };
+
     let mut response = to_batch_response_enriched(batch, None, source_name.as_deref());
+    response.model = model_label;
 
     if let Some(email) = created_by_email {
         response
@@ -2064,6 +2096,27 @@ pub async fn list_batches<P: PoolProvider>(
         HashMap::new()
     };
 
+    // Bulk-resolve each batch's model label from its input file's templates.
+    // Templates live in the fusillade database, so this uses the fusillade
+    // pool rather than the control-layer connection above.
+    let file_ids: Vec<Uuid> = batches
+        .iter()
+        .filter_map(|b| b.file_id.map(|id| id.0))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let file_models_map: HashMap<Uuid, Vec<String>> = if !file_ids.is_empty() {
+        let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get fusillade connection for batch models: {e}"),
+        })?;
+        BatchTemplates::new(&mut templates_conn)
+            .get_file_models(&file_ids)
+            .await
+            .map_err(Error::Database)?
+    } else {
+        HashMap::new()
+    };
+
     // Fetch analytics in bulk if requested
     let analytics_map: HashMap<Uuid, BatchAnalytics> = if include_analytics && !batches.is_empty() {
         crate::db::handlers::analytics::get_batches_analytics_bulk(state.db.read(), &batch_ids)
@@ -2080,6 +2133,7 @@ pub async fn list_batches<P: PoolProvider>(
         .into_iter()
         .map(|batch| {
             let batch_id = batch.id;
+            let file_id = batch.file_id.map(|id| id.0);
 
             // Resolve individual creator email via api_key_id, with fallback
             // to batch owner for legacy batches without api_key_id
@@ -2156,6 +2210,10 @@ pub async fn list_batches<P: PoolProvider>(
                     .get_or_insert_with(HashMap::new)
                     .insert("context_type".to_string(), ctype);
             }
+
+            response.model = file_id
+                .and_then(|fid| file_models_map.get(&fid))
+                .and_then(|models| batch_model_label(models));
 
             if include_analytics {
                 response.analytics = analytics_map.get(&batch_id).cloned();
@@ -3062,6 +3120,119 @@ mod tests {
         assert!(analytics["total_prompt_tokens"].is_number());
         assert!(analytics["total_completion_tokens"].is_number());
         assert!(analytics["total_tokens"].is_number());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_model_field(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment_a = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment_a.id, group.id, user.id).await;
+        let deployment_b = create_test_deployment(&pool, user.id, "gpt-3half-model", "gpt-3.5").await;
+        add_deployment_to_group(&pool, deployment_b.id, group.id, user.id).await;
+
+        let upload_file = |jsonl_content: &'static str| {
+            let app = &app;
+            let user = &user;
+            async move {
+                let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+                let multipart = axum_test::multipart::MultipartForm::new()
+                    .add_part("file", file_part)
+                    .add_part("purpose", axum_test::multipart::Part::text("batch"));
+                let upload_resp = app
+                    .post("/ai/v1/files")
+                    .multipart(multipart)
+                    .add_header(&add_auth_headers(user)[0].0, &add_auth_headers(user)[0].1)
+                    .add_header(&add_auth_headers(user)[1].0, &add_auth_headers(user)[1].1)
+                    .await;
+                upload_resp.assert_status(StatusCode::CREATED);
+                let file: serde_json::Value = upload_resp.json();
+                file["id"].as_str().unwrap().to_string()
+            }
+        };
+
+        let create_batch = |file_id: String| {
+            let app = &app;
+            let user = &user;
+            async move {
+                let create_req = CreateBatchRequest {
+                    input_file_id: file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    api_key_id: None,
+                };
+                let create_resp = app
+                    .post("/ai/v1/batches")
+                    .json(&create_req)
+                    .add_header(&add_auth_headers(user)[0].0, &add_auth_headers(user)[0].1)
+                    .add_header(&add_auth_headers(user)[1].0, &add_auth_headers(user)[1].1)
+                    .await;
+                create_resp.assert_status(StatusCode::CREATED);
+                let batch: serde_json::Value = create_resp.json();
+                batch
+            }
+        };
+
+        // Single-model file: the create response labels the batch with the alias
+        let single_file_id = upload_file(
+            r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#,
+        )
+        .await;
+        let single_batch = create_batch(single_file_id).await;
+        assert_eq!(single_batch["model"].as_str(), Some("gpt-4"));
+        let single_batch_id = single_batch["id"].as_str().unwrap().to_string();
+
+        // Mixed-model file: labeled "mixed"
+        let mixed_file_id = upload_file(
+            "{\"custom_id\":\"request-1\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}}\n{\"custom_id\":\"request-2\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-3.5\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}}",
+        )
+        .await;
+        let mixed_batch = create_batch(mixed_file_id).await;
+        assert_eq!(mixed_batch["model"].as_str(), Some("mixed"));
+        let mixed_batch_id = mixed_batch["id"].as_str().unwrap().to_string();
+
+        // The list carries the same labels per row
+        let list_resp = app
+            .get("/ai/v1/batches?include=analytics")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        list_resp.assert_status_ok();
+        let list_result: serde_json::Value = list_resp.json();
+        let rows = list_result["data"].as_array().unwrap();
+        let model_of = |id: &str| {
+            rows.iter()
+                .find(|row| row["id"].as_str() == Some(id))
+                .expect("batch should be listed")["model"]
+                .as_str()
+                .map(str::to_string)
+        };
+        assert_eq!(model_of(&single_batch_id), Some("gpt-4".to_string()));
+        assert_eq!(model_of(&mixed_batch_id), Some("mixed".to_string()));
+
+        // The detail endpoint carries the label too
+        let get_resp = app
+            .get(&format!("/ai/v1/batches/{single_batch_id}"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_resp.assert_status_ok();
+        let detail: serde_json::Value = get_resp.json();
+        assert_eq!(detail["model"].as_str(), Some("gpt-4"));
+
+        let get_mixed_resp = app
+            .get(&format!("/ai/v1/batches/{mixed_batch_id}"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_mixed_resp.assert_status_ok();
+        let mixed_detail: serde_json::Value = get_mixed_resp.json();
+        assert_eq!(mixed_detail["model"].as_str(), Some("mixed"));
     }
 
     #[sqlx::test]

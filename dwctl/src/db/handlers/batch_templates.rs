@@ -47,6 +47,30 @@ impl<'c> BatchTemplates<'c> {
             .map_err(DbError::from)
     }
 
+    /// Distinct models referenced by each file's templates, in bulk. Files
+    /// with no templates are absent from the map.
+    pub async fn get_file_models(&mut self, file_ids: &[Uuid]) -> Result<HashMap<Uuid, Vec<String>>> {
+        if file_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT file_id, array_agg(DISTINCT model ORDER BY model) AS models
+            FROM request_templates
+            WHERE file_id = ANY($1)
+            GROUP BY file_id
+            "#,
+        )
+        .bind(file_ids)
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| Ok((row.try_get("file_id")?, row.try_get("models")?)))
+            .collect::<std::result::Result<_, sqlx::Error>>()
+            .map_err(DbError::from)
+    }
+
     /// Stream templates in their original JSONL order from the primary pool.
     pub fn stream_reasoning_requests<'a>(
         &'a mut self,

@@ -179,6 +179,13 @@ pub struct BatchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
 
+    /// Model alias used by this batch's requests, or `"mixed"` when the input
+    /// file spans multiple models. Absent when no templates are resolvable
+    /// (e.g. the input file was deleted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Qwen/Qwen3-235B-A22B-Instruct-2507")]
+    pub model: Option<String>,
+
     /// Aggregated analytics metrics (only included when requested via `include=analytics`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analytics: Option<BatchAnalytics>,
