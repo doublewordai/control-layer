@@ -81,6 +81,11 @@ impl DispatchProcessor {
         self
     }
 
+    /// Whether a dispatch to this path is marked for streaming and reassembly.
+    fn should_mark(&self, path: &str) -> bool {
+        self.streamable_endpoints.iter().any(|e| e == path)
+    }
+
     /// Wire in the keystore so ZDR request bodies are decrypted before dispatch.
     pub fn with_keystore(mut self, keystore: Option<crate::keystore::Keystore>) -> Self {
         self.keystore = keystore;
@@ -337,7 +342,7 @@ where
         // request never reaches this processor, so marking here is exactly the
         // signal the edge needs - and without it a streaming client on a
         // configured path has its stream collapsed into a single body.
-        if self.streamable_endpoints.iter().any(|e| e == &request.data.path) {
+        if self.should_mark(&request.data.path) {
             request
                 .data
                 .batch_metadata
@@ -360,31 +365,28 @@ mod tests {
     /// Nothing else distinguishes a daemon dispatch from a client's own request
     /// there, so this is the producing half of that contract; the edge's half is
     /// tested in `crate::inference::outbound_request`.
-    fn mark(processor: &DispatchProcessor, path: &str) -> Option<String> {
-        let mut metadata = std::collections::HashMap::new();
-        if processor.streamable_endpoints.iter().any(|e| e == path) {
-            metadata.insert(crate::inference::outbound_request::STREAM_MARKER_KEY.to_string(), "1".to_string());
-        }
-        metadata.get(crate::inference::outbound_request::STREAM_MARKER_KEY).cloned()
+    ///
+    /// These call the same predicate `process` does rather than restating the
+    /// condition: a test that re-implements what it checks passes whether or not
+    /// the production path ever runs it.
+    fn processor() -> DispatchProcessor {
+        DispatchProcessor::new().with_streamable_endpoints(vec!["/v1/chat/completions".to_string()])
     }
 
     #[test]
     fn a_streamable_path_is_marked() {
-        let processor = DispatchProcessor::new().with_streamable_endpoints(vec!["/v1/chat/completions".to_string()]);
-        assert_eq!(mark(&processor, "/v1/chat/completions").as_deref(), Some("1"));
+        assert!(processor().should_mark("/v1/chat/completions"));
     }
 
     #[test]
     fn a_path_that_is_not_streamable_is_left_unmarked() {
-        let processor = DispatchProcessor::new().with_streamable_endpoints(vec!["/v1/chat/completions".to_string()]);
-        assert_eq!(mark(&processor, "/v1/embeddings"), None);
+        assert!(!processor().should_mark("/v1/embeddings"));
     }
 
     /// With nothing configured the daemon marks nothing, so the edge reassembles
     /// nothing. A misconfiguration costs usage reporting, never a client's stream.
     #[test]
     fn no_configuration_marks_nothing() {
-        let processor = DispatchProcessor::new();
-        assert_eq!(mark(&processor, "/v1/chat/completions"), None);
+        assert!(!DispatchProcessor::new().should_mark("/v1/chat/completions"));
     }
 }
