@@ -654,6 +654,61 @@ async fn cleanup_fixture(fixture: StreamingFixture) {
     fixture.bg_services.shutdown().await;
 }
 
+/// A client asking for a stream must receive one, through the whole app.
+///
+/// This is the regression that shipped: the edge decided to reassemble from a
+/// header it stamps on every inbound request, so a client's `stream: true` came
+/// back as one `chat.completion` object. Nothing at this level covered it - both
+/// streaming fixtures sent the daemon's headers, so both took the daemon's path.
+#[sqlx::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_client_stream_is_not_reassembled(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello!\"}}],\"usage\":null}\n\ndata: [DONE]\n\n";
+
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({ "stream": true })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
+
+    // No daemon headers at all: this is a client, and the client asked to stream.
+    let inference_response = fixture
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello from E2E test"}],
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(inference_response.status_code().as_u16(), 200);
+    let content_type = inference_response
+        .headers()
+        .get("content-type")
+        .map_or("", |v| v.to_str().unwrap_or_default())
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "a client that asked to stream must not be handed an assembled body, got {content_type:?}"
+    );
+    assert!(
+        inference_response.text().starts_with("data:"),
+        "the frames themselves must reach the client"
+    );
+
+    cleanup_fixture(fixture).await;
+}
+
 #[sqlx::test]
 #[test_log::test]
 async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool: PgPool) {
@@ -681,6 +736,10 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         .server
         .post("/ai/v1/chat/completions")
         .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        // Both headers, because a real daemon dispatch carries both: the mark it
+        // sets for itself, and the correlation id the edge takes an early return
+        // on so a dispatch does not create a second row.
+        .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
         .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
         .json(&serde_json::json!({
             "model": "test-model",
@@ -723,6 +782,10 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         .server
         .post("/ai/v1/completions")
         .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        // Both headers, because a real daemon dispatch carries both: the mark it
+        // sets for itself, and the correlation id the edge takes an early return
+        // on so a dispatch does not create a second row.
+        .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
         .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
         .json(&serde_json::json!({
             "model": "test-model",

@@ -1702,12 +1702,7 @@ pub async fn build_router(
     let onwards_router = {
         let daemon = &state.current_config().background_services.batch_daemon;
         let outbound_config = crate::inference::outbound_request::OutboundConfig {
-            streamable_endpoints: std::sync::Arc::new(daemon.streamable_endpoints.clone()),
-            timeouts: crate::inference::outbound_request::StreamTimeouts {
-                first_chunk: std::time::Duration::from_millis(daemon.first_chunk_timeout_ms),
-                chunk: std::time::Duration::from_millis(daemon.chunk_timeout_ms),
-                body: std::time::Duration::from_millis(daemon.body_timeout_ms),
-            },
+            timeouts: crate::inference::outbound_request::StreamTimeouts::from_daemon_config(daemon),
         };
         onwards_router.layer(middleware::from_fn_with_state(
             outbound_config,
@@ -3294,8 +3289,9 @@ impl Application {
         {
             let processing_timeout = std::time::Duration::from_millis(config.background_services.batch_daemon.processing_timeout_ms);
             let dispatch_ttl = config.image_normalizer.signing.dispatch_ttl(processing_timeout);
-            let mut dispatch_processor =
-                crate::inference::engine::dispatch_processor::DispatchProcessor::new().with_keystore(keystore.clone());
+            let mut dispatch_processor = crate::inference::engine::dispatch_processor::DispatchProcessor::new()
+                .with_keystore(keystore.clone())
+                .with_streamable_endpoints(config.background_services.batch_daemon.streamable_endpoints.clone());
             if config.image_normalizer.enabled {
                 dispatch_processor = dispatch_processor.with_image_normalizer(image_normalizer.clone(), dispatch_ttl);
             }
