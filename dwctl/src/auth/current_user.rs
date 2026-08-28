@@ -396,7 +396,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         Some(data) => data,
         None => {
             return Some(Err(Error::Unauthenticated {
-                message: Some("Invalid API key".to_string()),
+                message: Some(crate::errors::INVALID_API_KEY_MESSAGE.to_string()),
             }));
         }
     };
