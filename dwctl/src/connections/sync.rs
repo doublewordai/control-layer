@@ -997,17 +997,24 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         false
     };
 
+    // Fetched once, for both capacity reservations and the cached model label
+    // below. A fresh create (no batch_id on the sync entry) always implies
+    // !batch_already_populated, so the label never needs stats this skips.
+    let file_stats = if batch_already_populated {
+        Vec::new()
+    } else {
+        state
+            .request_manager
+            .get_file_template_stats(fusillade::FileId(input.file_id))
+            .await
+            .map_err(|e| anyhow::anyhow!("get file template stats: {e}"))?
+    };
+
     let reservation_ids = if batch_already_populated {
         Vec::new()
     } else {
         use crate::api::handlers::sla_capacity::{CapacityError, CapacityReservationInput, reserve_capacity};
         use crate::db::handlers::deployments::Deployments;
-
-        let file_stats = state
-            .request_manager
-            .get_file_template_stats(fusillade::FileId(input.file_id))
-            .await
-            .map_err(|e| anyhow::anyhow!("get file template stats: {e}"))?;
 
         // Filter out empty model aliases — those are tier-2 invalid lines that will
         // be failed after populate. They don't need capacity reservations.
@@ -1123,15 +1130,8 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         // Cache the batch's model label (single alias or "mixed") at creation
         // so list/get responses never aggregate over request_templates. Empty
         // aliases are tier-2 invalid lines, failed after populate — skip them.
-        let model_label = {
-            let stats = state
-                .request_manager
-                .get_file_template_stats(fusillade::FileId(input.file_id))
-                .await
-                .map_err(|e| anyhow::anyhow!("get file template stats for model label: {e}"))?;
-            let models: Vec<String> = stats.into_iter().map(|s| s.model).filter(|m| !m.is_empty()).collect();
-            crate::api::handlers::batches::batch_model_label(&models)
-        };
+        let models: Vec<String> = file_stats.iter().map(|s| s.model.clone()).filter(|m| !m.is_empty()).collect();
+        let model_label = crate::api::handlers::batches::batch_model_label(&models);
 
         let mut metadata = serde_json::json!({
             "request_source": "sync",
