@@ -97,12 +97,20 @@ impl StreamTimeouts {
 /// layer can tell daemon traffic from a client's own request:
 /// `x-fusillade-request-id` is stamped by the edge on everything for
 /// correlation, `batch_id` is absent for batchless flex as well as for realtime,
-/// and the service tier never leaves the database. A realtime request reaches
-/// the edge directly and never passes through the daemon's HTTP client, so a
-/// header set there is exactly the signal needed.
+/// and the service tier never leaves the database. A client's request reaches
+/// the edge directly and never passes through the daemon's dispatch processor,
+/// which is what makes a mark set there the signal this needs.
 ///
 /// Inferring it from the path instead collapses a streaming client's response
 /// into a single body, because the path is identical on both planes.
+///
+/// Trusting a header is safe only because the sso-stack ingress strips every
+/// `x-fusillade-*` header from external requests, which is the same perimeter
+/// the `x-fusillade-request-id` early return in `inference::middleware` already
+/// depends on - see the note on `strip_scheduling_priority`. A dwctl reachable
+/// without traversing that proxy would let a caller set this. The blast radius
+/// is narrow either way: a spoofed mark reassembles the caller's own response
+/// and buffers their own body, under the same budgets as any other request.
 fn should_force_stream(parts: &axum::http::request::Parts) -> bool {
     parts.headers.get(STREAM_MARKER_HEADER).and_then(|v| v.to_str().ok()) == Some("1")
 }

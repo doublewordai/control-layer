@@ -52,7 +52,8 @@ pub struct DispatchProcessor {
     /// Paths whose responses are read as a stream and reassembled by the edge,
     /// so the provider reports token usage. Marked here rather than inferred at
     /// the edge: only daemon dispatches reach this processor, which is what
-    /// separates them from a client's own request. See [`STREAM_MARKER_KEY`].
+    /// separates them from a client's own request. See
+    /// [`crate::inference::outbound_request::STREAM_MARKER_KEY`].
     streamable_endpoints: Vec<String>,
     default: DefaultRequestProcessor,
 }

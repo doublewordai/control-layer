@@ -648,7 +648,11 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         .server
         .post("/ai/v1/chat/completions")
         .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        // Both headers, because a real daemon dispatch carries both: the mark it
+        // sets for itself, and the correlation id the edge takes an early return
+        // on so a dispatch does not create a second row.
         .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
+        .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "Hello from E2E test"}]
@@ -690,7 +694,11 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         .server
         .post("/ai/v1/completions")
         .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        // Both headers, because a real daemon dispatch carries both: the mark it
+        // sets for itself, and the correlation id the edge takes an early return
+        // on so a dispatch does not create a second row.
         .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
+        .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "prompt": "Hello from E2E test"
