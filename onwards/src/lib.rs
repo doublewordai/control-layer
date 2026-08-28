@@ -1179,8 +1179,10 @@ mod tests {
             ],
         );
         // dynamo (accepts) first, third party (does not) second: the wave-1 shape.
-        let app_state =
-            AppState::with_client(completions_pool_targets("gpt-4", &[true, false]), mock.clone());
+        let app_state = AppState::with_client(
+            completions_pool_targets("gpt-4", &[true, false]),
+            mock.clone(),
+        );
         let server = TestServer::new(build_router(app_state)).unwrap();
 
         let response = server
@@ -1218,7 +1220,8 @@ mod tests {
     /// feature is needed most.
     #[tokio::test]
     async fn a_non_accepting_primary_never_sees_priority_either() {
-        let mock = MockHttpClient::new_streaming(StatusCode::OK, vec![OK_CONTENT_FRAME.to_string()]);
+        let mock =
+            MockHttpClient::new_streaming(StatusCode::OK, vec![OK_CONTENT_FRAME.to_string()]);
         let app_state =
             AppState::with_client(completions_pool_targets("gpt-4", &[false]), mock.clone());
         let server = TestServer::new(build_router(app_state)).unwrap();
