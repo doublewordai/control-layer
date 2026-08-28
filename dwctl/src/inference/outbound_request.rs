@@ -72,15 +72,31 @@ pub struct OutboundConfig {
     pub timeouts: StreamTimeouts,
 }
 
+/// Marker the inference middleware attaches to a request that arrived FROM the
+/// fusillade daemon (its `X-Fusillade-Request-Id` was present at ingress).
+///
+/// The header itself cannot be the discriminator at this depth: the inference
+/// middleware stamps the SAME header on every realtime dispatch as the
+/// response-id carrier (see `inference_middleware`), so by the time a request
+/// reaches this innermost layer, daemon and realtime traffic look identical
+/// header-wise. Keying the reassembly on the header force-reassembled every
+/// realtime stream — a client could never receive SSE at all.
+#[derive(Clone, Copy, Debug)]
+pub struct FusilladeDispatch;
+
 /// Whether this request is batch traffic that should be forced to stream.
 ///
-/// The daemon stamps `X-Fusillade-Request-Id` on everything it sends, which is
-/// what separates its traffic from a real client's. A client asking for a
-/// non-streaming completion must keep getting exactly that, so the forcing is
-/// scoped to requests carrying that header on a configured path. The daemon
-/// itself knows nothing about any of this.
+/// Daemon traffic is recognised by the [`FusilladeDispatch`] extension the
+/// inference middleware attaches at its early return (where header presence is
+/// still authoritative — the sso ingress strips external `x-fusillade-*`). A
+/// client asking for a non-streaming completion must keep getting exactly
+/// that, so the forcing is scoped to marked requests on a configured path.
+/// The daemon itself knows nothing about any of this. Continuation resume
+/// legs enter below the inference middleware, never carry the marker, and so
+/// are never reassembled — their raw completions SSE belongs to the resume
+/// layer.
 fn should_force_stream(cfg: &OutboundConfig, parts: &axum::http::request::Parts) -> bool {
-    if !parts.headers.contains_key("x-fusillade-request-id") {
+    if parts.extensions.get::<FusilladeDispatch>().is_none() {
         return false;
     }
     let path = dispatch_path(parts);
@@ -606,11 +622,15 @@ mod tests {
     }
 
     fn parts_for(path: &str, fusillade: bool) -> axum::http::request::Parts {
-        let mut builder = HttpRequest::builder().uri(path);
+        // Daemon traffic is recognised by the marker the inference middleware
+        // attaches, not the raw header: the same header is stamped on every
+        // realtime dispatch as the response-id carrier, so it cannot separate
+        // the two populations at this depth.
+        let mut parts = HttpRequest::builder().uri(path).body(()).unwrap().into_parts().0;
         if fusillade {
-            builder = builder.header("x-fusillade-request-id", "00000000-0000-0000-0000-000000000000");
+            parts.extensions.insert(FusilladeDispatch);
         }
-        builder.body(()).unwrap().into_parts().0
+        parts
     }
 
     fn config(paths: &[&str]) -> OutboundConfig {
@@ -644,7 +664,17 @@ mod tests {
                     next.run(Request::from_parts(parts, body)).await
                 }
             }));
-        let app = Router::new().nest("/ai/v1", inner);
+        // The inference middleware owns the daemon-marking at ingress; mirror
+        // its early-return contract here so this test keeps exercising what it
+        // is for — the nested-path mechanics under a real mount prefix.
+        let app = Router::new()
+            .nest("/ai/v1", inner)
+            .layer(axum::middleware::from_fn(|mut req: Request, next: Next| async move {
+                if req.headers().contains_key("x-fusillade-request-id") {
+                    req.extensions_mut().insert(FusilladeDispatch);
+                }
+                next.run(req).await
+            }));
 
         let server = axum_test::TestServer::new(app).unwrap();
         server
