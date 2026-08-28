@@ -35,7 +35,6 @@
 //! bytes of token delta, so that difference is a large multiplier on per-request
 //! memory rather than a small one.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
@@ -53,7 +52,7 @@ use tracing::{debug, warn};
 /// that opens and then stalls, and it has no equivalent in a single overall
 /// timeout. Without it such a stream is only caught by `body`, which is sized for
 /// a slow upstream and is far longer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamTimeouts {
     /// Max time to the first event.
     pub first_chunk: Duration,
@@ -66,56 +65,71 @@ pub struct StreamTimeouts {
 /// What this layer needs to decide and perform the stream round trip.
 #[derive(Clone)]
 pub struct OutboundConfig {
-    /// Paths whose batch traffic is served as a stream so the provider reports
-    /// token usage, then reassembled back into a single body here.
-    pub streamable_endpoints: Arc<Vec<String>>,
     pub timeouts: StreamTimeouts,
 }
 
-/// Whether this request is batch traffic that should be forced to stream.
-///
-/// The daemon stamps `X-Fusillade-Request-Id` on everything it sends, which is
-/// what separates its traffic from a real client's. A client asking for a
-/// non-streaming completion must keep getting exactly that, so the forcing is
-/// scoped to requests carrying that header on a configured path. The daemon
-/// itself knows nothing about any of this.
-fn should_force_stream(cfg: &OutboundConfig, parts: &axum::http::request::Parts) -> bool {
-    if !parts.headers.contains_key("x-fusillade-request-id") {
-        return false;
+/// `batch_metadata` key the daemon's dispatch sets to mark a request for
+/// streaming and reassembly. The daemon forwards `batch_metadata` entries as
+/// `x-fusillade-batch-<key>` headers, so it arrives here as
+/// [`STREAM_MARKER_HEADER`].
+pub const STREAM_MARKER_KEY: &str = "stream";
+
+/// The header [`STREAM_MARKER_KEY`] arrives as.
+pub const STREAM_MARKER_HEADER: &str = "x-fusillade-batch-stream";
+
+impl StreamTimeouts {
+    /// Read the budgets from the daemon's configuration.
+    ///
+    /// Its own, not a separate set: the daemon sizes these for its workload and
+    /// they must not drift now that they are enforced here instead of there.
+    pub fn from_daemon_config(daemon: &crate::config::DaemonConfig) -> Self {
+        Self {
+            first_chunk: Duration::from_millis(daemon.first_chunk_timeout_ms),
+            chunk: Duration::from_millis(daemon.chunk_timeout_ms),
+            body: Duration::from_millis(daemon.body_timeout_ms),
+        }
     }
-    let path = dispatch_path(parts);
-    cfg.streamable_endpoints.iter().any(|e| path.ends_with(e.as_str()))
 }
 
-/// The path as the daemon addressed it, rather than as this layer sees it.
+/// Whether the daemon asked for this response to be streamed and reassembled.
 ///
-/// `streamable_endpoints` is configured in the daemon's terms
-/// (`/v1/chat/completions`), but this layer runs inside a router nested under a
-/// mount prefix, and nesting strips that prefix before the inner layers run. So
-/// `parts.uri.path()` is only the tail (`/chat/completions`) and never equals a
-/// configured value. `OriginalUri` carries the pre-nesting path, which still has
-/// the mount prefix on the front (`/ai/v1/chat/completions`), hence a suffix
-/// match rather than equality: the configured value is the part both sides agree
-/// on. Comparing against the stripped path silently matched nothing, which left
-/// batch traffic un-forced and un-reassembled.
-fn dispatch_path(parts: &axum::http::request::Parts) -> &str {
-    parts
-        .extensions
-        .get::<axum::extract::OriginalUri>()
-        .map_or_else(|| parts.uri.path(), |original| original.0.path())
+/// The daemon marks its own dispatches with this header. Nothing else at this
+/// layer can tell daemon traffic from a client's own request:
+/// `x-fusillade-request-id` is stamped by the edge on everything for
+/// correlation, `batch_id` is absent for batchless flex as well as for realtime,
+/// and the service tier never leaves the database. A realtime request reaches
+/// the edge directly and never passes through the daemon's HTTP client, so a
+/// header set there is exactly the signal needed.
+///
+/// Inferring it from the path instead collapses a streaming client's response
+/// into a single body, because the path is identical on both planes.
+fn should_force_stream(parts: &axum::http::request::Parts) -> bool {
+    parts.headers.get(STREAM_MARKER_HEADER).and_then(|v| v.to_str().ok()) == Some("1")
 }
 
 pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, request: Request, next: Next) -> Response {
     let (mut parts, body) = request.into_parts();
 
+    // Two separate questions, and they must not share a condition. Whether the
+    // body can be edited depends on its shape; whether the response is
+    // reassembled depends only on the daemon's mark. Reassembly used to sit
+    // behind the shape guard, which held only because Responses reaches this
+    // layer already translated to the completions shape - masking the coupling
+    // rather than removing it.
+    let force_stream = should_force_stream(&parts);
+
     let path = parts.uri.path();
     // `/chat/completions` also ends with `/completions`; both take the stream flags.
     if !path.ends_with("/completions") {
-        // Nothing to edit (e.g. /responses, /embeddings, /models): forward untouched.
-        return next.run(Request::from_parts(parts, body)).await;
+        // Nothing to edit (e.g. /responses, /embeddings, /models), but a marked
+        // dispatch still gets its response reassembled.
+        let response = next.run(Request::from_parts(parts, body)).await;
+        return if force_stream {
+            reassemble_stream(response, cfg.timeouts).await
+        } else {
+            response
+        };
     }
-
-    let force_stream = should_force_stream(&cfg, &parts);
 
     // Outer layers (onwards body limit, cache) already bound the body, so buffering
     // with no extra limit here can't widen the exposure.
@@ -605,78 +619,109 @@ mod tests {
         );
     }
 
-    fn parts_for(path: &str, fusillade: bool) -> axum::http::request::Parts {
-        let mut builder = HttpRequest::builder().uri(path);
-        if fusillade {
-            builder = builder.header("x-fusillade-request-id", "00000000-0000-0000-0000-000000000000");
+    /// Drive a real request through a real nest and report the content type the
+    /// caller receives. The upstream always streams; whether the caller sees a
+    /// stream or an assembled body is entirely this layer's decision.
+    ///
+    /// Hand-built `Parts` cannot answer this. They were what let a trigger that
+    /// matched every request through the edge pass as correct.
+    async fn content_type_through_the_edge(path: &str, headers: &[(&str, &str)]) -> String {
+        use axum::{Router, routing::post};
+
+        let upstream = || async {
+            let frames = "data: {\"id\":\"c\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
+            ([(header::CONTENT_TYPE, "text/event-stream")], frames)
+        };
+
+        let inner = Router::new()
+            .route("/chat/completions", post(upstream))
+            .route("/responses", post(upstream))
+            .layer(axum::middleware::from_fn_with_state(config(), outbound_request_middleware));
+        let app = Router::new().nest("/ai/v1", inner);
+
+        let server = axum_test::TestServer::new(app).unwrap();
+        let mut req = server.post(path).json(&serde_json::json!({"model": "m", "messages": []}));
+        for (k, v) in headers {
+            req = req.add_header(*k, *v);
         }
-        builder.body(()).unwrap().into_parts().0
+        let response = req.await;
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .map_or_else(String::new, |v| v.to_str().unwrap_or_default().to_string())
     }
 
-    fn config(paths: &[&str]) -> OutboundConfig {
+    fn config() -> OutboundConfig {
         OutboundConfig {
-            streamable_endpoints: Arc::new(paths.iter().map(|s| s.to_string()).collect()),
             timeouts: timeouts(1000, 1000, 5000),
         }
     }
 
-    /// Batch traffic on a configured path is what gets forced to stream.
-    /// The layer is applied inside a router nested under a prefix, so the path it
-    /// sees is the nested one while the configured endpoints are absolute. A unit
-    /// test that builds `Parts` by hand cannot catch that, so this drives a real
-    /// request through a real nest.
-    #[tokio::test]
-    async fn the_configured_path_matches_what_the_nested_router_sees() {
-        use axum::{Router, routing::post};
-
-        let seen: Arc<std::sync::Mutex<Option<bool>>> = Arc::new(std::sync::Mutex::new(None));
-        let probe = seen.clone();
-
-        let cfg = config(&["/v1/chat/completions"]);
-        let inner = Router::new()
-            .route("/chat/completions", post(|| async { "{}" }))
-            .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
-                let cfg = cfg.clone();
-                let probe = probe.clone();
-                async move {
-                    let (parts, body) = req.into_parts();
-                    *probe.lock().unwrap() = Some(should_force_stream(&cfg, &parts));
-                    next.run(Request::from_parts(parts, body)).await
-                }
-            }));
-        let app = Router::new().nest("/ai/v1", inner);
-
-        let server = axum_test::TestServer::new(app).unwrap();
-        server
-            .post("/ai/v1/chat/completions")
-            .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
-            .json(&serde_json::json!({"model": "m", "messages": []}))
-            .await;
+    /// The budgets have to come from the daemon's own configuration, and the
+    /// three are the same type in the same order, which is exactly the shape that
+    /// transposes silently. Every other test here supplies them directly, so
+    /// nothing else would notice two of them swapped.
+    #[test]
+    fn the_budgets_are_read_from_the_daemons_own_configuration() {
+        let mut daemon = crate::config::DaemonConfig::default();
+        daemon.first_chunk_timeout_ms = 1;
+        daemon.chunk_timeout_ms = 2;
+        daemon.body_timeout_ms = 3;
 
         assert_eq!(
-            *seen.lock().unwrap(),
-            Some(true),
-            "the configured endpoint must match the path the nested layer actually sees"
+            StreamTimeouts::from_daemon_config(&daemon),
+            StreamTimeouts {
+                first_chunk: Duration::from_millis(1),
+                chunk: Duration::from_millis(2),
+                body: Duration::from_millis(3),
+            }
         );
     }
 
-    #[test]
-    fn batch_traffic_on_a_streamable_path_is_forced() {
-        let cfg = config(&["/v1/chat/completions"]);
-        assert!(should_force_stream(&cfg, &parts_for("/v1/chat/completions", true)));
+    /// The daemon marks its own dispatches, and those get reassembled.
+    #[tokio::test]
+    async fn daemon_traffic_is_reassembled() {
+        let ct = content_type_through_the_edge(
+            "/ai/v1/chat/completions",
+            &[
+                (STREAM_MARKER_HEADER, "1"),
+                ("x-fusillade-request-id", "00000000-0000-0000-0000-000000000000"),
+            ],
+        )
+        .await;
+        assert!(ct.starts_with("application/json"), "expected an assembled body, got {ct:?}");
     }
 
-    /// A real client asking for a non-streaming completion must keep getting one.
-    /// The daemon's correlation header is the only thing separating the two.
-    #[test]
-    fn client_traffic_is_never_forced() {
-        let cfg = config(&["/v1/chat/completions"]);
-        assert!(!should_force_stream(&cfg, &parts_for("/v1/chat/completions", false)));
+    /// A streaming client must keep receiving a stream.
+    ///
+    /// The correlation header is present, because the edge stamps it on every
+    /// inbound request. That is exactly why it cannot be the signal: keying off
+    /// it collapsed every streaming client's response into a single body.
+    #[tokio::test]
+    async fn client_traffic_still_streams() {
+        let ct = content_type_through_the_edge(
+            "/ai/v1/chat/completions",
+            &[("x-fusillade-request-id", "00000000-0000-0000-0000-000000000000")],
+        )
+        .await;
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "a streaming client must not have its stream reassembled, got {ct:?}"
+        );
     }
 
-    #[test]
-    fn batch_traffic_off_a_streamable_path_is_left_alone() {
-        let cfg = config(&["/v1/chat/completions"]);
-        assert!(!should_force_stream(&cfg, &parts_for("/v1/embeddings", true)));
+    /// Nothing at all from the daemon: also a client, also a stream.
+    #[tokio::test]
+    async fn unmarked_traffic_still_streams() {
+        let ct = content_type_through_the_edge("/ai/v1/chat/completions", &[]).await;
+        assert!(ct.starts_with("text/event-stream"), "got {ct:?}");
+    }
+
+    /// Responses reaches this layer already translated to the completions shape,
+    /// so the mark is what carries the decision, not the path.
+    #[tokio::test]
+    async fn marked_responses_traffic_is_reassembled() {
+        let ct = content_type_through_the_edge("/ai/v1/responses", &[(STREAM_MARKER_HEADER, "1")]).await;
+        assert!(ct.starts_with("application/json"), "expected an assembled body, got {ct:?}");
     }
 }
