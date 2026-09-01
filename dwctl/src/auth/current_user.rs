@@ -396,7 +396,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         Some(data) => data,
         None => {
             return Some(Err(Error::Unauthenticated {
-                message: Some("Invalid API key".to_string()),
+                message: Some(crate::errors::INVALID_API_KEY_MESSAGE.to_string()),
             }));
         }
     };
@@ -719,7 +719,15 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         } else {
             debug!("Authentication failed: invalid credentials");
             trace!("All authentication attempts failed ({}): {:?}", auth_errors.len(), auth_errors);
-            Err(Error::Unauthenticated { message: None })
+            // Surface the API-key failure copy (the region-aware invalid-key
+            // message) rather than the generic "Authentication required"
+            // fallback. Scoped to the API-key method so the other auth
+            // methods' responses stay byte-identical.
+            let message = auth_errors.iter().find_map(|(method, e)| match e {
+                Error::Unauthenticated { message } if *method == "API key" => message.clone(),
+                _ => None,
+            });
+            Err(Error::Unauthenticated { message })
         }
     }
 }

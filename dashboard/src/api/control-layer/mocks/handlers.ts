@@ -266,7 +266,6 @@ function resolveComponents(modelId: string): import("../types").ModelComponent[]
         model_type: componentModel?.model_type ?? undefined,
         endpoint: endpoint ? { id: endpoint.id, name: endpoint.name } : undefined,
         trusted: componentModel?.trusted,
-        open_responses_adapter: componentModel?.open_responses_adapter,
       },
     };
   });

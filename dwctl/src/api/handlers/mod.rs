@@ -56,7 +56,6 @@ pub mod requests;
 pub mod sla_capacity;
 pub mod static_assets;
 pub mod support;
-pub mod tool_sources;
 pub mod transactions;
 pub mod unverified_volume;
 pub mod users;

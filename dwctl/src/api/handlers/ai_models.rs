@@ -178,9 +178,11 @@ pub async fn list_ai_models<P: PoolProvider>(
     .map_err(|e| database_error("lookup_api_key", e))?;
 
     let Some(user_id) = user_id else {
+        // See INVALID_API_KEY_MESSAGE: a wrong-region key looks identical to an
+        // invalid one, so the copy nudges users to check their regional endpoint.
         return Err(openai_error(
             StatusCode::UNAUTHORIZED,
-            "Invalid API key",
+            crate::errors::INVALID_API_KEY_MESSAGE,
             "authentication_error",
             "invalid_api_key",
         ));

@@ -56,27 +56,12 @@ pub enum FusilladeError {
     #[error("HTTP request timed out: {0}")]
     HttpClientTimeout(String),
 
-    /// Timed out waiting for response headers + first body chunk (time-to-first-token).
-    /// Only used for streaming requests. Handles servers (like vLLM) that return
-    /// headers immediately but queue the request before producing tokens.
-    #[error("First chunk timeout: {0}")]
-    FirstChunkTimeout(String),
-
     /// The request body upload made no progress for the configured stall window.
     /// Distinguishes send-phase hangs (a wedged connection or a stalled write)
     /// from a slow-to-respond upstream, which is governed by first_chunk_timeout:
     /// uploading a request should take seconds even when the answer takes hours.
     #[error("Upload stall timeout: {0}")]
     UploadStallTimeout(String),
-
-    /// Timed out waiting for the next chunk of response body tokens (streaming only)
-    #[error("Tokens timeout: {0}")]
-    TokensTimeout(String),
-
-    /// Timed out waiting for the entire response body to complete (streaming only).
-    /// Fires when the total body read exceeds body_timeout.
-    #[error("Body timeout: {0}")]
-    BodyTimeout(String),
 
     /// Serialization/deserialization error
     #[error("Serialization error: {0}")]

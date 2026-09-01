@@ -192,7 +192,6 @@ struct DeployedModel {
     pub backoff_max_total_ms: Option<i32>,
     pub sanitize_responses: bool,
     pub trusted: bool,
-    pub open_responses_adapter: Option<bool>,
     pub reasoning_translation_overrides: Option<serde_json::Value>,
     // Traffic routing
     pub allowed_batch_completion_windows: Option<Vec<String>>,
@@ -258,7 +257,6 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             backoff_max_total_ms: m.backoff_max_total_ms,
             sanitize_responses: m.sanitize_responses,
             trusted: m.trusted,
-            open_responses_adapter: m.open_responses_adapter.unwrap_or(true),
             reasoning_translation_overrides: m.reasoning_translation_overrides.and_then(|value| {
                 serde_json::from_value(value)
                     .inspect_err(|error| tracing::warn!(%error, "failed to deserialize reasoning translation overrides"))
@@ -320,12 +318,12 @@ impl<'c> Repository for Deployments<'c> {
                 downstream_hourly_rate, downstream_input_token_cost_ratio,
                 is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
                 fallback_with_replacement, fallback_max_attempts,
-                sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows,
+                sanitize_responses, trusted, allowed_batch_completion_windows,
                 metadata,
                 backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
                 reasoning_translation_overrides
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -357,16 +355,15 @@ impl<'c> Repository for Deployments<'c> {
             request.fallback_max_attempts,
             request.sanitize_responses,
             request.trusted,
-            Some(request.open_responses_adapter),
             request.allowed_batch_completion_windows.as_ref().map(|w| w.as_slice()),
             request.metadata.as_ref().map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({}))).unwrap_or_else(|| serde_json::json!({})) as serde_json::Value,
-            request.backoff_enabled,                  // $33
-            request.backoff_initial_ms,               // $34
-            request.backoff_max_ms,                   // $35
-            request.backoff_factor,                   // $36
-            request.backoff_jitter.as_str(),          // $37
-            request.backoff_max_total_ms,             // $38
-            reasoning_translation_overrides,          // $39
+            request.backoff_enabled,                  // $32
+            request.backoff_initial_ms,               // $33
+            request.backoff_max_ms,                   // $34
+            request.backoff_factor,                   // $35
+            request.backoff_jitter.as_str(),          // $36
+            request.backoff_max_total_ms,             // $37
+            reasoning_translation_overrides,          // $38
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -385,7 +382,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -410,7 +407,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -578,35 +575,34 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE fallback_max_attempts
             END,
             trusted = COALESCE($42, trusted),
-            open_responses_adapter = COALESCE($43, open_responses_adapter),
 
             -- Batch completion windows
             allowed_batch_completion_windows = CASE
-                WHEN $44 THEN $45
+                WHEN $43 THEN $44
                 ELSE allowed_batch_completion_windows
             END,
 
             -- Catalog metadata
             metadata = CASE
-                WHEN $46 THEN $47
+                WHEN $45 THEN $46
                 ELSE metadata
             END,
 
-            display_name = COALESCE($48, display_name),
+            display_name = COALESCE($47, display_name),
 
             -- Inter-attempt backoff
-            backoff_enabled = COALESCE($49, backoff_enabled),
-            backoff_initial_ms = COALESCE($50, backoff_initial_ms),
-            backoff_max_ms = COALESCE($51, backoff_max_ms),
-            backoff_factor = COALESCE($52, backoff_factor),
-            backoff_jitter = COALESCE($53, backoff_jitter),
+            backoff_enabled = COALESCE($48, backoff_enabled),
+            backoff_initial_ms = COALESCE($49, backoff_initial_ms),
+            backoff_max_ms = COALESCE($50, backoff_max_ms),
+            backoff_factor = COALESCE($51, backoff_factor),
+            backoff_jitter = COALESCE($52, backoff_jitter),
             backoff_max_total_ms = CASE
-                WHEN $54 THEN $55
+                WHEN $53 THEN $54
                 ELSE backoff_max_total_ms
             END,
 
             reasoning_translation_overrides = CASE
-                WHEN $56 THEN $57
+                WHEN $55 THEN $56
                 ELSE reasoning_translation_overrides
             END,
 
@@ -664,28 +660,27 @@ impl<'c> Repository for Deployments<'c> {
             request.fallback_max_attempts.is_some() as bool,                         // $40
             request.fallback_max_attempts.as_ref().and_then(|inner| inner.as_ref()), // $41
             request.trusted,                                                         // $42
-            request.open_responses_adapter,                                          // $43
             // Batch completion windows
-            request.allowed_batch_completion_windows.is_some() as bool, // $44
-            request.allowed_batch_completion_windows.as_ref().and_then(|inner| inner.as_deref()) as Option<&[String]>, // $45
+            request.allowed_batch_completion_windows.is_some() as bool, // $43
+            request.allowed_batch_completion_windows.as_ref().and_then(|inner| inner.as_deref()) as Option<&[String]>, // $44
             // Catalog metadata
-            request.metadata.is_some() as bool, // $46
+            request.metadata.is_some() as bool, // $45
             request
                 .metadata
                 .as_ref()
                 .map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({})))
-                .unwrap_or_else(|| serde_json::json!({})) as serde_json::Value, // $47
-            request.display_name.as_deref(),    // $48
+                .unwrap_or_else(|| serde_json::json!({})) as serde_json::Value, // $46
+            request.display_name.as_deref(),    // $47
             // Inter-attempt backoff
-            request.backoff_enabled,                                                // $49
-            request.backoff_initial_ms,                                             // $50
-            request.backoff_max_ms,                                                 // $51
-            request.backoff_factor,                                                 // $52
-            request.backoff_jitter.as_deref(),                                      // $53
-            request.backoff_max_total_ms.is_some() as bool,                         // $54
-            request.backoff_max_total_ms.as_ref().and_then(|inner| inner.as_ref()), // $55
-            request.reasoning_translation_overrides.is_some(),                      // $56
-            reasoning_translation_overrides,                                        // $57
+            request.backoff_enabled,                                                // $48
+            request.backoff_initial_ms,                                             // $49
+            request.backoff_max_ms,                                                 // $50
+            request.backoff_factor,                                                 // $51
+            request.backoff_jitter.as_deref(),                                      // $52
+            request.backoff_max_total_ms.is_some() as bool,                         // $53
+            request.backoff_max_total_ms.as_ref().and_then(|inner| inner.as_ref()), // $54
+            request.reasoning_translation_overrides.is_some(),                      // $55
+            reasoning_translation_overrides,                                        // $56
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -982,7 +977,6 @@ impl<'c> Deployments<'c> {
                 dm.description as model_description,
                 dm.type as model_type,
                 dm.trusted as model_trusted,
-                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM inserted
@@ -1015,7 +1009,6 @@ impl<'c> Deployments<'c> {
             endpoint_id: result.endpoint_id,
             endpoint_name: result.endpoint_name,
             model_trusted: result.model_trusted,
-            model_open_responses_adapter: result.model_open_responses_adapter.unwrap_or(true),
         })
     }
 
@@ -1059,7 +1052,6 @@ impl<'c> Deployments<'c> {
                 dm.description as model_description,
                 dm.type as model_type,
                 dm.trusted as model_trusted,
-                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
@@ -1091,7 +1083,6 @@ impl<'c> Deployments<'c> {
                 endpoint_id: r.endpoint_id,
                 endpoint_name: r.endpoint_name,
                 model_trusted: r.model_trusted,
-                model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
             })
             .collect())
     }
@@ -1122,7 +1113,6 @@ impl<'c> Deployments<'c> {
                 dm.description as model_description,
                 dm.type as model_type,
                 dm.trusted as model_trusted,
-                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
@@ -1155,7 +1145,6 @@ impl<'c> Deployments<'c> {
                 endpoint_id: r.endpoint_id,
                 endpoint_name: r.endpoint_name,
                 model_trusted: r.model_trusted,
-                model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
             });
         }
 
@@ -1370,7 +1359,6 @@ impl<'c> Deployments<'c> {
                 dm.description as model_description,
                 dm.type as model_type,
                 dm.trusted as model_trusted,
-                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
@@ -1401,7 +1389,6 @@ impl<'c> Deployments<'c> {
             endpoint_id: r.endpoint_id,
             endpoint_name: r.endpoint_name,
             model_trusted: r.model_trusted,
-            model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
         }))
     }
 

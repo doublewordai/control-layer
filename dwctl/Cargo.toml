@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "10.17.1" # x-release-please-version
+version = "11.1.0" # x-release-please-version
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
@@ -58,6 +58,8 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "trace"] }
 async-trait = "0.1"
 async-stream = "0.3"
+eventsource-stream = "0.2"
+openai-reassembler = "0.4.0"
 url = { version = "2.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive", "env"] }
 reqwest = { version = "0.13", default-features = false, features = [
@@ -83,7 +85,6 @@ argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
 onwards = { path = "../onwards" }
-onwards-fusillade = { path = "../onwards-fusillade" }
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)

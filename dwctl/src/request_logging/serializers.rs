@@ -274,6 +274,23 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
     }
 }
 
+/// Whether a captured response body is an SSE stream rather than a single JSON body.
+///
+/// The dispatch used to announce this with a request header, because the layer that
+/// reassembled the stream sat above this one and so this one saw the raw frames while
+/// the captured request body still said `stream: false`. Reassembly now happens below
+/// this layer, so a stream reaching here is either a genuine client-facing one or a
+/// stored body from before that change, and in both cases the body says so itself.
+///
+/// SSE is a sequence of `field: value` lines, and the first non-blank line of anything
+/// this captures is a `data:` or `event:` field. A JSON body starts with `{` or `[`, so
+/// the two cannot be confused.
+fn looks_like_sse(body: &str) -> bool {
+    body.lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.starts_with("data:") || line.starts_with("event:"))
+}
+
 /// Parses HTTP response body data into structured AI response types.
 ///
 /// # Arguments
@@ -307,20 +324,16 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
         return Ok(AiResponse::Other(Value::Null));
     }
 
-    // Onwards injects stream:true into the forwarded body when it sees this header,
-    // but outlet captures the original request body (without stream:true). Check the
-    // header so we know to use the streaming parser for the response.
-    let fusillade_stream = request_data
-        .headers
-        .get("x-fusillade-stream")
-        .and_then(|values| values.first())
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        == Some("true");
+    // Batch traffic is dispatched as a stream so the provider reports usage, but the
+    // captured request body is the caller's and still says `stream: false`. The
+    // response is self-describing, so take it from that rather than from a header the
+    // dispatch had to add for this layer's benefit.
+    let sse_body = looks_like_sse(&body_str);
 
     // /v1/messages (Anthropic) has its own SSE event lifecycle and a distinct
     // blocking shape, both produced by dwctl's edge translator. Detect it by path
     // (like /responses) - stream is signalled by the request body's `stream` flag
-    // or the fusillade header.
+    // or by the response arriving as SSE.
     let result = if request_data.uri.path().ends_with("/messages") {
         let anthropic_stream = request_data
             .body
@@ -328,7 +341,7 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
             .and_then(|b| serde_json::from_slice::<Value>(b).ok())
             .and_then(|v| v.get("stream").and_then(Value::as_bool))
             .unwrap_or(false)
-            || fusillade_stream;
+            || sse_body;
         if anthropic_stream {
             utils::parse_anthropic_streaming_response(&body_str)
         } else {
@@ -343,7 +356,7 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
             Ok(parsed_request) => {
                 // /v1/responses has its own SSE event format distinct from chat completions.
                 if let Some(responses_req) = &parsed_request.responses_request {
-                    if responses_req.stream.unwrap_or(false) || fusillade_stream {
+                    if responses_req.stream.unwrap_or(false) || sse_body {
                         utils::parse_responses_streaming_response(&body_str)
                     } else {
                         // Try the typed Response parser first. Fall back to the generic untagged
@@ -360,7 +373,7 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
                     // used to lose it there, send a streamed body to the non-streaming
                     // parser, and bill the request ZERO tokens. `Other` carries the raw
                     // `Value`, so take the flag from that instead of re-parsing the body.
-                    let is_streaming = fusillade_stream
+                    let is_streaming = sse_body
                         || match &parsed_request.request {
                             AiRequest::ChatCompletions(req) => req.stream.unwrap_or(false),
                             AiRequest::Completions(req) => req.stream.unwrap_or(false),
@@ -714,8 +727,6 @@ impl Auth {
 /// loop. The client executes the tool itself and sends a fresh request, so the follow-up
 /// arrives with its own `fusillade_request_id` and is otherwise indistinguishable from an
 /// ordinary multi-turn message. Without this the whole class of usage is invisible.
-/// (Server-side tool loops are a different thing entirely, counted by `tool_iterations`
-/// and detailed in `tool_call_analytics`.)
 ///
 /// Deliberately a free function over the already-deserialised `AiResponse` rather than a
 /// field on `TokenMetrics`: nothing new is parsed, and none of the nine `TokenMetrics`
@@ -1372,13 +1383,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ai_response_fusillade_stream_header() {
-        // Request body has stream: false, but x-fusillade-stream header is set.
-        // Outlet captures the original body before onwards injects stream:true,
-        // so the header is the only signal that the response is SSE.
+    fn test_parse_ai_response_detects_stream_from_the_body() {
+        // Request body has stream: false, but the captured response is SSE: the
+        // captured request is what the caller sent, before the stream was forced
+        // downstream, so the response body is the only thing that says so.
         let request_json = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "hello"}], "stream": false}"#;
-        let mut headers = HashMap::new();
-        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let headers = HashMap::new();
         let request_data = RequestData {
             correlation_id: 123,
             timestamp: SystemTime::now(),
@@ -1520,13 +1530,12 @@ mod tests {
     }
 
     #[test]
-    fn test_fusillade_stream_with_embedded_error_frame_reclassifies_to_500() {
+    fn test_streamed_body_with_embedded_error_frame_reclassifies_to_500() {
         // Reproduces trace 91ea8848dc08735f183449277b8b8846: Dynamo started a 200 OK
         // SSE stream, generated some delta chunks, then crashed mid-generation and
         // emitted an error frame in place of the terminal usage chunk + [DONE].
         let request_json = r#"{"model": "moonshotai/Kimi-K2.6", "messages": [{"role": "user", "content": "hi"}], "stream": false}"#;
-        let mut headers = HashMap::new();
-        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let headers = HashMap::new();
         let request_data = RequestData {
             correlation_id: 999,
             timestamp: SystemTime::now(),
@@ -1639,12 +1648,11 @@ mod tests {
     }
 
     #[test]
-    fn test_fusillade_stream_with_real_error_status_is_preserved() {
+    fn test_streamed_body_with_real_error_status_is_preserved() {
         // If upstream returns a real non-2xx status (no SSE body to scan), we must NOT
         // override it to 500. The real status code is more informative.
         let request_json = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}], "stream": false}"#;
-        let mut headers = HashMap::new();
-        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let headers = HashMap::new();
         let request_data = RequestData {
             correlation_id: 7,
             timestamp: SystemTime::now(),
@@ -1681,8 +1689,7 @@ mod tests {
     #[test]
     fn test_parse_ai_response_fusillade_completions_stream() {
         let request_json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": "Hello", "stream": false}"#;
-        let mut headers = HashMap::new();
-        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let headers = HashMap::new();
         let request_data = RequestData {
             correlation_id: 123,
             timestamp: SystemTime::now(),
@@ -2807,7 +2814,7 @@ mod tests {
     /// Build a POST /v1/chat/completions request + response pair from a raw body.
     ///
     /// `stream` has to be declared on the REQUEST: parse_ai_response picks the SSE parser
-    /// from the request's `stream: true` (or the x-fusillade-stream header), not by sniffing
+    /// from the shape of the captured body, not by sniffing
     /// the response. Getting this wrong makes an SSE body fail to parse rather than
     /// producing a wrong finish_reason, which is how the first draft of these tests failed.
     fn chat_pair(body: &'static str, stream: bool) -> (RequestData, ResponseData) {

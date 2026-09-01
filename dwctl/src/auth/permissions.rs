@@ -155,14 +155,6 @@ pub mod resource {
         }
     }
 
-    #[derive(Default)]
-    pub struct ToolSources;
-
-    impl From<ToolSources> for Resource {
-        fn from(_: ToolSources) -> Resource {
-            Resource::ToolSources
-        }
-    }
     impl From<Connections> for Resource {
         fn from(_: Connections) -> Resource {
             Resource::Connections
