@@ -1662,7 +1662,10 @@ pub async fn build_router(
     //   • inference_mw outermost: it must see the RAW foreign request (e.g. `/responses`
     //     with `background`/`service_tier`) to route the Responses control plane, mint the
     //     tracking id, and hydrate `previous_response_id` before translation flattens the
-    //     request to Chat Completions.
+    //     request to Chat Completions. It is also where out-of-band functional parameters
+    //     (`?serviceTier=`, a `-dw-flex` model-name suffix — see `inference::params`) are parsed
+    //     and normalised into the body, for the same reason: everything that consumes them —
+    //     tier dispatch, model access, tariff lookup in the outlet — is inner to this layer.
     //   • translation inner to outlet: on the response path (inner runs first) it reframes
     //     chat → Responses BEFORE outlet captures it, so the persisted row — which
     //     `GET /v1/responses/{id}` reads — is a Responses object. Everything inner to
@@ -3416,6 +3419,19 @@ impl Application {
             flex_completion_window: config.batches.async_requests.completion_window.clone(),
             keystore: bg_services.keystore.clone(),
             zdr_key_cache: bg_services.zdr_key_cache.clone(),
+            // The same `Targets` handed to onwards' router state below, so the model-suffix
+            // parse and the router can never disagree about which aliases exist.
+            onwards_targets: bg_services.onwards_targets.clone(),
+            params_config: crate::inference::params::ParamsConfig {
+                query_params: config.request_params.query_params,
+                model_suffix: config.request_params.model_suffix,
+                model_suffix_delimiter: config.request_params.model_suffix_delimiter.clone(),
+                // Deliberately not user-settable: `cacheBreakpoint` injects a `cache_control`
+                // marker, and only the cache layer strips it before the request goes upstream.
+                // With the cache layer absent the marker would leak to the provider, so the
+                // param must simply be unrecognised.
+                cache_breakpoint: config.cache.enabled,
+            },
         };
 
         // Build onwards router from targets with body transform + response sanitization.

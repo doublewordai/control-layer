@@ -176,6 +176,10 @@ pub struct Config {
     pub email: EmailConfig,
     /// Onwards proxy configuration
     pub onwards: OnwardsConfig,
+    /// Out-of-band functional request parameters (query param / model-name suffix).
+    /// See [`RequestParamsConfig`].
+    #[serde(default)]
+    pub request_params: RequestParamsConfig,
     /// Optional URL to redirect new users to for onboarding (e.g., "https://onboarding.doubleword.ai")
     /// When set, users with a null `last_login` will receive this URL in the `/users/current` response.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1033,6 +1037,68 @@ pub struct OnwardsConfig {
     /// When false (default), all requests are passed through transparently.
     /// When true, only known OpenAI API paths are accepted and validated.
     pub strict_mode: bool,
+}
+
+/// Out-of-band functional request parameters — see [`crate::inference::params`].
+///
+/// Clients that can only configure `base_url` and `model_name` (coding-agent harnesses,
+/// proxy middlemen) cannot set body fields, so `service_tier` and the automatic-caching
+/// marker are also accepted as a URL query parameter and as a suffix on the model name.
+/// Both are normalised into the body at the edge, so every downstream layer sees a request
+/// identical to one the client could have sent itself.
+///
+/// The defaults preserve current behaviour exactly: model resolution is untouched until
+/// `model_suffix` is enabled.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RequestParamsConfig {
+    /// Honour owned query parameters (`?serviceTier=`, `?cacheBreakpoint=`) on the inference
+    /// routes. The parameter is stripped from the forwarded URI — onwards sends
+    /// `path_and_query` verbatim upstream, so it must not leak to the provider.
+    /// Set via environment: `DWCTL_REQUEST_PARAMS__QUERY_PARAMS=false`
+    pub query_params: bool,
+
+    /// Honour a functional suffix on the `model` field (e.g. `my-model-dw-flex`), in the spirit
+    /// of OpenRouter's `deepseek/deepseek-r1:free` but on the vendor-marked `-dw-` delimiter
+    /// rather than a colon, which harnesses already use for their own per-request knobs.
+    ///
+    /// Opt-in, because it changes model-resolution semantics. It is safe by construction —
+    /// an exact alias match always wins, and a suffix is only stripped when what remains is
+    /// itself a real routing alias — but enabling it per deployment allows a soak first.
+    ///
+    /// **Set this the same way on every replica in an environment.** It is per-process, so a
+    /// split rollout means `my-model-dw-flex` succeeds on one pod and 404s on another. Nothing is
+    /// persisted in a bad state — the submit path stores the already-resolved alias, and queued
+    /// requests bypass this parse entirely — so the fix is just to finish the rollout or roll it
+    /// back. Watch `dwctl_request_params_suffix_ignored_total`: non-zero means some pods are
+    /// receiving suffixed requests with the feature off.
+    /// Set via environment: `DWCTL_REQUEST_PARAMS__MODEL_SUFFIX=true`
+    pub model_suffix: bool,
+
+    /// Delimiter separating the alias from its suffix tokens. Aliases have no character-class
+    /// validation (migration 019 even generates aliases containing spaces and parentheses),
+    /// so this is configurable for a deployment whose aliases already contain the default.
+    ///
+    /// The default is deliberately not `:`. Harnesses use `model:token` for their own knobs
+    /// (thinking strength — `:xhigh`, `:high`) and colons are real inside model ids — Bedrock
+    /// `anthropic.claude-v2:0`, Ollama `llama3.1:8b`. Under `-dw-` all of those are inert:
+    /// they never match, so such names route exactly as they do with the feature off.
+    ///
+    /// Only override this if your aliases already contain `-dw-`, and prefer a delimiter that
+    /// is likewise not in anyone else's namespace. Setting it to `:` re-adopts the colon
+    /// namespace and will 400 a harness that appends its own `:xhigh` to a live alias.
+    /// Set via environment: `DWCTL_REQUEST_PARAMS__MODEL_SUFFIX_DELIMITER=::`
+    pub model_suffix_delimiter: String,
+}
+
+impl Default for RequestParamsConfig {
+    fn default() -> Self {
+        Self {
+            query_params: true,
+            model_suffix: false,
+            model_suffix_delimiter: "-dw-".to_string(),
+        }
+    }
 }
 
 /// Cached-input pricing — the dwctl-owned cache tower layer. All cache configuration lives
@@ -2722,6 +2788,7 @@ impl Default for Config {
             limits: LimitsConfig::default(),
             email: EmailConfig::default(),
             onwards: OnwardsConfig::default(),
+            request_params: RequestParamsConfig::default(),
             onboarding_url: None,
             support_email: "support@doubleword.ai".to_string(),
             connections: ConnectionsConfig::default(),

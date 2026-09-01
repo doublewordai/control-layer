@@ -3,6 +3,15 @@
 //! Applied to the onwards router for all inference POST requests
 //! (`/v1/responses`, `/v1/chat/completions`, `/v1/embeddings`).
 //!
+//! ## Out-of-band parameters
+//!
+//! Being the outermost layer, this is also where [`super::params`] runs its single parse of
+//! functional parameters supplied as a URL query param or a model-name suffix, reusing the
+//! body parse below rather than adding one. It has to happen here: the values it resolves are
+//! read a few lines later (`model`, `service_tier`, the background contract, model access),
+//! all of which are upstream of translation. Resolved values are normalised into the body, so
+//! every inner layer sees a request identical to one the client could have sent itself.
+//!
 //! ## Routing
 //!
 //! Every tier here writes a BATCHLESS request — one `requests` row with
@@ -34,6 +43,7 @@ use fusillade_arsenal::PostgresRequestManager;
 use sqlx_pool_router::PoolProvider;
 
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
+use super::params::{self, ParamsConfig};
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
 use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
@@ -77,6 +87,14 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
     /// empty (every key reads as non-ZDR) when the sync is not wired.
     pub zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
+    /// Live alias to target map, shared with onwards' own router state, so a model-name
+    /// suffix is only stripped when what remains is a real routing target. Consulting the
+    /// very map onwards routes against is what keeps this from ever disagreeing with the
+    /// router. O(1) `DashMap` read; no DB round trip on the request path.
+    pub onwards_targets: onwards::target::Targets,
+    /// Which out-of-band parameter channels are recognised
+    /// (`config.request_params`, plus `cache_breakpoint` derived from `config.cache.enabled`).
+    pub params_config: ParamsConfig,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -97,7 +115,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     }
 
     // Read and parse the request body
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -113,6 +131,57 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             return Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
         }
     };
+
+    // The single parse of out-of-band functional parameters (COR-614): a URL query param or
+    // a suffix on the model name, for clients that can only configure `base_url` and
+    // `model_name`. It runs here, on the parse this middleware already does, because it is
+    // strictly before everything that consumes the values it resolves — the `model` read
+    // below, the `service_tier` dispatch, the background contract check, and the model-access
+    // check. Resolved values are normalised into the body, so every inner layer (logging,
+    // translation, cache, the flex queue, onwards) sees a request identical to one the client
+    // could have sent itself, and needs no change.
+    let params = match params::parse(&request_value, parts.uri.query(), &state.onwards_targets, &state.params_config) {
+        Ok(params) => params,
+        Err(e) => {
+            // This layer is outermost, so the outlet never sees a rejection from here and it
+            // does not appear in the customer-facing request log — unlike the cache layer's
+            // `cacheBreakpoint` 400, which sits inner to the outlet. Until that gap is closed
+            // for edge 4xx generally, this line is the only per-request record of the refusal.
+            // Identifiers only: the model alias and the offending token, never body content.
+            let requested_model = request_value.get("model").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+            tracing::warn!(
+                model = %requested_model,
+                reason = %e,
+                "Rejected inference request with an invalid out-of-band parameter"
+            );
+            return params::rejection_response(&e);
+        }
+    };
+    let params_changed_body = params::apply_to_body(&params, &mut request_value);
+    if !params.consumed_query_params.is_empty() {
+        // onwards forwards `path_and_query` verbatim to the provider, so a param we own must
+        // not survive into the upstream URI.
+        parts.uri = params::strip_params(&parts.uri, &params.consumed_query_params);
+    }
+    let tier_source = params.service_tier.map(|(_, source)| source);
+    for (param, source) in [
+        params.service_tier.map(|(_, source)| ("service_tier", source)),
+        params.cache_breakpoint.map(|(_, source)| ("cache_breakpoint", source)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if source != params::Source::Body {
+            params::record_param(param, source);
+        }
+    }
+    // A suffixed request arriving at a process with the channel off. Harmless on its own, but
+    // on a multi-replica deployment it means the rollout is uneven and the same request is
+    // succeeding elsewhere — see `params`' module docs.
+    if params.suffix_ignored {
+        params::record_suffix_ignored();
+    }
+    parts.extensions.insert(Arc::new(params));
 
     // Strip client-supplied completion/response id fields before the request is
     // re-serialised and forwarded. dwctl owns the single parse-and-shape now, so
@@ -215,7 +284,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // flag (Flex | Background). The multi-step warm-path loop that used to sit here
     // (has_tools / warm_path_branch / try_warm_path_*) was removed on this branch, so
     // only the tier validation survives.
-    if let Some(message) = background_contract_error(service_tier, is_responses_api, background) {
+    if let Some(message) = background_contract_error(service_tier, is_responses_api, background, tier_source) {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header("content-type", "application/json")
@@ -381,6 +450,32 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             ))
             .unwrap();
     }
+
+    // Re-serialise only when the parameter parse actually changed the body. `body_bytes` is
+    // what the realtime arm forwards — the `request_value` mutations above reach the stored
+    // fusillade template and the queued flex/background body, but not the live realtime
+    // request — so this is the one point where the forwarded bytes can be made consistent
+    // with the resolved parameters. Gated on `changed`, so a request that carries no
+    // out-of-band parameter is forwarded byte-for-byte as before this existed.
+    let body_bytes = if params_changed_body {
+        match serde_json::to_vec(&request_value) {
+            Ok(bytes) => {
+                // Stripping a suffix shrinks the body, so a client-supplied Content-Length is
+                // now wrong. Drop it (as `outbound_request` does); onwards recomputes it for
+                // the upstream request.
+                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                bytes::Bytes::from(bytes)
+            }
+            // Serialising a Value we just parsed can't realistically fail; if it ever does,
+            // forward the original bytes rather than failing the request.
+            Err(e) => {
+                tracing::error!(error = %e, "Failed to re-serialise request body after parameter normalisation");
+                body_bytes
+            }
+        }
+    } else {
+        body_bytes
+    };
 
     match service_tier {
         ServiceTier::Realtime => {
@@ -719,21 +814,38 @@ fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
 
 /// Return a user-actionable validation error when the background tier is used
 /// outside its asynchronous Responses API contract.
-fn background_contract_error(service_tier: ServiceTier, is_responses_api: bool, background: bool) -> Option<&'static str> {
+///
+/// `tier_source` names the channel the tier actually came from: when it was inferred from a
+/// model-name suffix or a query parameter, the message must not point the caller at a body
+/// field they never sent.
+fn background_contract_error(
+    service_tier: ServiceTier,
+    is_responses_api: bool,
+    background: bool,
+    tier_source: Option<params::Source>,
+) -> Option<String> {
     if !matches!(service_tier, ServiceTier::Background) {
         return None;
     }
-    if !is_responses_api {
-        return Some(
-            "service_tier: \"background\" is only supported by /v1/responses. Submit the request to /v1/responses with background: true, or choose a foreground service_tier.",
-        );
-    }
-    if !background {
-        return Some(
-            "service_tier: \"background\" is asynchronous and requires background: true. Set background: true and poll GET /v1/responses/{id}, or choose a foreground service_tier.",
-        );
-    }
-    None
+    let message = if !is_responses_api {
+        "service_tier: \"background\" is only supported by /v1/responses. Submit the request to /v1/responses with background: true, or choose a foreground service_tier."
+    } else if !background {
+        "service_tier: \"background\" is asynchronous and requires background: true. Set background: true and poll GET /v1/responses/{id}, or choose a foreground service_tier."
+    } else {
+        return None;
+    };
+    Some(match tier_source {
+        Some(params::Source::ModelSuffix) => {
+            format!("{message} (service_tier was inferred from the model-name suffix)")
+        }
+        Some(params::Source::Query) => {
+            format!(
+                "{message} (service_tier was taken from the {} query parameter)",
+                params::SERVICE_TIER_PARAM
+            )
+        }
+        _ => message.to_string(),
+    })
 }
 
 /// Handle a realtime request (priority/default/auto).
@@ -1349,20 +1461,37 @@ mod tests {
 
     #[test]
     fn background_service_tier_requires_async_responses() {
-        assert_eq!(background_contract_error(ServiceTier::Background, true, true), None);
+        assert_eq!(background_contract_error(ServiceTier::Background, true, true, None), None);
 
-        let foreground_error =
-            background_contract_error(ServiceTier::Background, true, false).expect("foreground background-tier request must be rejected");
+        let foreground_error = background_contract_error(ServiceTier::Background, true, false, None)
+            .expect("foreground background-tier request must be rejected");
         assert!(foreground_error.contains("background: true"));
         assert!(foreground_error.contains("service_tier"));
 
-        let unsupported_endpoint_error = background_contract_error(ServiceTier::Background, false, false)
+        let unsupported_endpoint_error = background_contract_error(ServiceTier::Background, false, false, None)
             .expect("non-Responses background-tier request must be rejected");
         assert!(unsupported_endpoint_error.contains("/v1/responses"));
         assert!(unsupported_endpoint_error.contains("background: true"));
 
-        assert_eq!(background_contract_error(ServiceTier::Flex, true, false), None);
-        assert_eq!(background_contract_error(ServiceTier::Realtime, false, false), None);
+        assert_eq!(background_contract_error(ServiceTier::Flex, true, false, None), None);
+        assert_eq!(background_contract_error(ServiceTier::Realtime, false, false, None), None);
+    }
+
+    #[test]
+    fn background_contract_error_names_the_channel_the_tier_came_from() {
+        // The tier was never in the body, so the message must not imply the caller sent it.
+        let suffix_error = background_contract_error(ServiceTier::Background, false, false, Some(params::Source::ModelSuffix))
+            .expect("non-Responses background-tier request must be rejected");
+        assert!(suffix_error.contains("model-name suffix"));
+
+        let query_error = background_contract_error(ServiceTier::Background, false, false, Some(params::Source::Query))
+            .expect("non-Responses background-tier request must be rejected");
+        assert!(query_error.contains(params::SERVICE_TIER_PARAM));
+
+        // A body-sourced tier reads exactly as it always did.
+        let body_error = background_contract_error(ServiceTier::Background, false, false, Some(params::Source::Body))
+            .expect("non-Responses background-tier request must be rejected");
+        assert!(!body_error.contains("inferred"));
     }
 
     #[sqlx::test]
