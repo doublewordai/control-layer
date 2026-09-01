@@ -3851,6 +3851,35 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_reserve_capacity_for_batch_fails_open_when_pending_counts_query_fails(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.pending_capacity_counts_enabled = true;
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        // Break the pending-count query outright: the optional gate must not
+        // turn its own failure into a rejected submission.
+        sqlx::query("DROP TABLE fusillade.requests CASCADE").execute(&pool).await.unwrap();
+
+        let file_model_counts = HashMap::from([(alias.clone(), 1_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let reservation_ids =
+            super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+                .await
+                .expect("a failing pending-count query must fail open, not reject the submission");
+
+        assert_eq!(reservation_ids.len(), 1);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_reserve_capacity_for_batch_ignores_flex_pending_counts_when_enabled(pool: PgPool) {
         let mut config = create_test_config();
         config.batches.pending_capacity_counts_enabled = true;

@@ -230,10 +230,37 @@ pub(crate) async fn reserve_capacity<P: sqlx_pool_router::PoolProvider>(
         // Only count normal batch rows when admitting new batches. Flex and
         // realtime rows are batchless service tiers and should not consume
         // batch capacity.
-        request_manager
+        //
+        // Known scope limit: the tier doubles as a completion-window class —
+        // 1h-window batch rows are stored with service_tier = 'flex', and only
+        // 24h-window rows carry the NULL tier this filter selects. Admission
+        // for a 1h batch therefore counts reservations plus 24h-tier rows
+        // expiring inside the hour, but not the existing 1h/flex backlog.
+        // Widening the filter to include 'flex' would also count batchless
+        // flex (Responses API) rows against batch capacity, which this comment
+        // block deliberately excludes; revisit when admission moves to the
+        // counter-based estimator.
+        //
+        // Fail open: this count is an optional protection (it only runs when
+        // `pending_capacity_counts_enabled` is set), so a failed or timed-out
+        // count must not fail the submission — that would turn a database
+        // timeout into a customer-facing 500 for work the system could accept.
+        // Admission then degrades, for this one submission, to the same
+        // reservations-only check it performs with the flag off.
+        match request_manager
             .get_pending_request_counts_by_model_and_window(&windows, &states, &model_filter, &ServiceTierFilter::Include(vec![None]), true)
             .await
-            .map_err(|e| CapacityError::Internal(format!("get pending counts: {e}")))?
+        {
+            Ok(counts) => counts,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "Pending-count query failed during batch admission; admitting on active reservations only"
+                );
+                pending_counts_since = None;
+                HashMap::new()
+            }
+        }
     } else {
         HashMap::new()
     };

@@ -40,8 +40,12 @@
 -- and the pending_* partials), verified with EXPLAIN ANALYZE against a copy of
 -- production with both indexes dropped.
 --
--- On large production tables, create this CONCURRENTLY before deploying the
--- migration so the IF NOT EXISTS statement below becomes a no-op:
+-- On large production tables, run all three statements CONCURRENTLY before
+-- deploying the migration so the statements below become no-ops. The create
+-- avoids blocking writes; the drops matter too, because a plain DROP INDEX
+-- takes a brief ACCESS EXCLUSIVE lock on `requests` that queues behind the
+-- longest-running query (the claim statements run for tens of seconds under
+-- load), and every other query then queues behind the waiting DROP:
 --
 --   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_requests_active_batched_demand
 --   ON requests (model, service_tier, batch_id)
@@ -49,6 +53,9 @@
 --     AND batch_id IS NOT NULL
 --     AND template_id IS NOT NULL
 --     AND service_tier IS DISTINCT FROM 'background';
+--
+--   DROP INDEX CONCURRENTLY IF EXISTS idx_requests_active_sla_counts;
+--   DROP INDEX CONCURRENTLY IF EXISTS idx_requests_active_non_priority_counts;
 
 CREATE INDEX IF NOT EXISTS idx_requests_active_batched_demand
 ON requests (model, service_tier, batch_id)
