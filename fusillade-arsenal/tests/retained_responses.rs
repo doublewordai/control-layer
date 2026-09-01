@@ -2799,6 +2799,11 @@ async fn archive<P: PoolProvider>(
     max_groups: i64,
     max_bytes: i64,
 ) -> fusillade_arsenal::error::Result<RetainedResponseArchiveOutcome> {
+    // Pinned cutoffs pair with the suite's pinned fixture dates: both sides
+    // of every movement comparison live in fixture time, so the real date
+    // never leaks in. Tests whose fixtures use the real clock (the trailing
+    // window assertions read SQL now()) must call `archive_at` with real-now
+    // cutoffs instead of this helper.
     archive_at(
         manager,
         policy,
@@ -5152,9 +5157,17 @@ async fn retained_trailing_filters_discriminate_windows_models_and_tiers(pool: P
         ensure_partition(&pool, delete_on).await;
     }
     let request_manager = manager(&pool).await;
-    let outcome = archive(&request_manager, &retention_policy, 4, i64::MAX)
-        .await
-        .unwrap();
+    let archive_now = Utc::now();
+    let outcome = archive_at(
+        &request_manager,
+        &retention_policy,
+        archive_now,
+        archive_now,
+        4,
+        i64::MAX,
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome.groups_archived, 4);
 
     let mut flex_rows = request_manager
@@ -5254,9 +5267,17 @@ async fn retained_failed_trailing_filters_discriminate_windows_models_and_tiers(
         ensure_partition(&pool, delete_on).await;
     }
     let request_manager = manager(&pool).await;
-    let outcome = archive(&request_manager, &retention_policy, 4, i64::MAX)
-        .await
-        .unwrap();
+    let archive_now = Utc::now();
+    let outcome = archive_at(
+        &request_manager,
+        &retention_policy,
+        archive_now,
+        archive_now,
+        4,
+        i64::MAX,
+    )
+    .await
+    .unwrap();
     assert_eq!(outcome.groups_archived, 4);
 
     let mut flex_rows = request_manager
