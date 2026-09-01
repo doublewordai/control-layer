@@ -1557,6 +1557,15 @@ mod tests {
         assert_eq!(sync_entry.1, "activated", "sync entry should be activated");
         let batch_id = fusillade::BatchId(sync_entry.0);
 
+        // The cached model label ignores the empty tier-2 aliases: a file whose
+        // only real alias is gpt-4 is homogeneous, not "mixed".
+        let batch = state.request_manager.get_batch(batch_id).await.expect("get_batch");
+        assert_eq!(
+            batch.metadata.as_ref().and_then(|m| m.get("dw_model")).and_then(|v| v.as_str()),
+            Some("gpt-4"),
+            "sync-created batch should cache its model label as dw_model"
+        );
+
         let requests = state
             .request_manager
             .get_batch_requests(batch_id)
@@ -1650,6 +1659,68 @@ mod tests {
         assert_eq!(errors[0]["template_index"], 1);
         assert_eq!(errors[0]["line"], 4);
         assert_eq!(errors[0]["error"], "missing model field in body");
+    }
+
+    /// A sync-created batch whose file spans several models caches the
+    /// collapsed `"mixed"` label rather than any one alias.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_activate_batch_stamps_mixed_model_label(pool: PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::{create_test_endpoint, create_test_model};
+
+        let state = setup_task_state(pool.clone()).await;
+
+        let user = create_test_user(&pool, Role::PlatformManager).await;
+        let user_id = user.id;
+
+        // Both models must exist for the capacity check to resolve them.
+        let endpoint_id = create_test_endpoint(&pool, "test-endpoint", user_id).await;
+        create_test_model(&pool, "gpt-4-internal", "gpt-4", endpoint_id, user_id).await;
+        create_test_model(&pool, "gpt-3.5-internal", "gpt-3.5", endpoint_id, user_id).await;
+
+        let connection_id = insert_test_connection(&pool, user_id).await;
+        let sync_id = insert_test_sync_op(&pool, connection_id, user_id).await;
+        let entry_id = insert_test_sync_entry(&pool, sync_id, connection_id, "data/mixed.jsonl").await;
+
+        let templates = vec![valid_template("gpt-4"), valid_template("gpt-3.5")];
+        let file_id = create_test_file(&state, user_id, templates).await;
+
+        sqlx::query!(
+            "UPDATE sync_entries SET file_id = $2, template_count = 2 WHERE id = $1",
+            entry_id,
+            file_id,
+        )
+        .execute(&pool)
+        .await
+        .expect("update sync_entry");
+
+        let input = ActivateBatchInput {
+            sync_id,
+            sync_entry_id: entry_id,
+            connection_id,
+            file_id,
+            template_count: 2,
+        };
+
+        run_activate_batch(&state, &input).await.expect("run_activate_batch");
+
+        let batch_id: Uuid = sqlx::query_scalar("SELECT batch_id FROM sync_entries WHERE id = $1")
+            .bind(entry_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch batch_id");
+        let batch = state
+            .request_manager
+            .get_batch(fusillade::BatchId(batch_id))
+            .await
+            .expect("get_batch");
+
+        assert_eq!(
+            batch.metadata.as_ref().and_then(|m| m.get("dw_model")).and_then(|v| v.as_str()),
+            Some("mixed"),
+            "a multi-model file should cache the collapsed \"mixed\" label"
+        );
     }
 
     /// Verify that run_activate_batch returns a retryable error when the model
