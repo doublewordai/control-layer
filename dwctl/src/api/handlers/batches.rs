@@ -321,6 +321,10 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
         sync_id: raw_metadata.get("dw_sync_id").cloned(),
     };
 
+    // Model label cached on the batch at creation time: surfaced as the typed
+    // `model` field, stripped from caller-visible metadata below.
+    let model = raw_metadata.get("dw_model").cloned();
+
     // Build user-facing metadata: filter out internal dw_* keys.
     // Keep request_source, created_by_email, context_name, context_type for backwards compat.
     let internal_keys = [
@@ -332,6 +336,8 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
         // Recorded for analytics, not for the caller: echoing a client's own User-Agent
         // back at it tells it nothing it didn't just send us.
         "dw_user_agent",
+        // Surfaced as the typed `model` field instead.
+        "dw_model",
     ];
     let mut metadata: HashMap<String, String> = raw_metadata
         .into_iter()
@@ -464,8 +470,21 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
             failed: batch.failed_requests,
         },
         metadata: if metadata.is_empty() { None } else { Some(metadata) },
+        model,
         analytics: None,
         dwext: if dwext.is_empty() { None } else { Some(dwext) },
+    }
+}
+
+/// Collapse the distinct models behind a batch into the single label the
+/// public UI shows per batch: the alias when homogeneous, `"mixed"` otherwise.
+/// Cached on the batch as `dw_model` metadata at creation time so list/get
+/// responses never aggregate over `request_templates`.
+pub(crate) fn batch_model_label(models: &[String]) -> Option<String> {
+    match models {
+        [] => None,
+        [only] => Some(only.clone()),
+        _ => Some("mixed".to_string()),
     }
 }
 
@@ -483,13 +502,14 @@ async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Opt
 /// Metadata keys the server owns. A caller-supplied value for any of these is dropped at
 /// creation rather than merged: they are either injected server-side during response
 /// enrichment, or they are provenance, which is worth nothing if the caller can set it.
-const RESERVED_METADATA_KEYS: [&str; 6] = [
+const RESERVED_METADATA_KEYS: [&str; 7] = [
     "created_by_email",
     "context_name",
     "context_type",
     "request_source",
     "created_by",
     "dw_user_agent",
+    "dw_model",
 ];
 
 /// Whether a caller-supplied metadata key collides with a reserved one, comparing the
@@ -826,6 +846,14 @@ pub async fn create_batch<P: PoolProvider>(
     if let Some(user_agent) = creator_user_agent {
         metadata_map.insert("dw_user_agent".to_string(), user_agent);
     }
+    // Cache the batch's model label at creation — the template counts are
+    // already loaded for validation, so this costs nothing. Response
+    // enrichment surfaces it as the typed `model` field; list/get never have
+    // to aggregate over request_templates.
+    let model_aliases_for_label: Vec<String> = file_model_counts.keys().cloned().collect();
+    if let Some(label) = batch_model_label(&model_aliases_for_label) {
+        metadata_map.insert("dw_model".to_string(), label);
+    }
     let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input — created_by uses org ID when in org context for ownership scoping
@@ -934,7 +962,9 @@ pub async fn create_batch<P: PoolProvider>(
     // batch.created webhook deliveries are created by the notification poller
     // which polls fusillade.batches for new records.
 
-    // For create, we have the current user's email directly
+    // For create, we have the current user's email directly. The model label
+    // rides on the batch's stored metadata (`dw_model`, injected above) and is
+    // surfaced by response enrichment.
     Ok((
         StatusCode::CREATED,
         Json(to_batch_response_with_email(batch, Some(&current_user.email))),
@@ -2710,10 +2740,13 @@ mod tests {
             "Dw-User-Agent",
             "request_source",
             "created_by",
+            "dw_model",
+            "dw-model",
+            "DW_MODEL",
         ] {
             assert!(is_reserved_metadata_key(reserved), "{reserved} should be reserved");
         }
-        for allowed in ["team", "dw_user_agent_note", "user_agent", "dwuseragent"] {
+        for allowed in ["team", "dw_user_agent_note", "user_agent", "dwuseragent", "model"] {
             assert!(!is_reserved_metadata_key(allowed), "{allowed} is the caller's to set");
         }
     }
@@ -3070,6 +3103,125 @@ mod tests {
         assert!(analytics["total_prompt_tokens"].is_number());
         assert!(analytics["total_completion_tokens"].is_number());
         assert!(analytics["total_tokens"].is_number());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_model_field(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment_a = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment_a.id, group.id, user.id).await;
+        let deployment_b = create_test_deployment(&pool, user.id, "gpt-3half-model", "gpt-3.5").await;
+        add_deployment_to_group(&pool, deployment_b.id, group.id, user.id).await;
+
+        let upload_file = |jsonl_content: &'static str| {
+            let app = &app;
+            let user = &user;
+            async move {
+                let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+                let multipart = axum_test::multipart::MultipartForm::new()
+                    .add_part("file", file_part)
+                    .add_part("purpose", axum_test::multipart::Part::text("batch"));
+                let upload_resp = app
+                    .post("/ai/v1/files")
+                    .multipart(multipart)
+                    .add_header(&add_auth_headers(user)[0].0, &add_auth_headers(user)[0].1)
+                    .add_header(&add_auth_headers(user)[1].0, &add_auth_headers(user)[1].1)
+                    .await;
+                upload_resp.assert_status(StatusCode::CREATED);
+                let file: serde_json::Value = upload_resp.json();
+                file["id"].as_str().unwrap().to_string()
+            }
+        };
+
+        let create_batch = |file_id: String| {
+            let app = &app;
+            let user = &user;
+            async move {
+                let create_req = CreateBatchRequest {
+                    input_file_id: file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    api_key_id: None,
+                };
+                let create_resp = app
+                    .post("/ai/v1/batches")
+                    .json(&create_req)
+                    .add_header(&add_auth_headers(user)[0].0, &add_auth_headers(user)[0].1)
+                    .add_header(&add_auth_headers(user)[1].0, &add_auth_headers(user)[1].1)
+                    .await;
+                create_resp.assert_status(StatusCode::CREATED);
+                let batch: serde_json::Value = create_resp.json();
+                batch
+            }
+        };
+
+        // Single-model file: the create response labels the batch with the alias
+        let single_file_id = upload_file(
+            r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#,
+        )
+        .await;
+        let single_batch = create_batch(single_file_id).await;
+        assert_eq!(single_batch["model"].as_str(), Some("gpt-4"));
+        // The label is stored as dw_model metadata but must surface only as
+        // the typed field, never in caller-visible metadata.
+        assert!(single_batch["metadata"]["dw_model"].is_null(), "dw_model leaked into metadata");
+        let single_batch_id = single_batch["id"].as_str().unwrap().to_string();
+
+        // Mixed-model file: labeled "mixed"
+        let mixed_file_id = upload_file(
+            "{\"custom_id\":\"request-1\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}}\n{\"custom_id\":\"request-2\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-3.5\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}}",
+        )
+        .await;
+        let mixed_batch = create_batch(mixed_file_id).await;
+        assert_eq!(mixed_batch["model"].as_str(), Some("mixed"));
+        let mixed_batch_id = mixed_batch["id"].as_str().unwrap().to_string();
+
+        // The list carries the same labels per row
+        let list_resp = app
+            .get("/ai/v1/batches?include=analytics")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        list_resp.assert_status_ok();
+        let list_result: serde_json::Value = list_resp.json();
+        let rows = list_result["data"].as_array().unwrap();
+        let model_of = |id: &str| {
+            rows.iter()
+                .find(|row| row["id"].as_str() == Some(id))
+                .expect("batch should be listed")["model"]
+                .as_str()
+                .map(str::to_string)
+        };
+        assert_eq!(model_of(&single_batch_id), Some("gpt-4".to_string()));
+        assert_eq!(model_of(&mixed_batch_id), Some("mixed".to_string()));
+        for row in rows {
+            assert!(row["metadata"]["dw_model"].is_null(), "dw_model leaked into list metadata");
+        }
+
+        // The detail endpoint carries the label too
+        let get_resp = app
+            .get(&format!("/ai/v1/batches/{single_batch_id}"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_resp.assert_status_ok();
+        let detail: serde_json::Value = get_resp.json();
+        assert_eq!(detail["model"].as_str(), Some("gpt-4"));
+
+        let get_mixed_resp = app
+            .get(&format!("/ai/v1/batches/{mixed_batch_id}"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_mixed_resp.assert_status_ok();
+        let mixed_detail: serde_json::Value = get_mixed_resp.json();
+        assert_eq!(mixed_detail["model"].as_str(), Some("mixed"));
     }
 
     #[sqlx::test]

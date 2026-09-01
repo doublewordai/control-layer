@@ -9,7 +9,6 @@ COPY fusillade/ fusillade/
 COPY fusillade-core/ fusillade-core/
 COPY fusillade-arsenal/ fusillade-arsenal/
 COPY onwards/ onwards/
-COPY onwards-fusillade/ onwards-fusillade/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Backend build stage
@@ -48,7 +47,6 @@ COPY fusillade/ fusillade/
 COPY fusillade-core/ fusillade-core/
 COPY fusillade-arsenal/ fusillade-arsenal/
 COPY onwards/ onwards/
-COPY onwards-fusillade/ onwards-fusillade/
 RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
 ENV SQLX_OFFLINE=true
 RUN cargo build --release -p dwctl

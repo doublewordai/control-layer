@@ -701,9 +701,10 @@ background_services:
     #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
 
     # Endpoints that should use SSE streaming for usage tracking.
-    # Batch requests to these paths are sent with X-Fusillade-Stream: true,
-    # causing the upstream proxy to inject stream: true and stream_options.include_usage.
-    # The streamed response is reassembled into non-streaming JSON before storage.
+    # Batch requests to these paths have stream: true and stream_options.include_usage
+    # injected on the way out, and the streamed response is reassembled into
+    # non-streaming JSON before it is stored or returned. Only batch traffic is
+    # affected; a client request to the same path is left as the client sent it.
     streamable_endpoints:
       - /v1/chat/completions
       - /v1/completions

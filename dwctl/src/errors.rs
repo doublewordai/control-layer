@@ -75,6 +75,15 @@ use thiserror::Error as ThisError;
 /// when the database connection pool is exhausted.
 const POOL_EXHAUSTED_RETRY_AFTER_SECS: &str = "30";
 
+/// Message returned when a bearer API key is not recognised.
+///
+/// API keys are region-bound but carry no region prefix, so a key from the
+/// account's other-region endpoint is indistinguishable from an invalid one.
+/// The copy stays generic (no endpoint URLs enumerated) and points at the
+/// regional-endpoints docs page so users check their base URL before
+/// concluding the key itself is bad.
+pub const INVALID_API_KEY_MESSAGE: &str = "Invalid API key. API keys are region-bound: if you expected this key to work, check that your base URL matches the region the key was created in. See https://docs.doubleword.ai/inference-api/regional-endpoints";
+
 #[derive(ThisError, Debug)]
 pub enum Error {
     /// Authentication required but not provided

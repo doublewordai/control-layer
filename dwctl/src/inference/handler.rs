@@ -224,8 +224,7 @@ pub async fn delete_response<P: PoolProvider>(
     // `get_response`'s resolution:
     //   * Multi-step — head_step exists; walk the chain and collect every
     //     `request_id` from its rows (`None` on tool_call steps, which have
-    //     no backing fusillade row — tool dispatch lives in
-    //     `tool_call_analytics`).
+    //     no backing fusillade row).
     //   * Single-step — head_step_uuid is itself the fusillade.requests id.
     //
     // For the ownership check we use the head row's `created_by` (same row

@@ -11,8 +11,8 @@ use std::{
 use metrics::histogram;
 use onwards::target::{
     Auth, BackoffConfig as OnwardsBackoffConfig, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
-    JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig,
-    PoolSpec, PoolsSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
+    JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, PoolsSpec,
+    ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
     inheritable_routing_rules,
 };
 use sqlx::{PgPool, postgres::PgListener};
@@ -65,7 +65,6 @@ struct OnwardsTarget {
     capacity: Option<i32>,
     sanitize_responses: bool,
     trusted: bool,
-    open_responses_adapter: bool,
     reasoning_translation: Option<ReasoningTranslationConfig>,
     /// Traffic routing rules from the model_traffic_rules table
     routing_rules: Vec<RoutingRule>,
@@ -499,8 +498,6 @@ struct OnwardsCompositeModel {
     /// Whether to mark provider as trusted in strict mode
     #[allow(dead_code)] // Stored in DB but composite-level trust is not yet propagated to onwards
     trusted: bool,
-    /// Whether to enable the open_responses adapter at the pool level
-    open_responses_adapter: bool,
     /// Traffic routing rules from the database
     routing_rules: Vec<RoutingRule>,
     components: Vec<CompositeModelComponent>,
@@ -533,7 +530,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             cm.fallback_max_attempts,
             cm.sanitize_responses as composite_sanitize_responses,
             cm.trusted as composite_trusted,
-            cm.open_responses_adapter as "composite_open_responses_adapter?",
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
@@ -546,7 +542,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             dm.capacity as deployment_capacity,
             dm.sanitize_responses as deployment_sanitize_responses,
             dm.trusted as deployment_trusted,
-            dm.open_responses_adapter as "deployment_open_responses_adapter?",
             ie.reasoning_translation as endpoint_reasoning_translation,
             dm.reasoning_translation_overrides as model_reasoning_translation_overrides,
             -- Endpoint info
@@ -714,8 +709,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             backoff_jitter,
             backoff_max_total_ms,
             sanitize_responses,
-            trusted,
-            open_responses_adapter as "open_responses_adapter?"
+            trusted
         FROM deployed_models
         WHERE is_composite = TRUE
           AND deleted = FALSE
@@ -755,7 +749,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 backoff_max_total_ms: row.backoff_max_total_ms,
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
-                open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
                 routing_rules: Vec::new(), // Populated from separate query below
                 components: Vec::new(),
                 api_keys: Vec::new(),
@@ -789,7 +782,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     capacity: row.deployment_capacity,
                     sanitize_responses: row.deployment_sanitize_responses,
                     trusted: row.deployment_trusted,
-                    open_responses_adapter: row.deployment_open_responses_adapter.unwrap_or(true),
                     reasoning_translation: resolve_reasoning_translation(
                         row.endpoint_reasoning_translation,
                         row.model_reasoning_translation_overrides,
@@ -1012,9 +1004,6 @@ fn convert_composite_to_target_spec(
                     // For composite models, use the composite model's sanitize_responses setting
                     // This ensures the virtual model's toggle controls all providers
                     sanitize_response: composite.sanitize_responses,
-                    open_responses: Some(OpenResponsesConfig {
-                        adapter: target.open_responses_adapter,
-                    }),
                     request_timeout_secs: None,
                     // Each provider uses its own trusted setting from the database
                     // This allows fine-grained control over which providers bypass error sanitization
@@ -1077,9 +1066,6 @@ fn convert_composite_to_target_spec(
         response_headers: None,
         sanitize_response: composite.sanitize_responses,
         trusted: false, // Pool-level trusted defaults to false; providers set their own
-        open_responses: Some(OpenResponsesConfig {
-            adapter: composite.open_responses_adapter,
-        }),
         routing_rules: if pool_name == DEFAULT_COMPONENT_POOL {
             composite.routing_rules.clone()
         } else {
@@ -1227,9 +1213,6 @@ fn convert_to_config_file(
                 response_headers: None,
                 weight: 1,
                 sanitize_response: target.sanitize_responses,
-                open_responses: Some(OpenResponsesConfig {
-                    adapter: target.open_responses_adapter,
-                }),
                 request_timeout_secs: None,
                 trusted: Some(target.trusted),
                 // None → inherit from resolved `trusted` (see composite-model
@@ -1279,7 +1262,6 @@ fn convert_to_config_file(
                 strategy: OnwardsLoadBalanceStrategy::default(),
                 providers: vec![provider],
                 response_headers: None,
-                open_responses: None,
                 sanitize_response: target.sanitize_responses,
                 trusted: false,
                 routing_rules: target.routing_rules,
@@ -1354,7 +1336,6 @@ pub async fn load_targets_from_db(
             dm.capacity,
             dm.sanitize_responses,
             dm.trusted,
-            dm.open_responses_adapter,
             ie.reasoning_translation as endpoint_reasoning_translation,
             dm.reasoning_translation_overrides as model_reasoning_translation_overrides,
             dm.fallback_enabled,
@@ -1505,7 +1486,6 @@ pub async fn load_targets_from_db(
                 capacity: row.capacity,
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
-                open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
                 reasoning_translation: resolve_reasoning_translation(
                     row.endpoint_reasoning_translation.clone(),
                     row.model_reasoning_translation_overrides.clone(),
