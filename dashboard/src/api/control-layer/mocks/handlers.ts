@@ -2912,7 +2912,37 @@ export const handlers = [
     const body = (await request.json()) as OrganizationUpdateRequest;
     const org = organizationsData.find((o) => o.id === params.id);
     if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });
-    return HttpResponse.json({ ...org, ...body });
+    // Mirror the backend: the contact email is never applied directly. A
+    // differing email raises a pending change that both mailboxes must
+    // confirm, and the response keeps the current email.
+    const { email, ...rest } = body;
+    const newEmail = email?.trim().toLowerCase();
+    // The backend validates the address before raising a pending change;
+    // an empty or malformed email is a 400, never a pending state.
+    if (newEmail !== undefined && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+      return HttpResponse.json(
+        { error: "Invalid email address" },
+        { status: 400 },
+      );
+    }
+    const emailChanged =
+      newEmail !== undefined && newEmail !== org.email.toLowerCase();
+    return HttpResponse.json({
+      ...org,
+      ...rest,
+      ...(emailChanged
+        ? {
+            pending_email_change: {
+              new_email: newEmail,
+              expires_at: new Date(
+                Date.now() + 24 * 60 * 60 * 1000,
+              ).toISOString(),
+              new_email_confirmed_at: null,
+              old_email_confirmed_at: null,
+            },
+          }
+        : {}),
+    });
   }),
 
   http.delete("/admin/api/v1/organizations/:id", ({ params }) => {
