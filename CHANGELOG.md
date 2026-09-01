@@ -1,5 +1,13 @@
 # Changelog
 
+## [11.1.1](https://github.com/doublewordai/control-layer/compare/v11.1.0...v11.1.1) (2026-09-01)
+
+
+### Bug Fixes
+
+* **dwctl:** count pending requests outside the admission lock; index the batched demand branch ([#1531](https://github.com/doublewordai/control-layer/issues/1531)) ([73e8f80](https://github.com/doublewordai/control-layer/commit/73e8f8083eb4c7125526b71e89684cc857bb8d6f))
+* surface pending org email-change verification in the dashboard ([#1530](https://github.com/doublewordai/control-layer/issues/1530)) ([27ea5a1](https://github.com/doublewordai/control-layer/commit/27ea5a162eee9da036abeb8bb9d4d935e1c6f949))
+
 ## [11.1.0](https://github.com/doublewordai/control-layer/compare/v11.0.2...v11.1.0) (2026-09-01)
 
 
