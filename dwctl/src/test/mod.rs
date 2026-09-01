@@ -549,6 +549,39 @@ async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
     assert_eq!(invalid_capabilities_response.status_code(), 400);
 }
 
+#[sqlx::test]
+async fn ai_models_unknown_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
+    let config = crate::test::utils::create_test_config();
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, _bg_services) = app.into_test_server();
+
+    let response = server
+        .get("/ai/v1/models")
+        .add_header("authorization", "Bearer not-a-real-key")
+        .await;
+    assert_eq!(response.status_code(), 401);
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert_eq!(body["error"]["code"], "invalid_api_key");
+    assert_eq!(body["error"]["message"], crate::errors::INVALID_API_KEY_MESSAGE);
+
+    // The copy stays generic: it must point at the regional-endpoints docs page
+    // without enumerating regional API base URLs in the error body.
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("https://docs.doubleword.ai/inference-api/regional-endpoints"));
+    assert!(
+        !message.contains("api.doubleword.ai"),
+        "401 copy must not enumerate regional base URLs"
+    );
+    assert!(
+        !message.contains("api.us.doubleword.ai"),
+        "401 copy must not enumerate regional base URLs"
+    );
+}
+
 async fn assert_usage_recorded(fixture: &StreamingFixture, expected_uri: &str, prompt_tokens: i64, completion_tokens: i64) {
     let mut tries = 0;
     // The batcher flush folds the balance in the same transaction that
@@ -619,6 +652,61 @@ async fn cleanup_fixture(fixture: StreamingFixture) {
         .await;
     assert_eq!(delete_group_response.status_code(), 204, "Should delete test group");
     fixture.bg_services.shutdown().await;
+}
+
+/// A client asking for a stream must receive one, through the whole app.
+///
+/// This is the regression that shipped: the edge decided to reassemble from a
+/// header it stamps on every inbound request, so a client's `stream: true` came
+/// back as one `chat.completion` object. Nothing at this level covered it - both
+/// streaming fixtures sent the daemon's headers, so both took the daemon's path.
+#[sqlx::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_client_stream_is_not_reassembled(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello!\"}}],\"usage\":null}\n\ndata: [DONE]\n\n";
+
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({ "stream": true })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
+
+    // No daemon headers at all: this is a client, and the client asked to stream.
+    let inference_response = fixture
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello from E2E test"}],
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(inference_response.status_code().as_u16(), 200);
+    let content_type = inference_response
+        .headers()
+        .get("content-type")
+        .map_or("", |v| v.to_str().unwrap_or_default())
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "a client that asked to stream must not be handed an assembled body, got {content_type:?}"
+    );
+    assert!(
+        inference_response.text().starts_with("data:"),
+        "the frames themselves must reach the client"
+    );
+
+    cleanup_fixture(fixture).await;
 }
 
 #[sqlx::test]
@@ -1856,6 +1944,56 @@ mod openapi_access_control {
         let (server, _bg) = make_app_with_admin_docs(pool, true).await;
         let response = server.get("/ai/openapi.json").await;
         assert_eq!(response.status_code().as_u16(), 401);
+    }
+
+    #[sqlx::test]
+    async fn unknown_bearer_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool, true).await;
+
+        // The CurrentUser extractor rejects unknown bearer keys for every
+        // dwctl-authenticated surface; the copy must nudge users to check
+        // their regional endpoint without enumerating base URLs.
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header("authorization", "Bearer not-a-real-key")
+            .await;
+        assert_eq!(response.status_code().as_u16(), 401);
+
+        let text = response.text();
+        assert!(
+            text.contains(crate::errors::INVALID_API_KEY_MESSAGE),
+            "unknown-key 401 should carry the regional-endpoints copy, got: {text}"
+        );
+        assert!(
+            !text.contains("api.doubleword.ai"),
+            "401 copy must not enumerate regional base URLs"
+        );
+        assert!(
+            !text.contains("api.us.doubleword.ai"),
+            "401 copy must not enumerate regional base URLs"
+        );
+    }
+
+    #[sqlx::test]
+    async fn ai_spec_error_example_matches_live_copy(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let headers = add_auth_headers(&user);
+
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+
+        // The documented error example in the AI spec description is a separate
+        // string literal; keep it from drifting away from the live 401 copy.
+        let text = response.text();
+        assert!(
+            text.contains(crate::errors::INVALID_API_KEY_MESSAGE),
+            "AI OpenAPI description should embed the live invalid-API-key copy"
+        );
     }
 
     #[sqlx::test]

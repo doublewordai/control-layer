@@ -1,5 +1,20 @@
 # Changelog
 
+## [11.0.2](https://github.com/doublewordai/control-layer/compare/v11.0.1...v11.0.2) (2026-08-30)
+
+
+### Bug Fixes
+
+* **dwctl:** point unknown-API-key 401s at the regional-endpoints docs ([#1541](https://github.com/doublewordai/control-layer/issues/1541)) ([6c5b1f9](https://github.com/doublewordai/control-layer/commit/6c5b1f92b27a075f935a714156c53d1cee936022))
+* **dwctl:** tolerate backend-omitted fields in Responses translation, stop retry loops on translate failure ([#1544](https://github.com/doublewordai/control-layer/issues/1544)) ([04c07c9](https://github.com/doublewordai/control-layer/commit/04c07c9fad947668b6d0be77a38475528dbdc6de))
+
+## [11.0.1](https://github.com/doublewordai/control-layer/compare/v11.0.0...v11.0.1) (2026-08-28)
+
+
+### Bug Fixes
+
+* **dwctl:** mark daemon dispatches instead of inferring them at the edge ([#1538](https://github.com/doublewordai/control-layer/issues/1538)) ([fa16fba](https://github.com/doublewordai/control-layer/commit/fa16fba5145336f7c3dd7b1a2233ed6d7845f214))
+
 ## [11.0.0](https://github.com/doublewordai/control-layer/compare/v10.17.1...v11.0.0) (2026-08-27)
 
 
