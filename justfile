@@ -13,9 +13,11 @@ get-admin-email:
 # - macOS or Linux
 # - Homebrew (recommended for tool installation)
 #
-# First-time setup:
-#   brew install docker hurl postgresql
-#   just setup
+# First-time setup (cargo comes from rustup, not Homebrew):
+#   brew install hurl postgresql pnpm
+#   brew install --cask docker
+#   cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
+#   just check
 check:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -26,7 +28,7 @@ check:
     missing_tools=()
 
     # Required tools
-    required_tools=("docker" "hurl" "psql" "createdb" "cargo" "pnpm")
+    required_tools=("docker" "hurl" "psql" "createdb" "cargo" "pnpm" "sqlx")
     for tool in "${required_tools[@]}"; do
         if ! command -v "$tool" >/dev/null 2>&1; then
             missing_tools+=("$tool")
@@ -107,7 +109,18 @@ db-setup:
 
     # Write .env files for sqlx compile-time verification
     echo "Writing .env files..."
-    echo "DATABASE_URL=postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic" > dwctl/.env
+    DWCTL_DATABASE_URL="postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic%2Cfusillade"
+    DWCTL_FUSILLADE_DATABASE_URL="postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dfusillade"
+    FUSILLADE_DATABASE_URL="postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade"
+
+    echo "Creating fusillade schema in dwctl database..."
+    PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d dwctl \
+        -c "CREATE SCHEMA IF NOT EXISTS fusillade" >/dev/null
+
+    echo "DATABASE_URL=$DWCTL_DATABASE_URL" > .env
+    echo "DATABASE_URL=$DWCTL_DATABASE_URL" > dwctl/.env
+    echo "DATABASE_URL=$FUSILLADE_DATABASE_URL" > fusillade/.env
+    echo "DATABASE_URL=$FUSILLADE_DATABASE_URL" > fusillade-arsenal/.env
 
     # Run migrations
     echo "Running migrations..."
@@ -119,32 +132,136 @@ db-setup:
         exit 1
     fi
 
+    echo "Running fusillade migrations..."
+    if (cd fusillade-arsenal && sqlx migrate run); then
+        echo "  ✅ fusillade migrations complete"
+    else
+        echo "  ❌ fusillade migrations failed"
+        exit 1
+    fi
+
+    echo "Running fusillade schema-mode migrations..."
+    if (cd fusillade-arsenal && DATABASE_URL="$DWCTL_FUSILLADE_DATABASE_URL" sqlx migrate run); then
+        echo "  ✅ fusillade schema-mode migrations complete"
+    else
+        echo "  ❌ fusillade schema-mode migrations failed"
+        exit 1
+    fi
+
+    echo "Running underway migrations..."
+    # The underway crate (a dependency) ships its own SQLx migrations that
+    # create the underway schema (underway.task, underway.task_attempt, etc.).
+    # These are applied at runtime by underway::run_migrations, but are not
+    # part of dwctl's migration set. They are needed at compile time for
+    # SQLx query verification when DATABASE_URL is set (e.g. when exported in
+    # the shell, as CLAUDE.md suggests). Without them, cargo clippy
+    # --all-features fails with "relation \"underway.task\" does not exist".
+    UNDERWAY_DIR=$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" \
+        -path "*/underway-*/migrations" -type d 2>/dev/null | head -1)
+    if [ -n "$UNDERWAY_DIR" ] && [ -d "$UNDERWAY_DIR" ]; then
+        PGPASSWORD="$DB_PASS" psql -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d dwctl \
+            -c "CREATE SCHEMA IF NOT EXISTS underway" >/dev/null
+        UNDERWAY_DATABASE_URL="postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dunderway"
+        if DATABASE_URL="$UNDERWAY_DATABASE_URL" sqlx migrate run --source "$UNDERWAY_DIR"; then
+            echo "  ✅ underway migrations complete"
+        else
+            echo "  ❌ underway migrations failed"
+            exit 1
+        fi
+    else
+        echo "  ⚠️ underway crate not found in cargo registry, skipping"
+        echo "     Run 'cargo fetch' first, or these will be applied at runtime"
+    fi
+
     echo ""
     echo "✅ Database setup complete!"
     echo ""
     echo "Database URLs configured:"
-    echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic"
+    echo "  dwctl:     postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/dwctl?options=-c%20search_path%3Dpublic%2Cfusillade"
+    echo "  fusillade: postgres://$DB_USER:$DB_PASS@$DB_HOST:$DB_PORT/fusillade"
 
-# Start the full development stack with hot reload
+# Run dwctl from source: 'just dev-native'
+#
+# The inner loop for Rust work. Compiles dwctl on the host and runs it against
+# the Postgres that 'just db-start' provides, so a change is a cargo rebuild.
+# This is also the only mode SQLx's compile-time query verification is set up for.
+# It reads the DATABASE_URL that 'just db-setup' writes into .env.
+#
+# Both cookie overrides below are necessary for local work. config.yaml
+# ships cookie_secure: true and cookie_same_site: "strict", are for
+# production, but impossible on http://localhost.
+#
+# Extra arguments are passed to cargo, e.g. 'just dev-native --release'.
+#
+# Examples:
+#   just dev-native                              # Debug build, native auth on localhost
+#   just dev-native --release                    # Optimised build
+#   RUST_LOG=info,dwctl=debug,sqlx=debug just dev-native   # Log every SQL statement and its timing
+
+# Build and run dwctl on the host, against 'just db-start' Postgres
+dev-native *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    DB_HOST="${DB_HOST:-localhost}"
+    DB_PORT="${DB_PORT:-5432}"
+
+    if ! command -v pg_isready >/dev/null 2>&1; then
+        echo "❌ pg_isready not found - install the PostgreSQL client tools"
+        exit 1
+    fi
+
+    if ! pg_isready -h "$DB_HOST" -p "$DB_PORT" >/dev/null 2>&1; then
+        echo "❌ No PostgreSQL on $DB_HOST:$DB_PORT"
+        echo ""
+        echo "   Start it and create the databases:"
+        echo ""
+        echo "     just db-start && just db-setup"
+        echo ""
+        exit 1
+    fi
+
+    # db-setup writes this; without it SQLx has no DATABASE_URL to verify
+    # queries against and the build fails with errors that point at the SQL
+    # rather than at the missing file.
+    if [ ! -f dwctl/.env ]; then
+        echo "❌ dwctl/.env is missing - SQLx needs it to verify queries at compile time"
+        echo ""
+        echo "     just db-setup"
+        echo ""
+        exit 1
+    fi
+
+    echo "▸ PostgreSQL up on $DB_HOST:$DB_PORT"
+    echo "▸ Native auth relaxed for http://localhost (Secure off, SameSite=lax)"
+    echo ""
+
+    DWCTL_AUTH__NATIVE__SESSION__COOKIE_SECURE=false \
+    DWCTL_AUTH__NATIVE__SESSION__COOKIE_SAME_SITE=lax \
+    cargo run {{args}}
+
+# Start the containerised development stack: 'just dev'
 #
 # Uses docker-compose.yml (base) + docker-compose.override.yml (dev overrides):
 # - docker-compose.yml: Production-ready service definitions
-# - docker-compose.override.yml: Development-specific settings (ports, volumes, hot reload)
+# - docker-compose.override.yml: Development-specific settings (ports, volumes)
 #
 # Services running in development mode:
-# - control-layer: Rust API server (port 3001) - hot reloads via volume mounts
+# - control-layer: published dwctl image (port 3001) - NOT built from source
 # - control-layer-frontend: React dev server (port 5173) - Vite HMR enabled
-# - postgres: Database (port 5432) - exposed for direct access
+# - postgres: Database (port 5433 on the host) - exposed for direct access
 #
-# The --watch flag enables hot reload. File changes trigger container rebuilds.
+# The --watch flag rebuilds the frontend container on dependency changes.
+# Editing Rust here does nothing: dwctl is an image. Use 'just dev-native'
+# when the change lives in Rust.
 #
-# Access the app at: https://localhost
 # Direct API access: http://localhost:3001
-# Database: postgres://control_layer:control_layer_password@localhost:5432/control_layer
-#
+# Database: postgres://control_layer:control_layer_password@localhost:5433/control_layer
 #
 # Examples:
 #   just dev                    # Standard development stack
+
+# Containerised stack: dwctl image + dashboard dev server + Postgres
 dev *args="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -451,7 +568,7 @@ test target="" *args="":
                 fi
                 # Remove --watch from args and pass remaining to cargo test
                 remaining_args=$(echo "{{args}}" | sed 's/--watch//g' | xargs)
-                cargo watch -x "test $remaining_args"
+                cargo watch -x "test --workspace --all-features $remaining_args"
             elif [[ "{{args}}" == *"--coverage"* ]]; then
                 if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
                     echo "❌ Error: cargo-llvm-cov not found. Install with:"
@@ -460,9 +577,9 @@ test target="" *args="":
                     echo "  cargo binstall cargo-llvm-cov"
                     exit 1
                 fi
-                cargo llvm-cov --fail-under-lines 60 --lcov --output-path lcov.info
+                cargo llvm-cov --workspace --all-features --fail-under-lines 60 --lcov --output-path lcov.info
             else
-                cargo test {{args}}
+                cargo test --workspace --all-features {{args}}
             fi
             ;;
         ts)
@@ -498,7 +615,8 @@ test target="" *args="":
 # rust: Rust code formatting and linting
 # - Runs cargo fmt --check to verify formatting
 # - Runs cargo clippy for Rust-specific lints and suggestions
-# - Checks all Rust projects (dwctl)
+# - Checks the application and locally maintained Fusillade crates
+# - Onwards retains its imported standalone-repository lint policy
 # - Pass clippy args like -- -D warnings for stricter checking
 #
 #
@@ -524,13 +642,36 @@ lint target *args="":
             echo "Checking Cargo.lock sync..."
             cargo metadata --locked > /dev/null
             echo "Running cargo fmt --check..."
-            cargo fmt --check
+            cargo fmt --check \
+                --package dwctl \
+                --package fusillade \
+                --package fusillade-core \
+                --package fusillade-arsenal
             echo "Running cargo clippy..."
-            cargo clippy {{args}}
+            cargo clippy \
+                --package dwctl \
+                --package fusillade \
+                --package fusillade-core \
+                --package fusillade-arsenal \
+                --all-features \
+                --no-deps \
+                {{args}}
             echo "Running ZDR no-payload-logging guard..."
-            ./scripts/check-no-payload-logging.sh
+            ./scripts/check-no-payload-logging.sh \
+                dwctl/src \
+                fusillade/src \
+                fusillade-core/src \
+                fusillade-arsenal/src
             echo "Checking SQLx prepared queries..."
             cargo sqlx prepare --check --workspace
+            echo "Checking local Rust workspace topology..."
+            bash .github/scripts/test-local-rust-workspace.sh
+            .github/scripts/test-fusillade-migration-checksums.py
+            .github/scripts/test-publish-onwards.sh
+            .github/scripts/test-publish-fusillade-crates.sh
+            .github/scripts/test-sync-fusillade-release-dependencies.sh
+            .github/scripts/test-rust-ci-matrix.sh
+            .github/scripts/test-aggregate-rust-coverage.sh
             ;;
         *)
             echo "Usage: just lint [ts|rust]"
@@ -550,7 +691,7 @@ lint target *args="":
 #
 # rust: Rust code formatting
 # - Uses cargo fmt to format all Rust code
-# - Formats all Rust projects (dwctl)
+# - Formats the application and locally maintained Fusillade crates
 # - Applies standard Rust formatting conventions
 # - Modifies files in place to fix formatting issues
 #
@@ -566,8 +707,13 @@ fmt target *args="":
             cd dashboard && pnpm exec prettier --write . {{args}}
             ;;
         rust)
-            echo "Running cargo fmt for dwctl..."
-            cargo fmt {{args}}
+            echo "Running cargo fmt for dwctl and Fusillade..."
+            cargo fmt \
+                --package dwctl \
+                --package fusillade \
+                --package fusillade-core \
+                --package fusillade-arsenal \
+                {{args}}
             ;;
         *)
             echo "Usage: just fmt [ts|rust]"
@@ -768,82 +914,6 @@ security-scan target="latest" *args="":
         echo "✅ No critical or high severity vulnerabilities found."
     fi
 
-# Publish packages to crates.io: 'just release'
-#
-# Publishes both fusillade and dwctl packages to crates.io in an idempotent way.
-# If a version is already published, it will be skipped gracefully.
-#
-# Prerequisites:
-# - Authentication: Either run 'cargo login' or set CARGO_REGISTRY_TOKEN environment variable
-# - Node.js and pnpm installed (for building dwctl frontend)
-#
-# The release process:
-# 1. Attempts to publish fusillade (skips if version already exists)
-# 2. Builds frontend and bundles it into dwctl/static
-# 3. Attempts to publish dwctl (skips if version already exists)
-#
-# Examples:
-#   just release                              # Use stored credentials from 'cargo login'
-#   CARGO_REGISTRY_TOKEN=<token> just release # Use token from environment
-release:
-    #!/usr/bin/env bash
-    set -euo pipefail
-
-    echo "📦 Publishing packages to crates.io..."
-    echo ""
-
-    # Build cargo publish command with optional token
-    PUBLISH_CMD="cargo publish --allow-dirty --color always"
-    if [ -n "${CARGO_REGISTRY_TOKEN:-}" ]; then
-        echo "Using CARGO_REGISTRY_TOKEN from environment"
-        PUBLISH_CMD="$PUBLISH_CMD --token $CARGO_REGISTRY_TOKEN"
-    else
-        echo "Using stored credentials from 'cargo login'"
-    fi
-    echo ""
-
-    # Function to publish a package and handle errors gracefully
-    publish_package() {
-        local package=$1
-
-        echo "Publishing $package..."
-        if $PUBLISH_CMD -p "$package" 2>&1 | tee /tmp/cargo-publish-$package.log; then
-            echo "✅ Successfully published $package"
-            return 0
-        else
-            # Check if the error is because the version already exists
-            if grep -q "already uploaded" /tmp/cargo-publish-$package.log || \
-               grep -q "crate version .* is already uploaded" /tmp/cargo-publish-$package.log; then
-                echo "ℹ️  $package version already published, skipping"
-                return 0
-            else
-                echo "❌ Failed to publish $package"
-                cat /tmp/cargo-publish-$package.log
-                return 1
-            fi
-        fi
-    }
-
-    # Build frontend for dwctl
-    echo "Building frontend and publishing dwctl..."
-    echo "Building frontend..."
-    cd dashboard
-    pnpm install --frozen-lockfile
-    pnpm run build
-    cd ..
-
-    echo "Copying frontend to dwctl/static..."
-    rm -rf dwctl/static
-    cp -r dashboard/dist dwctl/static
-    echo "✅ Frontend built and bundled"
-    echo ""
-
-    # Publish dwctl
-    publish_package "dwctl" || exit 1
-
-    echo ""
-    echo "🎉 Release process completed successfully!"
-
 # Start Docker PostgreSQL with fsync disabled for fast testing
 #
 # This starts a PostgreSQL container optimized for testing:
@@ -869,15 +939,36 @@ db-start:
         fi
     else
         echo "Creating new test-postgres container with fsync disabled and trust auth..."
+        # max_connections=400 (postgres defaults to 100, which this suite exhausts).
+        #
+        # `#[sqlx::test]` runs one test per core and each test that builds a full app opens
+        # FOUR pools -- main 4 + fusillade 4 + outlet 4 + underway 10, see
+        # dwctl/src/test/utils.rs -- so ~22 connections per test at the ceiling. Eight cores
+        # is therefore ~176 worst case, sixteen is ~350, before anything else on the machine
+        # takes a share. Past the limit tests fail with "pool timed out while waiting for an
+        # open connection", which reads like a hang or a deadlock rather than a resource
+        # limit, and which tests fail changes between runs.
+        #
+        # Worth knowing: a `cargo run` dev server pointed at the same database holds ~38
+        # connections of its own. Under the old default that alone was ~40% of the budget,
+        # and stopping it was the difference between a module failing 10 tests and passing
+        # 57 in 7 seconds. Raising the ceiling means you no longer have to think about it.
         # Create volume if it doesn't exist
         docker volume create test-postgres-data >/dev/null 2>&1 || true
+        # PGDATA is set explicitly, and the volume is mounted at exactly that
+        # path. Postgres 18 moved its default PGDATA to a versioned directory,
+        # so mounting the parent instead lets two majors write side by side in
+        # one volume: switching version silently yields an empty database
+        # rather than an error.
         docker run --name test-postgres \
           -e POSTGRES_PASSWORD=password \
           -e POSTGRES_HOST_AUTH_METHOD=trust \
+          -e PGDATA=/var/lib/postgresql/data \
           -p 5432:5432 \
-          -v test-postgres-data:/var/lib/postgresql/ \
-          -d postgres:latest \
-          postgres -c fsync=off \
+          -v test-postgres-data:/var/lib/postgresql/data \
+          -d postgres:17 \
+          postgres -c max_connections=400 \
+          -c fsync=off \
           -c full_page_writes=off \
           -c synchronous_commit=off \
           -c wal_level=minimal \
@@ -890,15 +981,32 @@ db-start:
     fi
 
     echo "Waiting for postgres to be ready..."
-    sleep 3
 
-    # Verify it's up
-    if pg_isready -h localhost -p 5432 >/dev/null 2>&1; then
-        echo "✅ PostgreSQL is ready on localhost:5432"
-    else
-        echo "❌ PostgreSQL not responding"
-        exit 1
-    fi
+    for _ in $(seq 30); do
+        if pg_isready -h localhost -p 5432 >/dev/null 2>&1; then
+            echo "✅ PostgreSQL is ready on localhost:5432"
+            exit 0
+        fi
+
+        # Usually a volume left over from a different PostgreSQL major: the
+        # server refuses the data directory and the container exits.
+        if ! docker ps --format '{{{{.Names}}' | grep -q "^test-postgres$"; then
+            echo "❌ test-postgres exited during startup"
+            echo ""
+            echo "   If the pinned PostgreSQL version changed, recreate the"
+            echo "   volume - it holds local test data only:"
+            echo ""
+            echo "     just db-stop --remove && just db-start && just db-setup"
+            echo ""
+            docker logs --tail 15 test-postgres 2>&1 || true
+            exit 1
+        fi
+
+        sleep 1
+    done
+
+    echo "❌ PostgreSQL not responding after 30s - check 'docker logs test-postgres'"
+    exit 1
 
 # Stop Docker PostgreSQL container
 #

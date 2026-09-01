@@ -1,0 +1,16 @@
+-- no-transaction
+--
+-- Migration 114 (COR-516): drop idx_analytics_user_status_ok_usage (~23 GB, the
+-- single largest index on http_analytics).
+--
+-- Its only reader was get_model_user_usage (the per-model → users breakdown), which
+-- migration 112's release (PR #1254) repointed onto user_model_usage_daily. That
+-- release is fully rolled out before this ships, so no pod scans this index any
+-- more — the same "reader removed a prior release" property that made 112's
+-- DROP TABLE safe. Verified against prod pg_stat_user_indexes (last scan predated
+-- the cutover; the daily-rollup pkey took over the read).
+--
+-- CONCURRENTLY (so it can't block the batcher's writes) requires running outside a
+-- transaction — hence the `-- no-transaction` directive above (same pattern as
+-- migration 048's CREATE INDEX CONCURRENTLY).
+DROP INDEX CONCURRENTLY IF EXISTS idx_analytics_user_status_ok_usage;

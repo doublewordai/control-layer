@@ -2,7 +2,7 @@
 
 use serde_json::{Value, json};
 
-use super::model::{Content, ContentBlock, ImageSource, InputMessage, MessagesRequest, System, Tool, ToolResultContent};
+use super::model::{Content, ContentBlock, ImageSource, InputMessage, MessagesRequest, Tool, ToolResultContent};
 use crate::inference::translation::TranslationError;
 
 /// Translate an Anthropic Messages request into a Chat Completions request body. `cache_enabled`
@@ -80,7 +80,57 @@ pub fn to_chat_completions(req: MessagesRequest, cache_enabled: bool) -> Result<
         out.insert("cache_control".into(), cc.clone());
     }
 
+    // Caching disabled → the cache middleware that normally strips block-level markers before the
+    // upstream call isn't in the stack (it and this translator gate on the same `cache.enabled`).
+    // The content-part / tool_call / tool-definition converters preserve markers unconditionally (a
+    // faithful mirror of what the caller sent), so with nothing downstream to remove them we strip
+    // them here to keep the forwarded body clean — an unknown `cache_control` field could be
+    // rejected by a strict OpenAI-compatible backend. Completes the same principle the top-level
+    // automatic marker already follows above: emit cache markers only when the layer that consumes
+    // them is present.
+    if !cache_enabled {
+        strip_cache_control_markers(&mut out);
+    }
+
     Ok(Value::Object(out))
+}
+
+/// Remove every `cache_control` marker this translator may have emitted, in place. Targeted to the
+/// exact sites the converters write markers (message content parts, assistant `tool_calls`, tool
+/// definitions, and the top level) rather than a blind recursive walk, so it never descends into
+/// caller data such as a tool call's `function.arguments`. Mirrors the sites in
+/// [`crate::prompt_cache::inject`]'s outbound sanitiser.
+fn strip_cache_control_markers(out: &mut serde_json::Map<String, Value>) {
+    out.remove("cache_control");
+    if let Some(messages) = out.get_mut("messages").and_then(Value::as_array_mut) {
+        for msg in messages.iter_mut() {
+            if let Some(obj) = msg.as_object_mut() {
+                obj.remove("cache_control");
+            }
+            // Array-form content only; string content carries no marker.
+            if let Some(content) = msg.get_mut("content").and_then(Value::as_array_mut) {
+                for part in content.iter_mut() {
+                    if let Some(part_obj) = part.as_object_mut() {
+                        part_obj.remove("cache_control");
+                    }
+                }
+            }
+            if let Some(tool_calls) = msg.get_mut("tool_calls").and_then(Value::as_array_mut) {
+                for call in tool_calls.iter_mut() {
+                    if let Some(call_obj) = call.as_object_mut() {
+                        call_obj.remove("cache_control");
+                    }
+                }
+            }
+        }
+    }
+    if let Some(tools) = out.get_mut("tools").and_then(Value::as_array_mut) {
+        for tool in tools.iter_mut() {
+            if let Some(tool_obj) = tool.as_object_mut() {
+                tool_obj.remove("cache_control");
+            }
+        }
+    }
 }
 
 /// Anthropic `thinking` config -> OpenAI `reasoning_effort` bucket. Only enabled
@@ -100,13 +150,14 @@ fn thinking_to_reasoning_effort(thinking: Option<&Value>) -> Option<&'static str
     })
 }
 
-/// Anthropic top-level `system` -> a leading OpenAI system message. Text blocks
-/// keep `cache_control` by emitting array-form content parts.
-fn system_to_message(system: &System) -> Option<Value> {
+/// System content (the top-level `system` field, or a `role: "system"` entry in
+/// `messages`) -> an OpenAI system message. Text blocks keep `cache_control` by
+/// emitting array-form content parts.
+fn system_to_message(system: &Content) -> Option<Value> {
     match system {
-        System::Text(t) if !t.is_empty() => Some(json!({ "role": "system", "content": t })),
-        System::Text(_) => None,
-        System::Blocks(blocks) => {
+        Content::Text(t) if !t.is_empty() => Some(json!({ "role": "system", "content": t })),
+        Content::Text(_) => None,
+        Content::Blocks(blocks) => {
             let parts: Vec<Value> = blocks.iter().filter_map(text_block_to_part).collect();
             if parts.is_empty() {
                 None
@@ -121,6 +172,10 @@ fn convert_message(m: &InputMessage, out: &mut Vec<Value>) -> Result<(), Transla
     match m.role.as_str() {
         "assistant" => out.push(convert_assistant(&m.content)),
         "user" => convert_user(&m.content, out),
+        // Anthropic accepts mid-conversation `role: "system"` entries in `messages`
+        // (Claude Code injects harness reminders this way); keep them in place as
+        // OpenAI system messages.
+        "system" => out.extend(system_to_message(&m.content)),
         other => return Err(TranslationError::BadRequest(format!("unsupported message role: {other}"))),
     }
     Ok(())
@@ -156,15 +211,32 @@ fn convert_assistant(content: &Content) -> Value {
                             marker = Some(cc.clone());
                         }
                     }
-                    ContentBlock::ToolUse { id, name, input, .. } => {
-                        tool_calls.push(json!({
+                    ContentBlock::ToolUse {
+                        id,
+                        name,
+                        input,
+                        cache_control,
+                    } => {
+                        let mut call = json!({
                             "id": id,
                             "type": "function",
                             "function": {
                                 "name": name,
                                 "arguments": serde_json::to_string(input).unwrap_or_else(|_| "{}".into()),
                             }
-                        }));
+                        });
+                        // Preserve a marker on the tool call itself — the OpenAI-native mirror of
+                        // Anthropic's `tool_use.cache_control`. The cache reads it as a breakpoint and
+                        // strips it before upstream. Dropping it (as we used to) lost the SDK's
+                        // advancing breakpoint whenever it landed on a tool_use block, breaking the
+                        // read chain and leaving the growing conversation uncached. A `null` is "no
+                        // marker".
+                        if let Some(cc) = cache_control
+                            && !cc.is_null()
+                        {
+                            call["cache_control"] = cc.clone();
+                        }
+                        tool_calls.push(call);
                     }
                     // Images / tool_results are not expected on an assistant turn.
                     _ => {}
@@ -369,6 +441,52 @@ mod tests {
         assert!(out.get("cache_control").is_none(), "caching disabled → top-level marker dropped");
     }
 
+    /// Does any object anywhere under `v` carry a `cache_control` key? (A tool call's
+    /// `function.arguments` is a JSON *string*, not a nested object, so it's never descended into —
+    /// no false positives from caller data.)
+    fn any_cache_control(v: &Value) -> bool {
+        match v {
+            Value::Object(map) => map.contains_key("cache_control") || map.values().any(any_cache_control),
+            Value::Array(arr) => arr.iter().any(any_cache_control),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn all_block_markers_stripped_when_caching_disabled() {
+        // Every converter preserves cache_control unconditionally (system, user/assistant text,
+        // tool_use, tool_result, tool def). With caching OFF the strip middleware isn't in the stack,
+        // so translation itself must emit a body with NO cache_control anywhere — otherwise a marker
+        // leaks to a strict OpenAI-compatible upstream.
+        let body = json!({
+            "model": "m", "max_tokens": 16,
+            "system": [{"type": "text", "text": "sys", "cache_control": {"type": "ephemeral"}}],
+            "tools": [{"name": "lookup", "description": "d", "input_schema": {"type": "object"},
+                       "cache_control": {"type": "ephemeral"}}],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "q", "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "text", "text": "thinking", "cache_control": {"type": "ephemeral"}},
+                    {"type": "tool_use", "id": "tu1", "name": "lookup", "input": {"x": 1},
+                     "cache_control": {"type": "ephemeral"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu1", "content": "res",
+                     "cache_control": {"type": "ephemeral"}}
+                ]}
+            ]
+        });
+
+        // Sanity: caching ON preserves markers somewhere (so the OFF assertion below is meaningful).
+        assert!(any_cache_control(&translate(body.clone())), "caching on → markers preserved");
+
+        // Caching OFF: no cache_control survives anywhere in the translated body.
+        let off = to_chat_completions(serde_json::from_value(body).unwrap(), false).unwrap();
+        assert!(!any_cache_control(&off), "caching off → every block marker stripped");
+    }
+
     #[test]
     fn assistant_cache_control_preserved_as_array_content() {
         // An advancing marker on an assistant text block must survive translation (it used to be
@@ -447,5 +565,75 @@ mod tests {
             ]
         }));
         assert_eq!(out["messages"][1]["content"], "sunny", "unmarked tool_result stays a plain string");
+    }
+
+    #[test]
+    fn assistant_tool_use_cache_control_preserved_on_tool_call() {
+        // The SDK's advancing breakpoint often lands on a tool_use block — it must survive onto the
+        // OpenAI tool_call (1b: mirror of Anthropic's tool_use.cache_control), not be dropped.
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [{ "role": "assistant", "content": [
+                { "type": "text", "text": "calling" },
+                { "type": "tool_use", "id": "tu_1", "name": "lookup", "input": {"q": "x"},
+                  "cache_control": { "type": "ephemeral", "ttl": "1h" } }
+            ]}]
+        }));
+        let call = &out["messages"][0]["tool_calls"][0];
+        assert_eq!(call["id"], "tu_1");
+        assert_eq!(call["function"]["name"], "lookup");
+        assert_eq!(call["cache_control"]["ttl"], "1h", "marker preserved on the tool_call");
+    }
+
+    #[test]
+    fn assistant_tool_use_without_marker_has_no_cache_control() {
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [{ "role": "assistant", "content": [
+                { "type": "tool_use", "id": "tu_1", "name": "lookup", "input": {} }
+            ]}]
+        }));
+        assert!(
+            out["messages"][0]["tool_calls"][0].get("cache_control").is_none(),
+            "no marker → clean tool_call"
+        );
+    }
+
+    #[test]
+    fn system_role_in_messages_kept_in_place() {
+        // Anthropic accepts mid-conversation `role: "system"` entries (Claude Code injects harness
+        // reminders this way). They must translate in place, not 400.
+        let out = translate(json!({
+            "model": "m", "max_tokens": 16,
+            "system": "top-level system",
+            "messages": [
+                { "role": "user", "content": "hi" },
+                { "role": "system", "content": [
+                    { "type": "text", "text": "reminder", "cache_control": { "type": "ephemeral" } }
+                ]},
+                { "role": "user", "content": "go" }
+            ]
+        }));
+        let msgs = out["messages"].as_array().unwrap();
+        assert_eq!(msgs[0], json!({ "role": "system", "content": "top-level system" }));
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["role"], "system");
+        assert_eq!(
+            msgs[2]["content"],
+            json!([{ "type": "text", "text": "reminder", "cache_control": { "type": "ephemeral" } }]),
+            "block-form system entry keeps its cache_control part"
+        );
+        assert_eq!(msgs[3]["role"], "user");
+    }
+
+    #[test]
+    fn unknown_role_in_messages_still_rejected() {
+        let req = serde_json::from_value::<MessagesRequest>(json!({
+            "model": "m", "max_tokens": 16,
+            "messages": [{ "role": "developer", "content": "hi" }]
+        }))
+        .unwrap();
+        let err = to_chat_completions(req, true).unwrap_err();
+        assert!(matches!(err, TranslationError::BadRequest(m) if m.contains("developer")));
     }
 }

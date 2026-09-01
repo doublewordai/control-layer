@@ -698,11 +698,12 @@ struct UserUsageRow {
 
 /// Get usage data grouped by user for a specific model.
 ///
-/// Only counts successful (2xx) requests, matching the `/usage` page
-/// (`get_user_model_breakdown_for_range` / `refresh_user_model_usage`). Without
-/// the status filter, request counts are inflated by failed requests — chiefly
-/// 429 rate-limit responses and 5xx errors from batch retries, which carry no
-/// tokens or cost but still create `http_analytics` rows.
+/// Reads the `user_model_usage_daily` rollup (COR-516) instead of scanning raw
+/// `http_analytics`, mirroring the `/usage` page. The rollup already folds only
+/// successful (2xx) requests (see `refresh_user_model_usage_daily`), so failed
+/// requests don't inflate the counts. Because it is keyed by UTC `usage_date`,
+/// the range is whole-UTC-day and `last_active_at` is day-granular
+/// (`MAX(usage_date)`), not the exact last-request timestamp.
 #[instrument(skip(db), err)]
 pub async fn get_model_user_usage(
     db: &PgPool,
@@ -715,22 +716,20 @@ pub async fn get_model_user_usage(
         UserUsageRow,
         r#"
         SELECT
-            ha.user_id,
+            umu.user_id,
             u.email as "user_email?",
-            COUNT(*) as request_count,
-            COALESCE(SUM(ha.prompt_tokens), 0)::bigint as total_input_tokens,
-            COALESCE(SUM(ha.completion_tokens), 0)::bigint as total_output_tokens,
-            COALESCE(SUM(ha.total_tokens), 0)::bigint as total_tokens,
-            SUM(ha.total_cost)::float8 as total_cost,
-            MAX(ha.timestamp) as last_active_at
-        FROM http_analytics ha
-        LEFT JOIN users u ON u.id = ha.user_id
-        WHERE ha.model = $1
-            AND ha.timestamp >= $2
-            AND ha.timestamp <= $3
-            AND ha.user_id IS NOT NULL
-            AND ha.status_code BETWEEN 200 AND 299
-        GROUP BY ha.user_id, u.email
+            COALESCE(SUM(umu.request_count), 0)::bigint as request_count,
+            COALESCE(SUM(umu.input_tokens), 0)::bigint as total_input_tokens,
+            COALESCE(SUM(umu.output_tokens), 0)::bigint as total_output_tokens,
+            COALESCE(SUM(umu.input_tokens + umu.output_tokens), 0)::bigint as total_tokens,
+            SUM(umu.cost)::float8 as total_cost,
+            (MAX(umu.usage_date)::timestamp AT TIME ZONE 'UTC') as last_active_at
+        FROM user_model_usage_daily umu
+        LEFT JOIN users u ON u.id = umu.user_id
+        WHERE umu.model = $1
+            AND umu.usage_date >= ($2::timestamptz AT TIME ZONE 'UTC')::date
+            AND umu.usage_date <= ($3::timestamptz AT TIME ZONE 'UTC')::date
+        GROUP BY umu.user_id, u.email
         ORDER BY request_count DESC
         "#,
         model_alias,
@@ -744,15 +743,13 @@ pub async fn get_model_user_usage(
     let totals_row = sqlx::query!(
         r#"
         SELECT
-            COUNT(*) as total_requests,
-            COALESCE(SUM(total_tokens), 0)::bigint as total_tokens,
-            SUM(total_cost)::float8 as total_cost
-        FROM http_analytics
+            SUM(request_count)::bigint as total_requests,
+            COALESCE(SUM(input_tokens + output_tokens), 0)::bigint as total_tokens,
+            SUM(cost)::float8 as total_cost
+        FROM user_model_usage_daily
         WHERE model = $1
-            AND timestamp >= $2
-            AND timestamp <= $3
-            AND user_id IS NOT NULL
-            AND status_code BETWEEN 200 AND 299
+            AND usage_date >= ($2::timestamptz AT TIME ZONE 'UTC')::date
+            AND usage_date <= ($3::timestamptz AT TIME ZONE 'UTC')::date
         "#,
         model_alias,
         start_date,
@@ -787,42 +784,94 @@ pub async fn get_model_user_usage(
     })
 }
 
-/// Get aggregated analytics metrics for a batch given a list of request IDs
+/// Get aggregated analytics metrics for a batch.
+///
+/// Reads the denormalized per-batch aggregates from `batch_aggregates` (COR-524) — folded
+/// by the analytics batcher and backfilled from raw — rather than scanning `http_analytics`
+/// by `fusillade_batch_id`. Latency is reconstructed from the stored sum + count (the AVG
+/// the old query computed directly).
+///
+/// Returns `None` when the batch has no `batch_aggregates` row. Because `batch_aggregates`
+/// is the durable read model (not subject to `http_analytics` retention), a missing row now
+/// means the batch predates the read model and its raw analytics have aged out — the caller
+/// surfaces this as a 404 ("analytics no longer available") rather than a misleading all-zero
+/// result. (It also covers a batch that never had a foldable request, e.g. all-non-2xx.)
 #[instrument(skip(pool))]
-pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<BatchAnalytics> {
-    // Query analytics for these specific request IDs
-    let metrics = sqlx::query!(
+pub async fn get_batch_analytics(pool: &PgPool, batch_id: &Uuid) -> Result<Option<BatchAnalytics>> {
+    let row = sqlx::query!(
         r#"
         SELECT
-            COUNT(*) as "total_requests!",
-            COALESCE(SUM(prompt_tokens), 0) as "total_prompt_tokens!",
-            COALESCE(SUM(completion_tokens), 0) as "total_completion_tokens!",
-            COALESCE(SUM(reasoning_tokens), 0) as "total_reasoning_tokens!",
-            COALESCE(SUM(total_tokens), 0) as "total_tokens!",
-            AVG(duration_ms) as "avg_duration_ms",
-            AVG(duration_to_first_byte_ms) as "avg_ttfb_ms",
-            SUM((prompt_tokens * COALESCE(input_price_per_token, 0)) +
-                (completion_tokens * COALESCE(output_price_per_token, 0))) as "total_cost"
-        FROM http_analytics
+            total_requests,
+            total_prompt_tokens,
+            total_completion_tokens,
+            total_reasoning_tokens,
+            total_tokens,
+            sum_duration_ms,
+            count_duration_ms,
+            sum_ttfb_ms,
+            count_ttfb_ms,
+            total_amount,
+            total_list_cost
+        FROM batch_aggregates
         WHERE fusillade_batch_id = $1
-          AND status_code BETWEEN 200 AND 299
         "#,
         batch_id
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await?;
 
-    let reasoning = metrics.total_reasoning_tokens.to_i64().unwrap_or(0);
-    Ok(BatchAnalytics {
-        total_requests: metrics.total_requests,
-        total_prompt_tokens: metrics.total_prompt_tokens.to_i64().unwrap_or(0),
-        total_completion_tokens: metrics.total_completion_tokens.to_i64().unwrap_or(0),
-        total_reasoning_tokens: if reasoning > 0 { Some(reasoning) } else { None },
-        total_tokens: metrics.total_tokens.to_i64().unwrap_or(0),
-        avg_duration_ms: metrics.avg_duration_ms.and_then(|d| d.to_f64()),
-        avg_ttfb_ms: metrics.avg_ttfb_ms.and_then(|d| d.to_f64()),
-        total_cost: metrics.total_cost.map(|d| d.to_string()),
-    })
+    Ok(row.map(|r| {
+        batch_analytics_from_row(
+            r.total_requests,
+            r.total_prompt_tokens,
+            r.total_completion_tokens,
+            r.total_reasoning_tokens,
+            r.total_tokens,
+            r.sum_duration_ms,
+            r.count_duration_ms,
+            r.sum_ttfb_ms,
+            r.count_ttfb_ms,
+            r.total_amount,
+            r.total_list_cost,
+        )
+    }))
+}
+
+/// Build a [`BatchAnalytics`] from a `batch_aggregates` row's denormalized aggregates,
+/// dividing the stored latency sum/count back into an average (NULL when nothing reported
+/// the metric — reproducing SQL `AVG`, which ignores NULLs). Takes the columns positionally
+/// so both the single- and bulk-read queries (whose row types differ) can share it.
+#[allow(clippy::too_many_arguments)]
+fn batch_analytics_from_row(
+    total_requests: i64,
+    total_prompt_tokens: i64,
+    total_completion_tokens: i64,
+    total_reasoning_tokens: i64,
+    total_tokens: i64,
+    sum_duration_ms: i64,
+    count_duration_ms: i64,
+    sum_ttfb_ms: i64,
+    count_ttfb_ms: i64,
+    total_amount: Decimal,
+    total_list_cost: Decimal,
+) -> BatchAnalytics {
+    let avg = |sum: i64, count: i64| (count > 0).then(|| sum as f64 / count as f64);
+    BatchAnalytics {
+        total_requests,
+        total_prompt_tokens,
+        total_completion_tokens,
+        total_reasoning_tokens: (total_reasoning_tokens > 0).then_some(total_reasoning_tokens),
+        total_tokens,
+        avg_duration_ms: avg(sum_duration_ms, count_duration_ms),
+        avg_ttfb_ms: avg(sum_ttfb_ms, count_ttfb_ms),
+        // BILLED cost (`total_amount`, folded from the credits ledger) — the cache-aware amount
+        // the customer actually paid. This endpoint historically recomputed price x tokens (list
+        // price, cache-unaware) and the COR-524 denorm faithfully preserved that as
+        // `total_list_cost`; customers read this field as "what I was billed", so it now serves
+        // the billed figure, with the list price alongside for the savings delta.
+        total_cost: Some(total_amount.to_string()),
+        total_list_cost: Some(total_list_cost.to_string()),
+    }
 }
 
 /// Get aggregated analytics metrics for multiple batches in a single query
@@ -832,24 +881,24 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
         return Ok(HashMap::new());
     }
 
-    // Query analytics for all batch IDs at once, grouped by batch ID
+    // Read the denormalized per-batch aggregates (COR-524), one row per batch.
     let rows = sqlx::query!(
         r#"
         SELECT
             fusillade_batch_id,
-            COUNT(*) as "total_requests!",
-            COALESCE(SUM(prompt_tokens), 0) as "total_prompt_tokens!",
-            COALESCE(SUM(completion_tokens), 0) as "total_completion_tokens!",
-            COALESCE(SUM(reasoning_tokens), 0) as "total_reasoning_tokens!",
-            COALESCE(SUM(total_tokens), 0) as "total_tokens!",
-            AVG(duration_ms) as "avg_duration_ms",
-            AVG(duration_to_first_byte_ms) as "avg_ttfb_ms",
-            SUM((prompt_tokens * COALESCE(input_price_per_token, 0)) +
-                (completion_tokens * COALESCE(output_price_per_token, 0))) as "total_cost"
-        FROM http_analytics
+            total_requests,
+            total_prompt_tokens,
+            total_completion_tokens,
+            total_reasoning_tokens,
+            total_tokens,
+            sum_duration_ms,
+            count_duration_ms,
+            sum_ttfb_ms,
+            count_ttfb_ms,
+            total_amount,
+            total_list_cost
+        FROM batch_aggregates
         WHERE fusillade_batch_id = ANY($1)
-          AND status_code BETWEEN 200 AND 299
-        GROUP BY fusillade_batch_id
         "#,
         batch_ids
     )
@@ -859,36 +908,29 @@ pub async fn get_batches_analytics_bulk(pool: &PgPool, batch_ids: &[Uuid]) -> Re
     // Convert rows to HashMap
     let mut result = HashMap::new();
     for row in rows {
-        if let Some(batch_id) = row.fusillade_batch_id {
-            let reasoning = row.total_reasoning_tokens.to_i64().unwrap_or(0);
-            result.insert(
-                batch_id,
-                BatchAnalytics {
-                    total_requests: row.total_requests,
-                    total_prompt_tokens: row.total_prompt_tokens.to_i64().unwrap_or(0),
-                    total_completion_tokens: row.total_completion_tokens.to_i64().unwrap_or(0),
-                    total_reasoning_tokens: if reasoning > 0 { Some(reasoning) } else { None },
-                    total_tokens: row.total_tokens.to_i64().unwrap_or(0),
-                    avg_duration_ms: row.avg_duration_ms.and_then(|d: Decimal| d.to_f64()),
-                    avg_ttfb_ms: row.avg_ttfb_ms.and_then(|d: Decimal| d.to_f64()),
-                    total_cost: row.total_cost.map(|d: Decimal| d.to_string()),
-                },
-            );
-        }
+        result.insert(
+            row.fusillade_batch_id,
+            batch_analytics_from_row(
+                row.total_requests,
+                row.total_prompt_tokens,
+                row.total_completion_tokens,
+                row.total_reasoning_tokens,
+                row.total_tokens,
+                row.sum_duration_ms,
+                row.count_duration_ms,
+                row.sum_ttfb_ms,
+                row.count_ttfb_ms,
+                row.total_amount,
+                row.total_list_cost,
+            ),
+        );
     }
 
-    // For batch IDs with no analytics data, insert empty analytics
+    // For batch IDs with no aggregates row, insert empty analytics. A missing row means the
+    // batch had no successful (2xx) requests folded, or it predates the read model / aged out
+    // of retention — not specifically "no billed requests" (the fold covers all 2xx, incl. free).
     for batch_id in batch_ids {
-        result.entry(*batch_id).or_insert(BatchAnalytics {
-            total_requests: 0,
-            total_prompt_tokens: 0,
-            total_completion_tokens: 0,
-            total_reasoning_tokens: None,
-            total_tokens: 0,
-            avg_duration_ms: None,
-            avg_ttfb_ms: None,
-            total_cost: None,
-        });
+        result.entry(*batch_id).or_default();
     }
 
     Ok(result)
@@ -1066,69 +1108,6 @@ pub async fn get_user_batch_counts(pool: &PgPool, user_id: Uuid) -> Result<(i64,
     ))
 }
 
-/// Incrementally aggregate new http_analytics rows into the user_model_usage summary table.
-/// Uses a cursor to track the last processed id, so only new rows are scanned.
-#[instrument(skip(pool), err)]
-pub async fn refresh_user_model_usage(pool: &PgPool) -> Result<()> {
-    let mut tx = pool.begin().await?;
-
-    let cursor: i64 = sqlx::query_scalar!("SELECT last_processed_id FROM user_model_usage_cursor WHERE id = TRUE FOR UPDATE")
-        .fetch_one(&mut *tx)
-        .await?;
-
-    let new_max: Option<i64> = sqlx::query_scalar!(
-        r#"
-        SELECT MAX(id) FROM http_analytics
-        WHERE id > $1 AND user_id IS NOT NULL AND model IS NOT NULL
-        "#,
-        cursor
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-
-    let Some(new_max) = new_max else {
-        return Ok(());
-    };
-
-    sqlx::query!(
-        r#"
-        INSERT INTO user_model_usage (user_id, model, input_tokens, output_tokens, cost, request_count)
-        SELECT user_id,
-               model,
-               COALESCE(SUM(prompt_tokens), 0),
-               COALESCE(SUM(completion_tokens), 0),
-               COALESCE(SUM(total_cost), 0),
-               COUNT(*)
-        FROM http_analytics
-        WHERE id > $1 AND id <= $2
-              AND user_id IS NOT NULL AND model IS NOT NULL
-              AND status_code BETWEEN 200 AND 299
-        GROUP BY user_id, model
-        ON CONFLICT (user_id, model)
-        DO UPDATE SET
-            input_tokens = user_model_usage.input_tokens + EXCLUDED.input_tokens,
-            output_tokens = user_model_usage.output_tokens + EXCLUDED.output_tokens,
-            cost = user_model_usage.cost + EXCLUDED.cost,
-            request_count = user_model_usage.request_count + EXCLUDED.request_count,
-            updated_at = NOW()
-        "#,
-        cursor,
-        new_max
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    sqlx::query!(
-        "UPDATE user_model_usage_cursor SET last_processed_id = $1, updated_at = NOW() WHERE id = TRUE",
-        new_max
-    )
-    .execute(&mut *tx)
-    .await?;
-
-    tx.commit().await?;
-    Ok(())
-}
-
 /// Advisory-lock key for the daily-usage refresh, so at most one refresh runs at a
 /// time across all pods. Ascii "DWCTUSGD" (dwctl usage daily); mirrors the lock-id
 /// encoding used for `LEADER_LOCK_ID` in `lib.rs`.
@@ -1239,21 +1218,23 @@ pub async fn get_realtime_tariffs(pool: &PgPool) -> Result<HashMap<String, (Deci
         .collect())
 }
 
-/// Get per-model breakdown from the pre-aggregated user_model_usage table.
-/// Totals (tokens, cost, request count) are derived from these results by the handler.
+/// Get all-time per-model breakdown from the pre-aggregated `user_model_usage_daily`
+/// rollup, summed across every day. Totals (tokens, cost, request count) are derived from
+/// these results by the handler.
 #[instrument(skip(pool), err)]
 pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Vec<ModelBreakdownEntry>> {
     let rows = sqlx::query_as!(
         ModelBreakdownRow,
         r#"
         SELECT model,
-               input_tokens,
-               output_tokens,
-               cost,
-               request_count
-        FROM user_model_usage
+               SUM(input_tokens)::bigint  AS input_tokens,
+               SUM(output_tokens)::bigint AS output_tokens,
+               SUM(cost)                  AS cost,
+               SUM(request_count)::bigint AS request_count
+        FROM user_model_usage_daily
         WHERE user_id = $1
-        ORDER BY request_count DESC
+        GROUP BY model
+        ORDER BY SUM(request_count) DESC
         "#,
         user_id
     )
@@ -1274,10 +1255,13 @@ pub async fn get_user_model_breakdown(pool: &PgPool, user_id: Uuid) -> Result<Ve
         .collect())
 }
 
-// ===== DATE-FILTERED USAGE QUERIES (bypass pre-aggregated tables) =====
+// ===== DATE-FILTERED USAGE QUERIES (served from the daily rollup, UTC-day-granular) =====
 
-/// Get per-model breakdown directly from http_analytics for a date range.
-/// Used when the user requests date-filtered usage data.
+/// Get per-model breakdown for a date range from the `user_model_usage_daily` rollup.
+///
+/// The rollup is keyed by UTC `usage_date`, so the range is matched at **day** granularity:
+/// the start/end timestamps are truncated to their UTC date. Sub-day ranges therefore
+/// collapse to whole days — callers (and the UI) present usage at day granularity.
 #[instrument(skip(pool), err)]
 pub async fn get_user_model_breakdown_for_range(
     pool: &PgPool,
@@ -1289,17 +1273,16 @@ pub async fn get_user_model_breakdown_for_range(
         ModelBreakdownRow,
         r#"
         SELECT model,
-               COALESCE(SUM(prompt_tokens), 0)::bigint as input_tokens,
-               COALESCE(SUM(completion_tokens), 0)::bigint as output_tokens,
-               COALESCE(SUM(total_cost), 0) as cost,
-               COUNT(*) as request_count
-        FROM http_analytics
+               SUM(input_tokens)::bigint  AS input_tokens,
+               SUM(output_tokens)::bigint AS output_tokens,
+               SUM(cost)                  AS cost,
+               SUM(request_count)::bigint AS request_count
+        FROM user_model_usage_daily
         WHERE user_id = $1
-          AND timestamp >= $2 AND timestamp <= $3
-          AND model IS NOT NULL
-          AND status_code BETWEEN 200 AND 299
+          AND usage_date >= ($2::timestamptz AT TIME ZONE 'UTC')::date
+          AND usage_date <= ($3::timestamptz AT TIME ZONE 'UTC')::date
         GROUP BY model
-        ORDER BY request_count DESC
+        ORDER BY SUM(request_count) DESC
         "#,
         user_id,
         start,
@@ -1322,17 +1305,17 @@ pub async fn get_user_model_breakdown_for_range(
         .collect())
 }
 
-/// Get distinct batch count directly from http_analytics for a date range.
+/// Get distinct batch count for a date range from `batch_aggregates` (one row per batch,
+/// filtered by `created_at`). Batch counts are not summable across day boundaries, so they
+/// come from `batch_aggregates` rather than the daily rollup.
 #[instrument(skip(pool), err)]
 pub async fn get_user_batch_count_for_range(pool: &PgPool, user_id: Uuid, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<i64> {
     let row = sqlx::query_scalar!(
         r#"
-        SELECT COUNT(DISTINCT fusillade_batch_id) as "count!"
-        FROM http_analytics
+        SELECT COUNT(*) as "count!"
+        FROM batch_aggregates
         WHERE user_id = $1
-          AND timestamp >= $2 AND timestamp <= $3
-          AND fusillade_batch_id IS NOT NULL
-          AND status_code BETWEEN 200 AND 299
+          AND created_at >= $2 AND created_at <= $3
         "#,
         user_id,
         start,
@@ -1783,18 +1766,25 @@ mod tests {
         output_price_per_token: Option<f64>,
     }
 
-    // Helper function to insert analytics data with fusillade_request_id
+    // Helper: record one batch request. Since COR-524 repointed get_batch_analytics onto
+    // batch_aggregates, this writes the http_analytics row (still the source of truth other
+    // code reads) AND folds the request into batch_aggregates the same way the batcher does,
+    // so the read-model these tests exercise is populated. Each call = one folded request;
+    // repeated calls for a batch accumulate.
     async fn insert_test_analytics_with_batch_id(pool: &PgPool, data: TestBatchAnalyticsData<'_>) {
-        use crate::request_logging::batcher::list_price;
+        use crate::api::models::users::Role;
+        use crate::pricing::list_price;
+        use crate::test::utils::create_test_user;
         use rust_decimal::Decimal;
         use uuid::Uuid;
 
         let input_price = data.input_price_per_token.and_then(Decimal::from_f64_retain);
         let output_price = data.output_price_per_token.and_then(Decimal::from_f64_retain);
-        // Derive total_cost with the same function the batcher bills with. These rows carry no
-        // cache split (the cache_* columns default to 0), so this is the plain no-cache billed
-        // cost — these tests don't exercise cache pricing.
-        let total_cost = list_price(data.prompt_tokens, data.completion_tokens, input_price, output_price);
+        // Derive the list cost with the same function the batcher bills with. These rows carry
+        // no cache split (the cache_* columns default to 0), so this is the plain no-cache
+        // cost — these tests don't exercise cache pricing. None (no pricing) folds as 0.
+        let list_cost = list_price(data.prompt_tokens, data.completion_tokens, input_price, output_price);
+        let list_cost = list_cost.unwrap_or(Decimal::ZERO);
 
         sqlx::query!(
             r#"
@@ -1820,11 +1810,52 @@ mod tests {
             data.fusillade_request_id,
             input_price,
             output_price,
-            total_cost,
+            Some(list_cost),
         )
         .execute(pool)
         .await
         .expect("Failed to insert test analytics data with batch ID");
+
+        // Fold into batch_aggregates (the read model get_batch_analytics now reads). Mirrors
+        // the batcher's per-flush fold; user_id satisfies the FK (value is not asserted).
+        let user_id = create_test_user(pool, Role::StandardUser).await.id;
+        let ttfb = data.duration_to_first_byte_ms.map(|d| d as i64);
+        sqlx::query!(
+            r#"
+            INSERT INTO batch_aggregates (
+                fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, service_tier, total_requests,
+                total_prompt_tokens, total_completion_tokens, total_reasoning_tokens, total_tokens,
+                sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms, total_list_cost
+            )
+            VALUES ($1, $2, $3, 1, 1, 'batch', 1, $4, $5, $6, $7, $8, 1, $9, $10, $3)
+            ON CONFLICT (fusillade_batch_id) DO UPDATE SET
+                total_amount = batch_aggregates.total_amount + EXCLUDED.total_amount,
+                transaction_count = batch_aggregates.transaction_count + EXCLUDED.transaction_count,
+                total_requests = batch_aggregates.total_requests + EXCLUDED.total_requests,
+                total_prompt_tokens = batch_aggregates.total_prompt_tokens + EXCLUDED.total_prompt_tokens,
+                total_completion_tokens = batch_aggregates.total_completion_tokens + EXCLUDED.total_completion_tokens,
+                total_reasoning_tokens = batch_aggregates.total_reasoning_tokens + EXCLUDED.total_reasoning_tokens,
+                total_tokens = batch_aggregates.total_tokens + EXCLUDED.total_tokens,
+                sum_duration_ms = batch_aggregates.sum_duration_ms + EXCLUDED.sum_duration_ms,
+                count_duration_ms = batch_aggregates.count_duration_ms + EXCLUDED.count_duration_ms,
+                sum_ttfb_ms = batch_aggregates.sum_ttfb_ms + EXCLUDED.sum_ttfb_ms,
+                count_ttfb_ms = batch_aggregates.count_ttfb_ms + EXCLUDED.count_ttfb_ms,
+                total_list_cost = batch_aggregates.total_list_cost + EXCLUDED.total_list_cost
+            "#,
+            data.fusillade_batch_id,
+            user_id,
+            list_cost,
+            data.prompt_tokens,
+            data.completion_tokens,
+            data.reasoning_tokens,
+            data.prompt_tokens + data.completion_tokens,
+            data.duration_ms as i64,
+            ttfb.unwrap_or(0),
+            i64::from(ttfb.is_some()),
+        )
+        .execute(pool)
+        .await
+        .expect("Failed to fold test batch_aggregates row");
     }
 
     #[sqlx::test]
@@ -1852,7 +1883,10 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         assert_eq!(result.total_requests, 1);
         assert_eq!(result.total_prompt_tokens, 100);
@@ -1866,6 +1900,48 @@ mod tests {
         let cost = result.total_cost.unwrap();
         let cost_f64: f64 = cost.parse().unwrap();
         assert!((cost_f64 - 0.0025).abs() < 0.00001);
+    }
+
+    #[sqlx::test]
+    async fn test_get_batch_analytics_serves_billed_cost_not_list_price(pool: PgPool) {
+        // The regression a customer caught from outside (2026-07): the endpoint served
+        // `total_list_cost` (un-discounted list price) as `total_cost`, while the ledger billed
+        // the cache-discounted amount. The test helper folds equal billed/list values, so this
+        // test writes a row where they DIFFER — a batch whose prompts were largely served from
+        // the prompt cache — and pins: `total_cost` = the billed `total_amount`, with the list
+        // price surfaced separately as `total_list_cost`.
+        use crate::api::models::users::Role;
+        use crate::test::utils::create_test_user;
+
+        let batch_id = Uuid::new_v4();
+        let user_id = create_test_user(&pool, Role::StandardUser).await.id;
+        sqlx::query!(
+            r#"
+            INSERT INTO batch_aggregates (
+                fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, service_tier,
+                total_requests, total_prompt_tokens, total_completion_tokens, total_reasoning_tokens,
+                total_tokens, sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms,
+                total_list_cost
+            )
+            VALUES ($1, $2, 0.0199, 1000, 1, 'batch', 1000, 1433730, 50000, 0, 1483730, 500000, 1000, 0, 0, 0.0422)
+            "#,
+            batch_id,
+            user_id,
+        )
+        .execute(&pool)
+        .await
+        .expect("insert batch_aggregates row");
+
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
+
+        let billed: f64 = result.total_cost.expect("billed cost present").parse().unwrap();
+        let list: f64 = result.total_list_cost.expect("list cost present").parse().unwrap();
+        assert!((billed - 0.0199).abs() < 1e-9, "total_cost must be the BILLED amount, got {billed}");
+        assert!((list - 0.0422).abs() < 1e-9, "total_list_cost must be the list price, got {list}");
+        assert!(billed < list, "cache-discounted billed cost sits below list price");
     }
 
     #[sqlx::test]
@@ -1931,7 +2007,10 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         assert_eq!(result.total_requests, 3);
         assert_eq!(result.total_prompt_tokens, 225); // 50 + 100 + 75
@@ -1960,15 +2039,11 @@ mod tests {
     async fn test_get_batch_analytics_nonexistent_batch_id(pool: PgPool) {
         let nonexistent_batch_id = Uuid::new_v4();
 
+        // No batch_aggregates row → None, which the handler surfaces as 404
+        // ("analytics no longer available") rather than a misleading all-zero payload (COR-524).
         let result = get_batch_analytics(&pool, &nonexistent_batch_id).await.unwrap();
 
-        assert_eq!(result.total_requests, 0);
-        assert_eq!(result.total_prompt_tokens, 0);
-        assert_eq!(result.total_completion_tokens, 0);
-        assert_eq!(result.total_tokens, 0);
-        assert_eq!(result.avg_duration_ms, None);
-        assert_eq!(result.avg_ttfb_ms, None);
-        assert_eq!(result.total_cost, None);
+        assert!(result.is_none());
     }
 
     #[sqlx::test]
@@ -2018,7 +2093,10 @@ mod tests {
         .await;
 
         // Query only for batch 1
-        let result = get_batch_analytics(&pool, &batch_id_1).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id_1)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         // Should only return data for batch 1
         assert_eq!(result.total_requests, 1);
@@ -2053,7 +2131,10 @@ mod tests {
         )
         .await;
 
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         assert_eq!(result.total_requests, 1);
         assert_eq!(result.total_prompt_tokens, 50);
@@ -2134,7 +2215,10 @@ mod tests {
         .await;
 
         // Query only for the first batch
-        let result = get_batch_analytics(&pool, &batch_id).await.unwrap();
+        let result = get_batch_analytics(&pool, &batch_id)
+            .await
+            .unwrap()
+            .expect("batch has batch_aggregates analytics");
 
         // Should only include the two requests from the first batch, not the other batch
         assert_eq!(result.total_requests, 2);
@@ -2349,7 +2433,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_refresh_user_model_usage_includes_realtime_requests(pool: PgPool) {
+    async fn test_all_time_breakdown_includes_realtime_requests(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
 
@@ -2384,7 +2468,7 @@ mod tests {
         )
         .await;
 
-        refresh_user_model_usage(&pool).await.unwrap();
+        refresh_user_model_usage_daily(&pool).await.unwrap();
 
         let breakdown = get_user_model_breakdown(&pool, user_id).await.unwrap();
         assert_eq!(breakdown.len(), 1);
@@ -2550,6 +2634,8 @@ mod tests {
         )
         .await;
 
+        refresh_user_model_usage_daily(&pool).await.unwrap();
+
         let breakdown = get_user_model_breakdown_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
         assert_eq!(breakdown.len(), 1);
         assert_eq!(breakdown[0].model, "claude-3");
@@ -2559,64 +2645,79 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_batch_count_excludes_realtime_requests(pool: PgPool) {
+    async fn test_get_user_model_breakdown_for_range_spans_utc_midnight(pool: PgPool) {
+        // The range is matched at UTC-day granularity, so a window straddling UTC
+        // midnight must include BOTH days it touches. Seed one request just before
+        // midnight and one just after; a range from 23:00 to 01:00 UTC truncates to
+        // the two dates and should sum both rows.
         let user_id = create_usage_test_user(&pool).await;
-        let now = Utc::now();
-        let one_hour_ago = now - Duration::hours(1);
-        let batch_id = Uuid::new_v4();
+        let before_midnight = DateTime::parse_from_rfc3339("2025-03-10T23:30:00Z").unwrap().with_timezone(&Utc);
+        let after_midnight = DateTime::parse_from_rfc3339("2025-03-11T00:30:00Z").unwrap().with_timezone(&Utc);
 
-        // Insert a realtime request (no batch id)
-        insert_usage_analytics(
-            &pool,
-            UsageAnalyticsParams {
-                user_id,
-                model: "gpt-4",
-                prompt_tokens: 100,
-                completion_tokens: 50,
-                total_cost: 0.0,
-                timestamp: now,
-                fusillade_batch_id: None,
-                status_code: 200,
-            },
-        )
-        .await;
-        // Insert two requests from the same batch
-        insert_usage_analytics(
-            &pool,
-            UsageAnalyticsParams {
-                user_id,
-                model: "gpt-4",
-                prompt_tokens: 200,
-                completion_tokens: 100,
-                total_cost: 0.0,
-                timestamp: now,
-                fusillade_batch_id: Some(batch_id),
-                status_code: 200,
-            },
-        )
-        .await;
-        insert_usage_analytics(
-            &pool,
-            UsageAnalyticsParams {
-                user_id,
-                model: "gpt-4",
-                prompt_tokens: 150,
-                completion_tokens: 75,
-                total_cost: 0.0,
-                timestamp: now,
-                fusillade_batch_id: Some(batch_id),
-                status_code: 200,
-            },
-        )
-        .await;
+        for (ts, prompt, completion) in [(before_midnight, 10, 5), (after_midnight, 20, 7)] {
+            insert_usage_analytics(
+                &pool,
+                UsageAnalyticsParams {
+                    user_id,
+                    model: "claude-3",
+                    prompt_tokens: prompt,
+                    completion_tokens: completion,
+                    total_cost: 0.0,
+                    timestamp: ts,
+                    fusillade_batch_id: None,
+                    status_code: 200,
+                },
+            )
+            .await;
+        }
 
-        let count = get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
-        // Only 1 distinct batch, realtime requests not counted
-        assert_eq!(count, 1);
+        refresh_user_model_usage_daily(&pool).await.unwrap();
+
+        let start = DateTime::parse_from_rfc3339("2025-03-10T23:00:00Z").unwrap().with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2025-03-11T01:00:00Z").unwrap().with_timezone(&Utc);
+        let breakdown = get_user_model_breakdown_for_range(&pool, user_id, start, end).await.unwrap();
+
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(breakdown[0].request_count, 2, "both sides of UTC midnight must be counted");
+        assert_eq!(breakdown[0].input_tokens, 30); // 10 + 20
+        assert_eq!(breakdown[0].output_tokens, 12); // 5 + 7
+    }
+
+    /// Insert a completed batch into `batch_aggregates` (one row per batch), the source
+    /// the range batch-count now reads from.
+    async fn insert_batch_aggregate(pool: &PgPool, user_id: Uuid, created_at: DateTime<Utc>, max_seq: i64) {
+        sqlx::query!(
+            r#"
+            INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at)
+            VALUES ($1, $2, 0, 1, $3, $4)
+            "#,
+            Uuid::new_v4(),
+            user_id,
+            max_seq,
+            created_at,
+        )
+        .execute(pool)
+        .await
+        .expect("Failed to insert batch_aggregate");
     }
 
     #[sqlx::test]
-    async fn test_refresh_user_model_usage_excludes_errors(pool: PgPool) {
+    async fn test_batch_count_for_range_counts_batches_in_window(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+        let now = Utc::now();
+        let one_hour_ago = now - Duration::hours(1);
+
+        // Batch count now comes from batch_aggregates (one row per completed batch),
+        // filtered by created_at. Two distinct batches inside the window.
+        insert_batch_aggregate(&pool, user_id, now, 1).await;
+        insert_batch_aggregate(&pool, user_id, now, 2).await;
+
+        let count = get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[sqlx::test]
+    async fn test_all_time_breakdown_excludes_errors(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
 
@@ -2693,7 +2794,7 @@ mod tests {
         )
         .await;
 
-        refresh_user_model_usage(&pool).await.unwrap();
+        refresh_user_model_usage_daily(&pool).await.unwrap();
 
         let breakdown = get_user_model_breakdown(&pool, user_id).await.unwrap();
         assert_eq!(breakdown.len(), 1);
@@ -2755,6 +2856,8 @@ mod tests {
         )
         .await;
 
+        refresh_user_model_usage_daily(&pool).await.unwrap();
+
         let breakdown = get_user_model_breakdown_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
         assert_eq!(breakdown.len(), 1);
         assert_eq!(breakdown[0].model, "claude-3");
@@ -2765,46 +2868,17 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_get_user_batch_count_for_range_excludes_errors(pool: PgPool) {
+    async fn test_batch_count_for_range_respects_window(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
         let one_hour_ago = now - Duration::hours(1);
-        let batch_ok = Uuid::new_v4();
-        let batch_err = Uuid::new_v4();
 
-        // Successful batch request
-        insert_usage_analytics(
-            &pool,
-            UsageAnalyticsParams {
-                user_id,
-                model: "gpt-4",
-                prompt_tokens: 100,
-                completion_tokens: 50,
-                total_cost: 0.0,
-                timestamp: now,
-                fusillade_batch_id: Some(batch_ok),
-                status_code: 200,
-            },
-        )
-        .await;
-        // Failed batch request (different batch) - should be excluded
-        insert_usage_analytics_with_status(
-            &pool,
-            UsageAnalyticsParams {
-                user_id,
-                model: "gpt-4",
-                prompt_tokens: 80,
-                completion_tokens: 0,
-                total_cost: 0.0,
-                timestamp: now,
-                fusillade_batch_id: Some(batch_err),
-                status_code: 500,
-            },
-        )
-        .await;
+        // One batch inside the window, one well outside it (created two days ago).
+        insert_batch_aggregate(&pool, user_id, now, 1).await;
+        insert_batch_aggregate(&pool, user_id, now - Duration::days(2), 2).await;
 
         let count = get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
-        // Only the successful batch should be counted
+        // Only the in-window batch is counted.
         assert_eq!(count, 1);
     }
 }

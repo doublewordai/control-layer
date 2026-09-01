@@ -28,6 +28,7 @@ use crate::db::{
 };
 use crate::errors::{Error, Result};
 use crate::image_normalizer::{ImageInput, ImageNormalizer, Mode as ImageNormalizerMode, walker as image_walker};
+use crate::reasoning::ModelReasoningPolicy;
 use crate::types::Resource;
 use axum::{
     Json,
@@ -169,12 +170,12 @@ impl OpenAIBatchRequest {
     /// # Arguments
     /// * `endpoint` - The target endpoint (e.g., "http://localhost:8080/ai")
     /// * `api_key` - The API key to inject for request execution
-    /// * `accessible_models` - Map of model aliases to their optional ModelType
+    /// * `accessible_models` - Model type and effective reasoning policy by alias
     fn to_internal(
         &self,
         endpoint: &str,
         api_key: String,
-        accessible_models: &HashMap<String, Option<ModelType>>,
+        accessible_models: &HashMap<String, AccessibleBatchModel>,
         allowed_url_paths: &[String],
     ) -> Result<fusillade::RequestTemplateInput> {
         // Validate custom_id is safe for HTTP headers
@@ -197,15 +198,27 @@ impl OpenAIBatchRequest {
             .to_string();
 
         // Validate model access
-        let model_type = accessible_models.get(&model).ok_or_else(|| Error::ModelAccessDenied {
+        let accessible_model = accessible_models.get(&model).ok_or_else(|| Error::ModelAccessDenied {
             model_name: model.clone(),
             message: format!("Model '{}' has not been configured or is not available to user.", model),
         })?;
 
         // Validate endpoint matches model type (skip if model type is unknown)
-        if let Some(model_type) = model_type {
+        if let Some(model_type) = &accessible_model.model_type {
             validate_endpoint_model_type(&self.url, &model, model_type)?;
         }
+
+        accessible_model
+            .reasoning_policy
+            .validate_request(&self.url, &self.body)
+            .map_err(|error| match error.status_code() {
+                422 => Error::UnprocessableEntity {
+                    message: error.message().to_string(),
+                },
+                _ => Error::BadRequest {
+                    message: error.message().to_string(),
+                },
+            })?;
 
         // Strip 'priority' key from body if present (users shouldn't control priority)
         let mut sanitized_body = self.body.clone();
@@ -447,6 +460,8 @@ enum FileUploadError {
     ModelAccessDenied { model: String, line: u64 },
     /// Per-line validation error (custom_id, method, url, etc.)
     ValidationError { line: u64, message: String },
+    /// A well-formed line whose reasoning budget cannot be processed.
+    UnprocessableValidationError { line: u64, message: String },
     /// Image normalisation transient failure (origin timeout / 5xx after
     /// retries, GCS network blip). Surface as 503 so the client retries
     /// rather than thinking the file is malformed.
@@ -537,6 +552,9 @@ impl FileUploadError {
                 ),
             },
             FileUploadError::ValidationError { line, message } => Error::BadRequest {
+                message: format!("Line {}: {}", line, message),
+            },
+            FileUploadError::UnprocessableValidationError { line, message } => Error::UnprocessableEntity {
                 message: format!("Line {}: {}", line, message),
             },
             FileUploadError::ImageTransient { line, message } => Error::ServiceUnavailable {
@@ -638,8 +656,30 @@ fn resolve_upload_stream_result(
 struct FileRequestContext {
     endpoint: String,
     api_key: String,
-    accessible_models: HashMap<String, Option<ModelType>>,
+    accessible_models: HashMap<String, AccessibleBatchModel>,
     allowed_url_paths: Vec<String>,
+}
+
+struct AccessibleBatchModel {
+    model_type: Option<ModelType>,
+    reasoning_policy: ModelReasoningPolicy,
+}
+
+fn map_request_validation_error(error: &Error, line: u64) -> FileUploadError {
+    match error {
+        Error::ModelAccessDenied { model_name, .. } => FileUploadError::ModelAccessDenied {
+            model: model_name.clone(),
+            line,
+        },
+        Error::UnprocessableEntity { message } => FileUploadError::UnprocessableValidationError {
+            line,
+            message: message.clone(),
+        },
+        _ => FileUploadError::ValidationError {
+            line,
+            message: error.to_string(),
+        },
+    }
 }
 
 /// Helper function to create a stream of FileStreamItem from multipart upload
@@ -897,16 +937,7 @@ fn create_file_stream(
                                                 }
                                                 Err(e) => {
                                                     // Map the Error back to FileUploadError
-                                                    let upload_err = match &e {
-                                                        Error::ModelAccessDenied { model_name, .. } => FileUploadError::ModelAccessDenied {
-                                                            model: model_name.clone(),
-                                                            line: line_count + 1,
-                                                        },
-                                                        _ => FileUploadError::ValidationError {
-                                                            line: line_count + 1,
-                                                            message: e.to_string(),
-                                                        },
-                                                    };
+                                                    let upload_err = map_request_validation_error(&e, line_count + 1);
                                                     abort!(upload_err);
                                                 }
                                             }
@@ -991,16 +1022,7 @@ fn create_file_stream(
                                             }
                                         }
                                         Err(e) => {
-                                            let upload_err = match &e {
-                                                Error::ModelAccessDenied { model_name, .. } => FileUploadError::ModelAccessDenied {
-                                                    model: model_name.clone(),
-                                                    line: line_count + 1,
-                                                },
-                                                _ => FileUploadError::ValidationError {
-                                                    line: line_count + 1,
-                                                    message: e.to_string(),
-                                                },
-                                            };
+                                            let upload_err = map_request_validation_error(&e, line_count + 1);
                                             abort!(upload_err);
                                         }
                                     }
@@ -1149,10 +1171,13 @@ pub async fn upload_file<P: PoolProvider>(
 
     // Get or create user-specific hidden batch API key for batch request execution.
     // We need the key ID for per-member attribution within orgs.
+    // A capped authenticating key resolves to its cap-scope child (the template
+    // key is only the legacy COALESCE fallback for batches without their own
+    // key, but keep it scope-consistent with batch creation).
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut api_keys_repo = ApiKeys::new(&mut conn);
     let (user_api_key, api_key_id) = api_keys_repo
-        .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, current_user.id)
+        .resolve_batch_execution_key(target_user_id, current_user.id, current_user.api_key_id)
         .await
         .map_err(Error::Database)?;
 
@@ -1166,8 +1191,24 @@ pub async fn upload_file<P: PoolProvider>(
         .with_statuses(vec![ModelStatus::Active])
         .with_deleted(false);
     let accessible_deployments = deployments_repo.list(&filter).await.map_err(Error::Database)?;
-    let accessible_models: HashMap<String, Option<ModelType>> =
-        accessible_deployments.into_iter().map(|d| (d.alias, d.model_type)).collect();
+    let aliases = accessible_deployments
+        .iter()
+        .map(|deployment| deployment.alias.clone())
+        .collect::<Vec<_>>();
+    let mut reasoning_policies = deployments_repo.get_reasoning_policies(&aliases).await.map_err(Error::Database)?;
+    let accessible_models: HashMap<String, AccessibleBatchModel> = accessible_deployments
+        .into_iter()
+        .map(|deployment| {
+            let reasoning_policy = reasoning_policies.remove(&deployment.alias).unwrap_or_default();
+            (
+                deployment.alias,
+                AccessibleBatchModel {
+                    model_type: deployment.model_type,
+                    reasoning_policy,
+                },
+            )
+        })
+        .collect();
 
     // drop conn so it isn't persisted for entire upload process
     drop(conn);
@@ -1300,13 +1341,10 @@ pub async fn list_files<P: PoolProvider>(
     let api_key_ids_filter = if let Some(member_id) = query.member_id {
         let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let key_ids = match current_user.active_organization {
-            Some(org_id) => {
-                let key_id = ApiKeys::new(&mut read_conn)
-                    .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
-                    .await
-                    .map_err(Error::Database)?;
-                key_id.into_iter().collect::<Vec<_>>()
-            }
+            Some(org_id) => ApiKeys::new(&mut read_conn)
+                .find_hidden_key_ids(org_id, ApiKeyPurpose::Batch, member_id)
+                .await
+                .map_err(Error::Database)?,
             None if can_read_all_files => ApiKeys::new(&mut read_conn)
                 .find_all_hidden_key_ids_by_creator(ApiKeyPurpose::Batch, member_id)
                 .await
@@ -1330,11 +1368,10 @@ pub async fn list_files<P: PoolProvider>(
     } else if let Some(org_id) = current_user.active_organization.filter(|_| query.own) {
         // own=true in org context: filter to files created by the current user's hidden key
         let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        let key_id = ApiKeys::new(&mut read_conn)
-            .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, current_user.id)
+        let key_ids = ApiKeys::new(&mut read_conn)
+            .find_hidden_key_ids(org_id, ApiKeyPurpose::Batch, current_user.id)
             .await
             .map_err(Error::Database)?;
-        let key_ids: Vec<_> = key_id.into_iter().collect();
         if key_ids.is_empty() {
             return Ok(Json(FileListResponse {
                 object_type: ListObject::List,
@@ -2111,6 +2148,92 @@ mod tests {
     use sqlx::PgPool;
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
+
+    async fn upload_batch_jsonl(
+        app: &axum_test::TestServer,
+        user: &crate::api::models::users::UserResponse,
+        jsonl: &str,
+    ) -> axum_test::TestResponse {
+        app.post("/ai/v1/files")
+            .add_header(&add_auth_headers(user)[0].0, &add_auth_headers(user)[0].1)
+            .add_header(&add_auth_headers(user)[1].0, &add_auth_headers(user)[1].1)
+            .multipart(axum_test::multipart::MultipartForm::new().add_text("purpose", "batch").add_part(
+                "file",
+                axum_test::multipart::Part::bytes(jsonl.as_bytes().to_vec()).file_name("reasoning-batch.jsonl"),
+            ))
+            .await
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn validates_reasoning_controls_during_upload(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "reasoning-model", "reasoning-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        sqlx::query(
+            r#"
+            UPDATE deployed_models
+            SET reasoning_translation_overrides = $1
+            WHERE id = $2
+            "#,
+        )
+        .bind(serde_json::json!({
+            "chat_completions": {
+                "mode": "override",
+                "translation": {
+                    "unsupported_efforts": ["none", "minimal", "low", "medium", "xhigh", "max"],
+                    "writes": [
+                        {"target_path": "/reasoning_effort", "values": {"high": "high"}},
+                        {"target_path": "/thinking_token_budget", "values": {"high": 8192}}
+                    ]
+                }
+            },
+            "responses": {"mode": "disabled"}
+        }))
+        .bind(deployment.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let omitted = upload_batch_jsonl(
+            &app,
+            &user,
+            r#"{"custom_id":"omitted","method":"POST","url":"/v1/chat/completions","body":{"model":"reasoning-model","messages":[]}}"#,
+        )
+        .await;
+        omitted.assert_status(axum::http::StatusCode::CREATED);
+
+        let provider_native = upload_batch_jsonl(
+            &app,
+            &user,
+            r#"{"custom_id":"native","method":"POST","url":"/v1/chat/completions","body":{"model":"reasoning-model","messages":[],"thinking":{"type":"enabled"}}}"#,
+        )
+        .await;
+        provider_native.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        assert!(provider_native.text().contains("use 'reasoning_effort'"));
+
+        let unsupported = upload_batch_jsonl(
+            &app,
+            &user,
+            r#"{"custom_id":"unsupported","method":"POST","url":"/v1/chat/completions","body":{"model":"reasoning-model","messages":[],"reasoning_effort":"medium"}}"#,
+        )
+        .await;
+        unsupported.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        assert!(unsupported.text().contains("not supported by this provider"));
+
+        let missing_budget_limit = upload_batch_jsonl(
+            &app,
+            &user,
+            r#"{"custom_id":"budget","method":"POST","url":"/v1/chat/completions","body":{"model":"reasoning-model","messages":[],"reasoning_effort":"high"}}"#,
+        )
+        .await;
+        missing_budget_limit.assert_status(axum::http::StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(missing_budget_limit.text().contains("max_completion_tokens is not set"));
+    }
 
     #[sqlx::test]
     #[test_log::test]

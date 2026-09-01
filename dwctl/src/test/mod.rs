@@ -1,7 +1,6 @@
 pub mod anthropic;
 pub mod cache_classifier;
 pub mod databases;
-pub mod multi_step_executor;
 pub mod responses;
 pub mod sigterm_drain;
 pub mod sla;
@@ -36,16 +35,13 @@ struct StreamingFixture {
     group_id: Uuid,
 }
 
-async fn setup_streaming_fixture(
-    pool: &PgPool,
-    mock_endpoint_url: String,
-    model_name: &str,
-    alias: &str,
-    open_responses_adapter: Option<bool>,
-) -> StreamingFixture {
+async fn setup_streaming_fixture(pool: &PgPool, mock_endpoint_url: String, model_name: &str, alias: &str) -> StreamingFixture {
     let mut config = crate::test::utils::create_test_config();
     config.background_services.onwards_sync.enabled = true;
     config.enable_request_logging = true;
+    // Batch traffic to these paths is forced to stream and reassembled on the way
+    // back, which is what these fixtures exercise.
+    config.background_services.batch_daemon.streamable_endpoints = vec!["/v1/chat/completions".to_string(), "/v1/completions".to_string()];
 
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
         .await
@@ -114,7 +110,6 @@ async fn setup_streaming_fixture(
             "alias": alias,
             "description": "Test model deployment",
             "hosted_on": endpoint.id,
-            "open_responses_adapter": open_responses_adapter,
             "tariffs": [{
                 "name": "batch",
                 "input_price_per_token": "0.001",
@@ -190,6 +185,34 @@ async fn wait_for_model(server: &TestServer, api_key: &str, alias: &str) {
         status
     );
     assert_eq!(status, 200, "Model should be available in onwards config after polling");
+}
+
+async fn create_standard_model_for_test(
+    server: &TestServer,
+    admin_headers: &[(String, String)],
+    endpoint_id: Uuid,
+    alias: &str,
+    traffic_routing_rules: Option<serde_json::Value>,
+) -> crate::api::models::deployments::DeployedModelResponse {
+    let mut body = serde_json::json!({
+        "type": "standard",
+        "model_name": alias,
+        "alias": alias,
+        "hosted_on": endpoint_id
+    });
+
+    if let Some(traffic_routing_rules) = traffic_routing_rules {
+        body["traffic_routing_rules"] = traffic_routing_rules;
+    }
+
+    let response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&body)
+        .await;
+    assert_eq!(response.status_code(), 200, "Failed to create model: {body}");
+    response.json()
 }
 
 #[sqlx::test]
@@ -304,10 +327,258 @@ async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPo
             "messages": [{"role": "user", "content": "hello"}]
         }))
         .await;
+    // The zero-credit key must not be able to dispatch. Depending on how the
+    // async onwards reconcile interleaves with NOTIFY-triggered reloads from
+    // concurrent tests, that surfaces as either 404 (alias absent from the
+    // targets snapshot) or 402 (target present, key excluded by the balance
+    // gate -> onwards 403 -> enriched to InsufficientCredits). Both prove the
+    // invariant; pinning one of them is a race.
+    let status = completion_response.status_code().as_u16();
+    assert!(
+        status == 404 || status == 402,
+        "Zero-credit key must not dispatch (got {status}): {}",
+        completion_response.text()
+    );
+}
+
+#[sqlx::test]
+async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
+    let config = crate::test::utils::create_test_config();
+
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, _bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+
+    let regular_user = create_test_user(&pool, Role::StandardUser).await;
+    let regular_headers = add_auth_headers(&regular_user);
+
+    let group_one_response = server
+        .post("/admin/api/v1/groups")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("ai-model-filter-one-{}", Uuid::new_v4()),
+            "description": "First AI models filter group"
+        }))
+        .await;
+    assert_eq!(group_one_response.status_code(), 201, "Failed to create first group");
+    let group_one: GroupResponse = group_one_response.json();
+
+    let group_two_response = server
+        .post("/admin/api/v1/groups")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("ai-model-filter-two-{}", Uuid::new_v4()),
+            "description": "Second AI models filter group"
+        }))
+        .await;
+    assert_eq!(group_two_response.status_code(), 201, "Failed to create second group");
+    let group_two: GroupResponse = group_two_response.json();
+
+    for group_id in [group_one.id, group_two.id] {
+        let add_user_response = server
+            .post(&format!("/admin/api/v1/groups/{}/users/{}", group_id, regular_user.id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .await;
+        assert_eq!(add_user_response.status_code(), 204, "Failed to add user to group");
+    }
+
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("AI Model Filters Endpoint {}", Uuid::new_v4()),
+            "url": "https://example.invalid/v1/",
+            "description": "Endpoint for AI model filter tests",
+            "reasoning_translation": {
+                "chat_completions": {
+                    "unsupported_efforts": ["minimal", "xhigh", "max"],
+                    "writes": [{
+                        "target_path": "/reasoning_effort",
+                        "values": {
+                            "none": "none",
+                            "low": "low",
+                            "medium": "medium",
+                            "high": "high"
+                        }
+                    }]
+                }
+            }
+        }))
+        .await;
+    assert_eq!(endpoint_response.status_code(), 201, "Failed to create endpoint");
+    let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = endpoint_response.json();
+
+    let allowed_alias = format!("ai-filter-allowed-{}", Uuid::new_v4());
+    let denied_alias = format!("ai-filter-denied-{}", Uuid::new_v4());
+    let redirected_alias = format!("ai-filter-redirected-{}", Uuid::new_v4());
+    let redirect_target_alias = format!("ai-filter-target-{}", Uuid::new_v4());
+    let other_group_alias = format!("ai-filter-other-{}", Uuid::new_v4());
+
+    create_standard_model_for_test(&server, &admin_headers, endpoint.id, &redirect_target_alias, None).await;
+    let allowed_model = create_standard_model_for_test(&server, &admin_headers, endpoint.id, &allowed_alias, None).await;
+    let denied_model = create_standard_model_for_test(
+        &server,
+        &admin_headers,
+        endpoint.id,
+        &denied_alias,
+        Some(serde_json::json!([{ "api_key_purpose": "realtime", "action": { "type": "deny" } }])),
+    )
+    .await;
+    let redirected_model = create_standard_model_for_test(
+        &server,
+        &admin_headers,
+        endpoint.id,
+        &redirected_alias,
+        Some(serde_json::json!([{
+            "api_key_purpose": "realtime",
+            "action": { "type": "redirect", "target": redirect_target_alias }
+        }])),
+    )
+    .await;
+    let other_group_model = create_standard_model_for_test(&server, &admin_headers, endpoint.id, &other_group_alias, None).await;
+
+    for deployment_id in [allowed_model.id, denied_model.id, redirected_model.id] {
+        let add_model_response = server
+            .post(&format!("/admin/api/v1/groups/{}/models/{}", group_one.id, deployment_id))
+            .add_header(&admin_headers[0].0, &admin_headers[0].1)
+            .add_header(&admin_headers[1].0, &admin_headers[1].1)
+            .await;
+        assert_eq!(add_model_response.status_code(), 204, "Failed to add model to first group");
+    }
+
+    let add_other_model_response = server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group_two.id, other_group_model.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(add_other_model_response.status_code(), 204, "Failed to add model to second group");
+
+    let api_key_response = server
+        .post(&format!("/admin/api/v1/users/{}/api-keys", regular_user.id))
+        .add_header(&regular_headers[0].0, &regular_headers[0].1)
+        .add_header(&regular_headers[1].0, &regular_headers[1].1)
+        .json(&serde_json::json!({
+            "name": "AI Models Filter Key",
+            "purpose": "realtime"
+        }))
+        .await;
+    assert_eq!(api_key_response.status_code(), 201, "Failed to create API key");
+    let api_key: crate::api::models::api_keys::ApiKeyResponse = api_key_response.json();
+
+    let extract_ids = |models: serde_json::Value| -> Vec<String> {
+        models["data"]
+            .as_array()
+            .expect("models response data should be an array")
+            .iter()
+            .map(|model| model["id"].as_str().expect("model id should be a string").to_string())
+            .collect()
+    };
+
+    let default_response = server
+        .get("/ai/v1/models")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(default_response.status_code(), 200);
+    let default_models: serde_json::Value = default_response.json();
+    assert!(
+        default_models["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|model| model.get("supported_reasoning_efforts").is_none()),
+        "default model objects must retain the OpenAI schema: {default_models}"
+    );
+    let default_ids = extract_ids(default_models);
+    assert!(default_ids.contains(&allowed_alias));
+    assert!(default_ids.contains(&denied_alias));
+    assert!(default_ids.contains(&redirected_alias));
+    assert!(default_ids.contains(&other_group_alias));
+
+    let group_response = server
+        .get(&format!("/ai/v1/models?group={}", group_one.id))
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(group_response.status_code(), 200);
+    let group_ids = extract_ids(group_response.json());
+    assert!(group_ids.contains(&allowed_alias));
+    assert!(group_ids.contains(&denied_alias));
+    assert!(group_ids.contains(&redirected_alias));
+    assert!(!group_ids.contains(&other_group_alias));
+
+    let realtime_response = server
+        .get(&format!("/ai/v1/models?group={}&available_for_realtime=true", group_one.id))
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(realtime_response.status_code(), 200);
+    let realtime_ids = extract_ids(realtime_response.json());
+    assert!(realtime_ids.contains(&allowed_alias));
+    assert!(realtime_ids.contains(&redirected_alias));
+    assert!(!realtime_ids.contains(&denied_alias));
+    assert!(!realtime_ids.contains(&other_group_alias));
+
+    let capabilities_response = server
+        .get("/ai/v1/models?include_reasoning_capabilities=true")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(capabilities_response.status_code(), 200);
+    let capabilities: serde_json::Value = capabilities_response.json();
+    let allowed = capabilities["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|model| model["id"] == allowed_alias)
+        .unwrap();
     assert_eq!(
-        completion_response.status_code(),
-        404,
-        "Zero-credit key should remain absent from the dispatch target pool"
+        allowed["supported_reasoning_efforts"]["chat_completions"],
+        serde_json::json!(["none", "low", "medium", "high"])
+    );
+    assert!(allowed["supported_reasoning_efforts"].get("responses").is_none());
+
+    let invalid_capabilities_response = server
+        .get("/ai/v1/models?include_reasoning_capabilities=sometimes")
+        .add_header("authorization", format!("Bearer {}", api_key.key))
+        .await;
+    assert_eq!(invalid_capabilities_response.status_code(), 400);
+}
+
+#[sqlx::test]
+async fn ai_models_unknown_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
+    let config = crate::test::utils::create_test_config();
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, _bg_services) = app.into_test_server();
+
+    let response = server
+        .get("/ai/v1/models")
+        .add_header("authorization", "Bearer not-a-real-key")
+        .await;
+    assert_eq!(response.status_code(), 401);
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert_eq!(body["error"]["code"], "invalid_api_key");
+    assert_eq!(body["error"]["message"], crate::errors::INVALID_API_KEY_MESSAGE);
+
+    // The copy stays generic: it must point at the regional-endpoints docs page
+    // without enumerating regional API base URLs in the error body.
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("https://docs.doubleword.ai/inference-api/regional-endpoints"));
+    assert!(
+        !message.contains("api.doubleword.ai"),
+        "401 copy must not enumerate regional base URLs"
+    );
+    assert!(
+        !message.contains("api.us.doubleword.ai"),
+        "401 copy must not enumerate regional base URLs"
     );
 }
 
@@ -383,6 +654,61 @@ async fn cleanup_fixture(fixture: StreamingFixture) {
     fixture.bg_services.shutdown().await;
 }
 
+/// A client asking for a stream must receive one, through the whole app.
+///
+/// This is the regression that shipped: the edge decided to reassemble from a
+/// header it stamps on every inbound request, so a client's `stream: true` came
+/// back as one `chat.completion` object. Nothing at this level covered it - both
+/// streaming fixtures sent the daemon's headers, so both took the daemon's path.
+#[sqlx::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_client_stream_is_not_reassembled(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello!\"}}],\"usage\":null}\n\ndata: [DONE]\n\n";
+
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({ "stream": true })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
+
+    // No daemon headers at all: this is a client, and the client asked to stream.
+    let inference_response = fixture
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello from E2E test"}],
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(inference_response.status_code().as_u16(), 200);
+    let content_type = inference_response
+        .headers()
+        .get("content-type")
+        .map_or("", |v| v.to_str().unwrap_or_default())
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "a client that asked to stream must not be handed an assembled body, got {content_type:?}"
+    );
+    assert!(
+        inference_response.text().starts_with("data:"),
+        "the frames themselves must reach the client"
+    );
+
+    cleanup_fixture(fixture).await;
+}
+
 #[sqlx::test]
 #[test_log::test]
 async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool: PgPool) {
@@ -404,13 +730,17 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         .mount(&mock_server)
         .await;
 
-    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model", None).await;
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
 
     let inference_response = fixture
         .server
         .post("/ai/v1/chat/completions")
         .add_header("authorization", format!("Bearer {}", fixture.api_key))
-        .add_header("x-fusillade-stream", "true")
+        // Both headers, because a real daemon dispatch carries both: the mark it
+        // sets for itself, and the correlation id the edge takes an early return
+        // on so a dispatch does not create a second row.
+        .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
+        .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "Hello from E2E test"}]
@@ -418,7 +748,9 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         .await;
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
-    assert_eq!(inference_response.text(), sse_response);
+    let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(assembled["choices"][0]["message"]["content"], "Hello! How can I help you today?");
+    assert_eq!(assembled["usage"]["total_tokens"], 21);
     assert_usage_recorded(&fixture, "http://localhost/chat/completions", 9, 12).await;
     cleanup_fixture(fixture).await;
 }
@@ -444,20 +776,17 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         .mount(&mock_server)
         .await;
 
-    let fixture = setup_streaming_fixture(
-        &pool,
-        format!("{}/v1", mock_server.uri()),
-        "gpt-3.5-turbo-instruct",
-        "test-model",
-        None,
-    )
-    .await;
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo-instruct", "test-model").await;
 
     let inference_response = fixture
         .server
         .post("/ai/v1/completions")
         .add_header("authorization", format!("Bearer {}", fixture.api_key))
-        .add_header("x-fusillade-stream", "true")
+        // Both headers, because a real daemon dispatch carries both: the mark it
+        // sets for itself, and the correlation id the edge takes an early return
+        // on so a dispatch does not create a second row.
+        .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
+        .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "prompt": "Hello from E2E test"
@@ -465,7 +794,8 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         .await;
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
-    assert_eq!(inference_response.text(), sse_response);
+    let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(assembled["usage"]["total_tokens"], 20);
     assert_usage_recorded(&fixture, "http://localhost/completions", 8, 12).await;
     cleanup_fixture(fixture).await;
 }
@@ -625,19 +955,25 @@ async fn test_e2e_traffic_routing_rules(pool: PgPool) {
         "messages": [{"role": "user", "content": "test"}]
     });
 
+    let mut baseline_status = 0u16;
     for i in 0..50 {
         let resp = server
             .post("/ai/v1/chat/completions")
             .add_header("authorization", format!("Bearer {}", realtime_key.key))
             .json(&chat_body)
             .await;
-        if resp.status_code().as_u16() != 404 {
-            assert_eq!(resp.status_code().as_u16(), 200, "Baseline request should succeed");
+        baseline_status = resp.status_code().as_u16();
+        if baseline_status == 200 {
             break;
         }
-        assert!(i < 49, "Model never became available after polling");
-        tokio::task::yield_now().await;
+        assert!(
+            matches!(baseline_status, 403 | 404),
+            "Unexpected baseline status while waiting for routing config: {baseline_status}"
+        );
+        assert!(i < 49, "Model never became available after polling, last status: {baseline_status}");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
+    assert_eq!(baseline_status, 200, "Baseline request should succeed");
 
     // ===== Scenario 1: Deny batch purpose =====
 
@@ -989,6 +1325,7 @@ async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     }
     fn response(correlation_id: u64) -> ResponseData {
         ResponseData {
+            extensions: Default::default(),
             correlation_id,
             timestamp: SystemTime::now(),
             status: axum::http::StatusCode::OK,
@@ -1036,7 +1373,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
     config.enable_analytics = false; // Disable to avoid spawning background batcher task
 
     // Build router with request logging disabled
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(
+    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
         DbPools::new(pool.clone()),
         Default::default(),
     ));
@@ -1397,6 +1734,49 @@ async fn test_openapi_specs_serialize() {
     assert!(ai_spec.contains("/embeddings"));
 }
 
+#[test]
+fn ai_models_openapi_documents_reasoning_capabilities_query_parameter() {
+    use utoipa::OpenApi;
+
+    let spec = serde_json::to_value(AiApiDoc::openapi()).expect("AI spec serializes");
+    let parameter = spec["paths"]["/models"]["get"]["parameters"]
+        .as_array()
+        .and_then(|parameters| {
+            parameters
+                .iter()
+                .find(|parameter| parameter["name"] == "include_reasoning_capabilities")
+        })
+        .expect("GET /models should document include_reasoning_capabilities");
+
+    assert_eq!(parameter["in"], "query");
+    assert_eq!(parameter["schema"]["type"], "boolean");
+    assert!(
+        spec["components"]["schemas"]["ModelObject"]["properties"]["supported_reasoning_efforts"].is_object(),
+        "ModelObject should document supported_reasoning_efforts"
+    );
+}
+
+#[test]
+fn admin_models_openapi_documents_reasoning_capabilities_include() {
+    use utoipa::OpenApi;
+
+    let spec = serde_json::to_value(AdminApiDoc::openapi()).expect("admin spec serializes");
+    let include = spec["paths"]["/models"]["get"]["parameters"]
+        .as_array()
+        .and_then(|parameters| parameters.iter().find(|parameter| parameter["name"] == "include"))
+        .expect("GET /models should document the include query parameter");
+    let description = include["description"].as_str().expect("include should have a description");
+
+    assert!(
+        description.contains("reasoning_capabilities"),
+        "include description should advertise reasoning_capabilities: {description}"
+    );
+    assert!(
+        spec["components"]["schemas"]["DeployedModelResponse"]["properties"]["supported_reasoning_efforts"].is_object(),
+        "DeployedModelResponse should document supported_reasoning_efforts"
+    );
+}
+
 /// Access-control tests for `/admin/openapi.json`, `/admin/docs`,
 /// `/ai/openapi.json`, and `/ai/docs`. These exist because a pentest
 /// found the Admin spec was world-readable, leaking the full internal
@@ -1432,6 +1812,8 @@ mod openapi_access_control {
                 requests_per_second: None,
                 burst_size: None,
                 member_id: None,
+                spend_limit: None,
+                spend_limit_interval: None,
             },
         ))
         .await
@@ -1565,6 +1947,56 @@ mod openapi_access_control {
     }
 
     #[sqlx::test]
+    async fn unknown_bearer_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool, true).await;
+
+        // The CurrentUser extractor rejects unknown bearer keys for every
+        // dwctl-authenticated surface; the copy must nudge users to check
+        // their regional endpoint without enumerating base URLs.
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header("authorization", "Bearer not-a-real-key")
+            .await;
+        assert_eq!(response.status_code().as_u16(), 401);
+
+        let text = response.text();
+        assert!(
+            text.contains(crate::errors::INVALID_API_KEY_MESSAGE),
+            "unknown-key 401 should carry the regional-endpoints copy, got: {text}"
+        );
+        assert!(
+            !text.contains("api.doubleword.ai"),
+            "401 copy must not enumerate regional base URLs"
+        );
+        assert!(
+            !text.contains("api.us.doubleword.ai"),
+            "401 copy must not enumerate regional base URLs"
+        );
+    }
+
+    #[sqlx::test]
+    async fn ai_spec_error_example_matches_live_copy(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let headers = add_auth_headers(&user);
+
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+
+        // The documented error example in the AI spec description is a separate
+        // string literal; keep it from drifting away from the live 401 copy.
+        let text = response.text();
+        assert!(
+            text.contains(crate::errors::INVALID_API_KEY_MESSAGE),
+            "AI OpenAPI description should embed the live invalid-API-key copy"
+        );
+    }
+
+    #[sqlx::test]
     async fn ai_spec_allows_any_authenticated_identity(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
 
@@ -1604,7 +2036,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     config.enable_metrics = false;
     config.enable_analytics = false; // Disable to avoid spawning background batcher task
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(
+    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
         DbPools::new(pool.clone()),
         Default::default(),
     ));
@@ -1666,7 +2098,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     config.enable_metrics = true;
     config.enable_analytics = false; // Disable to avoid spawning background batcher task
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(
+    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
         DbPools::new(pool.clone()),
         Default::default(),
     ));
@@ -2229,4 +2661,138 @@ async fn test_read_pool_enforces_readonly(pool: PgPool) {
         .await;
 
     assert!(result.is_ok(), "Write operation on write pool should succeed");
+}
+
+/// The components API round-trips a member's pool, and lets the SAME hosted
+/// model be a member of two pools with independent per-pool ordering — which is
+/// how the canary is wired (dynamo position 0 in both).
+#[sqlx::test]
+#[test_log::test]
+async fn test_component_pool_round_trips_and_allows_dual_membership(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    let endpoint: serde_json::Value = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"name": "Test Endpoint", "url": "https://api.example.com/v1"}))
+        .await
+        .json();
+
+    let mut members = Vec::new();
+    for name in ["dynamo-flash", "fireworks-flash", "novita-flash"] {
+        let model: serde_json::Value = server
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&serde_json::json!({"type": "standard", "model_name": name, "hosted_on": endpoint["id"]}))
+            .await
+            .json();
+        members.push(model["id"].as_str().unwrap().to_string());
+    }
+
+    let composite: serde_json::Value = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"type": "composite", "model_name": "dsv4-flash"}))
+        .await
+        .json();
+    let composite_id = composite["id"].as_str().unwrap().to_string();
+
+    let add = async |member: &str, body: serde_json::Value| {
+        server
+            .post(&format!("/admin/api/v1/models/{composite_id}/components/{member}"))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&body)
+            .await
+    };
+
+    // An add that names no pool keeps today's behaviour: the default pool.
+    let plain = add(&members[2], serde_json::json!({"weight": 50})).await;
+    assert_eq!(plain.status_code(), 200);
+    assert_eq!(plain.json::<serde_json::Value>()["pool"], "default");
+
+    let on_prem = add(&members[0], serde_json::json!({"weight": 50})).await;
+    assert_eq!(on_prem.status_code(), 200);
+    assert_eq!(on_prem.json::<serde_json::Value>()["pool"], "default");
+
+    // The same hosted model joins the completions pool too — position 0 there,
+    // independent of its position in the default pool.
+    let on_prem_completions = add(&members[0], serde_json::json!({"weight": 50, "pool": "completions"})).await;
+    assert_eq!(on_prem_completions.status_code(), 200, "a member may belong to more than one pool");
+    let on_prem_completions: serde_json::Value = on_prem_completions.json();
+    assert_eq!(on_prem_completions["pool"], "completions");
+    assert_eq!(on_prem_completions["sort_order"], 0, "ordering is per pool");
+
+    // The validated target sits behind it, in the completions pool only.
+    let validated = add(&members[1], serde_json::json!({"weight": 50, "pool": "completions"})).await;
+    assert_eq!(validated.status_code(), 200);
+    let validated_body: serde_json::Value = validated.json();
+    assert_eq!(validated_body["pool"], "completions");
+    assert_eq!(validated_body["sort_order"], 1);
+
+    // A pool name outside the CHECK constraint is refused at the schema.
+    let bogus = add(&members[1], serde_json::json!({"weight": 50, "pool": "chat"})).await;
+    assert!(
+        bogus.status_code().is_client_error(),
+        "unknown pool names must not reach the database: {}",
+        bogus.status_code()
+    );
+
+    // A PATCH addresses one membership, named by `?pool=`; the other is untouched.
+    let moved = server
+        .patch(&format!(
+            "/admin/api/v1/models/{composite_id}/components/{}?pool=completions",
+            members[1]
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"sort_order": 0}))
+        .await;
+    assert_eq!(moved.status_code(), 200);
+    assert_eq!(moved.json::<serde_json::Value>()["sort_order"], 0);
+
+    let listed: serde_json::Value = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    let pools: Vec<&str> = listed.as_array().unwrap().iter().map(|c| c["pool"].as_str().unwrap()).collect();
+    assert_eq!(pools.iter().filter(|p| **p == "completions").count(), 2);
+    assert_eq!(pools.iter().filter(|p| **p == "default").count(), 2);
+
+    // Removing a completions membership leaves the default one alone: the same
+    // model is still serving chat.
+    let removed = server
+        .delete(&format!(
+            "/admin/api/v1/models/{composite_id}/components/{}?pool=completions",
+            members[0]
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await;
+    assert_eq!(removed.status_code(), 200);
+
+    let listed: serde_json::Value = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    let remaining: Vec<(&str, &str)> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["model"]["id"].as_str().unwrap(), c["pool"].as_str().unwrap()))
+        .collect();
+    assert!(
+        remaining.contains(&(members[0].as_str(), "default")),
+        "the default-pool membership survives: {remaining:?}"
+    );
+    assert!(!remaining.contains(&(members[0].as_str(), "completions")));
 }

@@ -1,7 +1,8 @@
 [package]
 name = "dwctl"
-version = "8.76.0"
+version = "11.1.1" # x-release-please-version
 edition = "2024"
+publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
 license = "MIT OR Apache-2.0"
 
@@ -19,7 +20,8 @@ embedded-db = ["dep:postgresql_embedded"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }
-fusillade = { version = "20.0.2" }
+fusillade = { path = "../fusillade" }
+fusillade-arsenal = { path = "../fusillade-arsenal" }
 tokio = { version = "1.0", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
@@ -56,6 +58,8 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "trace"] }
 async-trait = "0.1"
 async-stream = "0.3"
+eventsource-stream = "0.2"
+openai-reassembler = "0.4.0"
 url = { version = "2.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive", "env"] }
 reqwest = { version = "0.13", default-features = false, features = [
@@ -80,20 +84,14 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 argon2 = "0.5"
 base64 = "0.22"
 bytes = "1.5"
-onwards = { version = "0.34.5", features = ["multi-step"] }
+onwards = { path = "../onwards" }
 thiserror = "2.0.14"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
-outlet = "0.8.1"
-outlet-postgres = "0.5.1"
-async-openai = { version = "0.34.0", default-features = false, features = [
-  "chat-completion-types",
-  "completion-types",
-  "embedding-types",
-  "response-types",
-] }
+outlet = "0.9.1"
+outlet-postgres = "0.6.0"
 brotli = "8.0"
 flate2 = "1"
 lettre = { version = "0.11", features = [
@@ -111,6 +109,9 @@ hickory-resolver = { version = "0.26", default-features = false, features = [
 aes-gcm = "0.10.3"
 # Redis-backed keystore for zero-data-retention flex request keys.
 deadpool-redis = "0.18"
+redis = { version = "0.27", default-features = false, features = [
+  "tokio-rustls-comp",
+] }
 paste = "1.0"
 serde_with = "3.14.1"
 rust_decimal = { version = "1.38.0", features = ["serde"] }
@@ -150,6 +151,7 @@ async-stripe-misc = { version = "1.0.0-rc.0", features = ["tax_calculation"] }
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 async-stripe-billing = { version = "1.0.0-rc.0", features = [
   "billing_portal_session",
+  "invoice_item",
 ] }
 sqlx-pool-router = "0.2.0"
 minijinja = "2.15.1"
@@ -187,3 +189,6 @@ criterion = { version = "0.8", features = ["async_tokio"] }
 tempfile = "3.0"
 wiremock = "0.6"
 serde_urlencoded = "0.7"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.7.0"

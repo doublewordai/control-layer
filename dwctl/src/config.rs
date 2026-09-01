@@ -215,6 +215,10 @@ pub struct Config {
     /// tokenizer-svc URL, and the default pricing multipliers. See [`CacheConfig`].
     #[serde(default)]
     pub cache: CacheConfig,
+    /// Mid-stream continuation (stream resume): the on/off flag, per-origin gates,
+    /// and resume-behavior knobs. See [`ContinuationConfig`].
+    #[serde(default)]
+    pub continuation: ContinuationConfig,
 }
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
@@ -604,6 +608,12 @@ pub struct StripeConfig {
     /// Custom text displayed for terms of service acceptance during auto top-up setup.
     /// If not set, no terms of service acceptance text is shown.
     pub auto_topup_terms_of_service_text: Option<String>,
+    /// Custom text displayed for terms of service acceptance during onboarding
+    /// card verification (`POST /payments/setup`). Falls back to
+    /// `auto_topup_terms_of_service_text` when unset, since both are setup-mode
+    /// checkouts saving a card for later off-session use.
+    #[serde(default)]
+    pub setup_terms_of_service_text: Option<String>,
     /// Stripe tax code for auto top-up tax calculations (e.g. "txcd_10000000").
     /// If not set, falls back to the account-level default tax code in Stripe Tax settings.
     pub tax_code: Option<String>,
@@ -622,7 +632,13 @@ pub struct DummyConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Metadata {
-    /// Region name displayed in the UI (e.g., "UK South", "US East")
+    /// Region name displayed in the UI (e.g., "UK South", "US East").
+    ///
+    /// Surfaced verbatim on `GET /admin/api/v1/config`. Both dashboards hide
+    /// the region indicator entirely when this is `None`, rather than showing
+    /// an "unknown" placeholder — a deployment that serves one region has no
+    /// use for the label, and an account's region is where its data lives, so
+    /// displaying a guess is worse than displaying nothing.
     pub region: Option<String>,
     /// Organization name displayed in the UI
     pub organization: Option<String>,
@@ -704,7 +720,7 @@ impl Default for AuthConfig {
             native: NativeAuthConfig::default(),
             proxy_header: ProxyHeaderAuthConfig::default(),
             security: SecurityConfig::default(),
-            default_user_roles: vec![Role::StandardUser],
+            default_user_roles: vec![Role::StandardUser, Role::BackgroundInferenceUser],
             rate_limits: RateLimitTiersConfig::default(),
         }
     }
@@ -1067,6 +1083,39 @@ pub struct CacheConfig {
     /// Set via environment: `DWCTL_CACHE__DEFAULT_TTL=5m`
     pub default_ttl: String,
 
+    /// Deadline for joining the classify fork at response time. classify races the (slower)
+    /// model call, so this only bites when classification is still unresolved as the response
+    /// completes — a tokenizer/index hiccup — in which case the request bills un-cached
+    /// (fail-safe) once the deadline fires. Latency-sensitive realtime pods keep the tight
+    /// default; the fusillade-batch pod (no first-token pressure; classify joins inline after
+    /// the response) can afford a larger value (e.g. 10) so index retries have room to land.
+    ///
+    /// Set via environment: `DWCTL_CACHE__CLASSIFY_DEADLINE_SECS=10`
+    pub classify_deadline_secs: u64,
+
+    /// How many times a cache-index DB op (lookup/write/refresh) retries after a
+    /// connection-class failure (severed idle conn, TLS handshake EOF, auth timeout — the
+    /// Neon burst-churn family; non-connection errors never retry). Retries back off
+    /// 100ms·2^n so a herd of simultaneous failures doesn't re-storm the connection setup.
+    /// The classify deadline still bounds the caller regardless. Evidence for the default and
+    /// per-pod tuning: 100% of classify errors occur on the bursty batch pod, so it warrants
+    /// a higher value (e.g. 3) than the steady-traffic API pods.
+    ///
+    /// Set via environment: `DWCTL_CACHE__INDEX_CONN_RETRIES=3`
+    pub index_conn_retries: u32,
+
+    /// Exact chat-templated token counting via tokenizer-svc `/v1/render` (svc ≥ 0.3.0).
+    /// When true, cache splits are counted against the model's real chat-template
+    /// rendering — the same bytes the engine tokenizes — instead of raw content-block
+    /// text, eliminating the classifier-vs-engine drift that forces the billing caps to
+    /// engage. Per-alias it additionally requires a `template_version` from `/v1/models`;
+    /// aliases without one (and render failures) keep raw-segment counting. Rollout:
+    /// staging first, watch `dwctl_cache_render_drift_tokens` ≈ 0, then prod.
+    ///
+    /// Set via environment: `DWCTL_CACHE__RENDER_COUNTING=true`
+    #[serde(default)]
+    pub render_counting: bool,
+
     /// Handling of provider-injected per-request *telemetry* blocks (e.g. the Claude Code SDK's
     /// `x-anthropic-billing-header` line, whose nonce changes every request). Such a block sits
     /// ahead of the caller's `cache_control` breakpoint, so leaving it in would change the prefix
@@ -1084,6 +1133,9 @@ impl Default for CacheConfig {
             pricing: CachePricingConfig::default(),
             enabled_ttls: vec!["5m".to_string(), "1h".to_string()],
             default_ttl: "5m".to_string(),
+            classify_deadline_secs: 5,
+            index_conn_retries: 1,
+            render_counting: false,
             telemetry_blocks: TelemetryBlockConfig::default(),
         }
     }
@@ -1125,6 +1177,153 @@ impl Default for TelemetryBlockConfig {
         Self {
             strip_from_prompt: true,
             prefixes: vec!["x-anthropic-billing-header:".to_string()],
+        }
+    }
+}
+
+/// Mid-stream continuation (stream resume) configuration.
+///
+/// When a stream dies mid-generation on a continuation-enabled model, the resume
+/// middleware rebuilds prompt + partial output as token ids (tokenizer-svc
+/// `/v1/render`) and re-enters onwards as a `/v1/completions` request on the
+/// model's continuation composite, splicing the new stream into the client's
+/// still-open connection. Per-model activation additionally requires a
+/// `continuation`-purpose traffic rule + composite; with none attached, enabling
+/// this flag changes nothing.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContinuationConfig {
+    /// Global kill switch. When false (the default), the resume layer is not added
+    /// to the stack and the request path is byte-identical to today.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__ENABLED=true`
+    pub enabled: bool,
+
+    /// Base URL of the tokenizer-svc used to render resume prefixes. `None` (the
+    /// default) falls back to `cache.tokenizer_url` — the same service serves both
+    /// layers; set this only to split them.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__TOKENIZER_URL=http://tokenizer-svc:8088`
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokenizer_url: Option<String>,
+
+    /// Per-origin gates. All origins ride the same middleware; these choose which
+    /// request populations are eligible for resume at all.
+    pub origins: ContinuationOriginsConfig,
+
+    /// Maximum resume legs for one logical stream (a resume leg that itself dies
+    /// mid-stream re-enters the flow). Exhausted → the error surfaces to the
+    /// client exactly as an unresumed death would.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__MAX_ATTEMPTS=2`
+    pub max_attempts: u32,
+
+    /// Budget for one resume attempt (render + continuation-target time-to-first-
+    /// byte). Crossed → give up on that leg and surface the original error. Cold
+    /// provider prefill dominates this budget on long prompts; per-provider
+    /// TTFB-vs-prefix-length curves from the onboarding harness inform the value.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__RESUME_DEADLINE_SECS=20`
+    pub resume_deadline_secs: u64,
+
+    /// Inter-frame silence after which an armed stream is declared STALLED and
+    /// rescued — which CANCELS the original leg and re-prefills, so this must
+    /// never undercut the platform's own liveness judgment: fusillade's SSE
+    /// clients allow 600s between events (prod `chunk_timeout_ms`), and a
+    /// preempted/kv-thrashed but progressing stream must be allowed to
+    /// continue. Default 540 = just inside fusillade's 600s so batch-origin
+    /// stalls are still rescuable before the daemon aborts the request.
+    /// Arms only after the first generated text (admission/prefill silence is
+    /// never bounded here).
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__STALL_TIMEOUT_SECS=540`
+    pub stall_timeout_secs: u64,
+
+    /// Per-stream cap applied SEPARATELY to each retained allocation: the
+    /// request body (eligibility gate) and the accumulated generation
+    /// (accumulator cap) — worst case an armed stream retains ~2x this value.
+    /// Deliberately not a shared budget: deducting a large body from the
+    /// generation allowance would disarm long generations on big-prompt
+    /// requests, exactly the streams most worth rescuing. Exceeding either
+    /// bound marks the stream non-resumable and drops the buffer (outlet's own
+    /// capture is unaffected); the outcome metric records `cap_exceeded`.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__MAX_BUFFER_BYTES=2097152`
+    pub max_buffer_bytes: usize,
+
+    /// Numeric scheduling priority injected into resume-leg request bodies. The
+    /// dynamo scheduler orders by this field: batch/flex run negative
+    /// (deadline-derived), realtime runs 0 — any positive value puts resume legs
+    /// ahead of new realtime work, which is intentional: a resume finishes a
+    /// stream we already accepted, on a strict seam budget. Third-party providers
+    /// ignore the field.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__PRIORITY=100`
+    pub priority: i32,
+
+    /// Cap on concurrently in-flight resume legs per model (middleware counter).
+    /// Mid-stream deaths cluster in incidents; this bounds the stampede a flapping
+    /// model can send at its continuation provider. Excess deaths surface as plain
+    /// errors (outcome `throttled`).
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__MAX_INFLIGHT_PER_MODEL=8`
+    pub max_inflight_per_model: u32,
+
+    /// Which reconstructor rebuilds the partial generation, per model alias.
+    ///
+    /// A stream is only resumable if we can rebuild the exact text the model had
+    /// already emitted. The default reconstructor handles plain `content` and
+    /// gives up on `reasoning_content` / `tool_calls`; a model whose family has a
+    /// byte-exactness verdict from the fidelity harness can name that family here
+    /// and stay resumable through reasoning and partial tool calls. Recognised
+    /// value: `dsv4` (DeepSeek-V4 / DSML). A model absent from the map — or
+    /// naming a family we do not know — keeps the default.
+    ///
+    /// This is deliberately a config map for the canary: it moves onto the
+    /// per-route DB row next to the `continuation` traffic rule once more than one
+    /// family is live.
+    ///
+    /// Set via environment: `DWCTL_CONTINUATION__MODEL_RECONSTRUCTORS='{"deepseek-ai/DeepSeek-V4-Flash":"dsv4"}'`
+    pub model_reconstructors: HashMap<String, String>,
+}
+
+impl Default for ContinuationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            tokenizer_url: None,
+            origins: ContinuationOriginsConfig::default(),
+            max_attempts: 2,
+            resume_deadline_secs: 20,
+            stall_timeout_secs: 540,
+            max_buffer_bytes: 2 * 1024 * 1024,
+            priority: 100,
+            max_inflight_per_model: 8,
+            model_reconstructors: HashMap::new(),
+        }
+    }
+}
+
+/// Which request origins are eligible for mid-stream resume. Realtime leads the
+/// rollout (user-visible failures); batch resumes are a pure GPU saving vs
+/// fusillade's full retry and follow once realtime has bedded in.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ContinuationOriginsConfig {
+    /// Set via environment: `DWCTL_CONTINUATION__ORIGINS__REALTIME=true`
+    pub realtime: bool,
+    /// Set via environment: `DWCTL_CONTINUATION__ORIGINS__BATCH=true`
+    pub batch: bool,
+    /// Set via environment: `DWCTL_CONTINUATION__ORIGINS__PLAYGROUND=true`
+    pub playground: bool,
+}
+
+impl Default for ContinuationOriginsConfig {
+    fn default() -> Self {
+        Self {
+            realtime: true,
+            batch: false,
+            playground: false,
         }
     }
 }
@@ -1254,12 +1453,6 @@ pub struct BatchConfig {
         deserialize_with = "deserialize_positive_reservation_ttl"
     )]
     pub reservation_ttl_secs: i64,
-    /// Optional realtime priority decay window (seconds) for queue monitoring.
-    /// When set, completed FLEX requests within this lookback are included
-    /// in the 1h pending-request-counts bucket. When null or omitted, no decay
-    /// count is applied.
-    #[serde(default, deserialize_with = "deserialize_non_negative_optional_i64")]
-    pub priority_decay_window_secs: Option<i64>,
     /// Upload-volume cap for *unverified* creditors, expressed as requests per
     /// hour of completion window. The effective cap for a submission scales with
     /// its completion window: `unverified_requests_per_completion_hour *
@@ -1360,22 +1553,6 @@ where
     }
 }
 
-fn deserialize_non_negative_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    let opt: Option<i64> = Option::deserialize(deserializer)?;
-    match opt {
-        Some(value) if value < 0 => Err(D::Error::custom(format!(
-            "priority_decay_window_secs must be non-negative, got {}",
-            value
-        ))),
-        value => Ok(value),
-    }
-}
-
 /// Custom deserializer that validates throughput is positive, with null/missing defaulting to 100.0
 fn deserialize_positive_throughput<'de, D>(deserializer: D) -> Result<f32, D::Error>
 where
@@ -1413,7 +1590,6 @@ impl Default for BatchConfig {
             files: FilesConfig::default(),
             default_throughput: default_batch_throughput(),
             reservation_ttl_secs: default_reservation_ttl_secs(),
-            priority_decay_window_secs: None,
             unverified_requests_per_completion_hour: 1000,
             pending_capacity_counts_enabled: false,
         }
@@ -1433,6 +1609,41 @@ impl BatchConfig {
     }
 }
 
+/// Which fusillade claim loops should run inside this daemon process.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonMode {
+    /// Run both batchless request claims and batch claims.
+    #[default]
+    Both,
+    /// Run only the batchless request claim loop.
+    RequestOnly,
+    /// Run only the batch claim loop.
+    BatchOnly,
+}
+
+impl From<DaemonMode> for fusillade::DaemonMode {
+    fn from(mode: DaemonMode) -> Self {
+        match mode {
+            DaemonMode::Both => fusillade::DaemonMode::Both,
+            DaemonMode::RequestOnly => fusillade::DaemonMode::RequestOnly,
+            DaemonMode::BatchOnly => fusillade::DaemonMode::BatchOnly,
+        }
+    }
+}
+
+fn default_memory_gate_low_fraction() -> f64 {
+    0.65
+}
+
+fn default_adaptive_growth_factor() -> f64 {
+    1.5
+}
+
+fn default_adaptive_cut_factor() -> f64 {
+    0.8
+}
+
 /// The daemon processes batch requests asynchronously in the background.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1443,11 +1654,52 @@ pub struct DaemonConfig {
     /// - "leader": Only run if this instance is the leader
     pub enabled: DaemonEnabled,
 
+    /// Which claim loops this daemon process should run (default: "both").
+    /// - "both": Run request and batch claim loops
+    /// - "request_only": Run only batchless request claims
+    /// - "batch_only": Run only batch claims
+    #[serde(default)]
+    pub mode: DaemonMode,
+
     /// Maximum number of requests to claim in each iteration (default: 100)
     pub claim_batch_size: usize,
 
     /// Default concurrency limit per model (default: 10)
     pub default_model_concurrency: usize,
+
+    /// Discover each model's concurrency limit from downstream 529s instead of
+    /// using its configured value as a hard ceiling (default: false).
+    ///
+    /// When on, `default_model_concurrency` and per-model `batch_capacity`
+    /// become starting points rather than ceilings, and the memory gate becomes
+    /// the bound. The daemon refuses to enable this without
+    /// `memory_gate_high_fraction` set, since nothing else would bound growth.
+    #[serde(default)]
+    pub adaptive_concurrency: bool,
+
+    /// Multiplier applied to a model's limit each time it goes up
+    /// (default: 1.5).
+    #[serde(default = "default_adaptive_growth_factor")]
+    pub adaptive_growth_factor: f64,
+
+    /// Multiplier applied to a model's limit on downstream 529 (default: 0.8).
+    #[serde(default = "default_adaptive_cut_factor")]
+    pub adaptive_cut_factor: f64,
+
+    /// Fraction of the daemon's own memory limit at or above which it stops
+    /// claiming (default: 0, disabled).
+    ///
+    /// This is the process-wide bound. A count of in-flight requests cannot be
+    /// it, because per-request memory varies by more than an order of magnitude
+    /// between workloads; this measures the pod's actual usage instead. Required
+    /// when `adaptive_concurrency` is on.
+    #[serde(default)]
+    pub memory_gate_high_fraction: f64,
+
+    /// Fraction of the memory limit below which claiming resumes
+    /// (default: 0.65). Must be below `memory_gate_high_fraction`.
+    #[serde(default = "default_memory_gate_low_fraction")]
+    pub memory_gate_low_fraction: f64,
 
     /// How long to sleep between claim iterations in milliseconds (default: 1000)
     pub claim_interval_ms: u64,
@@ -1471,6 +1723,11 @@ pub struct DaemonConfig {
     /// Maximum backoff time in milliseconds (default: 10000)
     pub max_backoff_ms: u64,
 
+    /// HTTP error statuses retried in addition to Fusillade's built-in predicate.
+    /// Defaults to `[499]`; use `[]` to disable additional status retries.
+    #[serde(default = "default_additional_retryable_statuses")]
+    pub additional_retryable_statuses: Vec<u16>,
+
     /// Deprecated: use first_chunk_timeout_ms, chunk_timeout_ms, and body_timeout_ms instead.
     /// If set, splits into 90% first_chunk_timeout_ms and 10% body_timeout_ms.
     /// Ignored when the granular timeout fields are explicitly set.
@@ -1492,6 +1749,20 @@ pub struct DaemonConfig {
     /// but take an unreasonable total time.
     /// Default: 86,400,000 (24 hours).
     pub body_timeout_ms: u64,
+
+    /// Maximum time without progress while sending the request body, in milliseconds.
+    /// This only covers upload; keep it below first_chunk_timeout_ms so an upload
+    /// stall is reported before the broader first-response timeout. Default: 60,000.
+    pub upload_stall_timeout_ms: u64,
+
+    /// Request-body bytes per upload progress unit. Smaller values detect progress
+    /// more finely at the cost of more body frames. Must be greater than zero.
+    /// Default: 65,536 (64 KiB).
+    pub upload_chunk_bytes: usize,
+
+    /// How often the upload watchdog checks progress, in milliseconds. Keep this
+    /// well below upload_stall_timeout_ms. Must be greater than zero. Default: 100.
+    pub upload_stall_poll_ms: u64,
 
     /// Interval for logging daemon status (requests in flight) in milliseconds
     /// Set to None to disable periodic status logging (default: Some(2000))
@@ -1546,9 +1817,11 @@ pub struct DaemonConfig {
     /// exist. Default: 100.
     pub purge_throttle_ms: u64,
 
-    /// Request paths that should use SSE streaming for usage tracking.
-    /// When a request's path matches, an `X-Fusillade-Stream` header is sent
-    /// and the response is read as SSE, then reassembled into non-streaming JSON.
+    /// Request paths whose batch traffic is dispatched as a stream so the provider
+    /// reports token usage, then reassembled back into a single JSON body before it
+    /// is stored or returned. Batch traffic is identified by the correlation header
+    /// the daemon stamps on everything it sends; a real client's request to the same
+    /// path is untouched.
     /// Example: `["/v1/chat/completions", "/v1/completions"]`
     #[serde(default)]
     pub streamable_endpoints: Vec<String>,
@@ -1567,6 +1840,13 @@ pub struct DaemonConfig {
     /// deadline so earlier deadlines produce larger numbers. Default: false.
     #[serde(default)]
     pub inject_deadline_priority: bool,
+
+    /// Database-wide per-model ceiling below which no-SLA background work may
+    /// be claimed. Zero disables background processing while leaving
+    /// submission and inspection available. Background processing also
+    /// requires `inject_deadline_priority = true`.
+    #[serde(default)]
+    pub background_concurrency_limit: usize,
 
     /// Maximum request rows the batch claim daemon takes per iteration.
     /// 0 inherits `claim_batch_size`, so an existing tuned cap carries over
@@ -1618,10 +1898,88 @@ pub struct DaemonConfig {
     /// (3 minutes).
     #[serde(default = "default_claim_query_timeout_ms")]
     pub claim_query_timeout_ms: u64,
+
+    /// Batch-archive sweeper (fusillade phase 3): moves frozen terminal
+    /// batches' request rows from `fusillade.requests` into the partitioned
+    /// `batch_requests_archive`. OFF by default. The blue/green invariant:
+    /// deploys never move data — only flipping this flag does, and only once
+    /// every pod in the fleet runs location-routing-aware code AND this
+    /// dwctl version is the rollback floor (deny_unknown_fields: an older
+    /// pod parsing a config that contains these keys crash-loops).
+    #[serde(default)]
+    pub batch_archive_sweep_enabled: bool,
+    /// Sweep tick interval. 0 disables the worker (guarded in fusillade).
+    #[serde(default = "default_batch_archive_sweep_interval_ms")]
+    pub batch_archive_sweep_interval_ms: u64,
+    /// Bounded moves per sweep tick (never drain-until-empty).
+    #[serde(default = "default_batch_archive_moves_per_tick")]
+    pub batch_archive_sweep_moves_per_tick: i64,
+    /// Post-freeze dwell before a batch becomes a sweep candidate. Default 0
+    /// (move immediately — reads are mid-move safe by construction).
+    #[serde(default, deserialize_with = "deserialize_non_negative_secs")]
+    pub batch_archive_sweep_dwell_secs: f64,
+    /// Cancellation grace: batches with canceled rows that were in flight at
+    /// cancel are not archived while those rows are younger than this, so
+    /// late billed results can still supersede the cancel on the live row.
+    /// Default 600s, mirroring processing_timeout_ms.
+    #[serde(
+        default = "default_batch_archive_cancel_grace_secs",
+        deserialize_with = "deserialize_cancel_grace_secs"
+    )]
+    pub batch_archive_cancel_grace_secs: f64,
+    /// Historical backfill worker: same mover as the sweeper on its own
+    /// pacing, oldest-first. Enable after the sweeper is live and steady;
+    /// flip off to pause instantly (resumable by construction).
+    #[serde(default)]
+    pub batch_archive_backfill_enabled: bool,
+    #[serde(default = "default_batch_archive_backfill_interval_ms")]
+    pub batch_archive_backfill_interval_ms: u64,
+    #[serde(default = "default_batch_archive_moves_per_tick")]
+    pub batch_archive_backfill_moves_per_tick: i64,
+    /// Concurrent moves per backfill tick. Per-move cost is dominated by
+    /// fixed transaction overhead on small batches, so this — not tick
+    /// pacing — is the drain-throughput lever. Concurrent movers are safe
+    /// (the batch lock is taken SKIP LOCKED); the default keeps a
+    /// historical drain in the hours range without fleet-level scaling.
+    #[serde(default = "default_batch_archive_backfill_concurrency")]
+    pub batch_archive_backfill_concurrency: usize,
+    /// Weekly archive-partition runway maintained by the daemon's daily tick
+    /// (runs regardless of the flags above so partitions exist before any
+    /// flip; fusillade_archive_partitions_ahead gauges it).
+    #[serde(default = "default_batch_archive_partitions_weeks_ahead")]
+    pub batch_archive_partitions_weeks_ahead: i32,
+}
+
+fn default_batch_archive_sweep_interval_ms() -> u64 {
+    5_000
+}
+
+fn default_batch_archive_moves_per_tick() -> i64 {
+    4
+}
+
+fn default_batch_archive_cancel_grace_secs() -> f64 {
+    600.0
+}
+
+fn default_batch_archive_backfill_interval_ms() -> u64 {
+    1_000
+}
+
+fn default_batch_archive_backfill_concurrency() -> usize {
+    8
+}
+
+fn default_batch_archive_partitions_weeks_ahead() -> i32 {
+    4
 }
 
 fn default_claim_loop_max_consecutive_failures() -> u32 {
     10
+}
+
+fn default_additional_retryable_statuses() -> Vec<u16> {
+    vec![499]
 }
 
 fn default_claim_query_timeout_ms() -> u64 {
@@ -1681,6 +2039,54 @@ where
     }
 }
 
+/// Seconds knobs (archive dwell): finite and non-negative — NaN/inf/negative
+/// values would make the SQL interval predicates undefined.
+fn deserialize_non_negative_secs<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<f64> = Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(0.0),
+        Some(value) if !value.is_finite() => Err(D::Error::custom(format!("seconds value must be a finite number, got {}", value))),
+        Some(value) if value < 0.0 => Err(D::Error::custom(format!("seconds value must be non-negative, got {}", value))),
+        Some(value) => Ok(value),
+    }
+}
+
+/// Same validation as [`deserialize_non_negative_secs`] but defaulting to the
+/// cancellation-grace default when the key is absent.
+fn deserialize_cancel_grace_secs<'de, D>(deserializer: D) -> Result<f64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    let opt: Option<f64> = Option::deserialize(deserializer)?;
+    match opt {
+        None => Ok(default_batch_archive_cancel_grace_secs()),
+        Some(value) if !value.is_finite() => Err(D::Error::custom(format!(
+            "batch_archive_cancel_grace_secs must be a finite number, got {}",
+            value
+        ))),
+        Some(value) if value < 0.0 => Err(D::Error::custom(format!(
+            "batch_archive_cancel_grace_secs must be non-negative, got {}",
+            value
+        ))),
+        Some(value) => Ok(value),
+    }
+}
+
+/// Batch metadata keys fusillade forwards to dwctl as `x-fusillade-batch-<key>`
+/// headers on every dispatched request.
+///
+/// THIS LIST IS THE WHOLE MECHANISM. Storing a key in a batch's metadata does
+/// nothing on its own — `claimed_rows_to_requests` only copies the keys named
+/// here onto the claimed request, so an unlisted key is written, persisted, and
+/// silently never sent. Anything that has to reach `http_analytics` has to be
+/// added here as well as at the write site.
 fn default_batch_metadata_fields_dwctl() -> Vec<String> {
     vec![
         "id".to_string(),
@@ -1688,6 +2094,10 @@ fn default_batch_metadata_fields_dwctl() -> Vec<String> {
         "created_at".to_string(),
         "completion_window".to_string(),
         "request_source".to_string(),
+        // The submitter's User-Agent, stamped at creation by `create_batch`. Without
+        // it the analytics row for a dispatched batch request has no client at all:
+        // fusillade's own HTTP client sends no User-Agent.
+        "dw_user_agent".to_string(),
     ]
 }
 
@@ -1695,18 +2105,28 @@ impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             enabled: DaemonEnabled::Leader,
+            mode: DaemonMode::Both,
             claim_batch_size: 100,
             default_model_concurrency: 10,
+            adaptive_concurrency: false,
+            adaptive_growth_factor: default_adaptive_growth_factor(),
+            adaptive_cut_factor: default_adaptive_cut_factor(),
+            memory_gate_high_fraction: 0.0,
+            memory_gate_low_fraction: default_memory_gate_low_fraction(),
             claim_interval_ms: 1000,
             max_retries: Some(1000),
             stop_before_deadline_ms: Some(900_000),
             backoff_ms: 1000,
             backoff_factor: 2,
             max_backoff_ms: 10000,
+            additional_retryable_statuses: default_additional_retryable_statuses(),
             timeout_ms: None,
             first_chunk_timeout_ms: 86_400_000,
             chunk_timeout_ms: 86_400_000,
             body_timeout_ms: 86_400_000,
+            upload_stall_timeout_ms: 60_000,
+            upload_chunk_bytes: 64 * 1024,
+            upload_stall_poll_ms: 100,
             status_log_interval_ms: Some(2000),
             claim_timeout_ms: 60000,
             processing_timeout_ms: 600000,
@@ -1719,6 +2139,7 @@ impl Default for DaemonConfig {
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
+            background_concurrency_limit: 0,
             batch_claim_size: 0,
             batch_claim_batch_size: default_batch_claim_batch_size(),
             batch_claim_interval_ms: 0,
@@ -1726,6 +2147,16 @@ impl Default for DaemonConfig {
             claim_ramp_exponent: default_claim_ramp_exponent(),
             claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
             claim_query_timeout_ms: default_claim_query_timeout_ms(),
+            batch_archive_sweep_enabled: false,
+            batch_archive_sweep_interval_ms: default_batch_archive_sweep_interval_ms(),
+            batch_archive_sweep_moves_per_tick: default_batch_archive_moves_per_tick(),
+            batch_archive_sweep_dwell_secs: 0.0,
+            batch_archive_cancel_grace_secs: default_batch_archive_cancel_grace_secs(),
+            batch_archive_backfill_enabled: false,
+            batch_archive_backfill_interval_ms: default_batch_archive_backfill_interval_ms(),
+            batch_archive_backfill_moves_per_tick: default_batch_archive_moves_per_tick(),
+            batch_archive_backfill_concurrency: default_batch_archive_backfill_concurrency(),
+            batch_archive_partitions_weeks_ahead: default_batch_archive_partitions_weeks_ahead(),
         }
     }
 }
@@ -1759,8 +2190,14 @@ impl DaemonConfig {
         };
 
         fusillade::daemon::DaemonConfig {
+            mode: self.mode.into(),
             claim_batch_size: self.claim_batch_size,
             model_concurrency_limits: model_capacity_limits.unwrap_or_else(|| std::sync::Arc::new(dashmap::DashMap::new())),
+            adaptive_concurrency: self.adaptive_concurrency,
+            adaptive_growth_factor: self.adaptive_growth_factor,
+            adaptive_cut_factor: self.adaptive_cut_factor,
+            memory_gate_high_fraction: self.memory_gate_high_fraction,
+            memory_gate_low_fraction: self.memory_gate_low_fraction,
             model_escalations: Arc::new(DashMap::from_iter(self.model_escalations.clone())),
             claim_interval_ms: self.claim_interval_ms,
             max_retries: self.max_retries,
@@ -1768,9 +2205,13 @@ impl DaemonConfig {
             backoff_ms: self.backoff_ms,
             backoff_factor: self.backoff_factor,
             max_backoff_ms: self.max_backoff_ms,
+            additional_retryable_statuses: self.additional_retryable_statuses.clone(),
             first_chunk_timeout_ms,
             chunk_timeout_ms,
             body_timeout_ms,
+            upload_stall_timeout_ms: self.upload_stall_timeout_ms,
+            upload_chunk_bytes: self.upload_chunk_bytes,
+            upload_stall_poll_ms: self.upload_stall_poll_ms,
             status_log_interval_ms: self.status_log_interval_ms,
             claim_timeout_ms: self.claim_timeout_ms,
             processing_timeout_ms: self.processing_timeout_ms,
@@ -1779,9 +2220,9 @@ impl DaemonConfig {
             purge_interval_ms: self.purge_interval_ms,
             purge_batch_size: self.purge_batch_size,
             purge_throttle_ms: self.purge_throttle_ms,
-            streamable_endpoints: self.streamable_endpoints.clone(),
             urgency_weight: self.urgency_weight,
             inject_deadline_priority: self.inject_deadline_priority,
+            background_concurrency_limit: self.background_concurrency_limit,
             batch_claim_size: self.batch_claim_size,
             batch_claim_batch_size: self.batch_claim_batch_size,
             batch_claim_interval_ms: self.batch_claim_interval_ms,
@@ -1789,6 +2230,16 @@ impl DaemonConfig {
             claim_ramp_exponent: self.claim_ramp_exponent,
             claim_loop_max_consecutive_failures: self.claim_loop_max_consecutive_failures,
             claim_query_timeout_ms: self.claim_query_timeout_ms,
+            batch_archive_sweep_enabled: self.batch_archive_sweep_enabled,
+            batch_archive_sweep_interval_ms: self.batch_archive_sweep_interval_ms,
+            batch_archive_sweep_moves_per_tick: self.batch_archive_sweep_moves_per_tick,
+            batch_archive_sweep_dwell_secs: self.batch_archive_sweep_dwell_secs,
+            batch_archive_cancel_grace_secs: self.batch_archive_cancel_grace_secs,
+            batch_archive_backfill_enabled: self.batch_archive_backfill_enabled,
+            batch_archive_backfill_interval_ms: self.batch_archive_backfill_interval_ms,
+            batch_archive_backfill_moves_per_tick: self.batch_archive_backfill_moves_per_tick,
+            batch_archive_backfill_concurrency: self.batch_archive_backfill_concurrency,
+            batch_archive_partitions_weeks_ahead: self.batch_archive_partitions_weeks_ahead,
             ..Default::default()
         }
     }
@@ -2075,6 +2526,17 @@ pub struct CreditsConfig {
     /// `purchase`), so existing paying customers are never matched.
     #[serde(default)]
     pub first_payment_match_up_to: rust_decimal::Decimal,
+    /// Signup credits granted the first time a billing target verifies a payment
+    /// method through setup-mode checkout (`POST /payments/setup`), in dollars.
+    /// 0 disables the grant.
+    ///
+    /// Distinct from `initial_credits_for_standard_users`, which lands at account
+    /// creation for everyone. This one is the onboarding carrot that only pays out
+    /// once a real card has been verified, so it is not farmable by signing up
+    /// repeatedly. Idempotent per checkout session, and granted at most once per
+    /// billing target (see `Credits::grant_verification_credits`).
+    #[serde(default)]
+    pub verification_credits: rust_decimal::Decimal,
 }
 
 impl Default for CreditsConfig {
@@ -2084,6 +2546,8 @@ impl Default for CreditsConfig {
             initial_credits_for_standard_users: rust_decimal::Decimal::ZERO,
             // Default to 0 (first-payment match promotion disabled)
             first_payment_match_up_to: rust_decimal::Decimal::ZERO,
+            // Default to 0 (no signup credits on card verification)
+            verification_credits: rust_decimal::Decimal::ZERO,
         }
     }
 }
@@ -2266,6 +2730,7 @@ impl Default for Config {
             keystore: None,
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
+            continuation: ContinuationConfig::default(),
         }
     }
 }
@@ -2603,6 +3068,26 @@ impl Config {
             });
         }
 
+        if self.background_services.batch_daemon.upload_chunk_bytes == 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: upload_chunk_bytes cannot be 0. Set a positive integer value (default: 65536).".to_string(),
+            });
+        }
+
+        if self.background_services.batch_daemon.upload_stall_poll_ms == 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: upload_stall_poll_ms cannot be 0. Set a positive integer value (default: 100).".to_string(),
+            });
+        }
+
+        let batch_daemon = &self.background_services.batch_daemon;
+        if batch_daemon.background_concurrency_limit > 0 && !batch_daemon.inject_deadline_priority {
+            return Err(Error::Internal {
+                operation: "Config validation: background_concurrency_limit requires inject_deadline_priority=true so background work is always lower priority than SLA work."
+                    .to_string(),
+            });
+        }
+
         // Validate batch file configuration whenever the request manager could be used.
         // The PostgresRequestManager is always constructed and uses these values for its batch
         // insert strategy and buffer sizes. These settings are required when:
@@ -2747,6 +3232,35 @@ impl Config {
 mod tests {
     use super::*;
     use figment::Jail;
+
+    #[test]
+    fn default_auth_roles_include_background_inference() {
+        assert!(AuthConfig::default().default_user_roles.contains(&Role::BackgroundInferenceUser));
+    }
+
+    /// Stamping a key into a batch's metadata does NOTHING unless the key is also on this
+    /// list: fusillade copies only the listed keys onto each claimed request, so an
+    /// unlisted one is written, persisted, and silently never sent as a header — and the
+    /// `http_analytics` column it feeds stays empty with no error anywhere. Every column
+    /// fed this way is asserted here, so removing one from the list fails the build rather
+    /// than the dashboard.
+    #[test]
+    fn forwarded_batch_metadata_covers_every_column_analytics_fills_from_it() {
+        let forwarded = DaemonConfig::default().batch_metadata_fields;
+        // (metadata key, the http_analytics column it lands in)
+        for (key, column) in [
+            ("id", "fusillade_batch_id"),
+            ("completion_window", "batch_sla"),
+            ("created_at", "batch_created_at (batch-creation pricing)"),
+            ("request_source", "batch_request_source"),
+            ("dw_user_agent", "user_agent"),
+        ] {
+            assert!(
+                forwarded.contains(&key.to_string()),
+                "batch metadata key '{key}' is not forwarded, so http_analytics.{column} will never be populated for batch requests"
+            );
+        }
+    }
 
     #[test]
     fn test_model_sources_config() {
@@ -3465,62 +3979,9 @@ batches:
     }
 
     #[test]
-    fn test_priority_decay_window_default_disabled() {
-        let config = Config::default();
-        assert_eq!(config.batches.priority_decay_window_secs, None);
-    }
-
-    #[test]
     fn test_pending_capacity_counts_default_disabled() {
         let config = Config::default();
         assert!(!config.batches.pending_capacity_counts_enabled);
-    }
-
-    #[test]
-    fn test_priority_decay_window_explicit_value() {
-        Jail::expect_with(|jail| {
-            jail.create_file(
-                "test.yaml",
-                r#"
-secret_key: "test-secret-key"
-batches:
-  priority_decay_window_secs: 600
-"#,
-            )?;
-
-            let args = Args {
-                config: "test.yaml".into(),
-                validate: false,
-            };
-            let config = Config::load(&args)?;
-            assert_eq!(config.batches.priority_decay_window_secs, Some(600));
-
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_priority_decay_window_negative_rejected() {
-        Jail::expect_with(|jail| {
-            jail.create_file(
-                "test.yaml",
-                r#"
-secret_key: "test-secret-key"
-batches:
-  priority_decay_window_secs: -1
-"#,
-            )?;
-
-            let args = Args {
-                config: "test.yaml".into(),
-                validate: false,
-            };
-            let result = Config::load(&args);
-            assert!(result.is_err());
-            assert!(result.unwrap_err().to_string().contains("priority_decay_window_secs"));
-
-            Ok(())
-        });
     }
 
     #[test]
@@ -3679,6 +4140,131 @@ auth:
     }
 
     #[test]
+    fn test_additional_retryable_statuses_default_override_and_mapping() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.additional_retryable_statuses, vec![499]);
+            assert_eq!(
+                config
+                    .background_services
+                    .batch_daemon
+                    .to_fusillade_config()
+                    .additional_retryable_statuses,
+                vec![499]
+            );
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    additional_retryable_statuses: []
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert!(config.background_services.batch_daemon.additional_retryable_statuses.is_empty());
+            assert!(
+                config
+                    .background_services
+                    .batch_daemon
+                    .to_fusillade_config()
+                    .additional_retryable_statuses
+                    .is_empty()
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_adaptive_concurrency_default_override_and_mapping() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            // Off by default: turning it on lets a model's limit exceed its
+            // configured value, so it has to be a deliberate opt-in.
+            let config = Config::load(&args)?;
+            assert!(!config.background_services.batch_daemon.adaptive_concurrency);
+            let fusillade_config = config.background_services.batch_daemon.to_fusillade_config();
+            assert!(!fusillade_config.adaptive_concurrency);
+            assert_eq!(fusillade_config.adaptive_growth_factor, 1.5);
+            assert_eq!(fusillade_config.adaptive_cut_factor, 0.8);
+            assert_eq!(fusillade_config.memory_gate_high_fraction, 0.0);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    adaptive_concurrency: true
+    adaptive_growth_factor: 2.0
+    adaptive_cut_factor: 0.5
+    memory_gate_high_fraction: 0.75
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            let fusillade_config = config.background_services.batch_daemon.to_fusillade_config();
+            assert!(fusillade_config.adaptive_concurrency);
+            assert_eq!(fusillade_config.adaptive_growth_factor, 2.0);
+            assert_eq!(fusillade_config.adaptive_cut_factor, 0.5);
+            assert_eq!(fusillade_config.memory_gate_high_fraction, 0.75);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_background_concurrency_limit_yaml_override_and_mapping() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    background_concurrency_limit: 37
+    inject_deadline_priority: true
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            assert_eq!(
+                config
+                    .background_services
+                    .batch_daemon
+                    .to_fusillade_config()
+                    .background_concurrency_limit,
+                37
+            );
+            assert!(
+                config
+                    .background_services
+                    .batch_daemon
+                    .to_fusillade_config()
+                    .inject_deadline_priority
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
     fn test_urgency_weight_default() {
         Jail::expect_with(|jail| {
             jail.create_file(
@@ -3777,6 +4363,134 @@ background_services:
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_daemon_mode_default_and_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.mode, DaemonMode::Both);
+            assert_eq!(
+                fusillade::DaemonMode::from(config.background_services.batch_daemon.mode),
+                fusillade::DaemonMode::Both
+            );
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    mode: request_only
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.mode, DaemonMode::RequestOnly);
+            assert_eq!(
+                fusillade::DaemonMode::from(config.background_services.batch_daemon.mode),
+                fusillade::DaemonMode::RequestOnly
+            );
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    mode: batch_only
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.mode, DaemonMode::BatchOnly);
+            assert_eq!(
+                fusillade::DaemonMode::from(config.background_services.batch_daemon.mode),
+                fusillade::DaemonMode::BatchOnly
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_upload_watchdog_defaults_override_and_mapping() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: test-secret-key\n")?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            let daemon = &config.background_services.batch_daemon;
+            assert_eq!(daemon.upload_stall_timeout_ms, 60_000);
+            assert_eq!(daemon.upload_chunk_bytes, 64 * 1024);
+            assert_eq!(daemon.upload_stall_poll_ms, 100);
+
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    upload_stall_timeout_ms: 30000
+    upload_chunk_bytes: 8192
+    upload_stall_poll_ms: 25
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            let daemon = &config.background_services.batch_daemon;
+            assert_eq!(daemon.upload_stall_timeout_ms, 30_000);
+            assert_eq!(daemon.upload_chunk_bytes, 8 * 1024);
+            assert_eq!(daemon.upload_stall_poll_ms, 25);
+
+            let fusillade = daemon.to_fusillade_config();
+            assert_eq!(fusillade.upload_stall_timeout_ms, 30_000);
+            assert_eq!(fusillade.upload_chunk_bytes, 8 * 1024);
+            assert_eq!(fusillade.upload_stall_poll_ms, 25);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_upload_watchdog_zero_values_rejected() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+
+        config.background_services.batch_daemon.upload_chunk_bytes = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("upload_chunk_bytes cannot be 0"), "{err}");
+
+        config.background_services.batch_daemon.upload_chunk_bytes = 64 * 1024;
+        config.background_services.batch_daemon.upload_stall_poll_ms = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("upload_stall_poll_ms cannot be 0"), "{err}");
+    }
+
+    #[test]
+    fn test_background_processing_requires_priority_injection() {
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.background_services.batch_daemon.background_concurrency_limit = 1;
+        config.background_services.batch_daemon.inject_deadline_priority = false;
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("background_concurrency_limit requires inject_deadline_priority"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3948,6 +4662,138 @@ background_services:
 
             let config = Config::load(&args)?;
             assert_eq!(config.background_services.batch_daemon.urgency_weight, 0.5);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_cancel_grace_secs_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_cancel_grace_secs: -1.0
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("batch_archive_cancel_grace_secs must be non-negative"),
+                "unexpected error: {err}"
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_cancel_grace_secs_non_finite_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_cancel_grace_secs: .inf
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("batch_archive_cancel_grace_secs must be a finite number") || err.contains("invalid"),
+                "unexpected error: {err}"
+            );
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_cancel_grace_secs_null_uses_default() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_cancel_grace_secs: null
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.batch_archive_cancel_grace_secs, 600.0);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_sweep_dwell_secs_negative_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_sweep_dwell_secs: -0.001
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains("seconds value must be non-negative"), "unexpected error: {err}");
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_batch_archive_sweep_dwell_secs_non_finite_rejected() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+background_services:
+  batch_daemon:
+    batch_archive_sweep_dwell_secs: .nan
+"#,
+            )?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let result = Config::load(&args);
+            assert!(result.is_err());
+            let err = result.unwrap_err().to_string();
+            assert!(
+                err.contains("seconds value must be a finite number") || err.contains("invalid"),
+                "unexpected error: {err}"
+            );
 
             Ok(())
         });

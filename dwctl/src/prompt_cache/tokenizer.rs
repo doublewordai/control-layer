@@ -45,6 +45,63 @@ pub struct ModelInfo {
     pub alias: String,
     pub hf_repo: String,
     pub tokenizer_version: String,
+    /// Present when the alias is render-capable (tokenizer-svc ≥ 0.3.0): the hash of
+    /// the chat-template source (or encoder version). Folded into the index scope
+    /// under exact counting so template changes age entries out.
+    #[serde(default)]
+    pub template_version: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct RenderRequest<'a> {
+    virtual_model: &'a str,
+    messages: &'a serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<&'a serde_json::Value>,
+    /// Applies to the MAIN render only; prefix renders are always generation-prompt-off
+    /// server-side (a prefix up to a marker is not a generation view).
+    add_generation_prompt: bool,
+    /// Truncation points to also count (≤5, canonical tools→messages order). The svc
+    /// renders each truncated view independently and returns `prefix_counts` in request
+    /// order. Cache-agnostic: dwctl translates markers into these; the svc never sees
+    /// `cache_control`.
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    prefixes: &'a [WirePrefix],
+    /// The classifier only needs counts; echoing a 64k-token render would be waste.
+    return_rendered: bool,
+}
+
+/// One truncation point, in the svc's wire shape. `message`/`block`/`tool_call` are
+/// INCLUSIVE indices into the request as transmitted; `tools` is a COUNT (the first n
+/// definitions) — per the svc contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum WirePrefix {
+    /// The first `tools` definitions from `tools[]`, no messages.
+    Tools { tools: usize },
+    /// All tools + `messages[0..=message]` complete.
+    Message { message: usize },
+    /// All tools + `messages[0..message]` + message `message` truncated to
+    /// `content[0..=block]`, tool_calls removed.
+    Block { message: usize, block: usize },
+    /// All tools + `messages[0..message]` + message `message` with full content +
+    /// `tool_calls[0..=tool_call]`.
+    ToolCall { message: usize, tool_call: usize },
+}
+
+/// tokenizer-svc `/v1/render` response (0.3.0+): exact chat-templated counts — the
+/// same bytes the engine tokenizes.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RenderResponse {
+    pub virtual_model: String,
+    pub tokenizer_version: String,
+    pub template_version: String,
+    /// Token count of the MAIN render (generation prompt included when requested).
+    pub total: u32,
+    /// One count per requested prefix, in request order. `None` = the template refused
+    /// that truncated view (the caller backfills from raw counts).
+    #[serde(default)]
+    pub prefix_counts: Vec<Option<u32>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +115,11 @@ pub enum TokenizerError {
     /// caching for this request — full price, no customer-facing error.
     #[error("model {0:?} is not mapped in tokenizer-svc")]
     Unmapped(String),
+    /// `/v1/render` cannot template this alias or conversation (`422 NO_CHAT_TEMPLATE`
+    /// or `400 TEMPLATE_RENDER_FAILED`). The caller falls back to raw-segment counting
+    /// — today's accuracy, not an outage.
+    #[error("tokenizer-svc cannot render for {0:?}: {1}")]
+    RenderUnsupported(String, String),
     #[error("tokenizer-svc request failed: {0}")]
     Http(#[from] reqwest::Error),
     #[error("tokenizer-svc returned {status}: {body}")]
@@ -89,8 +151,20 @@ impl TokenizerClient {
     /// segments and the totals reconcile.
     pub async fn tokenize(&self, virtual_model: &str, segments: &[String]) -> TokenizerResult<TokenizeResponse> {
         let start = std::time::Instant::now();
+        let size = cache_metrics::tokenize_size_bucket(segments.iter().map(String::len).sum());
         let result = self.tokenize_inner(virtual_model, segments).await;
-        cache_metrics::record_tokenizer_duration(start.elapsed().as_secs_f64());
+        // Label cardinality guard: only a name tokenizer-svc actually ACCEPTED becomes a
+        // `model` label — an Ok response proves the alias is on the svc's baked map (a bounded,
+        // admin-controlled set), regardless of what this method was called with. Every error
+        // path gets a fixed label: `unmapped` (svc rejected the name) or `error` (timeout /
+        // connection / HTTP — the name was never validated, and error latency is service-wide,
+        // not model-specific). So an unvetted name can never mint a new series, even mid-outage.
+        let model_label = match &result {
+            Ok(_) => virtual_model,
+            Err(TokenizerError::Unmapped(_)) => "unmapped",
+            Err(_) => "error",
+        };
+        cache_metrics::record_tokenizer_duration(model_label, size, start.elapsed().as_secs_f64());
         cache_metrics::record_tokenizer_request(match &result {
             Ok(_) => "ok",
             Err(TokenizerError::Unmapped(_)) => "unmapped_422",
@@ -98,6 +172,80 @@ impl TokenizerClient {
             Err(_) => "transport_error",
         });
         result
+    }
+
+    /// Exact chat-templated counts via `/v1/render` (tokenizer-svc ≥ 0.3.0). Same
+    /// deadline/error/metrics discipline as `tokenize`; `RenderUnsupported` (422
+    /// NO_CHAT_TEMPLATE / 400 TEMPLATE_RENDER_FAILED) tells the caller to fall back to
+    /// raw-segment counting rather than skip caching.
+    pub async fn render(
+        &self,
+        virtual_model: &str,
+        messages: &serde_json::Value,
+        tools: Option<&serde_json::Value>,
+        add_generation_prompt: bool,
+        prefixes: &[WirePrefix],
+    ) -> TokenizerResult<RenderResponse> {
+        let start = std::time::Instant::now();
+        let size = cache_metrics::tokenize_size_bucket(messages.to_string().len() + tools.map(|t| t.to_string().len()).unwrap_or(0));
+        let result = self
+            .render_inner(virtual_model, messages, tools, add_generation_prompt, prefixes)
+            .await;
+        let model_label = match &result {
+            Ok(_) => virtual_model,
+            Err(TokenizerError::Unmapped(_)) => "unmapped",
+            Err(TokenizerError::RenderUnsupported(..)) => "render_unsupported",
+            Err(_) => "error",
+        };
+        cache_metrics::record_tokenizer_duration(model_label, size, start.elapsed().as_secs_f64());
+        cache_metrics::record_tokenizer_request(match &result {
+            Ok(_) => "render_ok",
+            Err(TokenizerError::Unmapped(_)) => "unmapped_422",
+            Err(TokenizerError::RenderUnsupported(..)) => "render_unsupported",
+            Err(TokenizerError::Status { .. }) => "http_error",
+            Err(_) => "transport_error",
+        });
+        result
+    }
+
+    async fn render_inner(
+        &self,
+        virtual_model: &str,
+        messages: &serde_json::Value,
+        tools: Option<&serde_json::Value>,
+        add_generation_prompt: bool,
+        prefixes: &[WirePrefix],
+    ) -> TokenizerResult<RenderResponse> {
+        let resp = self
+            .http
+            .post(format!("{}/v1/render", self.base_url))
+            .json(&RenderRequest {
+                virtual_model,
+                messages,
+                tools,
+                add_generation_prompt,
+                prefixes,
+                return_rendered: false,
+            })
+            .send()
+            .await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(resp.json().await?);
+        }
+        let body = resp.text().await.unwrap_or_default();
+        if status.as_u16() == 422 && body.contains("UNMAPPED_MODEL") {
+            return Err(TokenizerError::Unmapped(virtual_model.to_string()));
+        }
+        if (status.as_u16() == 422 && body.contains("NO_CHAT_TEMPLATE"))
+            || (status.as_u16() == 400 && body.contains("TEMPLATE_RENDER_FAILED"))
+        {
+            return Err(TokenizerError::RenderUnsupported(virtual_model.to_string(), body));
+        }
+        Err(TokenizerError::Status {
+            status: status.as_u16(),
+            body,
+        })
     }
 
     async fn tokenize_inner(&self, virtual_model: &str, segments: &[String]) -> TokenizerResult<TokenizeResponse> {

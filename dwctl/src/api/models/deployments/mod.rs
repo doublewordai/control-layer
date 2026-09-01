@@ -3,12 +3,14 @@
 pub mod enrichment;
 
 use super::pagination::Pagination;
+use crate::api::models::cache_pricing::CachePricingResponse;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::models::deployments::{
     BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy, ModelCatalogMetadata, ModelType,
     ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
 };
+use crate::reasoning::{ReasoningTranslationOverrides, SupportedReasoningEfforts};
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -84,7 +86,7 @@ pub struct ListModelsQuery {
     pub endpoint: Option<InferenceEndpointId>,
     /// Filter by group IDs (comma-separated UUIDs)
     pub group: Option<String>,
-    /// Include related data (comma-separated: "groups", "metrics", "status", "pricing", "endpoints", "facets")
+    /// Include related data (comma-separated: "groups", "metrics", "status", "pricing", "endpoints", "facets", "reasoning_capabilities")
     pub include: Option<String>,
     /// Show deleted models when true, non-deleted when false, all when not specified (admin only for deleted=true)
     pub deleted: Option<bool>,
@@ -102,6 +104,8 @@ pub struct ListModelsQuery {
     pub model_type: Option<ModelType>,
     /// Filter by capability (returns models that have this capability)
     pub capability: Option<String>,
+    /// Filter by realtime availability (true = no realtime deny rule, false = realtime deny rule)
+    pub available_for_realtime: Option<bool>,
     /// Sort field (default: created_at)
     pub sort: Option<ModelSortField>,
     /// Sort direction (default depends on sort field)
@@ -115,7 +119,8 @@ pub struct GetModelQuery {
     pub deleted: Option<bool>,
     /// Show inactive model when true, 404 when false/unspecified if model is inactive
     pub inactive: Option<bool>,
-    /// Include related data (comma-separated: "groups", "metrics", "status", "pricing", "endpoints")
+    /// Include related data (comma-separated: "groups", "metrics", "status", "pricing", "endpoints").
+    /// Pricing includes active customer tariffs and prompt-cache pricing.
     pub include: Option<String>,
 }
 
@@ -233,9 +238,9 @@ pub struct StandardModelCreate {
     /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
     #[serde(default)]
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
-    #[serde(default)]
-    pub open_responses_adapter: Option<bool>,
+    /// Per-surface overrides for the endpoint's provider reasoning translations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
     /// Insert an exponential backoff between retry attempts. For a standard
     /// (single-provider) model, enabling this implicitly also turns on
     /// fallback + with_replacement so that the same provider can be retried
@@ -301,7 +306,9 @@ pub struct CompositeModelCreate {
     /// Whether to trigger fallback on rate limit responses (defaults to true)
     #[serde(default = "default_true")]
     pub fallback_on_rate_limit: bool,
-    /// HTTP status codes that trigger fallback (defaults to [500, 502, 503, 504])
+    /// HTTP status codes that trigger fallback (defaults to [499, 500, 502, 503, 504]).
+    /// Rate-limit responses are controlled separately by `fallback_on_rate_limit`,
+    /// which defaults to true.
     #[serde(default = "default_fallback_statuses")]
     pub fallback_on_status: Vec<i32>,
     /// Sample with replacement during weighted random failover (defaults to false)
@@ -337,9 +344,6 @@ pub struct CompositeModelCreate {
     /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
     #[serde(default)]
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
-    #[serde(default)]
-    pub open_responses_adapter: Option<bool>,
     /// Traffic routing rules evaluated against API key labels.
     /// Each rule matches on key labels (e.g., purpose) and either denies or redirects traffic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -358,7 +362,7 @@ fn default_true() -> bool {
 }
 
 fn default_fallback_statuses() -> Vec<i32> {
-    vec![500, 502, 503, 504]
+    vec![499, 500, 502, 503, 504]
 }
 
 fn default_backoff_initial_ms() -> i32 {
@@ -447,9 +451,9 @@ pub struct DeployedModelUpdate {
     /// Whether to mark provider as trusted in strict mode (null = no change, used when strict_mode=true)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter (null = no change)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub open_responses_adapter: Option<bool>,
+    /// Reasoning translation overrides (omitted = unchanged, null = inherit both endpoint defaults).
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub reasoning_translation_overrides: Option<Option<ReasoningTranslationOverrides>>,
     /// Traffic routing rules (null = no change, Some(None) = clear, Some(rules) = set)
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub traffic_routing_rules: Option<Option<Vec<TrafficRoutingRule>>>,
@@ -533,6 +537,9 @@ pub struct DeployedModelResponse {
     /// Provider/downstream pricing details (only included if requested and user has Pricing::ReadAll)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_pricing: Option<ProviderPricing>,
+    /// Active customer prompt-cache pricing (only included when include=pricing)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_pricing: Option<CachePricingResponse>,
     /// Inference endpoint information (only included if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<super::inference_endpoints::InferenceEndpointResponse>,
@@ -559,9 +566,12 @@ pub struct DeployedModelResponse {
     /// Whether to mark provider as trusted in strict mode (used when strict_mode=true)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trusted: Option<bool>,
-    /// Whether the open_responses adapter is enabled (converts /v1/responses to /v1/chat/completions)
+    /// Provider reasoning translation overrides. Omitted for composite models.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub open_responses_adapter: Option<bool>,
+    pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
+    /// Reasoning efforts supported by every provider behind this model (only included if requested)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported_reasoning_efforts: Option<SupportedReasoningEfforts>,
     /// Traffic routing rules evaluated against API key labels
     #[serde(skip_serializing_if = "Option::is_none")]
     pub traffic_routing_rules: Option<Vec<TrafficRoutingRule>>,
@@ -618,6 +628,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             metrics: None,          // By default, metrics are not included
             status: None,           // By default, probe status is not included
             provider_pricing: None, // By default, provider pricing is not included
+            cache_pricing: None,    // By default, cache pricing is not included
             endpoint: None,         // By default, endpoint is not included
             tariffs: None,          // By default, tariffs are not included
             // Composite model fields
@@ -627,7 +638,12 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             components: None, // By default, components are not included
             sanitize_responses: Some(db.sanitize_responses),
             trusted: Some(db.trusted),
-            open_responses_adapter: Some(db.open_responses_adapter),
+            reasoning_translation_overrides: if db.is_composite {
+                None
+            } else {
+                Some(db.reasoning_translation_overrides.unwrap_or_default())
+            },
+            supported_reasoning_efforts: None,
             traffic_routing_rules: None, // Populated via enrichment (with_traffic_rules)
             allowed_batch_completion_windows: db.allowed_batch_completion_windows,
             metadata: serde_json::from_value::<ModelCatalogMetadata>(db.metadata)
@@ -660,6 +676,18 @@ impl DeployedModelResponse {
     /// Create a response with provider pricing included (admin only)
     pub fn with_provider_pricing(mut self, provider_pricing: Option<ProviderPricing>) -> Self {
         self.provider_pricing = provider_pricing;
+        self
+    }
+
+    /// Create a response with cache pricing included.
+    pub fn with_cache_pricing(mut self, cache_pricing: CachePricingResponse) -> Self {
+        self.cache_pricing = Some(cache_pricing);
+        self
+    }
+
+    /// Create a response with supported reasoning efforts included
+    pub fn with_supported_reasoning_efforts(mut self, supported_reasoning_efforts: Option<SupportedReasoningEfforts>) -> Self {
+        self.supported_reasoning_efforts = supported_reasoning_efforts;
         self
     }
 
@@ -697,7 +725,7 @@ impl DeployedModelResponse {
     pub fn mask_response_config(mut self) -> Self {
         self.sanitize_responses = None;
         self.trusted = None;
-        self.open_responses_adapter = None;
+        self.reasoning_translation_overrides = None;
         self
     }
 
@@ -796,6 +824,57 @@ impl DeployedModelResponse {
 
 // ===== Composite Model Component Types =====
 
+/// Which of a composite's named pools a membership belongs to.
+///
+/// A composite is a set of named pools, and onwards resolves `request class ->
+/// pool` before it selects a provider. `Default` is the pool that serves every
+/// class without a pool of its own — exactly the single member list that
+/// existed before pools — so an unqualified component is unchanged.
+///
+/// The same hosted model may be a member of more than one pool (dynamo at
+/// position 0 of both), with independent ordering in each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentPool {
+    /// Serves every request class that has no pool of its own. The default, so
+    /// adding a component never silently creates a continuation target.
+    #[default]
+    Default,
+    /// Serves `/v1/completions` — token-id continuation resume legs and
+    /// ordinary completions traffic alike. Members here are validated
+    /// continuation targets; "never serves chat" is structural, because they
+    /// are simply not members of the default pool.
+    Completions,
+}
+
+impl ComponentPool {
+    /// The stored/wire value, bounded by the column's CHECK constraint.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComponentPool::Default => "default",
+            ComponentPool::Completions => "completions",
+        }
+    }
+
+    /// Parse a stored value, falling back to the column default for anything
+    /// unrecognised (a row can only hold what the CHECK constraint allows).
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "completions" => ComponentPool::Completions,
+            _ => ComponentPool::Default,
+        }
+    }
+}
+
+/// Which pool a component request addresses. Omitted ⇒ `default`, so every
+/// existing caller keeps addressing the pool it always did.
+#[derive(Debug, Clone, Copy, Default, Deserialize, IntoParams)]
+pub struct ComponentPoolQuery {
+    /// The pool this component belongs to. Defaults to `default`.
+    #[serde(default)]
+    pub pool: ComponentPool,
+}
+
 /// Request to add a component to a composite model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelComponentCreate {
@@ -810,6 +889,10 @@ pub struct ModelComponentCreate {
     /// PATCH endpoint's `sort_order` to reorder. Retained for API compatibility.
     #[serde(default)]
     pub sort_order: i32,
+    /// Which of the composite's pools to add this member to. Defaults to
+    /// `default`.
+    #[serde(default)]
+    pub pool: ComponentPool,
 }
 
 fn default_weight() -> i32 {
@@ -832,6 +915,9 @@ pub struct ModelComponentUpdate {
     /// dense, unique 0..n-1 sequence — two components can never share a position.
     /// Out-of-range values are clamped. Omit to leave the order unchanged.
     pub sort_order: Option<i32>,
+    // A component's pool is not updatable: it is part of which membership this
+    // is (the request addresses it with `?pool=`), not a property of one. Move
+    // a member between pools by removing it from one and adding it to the other.
 }
 
 /// Summary of a model used as a component in a composite model
@@ -852,8 +938,6 @@ pub struct ComponentModelSummary {
     pub endpoint: Option<ComponentEndpointSummary>,
     /// Whether to mark provider as trusted in strict mode
     pub trusted: bool,
-    /// Whether the open_responses adapter is enabled
-    pub open_responses_adapter: bool,
 }
 
 /// Summary of an endpoint hosting a component model
@@ -873,6 +957,8 @@ pub struct ModelComponentResponse {
     pub weight: i32,
     /// Whether this component is enabled
     pub enabled: bool,
+    /// Which of the composite's pools this membership belongs to
+    pub pool: ComponentPool,
     /// Sort order for priority-based routing (lower = higher priority)
     pub sort_order: i32,
     /// When this component was added

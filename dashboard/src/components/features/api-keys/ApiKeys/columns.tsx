@@ -1,14 +1,44 @@
 "use client";
 
 import { type ColumnDef } from "@tanstack/react-table";
-import { ArrowUpDown, Trash2, Key } from "lucide-react";
+import { ArrowUpDown, Trash2, Pencil, RefreshCw, Eye } from "lucide-react";
 import { Button } from "../../../ui/button";
 import { Checkbox } from "../../../ui/checkbox";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../../../ui/tooltip";
 import type { ApiKey } from "../../../../api/control-layer/types";
+import {
+  formatCredits,
+  formatResetInstant,
+  limitPeriodLabel,
+} from "./spendCap";
 
 interface ColumnActions {
   onDelete: (apiKey: ApiKey) => void;
+  onEdit: (apiKey: ApiKey) => void;
+  /** Whether the current user may manage this key (rename, edit caps,
+   *  delete). Mirrors what the server permits: PlatformManager, org
+   *  owner/admin in org context, or the key's creator when they hold
+   *  self-manage rights in the active context. */
+  canManage: (apiKey: ApiKey) => boolean;
+  /** Whether the current user may rotate this key. Broader than canManage:
+   *  rotation is the secret-recovery path, so members without creation
+   *  rights can still rotate keys they hold. */
+  canRotate: (apiKey: ApiKey) => boolean;
   isPlatformManager?: boolean;
+  /** Org context only: show the holder of each key, resolved from the org
+   *  members list via created_by. */
+  showAssignee?: boolean;
+  resolveAssignee?: (createdBy: string) => string;
+  onRotate: (apiKey: ApiKey) => void;
+  /** Whether the current user may use the ONE-OFF reveal on this key: they
+   *  are its holder and the reveal hasn't been consumed. While true, Reveal
+   *  replaces Rotate for them (rotating before ever seeing the secret makes
+   *  no sense); admins keep plain Rotate throughout. */
+  canReveal: (apiKey: ApiKey) => boolean;
+  onReveal: (apiKey: ApiKey) => void;
+  /** Hide the bulk-select column (e.g. members without key-creation rights
+   *  can't delete). */
+  showSelect?: boolean;
 }
 
 export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
@@ -52,42 +82,66 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
       },
       cell: ({ row }) => {
         const apiKey = row.original;
+        const isPlatform = apiKey.purpose === "platform";
         return (
-          <div className="flex items-center gap-2">
-            <Key className="w-4 h-4 text-doubleword-neutral-500" />
-            <span className="font-medium">{apiKey.name}</span>
+          <div className="flex flex-col gap-0.5">
+            <div className="flex items-center gap-2">
+              <span className="font-semibold text-doubleword-neutral-900">
+                {apiKey.name}
+              </span>
+              <span
+                className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
+                  isPlatform
+                    ? "bg-purple-100 text-purple-800"
+                    : "bg-blue-100 text-blue-800"
+                }`}
+              >
+                {isPlatform ? "Platform" : "Inference"}
+              </span>
+            </div>
+            {apiKey.description && (
+              <span className="text-sm text-doubleword-neutral-600">
+                {apiKey.description}
+              </span>
+            )}
           </div>
         );
       },
     },
     {
-      accessorKey: "description",
-      header: "Description",
+      id: "assignee",
+      header: "Assignee",
       cell: ({ row }) => {
-        const description = row.getValue("description") as string | null;
+        const apiKey = row.original;
         return (
-          <span className="text-doubleword-neutral-600">
-            {description || "-"}
-          </span>
-        );
-      },
-    },
-    {
-      accessorKey: "purpose",
-      header: "Purpose",
-      cell: ({ row }) => {
-        const purpose = row.getValue("purpose") as string;
-        const isPlatform = purpose === "platform";
-        return (
-          <span
-            className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${
-              isPlatform
-                ? "bg-purple-100 text-purple-800"
-                : "bg-blue-100 text-blue-800"
-            }`}
-          >
-            {isPlatform ? "Platform" : "Inference"}
-          </span>
+          <div className="flex flex-col gap-0.5">
+            <span className="text-sm text-doubleword-neutral-700">
+              {actions.resolveAssignee
+                ? actions.resolveAssignee(apiKey.created_by)
+                : apiKey.created_by}
+            </span>
+            {/* Issued-key engagement signal for managers: once the holder
+                has opened (revealed) the key it's live on their side —
+                don't rotate it without cause. */}
+            {apiKey.secret_revealed_at == null ? (
+              <span className="text-xs text-amber-700">Not opened yet</span>
+            ) : (
+              <span className="text-xs text-doubleword-neutral-400">
+                Opened{" "}
+                {/* Fixed to UTC: local-tz rendering shifts dates around
+                    midnight per viewer and makes tests flaky. */}
+                {new Date(apiKey.secret_revealed_at).toLocaleDateString(
+                  "en-US",
+                  {
+                    year: "numeric",
+                    month: "short",
+                    day: "numeric",
+                    timeZone: "UTC",
+                  },
+                )}
+              </span>
+            )}
+          </div>
         );
       },
     },
@@ -123,6 +177,58 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
     //   },
     // },
     {
+      id: "usageLimit",
+      header: "Usage Limit",
+      cell: ({ row }) => {
+        const apiKey = row.original;
+        if (apiKey.spend_limit === null || apiKey.spend_limit === undefined) {
+          return (
+            <span className="text-doubleword-neutral-400 text-sm italic">
+              No limit
+            </span>
+          );
+        }
+        const spent = Number(apiKey.spend ?? 0);
+        const limit = Number(apiKey.spend_limit);
+        const capReached = limit > 0 && spent >= limit;
+        const pct =
+          limit > 0 ? Math.min(100, Math.round((spent / limit) * 100)) : 0;
+        return (
+          <div
+            className="min-w-40 flex flex-col gap-0.5"
+            aria-label="Usage limit"
+          >
+            <span className="flex items-center gap-2 text-sm font-medium text-doubleword-neutral-900">
+              {formatCredits(apiKey.spend ?? "0")} /{" "}
+              {formatCredits(apiKey.spend_limit)}
+              {capReached && (
+                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-800">
+                  Cap reached
+                </span>
+              )}
+            </span>
+            <div
+              className="h-1.5 w-full rounded bg-doubleword-neutral-100"
+              role="progressbar"
+              aria-valuenow={pct}
+              aria-valuemin={0}
+              aria-valuemax={100}
+            >
+              <div
+                className={`h-1.5 rounded ${capReached ? "bg-red-500" : "bg-doubleword-neutral-500"}`}
+                style={{ width: `${pct}%` }}
+              />
+            </div>
+            <span className="text-sm text-doubleword-neutral-600">
+              {limitPeriodLabel(apiKey.spend_limit_interval)}
+              {apiKey.resets_at &&
+                ` · resets ${formatResetInstant(apiKey.resets_at)}`}
+            </span>
+          </div>
+        );
+      },
+    },
+    {
       accessorKey: "created_at",
       header: ({ column }) => {
         return (
@@ -139,7 +245,8 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
         const date = new Date(row.getValue("created_at"));
         return (
           <span className="text-doubleword-neutral-600">
-            {date.toLocaleDateString("en-US", {
+            Created:{" "}
+            {date.toLocaleDateString("en-GB", {
               year: "numeric",
               month: "short",
               day: "numeric",
@@ -153,27 +260,99 @@ export const createColumns = (actions: ColumnActions): ColumnDef<ApiKey>[] => {
       header: "Actions",
       cell: ({ row }) => {
         const apiKey = row.original;
+        const canManage = actions.canManage(apiKey);
+        const canReveal = actions.canReveal(apiKey);
+        // While the holder's one-off reveal is pending, it REPLACES rotate
+        // for them — rotating a secret you've never seen makes no sense.
+        const canRotate = !canReveal && actions.canRotate(apiKey);
 
+        if (!canManage && !canRotate && !canReveal) {
+          // View-only rows: no mutating actions.
+          return null;
+        }
+
+        // Icon-only buttons need hover tooltips — Reveal vs Rotate are
+        // both circular-arrow-adjacent glyphs and easily confused. No
+        // TooltipProvider here: the ui/tooltip Tooltip wraps itself in one
+        // (delay 0), so an outer provider is inert.
         return (
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => actions.onDelete(apiKey)}
-            className="text-red-600 hover:text-red-700 hover:bg-red-50"
-          >
-            <Trash2 className="h-4 w-4" />
-          </Button>
+          <div className="flex items-center">
+            {canManage && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => actions.onEdit(apiKey)}
+                    aria-label={`Edit usage limit for ${apiKey.name}`}
+                    className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+                  >
+                    <Pencil className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Edit usage limit</TooltipContent>
+              </Tooltip>
+            )}
+            {canReveal && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => actions.onReveal(apiKey)}
+                    aria-label={`Reveal ${apiKey.name}`}
+                    className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+                  >
+                    <Eye className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Reveal secret (one-off)</TooltipContent>
+              </Tooltip>
+            )}
+            {canRotate && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => actions.onRotate(apiKey)}
+                    aria-label={`Rotate ${apiKey.name}`}
+                    className="text-doubleword-neutral-600 hover:text-doubleword-neutral-900"
+                  >
+                    <RefreshCw className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Rotate secret</TooltipContent>
+              </Tooltip>
+            )}
+            {canManage && (
+              <Tooltip>
+                <TooltipTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => actions.onDelete(apiKey)}
+                    aria-label={`Delete ${apiKey.name}`}
+                    className="text-red-600 hover:text-red-700 hover:bg-red-50"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
+                </TooltipTrigger>
+                <TooltipContent>Delete key</TooltipContent>
+              </Tooltip>
+            )}
+          </div>
         );
       },
     },
   ];
 
-  // Filter out the purpose column if user is not a platform manager
-  if (!actions.isPlatformManager) {
-    return allColumns.filter(
-      (col) => !("accessorKey" in col) || col.accessorKey !== "purpose",
-    );
-  }
-
-  return allColumns;
+  // The key-type badge rides inline on the Name column for everyone; the
+  // Assignee column only appears in org context, and the bulk-select column
+  // is dropped for users who can't delete anything anyway.
+  return allColumns.filter((col) => {
+    if (col.id === "assignee" && !actions.showAssignee) return false;
+    if (col.id === "select" && actions.showSelect === false) return false;
+    return true;
+  });
 };

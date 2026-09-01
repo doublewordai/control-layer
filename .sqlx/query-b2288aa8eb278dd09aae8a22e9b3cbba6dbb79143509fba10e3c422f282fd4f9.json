@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM request_templates WHERE id = ANY($1) AND file_id IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b2288aa8eb278dd09aae8a22e9b3cbba6dbb79143509fba10e3c422f282fd4f9"
+}

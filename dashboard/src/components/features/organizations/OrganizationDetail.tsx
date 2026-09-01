@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { ArrowLeft } from "lucide-react";
 import { MemberManagement } from "./MemberManagement";
 import { EditOrganizationModal } from "./EditOrganizationModal";
+import { PendingEmailChangeBadge } from "./PendingEmailChangeBadge";
 
 export function OrganizationDetail() {
   const { organizationId } = useParams<{ organizationId: string }>();
@@ -48,6 +49,10 @@ export function OrganizationDetail() {
           </h1>
           <div className="flex items-center gap-3 mt-1 text-sm text-muted-foreground flex-wrap">
             <span>{org.email}</span>
+            <PendingEmailChangeBadge
+              pending={org.pending_email_change}
+              currentEmail={org.email}
+            />
             <span>·</span>
             <span>{org.member_count ?? 0} members</span>
             {org.credit_balance !== undefined && (

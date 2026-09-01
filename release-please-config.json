@@ -1,10 +1,40 @@
 {
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "include-component-in-tag": false,
+  "separate-pull-requests": true,
   "packages": {
-    "dwctl": {
+    ".": {
+      "component": "dwctl",
+      "package-name": "dwctl",
+      "release-type": "simple",
+      "changelog-path": "CHANGELOG.md",
+      "extra-files": [
+        {
+          "type": "generic",
+          "path": "dwctl/Cargo.toml"
+        }
+      ]
+    },
+    "fusillade-arsenal": {
+      "component": "fusillade-arsenal",
+      "package-name": "fusillade-arsenal",
       "release-type": "rust",
-      "changelog-path": "/CHANGELOG.md"
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": true
+    },
+    "fusillade-core": {
+      "component": "fusillade-core",
+      "package-name": "fusillade-core",
+      "release-type": "rust",
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": true
+    },
+    "onwards": {
+      "component": "onwards",
+      "package-name": "onwards",
+      "release-type": "rust",
+      "changelog-path": "CHANGELOG.md",
+      "include-component-in-tag": true
     }
-  },
-  "plugins": ["cargo-workspace"],
-  "include-component-in-tag": false
+  }
 }

@@ -63,7 +63,10 @@ impl Modify for AdminSecurityAddon {
         api::handlers::api_keys::list_user_api_keys,
         api::handlers::api_keys::create_user_api_key,
         api::handlers::api_keys::get_user_api_key,
+        api::handlers::api_keys::update_user_api_key,
         api::handlers::api_keys::delete_user_api_key,
+        api::handlers::api_keys::rotate_user_api_key,
+        api::handlers::api_keys::reveal_user_api_key,
         api::handlers::inference_endpoints::list_inference_endpoints,
         api::handlers::inference_endpoints::get_inference_endpoint,
         api::handlers::inference_endpoints::create_inference_endpoint,
@@ -122,10 +125,11 @@ impl Modify for AdminSecurityAddon {
         api::handlers::requests::list_requests,
         api::handlers::requests::aggregate_requests,
         api::handlers::requests::aggregate_by_user,
-        api::handlers::queue::get_pending_request_counts,
+        api::handlers::queue::get_demand,
     ),
     components(
         schemas(
+            api::handlers::queue::DemandResponse,
             api::models::auth::RegisterRequest,
             api::models::auth::LoginRequest,
             api::models::auth::AuthResponse,
@@ -141,6 +145,7 @@ impl Modify for AdminSecurityAddon {
             api::models::api_keys::ListApiKeysQuery,
             api::models::api_keys::ApiKeyResponse,
             api::models::api_keys::ApiKeyInfoResponse,
+            api::models::api_keys::ApiKeySecretResponse,
             api::models::deployments::DeployedModelCreate,
             api::models::deployments::DeployedModelUpdate,
             api::models::deployments::DeployedModelUpdateRequest,
@@ -225,3 +230,26 @@ impl Modify for AdminSecurityAddon {
     ),
 )]
 pub struct AdminApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use utoipa::OpenApi;
+
+    /// `CurrentUser.api_key_id` is internal-only auth context (`#[serde(skip)]`);
+    /// utoipa honors serde skip, so it must not appear in the published schema.
+    /// Guards against the field leaking if the serde attribute is ever dropped.
+    #[test]
+    fn current_user_schema_omits_internal_api_key_id() {
+        let spec = AdminApiDoc::openapi();
+        let schema = spec
+            .components
+            .as_ref()
+            .expect("spec has components")
+            .schemas
+            .get("CurrentUser")
+            .expect("CurrentUser schema present");
+        let json = serde_json::to_string(schema).unwrap();
+        assert!(!json.contains("api_key_id"), "api_key_id leaked into CurrentUser schema: {json}");
+    }
+}

@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT u.user_type AS \"user_type!\",\n               uo.role AS \"role?\",\n               EXISTS(\n                   SELECT 1 FROM organization_member_roles omr\n                   WHERE omr.user_organization_id = uo.id AND omr.role = 'manage_keys'\n               ) AS \"has_manage_keys!\"\n        FROM users u\n        LEFT JOIN user_organizations uo\n               ON uo.organization_id = u.id\n              AND uo.user_id = $2\n              AND uo.status = 'active'\n        WHERE u.id = $1\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_type!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "role?",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "has_manage_keys!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "9a01888d8115b33d7a0506dafcd223efcb60fdc50a67ada7fd4ab3e5fbc81a19"
+}

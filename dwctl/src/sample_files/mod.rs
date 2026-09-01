@@ -196,7 +196,7 @@ mod tests {
             lb_strategy: crate::db::models::deployments::LoadBalancingStrategy::default(),
             fallback_enabled: true,
             fallback_on_rate_limit: true,
-            fallback_on_status: vec![429, 500, 502, 503, 504],
+            fallback_on_status: vec![429, 499, 500, 502, 503, 504],
             fallback_with_replacement: false,
             fallback_max_attempts: None,
             backoff_enabled: false,
@@ -207,7 +207,7 @@ mod tests {
             backoff_max_total_ms: None,
             sanitize_responses: true,
             trusted: false,
-            open_responses_adapter: true,
+            reasoning_translation_overrides: None,
             allowed_batch_completion_windows: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
         }

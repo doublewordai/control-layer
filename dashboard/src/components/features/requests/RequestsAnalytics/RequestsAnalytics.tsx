@@ -117,6 +117,9 @@ export function RequestsAnalytics({
     selectedModelPendingCounts?.["24h"] ??
     selectedModelPendingCounts?.["24hr"] ??
     0;
+  const pendingBackground =
+    selectedModelPendingCounts?.background ??
+    0;
 
   // Show loading state
   if (isLoading) {
@@ -267,6 +270,15 @@ export function RequestsAnalytics({
                   <p className="text-sm text-doubleword-neutral-600">24 hr</p>
                   <div className="text-3xl font-bold">
                     {pending24h.toLocaleString()}
+                  </div>
+                </div>
+                <div className="w-px bg-border mx-4"></div>
+                <div className="text-center">
+                  <p className="text-sm text-doubleword-neutral-600">
+                    Background
+                  </p>
+                  <div className="text-3xl font-bold">
+                    {pendingBackground.toLocaleString()}
                   </div>
                 </div>
               </>

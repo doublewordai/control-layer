@@ -14,8 +14,6 @@ import {
   GripVertical,
   Shield,
   ShieldOff,
-  Zap,
-  ZapOff,
 } from "lucide-react";
 import {
   DndContext,
@@ -85,6 +83,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "../../../ui/tooltip";
+import { buildFallbackUpdatePayload } from "../../../../utils/fallbackStatusCodes";
 
 interface ProvidersTabProps {
   model: Model;
@@ -102,7 +101,6 @@ const ProviderRow: React.FC<{
   onRemove: () => void;
   onToggle: () => void;
   onToggleTrusted?: () => void;
-  onToggleAdapter?: () => void;
   canManage: boolean;
   isUpdating: boolean;
   strictModeEnabled?: boolean;
@@ -122,7 +120,6 @@ const ProviderRow: React.FC<{
   onRemove,
   onToggle,
   onToggleTrusted,
-  onToggleAdapter,
   canManage,
   isUpdating,
   strictModeEnabled,
@@ -273,30 +270,6 @@ const ProviderRow: React.FC<{
                   </TooltipContent>
                 </Tooltip>
               )}
-              {strictModeEnabled && onToggleAdapter && (
-                <Tooltip>
-                  <TooltipTrigger asChild>
-                    <Button
-                      variant="ghost"
-                      size="icon"
-                      onClick={onToggleAdapter}
-                      disabled={isUpdating}
-                      className="h-8 w-8"
-                    >
-                      {(component.model.open_responses_adapter ?? true) ? (
-                        <Zap className="h-4 w-4 text-yellow-500 fill-yellow-100" />
-                      ) : (
-                        <ZapOff className="h-4 w-4 text-gray-400" />
-                      )}
-                    </Button>
-                  </TooltipTrigger>
-                  <TooltipContent side="top">
-                    {(component.model.open_responses_adapter ?? true)
-                      ? "Responses API adapter enabled"
-                      : "Responses API adapter disabled"}
-                  </TooltipContent>
-                </Tooltip>
-              )}
               {!isPriorityMode && (
                 <Button
                   variant="ghost"
@@ -352,7 +325,6 @@ const SortableProviderRow: React.FC<{
   onRemove: () => void;
   onToggle: () => void;
   onToggleTrusted?: () => void;
-  onToggleAdapter?: () => void;
   canManage: boolean;
   isUpdating: boolean;
   strictModeEnabled?: boolean;
@@ -751,6 +723,9 @@ const EditRoutingModal: React.FC<{
   const [fallbackOn429, setFallbackOn429] = useState(
     model.fallback?.on_status?.includes(429) ?? false,
   );
+  const [fallbackOn499, setFallbackOn499] = useState(
+    model.fallback?.on_status?.includes(499) ?? false,
+  );
   const [fallbackOn404, setFallbackOn404] = useState(
     model.fallback?.on_status?.includes(404) ?? false,
   );
@@ -772,6 +747,7 @@ const EditRoutingModal: React.FC<{
     setFallbackEnabled(model.fallback?.enabled ?? false);
     setFallbackOnRateLimit(model.fallback?.on_rate_limit ?? false);
     setFallbackOn429(model.fallback?.on_status?.includes(429) ?? false);
+    setFallbackOn499(model.fallback?.on_status?.includes(499) ?? false);
     setFallbackOn404(model.fallback?.on_status?.includes(404) ?? false);
     setFallbackOn5xx(
       model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false,
@@ -781,28 +757,24 @@ const EditRoutingModal: React.FC<{
   }, [model]);
 
   const handleSubmit = async () => {
-    // Build on_status array
-    const onStatus: number[] = [];
-    if (fallbackOn429) {
-      onStatus.push(429);
-    }
-    if (fallbackOn404) {
-      onStatus.push(404);
-    }
-    if (fallbackOn5xx) {
-      onStatus.push(500, 502, 503, 504);
-    }
+    const fallbackUpdate = buildFallbackUpdatePayload({
+      fallbackEnabled,
+      fallbackOnRateLimit,
+      originalStatuses: model.fallback?.on_status ?? [],
+      on429: fallbackOn429,
+      on499: fallbackOn499,
+      on404: fallbackOn404,
+      on5xx: fallbackOn5xx,
+      withReplacement,
+      maxAttempts,
+    });
 
     try {
       await updateMutation.mutateAsync({
         id: model.id,
         data: {
           lb_strategy: strategy,
-          fallback_enabled: fallbackEnabled,
-          fallback_on_rate_limit: fallbackEnabled ? fallbackOnRateLimit : false,
-          fallback_on_status: fallbackEnabled ? onStatus : [],
-          fallback_with_replacement: fallbackEnabled ? withReplacement : false,
-          fallback_max_attempts: fallbackEnabled ? maxAttempts : null,
+          ...fallbackUpdate,
         },
       });
       onClose();
@@ -906,6 +878,19 @@ const EditRoutingModal: React.FC<{
                   <Switch
                     checked={fallbackOn429}
                     onCheckedChange={setFallbackOn429}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label className="text-sm">Request cancelled (499)</Label>
+                    <p className="text-xs text-gray-500">
+                      When the provider cancels an in-flight request
+                    </p>
+                  </div>
+                  <Switch
+                    checked={fallbackOn499}
+                    onCheckedChange={setFallbackOn499}
                   />
                 </div>
 
@@ -1019,12 +1004,23 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
   const queryClient = useQueryClient();
 
   const {
-    data: components,
+    data: allComponents,
     isLoading,
     error,
   } = useModelComponents(model.id, {
     enabled: model.is_composite === true,
   });
+
+  // This tab manages CHAT serving, i.e. the default pool only. The list
+  // endpoint returns memberships from every pool, and the PATCH/DELETE
+  // endpoints default to the default-pool membership — so rendering (and
+  // reordering/toggling) completions-pool rows here would silently write to
+  // the wrong membership and scramble chat failover. Completions pools get
+  // their own pool-aware surface later.
+  const components = React.useMemo(
+    () => allComponents?.filter((c) => (c.pool ?? "default") === "default"),
+    [allComponents],
+  );
 
   const updateComponentMutation = useUpdateModelComponent();
   const removeMutation = useRemoveModelComponent();
@@ -1094,8 +1090,14 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     const previousComponents =
       queryClient.getQueryData<ModelComponent[]>(queryKey);
 
-    // Create optimistically updated components with new sort_order
-    const optimisticComponents = components.map((component) => {
+    // Create optimistically updated components with new sort_order. Built from
+    // the UNFILTERED list (the query cache holds every pool's memberships) but
+    // scoped to default-pool rows: the same deployment can also hold a
+    // completions membership whose sort_order must not be touched.
+    const isDefaultPool = (c: ModelComponent) =>
+      (c.pool ?? "default") === "default";
+    const optimisticComponents = (allComponents ?? []).map((component) => {
+      if (!isDefaultPool(component)) return component;
       const update = updates.find(
         (u) => u.componentModelId === component.model.id,
       );
@@ -1113,7 +1115,8 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     try {
       for (const update of updates) {
         const currentComponent = previousComponents?.find(
-          (c) => c.model.id === update.componentModelId,
+          (c) =>
+            isDefaultPool(c) && c.model.id === update.componentModelId,
         );
         // Only update if sort_order actually changed
         if (
@@ -1145,13 +1148,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     await updateModelMutation.mutateAsync({
       id: component.model.id,
       data: { trusted: !component.model.trusted },
-    });
-  };
-
-  const handleToggleAdapter = async (component: ModelComponent) => {
-    await updateModelMutation.mutateAsync({
-      id: component.model.id,
-      data: { open_responses_adapter: !(component.model.open_responses_adapter ?? true) },
     });
   };
 
@@ -1220,14 +1216,18 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
     }
     if (model.fallback.on_status && model.fallback.on_status.length > 0) {
       const has429 = model.fallback.on_status.includes(429);
+      const has499 = model.fallback.on_status.includes(499);
       const has404 = model.fallback.on_status.includes(404);
       const serverErrors = model.fallback.on_status.filter((s) => s >= 500);
       const otherErrors = model.fallback.on_status.filter(
-        (s) => s < 500 && s !== 429 && s !== 404,
+        (s) => s < 500 && s !== 429 && s !== 499 && s !== 404,
       );
       // Upstream 429 = when the provider returns rate limit errors
       if (has429) {
         fallbackTriggers.push("Provider rate limit (429)");
+      }
+      if (has499) {
+        fallbackTriggers.push("Request cancelled (499)");
       }
       // Upstream 404 = e.g. a self-hosted model that isn't currently live
       if (has404) {
@@ -1438,7 +1438,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                         onRemove={() => setRemovingComponent(component)}
                         onToggle={() => handleToggle(component)}
                         onToggleTrusted={() => handleToggleTrusted(component)}
-                        onToggleAdapter={() => handleToggleAdapter(component)}
                         canManage={canManage}
                         isUpdating={
                           updateComponentMutation.isPending ||
@@ -1465,7 +1464,6 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                     onRemove={() => setRemovingComponent(component)}
                     onToggle={() => handleToggle(component)}
                     onToggleTrusted={() => handleToggleTrusted(component)}
-                    onToggleAdapter={() => handleToggleAdapter(component)}
                     canManage={canManage}
                     isUpdating={
                       updateComponentMutation.isPending ||

@@ -145,6 +145,7 @@ pub mod auth;
 pub mod config;
 mod config_watcher;
 pub mod connections;
+pub mod continuation;
 mod crypto;
 pub mod db;
 mod email;
@@ -160,8 +161,11 @@ mod metrics;
 mod notifications;
 mod openapi;
 mod payment_providers;
+pub mod pricing;
 mod probes;
 pub mod prompt_cache;
+pub mod reasoning;
+mod recompute;
 mod request_logging;
 pub mod sample_files;
 mod static_assets;
@@ -288,7 +292,7 @@ where
     pub metrics_recorder: Option<GenAiMetrics>,
     #[builder(default = false)]
     pub is_leader: bool,
-    pub request_manager: Arc<fusillade::PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
+    pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<P>>,
     /// Background task runner for enqueuing deferred work (batch population, etc.)
     pub task_runner: Arc<tasks::TaskRunner<P>>,
     /// Resource limiters for protecting system capacity.
@@ -303,7 +307,7 @@ where
     /// don't use the multi-step Open Responses path can omit the
     /// wiring; the GET /v1/responses/{id} handler degrades to 404 in
     /// that case rather than panicking.
-    pub response_step_manager: Option<Arc<fusillade::PostgresResponseStepManager<P>>>,
+    pub response_step_manager: Option<Arc<fusillade_arsenal::PostgresResponseStepManager<P>>>,
     /// Singleton image normaliser used by the realtime middleware, the
     /// batch ingest path, the dispatcher's JIT-signing step, and the
     /// dashboard `/images/:sha256` endpoint. Built once at startup so
@@ -351,8 +355,20 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             // classify, tokenizer-svc call, commit, and index lookup (cache read).
             const CACHE_LATENCY_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0];
 
+            // Render-drift histogram buckets, in TOKENS (signed: render_total − engine
+            // prompt_tokens). Edges double as alert thresholds: the share of requests
+            // with |drift| beyond ±5/±20/±50/±100/±500 is exact at these edges, so
+            // Grafana alert rules can be tuned across them without a code release.
+            const RENDER_DRIFT_TOKEN_BUCKETS: &[f64] = &[-500.0, -100.0, -50.0, -20.0, -5.0, 0.0, 5.0, 20.0, 50.0, 100.0, 500.0];
+
             // Custom histogram buckets for fusillade retry attempts (0-10 retries)
             const RETRY_ATTEMPTS_BUCKETS: &[f64] = &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0];
+
+            // Custom histogram buckets for fusillade submission-epoch latencies
+            // (pickup delay and submission TTFT): 60 is an exact edge because
+            // the async-tier SLO ("starts within a minute") is read at it, and
+            // compliance ratios are only exact at a bucket edge.
+            const SUBMISSION_LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0, 1800.0, 3600.0];
 
             PrometheusBuilder::new()
                 .set_buckets_for_metric(Matcher::Full("dwctl_analytics_lag_seconds".to_string()), ANALYTICS_LAG_BUCKETS)
@@ -380,10 +396,25 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                 )
                 .expect("Failed to set custom buckets for dwctl_cache_lookup_duration_seconds")
                 .set_buckets_for_metric(
+                    Matcher::Full("dwctl_cache_render_drift_tokens".to_string()),
+                    RENDER_DRIFT_TOKEN_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_cache_render_drift_tokens")
+                .set_buckets_for_metric(
                     Matcher::Full("fusillade_retry_attempts_on_success".to_string()),
                     RETRY_ATTEMPTS_BUCKETS,
                 )
                 .expect("Failed to set custom buckets for fusillade_retry_attempts_on_success")
+                .set_buckets_for_metric(
+                    Matcher::Full("fusillade_request_time_to_first_token_seconds".to_string()),
+                    SUBMISSION_LATENCY_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for fusillade_request_time_to_first_token_seconds")
+                .set_buckets_for_metric(
+                    Matcher::Full("fusillade_request_pickup_delay_seconds".to_string()),
+                    SUBMISSION_LATENCY_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for fusillade_request_pickup_delay_seconds")
                 .install_recorder()
                 .expect("Failed to install Prometheus recorder")
         })
@@ -565,7 +596,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             provider_pricing: None,
                             sanitize_responses: None,
                             trusted: None,
-                            open_responses_adapter: None,
+                            reasoning_translation_overrides: None,
                             backoff_enabled: false,
                             backoff_initial_ms: 100,
                             backoff_max_ms: 5_000,
@@ -836,7 +867,7 @@ async fn setup_database(
             }
         }
     };
-    fusillade::migrator().run(&*fusillade_pools).await?;
+    fusillade_arsenal::migrator().run(&*fusillade_pools).await?;
 
     // Run underway migrations (background task queue)
     underway::run_migrations(&*db_pools).await?;
@@ -931,6 +962,16 @@ async fn setup_database(
     create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), argon2_params, &db_pools)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
+
+    // Provision the global continuation key (hidden, SYSTEM-owned — system
+    // ownership is what admits it to every model's onwards keyset regardless of
+    // group gating or pricing) so it exists and has synced into the onwards key
+    // cache before the first resume attempt.
+    if config.continuation.enabled {
+        continuation::provision_global_key(&db_pools)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to provision continuation key: {}", e))?;
+    }
 
     // Seed database with initial configuration (only runs once)
     seed_database(&config.model_sources, &db_pools).await?;
@@ -1165,6 +1206,10 @@ pub async fn build_router(
         // Add AnalyticsHandler for analytics/billing if enabled
         // The batcher is spawned in setup_background_services and managed by BackgroundServices
         if let Some(sender) = analytics_sender {
+            // Billing reads usage from the single `parse_ai_response -> AiResponse`
+            // parse (the same value request logging stores), via `TokenMetrics::from`.
+            // The outlet sits outer to translation, so it captures the foreign
+            // response body; `AiResponse` covers each protocol's own shape.
             let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), config.as_ref().clone());
             multi_handler = multi_handler.with(analytics_handler);
         }
@@ -1231,6 +1276,18 @@ pub async fn build_router(
         .route("/users/{user_id}/api-keys/{id}", get(api::handlers::api_keys::get_user_api_key))
         .route(
             "/users/{user_id}/api-keys/{id}",
+            patch(api::handlers::api_keys::update_user_api_key),
+        )
+        .route(
+            "/users/{user_id}/api-keys/{id}/rotate",
+            post(api::handlers::api_keys::rotate_user_api_key),
+        )
+        .route(
+            "/users/{user_id}/api-keys/{id}/reveal",
+            post(api::handlers::api_keys::reveal_user_api_key),
+        )
+        .route(
+            "/users/{user_id}/api-keys/{id}",
             delete(api::handlers::api_keys::delete_user_api_key),
         )
         // Webhooks as user sub-resources
@@ -1262,6 +1319,9 @@ pub async fn build_router(
         .route("/transactions", get(api::handlers::transactions::list_transactions))
         // Payment processing
         .route("/payments", post(api::handlers::payments::create_payment))
+        // Registered before `/payments/{id}` for clarity; axum matches the
+        // static segment first regardless, and the methods differ anyway.
+        .route("/payments/setup", post(api::handlers::payments::create_payment_setup))
         .route("/payments/{id}", patch(api::handlers::payments::process_payment))
         .route("/billing-portal", post(api::handlers::payments::create_billing_portal_session))
         .route("/auto-topup/enable", post(api::handlers::payments::enable_auto_topup))
@@ -1393,6 +1453,36 @@ pub async fn build_router(
             delete(api::handlers::organizations::cancel_invite),
         )
         .route(
+            "/organizations/{id}/invites/{invite_id}/resend",
+            post(api::handlers::organizations::resend_invite),
+        )
+        // Join requests: the mirror of invites, for users asking to join an
+        // organization that matches their email domain.
+        .route(
+            "/organizations/{id}/join-requests",
+            get(api::handlers::organizations::list_join_requests),
+        )
+        .route(
+            "/organizations/{id}/join-requests/{request_id}/approve",
+            post(api::handlers::organizations::approve_join_request),
+        )
+        .route(
+            "/organizations/{id}/join-requests/{request_id}/decline",
+            post(api::handlers::organizations::decline_join_request),
+        )
+        // Accept/decline by id, for an invitee who reached the invitation
+        // through onboarding rather than the emailed link. Authorized on the
+        // caller's own address matching the one invited — not on membership,
+        // which the only eligible caller does not have yet.
+        .route(
+            "/organizations/{id}/invites/{invite_id}/accept",
+            post(api::handlers::organizations::accept_invite_by_id),
+        )
+        .route(
+            "/organizations/{id}/invites/{invite_id}/decline",
+            post(api::handlers::organizations::decline_invite_by_id),
+        )
+        .route(
             "/organizations/invites/{token}",
             get(api::handlers::organizations::get_invite_details),
         )
@@ -1416,6 +1506,25 @@ pub async fn build_router(
             "/users/{user_id}/organizations",
             get(api::handlers::organizations::list_user_organizations),
         )
+        // A user's own outstanding join requests. Sits on the user rather than
+        // the organization because the requester isn't a member yet, so the
+        // organization-scoped queue below is closed to them.
+        .route(
+            "/users/{user_id}/join-requests",
+            get(api::handlers::organizations::list_user_join_requests),
+        )
+        // Filing one is a POST the user makes, never something signup does for
+        // them. Same path because it is the same resource from the same side.
+        .route(
+            "/users/{user_id}/join-requests",
+            post(api::handlers::organizations::create_user_join_request),
+        )
+        // The single read onboarding makes to decide which screen a new user
+        // sees: invited, domain-matched, or neither.
+        .route(
+            "/users/{user_id}/onboarding-context",
+            get(api::handlers::organizations::get_onboarding_context),
+        )
         // Organization session context (validates membership, client stores org ID for X-Organization-Id header)
         .route("/session/organization", post(api::handlers::organizations::set_active_organization))
         // Support requests
@@ -1433,6 +1542,10 @@ pub async fn build_router(
         .route("/requests/aggregate", get(api::handlers::requests::aggregate_requests))
         .route("/requests/aggregate-by-user", get(api::handlers::requests::aggregate_by_user))
         .route("/usage", get(api::handlers::requests::get_usage))
+        // Dry-run recompute of recorded usage. Read-only by construction — it is handed the
+        // read pool and has no write handle; corrections are applied by a documented human
+        // procedure, not by this endpoint.
+        .route("/usage-recompute", get(api::handlers::recompute::recompute_usage))
         // Probes management
         .route("/probes", get(api::handlers::probes::list_probes))
         .route("/probes", post(api::handlers::probes::create_probe))
@@ -1446,42 +1559,7 @@ pub async fn build_router(
         .route("/probes/{id}/results", get(api::handlers::probes::get_probe_results))
         .route("/probes/{id}/statistics", get(api::handlers::probes::get_statistics))
         // Queue monitoring
-        .route(
-            "/monitoring/pending-request-counts",
-            get(api::handlers::queue::get_pending_request_counts),
-        )
-        // Tool sources CRUD
-        .route("/tool-sources", get(api::handlers::tool_sources::list_tool_sources))
-        .route("/tool-sources", post(api::handlers::tool_sources::create_tool_source))
-        .route("/tool-sources/{id}", get(api::handlers::tool_sources::get_tool_source))
-        .route("/tool-sources/{id}", patch(api::handlers::tool_sources::update_tool_source))
-        .route("/tool-sources/{id}", delete(api::handlers::tool_sources::delete_tool_source))
-        // Tool sources ↔ deployment attachment
-        .route(
-            "/deployments/{id}/tool-sources",
-            get(api::handlers::tool_sources::list_deployment_tool_sources),
-        )
-        .route(
-            "/deployments/{id}/tool-sources/{source_id}",
-            axum::routing::put(api::handlers::tool_sources::attach_tool_source_to_deployment),
-        )
-        .route(
-            "/deployments/{id}/tool-sources/{source_id}",
-            delete(api::handlers::tool_sources::detach_tool_source_from_deployment),
-        )
-        // Tool sources ↔ group attachment
-        .route(
-            "/groups/{id}/tool-sources",
-            get(api::handlers::tool_sources::list_group_tool_sources),
-        )
-        .route(
-            "/groups/{id}/tool-sources/{source_id}",
-            axum::routing::put(api::handlers::tool_sources::attach_tool_source_to_group),
-        )
-        .route(
-            "/groups/{id}/tool-sources/{source_id}",
-            delete(api::handlers::tool_sources::detach_tool_source_from_group),
-        )
+        .route("/monitoring/demand", get(api::handlers::queue::get_demand))
         // Connections (external data sources)
         .route("/connections", post(api::handlers::connections::create_connection))
         .route("/connections", get(api::handlers::connections::list_connections))
@@ -1576,13 +1654,21 @@ pub async fn build_router(
     // wrapper: on a request it runs first; on the response it runs last. The stack below,
     // outermost → innermost (i.e. reverse of the code order), is:
     //
-    //   translation  →  responses_mw  →  outlet (logging/billing)
-    //                →  cache  →  error_enrichment  →  image_normalizer
-    //                →  tool_injection  →  models_route  →  onwards
+    //   inference_mw  →  outlet (logging/billing)  →  translation
+    //                →  cache  →  continuation  →  error_enrichment  →  image_normalizer
+    //                →  models_route  →  onwards
     //
     // Why this order:
+    //   • inference_mw outermost: it must see the RAW foreign request (e.g. `/responses`
+    //     with `background`/`service_tier`) to route the Responses control plane, mint the
+    //     tracking id, and hydrate `previous_response_id` before translation flattens the
+    //     request to Chat Completions.
+    //   • translation inner to outlet: on the response path (inner runs first) it reframes
+    //     chat → Responses BEFORE outlet captures it, so the persisted row — which
+    //     `GET /v1/responses/{id}` reads — is a Responses object. Everything inner to
+    //     translation only ever sees Chat Completions.
     //   • outlet outermost (of the body editors): it logs the request **as the customer
-    //     sent it** (cache_control markers intact, original image URLs, pre tool-injection)
+    //     sent it** (cache_control markers intact, original image URLs)
     //     and captures the response **after** cache injection, so billing sees cache_* usage.
     //   • cache inner to outlet, but OUTER to the body-mutating layers: it must hash the
     //     ORIGINAL request body. The image normaliser rewrites image URLs to per-request
@@ -1590,9 +1676,8 @@ pub async fn build_router(
     //     after it would make every image request a unique key → zero cache hits. Sitting
     //     before the reject-capable layers also means a request they 4xx (unfetchable/
     //     forbidden image) never gets a committed write — the success gate vetoes it.
-    //   • image_normalizer before tool_injection: it fetches/sanitises external image URLs
-    //     (and can reject the request) before tools are spliced in.
-    //   • tool_injection innermost: the body onwards forwards upstream is fully resolved.
+    //   • image_normalizer innermost: it fetches/sanitises external image URLs (and can
+    //     reject the request), so the body onwards forwards upstream is fully resolved.
     //
     // Each block below adds one layer; the inline notes cover that layer's specifics.
 
@@ -1605,19 +1690,27 @@ pub async fn build_router(
         .route("/models", get(api::handlers::ai_models::list_ai_models))
         .fallback_service(onwards_router);
 
-    // Apply tool injection middleware to the onwards router so that per-request tool
-    // schemas are resolved and injected into the request body before onwards processes it.
-    let tool_injection_state = crate::inference::tools::ToolInjectionState {
-        db: state.db.write().clone(),
+    // Last-mile request-body prep and the matching response-side stream reassembly,
+    // applied innermost so it runs right before onwards (inner to cache, which must
+    // hash the original body). Does the id-scrub and the streaming usage-flag
+    // injection that onwards / the BodyTransformFn hook used to do, so onwards can
+    // forward the body untouched.
+    //
+    // Innermost is load-bearing for the response half: request logging is applied
+    // outer to this, so reassembling here means it sees one complete body rather
+    // than every SSE frame retained for the life of the request.
+    let onwards_router = {
+        let daemon = &state.current_config().background_services.batch_daemon;
+        let outbound_config = crate::inference::outbound_request::OutboundConfig {
+            timeouts: crate::inference::outbound_request::StreamTimeouts::from_daemon_config(daemon),
+        };
+        onwards_router.layer(middleware::from_fn_with_state(
+            outbound_config,
+            crate::inference::outbound_request::outbound_request_middleware,
+        ))
     };
-    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        tool_injection_state,
-        crate::inference::tools::tool_injection_middleware,
-    ));
 
-    // Apply the image-input normaliser middleware. This runs BEFORE
-    // tool_injection in request flow (i.e. as an outer Tower layer added
-    // after the inner one). For each `/chat/completions` and `/responses`
+    // Apply the image-input normaliser middleware. For each `/chat/completions` and `/responses`
     // request, it walks the body for HTTP(S) `image_url` values, fetches +
     // stores them via `image_normalizer`, and substitutes signed URLs into
     // the body before the request reaches onwards.
@@ -1644,10 +1737,69 @@ pub async fn build_router(
         error_enrichment::error_enrichment_middleware,
     ));
 
+    // Apply the mid-stream continuation (resume) layer. It sits between the cache
+    // layer and error enrichment for two reasons: outlet and the cache see ONE
+    // logical stream with the single merged usage frame it emits (no analytics or
+    // cache surgery), and — the load-bearing one — the router it resumes INTO is
+    // the clone taken right here, so a resume leg re-enters BELOW outlet and the
+    // cache and produces no second analytics row, billing record or classify.
+    // Added only when enabled; otherwise the stack is byte-identical to today.
+    let onwards_router = {
+        let cfg = state.current_config();
+        if cfg.continuation.enabled {
+            // The resume target: everything inner to this layer (error
+            // enrichment → image normaliser → tool injection → onwards).
+            // `with_state` here is the same binding the outer `nest` applies to
+            // this router — it only erases the state type so the clone is a
+            // ready-to-call service, it does not change routing.
+            let resume_target = onwards_router.clone().with_state(state.clone());
+            let body_limit = match cfg.limits.requests.max_body_size {
+                0 => usize::MAX,
+                n => usize::try_from(n).unwrap_or(usize::MAX),
+            };
+            match crate::continuation::ContinuationState::build(
+                &cfg.continuation,
+                &cfg.cache.tokenizer_url,
+                state.db.write().clone(),
+                resume_target,
+                body_limit,
+            )
+            .await
+            {
+                Ok(continuation_state) => {
+                    tracing::info!("Mid-stream continuation enabled - wiring resume layer into onwards stack");
+                    crate::continuation::metrics::record_layer_wired(true);
+                    onwards_router.layer(middleware::from_fn_with_state(
+                        continuation_state,
+                        crate::continuation::continuation_middleware,
+                    ))
+                }
+                Err(e) => {
+                    // A missing continuation key must not take the gateway down:
+                    // without the layer, streams die exactly as they do today.
+                    // The gauge + background error are the ONLY signals that a
+                    // deployment which asked for continuation is serving without
+                    // it — no request ever fails because of this.
+                    crate::background_error!(
+                        crate::metrics::errors::component::CONTINUATION,
+                        "state_build",
+                        Error,
+                        error = %e,
+                        "Failed to build continuation state - resume layer NOT wired"
+                    );
+                    crate::continuation::metrics::record_layer_wired(false);
+                    onwards_router
+                }
+            }
+        } else {
+            onwards_router
+        }
+    };
+
     // Apply the cached-input pricing layer (dwctl-owned). Placed inner
     // to outlet so the billing/analytics capture sees the injected `cache_*` usage
-    // fields, but OUTER to the body-mutating layers (image normaliser, tool
-    // injection) so the classifier hashes the original user body — stable across
+    // fields, but OUTER to the body-mutating layer (image normaliser) so the
+    // classifier hashes the original user body — stable across
     // requests, which per-request signed image URLs would otherwise break. Added
     // only when enabled; otherwise the stack is byte-identical to today.
     let onwards_router = {
@@ -1658,12 +1810,13 @@ pub async fn build_router(
                 crate::prompt_cache::PrincipalResolver::new(pool.clone()),
                 crate::prompt_cache::ModelConfigResolver::new(pool.clone()),
                 crate::prompt_cache::TokenizerClient::new(cfg.cache.tokenizer_url.clone()),
-                Arc::new(crate::prompt_cache::PostgresIndex::new(pool)),
+                Arc::new(crate::prompt_cache::PostgresIndex::new(pool, cfg.cache.index_conn_retries)),
                 crate::prompt_cache::TierPolicy::from_config(&cfg.cache.enabled_ttls, &cfg.cache.default_ttl),
                 crate::prompt_cache::TelemetryPolicy::from_config(
                     cfg.cache.telemetry_blocks.strip_from_prompt,
                     &cfg.cache.telemetry_blocks.prefixes,
                 ),
+                cfg.cache.render_counting,
             );
             // Bound the cache layer's body buffer by the same limit onwards uses (0 =
             // unlimited), so it's never more restrictive than the entry point.
@@ -1673,7 +1826,11 @@ pub async fn build_router(
             };
             tracing::info!("Cached-input pricing enabled - wiring cache layer into onwards stack");
             onwards_router.layer(middleware::from_fn_with_state(
-                crate::prompt_cache::CacheLayerState::new(classifier, body_limit),
+                crate::prompt_cache::CacheLayerState::new(
+                    classifier,
+                    body_limit,
+                    std::time::Duration::from_secs(cfg.cache.classify_deadline_secs),
+                ),
                 crate::prompt_cache::cache_middleware,
             ))
         } else {
@@ -1681,32 +1838,22 @@ pub async fn build_router(
         }
     };
 
-    // Apply request logging layer only to onwards router
-    let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
-        onwards_router.layer(outlet_layer)
-    } else {
-        onwards_router
-    };
-
-    // Apply inference middleware to create pending fusillade rows for inference requests.
-    // This runs BEFORE outlet (outer layer executes first), so the X-Onwards-Response-Id
-    // header is set before outlet captures the request and passes it to FusilladeOutletHandler.
-    let onwards_router = if let Some(rms) = inference_middleware_state {
-        onwards_router.layer(middleware::from_fn_with_state(
-            rms,
-            crate::inference::middleware::inference_middleware,
-        ))
-    } else {
-        onwards_router
-    };
-
-    // Apply the generic edge protocol-translation middleware as the OUTERMOST
-    // layer on the onwards router. On the request path it runs first, so any
-    // foreign-protocol request (today: Anthropic `/v1/messages` and `/v1/models`)
-    // is translated before model discovery, image_normalizer, tool_injection,
-    // and onwards see it. On the response path it runs last, so only the final
-    // client bytes are reframed back into the foreign protocol. Native OpenAI
-    // requests match no translator and pass through untouched.
+    // Apply the edge protocol-translation middleware. Placement is deliberate: it
+    // sits INNER to the outlet and the inference middleware, but OUTER to cache /
+    // image-normalisation / tool-injection / onwards.
+    //
+    // Why here rather than outermost:
+    //   - inference_mw (outer) must see the RAW foreign request. The Responses API
+    //     carries control-plane fields (`background`, `service_tier`) and a stored-
+    //     object lifecycle that inference_mw routes on `/responses`; translating
+    //     first would rewrite `/responses` -> `/chat/completions` and hide them.
+    //   - outlet (outer) must capture the TRANSLATED response, because the row it
+    //     writes is what `GET /v1/responses/{id}` reads back. On the response path
+    //     inner layers run first, so translation reframes chat -> Responses before
+    //     outlet persists it (matching the old onwards-side placement).
+    //   - cache / image_normalizer / onwards (inner) still only
+    //     ever see Chat Completions.
+    // Native OpenAI requests match no translator and pass through untouched.
     let onwards_router = {
         // Bound the body the translation middleware buffers by the same cap as the
         // rest of the inference path (limits.requests.max_body_size, 0 = unlimited).
@@ -1721,6 +1868,17 @@ pub async fn build_router(
                 config.cache.enabled,
             )),
             std::sync::Arc::new(crate::inference::translation::anthropic::models::AnthropicModels),
+            // Edge Responses translation. A pure Responses<->Chat converter; the
+            // Responses control plane (id minting, previous_response_id hydration,
+            // background routing) lives in the outer inference middleware, and
+            // persistence lives in the outlet just above. Registered in BOTH strict
+            // and non-strict mode, exactly like the Anthropic translators above.
+            // Downstream, strict mode dispatches the normalised `/chat/completions`
+            // body via onwards' `/responses` route, and non-strict forwards it by
+            // the normalised path through onwards' catch-all (the same mechanism the
+            // `/messages` translation already relies on). dwctl owns Responses in
+            // both modes so id stamping, GET retrieval and hydration work uniformly.
+            std::sync::Arc::new(crate::inference::translation::responses::OpenResponses::new()),
         ];
         let translation_registry =
             crate::inference::translation::TranslationRegistry::new(translators).with_max_body_size(translation_body_limit);
@@ -1728,6 +1886,30 @@ pub async fn build_router(
             translation_registry,
             crate::inference::translation::middleware::translation_middleware,
         ))
+    };
+
+    // Apply request logging (outlet). OUTER to translation, so on the response path
+    // it captures the translated Responses object (the row `GET /v1/responses/{id}`
+    // reads); INNER to inference_mw, so the correlation headers it relies on
+    // (`x-onwards-response-id` / `x-fusillade-request-id`) are already set.
+    let onwards_router = if let Some(outlet_layer) = outlet_layer.clone() {
+        onwards_router.layer(outlet_layer)
+    } else {
+        onwards_router
+    };
+
+    // Apply the inference middleware as the OUTERMOST layer. It sees the raw
+    // foreign request (before translation), so it can read Responses-only fields
+    // (`background`, `service_tier`), mint the response/tracking id, run
+    // previous_response_id hydration, and set the correlation headers before
+    // anything downstream runs.
+    let onwards_router = if let Some(rms) = inference_middleware_state {
+        onwards_router.layer(middleware::from_fn_with_state(
+            rms,
+            crate::inference::middleware::inference_middleware,
+        ))
+    } else {
+        onwards_router
     };
 
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
@@ -2014,12 +2196,12 @@ async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next
 /// stop all background tasks. When dropped, the `drop_guard` will automatically cancel
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
-    request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
+    request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
     /// Step storage for multi-step responses, sharing the same fusillade
     /// pool as the request manager. Constructed in
     /// `setup_background_services` so the manager's processor (which
     /// dwctl wires later in `Application::new_with_pool`) can use it.
-    step_manager: Arc<fusillade::PostgresResponseStepManager<DbPools>>,
+    step_manager: Arc<fusillade_arsenal::PostgresResponseStepManager<DbPools>>,
     /// The onwards-instance daemon id registered in the `daemons` table
     /// for realtime / inline-loop attribution. The graceful-shutdown
     /// drain (`shutdown()`) marks this row Dead and releases any
@@ -2246,12 +2428,92 @@ impl BackgroundServices {
             crate::sync::onwards_config::load_targets_from_db(pool, &[], self.strict_mode, &crate::config::RateLimitTiersConfig::default())
                 .await?;
 
+        // Snapshot the routing table this update should produce, before the
+        // config is handed to the channel.
+        //
+        // `send` only queues the config for `Targets::receive_updates`, which
+        // applies it on its own task, so returning as soon as it succeeds does
+        // not mean the proxy can serve the new config yet. A test that goes
+        // straight from here to a proxied request can beat the apply and get a
+        // 403 for an API key that is already committed to the database.
+        //
+        // The alias set and each pool's authorised keys are compared by
+        // identity, not by count: a pool can carry the right number of keys and
+        // still not the one under test, which produces exactly the same 403 as
+        // a pool with no keys at all.
+        let expected: Vec<(String, Option<onwards::auth::KeySet>)> = new_targets
+            .targets
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().default_pool().keys().cloned()))
+            .collect();
+
+        // Kept so the update can be re-asserted below. `Targets` is a handle of
+        // `Arc` maps and `receive_updates` only reads from the value it is
+        // given, so re-sending this clone is safe.
+        let desired = new_targets.clone();
+
         // Send through the watch channel (same as automatic sync)
         sender
             .send(new_targets)
             .map_err(|_| anyhow::anyhow!("Failed to send targets update"))?;
 
-        Ok(())
+        // `onwards_targets` shares its maps with the router's `AppState`, so
+        // polling it observes exactly what a proxied request would resolve
+        // against. Reaching this point means the sender exists, which in turn
+        // means `receive_updates` was wired for this app, so an update that
+        // never lands is a real failure rather than a disabled-sync no-op.
+        //
+        // Note this cannot detect an update that changes nothing structural
+        // (e.g. only an endpoint URL) - such an update matches immediately and
+        // returns without waiting, exactly as before.
+        //
+        // Waiting for the state to appear once is not enough. The config
+        // listener shares this watch channel, and a reload it started before
+        // the test's own write can finish afterwards and apply that older
+        // snapshot over this one - dropping the key again in the window between
+        // this function returning and the test issuing its request. So the
+        // state has to hold for a settle window, and any regression re-asserts
+        // the desired config rather than waiting for the listener's periodic
+        // sync to come back around.
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(250);
+        const REASSERT_EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+        // Comfortably inside SETTLE, so the settle window is still sampled many
+        // times, without waking the scheduler thousands of times per call.
+        const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(10);
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        let mut stable_since: Option<std::time::Instant> = None;
+        let mut last_reassert = std::time::Instant::now();
+
+        loop {
+            let live = &self.onwards_targets.targets;
+            let applied = live.len() == expected.len()
+                && expected
+                    .iter()
+                    .all(|(alias, keys)| live.get(alias).is_some_and(|pool| pool.default_pool().keys() == keys.as_ref()));
+
+            let now = std::time::Instant::now();
+            if applied {
+                if now.duration_since(*stable_since.get_or_insert(now)) >= SETTLE {
+                    return Ok(());
+                }
+            } else {
+                stable_since = None;
+                if now.duration_since(last_reassert) >= REASSERT_EVERY {
+                    sender
+                        .send(desired.clone())
+                        .map_err(|_| anyhow::anyhow!("Failed to re-send targets update"))?;
+                    last_reassert = now;
+                }
+            }
+
+            if now >= deadline {
+                anyhow::bail!("onwards did not apply the config update within {:?}", TIMEOUT);
+            }
+
+            tokio::time::sleep(POLL_EVERY).await;
+        }
     }
 
     /// Manually refresh the per-key ZDR cache from the database (for testing).
@@ -2298,58 +2560,19 @@ impl BackgroundTaskBuilder {
     }
 }
 
-/// Setup background services (probe scheduler, batch daemon, leader election, onwards integration)
-/// Wire the fusillade request manager, step manager, and (optionally)
-/// the multi-step [`DwctlRequestProcessor`] into the daemon and start
-/// the background-services stack.
-///
-/// The caller owns construction of `request_manager`, `step_manager`,
-/// and `multi_step_processor` — and must build them in that order —
-/// because the multi-step processor depends on a `FusilladeResponseStore`,
-/// which itself depends on the request manager and step manager. That
-/// ordering is enforced at the type level (you cannot construct the
-/// processor without first constructing the others), which is why we
-/// take them as parameters rather than constructing them here: it
-/// guarantees that `set_processor` runs *before* any daemon spawn
-/// inside this function, including the leader-election callback's
-/// daemon spawn.
-///
-/// Pre-PR #1064 this function used to construct the request manager
-/// itself and spawn the daemon *before* the caller had a chance to
-/// build and wire the multi-step processor — which meant fusillade's
-/// `OnceLock`-snapshot in `PostgresRequestManager::run` captured a
-/// `None` processor and the daemon fell back to `DefaultRequestProcessor`
-/// for every `/v1/responses + service_tier=flex` claim, looping the
-/// request body back to ourselves and producing the
-/// `{"choices":[],"usage":null}` terminal failure observed in prod.
-///
-/// `multi_step_processor` is `Option<...>` so the test path can pass
-/// `None` to avoid forming the `request_manager → processor → response_store
-/// → request_manager` Arc cycle that blocks `sqlx::test`'s `DROP DATABASE`
-/// cleanup (the cycle's only effect in production — where the app lives
-/// forever — is benign).
+/// Setup background services (probe scheduler, batch daemon, leader election,
+/// onwards integration). The caller owns construction of `request_manager` and
+/// `step_manager` and passes them in, so they exist before any daemon spawn
+/// inside this function.
 pub(crate) struct BackgroundServicesInput {
-    /// Fusillade's HTTP request manager. The caller builds this so the
-    /// multi-step processor (which depends on it transitively via
-    /// `FusilladeResponseStore`) can be constructed and injected via
-    /// `set_processor` before any daemon spawn inside this function.
-    pub request_manager: Arc<fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>>,
+    /// Fusillade's durable DB store, shared with the daemon runtime.
+    pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
+    /// Fusillade's scheduling daemon. Owns HTTP dispatch and runtime
+    /// lifecycle; durable data operations live on `request_manager`.
+    pub postgres_daemon: Arc<fusillade::PostgresDaemon<DbPools, fusillade::ReqwestHttpClient>>,
     /// Fusillade's response-step manager. Shares the same fusillade
     /// pool as the request manager.
-    pub step_manager: Arc<fusillade::PostgresResponseStepManager<DbPools>>,
-    /// Multi-step processor to inject onto the request manager. `None`
-    /// in tests to avoid forming the `request_manager → processor →
-    /// response_store → request_manager` Arc cycle that blocks
-    /// `sqlx::test`'s `DROP DATABASE` cleanup.
-    pub multi_step_processor: Option<
-        Arc<
-            dyn fusillade::RequestProcessor<
-                    fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>,
-                    fusillade::ReqwestHttpClient,
-                > + Send
-                + Sync,
-        >,
-    >,
+    pub step_manager: Arc<fusillade_arsenal::PostgresResponseStepManager<DbPools>>,
     /// Shared map between the fusillade daemon's concurrency control
     /// and the onwards config-sync writer. Built once by the caller and
     /// passed in by-clone here.
@@ -2375,8 +2598,8 @@ pub(crate) struct BackgroundServicesInput {
 async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Result<BackgroundServices> {
     let BackgroundServicesInput {
         request_manager,
+        postgres_daemon,
         step_manager,
-        multi_step_processor,
         model_capacity_limits,
         pool,
         fusillade_pools,
@@ -2388,21 +2611,11 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         keystore,
     } = input;
 
-    // Wire the multi-step processor onto the request manager *before*
-    // any daemon spawn below — this is the whole reason `setup_background_services`
-    // accepts these as parameters rather than constructing them itself.
-    // See the function-level doc comment.
-    if let Some(processor) = multi_step_processor
-        && let Err(e) = request_manager.set_processor(processor)
-    {
-        tracing::warn!(error = e, "Multi-step processor was already set; skipping");
-    }
-
     // `keystore` comes from the caller (built once and shared). Install the
-    // TRANSITIONAL ZDR response transformer on the manager before the daemon
+    // TRANSITIONAL ZDR response transformer on the daemon before it
     // spawns below, so completed bodies are persisted encrypted.
     if let Some(ks) = keystore.clone()
-        && let Err(e) = request_manager.set_response_transformer(std::sync::Arc::new(crate::inference::zdr::ZdrResponseEncryptor::new(ks)))
+        && let Err(e) = postgres_daemon.set_response_transformer(std::sync::Arc::new(crate::inference::zdr::ZdrResponseEncryptor::new(ks)))
     {
         tracing::warn!(error = e, "ZDR response transformer was already set; skipping");
     }
@@ -2536,10 +2749,9 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
         // Start the fusillade batch processing daemon based on config
         use crate::config::DaemonEnabled;
-        use fusillade::DaemonExecutor;
         match config.background_services.batch_daemon.enabled {
             DaemonEnabled::Always | DaemonEnabled::Leader => {
-                let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
+                let daemon_handle = postgres_daemon.clone().run(shutdown_token.clone())?;
                 // Spawn task that propagates daemon errors
                 background_tasks.spawn("fusillade-daemon", async move {
                     match daemon_handle.await {
@@ -2593,8 +2805,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         // If daemon is set to "Always", start it immediately regardless of leader election
         use crate::config::DaemonEnabled;
         if config.background_services.batch_daemon.enabled == DaemonEnabled::Always {
-            use fusillade::DaemonExecutor;
-            let daemon_handle = request_manager.clone().run(shutdown_token.clone())?;
+            let daemon_handle = postgres_daemon.clone().run(shutdown_token.clone())?;
             // Spawn task that propagates daemon errors
             background_tasks.spawn("fusillade-daemon", async move {
                 match daemon_handle.await {
@@ -2622,6 +2833,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         let leader_election_scheduler_gain = probe_scheduler.clone();
         let leader_election_scheduler_lose = probe_scheduler.clone();
         let leader_election_request_manager_gain = request_manager.clone();
+        let leader_election_postgres_daemon_gain = postgres_daemon.clone();
         let leader_election_config = config.clone();
         let leader_election_flag = is_leader_flag.clone();
 
@@ -2649,6 +2861,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                     // This closure is run when a replica becomes the leader
                     let scheduler = leader_election_scheduler_gain.clone();
                     let request_manager = leader_election_request_manager_gain.clone();
+                    let postgres_daemon = leader_election_postgres_daemon_gain.clone();
                     let daemon_handle = daemon_handle_gain.clone();
                     let leadership_shutdown = leadership_shutdown_gain.clone();
                     async move {
@@ -2681,10 +2894,9 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
                         // Start the fusillade batch processing daemon based on config
                         use crate::config::DaemonEnabled;
-                        use fusillade::DaemonExecutor;
                         match config.background_services.batch_daemon.enabled {
                             DaemonEnabled::Leader => {
-                                let handle = request_manager
+                                let handle = postgres_daemon
                                     .run(session_token.clone())
                                     .map_err(|e| anyhow::anyhow!("Failed to start fusillade daemon: {}", e))?;
 
@@ -3003,19 +3215,18 @@ impl Application {
         // which requires direct database connection to primary (not through PgBouncer transaction pooling)
         let shared_config = SharedConfig::new(config.clone());
 
-        // Build the fusillade request manager, step manager, response
-        // store, and multi-step processor *before* spawning any daemons.
-        // Order is enforced at the type level (processor depends on
-        // response_store depends on (request_manager, step_manager)),
-        // so by the time we hand all four to `setup_background_services`,
-        // it can safely call `request_manager.set_processor(...)` before
-        // any daemon spawn. Fusillade's daemon snapshots the processor
-        // via `OnceLock::get()` at `run()` time, so anything spawned
-        // afterward (synchronous fusillade daemon AND the leader-gained
-        // closure) sees the multi-step processor — that's what fixes
-        // the `/v1/responses + service_tier=flex` regression where the
-        // daemon kept using `DefaultRequestProcessor` and looped the
-        // request body back to ourselves.
+        // Build the fusillade request manager, step manager, and response
+        // store before spawning any daemons.
+        //
+        // The daemon runs fusillade's `DefaultRequestProcessor`: every flex
+        // and background claim is dispatched as an HTTP call back through the
+        // loopback (`loopback_base_url`, `.../ai`), so it re-enters the full
+        // dwctl stack and edge translation converts `/responses` to Chat
+        // Completions on the way in and back to a Responses object on the way
+        // out. There is no dwctl-side request processor: the server-side
+        // multi-step tool loop was retired in COR-536, and with it the
+        // `DwctlRequestProcessor` that used to intercept `/v1/responses`
+        // claims and run that loop in-process instead of looping back.
         //
         // Shared `model_capacity_limits` map: the fusillade daemon's
         // per-model concurrency controller reads it; the onwards
@@ -3024,20 +3235,26 @@ impl Application {
         // we build it once here.
         let model_capacity_limits: Arc<dashmap::DashMap<String, usize>> = Arc::new(dashmap::DashMap::new());
 
+        let fusillade_daemon_config = config
+            .background_services
+            .batch_daemon
+            .to_fusillade_config_with_limits(Some(model_capacity_limits.clone()));
+
         let request_manager = Arc::new(
-            fusillade::PostgresRequestManager::new(
+            fusillade_arsenal::PostgresRequestManager::new(
                 fusillade_pools.clone(),
-                config
-                    .background_services
-                    .batch_daemon
-                    .to_fusillade_config_with_limits(Some(model_capacity_limits.clone())),
+                fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
             )
             .with_download_buffer_size(config.batches.files.download_buffer_size)
-            .with_batch_insert_strategy(fusillade::manager::postgres::BatchInsertStrategy::Batched {
+            .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
                 batch_size: config.batches.files.batch_insert_size,
             }),
         );
-        let step_manager = Arc::new(fusillade::PostgresResponseStepManager::new(fusillade_pools.clone()));
+        let postgres_daemon = Arc::new(fusillade::PostgresDaemon::from_store(
+            request_manager.clone(),
+            fusillade_daemon_config.clone(),
+        ));
+        let step_manager = Arc::new(fusillade_arsenal::PostgresResponseStepManager::new(fusillade_pools.clone()));
         // Build the ZDR keystore once and share it across the response store, the
         // daemon processor, and background services (which install the response
         // transformer). A misconfiguration is fatal.
@@ -3060,86 +3277,33 @@ impl Application {
         let image_normalizer =
             crate::image_normalizer::from_config(&config.image_normalizer).map_err(|e| anyhow::anyhow!("image normaliser config: {e}"))?;
 
-        // Build the multi-step processor's dependencies. These also end
-        // up wired into the inference middleware state below; cloning
-        // them is cheap (Arc + reqwest::Client share their internal
-        // connection pool / TLS root-cert cache across clones).
-        let multi_step_reqwest_client = reqwest::Client::new();
-        let multi_step_tool_executor_pool = Arc::new(db_pools.write().clone());
-        let multi_step_tool_executor = Arc::new(crate::inference::tools::HttpToolExecutor::new(
-            multi_step_reqwest_client.clone(),
-            Some(multi_step_tool_executor_pool.clone()),
-        ));
-        // Same `ReqwestHttpClient` shape the batch daemon uses internally,
-        // so per-step model fires inherit fusillade's header stamping
-        // (`X-Fusillade-Request-Id` for analytics correlation) and
-        // streamable-endpoint dispatch. Timeouts and the streamable list
-        // come from the same config knobs the daemon respects, so warm
-        // path and daemon path use identical streaming semantics.
-        let batch_daemon_cfg = &config.background_services.batch_daemon;
-        let batch_daemon_fusillade_cfg = batch_daemon_cfg.to_fusillade_config();
-        let multi_step_http_client: Arc<fusillade::ReqwestHttpClient> = Arc::new(fusillade::ReqwestHttpClient::new(
-            std::time::Duration::from_millis(batch_daemon_fusillade_cfg.first_chunk_timeout_ms),
-            std::time::Duration::from_millis(batch_daemon_fusillade_cfg.chunk_timeout_ms),
-            std::time::Duration::from_millis(batch_daemon_fusillade_cfg.body_timeout_ms),
-            batch_daemon_fusillade_cfg.streamable_endpoints.clone(),
-        ));
-        let multi_step_loop_config = onwards::LoopConfig {
-            max_response_step_depth: config.responses.max_response_step_depth,
-            max_response_iterations: config.responses.max_response_iterations,
-        };
-
-        // Build the processor itself only outside test mode: the
-        // `request_manager → processor.OnceLock → response_store →
-        // request_manager` Arc cycle is harmless in production (the app
-        // lives forever) but in `#[sqlx::test]` it keeps each test's
-        // pool clones alive past test teardown, blocking sqlx's
-        // `DROP DATABASE` cleanup. Tests run with `DefaultRequestProcessor`
-        // — their multi-step coverage lives in dedicated
-        // `test/multi_step_*` modules that bypass the daemon path
-        // anyway.
-        let multi_step_processor_for_setup = if cfg!(test) {
-            None
-        } else {
-            let tool_resolver: Arc<dyn crate::inference::engine::processor::DaemonToolResolver> =
-                Arc::new(crate::inference::engine::processor::DbToolResolver {
-                    pool: (*db_pools).write().clone(),
-                });
-            // Derive dispatch TTL from the batch daemon's processing timeout so
-            // the signed URL is always valid for at least one full dispatch
-            // attempt — never the cause of a batch failure on its own.
+        // Pre-dispatch preparation for daemon-claimed requests. MUST be installed
+        // before `setup_background_services` spawns the daemon, or claims can be
+        // dispatched without it. Two steps that cannot happen on the loopback:
+        //   - ZDR decrypt: the stored body is `dwzdr1:` ciphertext, so it is not
+        //     parseable JSON and every edge layer chokes before it could act.
+        //   - JIT image signing: the edge normaliser runs `Mode::All`, which does
+        //     not match the `dw-img://` tokens that file ingest stores.
+        // Derive the signing TTL from the daemon's processing timeout so a signed
+        // URL always outlives one full dispatch attempt.
+        {
             let processing_timeout = std::time::Duration::from_millis(config.background_services.batch_daemon.processing_timeout_ms);
             let dispatch_ttl = config.image_normalizer.signing.dispatch_ttl(processing_timeout);
-            let mut processor_builder = crate::inference::engine::processor::DwctlRequestProcessor::new(
-                response_store.clone(),
-                multi_step_tool_executor.clone(),
-                multi_step_http_client.clone(),
-                multi_step_loop_config,
-            )
-            .with_tool_resolver(tool_resolver);
+            let mut dispatch_processor = crate::inference::engine::dispatch_processor::DispatchProcessor::new()
+                .with_keystore(keystore.clone())
+                .with_streamable_endpoints(config.background_services.batch_daemon.streamable_endpoints.clone());
             if config.image_normalizer.enabled {
-                // Re-use the AppState-bound singleton built above; no second
-                // GCS client / ADC signer init.
-                processor_builder = processor_builder.with_image_normalizer(image_normalizer.clone(), dispatch_ttl);
+                dispatch_processor = dispatch_processor.with_image_normalizer(image_normalizer.clone(), dispatch_ttl);
             }
-            processor_builder = processor_builder.with_keystore(keystore.clone());
-            let processor = Arc::new(processor_builder);
-            Some(
-                processor
-                    as Arc<
-                        dyn fusillade::RequestProcessor<
-                                fusillade::PostgresRequestManager<DbPools, fusillade::ReqwestHttpClient>,
-                                fusillade::ReqwestHttpClient,
-                            > + Send
-                            + Sync,
-                    >,
-            )
-        };
+            if let Err(e) = postgres_daemon.set_processor(Arc::new(dispatch_processor)) {
+                tracing::warn!(error = e, "Dispatch processor was already set; skipping");
+            }
+        }
 
         let mut bg_services = setup_background_services(BackgroundServicesInput {
             request_manager: request_manager.clone(),
+            postgres_daemon: postgres_daemon.clone(),
             step_manager: step_manager.clone(),
-            multi_step_processor: multi_step_processor_for_setup,
             model_capacity_limits,
             pool: (*db_pools).clone(),
             fusillade_pools: fusillade_pools.clone(),
@@ -3152,32 +3316,6 @@ impl Application {
         })
         .await?;
 
-        // Enforce `stream_options.include_usage` for streaming chat completions.
-        //
-        // For streaming requests, upstream providers only report token usage in the final
-        // SSE chunk when `stream_options: { include_usage: true }` is set. Without it,
-        // the response contains no usage data and the request logs record 0 tokens — meaning
-        // the request can't be billed. The dashboard sets this automatically, but direct API
-        // callers may not.
-        //
-        // This applies to /chat/completions and the legacy /completions endpoint (both
-        // support `stream_options`). The Responses API (/responses) always includes usage
-        // in its response object regardless of streaming, so no transform is needed there.
-        // Embeddings don't support streaming.
-        let body_transform: onwards::BodyTransformFn = Arc::new(request_logging::stream_usage::stream_usage_transform);
-
-        // Create the HTTP tool executor used by the single-step
-        // (non-multi-step) realtime tool-injection path. Re-uses the
-        // same reqwest::Client and dwctl pool clones the multi-step
-        // executor (built earlier, before `setup_background_services`)
-        // does — cloning a reqwest::Client shares its connection pool /
-        // TLS root cert cache, and the PgPool clone shares the
-        // underlying connection pool. Building separate
-        // clients/pools would double TLS init cost per test and add
-        // unnecessary parallelism pressure.
-        let tool_executor =
-            crate::inference::tools::HttpToolExecutor::new(multi_step_reqwest_client.clone(), Some(multi_step_tool_executor_pool.clone()));
-
         // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id.
         let onwards_daemon_id = uuid::Uuid::new_v4();
         let fusillade_write_pool = bg_services.request_manager.pool().clone();
@@ -3186,9 +3324,9 @@ impl Application {
              VALUES ($1, $2, $3, $4, $5, 'running', NOW(), NOW())",
         )
         .bind(onwards_daemon_id)
-        .bind(fusillade::daemon::types::get_hostname())
-        .bind(fusillade::daemon::types::get_pid())
-        .bind(fusillade::daemon::types::get_version())
+        .bind(std::env::var("HOSTNAME").unwrap_or_else(|_| "unknown".to_string()))
+        .bind(std::process::id() as i32)
+        .bind(env!("CARGO_PKG_VERSION"))
         .bind(serde_json::json!({"type": "onwards"}))
         .execute(&fusillade_write_pool)
         .await;
@@ -3250,13 +3388,10 @@ impl Application {
             });
         } // daemon_registered
 
-        // `response_store`, `multi_step_tool_executor`,
-        // `multi_step_http_client`, `multi_step_loop_config` and the
-        // multi-step processor were built upfront before
-        // `setup_background_services` — `set_processor` ran inside
-        // setup, before any daemon spawn (synchronous fusillade daemon
-        // OR the leader-gained closure). All daemons see the
-        // multi-step processor at claim time.
+        // `response_store` was built upfront (above) so AppState can share it
+        // between the GET `/responses/{id}` handler and `previous_response_id`
+        // hydration. No request processor is installed on the daemon; see the
+        // `DefaultRequestProcessor` note above.
 
         // Inference middleware state. Non-background realtime no longer
         // does any DB work up front; the completion path goes through
@@ -3275,9 +3410,6 @@ impl Application {
             },
             dwctl_pool: (*db_pools).write().clone(),
             response_store: response_store.clone(),
-            multi_step_tool_executor,
-            multi_step_http_client,
-            loop_config: multi_step_loop_config,
             image_normalizer: image_normalizer.clone(),
             image_normalizer_enabled: config.image_normalizer.enabled,
             unverified_requests_per_completion_hour: config.batches.unverified_requests_per_completion_hour,
@@ -3286,7 +3418,7 @@ impl Application {
             zdr_key_cache: bg_services.zdr_key_cache.clone(),
         };
 
-        // Build onwards router from targets with body transform, response sanitization, and tool executor.
+        // Build onwards router from targets with body transform + response sanitization.
         // Realtime request bodies share the same configurable cap as batch
         // file requests (limits.requests.max_body_size, 0 = unlimited);
         // without an explicit limit onwards' strict mode would fall back to
@@ -3298,12 +3430,11 @@ impl Application {
         // onwards stays cache-agnostic: cached-input pricing now lives entirely in
         // the dwctl cache tower layer (wired in `build_router`, gated on `cache.enabled`).
         // No classifier is injected here.
-        let onwards_app_state = onwards::AppState::with_transform(bg_services.onwards_targets.clone(), body_transform)
+        // Request-body edits (id-scrub, streaming usage flags) now live in dwctl's own
+        // `outbound_request` middleware, so onwards needs no BodyTransformFn.
+        let onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
-            .with_streaming_header("x-fusillade-stream")
             .with_response_id_header("x-fusillade-request-id")
-            .with_tool_executor(Arc::new(tool_executor))
-            .with_response_store(response_store.clone() as Arc<dyn onwards::ResponseStore>)
             .with_body_limit(onwards_body_limit);
 
         let onwards_router = if bg_services.onwards_targets.strict_mode {

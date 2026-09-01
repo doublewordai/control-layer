@@ -36,7 +36,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .await
         .expect("Failed to create fusillade TestDbPools");
 
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_pools, Default::default()));
+    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
 
@@ -102,7 +102,7 @@ pub async fn setup_fusillade_pool(pool: &PgPool) -> PgPool {
         .await
         .expect("Failed to create fusillade pool");
 
-    fusillade::migrator()
+    fusillade_arsenal::migrator()
         .run(&fusillade_pool)
         .await
         .expect("Failed to run fusillade migrations");
@@ -115,11 +115,24 @@ pub async fn setup_fusillade_pool(pool: &PgPool) -> PgPool {
 pub async fn create_test_app_state_with_fusillade(pool: PgPool, config: crate::config::Config) -> crate::AppState<TestDbPools> {
     let fusillade_pool = setup_fusillade_pool(&pool).await;
 
+    create_test_app_state_with_database_pools(pool, fusillade_pool, config).await
+}
+
+/// Create an AppState backed by distinct control-layer and Fusillade pools.
+/// This is useful for tests that need to exercise cross-database pool ordering.
+pub async fn create_test_app_state_with_database_pools(
+    pool: PgPool,
+    fusillade_pool: PgPool,
+    config: crate::config::Config,
+) -> crate::AppState<TestDbPools> {
     let test_pools = TestDbPools::new(pool.clone()).await.expect("Failed to create TestDbPools");
     let fusillade_test_pools = TestDbPools::new(fusillade_pool)
         .await
         .expect("Failed to create fusillade TestDbPools");
-    let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_test_pools, Default::default()));
+    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
+        fusillade_test_pools,
+        Default::default(),
+    ));
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
 
@@ -337,16 +350,31 @@ pub fn create_test_config() -> crate::config::Config {
         image_normalizer: Default::default(),
         openapi: Default::default(),
         cache: Default::default(),
+        continuation: Default::default(),
         keystore: None,
     }
 }
 
+/// A test user on a caller-chosen email domain.
+///
+/// Organizations claim their owner's email domain as their username, so tests
+/// that create more than one organization need owners on *different* domains -
+/// and tests about domain collisions need them on the same one. The default
+/// helper puts everyone on example.com, which makes both impossible to express.
+pub async fn create_test_user_on_domain(pool: &PgPool, role: Role, domain: &str) -> UserResponse {
+    create_test_user_inner(pool, role, Some(domain)).await
+}
+
 pub async fn create_test_user(pool: &PgPool, role: Role) -> UserResponse {
+    create_test_user_inner(pool, role, None).await
+}
+
+async fn create_test_user_inner(pool: &PgPool, role: Role, domain: Option<&str>) -> UserResponse {
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut users_repo = Users::new(&mut conn);
     let user_id = Uuid::new_v4();
     let username = format!("testuser_{}", user_id.simple());
-    let email = format!("{username}@example.com");
+    let email = format!("{username}@{}", domain.unwrap_or("example.com"));
 
     let roles = vec![role];
 
@@ -485,6 +513,8 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         has_auto_topup_payment_method: false,
         auto_topup_monthly_limit: None,
         user_type: "individual".to_string(),
+        verified: false,
+        invoicing_enabled: false,
         zero_data_retention: false,
         organizations: None,
         active_organization_id: None,
@@ -514,6 +544,8 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
             requests_per_second: None,
             burst_size: None,
             member_id: None,
+            spend_limit: None,
+            spend_limit_interval: None,
         },
     );
 
@@ -672,6 +704,8 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         has_auto_topup_payment_method: false,
         auto_topup_monthly_limit: None,
         user_type: org.user_type,
+        verified: org.verified,
+        invoicing_enabled: org.invoicing_enabled,
         zero_data_retention: org.zero_data_retention,
         organizations: None,
         active_organization_id: None,
@@ -685,7 +719,16 @@ pub async fn add_org_member(pool: &PgPool, org_id: UserId, user_id: UserId, role
 
     let mut conn = pool.acquire().await.expect("Failed to acquire connection");
     let mut orgs = Organizations::new(&mut conn);
-    orgs.add_member(org_id, user_id, role).await.expect("Failed to add org member");
+    let membership = orgs.add_member(org_id, user_id, role).await.expect("Failed to add org member");
+    // Mirror the migration-128 backfill (existing members keep self-serve):
+    // plain members get the additive 'manage_keys' org role unless a test
+    // revokes it explicitly. NOTE: the API-layer default for NEW members is
+    // the opposite (deny) — tests exercising that path go through the API.
+    if role == "member" {
+        orgs.set_membership_manage_keys(membership.id, true)
+            .await
+            .expect("Failed to grant manage_keys");
+    }
 }
 
 pub async fn create_test_model(pool: &PgPool, model_name: &str, alias: &str, endpoint_id: uuid::Uuid, created_by: UserId) -> uuid::Uuid {

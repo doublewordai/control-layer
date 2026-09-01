@@ -13,9 +13,49 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    outputs:
+      prs: ${{ steps.release.outputs.prs }}
     steps:
       - uses: googleapis/release-please-action@v4
+        id: release
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
           token: ${{ secrets.RELEASE_TOKEN }}
+
+  synchronize-release-prs:
+    needs: [release-please]
+    if: >-
+      ${{
+        needs.release-please.outputs.prs != '' &&
+        needs.release-please.outputs.prs != '[]'
+      }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pr: ${{ fromJSON(needs.release-please.outputs.prs) }}
+    steps:
+      - name: Checkout release PR
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.RELEASE_TOKEN }}
+          ref: ${{ matrix.pr.headBranchName }}
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Synchronize release dependencies and lockfile
+        run: |
+          python3 .github/scripts/sync-fusillade-release-dependencies.py
+          cargo metadata --format-version 1 > /dev/null
+
+          if git diff --quiet -- Cargo.lock fusillade-arsenal/Cargo.toml; then
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock fusillade-arsenal/Cargo.toml
+          git commit -m "chore: synchronize release dependencies"
+          git push origin HEAD:${{ matrix.pr.headBranchName }}

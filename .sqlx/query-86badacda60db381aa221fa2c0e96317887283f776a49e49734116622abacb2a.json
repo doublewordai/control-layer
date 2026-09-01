@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT location, archive_bucket\n            FROM batches WHERE id = $1 AND deleted_at IS NULL\n            FOR UPDATE\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "location",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "archive_bucket",
+        "type_info": "Date"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "86badacda60db381aa221fa2c0e96317887283f776a49e49734116622abacb2a"
+}

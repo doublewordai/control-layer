@@ -997,17 +997,24 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         false
     };
 
+    // Fetched once, for both capacity reservations and the cached model label
+    // below. A fresh create (no batch_id on the sync entry) always implies
+    // !batch_already_populated, so the label never needs stats this skips.
+    let file_stats = if batch_already_populated {
+        Vec::new()
+    } else {
+        state
+            .request_manager
+            .get_file_template_stats(fusillade::FileId(input.file_id))
+            .await
+            .map_err(|e| anyhow::anyhow!("get file template stats: {e}"))?
+    };
+
     let reservation_ids = if batch_already_populated {
         Vec::new()
     } else {
         use crate::api::handlers::sla_capacity::{CapacityError, CapacityReservationInput, reserve_capacity};
         use crate::db::handlers::deployments::Deployments;
-
-        let file_stats = state
-            .request_manager
-            .get_file_template_stats(fusillade::FileId(input.file_id))
-            .await
-            .map_err(|e| anyhow::anyhow!("get file template stats: {e}"))?;
 
         // Filter out empty model aliases — those are tier-2 invalid lines that will
         // be failed after populate. They don't need capacity reservations.
@@ -1120,13 +1127,22 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         tracing::info!(batch_id = %existing, "Reusing batch from previous attempt");
         existing
     } else {
-        let metadata = serde_json::json!({
+        // Cache the batch's model label (single alias or "mixed") at creation
+        // so list/get responses never aggregate over request_templates. Empty
+        // aliases are tier-2 invalid lines, failed after populate — skip them.
+        let models: Vec<String> = file_stats.iter().map(|s| s.model.clone()).filter(|m| !m.is_empty()).collect();
+        let model_label = crate::api::handlers::batches::batch_model_label(&models);
+
+        let mut metadata = serde_json::json!({
             "request_source": "sync",
             "dw_source_id": input.connection_id.to_string(),
             "dw_source_name": connection_name,
             "dw_sync_id": input.sync_id.to_string(),
             "dw_external_key": external_key,
         });
+        if let Some(label) = model_label {
+            metadata["dw_model"] = serde_json::Value::String(label);
+        }
 
         let batch_input = fusillade::BatchInput {
             file_id: fusillade::FileId(input.file_id),
@@ -1333,12 +1349,18 @@ mod tests {
             .await
             .expect("fusillade pool");
 
-        fusillade::migrator().run(&fusillade_pool).await.expect("fusillade migrations");
+        fusillade_arsenal::migrator()
+            .run(&fusillade_pool)
+            .await
+            .expect("fusillade migrations");
 
         let fusillade_test_pools = sqlx_pool_router::TestDbPools::new(fusillade_pool)
             .await
             .expect("fusillade test pools");
-        let request_manager = std::sync::Arc::new(fusillade::PostgresRequestManager::new(fusillade_test_pools, Default::default()));
+        let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
+            fusillade_test_pools,
+            Default::default(),
+        ));
 
         crate::tasks::TaskState {
             request_manager,
@@ -1535,6 +1557,15 @@ mod tests {
         assert_eq!(sync_entry.1, "activated", "sync entry should be activated");
         let batch_id = fusillade::BatchId(sync_entry.0);
 
+        // The cached model label ignores the empty tier-2 aliases: a file whose
+        // only real alias is gpt-4 is homogeneous, not "mixed".
+        let batch = state.request_manager.get_batch(batch_id).await.expect("get_batch");
+        assert_eq!(
+            batch.metadata.as_ref().and_then(|m| m.get("dw_model")).and_then(|v| v.as_str()),
+            Some("gpt-4"),
+            "sync-created batch should cache its model label as dw_model"
+        );
+
         let requests = state
             .request_manager
             .get_batch_requests(batch_id)
@@ -1628,6 +1659,68 @@ mod tests {
         assert_eq!(errors[0]["template_index"], 1);
         assert_eq!(errors[0]["line"], 4);
         assert_eq!(errors[0]["error"], "missing model field in body");
+    }
+
+    /// A sync-created batch whose file spans several models caches the
+    /// collapsed `"mixed"` label rather than any one alias.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_activate_batch_stamps_mixed_model_label(pool: PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::{create_test_endpoint, create_test_model};
+
+        let state = setup_task_state(pool.clone()).await;
+
+        let user = create_test_user(&pool, Role::PlatformManager).await;
+        let user_id = user.id;
+
+        // Both models must exist for the capacity check to resolve them.
+        let endpoint_id = create_test_endpoint(&pool, "test-endpoint", user_id).await;
+        create_test_model(&pool, "gpt-4-internal", "gpt-4", endpoint_id, user_id).await;
+        create_test_model(&pool, "gpt-3.5-internal", "gpt-3.5", endpoint_id, user_id).await;
+
+        let connection_id = insert_test_connection(&pool, user_id).await;
+        let sync_id = insert_test_sync_op(&pool, connection_id, user_id).await;
+        let entry_id = insert_test_sync_entry(&pool, sync_id, connection_id, "data/mixed.jsonl").await;
+
+        let templates = vec![valid_template("gpt-4"), valid_template("gpt-3.5")];
+        let file_id = create_test_file(&state, user_id, templates).await;
+
+        sqlx::query!(
+            "UPDATE sync_entries SET file_id = $2, template_count = 2 WHERE id = $1",
+            entry_id,
+            file_id,
+        )
+        .execute(&pool)
+        .await
+        .expect("update sync_entry");
+
+        let input = ActivateBatchInput {
+            sync_id,
+            sync_entry_id: entry_id,
+            connection_id,
+            file_id,
+            template_count: 2,
+        };
+
+        run_activate_batch(&state, &input).await.expect("run_activate_batch");
+
+        let batch_id: Uuid = sqlx::query_scalar("SELECT batch_id FROM sync_entries WHERE id = $1")
+            .bind(entry_id)
+            .fetch_one(&pool)
+            .await
+            .expect("fetch batch_id");
+        let batch = state
+            .request_manager
+            .get_batch(fusillade::BatchId(batch_id))
+            .await
+            .expect("get_batch");
+
+        assert_eq!(
+            batch.metadata.as_ref().and_then(|m| m.get("dw_model")).and_then(|v| v.as_str()),
+            Some("mixed"),
+            "a multi-model file should cache the collapsed \"mixed\" label"
+        );
     }
 
     /// Verify that run_activate_batch returns a retryable error when the model

@@ -5,13 +5,20 @@
 //!
 //! ## Routing
 //!
-//! - `priority` / `default` / `auto` (realtime): creates a batch of 1 with
-//!   `completion_window=0s` in `processing` state, proxies via onwards.
+//! Every tier here writes a BATCHLESS request — one `requests` row with
+//! `batch_id = NULL`, distinguished by `service_tier`. None of them creates a
+//! batch, and none of them has a completion window; the tier column carries what
+//! the legacy `completion_window` values ("0s", "1h") used to encode.
+//!
+//! - `priority` / `default` / `auto` (realtime): writes `service_tier='priority'`
+//!   straight into `processing` (the proxy is already handling it, and a nil
+//!   `daemon_id` keeps the daemon from claiming it), proxies via onwards.
 //!   With `background=true`, returns 202 and spawns the proxy as a background task.
-//! - `flex` (async): creates a batch of 1 with `completion_window=1h` in
-//!   `pending` state. The fusillade daemon picks it up. With `background=false`,
-//!   holds the connection and polls until complete. With `background=true`,
-//!   returns 202 immediately.
+//! - `flex`: writes `service_tier='flex'` in `pending` state for the fusillade
+//!   daemon to claim. With `background=false`, holds the connection and polls
+//!   until complete. With `background=true`, returns 202 immediately.
+//! - `background`: writes `service_tier='background'` in `pending` state, run on
+//!   spare capacity with no deadline.
 
 use std::sync::Arc;
 
@@ -23,7 +30,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use fusillade::{PostgresRequestManager, ReqwestHttpClient};
+use fusillade_arsenal::PostgresRequestManager;
 use sqlx_pool_router::PoolProvider;
 
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
@@ -35,7 +42,7 @@ use crate::image_normalizer::ImageNormalizer;
 /// State for the inference middleware.
 #[derive(Clone)]
 pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
-    pub request_manager: Arc<PostgresRequestManager<P, ReqwestHttpClient>>,
+    pub request_manager: Arc<PostgresRequestManager<P>>,
     pub daemon_id: OnwardsDaemonId,
     /// Base URL for loopback requests (e.g., "http://127.0.0.1:3001/ai").
     /// Flex batches are routed back through dwctl so onwards handles the
@@ -43,14 +50,9 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub loopback_base_url: String,
     /// dwctl database pool for model access validation.
     pub dwctl_pool: sqlx::PgPool,
-    /// Multi-step warm-path streaming pieces. When the user sends
-    /// `stream: true` (and not `background: true`) on `/v1/responses`,
-    /// the middleware routes the request through
-    /// [`super::streaming::run_inline_streaming`] using these.
+    /// Fusillade-backed response store. Used by the control plane here for
+    /// `previous_response_id` hydration, and by `GET /v1/responses/{id}`.
     pub response_store: Arc<super::store::FusilladeResponseStore<P>>,
-    pub multi_step_tool_executor: Arc<crate::inference::tools::HttpToolExecutor>,
-    pub multi_step_http_client: Arc<fusillade::ReqwestHttpClient>,
-    pub loop_config: onwards::LoopConfig,
     /// Image-input normaliser (content-addressed store). On the **Flex**
     /// path the request is persisted and dispatched later by the daemon, so
     /// images are normalised to `dw-img://` tokens here (when enabled) — the
@@ -112,6 +114,15 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     };
 
+    // Strip client-supplied completion/response id fields before the request is
+    // re-serialised and forwarded. dwctl owns the single parse-and-shape now, so
+    // onwards forwards the bytes verbatim (COR-522); this preserves the guarantee
+    // from onwards PR #240 that these ids never reach upstream. Exact-key removal:
+    // extension fields and a legitimate `previous_response_id` are left intact.
+    scrub_request_id_fields(&mut request_value);
+
+    strip_scheduling_priority(&mut request_value);
+
     let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
     let model = model.as_str();
     let nested_path = parts.uri.path();
@@ -129,31 +140,35 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
 
-    // Inject server-side resolved tools into the request body so the
-    // multi-step path's transition function (which reads `body["tools"]`
-    // and forwards them to upstream model_call payloads) sees them.
-    // Without this, tools registered in the dwctl tool registry never
-    // reach the model — it can't issue real tool_calls and the loop
-    // runs as a single model_call.
-    //
-    // The single-step (onwards-routed) path injects tools via the
-    // strict-mode handlers; the multi-step path bypasses onwards for
-    // model_calls so we have to do it here. Skipped if the user
-    // already supplied tools (their list takes precedence).
-    //
-    // The cross-cutting `tool_injection_middleware` runs *inside* this
-    // layer (axum applies later-added layers as outer wrappers, so
-    // when inference_middleware fires, tool_injection hasn't yet
-    // populated request.extensions::<ResolvedTools>). We do the same
-    // DB resolve directly here.
-    if request_value.get("tools").is_none()
-        && is_responses_api
-        && let Some(key) = api_key.as_deref()
-        && let Ok(Some(resolved)) = crate::inference::tools::resolve_tools_for_request(&state.dwctl_pool, key, Some(model)).await
-    {
-        let openai_tools = resolved.to_openai_tools_array();
-        if !openai_tools.is_empty() {
-            request_value["tools"] = serde_json::Value::Array(openai_tools);
+    // `previous_response_id` hydration (Responses control plane). Inline the prior
+    // turn's output items ahead of the current input, in the Responses domain,
+    // BEFORE the edge translation (one layer inside this one) converts the request
+    // to Chat Completions. Runs here rather than in the translator so the pure
+    // translator stays stateless. Gated on the field's presence so the common path
+    // pays nothing. The hydrated body flows to every downstream path because it is
+    // re-serialised from `request_value` below.
+    if is_responses_api && request_value.get("previous_response_id").is_some() {
+        use crate::inference::translation::responses::hydrate::{HydrationError, hydrate_previous_response};
+        if let Err(e) = hydrate_previous_response(&*state.response_store, &mut request_value).await {
+            let (status, message) = match e {
+                HydrationError::NotFound(id) => (StatusCode::BAD_REQUEST, format!("previous response not found: {id}")),
+                HydrationError::Internal(msg) => {
+                    tracing::error!(error = %msg, "responses hydration failed");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "failed to load previous response".to_string())
+                }
+            };
+            let err_type = if status == StatusCode::BAD_REQUEST {
+                "invalid_request_error"
+            } else {
+                "server_error"
+            };
+            return Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"error": {"message": message, "type": err_type}}).to_string(),
+                ))
+                .unwrap();
         }
     }
 
@@ -196,70 +211,20 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     } else {
         requested_tier
     };
-    let is_flex = matches!(service_tier, ServiceTier::Flex);
-
-    // The warm path / multi-step loop only earns its keep when the
-    // request actually has tools to dispatch. Tool-free `/v1/responses`
-    // can be served by onwards' native single-step proxying (which
-    // rewrites /v1/responses → /v1/chat/completions on the wire and
-    // back), producing one tracking row via the standard outlet path
-    // instead of going through `record_step` / `response_steps` /
-    // `finalize_head_request`. We compute `has_tools` after tool
-    // injection so server-side-resolved tools also count.
-    let has_tools = request_value.get("tools").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty());
-
-    // Multi-step warm-path dispatch. Engages for tool-using
-    // `/v1/responses` realtime requests (priority / default / auto) so
-    // tool calls actually dispatch — single-step onwards proxying
-    // would forward server-side tools to the upstream model but never
-    // run them. Tool-free requests don't need this and fall through to
-    // `handle_realtime` like chat-completions.
-    // Flex requests skip the warm path entirely so they can reach
-    // `handle_flex` and be queued for the daemon (1h SLA, batch
-    // pricing). The daemon's `DwctlRequestProcessor` runs the same
-    // multi-step loop async when tools are present.
-    //
-    //   stream=true,  background=false, !flex, tools → SSE response, loop runs inline
-    //   stream=false, background=false, !flex, tools → JSON response, loop runs inline
-    //   stream=*,     background=true,  !flex, tools → 202 + spawned loop, GET /v1/responses/{id} polls
-    //   no tools, !flex                              → falls through to handle_realtime below
-    //   any flex                                     → falls through to handle_flex below
-    let stream_requested = is_responses_api && !background && request_value["stream"].as_bool().unwrap_or(false);
-
-    // ZDR + server-side tools (responses API) runs the multi-step tool loop —
-    // inline on the realtime warm path, async in the flex daemon — which
-    // scatters plaintext into response_steps / sub-request rows / per-step
-    // outlet logs that ZDR cannot cover. Reject at submit for both tiers, keyed
-    // on per-key policy alone (a keystore is irrelevant to whether we can
-    // safely serve the request).
-    if is_responses_api && has_tools && crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref()) {
+    // Upstream Background-tier request-contract validation + the daemon-processed
+    // flag (Flex | Background). The multi-step warm-path loop that used to sit here
+    // (has_tools / warm_path_branch / try_warm_path_*) was removed on this branch, so
+    // only the tier validation survives.
+    if let Some(message) = background_contract_error(service_tier, is_responses_api, background) {
         return Response::builder()
             .status(StatusCode::BAD_REQUEST)
             .header("content-type", "application/json")
             .body(Body::from(
-                serde_json::json!({"error": {"message": "Zero-data-retention is not supported for requests that use server-side tools.", "type": "invalid_request_error"}}).to_string(),
+                serde_json::json!({"error": {"message": message, "type": "invalid_request_error"}}).to_string(),
             ))
             .unwrap();
     }
-
-    match warm_path_branch(is_responses_api, is_flex, background, stream_requested, has_tools) {
-        WarmPathBranch::Stream => {
-            if let Some(resp) = try_warm_path_stream(&state, &request_value, api_key.as_deref(), model).await {
-                return resp;
-            }
-        }
-        WarmPathBranch::Blocking => {
-            if let Some(resp) = try_warm_path_blocking(&state, &request_value, api_key.as_deref(), model).await {
-                return resp;
-            }
-        }
-        WarmPathBranch::Background => {
-            if let Some(resp) = try_warm_path_background(&state, &request_value, api_key.as_deref(), model).await {
-                return resp;
-            }
-        }
-        WarmPathBranch::FallThrough => {}
-    }
+    let is_daemon_processed = matches!(service_tier, ServiceTier::Flex | ServiceTier::Background);
 
     tracing::debug!(
         model = %model,
@@ -275,10 +240,10 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     let request_id = uuid::Uuid::new_v4();
     let resp_id = format!("resp_{request_id}");
 
-    // Validate API key for flex requests (realtime is validated by onwards).
-    // Flex requests bypass onwards entirely — the daemon processes them later —
-    // so we must enforce auth here.
-    if matches!(service_tier, ServiceTier::Flex) {
+    // Validate API keys for daemon-processed requests (realtime is validated
+    // by onwards). Queued requests bypass onwards at submission time, so auth
+    // and model access must be enforced here.
+    if is_daemon_processed {
         match api_key.as_deref() {
             None => {
                 return Response::builder()
@@ -303,19 +268,25 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     }
 
-    // Resolve created_by upfront for background realtime responses (row must
-    // exist before returning 202). Flex uses the key owner's hidden batch key
-    // below, so resolving it there also supplies the attribution target.
-    let created_by = if background && matches!(service_tier, ServiceTier::Realtime) {
-        response_store::lookup_created_by(&state.dwctl_pool, api_key.as_deref()).await
-    } else {
-        None
-    };
-    let flex_batch_key = if matches!(service_tier, ServiceTier::Flex) {
-        match resolve_flex_batch_api_key(&state.dwctl_pool, api_key.as_deref()).await {
-            Ok(Some(key)) => Some(key),
+    if matches!(service_tier, ServiceTier::Background) {
+        match api_key_creator_can_run_background(&state.dwctl_pool, api_key.as_deref()).await {
+            Ok(Some(true)) => {}
+            Ok(Some(false)) => {
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "error": {
+                                "message": "Background inference requires the BackgroundInferenceUser role for the API key creator.",
+                                "type": "invalid_request_error"
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap();
+            }
             Ok(None) => {
-                tracing::warn!("Flex API key disappeared before hidden batch-key resolution");
                 return Response::builder()
                     .status(StatusCode::FORBIDDEN)
                     .header("content-type", "application/json")
@@ -325,14 +296,48 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     .unwrap();
             }
             Err(e) => {
-                tracing::error!(error = %e, "Failed to resolve flex hidden batch key");
+                tracing::error!(error = %e, "Failed to resolve background-inference role");
+                return Response::builder()
+                    .status(StatusCode::INTERNAL_SERVER_ERROR)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"error": {"message": "Failed to authorize background inference", "type": "server_error", "code": 500}}).to_string(),
+                    ))
+                    .unwrap();
+            }
+        }
+    }
+
+    // Resolve created_by upfront for background realtime responses (row must
+    // exist before returning 202). Flex uses the key owner's hidden batch key
+    // below, so resolving it there also supplies the attribution target.
+    let created_by = if background && matches!(service_tier, ServiceTier::Realtime) {
+        response_store::lookup_created_by(&state.dwctl_pool, api_key.as_deref()).await
+    } else {
+        None
+    };
+    let queued_batch_key = if is_daemon_processed {
+        match resolve_flex_batch_api_key(&state.dwctl_pool, api_key.as_deref()).await {
+            Ok(Some(key)) => Some(key),
+            Ok(None) => {
+                tracing::warn!(service_tier = %service_tier, "Queued API key disappeared before hidden batch-key resolution");
+                return Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"error": {"message": "Invalid API key", "type": "invalid_request_error"}}).to_string(),
+                    ))
+                    .unwrap();
+            }
+            Err(e) => {
+                tracing::error!(error = %e, service_tier = %service_tier, "Failed to resolve queued hidden batch key");
                 return Response::builder()
                     .status(StatusCode::INTERNAL_SERVER_ERROR)
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({
                             "error": {
-                                "message": "Failed to prepare flex request",
+                                "message": "Failed to prepare queued request",
                                 "type": "server_error",
                                 "code": 500,
                             }
@@ -355,7 +360,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // and its resolution already failed closed (403/500) on lookup errors above,
     // so an unresolved creditor never reaches enforcement. No-op for verified
     // creditors or a disabled cap.
-    if let Some(key) = flex_batch_key.as_ref()
+    if matches!(service_tier, ServiceTier::Flex)
+        && let Some(key) = queued_batch_key.as_ref()
         && let Err(err) = crate::api::handlers::unverified_volume::enforce_unverified_volume_limit(
             &*state.request_manager,
             state.unverified_requests_per_completion_hour,
@@ -397,7 +403,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             };
             handle_realtime(&state, realtime_input, &resp_id, model, background, zdr, parts, body_bytes, next).await
         }
-        ServiceTier::Flex => {
+        ServiceTier::Flex | ServiceTier::Background => {
+            let is_background_tier = matches!(service_tier, ServiceTier::Background);
             // ZDR is decided once here at submit (per-key policy); dispatch and
             // retrieve key off the stored body's sentinel instead of re-checking.
             // The tool-using case is already rejected above, before the warm-path
@@ -437,11 +444,11 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 match normalize_value_to_tokens(&mut request_value, &state.image_normalizer, access_pool, attribution).await {
                     Ok(n) => {
                         if n > 0 {
-                            tracing::debug!(substituted = n, "flex image normalisation replaced image inputs with tokens");
+                            tracing::debug!(substituted = n, service_tier = %service_tier, "Queued image normalisation replaced image inputs with tokens");
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "flex image normalisation failed");
+                        tracing::warn!(error = %e, service_tier = %service_tier, "Queued image normalisation failed");
                         return normalize_error_response(e);
                     }
                 }
@@ -501,15 +508,53 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 request_value.to_string()
             };
 
-            let flex_api_key = flex_batch_key
+            let queued_api_key = queued_batch_key
                 .as_ref()
                 .map(|key| key.secret.clone())
                 .unwrap_or_else(|| api_key.clone().unwrap_or_default());
-            let flex_created_by = flex_batch_key
+            let queued_created_by = queued_batch_key
                 .as_ref()
                 .map(|key| key.key_owner_id.to_string())
                 .or_else(|| created_by.clone())
                 .unwrap_or_default();
+            // Provenance for the dispatched request. This is the last moment the caller's
+            // client is knowable: the daemon picks this request up minutes to hours from
+            // now, over an HTTP client that sends no User-Agent, so without stashing it
+            // here the analytics row for the dispatch has no client at all. Same key and
+            // same 256-char truncation as the batch path (`batches::create_batch`), so both
+            // arrive as `x-fusillade-batch-dw-user-agent` and read identically downstream.
+            let queued_metadata = parts
+                .headers
+                .get(axum::http::header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(|ua| ua.chars().take(256).collect::<String>())
+                .filter(|ua| !ua.is_empty())
+                .map(|ua| serde_json::json!({ "dw_user_agent": ua }));
+            if is_background_tier {
+                let background_input = fusillade::CreateBackgroundInput {
+                    request_id,
+                    body: flex_body,
+                    model: model.to_string(),
+                    endpoint: state.loopback_base_url.clone(),
+                    method: "POST".to_string(),
+                    path: endpoint.clone(),
+                    api_key: queued_api_key,
+                    created_by: queued_created_by,
+                    metadata: queued_metadata,
+                };
+                return handle_background(&state, background_input, &resp_id, model).await;
+            }
+
+            // INVARIANT: the daemon dispatches this job back through the loopback
+            // (`endpoint` = `.../ai`), so it re-enters the FULL dwctl stack,
+            // including the edge translation layer. That is load-bearing for
+            // Responses: this middleware runs OUTER to translation, so `flex_body`
+            // and `path` are still the RAW `/responses` request here (untranslated).
+            // Translation converts it on the daemon's loopback in both directions
+            // (request -> chat for the model call, chat -> Responses for the stored
+            // result), which is what lets `GET /v1/responses/{id}` return a
+            // Responses object. Do not "optimise" the loopback to hit onwards
+            // directly - that would bypass translation and break Responses flex.
             let flex_input = fusillade::CreateFlexInput {
                 request_id,
                 body: flex_body,
@@ -517,8 +562,9 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 endpoint: state.loopback_base_url.clone(),
                 method: "POST".to_string(),
                 path: endpoint.clone(),
-                api_key: flex_api_key,
-                created_by: flex_created_by,
+                api_key: queued_api_key,
+                created_by: queued_created_by,
+                metadata: queued_metadata,
             };
 
             match (is_chat_completions_api, flex_stream) {
@@ -533,11 +579,14 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 }
 
 /// Resolved service tier.
+#[derive(Clone, Copy)]
 enum ServiceTier {
     /// Realtime: direct proxy via onwards.
     Realtime,
-    /// Flex: batch of 1 with 1h completion window, processed by fusillade daemon.
+    /// Flex: a batchless `service_tier='flex'` request, claimed by the fusillade daemon.
     Flex,
+    /// Background: no-SLA spare-capacity processing by background workers.
+    Background,
 }
 
 #[derive(Debug, Clone)]
@@ -555,11 +604,29 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
         return Ok(None);
     };
 
+    // The cap-scope child is fetched in the same by-secret lookup (this runs
+    // per flex request — no extra round trip). If the authenticating key has a
+    // cap-scope child (`parent_api_key_id = ak.id`), the flex request executes
+    // on it so spend can be attributed/enforced per key when a cap is set
+    // (children are minted at cap-set time and deliberately outlive cap
+    // removal). If no child exists, fall back to the shared hidden batch key
+    // as before.
+    //
+    // Invariant: the bearer here is always an external, user-visible key. The
+    // only traffic that carries hidden batch keys (shared or cap-scope child)
+    // is the fusillade daemon loopback, which bypasses this middleware via the
+    // `x-fusillade-request-id` guard at the top of `inference_middleware`, and
+    // hidden-key secrets are never exposed to clients.
     let row = sqlx::query(
         r#"
-        SELECT ak.user_id, ak.created_by, u.verified
+        SELECT ak.user_id, ak.created_by, u.verified, child.secret AS child_secret
         FROM api_keys ak
         LEFT JOIN users u ON u.id = ak.user_id
+        LEFT JOIN api_keys child
+               ON child.parent_api_key_id = ak.id
+              AND child.purpose = 'batch'
+              AND child.hidden = true
+              AND child.is_deleted = false
         WHERE ak.secret = $1 AND ak.is_deleted = false
         LIMIT 1
         "#,
@@ -576,12 +643,21 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     // NULL when the LEFT JOIN found no user row; a missing row counts as
     // unverified, matching `Users::is_verified`.
     let verified: bool = sqlx::Row::try_get(&row, "verified").ok().flatten().unwrap_or(false);
+    // NULL (no child) decodes as None via the Option; genuine decode errors
+    // propagate rather than silently downgrading a capped key to the shared
+    // (uncapped) execution key.
+    let child_secret: Option<String> = sqlx::Row::try_get(&row, "child_secret")?;
 
-    let mut conn = pool.acquire().await?;
-    let mut api_keys_repo = ApiKeys::new(&mut conn);
-    let secret = api_keys_repo
-        .get_or_create_hidden_key(key_owner_id, ApiKeyPurpose::Batch, created_by)
-        .await?;
+    let secret = match child_secret {
+        Some(secret) => secret,
+        None => {
+            let mut conn = pool.acquire().await?;
+            let mut api_keys_repo = ApiKeys::new(&mut conn);
+            api_keys_repo
+                .get_or_create_hidden_key(key_owner_id, ApiKeyPurpose::Batch, created_by)
+                .await?
+        }
+    };
 
     Ok(Some(FlexBatchApiKey {
         secret,
@@ -590,76 +666,74 @@ async fn resolve_flex_batch_api_key(pool: &sqlx::PgPool, api_key: Option<&str>) 
     }))
 }
 
+/// Resolve the background capability from the human who created an API key.
+///
+/// For organization-owned keys, `api_keys.user_id` is the organization while
+/// `api_keys.created_by` is the acting member. Background authorization follows
+/// the latter so an organization role cannot accidentally grant the capability.
+async fn api_key_creator_can_run_background(pool: &sqlx::PgPool, api_key: Option<&str>) -> Result<Option<bool>, DbError> {
+    let Some(api_key) = api_key else {
+        return Ok(None);
+    };
+
+    sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM user_roles ur
+            WHERE ur.user_id = ak.created_by
+              AND ur.role = 'BACKGROUNDINFERENCEUSER'
+        )
+        FROM api_keys ak
+        WHERE ak.secret = $1 AND ak.is_deleted = false
+        LIMIT 1
+        "#,
+    )
+    .bind(api_key)
+    .fetch_optional(pool)
+    .await
+    .map_err(Into::into)
+}
+
 impl std::fmt::Display for ServiceTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ServiceTier::Realtime => write!(f, "realtime"),
             ServiceTier::Flex => write!(f, "flex"),
+            ServiceTier::Background => write!(f, "background"),
         }
     }
 }
 
 /// Map the service_tier string to a resolved tier.
-/// Only "flex" gets async processing. Everything else is realtime.
+/// The `flex` and provider-extension `background` values get queued daemon
+/// processing. Everything else is realtime.
 fn resolve_service_tier(tier: Option<&str>) -> ServiceTier {
     match tier {
         Some("flex") => ServiceTier::Flex,
+        Some("background") => ServiceTier::Background,
         // "priority", "default", "auto", None → realtime
         _ => ServiceTier::Realtime,
     }
 }
 
-/// Which warm-path branch (if any) should handle a request, given
-/// the orthogonal flags `(is_responses_api, is_flex, background,
-/// stream_requested)`. `FallThrough` means the request continues to
-/// the realtime / flex dispatch below — that's how flex
-/// `/v1/responses` reaches `handle_flex` and how chat completions /
-/// embeddings always reach `handle_realtime`.
-///
-/// Extracted as a pure function so the routing decision is testable
-/// without standing up the full middleware state.
-///
-/// Check order matters for readability rather than correctness — both
-/// short-circuits return `FallThrough`, so reordering them produces
-/// the same answer — but reading flex-first makes the bug-this-PR-
-/// fixes connection explicit: flex must never reach the warm path.
-/// `is_responses_api` second documents that warm path is exclusive
-/// to `/v1/responses`. Stream/background tail dispatch is the only
-/// real branching.
-#[derive(Debug, PartialEq, Eq)]
-enum WarmPathBranch {
-    Stream,
-    Blocking,
-    Background,
-    FallThrough,
-}
-
-fn warm_path_branch(is_responses_api: bool, is_flex: bool, background: bool, stream_requested: bool, has_tools: bool) -> WarmPathBranch {
-    // Flex must reach `handle_flex` to land in fusillade-pending
-    // state for the daemon. Engaging warm-path for flex would defeat
-    // the tier (the loop runs inline, billed as realtime).
-    if is_flex {
-        return WarmPathBranch::FallThrough;
+/// Return a user-actionable validation error when the background tier is used
+/// outside its asynchronous Responses API contract.
+fn background_contract_error(service_tier: ServiceTier, is_responses_api: bool, background: bool) -> Option<&'static str> {
+    if !matches!(service_tier, ServiceTier::Background) {
+        return None;
     }
-    // Warm path is /v1/responses-only — chat completions and
-    // embeddings stay on the single-step proxy path.
     if !is_responses_api {
-        return WarmPathBranch::FallThrough;
+        return Some(
+            "service_tier: \"background\" is only supported by /v1/responses. Submit the request to /v1/responses with background: true, or choose a foreground service_tier.",
+        );
     }
-    // Tool-free /v1/responses doesn't need the multi-step loop —
-    // there are no tool_calls to dispatch. Fall through so onwards'
-    // single-step /v1/responses → /v1/chat/completions proxy handles
-    // it, producing one tracking row via the standard outlet path.
-    if !has_tools {
-        return WarmPathBranch::FallThrough;
+    if !background {
+        return Some(
+            "service_tier: \"background\" is asynchronous and requires background: true. Set background: true and poll GET /v1/responses/{id}, or choose a foreground service_tier.",
+        );
     }
-    if stream_requested {
-        WarmPathBranch::Stream
-    } else if background {
-        WarmPathBranch::Background
-    } else {
-        WarmPathBranch::Blocking
-    }
+    None
 }
 
 /// Handle a realtime request (priority/default/auto).
@@ -832,6 +906,48 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
             }
         }
     }
+}
+
+fn background_submission_body(resp_id: &str, model: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": resp_id,
+        "object": "response",
+        "status": "queued",
+        "model": model,
+        "background": true,
+        "service_tier": "background",
+        "output": [],
+    })
+}
+
+/// Enqueue a no-SLA Responses API request for spare-capacity processing.
+async fn handle_background<P: PoolProvider + Clone + Send + Sync + 'static>(
+    state: &InferenceMiddlewareState<P>,
+    input: fusillade::CreateBackgroundInput,
+    resp_id: &str,
+    model: &str,
+) -> Response {
+    if let Err(e) = fusillade::Storage::create_background(&*state.request_manager, input).await {
+        tracing::error!(error = %e, "Failed to create background row in fusillade");
+        return Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "error": {
+                        "message": "Failed to enqueue background request",
+                        "type": "server_error",
+                        "code": 500,
+                    }
+                })
+                .to_string(),
+            ))
+            .unwrap();
+    }
+
+    let response_body = background_submission_body(resp_id, model);
+    tracing::debug!(response_id = %resp_id, "Enqueued background request");
+    (StatusCode::ACCEPTED, Json(response_body)).into_response()
 }
 
 /// Handle a flex `/v1/chat/completions` request.
@@ -1010,234 +1126,107 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
 }
 
 /// Check if a request should be intercepted by this middleware.
+///
+/// `/messages` is included because this middleware now runs OUTER to the edge
+/// translation (so it sees the raw foreign path). Anthropic `/messages` still
+/// needs a tracking row and realtime/flex routing, exactly like `/chat/completions`
+/// it would otherwise be translated into; translation happens on the layer just
+/// inside this one.
 pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool {
+    // `/completions` (which `/chat/completions` also ends with) is included so
+    // native completions traffic passes through `strip_scheduling_priority`:
+    // it is the one POST inference path where a typed `priority` field exists
+    // in onwards' strict schema, so leaving it un-intercepted would let any
+    // external key steer the dynamo scheduler queue.
     method == axum::http::Method::POST
-        && (path.ends_with("/responses") || path.ends_with("/chat/completions") || path.ends_with("/embeddings"))
+        && (path.ends_with("/responses") || path.ends_with("/completions") || path.ends_with("/messages") || path.ends_with("/embeddings"))
 }
 
-/// Attempt to dispatch a `/v1/responses` request through the warm-path
-/// streaming handler. Returns `Some(response)` if the dispatch
-/// succeeded; `None` if the request can't be served via the warm path
-/// (no API key, missing tool resolution, etc.) and should fall through
-/// to the standard single-step / daemon paths.
-async fn try_warm_path_stream<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &InferenceMiddlewareState<P>,
-    request_value: &serde_json::Value,
-    api_key: Option<&str>,
-    model: &str,
-) -> Option<Response> {
-    let api_key = api_key?;
-    let (head_step_uuid, resolved, upstream) = warm_path_setup(state, request_value, api_key, model).await?;
+/// Client-supplied completion/response id keys to strip from a request body
+/// before forwarding upstream (ported from onwards PR #240). Not legitimate
+/// request fields, so removing them never drops real input.
+const SCRUB_ID_KEYS: [&str; 5] = ["id", "completion_id", "completionId", "response_id", "responseId"];
 
-    let sse = super::streaming::run_inline_streaming(
-        state.response_store.clone(),
-        state.multi_step_tool_executor.clone(),
-        resolved,
-        state.multi_step_http_client.clone(),
-        upstream,
-        state.loop_config,
-        head_step_uuid.to_string(),
-        model.to_string(),
-    );
-    Some(sse.into_response())
-}
-
-/// Warm-path blocking handler for `/v1/responses` with
-/// `stream:false, background:false`. Same multi-step machinery as
-/// `try_warm_path_stream`, but accumulates the loop's output and
-/// returns a single JSON response instead of an SSE stream — so tools
-/// dispatch correctly even when the user opted out of streaming.
-async fn try_warm_path_blocking<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &InferenceMiddlewareState<P>,
-    request_value: &serde_json::Value,
-    api_key: Option<&str>,
-    model: &str,
-) -> Option<Response> {
-    let api_key = api_key?;
-    let (request_id, resolved, upstream) = match warm_path_setup(state, request_value, api_key, model).await {
-        Some(s) => s,
-        None => return None,
-    };
-
-    let result = super::streaming::run_inline_blocking(
-        state.response_store.clone(),
-        state.multi_step_tool_executor.clone(),
-        resolved,
-        state.multi_step_http_client.clone(),
-        upstream,
-        state.loop_config,
-        request_id.to_string(),
-        model.to_string(),
-    )
-    .await;
-
-    let (status, body) = match result {
-        Ok(json) => (StatusCode::OK, json),
-        Err(err_payload) => (StatusCode::BAD_GATEWAY, serde_json::json!({"error": err_payload})),
-    };
-    Some((status, Json(body)).into_response())
-}
-
-/// Warm-path background handler for `/v1/responses` with
-/// `background:true`. Spawns the multi-step loop in a background
-/// task and returns a 202 with the in_progress response shape — the
-/// caller polls `GET /v1/responses/{id}` for the terminal state.
-async fn try_warm_path_background<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &InferenceMiddlewareState<P>,
-    request_value: &serde_json::Value,
-    api_key: Option<&str>,
-    model: &str,
-) -> Option<Response> {
-    let api_key = api_key?;
-    let (request_id, resolved, upstream) = match warm_path_setup(state, request_value, api_key, model).await {
-        Some(s) => s,
-        None => return None,
-    };
-
-    let resp_id = format!("resp_{request_id}");
-    let response_body = serde_json::json!({
-        "id": resp_id,
-        "object": "response",
-        "status": "in_progress",
-        "model": model,
-        "background": true,
-        "output": [],
-    });
-
-    let response_store = state.response_store.clone();
-    let tool_executor = state.multi_step_tool_executor.clone();
-    let http_client = state.multi_step_http_client.clone();
-    let loop_config = state.loop_config;
-    let model_str = model.to_string();
-    let request_id_str = request_id.to_string();
-    tokio::spawn(async move {
-        let _ = super::streaming::run_inline_blocking(
-            response_store,
-            tool_executor,
-            resolved,
-            http_client,
-            upstream,
-            loop_config,
-            request_id_str,
-            model_str,
-        )
-        .await;
-    });
-
-    Some((StatusCode::ACCEPTED, Json(response_body)).into_response())
-}
-
-/// Shared setup for the three warm paths: register the per-response
-/// context in the side-channel so the bridge's `next_action_for` /
-/// `record_step` can re-parse the original body and stamp api_key /
-/// created_by / base_url on per-step sub-request rows; resolve
-/// per-request tools; build the upstream target.
+/// Remove the [`SCRUB_ID_KEYS`] from a request body's top-level object, in place.
 ///
-/// Returns the head-step UUID — the caller surfaces it to the user as
-/// `resp_<id>` and threads its string form into `run_response_loop` as
-/// the loop's `request_id` parameter.
-///
-/// A single `/v1/responses` fusillade row is created up front via
-/// `create_realtime` (state=`processing`, id=`head_step_uuid`). That
-/// row is the response: `record_step`'s head branch reuses it instead
-/// of inserting another, and `finalize_head_request` completes it when
-/// the loop terminates. Descendant model_call steps still mint their
-/// own sub-request rows. The asymmetry with the daemon-driven flex
-/// path (which uses `handle_flex` to create the same shape of row in
-/// `pending` state) is just state at insert: warm path doesn't go
-/// through the daemon's claim cycle.
-async fn warm_path_setup<P: PoolProvider + Clone + Send + Sync + 'static>(
-    state: &InferenceMiddlewareState<P>,
-    request_value: &serde_json::Value,
-    api_key: &str,
-    model: &str,
-) -> Option<(uuid::Uuid, Arc<crate::inference::tools::ResolvedToolSet>, onwards::UpstreamTarget)> {
-    let created_by = response_store::lookup_created_by(&state.dwctl_pool, Some(api_key)).await;
-
-    let resolved = match crate::inference::tools::resolve_tools_for_request(&state.dwctl_pool, api_key, Some(model)).await {
-        Ok(Some(set)) => Arc::new(set),
-        Ok(None) => Arc::new(crate::inference::tools::ResolvedToolSet::new(
-            std::collections::HashMap::new(),
-            std::collections::HashMap::new(),
-        )),
-        Err(e) => {
-            tracing::warn!(error = %e, "warm-path: tool resolution failed; running with no tools");
-            Arc::new(crate::inference::tools::ResolvedToolSet::new(
-                std::collections::HashMap::new(),
-                std::collections::HashMap::new(),
-            ))
+/// Exact-key removal only: every other extension field is preserved, and a
+/// legitimate `previous_response_id` (a different key) is untouched.
+fn scrub_request_id_fields(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        for key in SCRUB_ID_KEYS {
+            obj.remove(key);
         }
-    };
-
-    // The transition function uses these names to decide which
-    // tool_calls returned by the model can be auto-dispatched and
-    // which must be passed through to the client as `function_call`
-    // output items. Any tool the user supplies in their request body
-    // that isn't registered in `tool_sources` ends up outside this set
-    // and gets the client-side passthrough treatment — without this,
-    // HttpToolExecutor would try to dispatch the unknown name and the
-    // step would fail with `Tool not found`.
-    let resolved_tool_names = resolved.tools.keys().cloned().collect();
-
-    // Allocate the head step UUID up front so the side-channel entry
-    // and the fusillade row share the same id — `record_step`'s head
-    // branch reuses this row instead of creating a separate sub-request.
-    let head_step_uuid = uuid::Uuid::new_v4();
-
-    let pending = response_store::PendingResponseInput {
-        body: request_value.to_string(),
-        api_key: Some(api_key.to_string()),
-        created_by: created_by.clone(),
-        base_url: state.loopback_base_url.clone(),
-        resolved_tool_names,
-    };
-    if let Err(e) = state.response_store.register_pending_with_id(head_step_uuid, pending) {
-        tracing::error!(
-            error = %e,
-            request_id = %head_step_uuid,
-            "warm-path: failed to register pending input — aborting warm path",
-        );
-        return None;
     }
+}
 
-    // Create the /v1/responses row up front in `processing` state so
-    // it's not claimable by the daemon (warm path owns its lifecycle)
-    // and so `record_step`'s head branch can attach to it via id.
-    let realtime_input = fusillade::CreateRealtimeInput {
-        request_id: head_step_uuid,
-        body: request_value.to_string(),
-        model: model.to_string(),
-        endpoint: state.loopback_base_url.clone(),
-        method: "POST".to_string(),
-        path: "/v1/responses".to_string(),
-        api_key: api_key.to_string(),
-        created_by: created_by.unwrap_or_default(),
-    };
-    if let Err(e) = fusillade::Storage::create_realtime(&*state.request_manager, realtime_input).await {
-        tracing::error!(
-            error = %e,
-            request_id = %head_step_uuid,
-            "warm-path: failed to create /v1/responses tracking row — aborting warm path",
-        );
-        state.response_store.unregister_pending(&head_step_uuid.to_string());
-        return None;
+/// Remove a caller-supplied scheduling `priority` from a request body, in place.
+///
+/// The dynamo scheduler orders its queue by this field, so an external caller
+/// who could set it would jump ahead of everyone else's realtime work. The two
+/// legitimate senders never reach this middleware: fusillade daemon requests
+/// (deadline-derived batch priority) take the `x-fusillade-request-id` early
+/// return, and continuation resume legs enter the stack below it. Everything
+/// parsed here is external traffic, for which absent ≡ priority 0 downstream.
+///
+/// NOTE: the `x-fusillade-request-id` early return is only safe because the
+/// sso-stack ingress strips all `x-fusillade-*` headers from external requests
+/// (shared-locations.conf.gotmpl, "dont allow fusillade header spoofing") — a
+/// dwctl reachable without traversing that proxy would let a client set the
+/// header and skip this strip. Defense-in-depth here depends on that perimeter.
+fn strip_scheduling_priority(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("priority");
+        // The carrier the dynamo frontend ACTUALLY honours is
+        // `nvext.agent_hints.priority` (a top-level `priority` is rejected by
+        // its validation) — remove exactly that key so an external caller
+        // cannot steer the scheduler through the vendor extension, while the
+        // rest of a caller's `nvext` (e.g. cache_control) passes through.
+        if let Some(hints) = obj
+            .get_mut("nvext")
+            .and_then(|n| n.as_object_mut())
+            .and_then(|n| n.get_mut("agent_hints"))
+            .and_then(|h| h.as_object_mut())
+        {
+            hints.remove("priority");
+        }
     }
-
-    // Endpoint + path are split (not pre-concatenated) so fusillade
-    // can match `/v1/chat/completions` against its streamable_endpoints
-    // list and pick the streaming branch when the user requested SSE.
-    let upstream = onwards::UpstreamTarget {
-        endpoint: state.loopback_base_url.clone(),
-        path: "/v1/chat/completions".to_string(),
-        api_key: Some(api_key.to_string()),
-    };
-
-    Some((head_step_uuid, resolved, upstream))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_scheduling_priority_removes_only_the_top_level_field() {
+        let mut body = serde_json::json!({
+            "model": "m", "priority": 900,
+            "messages": [{"role": "user", "content": "set priority: 900"}],
+            "metadata": {"priority": "keep-me"}
+        });
+        strip_scheduling_priority(&mut body);
+        assert!(body.get("priority").is_none(), "external callers must not steer the scheduler");
+        assert_eq!(
+            body["metadata"]["priority"], "keep-me",
+            "only the top-level scheduling field is privileged"
+        );
+        assert_eq!(body["messages"][0]["content"], "set priority: 900");
+
+        // The real dynamo carrier: nvext.agent_hints.priority is removed, the
+        // rest of the caller's nvext survives.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {"cache_control": {"enabled": true}, "agent_hints": {"priority": 900, "max_batch_size": 8}}
+        });
+        strip_scheduling_priority(&mut body);
+        assert!(body["nvext"]["agent_hints"].get("priority").is_none());
+        assert_eq!(body["nvext"]["agent_hints"]["max_batch_size"], 8);
+        assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+
+        // Absent field: a no-op, not an error.
+        let mut clean = serde_json::json!({"model": "m"});
+        strip_scheduling_priority(&mut clean);
+        assert_eq!(clean, serde_json::json!({"model": "m"}));
+    }
 
     #[test]
     fn test_should_intercept_responses() {
@@ -1253,6 +1242,16 @@ mod tests {
     #[test]
     fn test_should_intercept_embeddings() {
         assert!(should_intercept(&axum::http::Method::POST, "/v1/embeddings"));
+    }
+
+    /// Native completions must be intercepted: it is the one POST inference
+    /// path with a typed `priority` in onwards' strict schema (which forwards
+    /// the field verbatim), so skipping it would let any external key
+    /// queue-jump the dynamo scheduler via `/v1/completions`.
+    #[test]
+    fn test_should_intercept_completions() {
+        assert!(should_intercept(&axum::http::Method::POST, "/v1/completions"));
+        assert!(should_intercept(&axum::http::Method::POST, "/completions"));
     }
 
     #[test]
@@ -1274,6 +1273,30 @@ mod tests {
     #[test]
     fn test_should_not_intercept_files() {
         assert!(!should_intercept(&axum::http::Method::POST, "/v1/files"));
+    }
+
+    #[test]
+    fn scrub_strips_id_keys_and_preserves_extensions_and_previous_response_id() {
+        let mut v = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "id": "gone",
+            "completion_id": "gone",
+            "completionId": "gone",
+            "response_id": "gone",
+            "responseId": "gone",
+            "previous_response_id": "resp_keep",
+            "x_custom_extension": "keep",
+        });
+        scrub_request_id_fields(&mut v);
+        let obj = v.as_object().unwrap();
+        for k in super::SCRUB_ID_KEYS {
+            assert!(!obj.contains_key(k), "{k} should have been scrubbed");
+        }
+        // previous_response_id (a superstring of a scrub key) and other extensions survive.
+        assert_eq!(obj["previous_response_id"], "resp_keep");
+        assert_eq!(obj["x_custom_extension"], "keep");
+        assert_eq!(obj["model"], "gpt-4o");
     }
 
     #[test]
@@ -1301,6 +1324,47 @@ mod tests {
         assert!(matches!(resolve_service_tier(Some("flex")), ServiceTier::Flex));
     }
 
+    #[test]
+    fn test_resolve_service_tier_background() {
+        assert!(matches!(resolve_service_tier(Some("background")), ServiceTier::Background));
+    }
+
+    #[test]
+    fn background_submission_is_queued_before_the_daemon_claims_it() {
+        let response = background_submission_body("resp_background", "test-model");
+
+        assert_eq!(
+            response,
+            serde_json::json!({
+                "id": "resp_background",
+                "object": "response",
+                "status": "queued",
+                "model": "test-model",
+                "background": true,
+                "service_tier": "background",
+                "output": [],
+            })
+        );
+    }
+
+    #[test]
+    fn background_service_tier_requires_async_responses() {
+        assert_eq!(background_contract_error(ServiceTier::Background, true, true), None);
+
+        let foreground_error =
+            background_contract_error(ServiceTier::Background, true, false).expect("foreground background-tier request must be rejected");
+        assert!(foreground_error.contains("background: true"));
+        assert!(foreground_error.contains("service_tier"));
+
+        let unsupported_endpoint_error = background_contract_error(ServiceTier::Background, false, false)
+            .expect("non-Responses background-tier request must be rejected");
+        assert!(unsupported_endpoint_error.contains("/v1/responses"));
+        assert!(unsupported_endpoint_error.contains("background: true"));
+
+        assert_eq!(background_contract_error(ServiceTier::Flex, true, false), None);
+        assert_eq!(background_contract_error(ServiceTier::Realtime, false, false), None);
+    }
+
     #[sqlx::test]
     async fn resolve_flex_batch_key_uses_hidden_batch_key_for_key_owner(pool: sqlx::PgPool) {
         use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
@@ -1324,6 +1388,8 @@ mod tests {
                     requests_per_second: None,
                     burst_size: None,
                     member_id: None,
+                    spend_limit: None,
+                    spend_limit_interval: None,
                 },
             ))
             .await
@@ -1362,66 +1428,99 @@ mod tests {
         assert!(row_hidden);
     }
 
-    // Routing-decision tests for `warm_path_branch`. The whole point
-    // of this PR is that flex `/v1/responses` must skip the warm
-    // path and fall through to `handle_flex`; these tests pin that
-    // contract so a future refactor that re-engages warm-path for
-    // flex can't silently regress the routing back to the bug.
+    #[sqlx::test]
+    async fn background_role_is_resolved_from_organization_key_creator(pool: sqlx::PgPool) {
+        use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
+        use crate::db::{
+            handlers::{Repository, api_keys::ApiKeys},
+            models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose},
+        };
 
-    #[test]
-    fn warm_path_branch_flex_responses_falls_through_to_handle_flex() {
-        // The bug being fixed: flex /v1/responses used to engage warm
-        // path regardless of tier and run the loop inline at realtime
-        // cost. After the fix, every flex case must fall through.
-        for &background in &[false, true] {
-            for &stream in &[false, true] {
-                for &has_tools in &[false, true] {
-                    assert_eq!(
-                        warm_path_branch(true, true, background, stream, has_tools),
-                        WarmPathBranch::FallThrough,
-                        "flex /v1/responses must fall through (background={background}, stream={stream}, has_tools={has_tools})"
-                    );
-                }
-            }
-        }
+        let creator = crate::test::utils::create_test_user(&pool, Role::BackgroundInferenceUser).await;
+        let org = crate::test::utils::create_test_org(&pool, creator.id).await;
+        let org_key = {
+            let mut conn = pool.acquire().await.expect("acquire connection");
+            ApiKeys::new(&mut conn)
+                .create(&ApiKeyCreateDBRequest::new(
+                    org.id,
+                    creator.id,
+                    ApiKeyCreate {
+                        name: "Org background key".to_string(),
+                        description: None,
+                        purpose: ApiKeyPurpose::Realtime,
+                        requests_per_second: None,
+                        burst_size: None,
+                        member_id: None,
+                        spend_limit: None,
+                        spend_limit_interval: None,
+                    },
+                ))
+                .await
+                .expect("create organization key")
+                .secret
+        };
+
+        assert_eq!(
+            api_key_creator_can_run_background(&pool, Some(&org_key))
+                .await
+                .expect("resolve creator role"),
+            Some(true)
+        );
+
+        let org_has_background_role: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM user_roles WHERE user_id = $1 AND role = 'BACKGROUNDINFERENCEUSER')")
+                .bind(org.id)
+                .fetch_one(&pool)
+                .await
+                .expect("query organization roles");
+        assert!(
+            !org_has_background_role,
+            "the organization owner row must not provide authorization"
+        );
     }
 
-    #[test]
-    fn warm_path_branch_realtime_responses_with_tools_picks_correct_warm_branch() {
-        // Realtime /v1/responses with tools keeps the existing
-        // warm-path behavior: stream → SSE, background → spawned
-        // task, neither → blocking JSON.
-        assert_eq!(warm_path_branch(true, false, false, true, true), WarmPathBranch::Stream);
-        assert_eq!(warm_path_branch(true, false, true, false, true), WarmPathBranch::Background);
-        assert_eq!(warm_path_branch(true, false, false, false, true), WarmPathBranch::Blocking);
-    }
+    #[sqlx::test]
+    async fn background_role_rejects_api_key_creator_without_capability(pool: sqlx::PgPool) {
+        use crate::api::models::{api_keys::ApiKeyCreate, users::Role};
+        use crate::db::{
+            handlers::{Repository, api_keys::ApiKeys},
+            models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose},
+        };
 
-    #[test]
-    fn warm_path_branch_realtime_responses_without_tools_falls_through() {
-        // Without tools the multi-step loop has nothing to dispatch.
-        // Fall through so onwards' single-step /v1/responses proxy
-        // handles it — produces one tracking row via the standard
-        // outlet path instead of record_step / response_steps.
-        for &background in &[false, true] {
-            for &stream in &[false, true] {
-                assert_eq!(
-                    warm_path_branch(true, false, background, stream, false),
-                    WarmPathBranch::FallThrough,
-                    "tool-free realtime /v1/responses must fall through (background={background}, stream={stream})"
-                );
-            }
-        }
-    }
+        let creator = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let key = {
+            let mut conn = pool.acquire().await.expect("acquire connection");
+            ApiKeys::new(&mut conn)
+                .create(&ApiKeyCreateDBRequest::new(
+                    creator.id,
+                    creator.id,
+                    ApiKeyCreate {
+                        name: "Foreground-only key".to_string(),
+                        description: None,
+                        purpose: ApiKeyPurpose::Realtime,
+                        requests_per_second: None,
+                        burst_size: None,
+                        member_id: None,
+                        spend_limit: None,
+                        spend_limit_interval: None,
+                    },
+                ))
+                .await
+                .expect("create key")
+                .secret
+        };
 
-    #[test]
-    fn warm_path_branch_chat_completions_always_falls_through() {
-        // Warm path is /v1/responses-only. Chat completions and
-        // embeddings never engage it regardless of tier — they go
-        // through the single-step proxy.
-        for &has_tools in &[false, true] {
-            assert_eq!(warm_path_branch(false, false, false, false, has_tools), WarmPathBranch::FallThrough);
-            assert_eq!(warm_path_branch(false, true, false, false, has_tools), WarmPathBranch::FallThrough);
-            assert_eq!(warm_path_branch(false, false, false, true, has_tools), WarmPathBranch::FallThrough);
-        }
+        assert_eq!(
+            api_key_creator_can_run_background(&pool, Some(&key))
+                .await
+                .expect("resolve creator role"),
+            Some(false)
+        );
+        assert_eq!(
+            api_key_creator_can_run_background(&pool, Some("unknown-key"))
+                .await
+                .expect("resolve unknown key"),
+            None
+        );
     }
 }

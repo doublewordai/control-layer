@@ -34,6 +34,13 @@ pub fn create_provider(config: PaymentConfig) -> Box<dyn PaymentProvider> {
 /// Result type for payment provider operations
 pub type Result<T> = std::result::Result<T, PaymentError>;
 
+/// Whether an automatic top-up decline may be retried.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoTopupDeclineKind {
+    Soft,
+    Hard,
+}
+
 /// Errors that can occur during payment processing
 #[derive(Debug, thiserror::Error)]
 pub enum PaymentError {
@@ -54,6 +61,23 @@ pub enum PaymentError {
 
     #[error("User does not have a payment provider customer ID")]
     NoCustomerId,
+
+    #[error("Automatic top-up payment was declined: {0:?}")]
+    AutoTopupDeclined(AutoTopupDeclineKind),
+
+    /// The session references a user this plane has never heard of, which in a
+    /// multi-region deployment overwhelmingly means it belongs to another
+    /// region: Stripe delivers account-level events to *every* configured
+    /// endpoint regardless of which plane created the session, so with one
+    /// Stripe account and two planes each receives the other's events as a
+    /// matter of course.
+    ///
+    /// Maps to 404, which is the honest answer for the front-channel
+    /// `PATCH /payments/{id}` caller. The webhook handler deliberately acks it
+    /// with 200 instead — see the arm there — because Stripe must be told to
+    /// stop redelivering an event this plane can never process.
+    #[error("Payment session references a user unknown to this plane: {0}")]
+    UnknownReference(String),
 }
 
 impl From<PaymentError> for StatusCode {
@@ -62,6 +86,12 @@ impl From<PaymentError> for StatusCode {
             PaymentError::PaymentNotCompleted => StatusCode::PAYMENT_REQUIRED,
             PaymentError::InvalidData(_) | PaymentError::NoCustomerId => StatusCode::BAD_REQUEST,
             PaymentError::AlreadyProcessed => StatusCode::OK,
+            // NOT ok here. A 2xx belongs to the webhook, where it stops Stripe
+            // redelivering; this mapping also serves the front-channel
+            // PATCH /payments/{id}, where reporting success for a session we
+            // cannot process would be a lie to the caller.
+            PaymentError::UnknownReference(_) => StatusCode::NOT_FOUND,
+            PaymentError::AutoTopupDeclined(_) => StatusCode::PAYMENT_REQUIRED,
             PaymentError::ProviderApi(_) | PaymentError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -155,10 +185,33 @@ pub trait PaymentProvider: Send + Sync {
     /// Fetches the payment session from the provider and returns validated details.
     async fn get_payment_session(&self, session_id: &str) -> Result<PaymentSession>;
 
-    /// Process a completed payment session
+    /// Create a setup-mode checkout session that verifies and saves a payment
+    /// method without charging it.
+    ///
+    /// Used by onboarding's "Add Payment Method" step: the user proves a real
+    /// card (and clears the unverified rate-limit tier) without having to buy
+    /// credits first. Returns the hosted checkout URL.
+    ///
+    /// Distinct from `create_auto_topup_checkout_session`, which is also
+    /// setup-mode but carries auto-top-up-specific consent copy and is only
+    /// reachable from the auto-top-up flow.
+    ///
+    /// # Arguments
+    /// * `payer` - The billing target being verified (individual or org)
+    /// * `cancel_url` - URL to redirect to if the user cancels
+    /// * `success_url` - URL to redirect to on success
+    async fn create_setup_checkout_session(&self, payer: &CheckoutPayer, cancel_url: &str, success_url: &str) -> Result<String>;
+
+    /// Process a completed checkout session
     ///
     /// This is idempotent - calling multiple times with the same session_id
     /// should not create duplicate transactions.
+    ///
+    /// Handles both checkout modes, dispatching on the session the provider
+    /// fetches: `payment` sessions credit the account, `setup` sessions save the
+    /// verified payment method and grant signup credits. The caller (the
+    /// `PATCH /payments/{id}` front channel and the webhook path alike) does not
+    /// know which mode a session id belongs to, so the dispatch lives here.
     ///
     /// `credits_config` carries credit-system settings (e.g. the first-payment
     /// match promotion) applied as part of processing, so the provider can act on
@@ -209,6 +262,33 @@ pub trait PaymentProvider: Send + Sync {
     /// Unlike `process_payment_session`, this does not create a credit transaction.
     /// It only validates the session so the caller can safely enable auto top-up.
     async fn process_auto_topup_session(&self, db_pool: &PgPool, session_id: &str) -> Result<AutoTopupSetupResult>;
+
+    /// Accrue `amount_cents` onto the account's next invoice instead of
+    /// charging a card now.
+    ///
+    /// For accounts with `users.invoicing_enabled` - enterprise customers whose
+    /// procurement can't pay by card on demand. The charge is parked as a
+    /// *pending* line on the provider's customer record; the provider raises,
+    /// emails and chases one invoice per billing period covering everything
+    /// accrued in it. One invoice a month, not one per top-up, which is the
+    /// point of the feature.
+    ///
+    /// Needs **no saved payment method**: these accounts may never have a card.
+    ///
+    /// This is post-pay. Credits are granted at accrual, before any money
+    /// arrives - the account is being extended credit on terms, which is why
+    /// `invoicing_enabled` is set by us after approval rather than self-served.
+    /// Waiting for payment instead would leave an invoice-billed account at a
+    /// zero balance all month, with auto top-up unable to top anything up.
+    ///
+    /// Returns the provider's line-item ID for reconciliation.
+    ///
+    /// # Arguments
+    /// * `amount_cents` - Amount to accrue in cents
+    /// * `customer_id` - Payment provider customer ID
+    /// * `description` - Line description shown on the invoice
+    /// * `idempotency_key` - Prevents the same top-up accruing twice
+    async fn accrue_invoice_item(&self, amount_cents: i64, customer_id: &str, description: &str, idempotency_key: &str) -> Result<String>;
 
     /// Charge a saved payment method off-session for auto top-up.
     ///

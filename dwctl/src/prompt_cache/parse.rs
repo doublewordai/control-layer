@@ -26,6 +26,7 @@
 //! excluded from this view (see [`TelemetryPolicy`]) so they don't poison the prefix hash and
 //! force write-only caching. In strip mode they're also removed from the forwarded request.
 
+use super::tokenizer::WirePrefix;
 use sha2::{Digest, Sha256};
 
 use super::index::{TierPolicy, TtlTier};
@@ -44,6 +45,12 @@ pub const WALK_BACK: usize = 20;
 /// *message* role (tool results) so the two hash into different cache entries, and included
 /// in the block hash like any other role.
 const TOOL_DEFINITION_ROLE: &str = "tool_definition";
+
+/// Synthetic role for an assistant `tool_calls[]` entry — the OpenAI-native shape of Anthropic's
+/// `tool_use` content block. Hashed as its own block so a tool-calling assistant turn contributes to
+/// the prefix (a null-content assistant would otherwise be invisible), and so a `cache_control` on
+/// the call is an honoured breakpoint. A distinct role keeps it from colliding with a text block.
+const TOOL_CALL_ROLE: &str = "tool_call";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ParseError {
@@ -77,6 +84,10 @@ pub struct Block {
     /// Text content for tokenization (the write-side segment). Empty for non-text
     /// blocks (e.g. images), which then bill as uncached.
     pub text: String,
+    /// Ordinal of the containing `messages[]` entry; `None` for tool-definition blocks
+    /// (which precede messages). Drives the block→message-boundary mapping for exact
+    /// (chat-templated) counting.
+    pub message_index: Option<usize>,
 }
 
 /// An explicit cache breakpoint (a `cache_control`-marked block).
@@ -85,6 +96,64 @@ pub struct Breakpoint {
     /// Index into `blocks` of the marked block (the inclusive prefix end).
     pub block_index: usize,
     pub ttl_tier: TtlTier,
+    /// How to reconstruct this breakpoint's prefix as a request for exact
+    /// (chat-templated) counting. Every marker position is constructible.
+    pub prefix: PrefixSpec,
+}
+
+/// A breakpoint's prefix, in request terms: which tools and how much of which messages
+/// are inside it. Exact counting renders this reconstructed prefix (generation prompt
+/// off) to count precisely what the marker covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrefixSpec {
+    /// Number of leading `tools[]` entries in the prefix (tools precede messages in the
+    /// canonical order; a marker on tools[j] keeps j+1 and no messages).
+    pub tools_kept: usize,
+    /// Number of COMPLETE leading messages in the prefix.
+    pub full_messages: usize,
+    /// For a mid-message marker: how much of the next (partial) message is kept.
+    /// `None` = the marker sits exactly on a message end.
+    pub partial: Option<PartialMessage>,
+}
+
+/// The kept portion of a partially-included message.
+///
+/// Ordinals count the request AS TRANSMITTED: in telemetry strip mode the sanitiser
+/// removes excluded blocks from the forwarded body, so kept parts are numbered over
+/// the surviving blocks (the view the tokenizer-svc renders).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialMessage {
+    /// Leading `content[]` parts kept (array-form content).
+    pub content_parts: usize,
+    /// Leading `tool_calls[]` kept (assistant messages; ordered after content).
+    pub tool_calls: usize,
+}
+
+impl PrefixSpec {
+    /// This prefix in the tokenizer-svc `/v1/render` wire shape. `tools` is a COUNT
+    /// (first n definitions); `message`/`block`/`tool_call` are inclusive indices —
+    /// per the svc contract.
+    pub fn to_wire(&self) -> WirePrefix {
+        if let Some(partial) = &self.partial {
+            if partial.tool_calls > 0 {
+                WirePrefix::ToolCall {
+                    message: self.full_messages,
+                    tool_call: partial.tool_calls - 1,
+                }
+            } else {
+                WirePrefix::Block {
+                    message: self.full_messages,
+                    block: partial.content_parts - 1,
+                }
+            }
+        } else if self.full_messages > 0 {
+            WirePrefix::Message {
+                message: self.full_messages - 1,
+            }
+        } else {
+            WirePrefix::Tools { tools: self.tools_kept }
+        }
+    }
 }
 
 /// The parsed cache view of a request.
@@ -126,8 +195,9 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
     // (`tools[i].cache_control` — the slot OpenAI clients set directly and the Anthropic
     // ingress translation maps its native tool marker to) marks a breakpoint. The block text
     // is the tool's JSON, tokenized as an estimate of the tool's contribution.
+    let tools_total = v.get("tools").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0);
     if let Some(tools) = v.get("tools").and_then(|t| t.as_array()) {
-        for tool in tools {
+        for (tool_ordinal, tool) in tools.iter().enumerate() {
             let ttl = match tool.get("cache_control") {
                 Some(cc) if !cc.is_null() => Some(parse_ttl(cc, policy)?),
                 _ => None,
@@ -147,16 +217,43 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
             blocks.push(Block {
                 role: TOOL_DEFINITION_ROLE.to_string(),
                 text,
+                message_index: None,
             });
             if let Some(ttl_tier) = ttl {
-                breakpoints.push(Breakpoint { block_index, ttl_tier });
+                breakpoints.push(Breakpoint {
+                    block_index,
+                    ttl_tier,
+                    prefix: PrefixSpec {
+                        tools_kept: tool_ordinal + 1,
+                        full_messages: 0,
+                        partial: None,
+                    },
+                });
             }
         }
     }
 
     if let Some(messages) = v.get("messages").and_then(|m| m.as_array()) {
-        for msg in messages {
+        for (message_index, msg) in messages.iter().enumerate() {
             let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("").to_string();
+            // Transmitted-view sizes for this message, for breakpoint prefix construction:
+            // in strip mode telemetry blocks are removed from the forwarded body, so they
+            // don't occupy content ordinals in the view the tokenizer-svc will render.
+            let content_len = msg
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter(|b| !(telemetry.strip_from_prompt && telemetry.excludes_block(&role, b)))
+                        .count()
+                })
+                .unwrap_or(0);
+            let calls_len = if role == "assistant" {
+                msg.get("tool_calls").and_then(|t| t.as_array()).map(|a| a.len()).unwrap_or(0)
+            } else {
+                0
+            };
+            let bp_watermark = breakpoints.len();
 
             match msg.get("content") {
                 // String content: one implicit text block, no marker possible.
@@ -167,18 +264,26 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
                     blocks.push(Block {
                         role: role.clone(),
                         text: s.clone(),
+                        message_index: Some(message_index),
                     });
                 }
                 // Array content: a sequence of blocks, each possibly marked.
                 Some(serde_json::Value::Array(arr)) => {
-                    for block in arr {
+                    // Ordinal of the current part in the TRANSMITTED body (strip mode
+                    // removes telemetry blocks, shifting later parts down).
+                    let mut fwd_ordinal = 0usize;
+                    for block in arr.iter() {
                         // Exclude provider-injected telemetry blocks (e.g. the Claude Code SDK's
                         // `x-anthropic-billing-header` line with its per-request `cch` nonce) from the
                         // cache prefix: left in, they'd change the prefix hash every turn and force
                         // write-only caching. `excludes_block` only matches UNMARKED blocks, so a
                         // caller's `cache_control` breakpoint is never dropped. (In strip mode the
-                        // outbound sanitiser also removes them from the forwarded request.)
+                        // outbound sanitiser also removes them from the forwarded request; otherwise
+                        // they still occupy a transmitted ordinal.)
                         if telemetry.excludes_block(&role, block) {
+                            if !telemetry.strip_from_prompt {
+                                fwd_ordinal += 1;
+                            }
                             continue;
                         }
                         let ttl = match block.get("cache_control") {
@@ -195,13 +300,91 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
                         cumulative_hashes.push(hasher.clone().finalize().to_vec());
 
                         let block_index = blocks.len();
-                        blocks.push(Block { role: role.clone(), text });
+                        blocks.push(Block {
+                            role: role.clone(),
+                            text,
+                            message_index: Some(message_index),
+                        });
                         if let Some(ttl_tier) = ttl {
-                            breakpoints.push(Breakpoint { block_index, ttl_tier });
+                            breakpoints.push(Breakpoint {
+                                block_index,
+                                ttl_tier,
+                                prefix: PrefixSpec {
+                                    tools_kept: tools_total,
+                                    full_messages: message_index,
+                                    partial: Some(PartialMessage {
+                                        content_parts: fwd_ordinal + 1,
+                                        tool_calls: 0,
+                                    }),
+                                },
+                            });
                         }
+                        fwd_ordinal += 1;
                     }
                 }
                 _ => {}
+            }
+
+            // Assistant `tool_calls[]` are cache blocks too — the OpenAI shape of Anthropic's
+            // `tool_use` content blocks. Hash each (after this message's content, mirroring
+            // `[text, tool_use]` order) so a tool-calling turn isn't invisible to the cache, and
+            // honour a `cache_control` on the call itself as a breakpoint. The call's JSON is the
+            // write-side text, tokenized as an estimate (like a tool definition). The marker is
+            // stripped before hashing, so a marked and an unmarked call still match.
+            //
+            // Gated to `assistant`: `tool_calls` is an assistant-only field in the OpenAI-compatible
+            // API, so a `tool_calls` on any other role is a malformed shape. Ignoring it here keeps
+            // it out of the cache key and out of the breakpoint budget rather than letting garbage
+            // input perturb either. (The outbound sanitiser is deliberately role-agnostic instead —
+            // it strips defensively so nothing leaks upstream; see `inject::remove_cache_control`.)
+            if role == "assistant"
+                && let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array())
+            {
+                for (call_ordinal, call) in tool_calls.iter().enumerate() {
+                    let ttl = match call.get("cache_control") {
+                        Some(cc) if !cc.is_null() => Some(parse_ttl(cc, policy)?),
+                        _ => None,
+                    };
+                    let stripped = strip_cache_control(call);
+                    let text = serde_json::to_string(&stripped)?;
+                    let canonical = canonical_block_bytes(TOOL_CALL_ROLE, &stripped);
+                    hasher.update(&canonical);
+                    cumulative_hashes.push(hasher.clone().finalize().to_vec());
+
+                    let block_index = blocks.len();
+                    blocks.push(Block {
+                        role: TOOL_CALL_ROLE.to_string(),
+                        text,
+                        message_index: Some(message_index),
+                    });
+                    if let Some(ttl_tier) = ttl {
+                        breakpoints.push(Breakpoint {
+                            block_index,
+                            ttl_tier,
+                            prefix: PrefixSpec {
+                                tools_kept: tools_total,
+                                full_messages: message_index,
+                                partial: Some(PartialMessage {
+                                    content_parts: content_len,
+                                    tool_calls: call_ordinal + 1,
+                                }),
+                            },
+                        });
+                    }
+                }
+            }
+
+            // Normalize this message's breakpoints: a marker on its FINAL element (last
+            // content part with no tool_calls, or last tool_call) covers the whole
+            // message — the prefix is simply messages[0..=message_index], no partial.
+            for bp in breakpoints[bp_watermark..].iter_mut() {
+                if let Some(partial) = &bp.prefix.partial
+                    && partial.content_parts == content_len
+                    && partial.tool_calls == calls_len
+                {
+                    bp.prefix.full_messages = message_index + 1;
+                    bp.prefix.partial = None;
+                }
             }
         }
     }
@@ -218,9 +401,17 @@ pub fn parse_chat_completions(body: &[u8], policy: &TierPolicy, telemetry: &Tele
         let last_index = blocks.len().saturating_sub(1);
         let last_marker = breakpoints.iter().find(|bp| bp.block_index == last_index).map(|bp| bp.ttl_tier);
         if let AutoAction::Synthesize(tier) = resolve_auto_action(auto_ttl, !blocks.is_empty(), last_marker, breakpoints.len())? {
+            // The automatic breakpoint is the very last block — its prefix is the entire
+            // conversation (all tools, all messages, nothing partial).
+            let full_messages = v.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0);
             breakpoints.push(Breakpoint {
                 block_index: last_index,
                 ttl_tier: tier,
+                prefix: PrefixSpec {
+                    tools_kept: tools_total,
+                    full_messages,
+                    partial: None,
+                },
             });
         }
     }
@@ -360,7 +551,7 @@ pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy, telemetry
                     last_marker = None;
                 }
                 Some(serde_json::Value::Array(arr)) => {
-                    for block in arr {
+                    for block in arr.iter() {
                         // Skip provider telemetry blocks so the "last block" matches parse's view.
                         if telemetry.excludes_block(role, block) {
                             continue;
@@ -384,6 +575,29 @@ pub fn validate_markers(body: &serde_json::Value, policy: &TierPolicy, telemetry
                     }
                 }
                 _ => {}
+            }
+
+            // Assistant `tool_calls[]` count toward the same cap and are validated identically (see
+            // parse_chat_completions) — the last call is the message's final block. Gated to
+            // `assistant` to match parse_chat_completions exactly (tool_calls is assistant-only);
+            // validation and hashing must agree on what counts as a block/breakpoint.
+            if role == "assistant"
+                && let Some(tool_calls) = msg.get("tool_calls").and_then(|t| t.as_array())
+            {
+                for call in tool_calls.iter() {
+                    saw_block = true;
+                    match call.get("cache_control") {
+                        Some(cc) if !cc.is_null() => {
+                            let tier = parse_ttl(cc, policy)?;
+                            breakpoints += 1;
+                            if breakpoints > MAX_BREAKPOINTS {
+                                return Err(ParseError::TooManyBreakpoints);
+                            }
+                            last_marker = Some(tier);
+                        }
+                        _ => last_marker = None,
+                    }
+                }
             }
         }
     }
@@ -481,6 +695,205 @@ fn canonical_block_bytes(role: &str, stripped_block: &serde_json::Value) -> Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefix_spec_end_of_message_is_whole_messages() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [{"type":"text","text":"sys","cache_control":{"type":"ephemeral"}}]},
+                {"role": "user", "content": [
+                    {"type":"text","text":"a"},
+                    {"type":"text","text":"b","cache_control":{"type":"ephemeral"}}
+                ]}
+            ]
+        })
+        .to_string();
+        let p = parse_chat_completions(
+            body.as_bytes(),
+            &TierPolicy::from_config(&["5m".to_string()], "5m"),
+            &TelemetryPolicy::default(),
+        )
+        .unwrap();
+        // Marker on the only block of message 0 → the whole first message, no partial.
+        assert_eq!(
+            p.breakpoints[0].prefix,
+            PrefixSpec {
+                tools_kept: 0,
+                full_messages: 1,
+                partial: None
+            }
+        );
+        // Marker on the last block of message 1 → both messages whole.
+        assert_eq!(
+            p.breakpoints[1].prefix,
+            PrefixSpec {
+                tools_kept: 0,
+                full_messages: 2,
+                partial: None
+            }
+        );
+    }
+
+    #[test]
+    fn prefix_spec_mid_message_keeps_partial_content() {
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type":"text","text":"c","cache_control":{"type":"ephemeral"}},
+                    {"type":"text","text":"d"}
+                ]}
+            ]
+        })
+        .to_string();
+        let p = parse_chat_completions(
+            body.as_bytes(),
+            &TierPolicy::from_config(&["5m".to_string()], "5m"),
+            &TelemetryPolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            p.breakpoints[0].prefix,
+            PrefixSpec {
+                tools_kept: 0,
+                full_messages: 0,
+                partial: Some(PartialMessage {
+                    content_parts: 1,
+                    tool_calls: 0
+                }),
+            },
+            "mid-message marker keeps exactly the marked parts"
+        );
+    }
+
+    #[test]
+    fn prefix_spec_tool_definition_and_tool_call_markers() {
+        let body = serde_json::json!({
+            "tools": [
+                {"type":"function","function":{"name":"f"},"cache_control":{"type":"ephemeral"}},
+                {"type":"function","function":{"name":"g"}}
+            ],
+            "messages": [
+                {"role":"user","content":[{"type":"text","text":"hi"}]},
+                {"role":"assistant","content":[{"type":"text","text":"t"}],
+                 "tool_calls":[{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"},
+                                "cache_control":{"type":"ephemeral"}}]}
+            ]
+        })
+        .to_string();
+        let p = parse_chat_completions(
+            body.as_bytes(),
+            &TierPolicy::from_config(&["5m".to_string()], "5m"),
+            &TelemetryPolicy::default(),
+        )
+        .unwrap();
+        // tools[0] marker → the first tool only, no messages.
+        assert_eq!(
+            p.breakpoints[0].prefix,
+            PrefixSpec {
+                tools_kept: 1,
+                full_messages: 0,
+                partial: None
+            }
+        );
+        // Marker on the LAST tool_call of the last message → both messages whole (all
+        // tools included: they precede messages in canonical order).
+        assert_eq!(
+            p.breakpoints[1].prefix,
+            PrefixSpec {
+                tools_kept: 2,
+                full_messages: 2,
+                partial: None
+            }
+        );
+    }
+
+    #[test]
+    fn wire_prefix_maps_every_marker_shape() {
+        // `tools` is a count; `message`/`block`/`tool_call` are inclusive indices.
+        let cases = [
+            (
+                PrefixSpec {
+                    tools_kept: 2,
+                    full_messages: 0,
+                    partial: None,
+                },
+                WirePrefix::Tools { tools: 2 },
+                serde_json::json!({"tools": 2}),
+            ),
+            (
+                PrefixSpec {
+                    tools_kept: 2,
+                    full_messages: 3,
+                    partial: None,
+                },
+                WirePrefix::Message { message: 2 },
+                serde_json::json!({"message": 2}),
+            ),
+            (
+                PrefixSpec {
+                    tools_kept: 0,
+                    full_messages: 1,
+                    partial: Some(PartialMessage {
+                        content_parts: 2,
+                        tool_calls: 0,
+                    }),
+                },
+                WirePrefix::Block { message: 1, block: 1 },
+                serde_json::json!({"message": 1, "block": 1}),
+            ),
+            (
+                PrefixSpec {
+                    tools_kept: 0,
+                    full_messages: 1,
+                    partial: Some(PartialMessage {
+                        content_parts: 2,
+                        tool_calls: 1,
+                    }),
+                },
+                WirePrefix::ToolCall { message: 1, tool_call: 0 },
+                serde_json::json!({"message": 1, "tool_call": 0}),
+            ),
+        ];
+        for (spec, wire, json) in cases {
+            assert_eq!(spec.to_wire(), wire);
+            assert_eq!(serde_json::to_value(&wire).unwrap(), json, "wire serialization");
+        }
+    }
+
+    #[test]
+    fn telemetry_strip_mode_renumbers_wire_ordinals() {
+        // A telemetry block ahead of the marked part: in strip mode the sanitiser
+        // removes it from the forwarded body, so the marker's transmitted content
+        // ordinal shifts down by one; in keep mode the block still occupies index 0.
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": [
+                    {"type":"text","text":"x-anthropic-billing-header: cch=1"},
+                    {"type":"text","text":"kept","cache_control":{"type":"ephemeral"}},
+                    {"type":"text","text":"tail"}
+                ]}
+            ]
+        });
+        let strip = parse_with(body.clone(), &telemetry());
+        assert_eq!(
+            strip.breakpoints[0].prefix.partial,
+            Some(PartialMessage {
+                content_parts: 1,
+                tool_calls: 0
+            })
+        );
+        let keep = parse_with(
+            body,
+            &TelemetryPolicy::from_config(false, &["x-anthropic-billing-header:".to_string()]),
+        );
+        assert_eq!(
+            keep.breakpoints[0].prefix.partial,
+            Some(PartialMessage {
+                content_parts: 2,
+                tool_calls: 0
+            })
+        );
+    }
 
     fn all_tiers() -> TierPolicy {
         TierPolicy::from_config(&["5m".to_string(), "1h".to_string(), "24h".to_string()], "5m")
@@ -1019,6 +1432,118 @@ mod tests {
         assert!(unmarked.breakpoints.is_empty());
     }
 
+    // ---- Assistant tool_calls (the OpenAI shape of Anthropic tool_use blocks) ----
+
+    #[test]
+    fn tool_call_is_hashed_and_marker_is_a_breakpoint() {
+        // A null-content assistant with a marked tool_call: the call is a block (hashed) and its
+        // marker is a breakpoint. Without this the turn is invisible to the cache.
+        let p = parse(serde_json::json!({
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "tu1", "type": "function", "function": {"name": "lookup", "arguments": "{}"},
+                     "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ]}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 2, "user block + the tool_call block (null content adds none)");
+        assert_eq!(p.blocks[1].role, "tool_call");
+        assert_eq!(p.breakpoints.len(), 1);
+        assert_eq!(p.breakpoints[0].block_index, 1);
+        assert_eq!(p.breakpoints[0].ttl_tier, TtlTier::OneHour);
+        assert!(p.blocks[1].text.contains("lookup"), "the call JSON is the write-side text");
+    }
+
+    #[test]
+    fn tool_call_after_text_preserves_order() {
+        // assistant [text, tool_use] → content text block THEN the tool_call block, mirroring order.
+        let p = parse(serde_json::json!({
+            "messages": [{"role": "assistant", "content": [{"type": "text", "text": "calling"}],
+                          "tool_calls": [{"id": "t", "type": "function", "function": {"name": "f", "arguments": "{}"}}]}]
+        }));
+        assert_eq!(p.blocks.len(), 2);
+        assert_eq!(p.blocks[0].role, "assistant");
+        assert_eq!(p.blocks[1].role, "tool_call");
+    }
+
+    #[test]
+    fn tool_call_marker_excluded_from_hash() {
+        // Marker stripped before hashing → a marked call and an unmarked one match (so the read chain
+        // holds as the SDK's marker advances off this call next turn).
+        let marked = parse(serde_json::json!({
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [
+                {"id": "tu1", "type": "function", "function": {"name": "f", "arguments": "{}"}, "cache_control": {"type": "ephemeral"}}
+            ]}]
+        }));
+        let unmarked = parse(serde_json::json!({
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [
+                {"id": "tu1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+            ]}]
+        }));
+        assert_eq!(marked.cumulative_hashes[0], unmarked.cumulative_hashes[0]);
+        assert_eq!(marked.breakpoints.len(), 1);
+        assert!(unmarked.breakpoints.is_empty());
+    }
+
+    #[test]
+    fn distinct_tool_calls_hash_differently() {
+        // Same assistant text, different tool call → different prefix hash (faithful to Anthropic:
+        // the tool_use block is part of the cache key, not just the text).
+        let a = parse(serde_json::json!({
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [
+                {"id": "t", "type": "function", "function": {"name": "f", "arguments": "{\"x\":1}"}}
+            ]}]
+        }));
+        let b = parse(serde_json::json!({
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [
+                {"id": "t", "type": "function", "function": {"name": "f", "arguments": "{\"x\":2}"}}
+            ]}]
+        }));
+        assert_ne!(a.cumulative_hashes[0], b.cumulative_hashes[0]);
+    }
+
+    #[test]
+    fn tool_call_markers_validate_and_count() {
+        // A disabled tier on a tool_call is a 400, like any other marker.
+        let policy = TierPolicy::from_config(&["5m".to_string(), "1h".to_string()], "5m");
+        let body = serde_json::json!({
+            "messages": [{"role": "assistant", "content": null, "tool_calls": [
+                {"id": "t", "type": "function", "function": {"name": "f", "arguments": "{}"}, "cache_control": {"type": "ephemeral", "ttl": "24h"}}
+            ]}]
+        });
+        assert!(matches!(
+            validate_markers(&body, &policy, &no_telemetry()).unwrap_err(),
+            ParseError::DisabledTier(TtlTier::TwentyFourHours)
+        ));
+    }
+
+    #[test]
+    fn tool_calls_on_non_assistant_message_are_ignored() {
+        // `tool_calls` is an assistant-only field. A `tool_calls` on any other role is malformed, and
+        // must not add a block, consume a breakpoint, or count during validation — otherwise garbage
+        // input could perturb the cache key or the breakpoint budget.
+        let p = parse(serde_json::json!({
+            "messages": [{"role": "user", "content": "q", "tool_calls": [
+                {"id": "t", "type": "function", "function": {"name": "f", "arguments": "{}"},
+                 "cache_control": {"type": "ephemeral"}}
+            ]}]
+        }));
+        assert_eq!(p.blocks.len(), 1, "only the user content block; the stray tool_calls is ignored");
+        assert_eq!(p.blocks[0].role, "user");
+        assert!(p.breakpoints.is_empty(), "the stray tool_call marker is not a breakpoint");
+
+        // validate_markers agrees: a disabled tier on a non-assistant tool_call is NOT counted (no
+        // error), because the field is ignored there too — keeping validation and hashing aligned.
+        let policy = TierPolicy::from_config(&["5m".to_string()], "5m");
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "q", "tool_calls": [
+                {"id": "t", "type": "function", "function": {"name": "f", "arguments": "{}"}, "cache_control": {"type": "ephemeral", "ttl": "24h"}}
+            ]}]
+        });
+        assert!(validate_markers(&body, &policy, &no_telemetry()).is_ok());
+    }
+
     // ---- Automatic caching (top-level `cache_control`) ----
 
     #[test]
@@ -1221,5 +1746,189 @@ mod tests {
         assert_eq!(turn1.cumulative_hashes[1], turn2.cumulative_hashes[1]);
         // turn2's own breakpoint has moved forward to its last block.
         assert_eq!(turn2.breakpoints[0].block_index, 3);
+    }
+
+    #[test]
+    fn automatic_marker_lands_on_trailing_tool_call() {
+        // A request ending in an assistant tool-call turn: the LAST tool_call is the last block,
+        // so that's where automatic caching marks — the whole request (text + both calls) is the
+        // cached prefix.
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": [{"type": "text", "text": "calling"}], "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {"id": "c2", "type": "function", "function": {"name": "g", "arguments": "{}"}}
+                ]}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 4, "user + assistant text + 2 tool_calls");
+        assert_eq!(p.breakpoints.len(), 1);
+        assert_eq!(p.breakpoints[0].block_index, 3, "the LAST tool_call");
+        assert_eq!(
+            p.breakpoints[0].prefix,
+            PrefixSpec {
+                tools_kept: 0,
+                full_messages: 2,
+                partial: None
+            },
+            "the prefix is both messages whole"
+        );
+    }
+
+    #[test]
+    fn automatic_marker_lands_on_trailing_tool_result() {
+        // A request ending with a tool result (the shape mid tool-loop, where the "last user
+        // message" naming is loosest): automatic marks the tool block — a larger prefix than the
+        // literal last user message, which is the right cache boundary.
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "tool output"}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 3, "user + tool_call + tool result");
+        assert_eq!(p.blocks[2].role, "tool");
+        assert_eq!(p.breakpoints[0].block_index, 2);
+        assert_eq!(p.breakpoints[0].prefix.full_messages, 3);
+    }
+
+    #[test]
+    fn automatic_marker_on_trailing_image_block() {
+        // Image last: the image block is a real block (it participates in the prefix hash via its
+        // URL/base64 bytes) with empty write-side text — the marker lands on it, keeping the cache
+        // chain alive across image turns. Image tokens themselves are never discounted (they fall
+        // into the uncached tail; "image-token caching is deferred" at the top of this module).
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 2);
+        assert_eq!(p.blocks[1].text, "", "image blocks carry no write-side text");
+        assert_eq!(p.breakpoints[0].block_index, 1, "marker on the image block");
+        // Same image, different encoding bytes → different prefix (the URL string is the content).
+        let other = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}}
+                ]}
+            ]
+        }));
+        assert_ne!(p.cumulative_hashes[1], other.cumulative_hashes[1]);
+    }
+
+    #[test]
+    fn automatic_with_trailing_blockless_message_marks_last_real_block() {
+        // KNOWN SKEW, pinned: a trailing message that contributes no blocks (null/absent content,
+        // no tool_calls) leaves the automatic marker on the LAST REAL block — but the breakpoint's
+        // prefix still counts ALL messages, so exact counting includes the phantom message's
+        // template scaffolding (a few tokens) in the stored prefix count while the hash boundary
+        // sits earlier. Bounded: at worst a few tokens shift between the creation/uncached buckets
+        // this turn and inflate the read by the same next turn; the billing caps floor it at zero.
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": null}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 1, "the null-content assistant adds no block");
+        assert_eq!(p.breakpoints[0].block_index, 0, "marker on the last REAL block");
+        assert_eq!(p.breakpoints[0].prefix.full_messages, 2, "prefix spec counts the phantom message");
+
+        // Same for a trailing empty content array.
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": []}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 1);
+        assert_eq!(p.breakpoints[0].block_index, 0);
+
+        // An empty-STRING content is a real (empty text) block, not the blockless shape.
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": ""}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 2, "empty-string prefill is a block");
+        assert_eq!(p.breakpoints[0].block_index, 1);
+    }
+
+    #[test]
+    fn automatic_with_telemetry_last_block_marks_prior_block() {
+        // Strip mode with a trailing telemetry-only system message: the telemetry block is
+        // excluded from the cache view, so automatic marks the last REAL block — same prefix-spec
+        // family as the blockless case above (full_messages counts the telemetry-only message; in
+        // strip mode the forwarded body loses the block, so the render view matches what's sent).
+        let p = parse_with(
+            serde_json::json!({
+                "cache_control": {"type": "ephemeral"},
+                "messages": [
+                    {"role": "user", "content": "q"},
+                    {"role": "system", "content": [
+                        {"type": "text", "text": "x-anthropic-billing-header: cch=zzz"}
+                    ]}
+                ]
+            }),
+            &telemetry(),
+        );
+        assert_eq!(p.blocks.len(), 1, "telemetry block excluded from the cache view");
+        assert_eq!(p.breakpoints[0].block_index, 0);
+    }
+
+    #[test]
+    fn automatic_tool_loop_growth_reads_prior_turn() {
+        // The growing-conversation property through a TOOL loop (not just plain turns): turn 2
+        // appends the assistant tool-call, the tool result, and a new user message; its cumulative
+        // hash at turn 1's breakpoint block is unchanged, so turn 2 reads what turn 1 wrote.
+        let turn1 = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "q"}
+            ]
+        }));
+        let turn2 = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "result"},
+                {"role": "user", "content": "next"}
+            ]
+        }));
+        assert_eq!(turn1.breakpoints[0].block_index, 1);
+        assert_eq!(
+            turn1.cumulative_hashes[1], turn2.cumulative_hashes[1],
+            "turn 2 reads turn 1's write"
+        );
+        assert_eq!(turn2.blocks.len(), 5, "sys + user + tool_call + tool + user");
+        assert_eq!(turn2.breakpoints[0].block_index, 4, "marker moved to the new frontier");
+        // Well within the 20-block walk-back window: 3 new blocks per tool-loop turn.
+        let candidates = turn2.read_candidates(&turn2.breakpoints[0]);
+        assert!(
+            candidates.contains(&turn1.cumulative_hashes[1]),
+            "prior write reachable by walk-back"
+        );
     }
 }

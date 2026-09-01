@@ -44,6 +44,8 @@ impl From<CreditTransaction> for CreditTransactionDBResponse {
             source_id: tx.source_id,
             created_at: tx.created_at,
             api_key_id: tx.api_key_id,
+            // CreditTransaction doesn't carry the tier; callers that need it select it directly.
+            service_tier: None,
         }
     }
 }
@@ -70,8 +72,8 @@ pub struct AggregatedBatches {
 pub struct TransactionWithCategory {
     pub transaction: CreditTransactionDBResponse,
     pub batch_id: Option<Uuid>,
-    pub request_origin: Option<String>,
-    pub batch_sla: Option<String>,
+    /// Service tier: "realtime" / "flex" / "async" / "batch" (usage rows only).
+    pub service_tier: Option<String>,
     /// Number of requests in this batch (1 for non-batch transactions)
     pub batch_count: i32,
 }
@@ -196,6 +198,8 @@ impl<'c> Credits<'c> {
             source_id: row.source_id,
             created_at: row.created_at,
             api_key_id: row.api_key_id,
+            // Freshly created transaction; the tier isn't needed on this return path.
+            service_tier: None,
         })
     }
 
@@ -277,20 +281,76 @@ impl<'c> Credits<'c> {
             api_key_id: None,
         };
 
-        match self.create_transaction(&request).await {
-            Ok(_) => {
-                trace!("Granted first-payment match of {} to payee {}", match_amount, payee);
-                Ok(())
-            }
-            // Another concurrent payment path already granted the match for this
-            // source: idempotent no-op.
+        // Another concurrent payment path may already have granted the match for
+        // this source; `grant_once` makes that an idempotent no-op.
+        if self.grant_once(&request).await? {
+            trace!("Granted first-payment match of {} to payee {}", match_amount, payee);
+        }
+        Ok(())
+    }
+
+    /// Record a grant that must happen at most once, keyed by `source_id`.
+    ///
+    /// The `credits_transactions_source_id_unique` constraint is the whole
+    /// mechanism: a losing concurrent insert surfaces as a unique violation,
+    /// which we treat as "someone else already granted it". Letting the
+    /// database arbitrate is what makes this safe under the webhook racing the
+    /// front-channel confirmation - a read-then-insert check cannot be.
+    ///
+    /// Returns `true` if this call was the one that recorded the grant.
+    async fn grant_once(&mut self, request: &CreditTransactionCreateDBRequest) -> Result<bool> {
+        match self.create_transaction(request).await {
+            Ok(_) => Ok(true),
             Err(crate::db::errors::DbError::UniqueViolation { constraint, .. })
                 if constraint.as_deref() == Some("credits_transactions_source_id_unique") =>
             {
-                Ok(())
+                Ok(false)
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Grant one-off signup credits to `payee` for verifying a payment method.
+    ///
+    /// `amount <= 0` disables the grant. Called from the setup-mode checkout
+    /// (`POST /payments/setup`) return path, where the user proved a real card
+    /// without being charged.
+    ///
+    /// The `source_id` is derived from the *payee*, not the checkout session,
+    /// which is what makes "once per account" true rather than merely likely.
+    /// Keying on the session would only stop the webhook and the front-channel
+    /// `PATCH /payments/{id}` double-granting the *same* session; verifying a
+    /// second card produces a second session id and would pay out again. A
+    /// read-then-insert guard doesn't close that either - two concurrent
+    /// sessions can both observe no prior grant before either inserts. Keyed on
+    /// the payee, the unique constraint settles it atomically.
+    ///
+    /// The triggering session is recorded in the description for reconciliation.
+    ///
+    /// Recorded as an `admin_grant` via `create_transaction`, so it fires the
+    /// balance-restored notify like any other credit.
+    #[instrument(skip(self), fields(payee = %abbrev_uuid(&payee), amount = %amount), err)]
+    pub async fn grant_verification_credits(&mut self, amount: Decimal, payee: UserId, setup_source_id: &str) -> Result<()> {
+        if amount <= Decimal::ZERO {
+            return Ok(());
+        }
+
+        let request = CreditTransactionCreateDBRequest {
+            user_id: payee,
+            transaction_type: CreditTransactionType::AdminGrant,
+            amount,
+            source_id: format!("verification-credits:{payee}"),
+            description: Some(format!("Signup credits for verifying a payment method ({setup_source_id})")),
+            fusillade_batch_id: None,
+            api_key_id: None,
+        };
+
+        if self.grant_once(&request).await? {
+            trace!("Granted {} verification credits to payee {}", amount, payee);
+        } else {
+            trace!("Payee {} already received verification credits, skipping", payee);
+        }
+        Ok(())
     }
 
     /// Send a pg_notify so the onwards config sync re-evaluates key
@@ -374,9 +434,9 @@ impl<'c> Credits<'c> {
             .map(|types| types.iter().map(transaction_type_to_string).collect());
 
         let transactions = sqlx::query_as!(
-            CreditTransaction,
+            CreditTransactionDBResponse,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq, api_key_id
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, api_key_id, service_tier
             FROM credits_transactions
             WHERE user_id = $1
               AND ($4::text IS NULL OR description ILIKE '%' || $4 || '%')
@@ -398,7 +458,7 @@ impl<'c> Credits<'c> {
         .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(transactions.into_iter().map(CreditTransactionDBResponse::from).collect())
+        Ok(transactions)
     }
 
     /// List all transactions across all users (admin view) with optional filters
@@ -415,9 +475,9 @@ impl<'c> Credits<'c> {
             .map(|types| types.iter().map(transaction_type_to_string).collect());
 
         let transactions = sqlx::query_as!(
-            CreditTransaction,
+            CreditTransactionDBResponse,
             r#"
-            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, seq, api_key_id
+            SELECT id, user_id, transaction_type as "transaction_type: CreditTransactionType", amount, source_id, description, created_at, api_key_id, service_tier
             FROM credits_transactions
             WHERE ($3::text IS NULL OR description ILIKE '%' || $3 || '%')
               AND ($4::text[] IS NULL OR transaction_type::text = ANY($4))
@@ -437,7 +497,7 @@ impl<'c> Credits<'c> {
         .fetch_all(&mut *self.db)
         .await?;
 
-        Ok(transactions.into_iter().map(CreditTransactionDBResponse::from).collect())
+        Ok(transactions)
     }
 
     /// Get a single transaction by its ID
@@ -707,7 +767,8 @@ impl<'c> Credits<'c> {
 
         // Optimized query using pre-limited UNION branches for Merge Append
         // Each branch fetches skip+limit rows, then pagination applies to combined result
-        // For batches: join with http_analytics to get batch_request_source and batch_sla
+        // service_tier is read from the denormalized columns on batch_aggregates and
+        // credits_transactions (COR-514) — no http_analytics join.
         let fetch_limit = skip + limit;
         let rows = sqlx::query!(
             r#"
@@ -715,7 +776,7 @@ impl<'c> Credits<'c> {
                 -- Top N from batch_aggregates (index scan on idx_batch_agg_user_seq)
                 -- Only included if transaction_types filter includes 'usage' or is not set
                 -- and search term matches "Batch" description
-                -- JOIN with http_analytics to get batch_request_source and batch_sla
+                -- service_tier read from batch_aggregates (async / batch).
                 (SELECT
                     ba.fusillade_batch_id as id,
                     ba.user_id,
@@ -727,15 +788,8 @@ impl<'c> Credits<'c> {
                     ba.max_seq,
                     ba.fusillade_batch_id as batch_id,
                     ba.transaction_count as batch_count,
-                    COALESCE(NULLIF(sample_ha.batch_request_source, ''), 'fusillade') as request_origin,
-                    COALESCE(sample_ha.batch_sla, '') as batch_sla
+                    ba.service_tier as service_tier
                 FROM batch_aggregates ba
-                LEFT JOIN LATERAL (
-                    SELECT batch_request_source, batch_sla
-                    FROM http_analytics ha
-                    WHERE ha.fusillade_batch_id = ba.fusillade_batch_id
-                    LIMIT 1
-                ) sample_ha ON true
                 WHERE ba.user_id = $1
                   AND $7::bool = true
                   AND $10::bool = true
@@ -748,7 +802,7 @@ impl<'c> Credits<'c> {
                 UNION ALL
 
                 -- Top N from non-batched transactions (index scan on idx_credits_tx_non_batched)
-                -- JOIN with http_analytics to get request_origin for non-batch usage transactions
+                -- service_tier read from the ledger (realtime / flex).
                 (SELECT
                     ct.id,
                     ct.user_id,
@@ -760,10 +814,8 @@ impl<'c> Credits<'c> {
                     ct.seq as max_seq,
                     NULL::uuid as batch_id,
                     1::int as batch_count,
-                    ha.request_origin as request_origin,
-                    ha.batch_sla as batch_sla
+                    ct.service_tier as service_tier
                 FROM credits_transactions ct
-                LEFT JOIN http_analytics ha ON ha.id::text = ct.source_id
                 WHERE ct.user_id = $1
                   AND ct.fusillade_batch_id IS NULL
                   AND ($5::text IS NULL OR ct.description ILIKE '%' || $5 || '%')
@@ -815,12 +867,12 @@ impl<'c> Credits<'c> {
                 source_id,
                 created_at,
                 api_key_id: None,
+                service_tier: row.service_tier.clone(),
             };
             results.push(TransactionWithCategory {
                 transaction,
                 batch_id: row.batch_id,
-                request_origin: row.request_origin,
-                batch_sla: row.batch_sla,
+                service_tier: row.service_tier,
                 batch_count: row.batch_count.unwrap_or(1),
             });
         }
@@ -903,6 +955,103 @@ mod tests {
         // Verify balance via get_user_balance (balance_after is no longer stored for new transactions)
         let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
         assert_eq!(balance, Decimal::from_str("100.50").unwrap());
+    }
+
+    /// A usage transaction carrying a `fusillade_batch_id` is NOT listed individually —
+    /// the grouped query's non-batch arm filters `WHERE fusillade_batch_id IS NULL`, and
+    /// batched spend reaches the customer only through `batch_aggregates`.
+    ///
+    /// This is a trap for anyone amending billing by hand. A compensating correction for a
+    /// batched request, written with the batch id set and without also folding
+    /// `batch_aggregates.total_amount`, is charged to the customer and appears **nowhere**
+    /// in their transaction history. The internal usage-repair runbook therefore writes
+    /// batch corrections with a NULL batch id so they surface as their own line; this test
+    /// pins the behaviour that advice depends on.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn batched_transaction_is_invisible_without_an_aggregate_row(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let batch_id = Uuid::new_v4();
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+
+        // A usage row tagged with a batch, but no batch_aggregates row to surface it.
+        sqlx::query!(
+            r#"INSERT INTO credits_transactions
+               (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, service_tier)
+               VALUES ($1, 'usage', $2, $3, 'batched usage', $4, 'batch')"#,
+            user_id,
+            Decimal::from_str("1.25").unwrap(),
+            format!("test-batched-{}", Uuid::new_v4()),
+            batch_id,
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("insert batched usage");
+
+        let mut credits = Credits::new(&mut conn);
+        let listed = credits
+            .list_transactions_with_batches(user_id, 0, 50, &TransactionFilters::default())
+            .await
+            .expect("list transactions");
+
+        assert!(
+            listed.is_empty(),
+            "a batched transaction with no aggregate row must not appear; got {listed:?}"
+        );
+
+        // The ledger row is real - the money is recorded, it simply cannot be seen.
+        let ledger: Decimal = sqlx::query_scalar!(
+            r#"SELECT COALESCE(SUM(CASE WHEN transaction_type IN ('admin_grant','purchase')
+                                        THEN amount ELSE -amount END), 0) AS "total!"
+               FROM credits_transactions WHERE user_id = $1"#,
+            user_id
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("sum ledger");
+        assert_eq!(ledger, Decimal::from_str("-1.25").unwrap(), "the charge is in the ledger");
+
+        // ...and the balance read model has NOT moved, because a raw INSERT never folds it.
+        // That is the second half of the same trap, and why the repair runbook must run the
+        // balance heal after any manual ledger surgery.
+        let mut credits = Credits::new(&mut conn);
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(
+            balance,
+            Decimal::ZERO,
+            "a hand-written ledger row does not fold the checkpoint - heal is required"
+        );
+    }
+
+    /// The same correction written WITHOUT a batch id does surface, which is why the
+    /// runbook writes them that way.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn unbatched_correction_surfaces_as_its_own_line(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+
+        sqlx::query!(
+            r#"INSERT INTO credits_transactions
+               (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, service_tier)
+               VALUES ($1, 'usage', $2, $3, 'usage correction', NULL, 'batch')"#,
+            user_id,
+            Decimal::from_str("1.25").unwrap(),
+            format!("test-correction-{}", Uuid::new_v4()),
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("insert correction");
+
+        let mut credits = Credits::new(&mut conn);
+        let listed = credits
+            .list_transactions_with_batches(user_id, 0, 50, &TransactionFilters::default())
+            .await
+            .expect("list transactions");
+
+        assert_eq!(listed.len(), 1, "the correction must be visible to the customer");
+        assert_eq!(listed[0].transaction.description.as_deref(), Some("usage correction"));
+        assert_eq!(listed[0].batch_id, None);
     }
 
     #[sqlx::test]
@@ -2162,5 +2311,154 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(count, Some(1));
+    }
+
+    /// Amount granted as verification credits to a payee, if any. Keyed on the
+    /// payee because that - not the checkout session - is what the grant's
+    /// `source_id` is derived from.
+    async fn verification_grant_amount(pool: &PgPool, payee: UserId) -> Option<Decimal> {
+        sqlx::query_scalar!(
+            "SELECT amount FROM credits_transactions WHERE source_id = $1",
+            format!("verification-credits:{payee}")
+        )
+        .fetch_optional(pool)
+        .await
+        .expect("query verification grant")
+    }
+
+    async fn verification_grant_count(pool: &PgPool, user: UserId) -> i64 {
+        sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'verification-credits:%'",
+            user
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .unwrap_or(0)
+    }
+
+    #[sqlx::test]
+    async fn test_verification_credits_granted_on_first_verification(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        assert_eq!(verification_grant_amount(&pool, user).await, None);
+
+        credits
+            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, "cs_setup_1")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            verification_grant_amount(&pool, user).await,
+            Some(Decimal::from_str("25.0").unwrap())
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_verification_credits_disabled_at_zero(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        credits.grant_verification_credits(Decimal::ZERO, user, "cs_setup_1").await.unwrap();
+
+        assert_eq!(verification_grant_amount(&pool, user).await, None);
+    }
+
+    /// The webhook and the front-channel `PATCH /payments/{id}` both fulfil the
+    /// same session; the derived source_id must make the second one a no-op.
+    #[sqlx::test]
+    async fn test_verification_credits_idempotent_for_one_session(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        for _ in 0..3 {
+            credits
+                .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, "cs_setup_1")
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(verification_grant_count(&pool, user).await, 1);
+    }
+
+    /// Verifying a *second* card produces a different session id. Keying the
+    /// grant on the payee is what stops it paying out twice.
+    #[sqlx::test]
+    async fn test_verification_credits_granted_only_once_per_user(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        credits
+            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, "cs_setup_1")
+            .await
+            .unwrap();
+        credits
+            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, "cs_setup_2")
+            .await
+            .unwrap();
+
+        assert_eq!(verification_grant_count(&pool, user).await, 1);
+        // The one grant that exists is from the first session.
+        let description: Option<String> = sqlx::query_scalar!(
+            "SELECT description FROM credits_transactions WHERE source_id = $1",
+            format!("verification-credits:{user}")
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            description.unwrap_or_default().contains("cs_setup_1"),
+            "the triggering session should be recorded for reconciliation"
+        );
+    }
+
+    /// Two sessions landing at once - the webhook for one card racing the
+    /// front-channel confirmation of another. A read-then-insert guard lets
+    /// both observe "no prior grant" and pay out twice; the unique constraint
+    /// on a payee-keyed source_id cannot.
+    #[sqlx::test]
+    async fn test_verification_credits_survive_concurrent_sessions(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+
+        let results = futures::future::join_all((0..5).map(|i| {
+            let pool = pool.clone();
+            async move {
+                let mut conn = pool.acquire().await.unwrap();
+                Credits::new(&mut conn)
+                    .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, &format!("cs_setup_{i}"))
+                    .await
+            }
+        }))
+        .await;
+
+        for result in results {
+            result.expect("a losing racer must no-op, not error");
+        }
+        assert_eq!(verification_grant_count(&pool, user).await, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_verification_credits_are_per_user(pool: PgPool) {
+        let first = create_test_user(&pool).await;
+        let second = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        credits
+            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), first, "cs_setup_1")
+            .await
+            .unwrap();
+        credits
+            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), second, "cs_setup_2")
+            .await
+            .unwrap();
+
+        assert_eq!(verification_grant_count(&pool, first).await, 1);
+        assert_eq!(verification_grant_count(&pool, second).await, 1);
     }
 }

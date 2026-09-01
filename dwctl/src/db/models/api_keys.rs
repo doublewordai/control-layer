@@ -3,6 +3,7 @@
 use crate::api::models::api_keys::ApiKeyCreate;
 use crate::types::{ApiKeyId, DeploymentId, UserId};
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -19,6 +20,12 @@ pub enum ApiKeyPurpose {
     Batch,
     /// Playground inference access (/ai/*) - hidden keys for dashboard playground
     Playground,
+    /// Mid-stream continuation access (/ai/*) - hidden keys the resume middleware
+    /// uses to replay a failed stream's exact token-id prefix via a completions
+    /// route. The purpose is what `model_traffic_rules` keys on to steer resume
+    /// legs to a model's continuation deployment; one hidden key per user, like
+    /// batch/playground.
+    Continuation,
 }
 
 /// Whether an API key `purpose` (raw DB string) is permitted on the inference
@@ -31,7 +38,7 @@ pub enum ApiKeyPurpose {
 /// queries in `sync::onwards_config` mirror this list as a SQL
 /// `ak.purpose IN (...)` filter (SQL cannot call this) - keep them in sync.
 pub fn is_inference_purpose(purpose: &str) -> bool {
-    matches!(purpose, "realtime" | "batch" | "playground")
+    matches!(purpose, "realtime" | "batch" | "playground" | "continuation")
 }
 
 #[cfg(test)]
@@ -43,6 +50,7 @@ mod purpose_tests {
         assert!(is_inference_purpose("realtime"));
         assert!(is_inference_purpose("batch"));
         assert!(is_inference_purpose("playground"));
+        assert!(is_inference_purpose("continuation"));
         assert!(!is_inference_purpose("platform"));
         assert!(!is_inference_purpose("unknown"));
     }
@@ -59,6 +67,10 @@ pub struct ApiKeyCreateDBRequest {
     pub burst_size: Option<i32>,
     /// The individual user who created this key
     pub created_by: UserId,
+    /// Optional spending cap; see migration 122. Callers that set this must
+    /// also mint the cap-scope child key (handler responsibility).
+    pub spend_limit: Option<Decimal>,
+    pub spend_limit_interval: Option<String>,
 }
 
 impl ApiKeyCreateDBRequest {
@@ -71,6 +83,8 @@ impl ApiKeyCreateDBRequest {
             requests_per_second: create.requests_per_second,
             burst_size: create.burst_size,
             created_by,
+            spend_limit: create.spend_limit,
+            spend_limit_interval: create.spend_limit_interval,
         }
     }
 }
@@ -99,4 +113,35 @@ pub struct ApiKeyDBResponse {
     pub model_access: Vec<DeploymentId>,
     pub requests_per_second: Option<f32>,
     pub burst_size: Option<i32>,
+    /// Optional spending cap (credits) for this key's cap scope. NULL = uncapped.
+    pub spend_limit: Option<Decimal>,
+    /// Cap reset period: None = one-off, else daily/weekly/monthly on
+    /// calendar-aligned UTC boundaries (never rolling windows).
+    pub spend_limit_interval: Option<String>,
+    /// Set only on hidden cap-scope child keys; see migration 122. Spend
+    /// accounting/enforcement group by COALESCE(parent_api_key_id, id).
+    pub parent_api_key_id: Option<ApiKeyId>,
+    /// System-managed internal key (shared batch/playground keys and cap-scope
+    /// children). Handlers must never expose, mutate, or select hidden keys —
+    /// `get_by_id` returns them, so every user-facing path filters on this.
+    pub hidden: bool,
+    /// When the key's holder first fetched the secret (migration 131). NULL =
+    /// an issued key awaiting its holder's one-off reveal; self-created keys
+    /// are born revealed. Rotation never touches this.
+    pub secret_revealed_at: Option<DateTime<Utc>>,
+}
+
+/// Spend display state for one cap scope (read from `api_key_spend_checkpoints`
+/// plus the migration-123 window helpers). All fields are display-only; the
+/// enforcement predicate lives in the onwards sync query.
+#[derive(Debug, Clone)]
+pub struct ApiKeySpendState {
+    /// Spend counted in the CURRENT calendar window (0 after a rollover that
+    /// hasn't folded yet; None if the scope has never folded).
+    pub spend: Option<Decimal>,
+    /// Lifetime folded spend for the scope (None if never folded).
+    pub total_spend: Option<Decimal>,
+    /// Next calendar boundary for windowed caps; None for one-off caps and
+    /// uncapped keys.
+    pub resets_at: Option<DateTime<Utc>>,
 }

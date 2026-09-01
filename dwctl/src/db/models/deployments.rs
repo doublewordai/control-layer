@@ -5,6 +5,7 @@
 //! across multiple underlying models based on configurable weights).
 
 use crate::api::models::deployments::{DeployedModelCreate, DeployedModelUpdate};
+use crate::reasoning::ReasoningTranslationOverrides;
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use bon::Builder;
 use chrono::{DateTime, NaiveDate, Utc};
@@ -333,7 +334,7 @@ fn default_true() -> bool {
 }
 
 fn default_fallback_status_codes() -> Vec<i32> {
-    vec![429, 500, 502, 503, 504]
+    vec![429, 499, 500, 502, 503, 504]
 }
 
 /// Fallback configuration for composite models
@@ -345,7 +346,7 @@ pub struct FallbackConfig {
     /// Fall back when provider is rate limited (default: true)
     #[serde(default = "default_true")]
     pub on_rate_limit: bool,
-    /// HTTP status codes that trigger fallback (default: [429, 500, 502, 503, 504])
+    /// HTTP status codes that trigger fallback (default: [429, 499, 500, 502, 503, 504])
     #[serde(default = "default_fallback_status_codes")]
     pub on_status: Vec<i32>,
     /// When true, weighted random failover samples with replacement (default: false)
@@ -436,7 +437,18 @@ pub struct DeploymentComponentCreateDBRequest {
     pub weight: i32,
     pub enabled: bool,
     pub sort_order: i32,
+    /// Which of the composite's named pools this membership belongs to
+    /// (`default` | `completions`).
+    pub pool: String,
 }
+
+/// The pool every request class falls back to: the single, interchangeable
+/// member list that existed before named pools. The column default.
+pub const DEFAULT_COMPONENT_POOL: &str = "default";
+
+/// The pool serving `/v1/completions`, including token-id continuation resume
+/// legs. Members here are validated continuation targets.
+pub const COMPLETIONS_COMPONENT_POOL: &str = "completions";
 
 /// Database response for a deployment component (flat structure with joined model info)
 #[derive(Debug, Clone)]
@@ -448,6 +460,9 @@ pub struct DeploymentComponentDBResponse {
     pub weight: i32,
     pub enabled: bool,
     pub sort_order: i32,
+    /// Which of the composite's named pools this membership belongs to
+    /// (`default` | `completions`).
+    pub pool: String,
     pub created_at: DateTime<Utc>,
     // Joined model fields
     pub model_alias: String,
@@ -458,7 +473,6 @@ pub struct DeploymentComponentDBResponse {
     pub endpoint_id: Option<InferenceEndpointId>,
     pub endpoint_name: Option<String>,
     pub model_trusted: bool,
-    pub model_open_responses_adapter: bool,
 }
 
 /// Database request for creating a new deployment
@@ -511,9 +525,8 @@ pub struct DeploymentCreateDBRequest {
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
     #[builder(default = false)]
     pub trusted: bool,
-    /// Whether to enable the open_responses adapter (converts /v1/responses to /v1/chat/completions)
-    #[builder(default = true)]
-    pub open_responses_adapter: bool,
+    /// Optional per-model overrides for endpoint reasoning translations.
+    pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
     /// Per-model allowed batch completion windows (overrides global config when set)
     pub allowed_batch_completion_windows: Option<Vec<String>>,
     /// Catalog metadata for display purposes (stored as JSONB)
@@ -563,7 +576,7 @@ impl DeploymentCreateDBRequest {
                     .maybe_backoff_max_total_ms(standard.backoff_max_total_ms)
                     .sanitize_responses(standard.sanitize_responses.unwrap_or(false))
                     .trusted(standard.trusted.unwrap_or(false))
-                    .open_responses_adapter(standard.open_responses_adapter.unwrap_or(true))
+                    .maybe_reasoning_translation_overrides(standard.reasoning_translation_overrides)
                     .maybe_allowed_batch_completion_windows(standard.allowed_batch_completion_windows)
                     .maybe_metadata(standard.metadata)
                     .build()
@@ -596,7 +609,6 @@ impl DeploymentCreateDBRequest {
                 .maybe_backoff_max_total_ms(composite.backoff_max_total_ms)
                 .sanitize_responses(composite.sanitize_responses)
                 .trusted(composite.trusted.unwrap_or(false))
-                .open_responses_adapter(composite.open_responses_adapter.unwrap_or(true))
                 .maybe_allowed_batch_completion_windows(composite.allowed_batch_completion_windows)
                 .maybe_metadata(composite.metadata)
                 .build(),
@@ -644,8 +656,8 @@ pub struct DeploymentUpdateDBRequest {
     pub sanitize_responses: Option<bool>,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter (converts /v1/responses to /v1/chat/completions)
-    pub open_responses_adapter: Option<bool>,
+    /// None leaves overrides unchanged; Some(None) inherits both endpoint defaults.
+    pub reasoning_translation_overrides: Option<Option<ReasoningTranslationOverrides>>,
     /// Per-model allowed batch completion windows (None = no change, Some(None) = clear, Some(windows) = set)
     pub allowed_batch_completion_windows: Option<Option<Vec<String>>>,
     /// Catalog metadata (None = no change, Some(metadata) = replace)
@@ -680,7 +692,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_backoff_max_total_ms(update.backoff_max_total_ms)
             .maybe_sanitize_responses(update.sanitize_responses)
             .maybe_trusted(update.trusted)
-            .maybe_open_responses_adapter(update.open_responses_adapter)
+            .maybe_reasoning_translation_overrides(update.reasoning_translation_overrides)
             .maybe_allowed_batch_completion_windows(update.allowed_batch_completion_windows)
             .maybe_metadata(update.metadata)
             .build()
@@ -754,8 +766,7 @@ pub struct DeploymentDBResponse {
     pub sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
     pub trusted: bool,
-    /// Whether the open_responses adapter is enabled (converts /v1/responses to /v1/chat/completions)
-    pub open_responses_adapter: bool,
+    pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
     /// Per-model allowed batch completion windows (overrides global config when set)
     pub allowed_batch_completion_windows: Option<Vec<String>>,
     /// Catalog metadata (JSONB)
@@ -796,6 +807,20 @@ mod backoff_derivation_tests {
             "backoff_enabled": backoff_enabled,
         }))
         .expect("valid StandardModelCreate JSON")
+    }
+
+    #[test]
+    fn composite_create_defaults_to_499_and_separate_rate_limit_fallback() {
+        let create = serde_json::from_value(serde_json::json!({
+            "type": "composite",
+            "model_name": "m",
+        }))
+        .expect("valid CompositeModelCreate JSON");
+
+        let request = DeploymentCreateDBRequest::from_api_create(uuid::Uuid::nil(), create);
+
+        assert_eq!(request.fallback_on_rate_limit, Some(true));
+        assert_eq!(request.fallback_on_status, Some(vec![499, 500, 502, 503, 504]));
     }
 
     // Regression guard for the headline invariant: a single-provider model

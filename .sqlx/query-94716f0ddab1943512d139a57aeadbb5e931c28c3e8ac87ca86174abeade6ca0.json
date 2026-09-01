@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE batches\n                    SET completed_requests = $2,\n                        failed_requests = $3,\n                        canceled_requests = $4,\n                        counts_frozen_at = NOW()\n                    WHERE id = $1\n                      AND retry_version = $5\n                      AND counts_frozen_at IS NULL\n                      AND (completed_at IS NOT NULL OR failed_at IS NOT NULL OR cancelled_at IS NOT NULL)\n                      AND NOT EXISTS (\n                          SELECT 1 FROM requests r\n                          WHERE r.batch_id = $1\n                            AND r.state NOT IN ('completed', 'failed', 'canceled')\n                      )\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "94716f0ddab1943512d139a57aeadbb5e931c28c3e8ac87ca86174abeade6ca0"
+}

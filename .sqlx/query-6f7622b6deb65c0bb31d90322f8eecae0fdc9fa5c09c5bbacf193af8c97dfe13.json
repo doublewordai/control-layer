@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT to_regclass(\n                'batch_requests_archive_y' || to_char($1::date, 'IYYY')\n                    || 'w' || to_char($1::date, 'IW')\n            ) IS NOT NULL AS \"exists!\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Date"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6f7622b6deb65c0bb31d90322f8eecae0fdc9fa5c09c5bbacf193af8c97dfe13"
+}

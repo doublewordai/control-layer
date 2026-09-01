@@ -60,7 +60,9 @@ use crate::metrics::errors::component::RESPONSES_WRITER;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use fusillade::{PersistCompletedRealtimeInput, PostgresRequestManager, ReqwestHttpClient, Storage};
+use chrono::{DateTime, Utc};
+use fusillade::{PersistCompletedRealtimeInput, Storage};
+use fusillade_arsenal::PostgresRequestManager;
 use metrics::{counter, gauge, histogram};
 use sqlx_pool_router::PoolProvider;
 use tokio::sync::mpsc;
@@ -108,6 +110,15 @@ pub struct RawCompletedRequest {
     /// Resolved user/org ID for the request (XOR-paired with batch_id on
     /// the fusillade row; required non-empty for batchless rows).
     pub created_by: String,
+    /// Wall-clock instant the request arrived, from outlet's request
+    /// timestamp. Consulted on the INSERT path only, where it becomes the
+    /// synthesized row's `created_at`/`claimed_at`/`started_at`.
+    pub started_at: DateTime<Utc>,
+    /// Wall-clock instant the response completed (`started_at +` outlet's
+    /// measured request duration). Consulted on the INSERT path only, where it
+    /// becomes `completed_at`/`failed_at` — so the row's duration reflects the
+    /// real latency instead of zero.
+    pub completed_at: DateTime<Utc>,
 }
 
 /// Sender handle handed to the outlet handler.
@@ -119,7 +130,7 @@ pub type RequestsWriterSender = mpsc::Sender<RawCompletedRequest>;
 /// Generic over `PoolProvider` so the same struct works in production
 /// (`DbPools`) and tests (`TestDbPools`).
 pub struct RequestsWriter<P: PoolProvider + Clone + Send + Sync + 'static> {
-    request_manager: Arc<PostgresRequestManager<P, ReqwestHttpClient>>,
+    request_manager: Arc<PostgresRequestManager<P>>,
     receiver: mpsc::Receiver<RawCompletedRequest>,
     batch_size: usize,
     max_retries: u32,
@@ -130,7 +141,7 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
     /// Build the writer and return it alongside the sender handle. Spawn the
     /// returned future via `tokio::spawn(writer.run(token))`; pass the sender
     /// into `FusilladeOutletHandler::new`.
-    pub fn new(request_manager: Arc<PostgresRequestManager<P, ReqwestHttpClient>>, batch_size: usize) -> (Self, RequestsWriterSender) {
+    pub fn new(request_manager: Arc<PostgresRequestManager<P>>, batch_size: usize) -> (Self, RequestsWriterSender) {
         let (sender, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
         let writer = Self {
             request_manager,
@@ -256,6 +267,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
                     path: record.endpoint.clone(),
                     api_key: record.api_key.clone(),
                     created_by: record.created_by.clone(),
+                    started_at: record.started_at,
+                    completed_at: record.completed_at,
                 })
                 .collect();
 
@@ -317,7 +330,9 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fusillade::{PostgresRequestManager, RequestId};
+    use fusillade::RequestId;
+    use fusillade::ReqwestHttpClient;
+    use fusillade_arsenal::PostgresRequestManager;
     use sqlx_pool_router::TestDbPools;
     use std::time::Duration;
     use tokio::time::timeout;
@@ -325,7 +340,7 @@ mod tests {
     use uuid::Uuid;
 
     /// Builds a writer wired to a fresh `#[sqlx::test]` pool with the
-    /// fusillade schema installed via `fusillade::migrator()` (so we don't
+    /// fusillade schema installed via `fusillade_arsenal::migrator()` (so we don't
     /// reference the fusillade source directory, which doesn't exist in
     /// CI). The returned request manager runs against a pool scoped to
     /// the fusillade schema. Tests pass `created_by` directly on each
@@ -336,7 +351,7 @@ mod tests {
     ) -> (
         RequestsWriter<TestDbPools>,
         RequestsWriterSender,
-        Arc<PostgresRequestManager<TestDbPools, ReqwestHttpClient>>,
+        Arc<PostgresRequestManager<TestDbPools>>,
     ) {
         let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
         let pools = TestDbPools::new(fusillade_pool).await.unwrap();
@@ -350,7 +365,7 @@ mod tests {
     /// time out. Mirrors the polling-not-sleeping pattern fusillade uses
     /// (see fusillade/CLAUDE.md).
     async fn wait_until_completed(
-        manager: &PostgresRequestManager<TestDbPools, ReqwestHttpClient>,
+        manager: &PostgresRequestManager<TestDbPools>,
         request_id: Uuid,
         timeout_secs: u64,
     ) -> fusillade::RequestDetail {
@@ -375,6 +390,14 @@ mod tests {
         let handle = tokio::spawn(writer.run(shutdown.clone()));
 
         let request_id = Uuid::new_v4();
+        // Real timing measured by the outlet handler: arrival, then completion
+        // 2s later. The writer must carry it through so the persisted row's
+        // duration is the true latency, not zero. Fixed, microsecond-aligned
+        // instants: Postgres timestamptz is microsecond-precision, so a
+        // nanosecond Utc::now() would not round-trip byte-for-byte and the
+        // completed_at equality assert below would be flaky.
+        let started_at = DateTime::from_timestamp_millis(1_700_000_000_000).unwrap();
+        let completed_at = started_at + chrono::Duration::seconds(2);
         sender
             .send(RawCompletedRequest {
                 request_id,
@@ -385,6 +408,8 @@ mod tests {
                 endpoint: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "user-test".to_string(),
+                started_at,
+                completed_at,
             })
             .await
             .expect("send should succeed");
@@ -394,6 +419,13 @@ mod tests {
         assert_eq!(detail.service_tier, Some("priority".to_string()));
         assert_eq!(detail.response_body, Some(r#"{"output":"done"}"#.to_string()));
         assert_eq!(detail.response_status, Some(200));
+        // Regression: the outlet-measured duration survives the writer round-trip.
+        assert_eq!(detail.completed_at, Some(completed_at));
+        let duration_ms = detail.duration_ms.expect("duration_ms should be populated");
+        assert!(
+            (duration_ms - 2000.0).abs() < 1.0,
+            "duration_ms should be ~2000 (real latency), got {duration_ms}"
+        );
 
         shutdown.cancel();
         timeout(Duration::from_secs(5), handle)
@@ -423,6 +455,8 @@ mod tests {
                     endpoint: "/v1/responses".to_string(),
                     api_key: String::new(),
                     created_by: "user-test".to_string(),
+                    started_at: Utc::now(),
+                    completed_at: Utc::now(),
                 })
                 .await
                 .expect("send should succeed");
@@ -462,6 +496,8 @@ mod tests {
                 endpoint: "/v1/responses".to_string(),
                 api_key: String::new(),
                 created_by: "user-test".to_string(),
+                started_at: Utc::now(),
+                completed_at: Utc::now(),
             })
             .await
             .expect("send should succeed");

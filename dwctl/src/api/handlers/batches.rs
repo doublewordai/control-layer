@@ -12,12 +12,15 @@ use crate::api::models::batches::{
     BatchAnalytics, BatchErrors, BatchListResponse, BatchObjectType, BatchResponse, BatchResultsQuery, CreateBatchRequest,
     ListBatchesQuery, ListObjectType, RequestCounts, RetryRequestsRequest,
 };
-use crate::api::models::users::CurrentUser;
-use crate::auth::permissions::{RequiresPermission, can_read_all_resources, has_permission, operation, resource};
-use crate::db::handlers::{Connections, Credits, Users, api_keys::ApiKeys, repository::Repository};
+use crate::api::models::users::{CurrentUser, Role};
+use crate::auth::permissions::{
+    RequiresPermission, can_read_all_resources, can_run_background_inference, has_permission, operation, resolve_key_capabilities, resource,
+};
+use crate::db::handlers::deployments::BatchModelInfo;
+use crate::db::handlers::{BatchTemplates, Connections, Credits, Deployments, Users, api_keys::ApiKeys, repository::Repository};
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::errors::{Error, Result};
-use crate::types::{Operation, Resource};
+use crate::types::{Operation, Permission, Resource};
 use axum::{
     Json,
     body::Body,
@@ -203,15 +206,47 @@ pub async fn build_cascade_batch_state_job<P: sqlx_pool_router::PoolProvider + C
 
 // ---------------------------------------------------------------------------
 
+fn parse_comma_separated_filter(raw: Option<&str>) -> Option<Vec<String>> {
+    let raw = raw?;
+    let values: Vec<String> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
+    if values.is_empty() { None } else { Some(values) }
+}
+
 /// Parse the comma-separated `completion_window` query param into the vec of
 /// values passed to fusillade. Returns `None` (no filter) when the param is
 /// missing or contains only whitespace. Values are forwarded as-is so callers
 /// can match any window string fusillade understands (e.g. `"24h"`, `"1h"`,
 /// `"0s"`, `"7d"`).
 fn parse_completion_window_filter(raw: Option<&str>) -> Option<Vec<String>> {
-    let raw = raw?;
-    let windows: Vec<String> = raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect();
-    if windows.is_empty() { None } else { Some(windows) }
+    parse_comma_separated_filter(raw)
+}
+
+#[derive(Debug)]
+struct BatchClassFilter {
+    completion_windows: Option<Vec<String>>,
+    service_tiers: Option<Vec<String>>,
+}
+
+fn parse_batch_class_filter(raw: Option<&str>, is_platform_manager: bool) -> Result<BatchClassFilter> {
+    let Some(values) = parse_completion_window_filter(raw) else {
+        return Ok(BatchClassFilter {
+            completion_windows: None,
+            service_tiers: None,
+        });
+    };
+
+    let includes_background = values.iter().any(|value| value == "background");
+    if includes_background && !is_platform_manager {
+        return Err(Error::BadRequest {
+            message: "completion_window=background is only available to platform managers".to_string(),
+        });
+    }
+
+    let completion_windows: Vec<_> = values.into_iter().filter(|value| value != "background").collect();
+    Ok(BatchClassFilter {
+        completion_windows: (!completion_windows.is_empty()).then_some(completion_windows),
+        service_tiers: includes_background.then(|| vec!["background".to_string()]),
+    })
 }
 
 /// Check if the current user "owns" a batch, considering org context.
@@ -286,9 +321,24 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
         sync_id: raw_metadata.get("dw_sync_id").cloned(),
     };
 
+    // Model label cached on the batch at creation time: surfaced as the typed
+    // `model` field, stripped from caller-visible metadata below.
+    let model = raw_metadata.get("dw_model").cloned();
+
     // Build user-facing metadata: filter out internal dw_* keys.
     // Keep request_source, created_by_email, context_name, context_type for backwards compat.
-    let internal_keys = ["dw_source_id", "dw_source_name", "dw_sync_id", "dw_external_key", "created_by"];
+    let internal_keys = [
+        "dw_source_id",
+        "dw_source_name",
+        "dw_sync_id",
+        "dw_external_key",
+        "created_by",
+        // Recorded for analytics, not for the caller: echoing a client's own User-Agent
+        // back at it tells it nothing it didn't just send us.
+        "dw_user_agent",
+        // Surfaced as the typed `model` field instead.
+        "dw_model",
+    ];
     let mut metadata: HashMap<String, String> = raw_metadata
         .into_iter()
         .filter(|(k, _)| !internal_keys.contains(&k.as_str()))
@@ -365,12 +415,34 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
     // Convert batch-level errors (validation errors, system errors, etc.)
     let errors = batch.errors.and_then(|e| serde_json::from_value::<BatchErrors>(e).ok());
 
-    // Check if batch has expired
-    let expired_at = if chrono::Utc::now() > batch.expires_at {
-        Some(batch.expires_at.timestamp())
+    // The OpenAI-shaped response predates no-SLA batches. Preserve the SLA
+    // window for ordinary batches and use the explicit tier name for
+    // background batches so callers never receive a fabricated deadline.
+    let is_background = batch.service_tier.as_deref() == Some("background");
+    let completion_window = if is_background {
+        "background".to_string()
     } else {
-        None
+        batch
+            .completion_window
+            .clone()
+            .expect("non-background batch must have a completion window")
     };
+    let expires_at = if is_background {
+        None
+    } else {
+        Some(
+            batch
+                .expires_at
+                .as_ref()
+                .expect("non-background batch must have an expiry")
+                .timestamp(),
+        )
+    };
+    let expired_at = batch
+        .expires_at
+        .as_ref()
+        .filter(|expires_at| !is_background && chrono::Utc::now() > **expires_at)
+        .map(|expires_at| expires_at.timestamp());
 
     BatchResponse {
         id: batch.id.0.to_string(),
@@ -378,14 +450,14 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
         endpoint: batch.endpoint.clone(),
         errors,
         input_file_id: batch.file_id.map(|id| id.0.to_string()).unwrap_or_default(),
-        completion_window: batch.completion_window.clone(),
+        completion_window,
         status: openai_status.to_string(),
         output_file_id: batch.output_file_id.map(|id| id.0.to_string()),
         // Always show error_file_id if it exists - the file content itself is filtered by fusillade
         error_file_id: batch.error_file_id.map(|id| id.0.to_string()),
         created_at: batch.created_at.timestamp(),
         in_progress_at,
-        expires_at: Some(batch.expires_at.timestamp()),
+        expires_at,
         finalizing_at,
         completed_at,
         failed_at,
@@ -398,8 +470,21 @@ fn to_batch_response_enriched(batch: fusillade::Batch, creator_email: Option<&st
             failed: batch.failed_requests,
         },
         metadata: if metadata.is_empty() { None } else { Some(metadata) },
+        model,
         analytics: None,
         dwext: if dwext.is_empty() { None } else { Some(dwext) },
+    }
+}
+
+/// Collapse the distinct models behind a batch into the single label the
+/// public UI shows per batch: the alias when homogeneous, `"mixed"` otherwise.
+/// Cached on the batch as `dw_model` metadata at creation time so list/get
+/// responses never aggregate over `request_templates`.
+pub(crate) fn batch_model_label(models: &[String]) -> Option<String> {
+    match models {
+        [] => None,
+        [only] => Some(only.clone()),
+        _ => Some("mixed".to_string()),
     }
 }
 
@@ -412,6 +497,28 @@ async fn fetch_creator_email(db: &sqlx::PgPool, batch: &fusillade::Batch) -> Opt
     let user_id = Uuid::parse_str(&batch.created_by).ok()?;
     let mut conn = db.acquire().await.ok()?;
     Users::new(&mut conn).get_by_id(user_id).await.ok().flatten().map(|u| u.email)
+}
+
+/// Metadata keys the server owns. A caller-supplied value for any of these is dropped at
+/// creation rather than merged: they are either injected server-side during response
+/// enrichment, or they are provenance, which is worth nothing if the caller can set it.
+const RESERVED_METADATA_KEYS: [&str; 7] = [
+    "created_by_email",
+    "context_name",
+    "context_type",
+    "request_source",
+    "created_by",
+    "dw_user_agent",
+    "dw_model",
+];
+
+/// Whether a caller-supplied metadata key collides with a reserved one, comparing the
+/// normalised form so `dw-user-agent` and `DW_USER_AGENT` are caught with `dw_user_agent`.
+/// `-` and `_` are the same character by the time fusillade has built a header name out of
+/// the key, so they are treated as the same key here.
+fn is_reserved_metadata_key(key: &str) -> bool {
+    let normalised = key.to_ascii_lowercase().replace('-', "_");
+    RESERVED_METADATA_KEYS.contains(&normalised.as_str())
 }
 
 #[utoipa::path(
@@ -428,6 +535,7 @@ The batch will begin processing immediately. Use `GET /batches/{batch_id}` to mo
         (status = 400, description = "Invalid request — check that the endpoint and completion_window are valid."),
         (status = 402, description = "Insufficient credits — account balance is below zero."),
         (status = 404, description = "Input file not found or you don't have access to it."),
+        (status = 422, description = "A reasoning effort maps to an absolute token budget but the request does not provide a sufficient output-token limit."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     )
 )]
@@ -436,14 +544,25 @@ pub async fn create_batch<P: PoolProvider>(
     State(state): State<AppState<P>>,
     current_user: RequiresPermission<resource::Batches, operation::CreateOwn>,
     has_api_key: crate::auth::current_user::HasApiKey,
+    // Before `Json`, which consumes the body and so must come last.
+    headers: axum::http::HeaderMap,
     Json(req): Json<CreateBatchRequest>,
 ) -> Result<(StatusCode, Json<BatchResponse>)> {
     let config = state.current_config();
+    let is_background = req.completion_window == "background";
+    if is_background && !can_run_background_inference(&current_user) {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Batches, Operation::CreateOwn),
+            action: Operation::CreateOwn,
+            resource: "background inference; assign the BackgroundInferenceUser role to submit this completion_window".to_string(),
+        });
+    }
+
     // Users with Batches::CreateAll (PlatformManager, admins) can use any
     // completion window that humantime can parse. Everyone else is restricted
     // to the configured allowed values.
     let can_use_any_window = has_permission(&current_user, Resource::Batches, Operation::CreateAll);
-    if !can_use_any_window && !config.batches.allowed_completion_windows.contains(&req.completion_window) {
+    if !is_background && !can_use_any_window && !config.batches.allowed_completion_windows.contains(&req.completion_window) {
         let allowed: Vec<&str> = config.batches.allowed_completion_windows.iter().map(|w| w.as_str()).collect();
 
         return Err(Error::BadRequest {
@@ -510,7 +629,6 @@ pub async fn create_batch<P: PoolProvider>(
             .as_deref()
             .is_some_and(|owner| is_batch_owner(&current_user, owner))
     {
-        use crate::types::{Operation, Permission};
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Files, Operation::ReadAll),
             action: Operation::CreateOwn,
@@ -557,35 +675,16 @@ pub async fn create_batch<P: PoolProvider>(
         }
     }
 
-    // Get per-model request counts from the file
-    let file_stats = state
-        .request_manager
-        .get_file_template_stats(fusillade::FileId(file_id))
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("get file template stats: {}", e),
-        })?;
-
-    let file_model_counts: HashMap<String, i64> = file_stats.iter().map(|s| (s.model.clone(), s.request_count)).collect();
+    // Read templates and model configuration from their respective primary
+    // pools. Besides avoiding upload-to-submit replica lag, this revalidates
+    // against any reasoning mapping or composite membership changes made
+    // since upload.
+    let (file_model_counts, batch_model_info) = load_and_validate_batch_models(&state, file_id).await?;
 
     let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
 
-    // Get per-model batch info (throughputs + allowed windows) in one query
-    let batch_model_info = {
-        use crate::db::handlers::deployments::Deployments;
-        let mut conn = state.db.read().acquire().await.map_err(|e| Error::Internal {
-            operation: format!("get db connection: {}", e),
-        })?;
-        Deployments::new(&mut conn)
-            .get_batch_model_info(&model_aliases)
-            .await
-            .map_err(|e| Error::Internal {
-                operation: format!("get batch model info: {}", e),
-            })?
-    };
-
     // Check per-model batch completion window restrictions (skipped for elevated users)
-    if !can_use_any_window {
+    if !is_background && !can_use_any_window {
         for (alias, allowed_windows) in &batch_model_info.allowed_windows {
             if !allowed_windows.contains(&req.completion_window) {
                 if allowed_windows.is_empty() {
@@ -613,18 +712,108 @@ pub async fn create_batch<P: PoolProvider>(
     // - No API key (cookie auth) -> "frontend"
     let request_source = if has_api_key.0 { "api" } else { "frontend" };
 
+    // The creating call's User-Agent, which is the only moment a batch's CLIENT is
+    // knowable. Every request the batch goes on to make is dispatched by the fusillade
+    // daemon minutes-to-hours later, over its own HTTP client, which sends no User-Agent at
+    // all - so `http_analytics.user_agent` is empty on 100% of batch rows and the client
+    // that submitted the work is unrecoverable from them. Stashing it here and replaying it
+    // on dispatch (see `request_logging::analytics_handler`) is what makes "which SDKs and
+    // CLIs submit batch work" answerable, the same question `request_source` answers only
+    // as far as "an API key of some kind".
+    //
+    // Truncated to 256 chars exactly as the analytics writer does, so a pathological client
+    // can't push kilobytes through batch metadata into every dispatched request's headers.
+    // Sliced on a char boundary, not a byte one, so a multi-byte UA can't be cut into
+    // invalid UTF-8.
+    let creator_user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .map(|ua| ua.chars().take(256).collect::<String>())
+        .filter(|ua| !ua.is_empty());
+
     // When in org context, attribute batch ownership to the org
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
+
+    // Explicit key selection (org dashboard flows): validate the chosen key
+    // before it drives execution and attribution below. Primary pool: the
+    // managed-mode requirement must see a just-flipped org mode — replica lag
+    // here would let a member bypass key selection.
+    let caps = {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        resolve_key_capabilities(&current_user, target_user_id, &mut conn)
+            .await
+            .map_err(Error::Database)?
+    };
+    let selected_key = if let Some(selected_id) = req.api_key_id {
+        if current_user.active_organization.is_none() {
+            return Err(Error::BadRequest {
+                message: "api_key_id selection is only available in organization context".to_string(),
+            });
+        }
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        let key = ApiKeys::new(&mut conn)
+            .get_by_id(selected_id)
+            .await
+            .map_err(Error::Database)?
+            .filter(|key| key.user_id == target_user_id)
+            // Hidden/system keys are not selectable.
+            .filter(|key| !key.hidden)
+            .filter(|key| key.parent_api_key_id.is_none())
+            // Explicit billing selection is an inference-key choice: batches
+            // are inference, so only realtime keys are selectable (matching
+            // the dashboard picker). Implicit attribution needs no such
+            // check — the auth middleware already refuses non-inference
+            // keys on every /ai/* path, so an authenticating key here is
+            // inference-purpose by construction.
+            .filter(|key| matches!(key.purpose, ApiKeyPurpose::Realtime))
+            // Usable by the caller: their own key, or any org key for org managers.
+            .filter(|key| caps.is_org_manager || key.created_by == current_user.id)
+            .ok_or_else(|| Error::NotFound {
+                resource: "API key".to_string(),
+                id: selected_id.to_string(),
+            })?;
+        Some(key)
+    } else {
+        None
+    };
+    // Managed-keys orgs: members hold issued keys rather than owning an
+    // implicit one, so a dashboard submission must name the key that will
+    // carry the batch's spend.
+    if selected_key.is_none() && current_user.api_key_id.is_none() && caps.requires_batch_key_selection() {
+        return Err(Error::BadRequest {
+            message: "This organization manages API keys centrally: select one of your issued API keys (api_key_id) to create a batch."
+                .to_string(),
+        });
+    }
+    // Attribution follows the selected key's creator (not the submitter), so
+    // an org manager running a batch on a member's key attributes the usage to
+    // that member — matching how API-authenticated submissions behave.
+    let (attribution_user_id, authenticating_key_id) = match &selected_key {
+        Some(key) => (key.created_by, Some(key.id)),
+        None => (current_user.id, current_user.api_key_id),
+    };
 
     // Get the hidden API key for batch execution and per-member attribution.
     // The secret is stored on the batch so the daemon uses the batch creator's
     // credentials, not the file uploader's key from request_templates.
+    // If the request was authenticated with a capped API key, this resolves to
+    // that key's cap-scope child instead of the shared member key, so the
+    // batch's spend counts against the authenticating key's spending cap.
     let (batch_api_key, api_key_id, target_verified) = {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let (secret, key_id) = ApiKeys::new(&mut conn)
-            .get_or_create_hidden_key_with_id(target_user_id, ApiKeyPurpose::Batch, current_user.id)
+            .resolve_batch_execution_key(target_user_id, attribution_user_id, authenticating_key_id)
             .await
             .map_err(Error::Database)?;
+        // Spending-cap pre-flight, beside the balance gate above: if the
+        // execution key's cap scope is already exhausted, reject up front
+        // instead of accepting a batch whose every request would be refused
+        // request-by-request at the proxy.
+        if ApiKeys::new(&mut conn).is_scope_exhausted(key_id).await.map_err(Error::Database)? {
+            return Err(Error::SpendCapExceeded {
+                message: "The API key used for this batch has reached its spending cap. Raise or remove the cap, or wait for the cap window to reset, then resubmit.".to_string(),
+            });
+        }
         // Resolve the creditor's verified flag on the same connection (the org in
         // org context, else the user) for the volume cap below — no extra acquire.
         let verified = Users::new(&mut conn).is_verified(target_user_id).await?;
@@ -634,78 +823,120 @@ pub async fn create_batch<P: PoolProvider>(
     // Convert metadata to HashMap and inject request_source and user info.
     // Strip reserved keys that are injected server-side during response enrichment
     // to prevent user-supplied values from colliding with system fields.
+    // `dw_user_agent` is stripped for a sharper reason than collision: it is provenance,
+    // and provenance a caller can set is worthless. Only the value read off the wire above
+    // is ever stored.
+    //
+    // Matched on the NORMALISED key — lower-cased, `-` folded to `_` — so `dw-user-agent`
+    // and `DW_User_Agent` are stripped alongside `dw_user_agent`. Nothing honours those
+    // spellings today: fusillade looks each metadata key up by its exact configured name,
+    // so only `dw_user_agent` is ever read. But it turns `_` into `-` when it builds the
+    // header, meaning both spellings are one header on the wire, and a forwarding loop that
+    // walked the caller's keys instead of the configured ones would let their spelling win.
+    // Folding here costs nothing and makes the invariant hold by construction rather than
+    // by the current shape of a loop two crates away.
     let mut metadata_map = req.metadata.unwrap_or_default();
-    for key in &["created_by_email", "context_name", "context_type", "request_source", "created_by"] {
-        metadata_map.remove(*key);
-    }
+    metadata_map.retain(|key, _| !is_reserved_metadata_key(key));
     metadata_map.insert("request_source".to_string(), request_source.to_string());
     metadata_map.insert("created_by".to_string(), current_user.id.to_string());
+    // `dw_` prefix: fusillade replays every metadata key onto dispatched requests as
+    // `x-fusillade-batch-<key>`, and `to_batch_response_with_email` filters `dw_*` out of
+    // the user-facing metadata. So the header arrives at analytics as
+    // `x-fusillade-batch-dw-user-agent` and the batch object doesn't echo it back.
+    if let Some(user_agent) = creator_user_agent {
+        metadata_map.insert("dw_user_agent".to_string(), user_agent);
+    }
+    // Cache the batch's model label at creation — the template counts are
+    // already loaded for validation, so this costs nothing. Response
+    // enrichment surfaces it as the typed `model` field; list/get never have
+    // to aggregate over request_templates.
+    let model_aliases_for_label: Vec<String> = file_model_counts.keys().cloned().collect();
+    if let Some(label) = batch_model_label(&model_aliases_for_label) {
+        metadata_map.insert("dw_model".to_string(), label);
+    }
     let metadata = serde_json::to_value(metadata_map).ok();
 
     // Create batch input — created_by uses org ID when in org context for ownership scoping
     let total_requests: i64 = file_model_counts.values().sum();
 
-    // Bound how much an unverified creditor can queue. Checked before reserving
-    // capacity / creating the batch so over-limit submissions are rejected up
-    // front. No-op for verified creditors or a disabled cap.
-    crate::api::handlers::unverified_volume::enforce_unverified_volume_limit(
-        &*state.request_manager,
-        config.batches.unverified_requests_per_completion_hour,
-        target_user_id,
-        target_verified,
-        &req.completion_window,
-        total_requests,
-        crate::api::handlers::unverified_volume::SubmissionKind::Batch,
-    )
-    .await?;
-
-    let batch_input = fusillade::BatchInput {
-        file_id: fusillade::FileId(file_id),
-        endpoint: req.endpoint.clone(),
-        completion_window: req.completion_window.clone(),
-        metadata,
-        created_by: Some(target_user_id.to_string()),
-        api_key_id: Some(api_key_id),
-        api_key: Some(batch_api_key),
-        total_requests: Some(total_requests),
-    };
-
-    let reservation_ids = reserve_capacity_for_batch(
-        &state,
-        &req.completion_window,
-        &file_model_counts,
-        &model_throughputs,
-        &model_ids_by_alias,
-        config.batches.relaxation_factor(&req.completion_window),
-    )
-    .await?;
-
-    // RAII guard: releases reservations when this scope exits, whether by normal
-    // return, early return (e.g. create_batch error), or unwind panic.
-    // The spawn is best-effort — the TTL is the true safety net if the runtime
-    // is unavailable at drop time.
-    let _release_guard = scopeguard::guard(reservation_ids.clone(), |ids| {
-        let state = state.clone();
-        tokio::runtime::Handle::current().spawn(async move {
-            if let Err(e) = release_capacity_reservations(&state, &ids).await {
-                tracing::warn!(
-                    reservation_ids = ?ids,
-                    error = %e,
-                    "Failed to release capacity reservations — will expire via TTL"
-                );
-            }
-        });
-    });
-
     // Batch record (fusillade DB) and job enqueue (dwctl DB) are on separate databases,
     // so true atomicity isn't possible. Each is a single independent write.
-    let batch = state
-        .request_manager
-        .create_batch_record(batch_input)
-        .await
-        .map_err(|e| Error::Internal {
-            operation: format!("create batch record: {}", e),
-        })?;
+    let batch = if is_background {
+        state
+            .request_manager
+            .create_background_batch_record(fusillade::BackgroundBatchInput {
+                file_id: fusillade::FileId(file_id),
+                endpoint: req.endpoint.clone(),
+                metadata,
+                created_by: Some(target_user_id.to_string()),
+                api_key_id: Some(api_key_id),
+                api_key: Some(batch_api_key),
+                total_requests: Some(total_requests),
+            })
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("create background batch record: {e}"),
+            })?
+    } else {
+        // Bound how much an unverified creditor can queue. Checked before
+        // reserving capacity / creating the batch so over-limit SLA submissions
+        // are rejected up front. No-op for verified creditors or a disabled cap.
+        crate::api::handlers::unverified_volume::enforce_unverified_volume_limit(
+            &*state.request_manager,
+            config.batches.unverified_requests_per_completion_hour,
+            target_user_id,
+            target_verified,
+            &req.completion_window,
+            total_requests,
+            crate::api::handlers::unverified_volume::SubmissionKind::Batch,
+        )
+        .await?;
+
+        let batch_input = fusillade::BatchInput {
+            file_id: fusillade::FileId(file_id),
+            endpoint: req.endpoint.clone(),
+            completion_window: req.completion_window.clone(),
+            metadata,
+            created_by: Some(target_user_id.to_string()),
+            api_key_id: Some(api_key_id),
+            api_key: Some(batch_api_key),
+            total_requests: Some(total_requests),
+        };
+
+        let reservation_ids = reserve_capacity_for_batch(
+            &state,
+            &req.completion_window,
+            &file_model_counts,
+            &model_throughputs,
+            &model_ids_by_alias,
+            config.batches.relaxation_factor(&req.completion_window),
+        )
+        .await?;
+
+        // RAII guard: releases reservations when this scope exits, whether by
+        // normal return, early return, or unwind panic. The TTL is the final
+        // safety net if the best-effort spawn cannot run.
+        let _release_guard = scopeguard::guard(reservation_ids.clone(), |ids| {
+            let state = state.clone();
+            tokio::runtime::Handle::current().spawn(async move {
+                if let Err(e) = release_capacity_reservations(&state, &ids).await {
+                    tracing::warn!(
+                        reservation_ids = ?ids,
+                        error = %e,
+                        "Failed to release capacity reservations — will expire via TTL"
+                    );
+                }
+            });
+        });
+
+        state
+            .request_manager
+            .create_batch_record(batch_input)
+            .await
+            .map_err(|e| Error::Internal {
+                operation: format!("create batch record: {e}"),
+            })?
+    };
 
     // Enqueue background job to populate requests from templates.
     if let Err(e) = state
@@ -731,11 +962,75 @@ pub async fn create_batch<P: PoolProvider>(
     // batch.created webhook deliveries are created by the notification poller
     // which polls fusillade.batches for new records.
 
-    // For create, we have the current user's email directly
+    // For create, we have the current user's email directly. The model label
+    // rides on the batch's stored metadata (`dw_model`, injected above) and is
+    // surfaced by response enrichment.
     Ok((
         StatusCode::CREATED,
         Json(to_batch_response_with_email(batch, Some(&current_user.email))),
     ))
+}
+
+async fn load_and_validate_batch_models<P: PoolProvider>(
+    state: &AppState<P>,
+    file_id: Uuid,
+) -> Result<(HashMap<String, i64>, BatchModelInfo)> {
+    let file_model_counts = {
+        let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get primary Fusillade connection for batch model counts: {e}"),
+        })?;
+        BatchTemplates::new(&mut templates_conn)
+            .get_model_counts(file_id)
+            .await
+            .map_err(Error::Database)?
+    };
+    let model_aliases = file_model_counts.keys().cloned().collect::<Vec<_>>();
+
+    let (batch_model_info, reasoning_policies) = {
+        let mut control_conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get primary control database connection for batch validation: {e}"),
+        })?;
+        let batch_model_info = Deployments::new(&mut control_conn)
+            .get_batch_model_info(&model_aliases)
+            .await
+            .map_err(Error::Database)?;
+        let reasoning_policies = Deployments::new(&mut control_conn)
+            .get_reasoning_policies(&model_aliases)
+            .await
+            .map_err(Error::Database)?;
+        (batch_model_info, reasoning_policies)
+    };
+
+    let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
+        operation: format!("get primary Fusillade connection for batch request validation: {e}"),
+    })?;
+    let mut templates = BatchTemplates::new(&mut templates_conn);
+    let mut stream = templates.stream_reasoning_requests(file_id);
+    while let Some(template) = stream.next().await {
+        let template = template.map_err(Error::Database)?;
+        let line = i64::from(template.line_number) + 1;
+        let context = match template.custom_id.as_deref() {
+            Some(custom_id) => format!("Line {line} (custom_id '{custom_id}')"),
+            None => format!("Line {line}"),
+        };
+        let body: serde_json::Value = serde_json::from_str(&template.body).map_err(|error| Error::BadRequest {
+            message: format!("{context}: stored request body is not valid JSON: {error}"),
+        })?;
+        let validation = reasoning_policies
+            .get(&template.model)
+            .cloned()
+            .unwrap_or_default()
+            .validate_request(&template.path, &body);
+        if let Err(error) = validation {
+            let message = format!("{context}: {}", error.message());
+            return Err(match error.status_code() {
+                422 => Error::UnprocessableEntity { message },
+                _ => Error::BadRequest { message },
+            });
+        }
+    }
+
+    Ok((file_model_counts, batch_model_info))
 }
 
 async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_aliases: &[String]) -> Result<HashMap<String, Uuid>> {
@@ -779,11 +1074,13 @@ async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_al
 /// ## Three-phase pipeline
 ///
 /// ```text
-/// Phase 1 — Reserve   (this fn, ~1 ms)
+/// Phase 1 — Reserve   (this fn)
+///   ├─ read pending request counts      (fusillade write pool, OUTSIDE the lock;
+///   │                                     the expensive read — scales with backlog)
 ///   ├─ BEGIN tx on dwctl write pool
 ///   ├─ pg_advisory_xact_lock per (model_id, window)  ← serialises concurrent reservations
-///   ├─ read active reservations         (dwctl write pool, inside tx)
-///   ├─ read pending request counts      (fusillade write pool, separate connection)
+///   ├─ read reservations                (dwctl write pool, inside tx: active ones plus
+///   │                                     any released since the pending snapshot)
 ///   ├─ check combined capacity
 ///   ├─ INSERT reservation rows
 ///   └─ COMMIT  ← lock released, reservation visible to peers
@@ -800,32 +1097,38 @@ async fn get_model_ids_by_aliases<P: PoolProvider>(state: &AppState<P>, model_al
 /// can read-check-then-insert at a time. Locks are acquired in deterministic UUID order
 /// to prevent deadlocks when a batch spans multiple models.
 ///
+/// The pending-count read is deliberately kept *outside* the lock. It is the only
+/// expensive step (it reads every active request of the requested models), so holding
+/// the lock across it would head-of-line block every concurrent submission for the same
+/// model+window behind the slowest count — and a count that hit its statement timeout
+/// stalled all of them for the full timeout. Outside the lock, a slow count degrades one
+/// submission instead of blocking all of them.
+///
 /// ## Read ordering and the fail-safe race window
 ///
 /// The two capacity reads come from **different connection pools** (dwctl vs. fusillade),
 /// so they hold independent PostgreSQL snapshots under `READ COMMITTED`. There is an
 /// unavoidable, tiny race window at the exact moment a concurrent batch finishes
 /// `create_batch` and its reservation is released — the "swap point" where requests
-/// transition from a reservation into committed pending rows. A new caller straddling
-/// this swap point could theoretically see inconsistent state across the two reads.
+/// transition from a reservation into committed pending rows.
 ///
-/// The read order here is deliberately chosen to make that race **fail-safe**:
+/// Because pending rows are read **first** (outside the lock) and reservations
+/// **second** (inside it), a batch swapping between the two reads would naively appear
+/// in **neither** — it wasn't committed when the rows were counted, and it was already
+/// released when the reservations were summed. To make the race fail-safe, the
+/// reservation read also counts reservations *released at or after* the instant the
+/// pending snapshot was taken (`released_since`). That instant is read from the dwctl
+/// database, so it shares a clock with `released_at`, and it is read before the pending
+/// snapshot, so any reservation released earlier than it belongs to a batch whose rows
+/// were already committed and therefore counted by the snapshot.
 ///
-/// - Reservations are read **first** (dwctl tx, inside the advisory lock).
-/// - Pending counts are read **second** (fusillade pool, outside the lock).
-///
-/// If the swap point falls between these two reads, the concurrent batch appears in
-/// **both** counts — as a reservation that hasn't been released yet, and as committed
-/// pending requests that have just landed. This double-counts the batch, causing a
-/// conservative over-estimate of load that leads to **under-acceptance** rather than
-/// over-acceptance.
-///
-/// The opposite ordering (pending first, reservations second) produces the dangerous
-/// case: the swap point could cause both reads to return zero, making the system
-/// appear completely idle and over-accepting the incoming batch.
+/// A batch that swaps during the window is then counted via its recently released
+/// reservation — and, if it committed just before the snapshot, possibly by both reads.
+/// That double count is a conservative over-estimate of load that leads to
+/// **under-acceptance** rather than over-acceptance.
 ///
 /// In short: the race is an inherent consequence of reading across two independent
-/// connections, but the read order ensures it always errs on the side of caution.
+/// connections, but the released-since rule ensures it always errs on the side of caution.
 /// Thin wrapper around the shared `reserve_capacity` for the API handler context.
 /// Converts `CapacityError` to the API's `Error` type.
 async fn reserve_capacity_for_batch<P: PoolProvider>(
@@ -1070,12 +1373,18 @@ pub async fn get_batch_analytics<P: PoolProvider>(
         });
     }
 
-    // Fetch aggregated analytics metrics for this batch
+    // Read this batch's aggregated metrics from the batch_aggregates read model. That model is
+    // durable — it replaces raw http_analytics, which COR-509 prunes — so a batch that has been
+    // folded keeps its metrics indefinitely. A missing row therefore means the batch simply
+    // hasn't been folded yet (brand new / no completed requests), not that data aged out, so
+    // return a zero-valued payload rather than 404. Ownership/existence is already enforced
+    // above, and platform managers expect to see metrics for any batch they can access.
     let analytics = crate::db::handlers::analytics::get_batch_analytics(state.db.read(), &batch_id)
         .await
         .map_err(|e| Error::Internal {
             operation: format!("fetch batch analytics: {}", e),
-        })?;
+        })?
+        .unwrap_or_default();
 
     Ok(Json(analytics))
 }
@@ -1383,13 +1692,11 @@ pub async fn delete_batch<P: PoolProvider>(
     post,
     path = "/batches/{batch_id}/retry",
     tag = "batches",
-    summary = "Retry failed requests",
-    description = "Retry all failed requests in a batch.
-
-Failed requests are reset to pending and will be processed again. Use this after fixing transient issues or increasing rate limits.",
+    summary = "Retry failed and canceled requests",
+    description = "Retry a batch: failed AND canceled requests are reset to pending and will be processed again; completed work is never redone. Retrying a cancelled batch overturns the cancellation (cancel-then-retry acts as pause/resume), so this also succeeds on a just-cancelled batch whose requests had not yet settled. Use it after fixing transient issues, increasing rate limits, or to resume a cancelled batch.",
     responses(
-        (status = 200, description = "Failed requests queued for retry.", body = BatchResponse),
-        (status = 400, description = "No failed requests to retry in this batch."),
+        (status = 200, description = "Requests queued for retry (or a cancellation was overturned and the batch resumed).", body = BatchResponse),
+        (status = 400, description = "Nothing to retry: no failed or canceled requests, and the batch was not cancelled."),
         (status = 404, description = "Batch not found or you don't have access to it."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
@@ -1435,9 +1742,17 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
             operation: format!("retry failed requests: {}", e),
         })?;
 
-    if retried_count == 0 {
+    // retried_count == 0 is still SUCCESS when the retry overturned a
+    // cancellation: the fast-resume flow (cancel + near-instant retry)
+    // re-pends nothing — no rows had settled to failed/canceled yet — but
+    // fusillade's batch reset fires on `count > 0 OR cancelling_at IS NOT
+    // NULL`, un-cancelling the batch so its rows become claimable again.
+    // Returning 400 here used to tell resuming users their successful
+    // resume had failed. Only a retry that neither re-pended rows nor
+    // overturned a cancellation is a true no-op.
+    if retried_count == 0 && batch.cancelling_at.is_none() {
         return Err(Error::BadRequest {
-            message: "No failed requests to retry in this batch".to_string(),
+            message: "Nothing to retry: no failed or canceled requests, and the batch is not cancelled".to_string(),
         });
     }
 
@@ -1629,12 +1944,13 @@ pub async fn list_batches<P: PoolProvider>(
         let mut read_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
         let key_ids = match current_user.active_organization {
             Some(org_id) => {
-                // Org context: find the single hidden key for this member in this org
-                let key_id = ApiKeys::new(&mut read_conn)
-                    .find_hidden_key_id(org_id, ApiKeyPurpose::Batch, member_id)
+                // Org context: the member's hidden keys in this org (shared +
+                // any cap-scope children, all of which their batches may be
+                // attributed to)
+                ApiKeys::new(&mut read_conn)
+                    .find_hidden_key_ids(org_id, ApiKeyPurpose::Batch, member_id)
                     .await
-                    .map_err(Error::Database)?;
-                key_id.into_iter().collect::<Vec<_>>()
+                    .map_err(Error::Database)?
             }
             None if can_read_all => {
                 // PM personal context: find ALL hidden keys created by this member
@@ -1666,7 +1982,8 @@ pub async fn list_batches<P: PoolProvider>(
     // Parse the comma-separated `completion_window` filter into the list
     // passed to fusillade. An empty/whitespace-only param is treated as "no
     // filter" so callers can send `completion_window=` to disable the default.
-    let completion_windows = parse_completion_window_filter(query.completion_window.as_deref());
+    let is_platform_manager = current_user.roles.contains(&Role::PlatformManager);
+    let batch_class_filter = parse_batch_class_filter(query.completion_window.as_deref(), is_platform_manager)?;
 
     // Fetch batches with ownership filtering, search, and cursor-based pagination
     let batches = state
@@ -1681,7 +1998,8 @@ pub async fn list_batches<P: PoolProvider>(
             created_after: query.created_after,
             created_before: query.created_before,
             active_first: query.active_first,
-            completion_windows,
+            completion_windows: batch_class_filter.completion_windows,
+            service_tiers: batch_class_filter.service_tiers,
         })
         .await
         .map_err(|e| match &e {
@@ -1895,7 +2213,10 @@ pub async fn list_batches<P: PoolProvider>(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_completion_window_filter;
+    use super::{
+        is_reserved_metadata_key, load_and_validate_batch_models, parse_batch_class_filter, parse_completion_window_filter,
+        to_batch_response_with_email,
+    };
     use crate::api::models::batches::CreateBatchRequest;
     use crate::api::models::users::Role;
     use crate::db::handlers::Credits;
@@ -1906,9 +2227,72 @@ mod tests {
     use fusillade::Storage;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
-    use sqlx_pool_router::TestDbPools;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+    use sqlx_pool_router::{PoolProvider, TestDbPools};
     use std::collections::HashMap;
+    use std::time::Duration;
     use uuid::Uuid;
+
+    fn background_batch() -> fusillade::Batch {
+        let now = chrono::Utc::now();
+        fusillade::Batch {
+            id: fusillade::BatchId(Uuid::new_v4()),
+            file_id: Some(fusillade::FileId(Uuid::new_v4())),
+            created_at: now,
+            metadata: None,
+            service_tier: Some("background".to_string()),
+            completion_window: None,
+            endpoint: "/v1/chat/completions".to_string(),
+            output_file_id: None,
+            error_file_id: None,
+            created_by: Uuid::new_v4().to_string(),
+            expires_at: None,
+            cancelling_at: None,
+            errors: None,
+            total_requests: 1,
+            pending_requests: 1,
+            in_progress_requests: 0,
+            completed_requests: 0,
+            failed_requests: 0,
+            canceled_requests: 0,
+            requests_started_at: Some(now),
+            finalizing_at: None,
+            completed_at: None,
+            failed_at: None,
+            cancelled_at: None,
+            deleted_at: None,
+            notification_sent_at: None,
+            api_key_id: None,
+        }
+    }
+
+    #[test]
+    fn background_batch_response_has_a_tier_label_and_no_expiry() {
+        let response = to_batch_response_with_email(background_batch(), None);
+
+        assert_eq!(response.completion_window, "background");
+        assert!(response.expires_at.is_none());
+        assert!(response.expired_at.is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "non-background batch must have a completion window")]
+    fn sla_batch_response_requires_a_completion_window() {
+        let mut batch = background_batch();
+        batch.service_tier = None;
+
+        let _ = to_batch_response_with_email(batch, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-background batch must have an expiry")]
+    fn sla_batch_response_requires_an_expiry() {
+        let mut batch = background_batch();
+        batch.service_tier = None;
+        batch.completion_window = Some("24h".to_string());
+
+        let _ = to_batch_response_with_email(batch, None);
+    }
 
     // -------------------------------------------------------------------------
     // parse_completion_window_filter — pure parsing, no DB needed.
@@ -1950,6 +2334,163 @@ mod tests {
         );
     }
 
+    #[test]
+    fn platform_manager_background_filter_maps_to_internal_service_tier() {
+        let filter = parse_batch_class_filter(Some("24h,background"), true).expect("platform manager filter should be valid");
+
+        assert_eq!(filter.completion_windows, Some(vec!["24h".to_string()]));
+        assert_eq!(filter.service_tiers, Some(vec!["background".to_string()]));
+    }
+
+    #[test]
+    fn non_platform_manager_background_filter_is_bad_request() {
+        let error = parse_batch_class_filter(Some("background"), false).expect_err("background filter should be restricted");
+
+        assert!(matches!(
+            error,
+            Error::BadRequest { message }
+                if message == "completion_window=background is only available to platform managers"
+        ));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn batch_validation_releases_fusillade_before_waiting_for_control(pool: PgPool) {
+        let migrated_fusillade_pool = setup_fusillade_pool(&pool).await;
+        migrated_fusillade_pool.close().await;
+
+        let base_options: PgConnectOptions = pool.connect_options().as_ref().clone();
+        let control_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .connect_with(base_options.clone())
+            .await
+            .unwrap();
+        let fusillade_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .connect_with(base_options.options([("search_path", "fusillade")]))
+            .await
+            .unwrap();
+        let state = create_test_app_state_with_database_pools(control_pool.clone(), fusillade_pool.clone(), create_test_config()).await;
+
+        let held_control = state.db.write().acquire().await.unwrap();
+        let held_fusillade = fusillade_pool.acquire().await.unwrap();
+        let validation_state = state.clone();
+        let validation = tokio::spawn(async move { load_and_validate_batch_models(&validation_state, Uuid::new_v4()).await });
+
+        // Let validation queue first for the only Fusillade connection, then
+        // release it. A second acquisition can complete only if validation
+        // releases Fusillade before it waits for the held control connection.
+        tokio::task::yield_now().await;
+        drop(held_fusillade);
+        let fusillade_is_available = tokio::time::timeout(Duration::from_millis(250), fusillade_pool.acquire()).await;
+        let released_before_control_wait = fusillade_is_available.is_ok();
+
+        drop(fusillade_is_available);
+        drop(held_control);
+        let validation_result = tokio::time::timeout(Duration::from_secs(1), validation)
+            .await
+            .expect("batch validation should finish after the control connection is released")
+            .expect("batch validation task should not panic");
+        validation_result.expect("empty batch validation should succeed");
+
+        assert!(
+            released_before_control_wait,
+            "batch validation held the Fusillade connection while waiting for the control pool"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn revalidates_reasoning_against_current_mapping_before_batch_creation(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "reasoning-model", "reasoning-model").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let configure_effort = |effort: &'static str| {
+            let pool = pool.clone();
+            async move {
+                let all_efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+                let unsupported = all_efforts.into_iter().filter(|candidate| *candidate != effort).collect::<Vec<_>>();
+                let values = serde_json::Map::from_iter([(effort.to_string(), serde_json::json!(effort))]);
+                sqlx::query(
+                    r#"
+                    UPDATE deployed_models
+                    SET reasoning_translation_overrides = $1
+                    WHERE id = $2
+                    "#,
+                )
+                .bind(serde_json::json!({
+                    "chat_completions": {
+                        "mode": "override",
+                        "translation": {
+                            "unsupported_efforts": unsupported,
+                            "writes": [{
+                                "target_path": "/reasoning_effort",
+                                "values": values
+                            }]
+                        }
+                    },
+                    "responses": {"mode": "disabled"}
+                }))
+                .bind(deployment.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+
+        configure_effort("high").await;
+        let jsonl = r#"{"custom_id":"reasoning-request","method":"POST","url":"/v1/chat/completions","body":{"model":"reasoning-model","messages":[],"reasoning_effort":"high"}}"#;
+        let upload = app
+            .post("/ai/v1/files")
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_part(
+                        "file",
+                        axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("reasoning-batch.jsonl"),
+                    )
+                    .add_part("purpose", axum_test::multipart::Part::text("batch")),
+            )
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload.json();
+
+        configure_effort("medium").await;
+        let response = app
+            .post("/ai/v1/batches")
+            .json(&CreateBatchRequest {
+                input_file_id: file["id"].as_str().unwrap().to_string(),
+                endpoint: "/v1/chat/completions".to_string(),
+                completion_window: "24h".to_string(),
+                metadata: None,
+                api_key_id: None,
+            })
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status(StatusCode::BAD_REQUEST);
+        let body = response.text();
+        assert!(
+            body.contains("Line 1 (custom_id 'reasoning-request')"),
+            "unexpected response: {body}"
+        );
+        assert!(body.contains("not supported by this provider"), "unexpected response: {body}");
+
+        let batch_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fusillade.batches")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(batch_count, 0, "validation must happen before creating a batch record");
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_batch_with_default_24h_sla(pool: PgPool) {
@@ -1984,6 +2525,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2036,6 +2578,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2082,6 +2625,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "1h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2093,6 +2637,118 @@ mod tests {
         resp.assert_status(StatusCode::BAD_REQUEST);
         let error_text = resp.text();
         assert!(error_text.contains("Unsupported completion_window"));
+    }
+
+    /// The batch's requests are dispatched by the fusillade daemon hours later, over an
+    /// HTTP client that sends no User-Agent — so creation time is the only moment the
+    /// client is knowable, and the batch metadata is how it reaches the dispatched rows.
+    ///
+    /// Also covers the spoof: provenance a caller can set is worthless, so a
+    /// `dw_user_agent` in the submitted metadata must be dropped rather than merged.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn batch_creation_stores_the_submitters_user_agent_and_drops_a_supplied_one(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part(
+                "file",
+                axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl"),
+            )
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap().to_string();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id,
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: Some(HashMap::from([
+                ("dw_user_agent".to_string(), "spoofed/9.9.9".to_string()),
+                // Same key once fusillade has folded `_` to `-` building the header name,
+                // so it has to be stripped by the same rule rather than by exact match.
+                ("dw-user-agent".to_string(), "spoofed-hyphenated/9.9.9".to_string()),
+                ("DW_USER_AGENT".to_string(), "spoofed-shouty/9.9.9".to_string()),
+                ("team".to_string(), "research".to_string()),
+            ])),
+            api_key_id: None,
+        };
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header("user-agent", "claude-cli/1.2.3")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch: crate::api::models::batches::BatchResponse = resp.json();
+
+        // Internal provenance, not part of the caller's own metadata: echoing a client's
+        // User-Agent back at it tells it nothing, and the caller's own keys must survive.
+        let returned = batch.metadata.clone().unwrap_or_default();
+        assert!(!returned.contains_key("dw_user_agent"), "dw_user_agent leaked into the response");
+        assert_eq!(returned.get("team").map(String::as_str), Some("research"));
+
+        let base_options: PgConnectOptions = pool.connect_options().as_ref().clone();
+        let fusillade_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .min_connections(0)
+            .connect_with(base_options.options([("search_path", "fusillade")]))
+            .await
+            .unwrap();
+        let metadata: serde_json::Value = sqlx::query_scalar("SELECT metadata FROM batches WHERE id = $1")
+            .bind(Uuid::parse_str(&batch.id).unwrap())
+            .fetch_one(&fusillade_pool)
+            .await
+            .expect("the batch should be stored with its metadata");
+        fusillade_pool.close().await;
+
+        assert_eq!(
+            metadata["dw_user_agent"], "claude-cli/1.2.3",
+            "the wire User-Agent should be stored for fusillade to replay on dispatch"
+        );
+        assert_eq!(metadata["team"], "research", "caller metadata should survive alongside it");
+        for spelling in ["dw-user-agent", "DW_USER_AGENT"] {
+            assert!(
+                metadata.get(spelling).is_none(),
+                "a reserved key must be stripped in every spelling that normalises to it, not just the exact one ({spelling} survived)"
+            );
+        }
+    }
+
+    /// The strip rule, on its own. `-` and `_` are the same character by the time fusillade
+    /// has built a header name out of the key, so they must be the same key here.
+    #[test]
+    fn reserved_metadata_keys_are_matched_on_their_normalised_form() {
+        for reserved in [
+            "dw_user_agent",
+            "dw-user-agent",
+            "DW_USER_AGENT",
+            "Dw-User-Agent",
+            "request_source",
+            "created_by",
+            "dw_model",
+            "dw-model",
+            "DW_MODEL",
+        ] {
+            assert!(is_reserved_metadata_key(reserved), "{reserved} should be reserved");
+        }
+        for allowed in ["team", "dw_user_agent_note", "user_agent", "dwuseragent", "model"] {
+            assert!(!is_reserved_metadata_key(allowed), "{allowed} is the caller's to set");
+        }
     }
 
     #[sqlx::test]
@@ -2133,6 +2789,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "1h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2166,6 +2823,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "48h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp2 = app
@@ -2211,6 +2869,7 @@ mod tests {
             endpoint: "/v1/responses".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2259,6 +2918,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2333,6 +2993,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "1h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -2400,6 +3061,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let create_resp = app
@@ -2445,6 +3107,125 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_batch_model_field(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        let deployment_a = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment_a.id, group.id, user.id).await;
+        let deployment_b = create_test_deployment(&pool, user.id, "gpt-3half-model", "gpt-3.5").await;
+        add_deployment_to_group(&pool, deployment_b.id, group.id, user.id).await;
+
+        let upload_file = |jsonl_content: &'static str| {
+            let app = &app;
+            let user = &user;
+            async move {
+                let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+                let multipart = axum_test::multipart::MultipartForm::new()
+                    .add_part("file", file_part)
+                    .add_part("purpose", axum_test::multipart::Part::text("batch"));
+                let upload_resp = app
+                    .post("/ai/v1/files")
+                    .multipart(multipart)
+                    .add_header(&add_auth_headers(user)[0].0, &add_auth_headers(user)[0].1)
+                    .add_header(&add_auth_headers(user)[1].0, &add_auth_headers(user)[1].1)
+                    .await;
+                upload_resp.assert_status(StatusCode::CREATED);
+                let file: serde_json::Value = upload_resp.json();
+                file["id"].as_str().unwrap().to_string()
+            }
+        };
+
+        let create_batch = |file_id: String| {
+            let app = &app;
+            let user = &user;
+            async move {
+                let create_req = CreateBatchRequest {
+                    input_file_id: file_id,
+                    endpoint: "/v1/chat/completions".to_string(),
+                    completion_window: "24h".to_string(),
+                    metadata: None,
+                    api_key_id: None,
+                };
+                let create_resp = app
+                    .post("/ai/v1/batches")
+                    .json(&create_req)
+                    .add_header(&add_auth_headers(user)[0].0, &add_auth_headers(user)[0].1)
+                    .add_header(&add_auth_headers(user)[1].0, &add_auth_headers(user)[1].1)
+                    .await;
+                create_resp.assert_status(StatusCode::CREATED);
+                let batch: serde_json::Value = create_resp.json();
+                batch
+            }
+        };
+
+        // Single-model file: the create response labels the batch with the alias
+        let single_file_id = upload_file(
+            r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#,
+        )
+        .await;
+        let single_batch = create_batch(single_file_id).await;
+        assert_eq!(single_batch["model"].as_str(), Some("gpt-4"));
+        // The label is stored as dw_model metadata but must surface only as
+        // the typed field, never in caller-visible metadata.
+        assert!(single_batch["metadata"]["dw_model"].is_null(), "dw_model leaked into metadata");
+        let single_batch_id = single_batch["id"].as_str().unwrap().to_string();
+
+        // Mixed-model file: labeled "mixed"
+        let mixed_file_id = upload_file(
+            "{\"custom_id\":\"request-1\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-4\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}}\n{\"custom_id\":\"request-2\",\"method\":\"POST\",\"url\":\"/v1/chat/completions\",\"body\":{\"model\":\"gpt-3.5\",\"messages\":[{\"role\":\"user\",\"content\":\"Hello\"}]}}",
+        )
+        .await;
+        let mixed_batch = create_batch(mixed_file_id).await;
+        assert_eq!(mixed_batch["model"].as_str(), Some("mixed"));
+        let mixed_batch_id = mixed_batch["id"].as_str().unwrap().to_string();
+
+        // The list carries the same labels per row
+        let list_resp = app
+            .get("/ai/v1/batches?include=analytics")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        list_resp.assert_status_ok();
+        let list_result: serde_json::Value = list_resp.json();
+        let rows = list_result["data"].as_array().unwrap();
+        let model_of = |id: &str| {
+            rows.iter()
+                .find(|row| row["id"].as_str() == Some(id))
+                .expect("batch should be listed")["model"]
+                .as_str()
+                .map(str::to_string)
+        };
+        assert_eq!(model_of(&single_batch_id), Some("gpt-4".to_string()));
+        assert_eq!(model_of(&mixed_batch_id), Some("mixed".to_string()));
+        for row in rows {
+            assert!(row["metadata"]["dw_model"].is_null(), "dw_model leaked into list metadata");
+        }
+
+        // The detail endpoint carries the label too
+        let get_resp = app
+            .get(&format!("/ai/v1/batches/{single_batch_id}"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_resp.assert_status_ok();
+        let detail: serde_json::Value = get_resp.json();
+        assert_eq!(detail["model"].as_str(), Some("gpt-4"));
+
+        let get_mixed_resp = app
+            .get(&format!("/ai/v1/batches/{mixed_batch_id}"))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        get_mixed_resp.assert_status_ok();
+        let mixed_detail: serde_json::Value = get_mixed_resp.json();
+        assert_eq!(mixed_detail["model"].as_str(), Some("mixed"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_errors_hidden_until_sla_expires(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
@@ -2476,6 +3257,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3069,6 +3851,35 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_reserve_capacity_for_batch_fails_open_when_pending_counts_query_fails(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.pending_capacity_counts_enabled = true;
+        let state = create_test_app_state_with_fusillade(pool.clone(), config).await;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = create_test_endpoint(&pool, &format!("test-{}", Uuid::new_v4()), user.id).await;
+
+        let alias = format!("alias-{}", Uuid::new_v4());
+        let model_id = create_test_model(&pool, "model-a", &alias, endpoint_id, user.id).await;
+
+        // Break the pending-count query outright: the optional gate must not
+        // turn its own failure into a rejected submission.
+        sqlx::query("DROP TABLE fusillade.requests CASCADE").execute(&pool).await.unwrap();
+
+        let file_model_counts = HashMap::from([(alias.clone(), 1_i64)]);
+        let model_throughputs = HashMap::from([(alias.clone(), 0.001_f32)]);
+        let model_ids_by_alias = HashMap::from([(alias.clone(), model_id)]);
+
+        let reservation_ids =
+            super::reserve_capacity_for_batch(&state, "1h", &file_model_counts, &model_throughputs, &model_ids_by_alias, 1.0)
+                .await
+                .expect("a failing pending-count query must fail open, not reject the submission");
+
+        assert_eq!(reservation_ids.len(), 1);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_reserve_capacity_for_batch_ignores_flex_pending_counts_when_enabled(pool: PgPool) {
         let mut config = create_test_config();
         config.batches.pending_capacity_counts_enabled = true;
@@ -3133,6 +3944,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "1h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3182,6 +3994,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3235,6 +4048,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "1h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3284,6 +4098,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "invalid".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3330,6 +4145,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "0s".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3383,6 +4199,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3518,6 +4335,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3570,12 +4388,69 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: completion_window.to_string(),
             metadata: None,
+            api_key_id: None,
         };
         app.post("/ai/v1/batches")
             .json(&create_req)
             .add_header(&auth[0].0, &auth[0].1)
             .add_header(&auth[1].0, &auth[1].1)
             .await
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn background_batch_requires_background_inference_role(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = setup_batch_user(&pool).await;
+
+        let response = submit_one_request_batch(&app, &user, "background").await;
+
+        response.assert_status(StatusCode::FORBIDDEN);
+        let body = response.text();
+        assert!(body.contains("BackgroundInferenceUser"), "unexpected response: {body}");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn background_batch_maps_completion_window_and_skips_sla_admission(pool: PgPool) {
+        let mut config = create_test_config();
+        config.batches.allowed_completion_windows = vec!["24h".to_string()];
+        config.batches.unverified_requests_per_completion_hour = 1;
+        config.batches.default_throughput = 0.0;
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser, Role::BackgroundInferenceUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+        sqlx::query("UPDATE deployed_models SET throughput = 0, batch_capacity = 0 WHERE id = $1")
+            .bind(deployment.id)
+            .execute(&pool)
+            .await
+            .expect("remove SLA capacity");
+
+        let first = submit_one_request_batch(&app, &user, "background").await;
+        first.assert_status(StatusCode::CREATED);
+        let body: serde_json::Value = first.json();
+        assert_eq!(body["completion_window"], "background");
+
+        let batch_id = Uuid::parse_str(body["id"].as_str().expect("batch id")).expect("UUID batch id");
+        let stored: (Option<String>, Option<String>, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as("SELECT service_tier, completion_window, expires_at FROM fusillade.batches WHERE id = $1")
+                .bind(batch_id)
+                .fetch_one(&pool)
+                .await
+                .expect("stored background batch");
+        assert_eq!(stored.0.as_deref(), Some("background"));
+        assert_eq!(stored.1, None);
+        assert_eq!(stored.2, None);
+
+        // A second request would exceed the configured unverified 1h SLA cap.
+        // Background has no SLA and must remain outside that admission path.
+        submit_one_request_batch(&app, &user, "background")
+            .await
+            .assert_status(StatusCode::CREATED);
     }
 
     #[sqlx::test]
@@ -3601,6 +4476,95 @@ mod tests {
             body.contains("Unverified") && body.to_lowercase().contains("verify"),
             "expected an actionable verify message, got: {body}"
         );
+    }
+
+    /// Spending-cap pre-flight: creating a batch with an API key whose cap
+    /// scope is exhausted is rejected up front with the explicit 402, instead
+    /// of accepting a batch whose every request the proxy would refuse.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_rejected_when_spend_cap_exhausted(pool: PgPool) {
+        use crate::db::handlers::Repository as _;
+        use crate::db::handlers::api_keys::ApiKeys;
+        use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose};
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = setup_batch_user(&pool).await;
+
+        // A capped realtime key for the user, its cap scope provisioned as the
+        // cap-set path would (child + zeroed window), then exhausted.
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = ApiKeys::new(&mut conn);
+        let key = repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "capped-batch-key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: user.id,
+                spend_limit: Some(rust_decimal::Decimal::from(10)),
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+        repo.get_or_create_child_hidden_key(key.id).await.unwrap();
+        repo.reset_spend_window(key.id).await.unwrap();
+        sqlx::query("UPDATE api_key_spend_checkpoints SET window_spend = 10, total_spend = 10 WHERE api_key_id = $1")
+            .bind(key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        drop(conn);
+
+        // Upload the input file (session auth — uploads aren't the gated step).
+        let jsonl = r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("test.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let auth = add_auth_headers(&user);
+        let upload = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        upload.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload.json();
+        let file_id = file["id"].as_str().unwrap().to_string();
+
+        // Creating the batch WITH the capped key resolves the execution key to
+        // its exhausted cap scope → explicit 402 up front.
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.clone(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            api_key_id: None,
+        };
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header("authorization", &format!("Bearer {}", key.secret))
+            .await;
+        resp.assert_status(StatusCode::PAYMENT_REQUIRED);
+        let body = resp.text();
+        assert!(
+            body.to_lowercase().contains("spending cap"),
+            "expected an explicit cap message, got: {body}"
+        );
+
+        // Control: the same batch via session auth (uncapped shared hidden
+        // key) is admitted — caps scope to the key, not the user.
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
     }
 
     #[sqlx::test]
@@ -3679,6 +4643,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let auth = add_auth_headers(&user);
@@ -3729,6 +4694,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3816,6 +4782,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let resp = app
@@ -3914,6 +4881,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
         let create_resp = app
             .post("/ai/v1/batches")
@@ -3965,6 +4933,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
         let personal_create_resp = app
             .post("/ai/v1/batches")
@@ -4213,7 +5182,8 @@ mod tests {
         assert_eq!(total_tokens, 4865, "Total tokens should be 4865");
     }
 
-    /// Test that batch analytics correctly aggregates reasoning tokens from http_analytics
+    /// Test that batch analytics surfaces folded reasoning tokens from the batch_aggregates
+    /// read model (COR-524) — both on the direct endpoint and via include=analytics.
     #[sqlx::test]
     #[test_log::test]
     async fn test_batch_analytics_with_reasoning_tokens(pool: PgPool) {
@@ -4226,7 +5196,7 @@ mod tests {
         add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
         // Upload a batch file
-        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"thinking-model","messages":[{"role":"user","content":"Hello"}],"thinking":{"type":"enabled","budget_tokens":4096}}}"#;
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"thinking-model","messages":[{"role":"user","content":"Hello"}],"reasoning_effort":"high"}}"#;
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("thinking-test.jsonl");
         let multipart = axum_test::multipart::MultipartForm::new()
             .add_part("file", file_part)
@@ -4247,6 +5217,7 @@ mod tests {
             endpoint: "/v1/chat/completions".to_string(),
             completion_window: "24h".to_string(),
             metadata: None,
+            api_key_id: None,
         };
 
         let create_resp = app
@@ -4260,31 +5231,26 @@ mod tests {
         let batch_id = batch["id"].as_str().unwrap();
         let batch_uuid = Uuid::parse_str(batch_id).unwrap();
 
-        // Insert analytics rows with reasoning tokens directly into http_analytics
-        let analytics_data = vec![(22i64, 891i64, 733i64, 913i64), (20, 2101, 1412, 2121), (18, 1813, 1735, 1831)];
-
-        for (prompt, completion, reasoning, total) in &analytics_data {
-            sqlx::query!(
-                r#"
-                INSERT INTO http_analytics (
-                    instance_id, correlation_id, timestamp, uri, method, status_code,
-                    duration_ms, model, prompt_tokens, completion_tokens, reasoning_tokens,
-                    total_tokens, fusillade_batch_id
-                ) VALUES ($1, $2, NOW(), '/ai/v1/chat/completions', 'POST', 200,
-                    100, 'thinking-model', $3, $4, $5, $6, $7)
-                "#,
-                Uuid::new_v4(),
-                (rand::random::<u64>() >> 1) as i64,
-                prompt,
-                completion,
-                reasoning,
-                total,
-                batch_uuid,
-            )
-            .execute(&pool)
-            .await
-            .expect("Failed to insert analytics data");
-        }
+        // The analytics endpoint now reads the batch_aggregates read model (COR-524), not raw
+        // http_analytics — so seed it with the batch's folded per-batch totals the way the
+        // batcher would (prompt 22+20+18=60, completion 891+2101+1813=4805,
+        // reasoning 733+1412+1735=3880, total 913+2121+1831=4865 over 3 requests).
+        sqlx::query(
+            r#"
+            INSERT INTO batch_aggregates (
+                fusillade_batch_id, user_id, total_amount, transaction_count, max_seq,
+                created_at, updated_at, service_tier, total_requests,
+                total_prompt_tokens, total_completion_tokens, total_reasoning_tokens, total_tokens,
+                sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms, total_list_cost
+            ) VALUES ($1, $2, 0, 3, 0, NOW(), NOW(), 'batch', 3,
+                60, 4805, 3880, 4865, 300, 3, 0, 0, 0)
+            "#,
+        )
+        .bind(batch_uuid)
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .expect("Failed to seed batch_aggregates read model");
 
         let auth = add_auth_headers(&user);
 
@@ -4339,6 +5305,35 @@ mod tests {
             list_analytics["total_reasoning_tokens"].as_i64().unwrap(),
             3880,
             "Reasoning tokens should match in list analytics"
+        );
+    }
+
+    /// A batch that exists in fusillade but has no `batch_aggregates` row (brand new / not yet
+    /// folded) returns 200 with a zero-valued payload from GET /batches/{id}/analytics. The read
+    /// model is durable, so a missing row means "nothing folded yet", not "aged out" (COR-524) —
+    /// platform managers still see (empty) metrics for any batch they can access.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_analytics_missing_read_model_row_returns_zeros(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        // Batch exists (fusillade) but nothing folded it into the batch_aggregates read model.
+        let (batch_id, _request_ids) = insert_batch_with_pending_requests(&pool, user.id, 3).await;
+
+        let resp = app
+            .get(&format!("/ai/v1/batches/{batch_id}/analytics"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+
+        resp.assert_status(StatusCode::OK);
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["total_requests"],
+            serde_json::json!(0),
+            "unfolded batch reports zero requests, not 404"
         );
     }
 
@@ -4482,5 +5477,387 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(canceled_count, 5, "all requests should now be canceled");
+    }
+
+    /// Fast-resume regression test: cancel followed by an immediate retry must
+    /// succeed and un-cancel the batch. In this window the cancel has stamped
+    /// `cancelling_at` on the batch but the async cascade job has not yet
+    /// settled any requests to `canceled` (the cascade worker does not run in
+    /// tests — see `test_cancel_batch_cascades_state_to_child_requests`), so
+    /// the retry re-pends zero rows. Before the `cancelling_at` guard, that
+    /// zero count was treated as "nothing to retry" and returned 400 even
+    /// though the retry had overturned the cancellation.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_retry_immediately_after_cancel_resumes_batch(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let (batch_id, request_ids) = insert_batch_with_pending_requests(&pool, user.id, 3).await;
+
+        let resp = app
+            .post(&format!("/ai/v1/batches/{batch_id}/cancel"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status_ok();
+
+        // Confirm the fast-resume premise: batch is cancelling but no request
+        // has settled yet.
+        let cancelling_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT cancelling_at FROM fusillade.batches WHERE id = $1")
+                .bind(batch_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(cancelling_at.is_some(), "cancel should stamp cancelling_at");
+        let pending_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM fusillade.requests WHERE id = ANY($1) AND state = 'pending'")
+                .bind(&request_ids)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending_count, 3, "no requests should have settled to canceled yet");
+
+        // Immediate retry: re-pends zero rows but must still overturn the
+        // cancellation and return 200 (was 400 before the guard).
+        let resp = app
+            .post(&format!("/ai/v1/batches/{batch_id}/retry"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status_ok();
+        let batch: serde_json::Value = resp.json();
+        assert_ne!(batch["status"], "cancelling", "resumed batch must not report cancelling");
+        assert_ne!(batch["status"], "cancelled", "resumed batch must not report cancelled");
+
+        let (cancelling_at, cancelled_at): (Option<chrono::DateTime<chrono::Utc>>, Option<chrono::DateTime<chrono::Utc>>) =
+            sqlx::query_as("SELECT cancelling_at, cancelled_at FROM fusillade.batches WHERE id = $1")
+                .bind(batch_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(cancelling_at.is_none(), "retry should clear cancelling_at");
+        assert!(cancelled_at.is_none(), "retry should clear cancelled_at");
+
+        let pending_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*)::bigint FROM fusillade.requests WHERE id = ANY($1) AND state = 'pending'")
+                .bind(&request_ids)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(pending_count, 3, "requests should remain pending and claimable after resume");
+    }
+
+    /// The true no-op retry still fails: nothing failed, nothing canceled,
+    /// and the batch is not being cancelled — the `cancelling_at` guard must
+    /// not turn every zero-count retry into a success.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_retry_with_nothing_to_retry_returns_400(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let (batch_id, _request_ids) = insert_batch_with_pending_requests(&pool, user.id, 3).await;
+
+        let resp = app
+            .post(&format!("/ai/v1/batches/{batch_id}/retry"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    // ── Explicit API key selection for dashboard batch creation ───────────
+
+    /// Shared setup: org with owner + member (both batch-capable), a
+    /// gpt-4 deployment the org can use, and an org-owned uploaded file.
+    /// Returns (app, bg_services, owner, member, org, file_id) — callers must
+    /// keep the BackgroundServices guard bound for the test's duration.
+    async fn setup_org_batch_env(
+        pool: &PgPool,
+    ) -> (
+        axum_test::TestServer,
+        crate::BackgroundServices,
+        crate::api::models::users::UserResponse,
+        crate::api::models::users::UserResponse,
+        crate::api::models::users::UserResponse,
+        String,
+    ) {
+        let (app, bg_services) = create_test_app(pool.clone(), false).await;
+
+        let owner = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let member = create_test_user_with_roles(pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(pool, owner.id).await;
+        add_org_member(pool, org.id, member.id, "member").await;
+
+        let group = create_test_group(pool).await;
+        add_user_to_group(pool, org.id, group.id).await;
+        // The owner also gets personal model access so tests can exercise
+        // personal-context uploads alongside org-context ones.
+        add_user_to_group(pool, owner.id, group.id).await;
+        let deployment = create_test_deployment(pool, owner.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(pool, deployment.id, group.id, owner.id).await;
+
+        let auth = add_auth_headers(&owner);
+        let org_cookie = format!("dw_active_org={}", org.id);
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part(
+                "file",
+                axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl"),
+            )
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap().to_string();
+
+        (app, bg_services, owner, member, org, file_id)
+    }
+
+    fn batch_req(file_id: &str, api_key_id: Option<crate::types::ApiKeyId>) -> CreateBatchRequest {
+        CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            api_key_id,
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_with_selected_api_key(pool: PgPool) {
+        let (app, _bg_services, owner, member, org, file_id) = setup_org_batch_env(&pool).await;
+        let owner_auth = add_auth_headers(&owner);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Owner creates a CAPPED visible org key.
+        let resp = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .json(&serde_json::json!({"name": "Capped Org Key", "purpose": "realtime", "spend_limit": "10"}))
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let key: serde_json::Value = resp.json();
+        let key_id: crate::types::ApiKeyId = key["id"].as_str().unwrap().parse().unwrap();
+
+        // Selecting a key in personal context is rejected. Needs a personally
+        // owned file — the org file would 403 on ownership before the
+        // selection check is reached.
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(
+                axum_test::multipart::MultipartForm::new()
+                    .add_part(
+                        "file",
+                        axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("personal.jsonl"),
+                    )
+                    .add_part("purpose", axum_test::multipart::Part::text("batch")),
+            )
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let personal_file: serde_json::Value = upload_resp.json();
+        let personal_file_id = personal_file["id"].as_str().unwrap().to_string();
+        app.post("/ai/v1/batches")
+            .json(&batch_req(&personal_file_id, Some(key_id)))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .await
+            .assert_status(StatusCode::BAD_REQUEST);
+
+        // A plain member cannot select someone else's key.
+        let member_auth = add_auth_headers(&member);
+        app.post("/ai/v1/batches")
+            .json(&batch_req(&file_id, Some(key_id)))
+            .add_header(&member_auth[0].0, &member_auth[0].1)
+            .add_header(&member_auth[1].0, &member_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+
+        // The key's creator selects it in org context → the batch executes on
+        // the key's cap-scope child, so its spend counts against the cap.
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&batch_req(&file_id, Some(key_id)))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+
+        let batch_key_id: Option<Uuid> = sqlx::query_scalar("SELECT api_key_id FROM fusillade.batches ORDER BY created_at DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let child_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE parent_api_key_id = $1")
+            .bind(key_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(batch_key_id, Some(child_id), "capped selection must execute on the cap-scope child");
+
+        // Platform-purpose keys are not selectable for batch billing — the
+        // explicit api_key_id choice is inference-only (implicit attribution
+        // via an authenticating platform key remains allowed elsewhere).
+        let resp = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .json(&serde_json::json!({"name": "Platform Org Key", "purpose": "platform"}))
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let platform_key: serde_json::Value = resp.json();
+        let platform_key_id: crate::types::ApiKeyId = platform_key["id"].as_str().unwrap().parse().unwrap();
+        app.post("/ai/v1/batches")
+            .json(&batch_req(&file_id, Some(platform_key_id)))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+
+        // Hidden root keys (e.g. the shared batch key minted by the create
+        // above: hidden = true, parent NULL) are not selectable even by their
+        // holder — the hidden filter, not just the parent filter, must hold.
+        let hidden_root_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM api_keys WHERE hidden = true AND parent_api_key_id IS NULL AND user_id = $1 AND created_by = $2 LIMIT 1",
+        )
+        .bind(org.id)
+        .bind(owner.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        app.post("/ai/v1/batches")
+            .json(&batch_req(&file_id, Some(hidden_root_id)))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await
+            .assert_status(StatusCode::NOT_FOUND);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_creation_rejects_platform_key_auth(pool: PgPool) {
+        let (app, _bg_services, owner, _member, org, file_id) = setup_org_batch_env(&pool).await;
+        let owner_auth = add_auth_headers(&owner);
+
+        // Owner mints one key of each purpose in the org.
+        let mut secrets = std::collections::HashMap::new();
+        for (name, purpose) in [("infer-key", "realtime"), ("mgmt-key", "platform")] {
+            let resp = app
+                .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+                .add_header(&owner_auth[0].0, &owner_auth[0].1)
+                .add_header(&owner_auth[1].0, &owner_auth[1].1)
+                .json(&serde_json::json!({"name": name, "purpose": purpose}))
+                .await;
+            resp.assert_status(StatusCode::CREATED);
+            let key: serde_json::Value = resp.json();
+            secrets.insert(purpose, key["key"].as_str().unwrap().to_string());
+        }
+
+        // Platform keys cannot even AUTHENTICATE /ai/* paths — the auth
+        // middleware requires an inference-purpose key there, so implicit
+        // platform attribution is impossible by construction. Pin that wall.
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&batch_req(&file_id, None))
+            .add_header("authorization", format!("Bearer {}", secrets["platform"]))
+            .await;
+        resp.assert_status_unauthorized();
+
+        // Inference-key Bearer auth: same request succeeds.
+        app.post("/ai/v1/batches")
+            .json(&batch_req(&file_id, None))
+            .add_header("authorization", format!("Bearer {}", secrets["realtime"]))
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_member_without_manage_keys_must_select_batch_key(pool: PgPool) {
+        let (app, _bg_services, owner, member, org, file_id) = setup_org_batch_env(&pool).await;
+        // Revoke the member's additive 'manage_keys' grant: without it they
+        // have no implicit key to bill, so UI batches must name an issued key.
+        sqlx::query(
+            "DELETE FROM organization_member_roles omr USING user_organizations uo \
+             WHERE uo.id = omr.user_organization_id AND uo.organization_id = $1 AND uo.user_id = $2 AND omr.role = 'manage_keys'",
+        )
+        .bind(org.id)
+        .bind(member.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let owner_auth = add_auth_headers(&owner);
+        let member_auth = add_auth_headers(&member);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Member submitting from the dashboard (cookie auth) with no key → 400.
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&batch_req(&file_id, None))
+            .add_header(&member_auth[0].0, &member_auth[0].1)
+            .add_header(&member_auth[1].0, &member_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        resp.assert_status(StatusCode::BAD_REQUEST);
+        assert!(resp.text().contains("select"), "error should tell the member to select a key");
+
+        // Owner issues a key to the member…
+        let resp = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", org.id))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .json(&serde_json::json!({"name": "Issued", "purpose": "realtime", "member_id": member.id}))
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let issued: serde_json::Value = resp.json();
+        let issued_id: crate::types::ApiKeyId = issued["id"].as_str().unwrap().parse().unwrap();
+
+        // …and the member can now create a batch with it, attributed to them.
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&batch_req(&file_id, Some(issued_id)))
+            .add_header(&member_auth[0].0, &member_auth[0].1)
+            .add_header(&member_auth[1].0, &member_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch_key_id: Uuid = sqlx::query_scalar("SELECT api_key_id FROM fusillade.batches ORDER BY created_at DESC LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let attributed_to: Uuid = sqlx::query_scalar("SELECT created_by FROM api_keys WHERE id = $1")
+            .bind(batch_key_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(attributed_to, member.id, "batch usage is attributed to the issued key's holder");
+
+        // Org managers are exempt from the selection requirement.
+        app.post("/ai/v1/batches")
+            .json(&batch_req(&file_id, None))
+            .add_header(&owner_auth[0].0, &owner_auth[0].1)
+            .add_header(&owner_auth[1].0, &owner_auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await
+            .assert_status(StatusCode::CREATED);
     }
 }

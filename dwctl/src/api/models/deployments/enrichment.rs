@@ -6,14 +6,15 @@
 
 use crate::{
     api::models::{
+        cache_pricing::CachePricingResponse,
         deployments::{
-            ComponentEndpointSummary, ComponentModelSummary, DeployedModelResponse, ModelComponentResponse, ModelMetrics, ModelProbeStatus,
-            ModelType,
+            ComponentEndpointSummary, ComponentModelSummary, ComponentPool, DeployedModelResponse, ModelComponentResponse, ModelMetrics,
+            ModelProbeStatus, ModelType,
         },
         inference_endpoints::InferenceEndpointResponse,
     },
     db::{
-        handlers::{Groups, InferenceEndpoints, Repository, analytics::get_model_metrics},
+        handlers::{CacheTariffs, Groups, InferenceEndpoints, Repository, analytics::get_model_metrics},
         models::{deployments::DeploymentComponentDBResponse, groups::GroupDBResponse},
     },
     errors::{Error, Result},
@@ -76,7 +77,7 @@ impl<'a> DeployedModelEnricher<'a> {
         let model_aliases: Vec<String> = models.iter().map(|m| m.alias.clone()).collect();
 
         // Fetch all includes in parallel for maximum performance
-        let (groups_result, status_map, metrics_map, endpoints_map, pricing_tariffs_map, components_map) = tokio::join!(
+        let (groups_result, status_map, metrics_map, endpoints_map, pricing_tariffs_map, cache_tariffs_map, components_map) = tokio::join!(
             // Groups query
             async {
                 if self.include_groups {
@@ -170,6 +171,15 @@ impl<'a> DeployedModelEnricher<'a> {
                     None
                 }
             },
+            // Active prompt-cache tariffs query
+            async {
+                if self.include_pricing {
+                    let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+                    Ok::<_, Error>(Some(CacheTariffs::new(&mut conn).get_active_bulk(&model_ids).await?))
+                } else {
+                    Ok(None)
+                }
+            },
             // Components query (for composite models)
             async {
                 if self.include_components && self.can_read_composite_info {
@@ -195,6 +205,7 @@ impl<'a> DeployedModelEnricher<'a> {
             Some((model_groups_map, groups_map)) => (Some(model_groups_map), Some(groups_map)),
             None => (None, None),
         };
+        let cache_tariffs_map = cache_tariffs_map?;
 
         // Build enriched responses
         let mut enriched_models = Vec::with_capacity(models.len());
@@ -223,6 +234,7 @@ impl<'a> DeployedModelEnricher<'a> {
             // Add tariffs if pricing is requested and available
             if self.include_pricing {
                 model_response = Self::apply_tariffs(model_response, &pricing_tariffs_map);
+                model_response = Self::apply_cache_pricing(model_response, &cache_tariffs_map);
                 // Hide pricing for purposes that the model denies via a
                 // traffic-routing rule. Run after `apply_tariffs` so it
                 // operates on the freshly-attached set; no-op if no tariffs.
@@ -378,6 +390,21 @@ impl<'a> DeployedModelEnricher<'a> {
         model
     }
 
+    /// Apply active prompt-cache pricing to a model response. Pricing is explicitly
+    /// disabled when no active cache-tariff row exists for the model.
+    fn apply_cache_pricing(
+        model: DeployedModelResponse,
+        cache_tariffs_map: &Option<HashMap<DeploymentId, crate::db::handlers::ActiveTariff>>,
+    ) -> DeployedModelResponse {
+        let cache_pricing = cache_tariffs_map
+            .as_ref()
+            .and_then(|tariffs| tariffs.get(&model.id))
+            .cloned()
+            .map(CachePricingResponse::from)
+            .unwrap_or_else(CachePricingResponse::disabled);
+        model.with_cache_pricing(cache_pricing)
+    }
+
     /// Apply components to a model response (for composite models)
     fn apply_components(
         mut model: DeployedModelResponse,
@@ -398,6 +425,7 @@ impl<'a> DeployedModelEnricher<'a> {
         ModelComponentResponse {
             weight: c.weight,
             enabled: c.enabled,
+            pool: ComponentPool::from_db(&c.pool),
             sort_order: c.sort_order,
             created_at: c.created_at,
             model: ComponentModelSummary {
@@ -416,7 +444,6 @@ impl<'a> DeployedModelEnricher<'a> {
                     name: c.endpoint_name.unwrap_or_default(),
                 }),
                 trusted: c.model_trusted,
-                open_responses_adapter: c.model_open_responses_adapter,
             },
         }
     }
@@ -455,6 +482,7 @@ mod tests {
             metrics: None,
             status: None,
             provider_pricing: None,
+            cache_pricing: None,
             endpoint: None,
             tariffs: None,
             // Composite model fields (regular model = not composite)
@@ -464,7 +492,8 @@ mod tests {
             components: None,
             sanitize_responses: None,
             trusted: None,
-            open_responses_adapter: None,
+            reasoning_translation_overrides: None,
+            supported_reasoning_efforts: None,
             traffic_routing_rules: None,
             allowed_batch_completion_windows: None,
             metadata: None,
@@ -620,14 +649,12 @@ mod tests {
         let mut model = create_test_model();
         model.sanitize_responses = Some(true);
         model.trusted = Some(false);
-        model.open_responses_adapter = Some(true);
 
         let masked = model.mask_response_config();
 
         // Response config fields should be masked
         assert_eq!(masked.sanitize_responses, None);
         assert_eq!(masked.trusted, None);
-        assert_eq!(masked.open_responses_adapter, None);
     }
 
     #[test]
@@ -647,6 +674,8 @@ mod tests {
                 requires_api_key: true,
                 auth_header_name: "Authorization".to_string(),
                 auth_header_prefix: "Bearer ".to_string(),
+                reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: Uuid::new_v4(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),

@@ -7,13 +7,13 @@
 //! Ownership is verified by checking the batch's `created_by` against the
 //! API key's `user_id` (which is the org ID for org-scoped keys).
 
+use crate::inference::response_store::StoreError;
 use axum::{
     Json,
     extract::{Path, State},
     http::HeaderMap,
 };
 use fusillade::{ResponseStepStore, Storage};
-use onwards::StoreError;
 use serde::{Deserialize, Serialize};
 use sqlx_pool_router::PoolProvider;
 use std::collections::HashSet;
@@ -224,8 +224,7 @@ pub async fn delete_response<P: PoolProvider>(
     // `get_response`'s resolution:
     //   * Multi-step — head_step exists; walk the chain and collect every
     //     `request_id` from its rows (`None` on tool_call steps, which have
-    //     no backing fusillade row — tool dispatch lives in
-    //     `tool_call_analytics`).
+    //     no backing fusillade row).
     //   * Single-step — head_step_uuid is itself the fusillade.requests id.
     //
     // For the ownership check we use the head row's `created_by` (same row

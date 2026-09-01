@@ -59,6 +59,7 @@
 
 pub mod analytics;
 pub mod api_keys;
+pub mod batch_templates;
 pub mod cache_tariffs;
 pub mod capacity_reservations;
 pub mod connections;
@@ -71,10 +72,10 @@ pub mod password_reset_tokens;
 pub mod provider_display_configs;
 pub mod repository;
 pub mod tariffs;
-pub mod tool_sources;
 pub mod users;
 pub mod webhooks;
 
+pub use batch_templates::BatchTemplates;
 pub use cache_tariffs::{ActiveTariff, CacheTariffOverrides, CacheTariffs};
 pub use capacity_reservations::BatchCapacityReservations;
 pub use connections::{Connections, SyncEntries, SyncOperations};
@@ -87,6 +88,5 @@ pub use password_reset_tokens::PasswordResetTokens;
 pub use provider_display_configs::ProviderDisplayConfigs;
 pub use repository::Repository;
 pub use tariffs::Tariffs;
-pub use tool_sources::ToolSources;
 pub use users::Users;
 pub use webhooks::Webhooks;

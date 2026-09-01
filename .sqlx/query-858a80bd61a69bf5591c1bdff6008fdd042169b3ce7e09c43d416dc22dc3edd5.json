@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE batches\n            SET failed_at = NOW(),\n                errors = $2\n            WHERE id = $1 AND failed_at IS NULL\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "858a80bd61a69bf5591c1bdff6008fdd042169b3ce7e09c43d416dc22dc3edd5"
+}

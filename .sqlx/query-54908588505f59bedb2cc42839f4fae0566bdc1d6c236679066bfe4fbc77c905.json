@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE requests r\n               SET state = CASE WHEN v.status BETWEEN 200 AND 299 THEN 'completed' ELSE 'failed' END,\n                   response_status = v.status,\n                   response_body = v.body,\n                   response_size = v.size,\n                   error = v.error,\n                   completed_at = CASE WHEN v.status BETWEEN 200 AND 299 THEN NOW() ELSE NULL END,\n                   failed_at = CASE WHEN v.status BETWEEN 200 AND 299 THEN NULL ELSE NOW() END\n              FROM UNNEST(\n                  $1::uuid[], $2::text[], $3::bigint[], $4::smallint[], $5::text[]\n              ) AS v(id, body, size, status, error)\n             WHERE r.id = v.id\n               AND r.state = 'processing'\n               AND r.service_tier = 'priority'\n               AND r.batch_id IS NULL\n            RETURNING r.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "TextArray",
+        "Int8Array",
+        "Int2Array",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "54908588505f59bedb2cc42839f4fae0566bdc1d6c236679066bfe4fbc77c905"
+}

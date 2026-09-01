@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH to_delete AS (\n                SELECT id FROM files\n                WHERE uploaded_by = $1\n                  AND deleted_at IS NULL\n                LIMIT $2\n                FOR UPDATE SKIP LOCKED\n            )\n            UPDATE files f\n            SET deleted_at = NOW(),\n                status = 'deleted'\n            FROM to_delete td\n            WHERE f.id = td.id\n            RETURNING f.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6f4084ac640045c445935f0e8e68821b4b56c7dfe6494cfb0eb8a5bcf33db634"
+}

@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT\n            SUM(request_count)::bigint as total_requests,\n            COALESCE(SUM(input_tokens + output_tokens), 0)::bigint as total_tokens,\n            SUM(cost)::float8 as total_cost\n        FROM user_model_usage_daily\n        WHERE model = $1\n            AND usage_date >= ($2::timestamptz AT TIME ZONE 'UTC')::date\n            AND usage_date <= ($3::timestamptz AT TIME ZONE 'UTC')::date\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "total_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "total_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "total_cost",
+        "type_info": "Float8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "b8167181226500b61f58cd9895cfddfb7ac2e78d09efc80de6c75945150fa027"
+}

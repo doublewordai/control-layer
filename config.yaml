@@ -190,9 +190,10 @@ auth:
   #   - RequestViewer: Read-only access to request logs and analytics
   #   - BillingManager: Full access to credit system and user billing
   #   - BatchAPIUser: Can manage files and batches for batch processing
+  #   - BackgroundInferenceUser: Can submit spare-capacity background inference
   # Example: To give all new users request viewing capabilities:
   #   default_user_roles: ["StandardUser", "RequestViewer"]
-  default_user_roles: ["StandardUser", "BatchAPIUser"]
+  default_user_roles: ["StandardUser", "BatchAPIUser", "BackgroundInferenceUser"]
 
   # Security settings
   security:
@@ -255,6 +256,17 @@ credits:
   # is derived from whether they have any prior purchase).
   # Example: 50 matches a new user's first $50 of credits.
   first_payment_match_up_to: 0
+  # Signup credits granted the first time a billing target verifies a payment
+  # method through setup-mode checkout (POST /payments/setup) — the onboarding
+  # "Add Payment Method" step, which saves and verifies a card without charging
+  # it. Set to 0 to disable.
+  #
+  # Unlike initial_credits_for_standard_users (granted to everyone at account
+  # creation), this only pays out once a real card has been verified, so it
+  # can't be farmed by signing up repeatedly. Granted at most once per billing
+  # target, and idempotent across the webhook/front-channel race.
+  # Example: 25 gives a newly verified user 25 credits.
+  verification_credits: 0
 
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
@@ -319,10 +331,6 @@ batches:
   # method / make a payment). Set to 0 to disable. Default: 1000.
   unverified_requests_per_completion_hour: 1000
 
-  # Optional realtime priority decay window for queue monitoring (seconds).
-  # When set, completed FLEX requests within this lookback are included in
-  # the 1h pending-request-counts bucket. Omit or set null to disable.
-  priority_decay_window_secs: 600
   pending_capacity_counts_enabled: false # Include committed pending requests in batch submission capacity checks (default: false)
 
   # Allowed completion windows for batch processing
@@ -461,6 +469,19 @@ cache:
   # "5m"). Must be one of enabled_ttls.
   # Set via environment: DWCTL_CACHE__DEFAULT_TTL=5m
   default_ttl: 5m
+  # Deadline (seconds) for joining the classify fork at response time. classify races the
+  # (slower) model call, so this only bites when classification is still unresolved as the
+  # response completes — in which case the request bills un-cached (fail-safe). Keep tight on
+  # latency-sensitive realtime pods; raise on the fusillade-batch pod (no first-token
+  # pressure) so index retries have room to land. Default 5.
+  # Set via environment: DWCTL_CACHE__CLASSIFY_DEADLINE_SECS=10
+  # classify_deadline_secs: 5
+  # Retries per cache-index DB op (lookup/write/refresh) after a connection-class failure
+  # (severed idle conn / TLS EOF / auth timeout — the burst-churn family; other errors never
+  # retry). Backed off 100ms*2^n; the classify deadline still bounds the caller. Raise on the
+  # bursty batch pod (e.g. 3); default 1.
+  # Set via environment: DWCTL_CACHE__INDEX_CONN_RETRIES=3
+  # index_conn_retries: 1
   # Default pricing multipliers — pre-fill values when enabling caching on a model without
   # explicit per-tier rates. The model_cache_tariffs row is the source of truth, so these
   # only matter at enable-time. Defaults shown; uncomment to override.
@@ -470,6 +491,73 @@ cache:
   #   default_write_multiplier_24h: 2.5
   #   default_read_multiplier: 0.1
   #   default_min_prefix_tokens: 1024
+
+# Mid-stream continuation (the resume layer): when a streaming generation dies
+# mid-output, rebuild the prompt + partial output as token-ids (tokenizer-svc
+# /v1/render) and resume it as a /v1/completions request through the model's
+# completions pool, splicing the result into the client's still-open stream with
+# merged billing. Per-model activation is DATA, not config: a model rescues only
+# when its composite carries a completions pool with an enabled member.
+continuation:
+  # Global kill switch. When false (default), the layer is not added to the
+  # stack and the request path is byte-identical to a build without it.
+  # Set via environment: DWCTL_CONTINUATION__ENABLED=true
+  enabled: false
+  # Base URL of the tokenizer-svc used to render resume prefixes. Unset
+  # (default) falls back to cache.tokenizer_url — the same service serves both
+  # layers; set only to split them.
+  # Set via environment: DWCTL_CONTINUATION__TOKENIZER_URL=http://tokenizer-svc:8088
+  # tokenizer_url: http://localhost:8088
+  # Per-origin eligibility gates (derived from the API key's purpose, the same
+  # signal analytics uses for request_origin). Permanent config, not rollout
+  # scaffolding: resume economics differ per origin (paying a provider again vs
+  # a plain retry behind fusillade's masking).
+  origins:
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__REALTIME=true
+    realtime: true
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__BATCH=true
+    batch: false
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__PLAYGROUND=true
+    playground: false
+  # Maximum resume legs for one logical stream (a leg that itself dies re-enters
+  # the chain). Exhausted -> the ORIGINAL death surfaces, exactly as unresumed.
+  # Set via environment: DWCTL_CONTINUATION__MAX_ATTEMPTS=2
+  max_attempts: 2
+  # Seconds per resume attempt (render + continuation-target time-to-first-byte).
+  # Crossed -> that leg is abandoned; attempts exhausted -> the original death
+  # surfaces. Cold provider prefill dominates on long prompts.
+  # Set via environment: DWCTL_CONTINUATION__RESUME_DEADLINE_SECS=20
+  resume_deadline_secs: 20
+  # Inter-frame silence after which an armed stream is declared stalled and
+  # rescued. Rescue CANCELS the original leg, so this must never undercut the
+  # platform's own liveness judgment (fusillade allows 600s between SSE events
+  # in prod): a preempted-but-progressing stream must be left alone. 540 sits
+  # just inside fusillade's 600s so batch-origin stalls remain rescuable before
+  # the daemon aborts. Arms only after the first generated text.
+  # Set via environment: DWCTL_CONTINUATION__STALL_TIMEOUT_SECS=540
+  stall_timeout_secs: 540
+  # Cap applied separately to each retained allocation per armed stream (the
+  # request body, and the accumulated generation) - worst case ~2x this value.
+  # Exceeded -> the stream is marked non-resumable (outcome cap_exceeded) and
+  # the buffer dropped; the stream itself is unaffected.
+  # Set via environment: DWCTL_CONTINUATION__MAX_BUFFER_BYTES=2097152
+  max_buffer_bytes: 2097152
+  # Dynamo scheduler priority on resume legs. Realtime runs 0, batch negative —
+  # positive puts resumes ahead of new work, deliberately: a resume finishes a
+  # stream already accepted, on a seam budget. Onwards strips the field for
+  # pool members that would reject it (third-party providers).
+  # Set via environment: DWCTL_CONTINUATION__PRIORITY=100
+  priority: 100
+  # Per-model cap on concurrently in-flight resume legs — bounds the stampede a
+  # flapping model can send at its continuation provider during an incident.
+  # Set via environment: DWCTL_CONTINUATION__MAX_INFLIGHT_PER_MODEL=8
+  max_inflight_per_model: 8
+  # Reconstructor per model alias, for models whose reasoning/tool-call streams
+  # have a byte-exactness verdict from the fidelity harness ("dsv4" = the
+  # DeepSeek-V4/DSML family). Absent from the map -> plain-content only;
+  # reasoning/tool streams disarm safely instead of resuming.
+  # Set via environment: DWCTL_CONTINUATION__MODEL_RECONSTRUCTORS='{"deepseek-ai/DeepSeek-V4-Flash":"dsv4"}'
+  model_reconstructors: {}
 
 # Background services configuration
 # Controls which background services run on this instance
@@ -510,11 +598,31 @@ background_services:
     # - "leader": Only run on the elected leader instance
     # - "never": Never run the daemon
     enabled: always
+    # Which fusillade claim loops this daemon process runs:
+    # - "both": Run request and batch claim loops (default)
+    # - "request_only": Run only batchless request claims
+    # - "batch_only": Run only batch claims
+    mode: both
 
     # Performance & Concurrency Settings
     claim_batch_size: 100 # Maximum number of requests to claim in each iteration
     default_model_concurrency: 10 # Default concurrent requests per model
     claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
+
+    # Adaptive per-model concurrency. Discovers the sustainable in-flight count
+    # from downstream 529s instead of running flat out at a static number.
+    #
+    # default_model_concurrency and per-model batch_capacity become the value
+    # each model STARTS at; the controller owns the number from there and can go
+    # above it. Turning this off puts every model back on its configured value,
+    # so the flag is safe to flip either way. Set max_total_in_flight first - it
+    # is what bounds this instance's memory once per-model values stop capping.
+    #
+    # adaptive_concurrency: false
+    # adaptive_growth_factor: 1.5    # Multiplier applied each time a limit goes up
+    # adaptive_cut_factor: 0.8       # Multiplier applied on downstream 529
+    # max_total_in_flight: 0         # Hard cap on this instance's total in-flight
+    #                                # requests across all models; 0 disables
 
     # Split claim daemons (fusillade >= 20): batched and batchless (flex) rows
     # are claimed by independent loops. All optional:
@@ -525,6 +633,10 @@ background_services:
     #                                 # false treats no-event models (external providers) as live
     # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live batches become claimable within
     #                                 # window_minutes^exponent minutes of deadline (~59m/24h, ~10m/1h)
+    # background_concurrency_limit: 0 # Per-model foreground in-flight threshold below which
+    #                                 # background workers may send; background work does not
+    #                                 # consume it. 0 disables processing, and a nonzero value requires
+    #                                 # inject_deadline_priority: true below
 
     # Retry & Backoff Settings
     # All retry parameters are optional and default to fusillade's built-in defaults
@@ -535,15 +647,45 @@ background_services:
     backoff_ms: 1000 # Initial backoff duration in milliseconds
     backoff_factor: 2 # Exponential backoff multiplier
     max_backoff_ms: 10000 # Maximum backoff duration in milliseconds
+    additional_retryable_statuses:
+      - 499
 
     # Timeout Settings
     # timeout_ms: 600000 # DEPRECATED: splits into 90% first_chunk_timeout_ms, 10% body_timeout_ms
     first_chunk_timeout_ms: 86400000 # Max time waiting for response headers (24 hours)
     chunk_timeout_ms: 86400000 # Max idle time between response body chunks (24 hours)
     body_timeout_ms: 86400000 # Max total time for entire response body (24 hours)
+    # Upload watchdog only covers sending the request body. Keep its stall
+    # timeout below first_chunk_timeout_ms so a stalled upload is reported first.
+    upload_stall_timeout_ms: 60000 # Max time without upload progress (1 minute)
+    upload_chunk_bytes: 65536 # Upload progress granularity (64 KiB)
+    upload_stall_poll_ms: 100 # Upload progress check interval (100 ms)
     claim_timeout_ms: 60000 # Max time in "claimed" state before auto-unclaim (1 minute)
     processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
     pending_request_counts_timeout_ms: 60000 # Statement timeout for pending request count queries (1 minute)
+
+    # Batch archive (fusillade phase 3): moves frozen terminal batches' rows
+    # from fusillade.requests into the partitioned batch_requests_archive.
+    # BOTH movers ship DISABLED — deploys never move data, only these flags
+    # do. Sequencing (load-bearing): flip only once every pod runs
+    # location-routing-aware code AND the dwctl version that introduced
+    # these keys is the rollback floor (deny_unknown_fields: an older pod
+    # parsing a config containing them crash-loops). The daily
+    # partition-runway tick always runs on batch-mode daemons regardless of
+    # these flags (fusillade_archive_partitions_ahead gauges it).
+    # batch_archive_sweep_enabled: false      # Steady-state sweeper: archive newly-frozen batches (oldest-first)
+    # batch_archive_sweep_interval_ms: 5000   # Sweep tick cadence (0 disables the worker)
+    # batch_archive_sweep_moves_per_tick: 4   # Bounded batch moves per tick, never drain-until-empty
+    # batch_archive_sweep_dwell_secs: 0       # Post-freeze dwell before archiving (0 = move immediately)
+    # batch_archive_cancel_grace_secs: 600    # Hold batches with in-flight-canceled rows this long so late
+    #                                         # billed results can still supersede the cancel on the live row
+    # batch_archive_backfill_enabled: false   # Historical drain: same mover, own pacing, oldest-first;
+    #                                         # flip off to pause instantly (resumable by construction)
+    # batch_archive_backfill_interval_ms: 1000
+    # batch_archive_backfill_moves_per_tick: 4
+    # batch_archive_backfill_concurrency: 8    # Concurrent moves per tick; the drain-throughput lever
+    #                                          # (per-move cost is mostly fixed txn overhead). 1 = sequential
+    # batch_archive_partitions_weeks_ahead: 4 # Weekly-partition runway maintained by the daily tick
 
     # Observability
     status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)
@@ -559,9 +701,10 @@ background_services:
     #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
 
     # Endpoints that should use SSE streaming for usage tracking.
-    # Batch requests to these paths are sent with X-Fusillade-Stream: true,
-    # causing the upstream proxy to inject stream: true and stream_options.include_usage.
-    # The streamed response is reassembled into non-streaming JSON before storage.
+    # Batch requests to these paths have stream: true and stream_options.include_usage
+    # injected on the way out, and the streamed response is reassembled into
+    # non-streaming JSON before it is stored or returned. Only batch traffic is
+    # affected; a client request to the same path is left as the client sent it.
     streamable_endpoints:
       - /v1/chat/completions
       - /v1/completions

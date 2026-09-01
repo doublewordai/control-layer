@@ -10,7 +10,7 @@ use crate::test::utils::{
 };
 use crate::{
     api::models::users::Role,
-    config::{DaemonConfig, DaemonEnabled, ModelSource},
+    config::{DaemonConfig, DaemonEnabled, DaemonMode, ModelSource},
     db::handlers::api_keys::ApiKeys,
     db::models::api_keys::ApiKeyPurpose,
 };
@@ -119,6 +119,7 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
 
     config.background_services.batch_daemon = DaemonConfig {
         enabled: DaemonEnabled::Always,
+        mode: DaemonMode::Both,
         claim_batch_size: 10,
         default_model_concurrency: 5,
         claim_interval_ms: 100,
@@ -127,6 +128,7 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
         backoff_ms: 100,
         backoff_factor: 2,
         max_backoff_ms: 1000,
+        additional_retryable_statuses: vec![499],
         timeout_ms: None,
         first_chunk_timeout_ms: 86_400_000,
         chunk_timeout_ms: 86_400_000,
@@ -152,7 +154,6 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
         purge_interval_ms: 0,
         purge_batch_size: 1000,
         purge_throttle_ms: 100,
-        streamable_endpoints: vec![],
         urgency_weight: 0.0,
         inject_deadline_priority: false,
         batch_claim_size: 0,
@@ -162,6 +163,8 @@ async fn test_route_at_claim_time_escalation(pool: PgPool) {
         claim_ramp_exponent: 0.56,
         claim_loop_max_consecutive_failures: 10,
         claim_query_timeout_ms: 180_000,
+        // Archive movers and future knobs: fusillade defaults (all dark).
+        ..DaemonConfig::default()
     };
 
     config.background_services.onwards_sync.enabled = true;
@@ -391,6 +394,7 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
     let mut config = create_test_config();
     config.background_services.batch_daemon = DaemonConfig {
         enabled: DaemonEnabled::Always,
+        mode: DaemonMode::Both,
         claim_batch_size: 10,
         default_model_concurrency: 5,
         claim_interval_ms: 100,
@@ -399,6 +403,7 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
         backoff_ms: 100,
         backoff_factor: 2,
         max_backoff_ms: 1000,
+        additional_retryable_statuses: vec![499],
         timeout_ms: None,
         first_chunk_timeout_ms: 86_400_000,
         chunk_timeout_ms: 86_400_000,
@@ -422,7 +427,6 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
         purge_interval_ms: 0,
         purge_batch_size: 1000,
         purge_throttle_ms: 100,
-        streamable_endpoints: vec![],
         urgency_weight: 0.0,
         inject_deadline_priority: false,
         batch_claim_size: 0,
@@ -432,6 +436,8 @@ async fn test_no_escalation_when_not_near_expiry(pool: PgPool) {
         claim_ramp_exponent: 0.56,
         claim_loop_max_consecutive_failures: 10,
         claim_query_timeout_ms: 180_000,
+        // Archive movers and future knobs: fusillade defaults (all dark).
+        ..DaemonConfig::default()
     };
 
     config.background_services.onwards_sync.enabled = true;

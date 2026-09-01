@@ -41,6 +41,7 @@ import type { Transaction } from "@/api/control-layer";
 import { useUserBalance, useTransactions, useUser } from "@/api/control-layer";
 import { useSettings } from "@/contexts";
 import { formatDollars } from "@/utils/money.ts";
+import { getServiceTierLabel } from "@/utils/serviceTier";
 import { useDebounce } from "@/hooks/useDebounce";
 
 export type AddFundsConfig =
@@ -180,35 +181,23 @@ export function TransactionHistory({
       return baseDescription;
     }
 
-    // For batches, show "Source Batch - Priority: X requests" format
-    // A transaction is a batch if it has a batch_id
-    const isBatch = tx.batch_id;
-    if (isBatch) {
+    // Human label for the service tier.
+    const tierKey = tx.service_tier ?? (tx.batch_id ? "batch" : "realtime");
+    const tierLabel = getServiceTierLabel(tierKey);
+    // Aggregated tiers have a batch_id — show the request count rather than a
+    // single model name.
+    if (tx.batch_id) {
       const requestCount = tx.batch_request_count || 0;
       const requestsText = requestCount > 0 ? `: ${requestCount} requests` : "";
-
-      // Determine source label: "Frontend" for frontend origin, "API" for everything else
-      const source = tx.request_origin === "frontend" ? "Frontend" : "API";
-
-      // Format priority - should always be present for batches
-      let priorityText = "";
-      if (tx.batch_sla) {
-        priorityText = ` - ${tx.batch_sla}`;
-      }
-
-      return `${source} Batch${priorityText}${requestsText}`;
+      return `${tierLabel}${requestsText}`;
     }
 
-    // For non-batch usage, extract model and tokens from description
-    // Expected format: "API usage: ModelName (X input + Y output tokens)"
-    const match = baseDescription.match(/^API usage:\s*(.+)$/i);
-    const details = match ? match[1] : baseDescription;
+    // Non-batch (realtime / flex): show the model, dropping the token counts.
+    // Description format: "API usage: ModelName (X input + Y output tokens)"
+    const match = baseDescription.match(/^API usage:\s*(.+?)\s*\(/i);
+    const model = match ? match[1] : baseDescription.replace(/^API usage:\s*/i, "");
 
-    // Determine category prefix based on request_origin
-    const category =
-      tx.request_origin === "frontend" ? "Playground" : "Realtime API";
-
-    return `${category}: ${details}`;
+    return `${tierLabel}: ${model}`;
   };
 
   const hasActiveFilters =

@@ -4,11 +4,38 @@ on:
   pull_request:
     branches: [main]
   merge_group:
-  workflow_dispatch:
+    types: [checks_requested]
 
 jobs:
+  changes:
+    name: release-only changes
+    runs-on: ubuntu-latest
+    outputs:
+      run-ci: ${{ steps.classify.outputs.run-ci }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
+
+      - name: Classify changes
+        id: classify
+        shell: bash
+        run: |
+          run_ci=true
+          changed_files=$(git diff --name-only HEAD^1...HEAD) || changed_files=
+
+          if [[ -n "$changed_files" ]] && ! grep -Evq '^(\.release-please-manifest\.json|(.+/)?CHANGELOG\.md|(.+/)?Cargo\.(toml|lock))$' <<< "$changed_files"; then
+            run_ci=false
+          fi
+
+          echo "run-ci=$run_ci" >> "$GITHUB_OUTPUT"
+
   frontend-test:
-    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
+    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: changes
+    name: dashboard / test
     runs-on: depot-ubuntu-24.04-8
 
     steps:
@@ -33,6 +60,8 @@ jobs:
 
       - name: Install just
         uses: extractions/setup-just@v3
+        with:
+          just-version: "1.46.0"
 
       - name: Run frontend CI pipeline
         id: ci-step
@@ -97,14 +126,232 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/total-bundle-size?value=${TOTAL_SIZE}" || true
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/gzipped-bundle-size?value=${GZIPPED_SIZE}" || true
 
-  backend-test:
-    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
+  backend-dwctl-test-shard:
+    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: changes
+    name: dwctl / test (${{ matrix.partition }}/4)
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
     runs-on: depot-ubuntu-24.04-16
 
+    # Each partition has an isolated PostgreSQL instance. SQLx tests create
+    # their own databases, pools, and listeners, so retain the raised
+    # connection limit from the unpartitioned job.
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Start Postgres
+        run: |
+          docker run -d --name postgres \
+            -e POSTGRES_DB=test \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -p 5432:5432 \
+            postgres:17 \
+            -c max_connections=300
+          for _ in $(seq 1 30); do
+            docker exec postgres pg_isready -U postgres && break
+            sleep 1
+          done
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: backend-test-dwctl-sharded
+          cache-on-failure: true
+
+      - name: Install just
+        uses: extractions/setup-just@v3
+        with:
+          just-version: "1.46.0"
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
+
+      - name: Install sqlx-cli and cargo-llvm-cov
+        run: |
+          cargo install cargo-llvm-cov --locked
+          cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
+
+      - name: Set up test databases
+        env:
+          DB_PASS: postgres
+        run: just db-setup
+
+      - name: Compile and test dwctl partition ${{ matrix.partition }}/4
+        run: |
+          START_TIME=$(date +%s)
+
+          cargo llvm-cov clean --workspace
+          # cargo-llvm-cov's wrapper includes the process ID in every profile
+          # filename. Nextest runs one process per test, so that creates
+          # thousands of files and makes profile merging the new bottleneck.
+          # LLVM's merge pool safely bounds concurrent writers instead.
+          # shellcheck disable=SC1090
+          source <(cargo llvm-cov show-env --export-prefix)
+          export LLVM_PROFILE_FILE="$PWD/target/dwctl-${{ matrix.partition }}-%32m.profraw"
+
+          cargo nextest run --package dwctl \
+            --cargo-profile ci \
+            --partition "count:${{ matrix.partition }}/4"
+          cargo llvm-cov report --profile ci \
+            --lcov \
+            --output-path "lcov-dwctl-${{ matrix.partition }}.info"
+
+          END_TIME=$(date +%s)
+          CI_DURATION=$((END_TIME - START_TIME))
+          echo "dwctl partition ${{ matrix.partition }}/4 completed in ${CI_DURATION}s"
+          curl -X POST \
+            "https://charts.somnial.co/doubleword-control-layer/backend-dwctl-partition-${{ matrix.partition }}-ci-duration?value=${CI_DURATION}" || true
+
+      - name: Upload dwctl partition ${{ matrix.partition }} coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage-dwctl-${{ matrix.partition }}
+          path: lcov-dwctl-${{ matrix.partition }}.info
+          if-no-files-found: error
+          retention-days: 1
+
+  backend-dwctl-test:
+    if: always() && needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: [changes, backend-dwctl-test-shard]
+    runs-on: ubuntu-latest
+    name: dwctl / test
+
+    steps:
+      - name: Require all dwctl test partitions
+        env:
+          DWCTL_TEST_RESULT: ${{ needs.backend-dwctl-test-shard.result }}
+        run: |
+          if [[ "$DWCTL_TEST_RESULT" != "success" ]]; then
+            echo "One or more dwctl test partitions failed: $DWCTL_TEST_RESULT" >&2
+            exit 1
+          fi
+
+  backend-crate-test:
+    if: always()
+    needs: changes
+    name: ${{ matrix.package }} / test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: fusillade
+            runner: depot-ubuntu-24.04-8
+            database: true
+          - package: fusillade-core
+            runner: depot-ubuntu-24.04-8
+            database: false
+          - package: fusillade-arsenal
+            runner: depot-ubuntu-24.04-8
+            database: true
+          - package: onwards
+            runner: depot-ubuntu-24.04-8
+            database: false
+            cargo_args: --all-features
+    runs-on: ${{ matrix.runner }}
+    env:
+      RUN_CI: ${{ needs.changes.outputs.run-ci }}
+
     # Postgres is started manually below (not via `services:`) so we can pass
-    # `-c max_connections=300` — the 16-core runner runs `#[sqlx::test]`
-    # tests with high parallelism, and each one opens its own pools + underway
+    # `-c max_connections=300`. SQLx tests open their own pools and underway
     # PgListener connections, so the default 100 is insufficient.
+
+    steps:
+      - name: Skip crate tests for release-only changes
+        if: env.RUN_CI != 'true'
+        run: echo "Skipping crate tests because this pull request only contains release metadata."
+
+      - name: Checkout code
+        if: env.RUN_CI == 'true'
+        uses: actions/checkout@v6
+
+      - name: Start Postgres
+        if: env.RUN_CI == 'true' && matrix.database
+        run: |
+          docker run -d --name postgres \
+            -e POSTGRES_DB=test \
+            -e POSTGRES_USER=postgres \
+            -e POSTGRES_PASSWORD=postgres \
+            -e POSTGRES_HOST_AUTH_METHOD=trust \
+            -p 5432:5432 \
+            postgres:17 \
+            -c max_connections=300
+          for _ in $(seq 1 30); do
+            docker exec postgres pg_isready -U postgres && break
+            sleep 1
+          done
+
+      - name: Install Rust
+        if: env.RUN_CI == 'true'
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache Rust build
+        if: env.RUN_CI == 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: backend-test-${{ matrix.package }}
+
+      - name: Install just
+        if: env.RUN_CI == 'true'
+        uses: extractions/setup-just@v3
+        with:
+          just-version: "1.46.0"
+
+      - name: Install sqlx-cli and cargo-llvm-cov
+        if: env.RUN_CI == 'true'
+        run: |
+          cargo install cargo-llvm-cov --locked
+          if [[ "${{ matrix.database }}" == "true" ]]; then
+            # Pin sqlx-cli to the 0.8.x line to match the library version.
+            cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
+          fi
+
+      - name: Set up test databases
+        if: env.RUN_CI == 'true' && matrix.database
+        env:
+          DB_PASS: postgres
+        run: just db-setup
+
+      - name: Compile and test ${{ matrix.package }}
+        if: env.RUN_CI == 'true'
+        run: |
+          START_TIME=$(date +%s)
+          cargo llvm-cov --package "${{ matrix.package }}" \
+            ${{ matrix.cargo_args }} \
+            --lcov \
+            --output-path "lcov-${{ matrix.package }}.info"
+          END_TIME=$(date +%s)
+          CI_DURATION=$((END_TIME - START_TIME))
+          echo "${{ matrix.package }} tests completed in ${CI_DURATION}s"
+          curl -X POST \
+            "https://charts.somnial.co/doubleword-control-layer/backend-${{ matrix.package }}-ci-duration?value=${CI_DURATION}" || true
+
+      - name: Upload ${{ matrix.package }} coverage
+        if: env.RUN_CI == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-coverage-${{ matrix.package }}
+          path: lcov-${{ matrix.package }}.info
+          if-no-files-found: error
+          retention-days: 1
+
+  backend-lint:
+    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: changes
+    name: workspace / rust lint
+    runs-on: depot-ubuntu-24.04-16
 
     steps:
       - name: Checkout code
@@ -118,7 +365,7 @@ jobs:
             -e POSTGRES_PASSWORD=postgres \
             -e POSTGRES_HOST_AUTH_METHOD=trust \
             -p 5432:5432 \
-            postgres:latest \
+            postgres:17 \
             -c max_connections=300
           for _ in $(seq 1 30); do
             docker exec postgres pg_isready -U postgres && break
@@ -127,74 +374,133 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-        with:
-          components: llvm-tools-preview
 
-      # used only for caching binary installs
-      - uses: Swatinem/rust-cache@v2
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: backend-lint
 
       - name: Install just
         uses: extractions/setup-just@v3
+        with:
+          just-version: "1.46.0"
 
-      - name: Install sqlx-cli and cargo-llvm-cov
-        run: |
-          # Pin sqlx-cli to the 0.8.x line to match the `sqlx` library version.
-          # sqlx-cli 0.9.0 stopped auto-loading the per-crate `.env`, so an
-          # unpinned install made `cargo sqlx prepare --check` fail to find
-          # DATABASE_URL. Keep the CLI and library majors in lockstep.
-          cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
-          cargo install cargo-llvm-cov --locked
+      - name: Install sqlx-cli
+        run: cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
 
-      - name: Run backend CI pipeline
-        id: ci-step
+      - name: Set up test databases
         env:
           DB_PASS: postgres
+        run: just db-setup
+
+      - name: Lint Rust workspace
+        run: just lint rust -- -D warnings
+
+      - name: Validate publishable Onwards package
+        run: cargo package --locked --package onwards --all-features
+
+  backend-test:
+    if: always() && needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    needs: [changes, backend-crate-test, backend-dwctl-test, backend-lint, frontend-test, build]
+    runs-on: ubuntu-latest
+    name: workspace / rust gate
+    env:
+      MINIMUM_COVERAGE: "60"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Validate preview workflow contract
+        run: ruby scripts/tests/preview_workflow_test.rb
+
+      - name: Require crate tests and lint
+        env:
+          CRATE_TEST_RESULT: ${{ needs.backend-crate-test.result }}
+          DWCTL_TEST_RESULT: ${{ needs.backend-dwctl-test.result }}
+          LINT_RESULT: ${{ needs.backend-lint.result }}
         run: |
-          START_TIME=$(date +%s)
-          just ci rust -- -D warnings
-          END_TIME=$(date +%s)
-          CI_DURATION=$((END_TIME - START_TIME))
-          echo "ci_duration=$CI_DURATION" >> $GITHUB_OUTPUT
-          echo "Rust CI pipeline completed in ${CI_DURATION}s"
-
-          # Report metrics to Somnial
-          curl -X POST "https://charts.somnial.co/doubleword-control-layer/backend-ci-duration?value=${CI_DURATION}" || true
-
-      - name: Extract backend coverage metrics
-        id: coverage-step
-        working-directory: ./dwctl
-        run: |
-          # Extract coverage from already generated lcov.info file (from 'just ci rust')
-          echo "Checking for coverage files..."
-          ls -la lcov.info || echo "lcov.info not found"
-
-          if [ -f lcov.info ]; then
-            echo "Found lcov.info, parsing coverage data..."
-
-            # Parse lcov.info using awk (clean and always available)
-            COVERAGE=$(awk '
-              /^LF:/ { lf += $2 }
-              /^LH:/ { lh += $2 }
-              END {
-                if (lf > 0)
-                  printf "%.2f", (lh * 100) / lf
-                else
-                  print "0"
-              }
-            ' FS=: lcov.info)
-
-            echo "coverage=$COVERAGE" >> $GITHUB_OUTPUT
-            echo "Backend code coverage: ${COVERAGE}%"
-
-            # Report coverage to Somnial
-            curl -X POST "https://charts.somnial.co/doubleword-control-layer/backend-code-coverage?value=${COVERAGE}" || true
-          else
-            echo "No coverage report found at lcov.info - coverage may not have been generated"
-            echo "coverage=0" >> $GITHUB_OUTPUT
+          if [[ "$CRATE_TEST_RESULT" != "success" ]]; then
+            echo "One or more crate test jobs failed: $CRATE_TEST_RESULT" >&2
+            exit 1
+          fi
+          if [[ "$DWCTL_TEST_RESULT" != "success" ]]; then
+            echo "dwctl test partitions failed: $DWCTL_TEST_RESULT" >&2
+            exit 1
+          fi
+          if [[ "$LINT_RESULT" != "success" ]]; then
+            echo "Rust workspace lint failed: $LINT_RESULT" >&2
+            exit 1
           fi
 
-  build:
-    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+      - name: Download per-crate coverage
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rust-coverage-*
+          path: rust-coverage
+          merge-multiple: true
+
+      - name: Aggregate backend coverage
+        id: coverage-step
+        run: |
+          shopt -s nullglob
+          coverage_files=(rust-coverage/*.info)
+          if (( ${#coverage_files[@]} != 8 )); then
+            echo "Expected 8 coverage files, found ${#coverage_files[@]}" >&2
+            exit 1
+          fi
+
+          .github/scripts/aggregate-rust-coverage.py \
+            --minimum "$MINIMUM_COVERAGE" \
+            "${coverage_files[@]}" | tee coverage-summary.txt
+
+          COVERAGE=$(awk -F= '/^coverage=/ { print $2 }' coverage-summary.txt)
+          echo "coverage=$COVERAGE" >> "$GITHUB_OUTPUT"
+          echo "Backend code coverage: ${COVERAGE}%"
+          curl -X POST \
+            "https://charts.somnial.co/doubleword-control-layer/backend-code-coverage?value=${COVERAGE}" || true
+
+      - name: Publish preview artifact
+        if: >-
+          github.event_name == 'pull_request' &&
+          startsWith(github.head_ref, 'preview/') &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          needs.frontend-test.result == 'success' &&
+          needs.build.result == 'success'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        env:
+          ARTIFACT_DIGEST: ${{ needs.build.outputs.image-digest }}
+        with:
+          github-token: ${{ secrets.PREVIEW_DISPATCH_TOKEN }}
+          script: |
+            const sha = context.payload.pull_request.head.sha
+            const digest = process.env.ARTIFACT_DIGEST
+            if (!/^[0-9a-f]{40}$/.test(sha) || !/^sha256:[0-9a-f]{64}$/.test(digest)) {
+              core.setFailed('Preview artifact identity is invalid')
+              return
+            }
+            await github.rest.repos.createDispatchEvent({
+              owner: '${{ secrets.DEPLOY_TARGET_OWNER }}',
+              repo: '${{ secrets.DEPLOY_TARGET_REPO }}',
+              event_type: 'preview-artifact-published',
+              client_payload: {
+                repository: context.repo.owner + '/' + context.repo.repo,
+                pull_request: context.payload.pull_request.number,
+                branch: context.payload.pull_request.head.ref,
+                sha,
+                artifact_kind: 'image',
+                artifact_repository: 'ghcr.io/doublewordai/control-layer',
+                version: `sha-${sha}`,
+                digest
+              }
+            })
+
+  # Image builds are first-wave jobs after change classification. Both depend
+  # only on `changes`, so the independently published images build in parallel.
+  onwards-pr-image:
+    if: needs.changes.outputs.run-ci == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'
+    needs: changes
+    name: onwards / image
     runs-on: depot-ubuntu-24.04
 
     permissions:
@@ -213,17 +519,53 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Build and push Onwards image
+        uses: depot/build-push-action@v1
+        with:
+          context: .
+          file: ./onwards/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ghcr.io/doublewordai/onwards:sha-${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          sbom: true
+          provenance: true
+
+  # Sibling image build to `onwards-pr-image`; both start after classification.
+  build:
+    if: needs.changes.outputs.run-ci == 'true' && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.login != 'dependabot[bot]'
+    needs: changes
+    name: dwctl / image
+    runs-on: depot-ubuntu-24.04
+
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v6
         env:
           DOCKER_METADATA_PR_HEAD_SHA: true
+          DOCKER_METADATA_SHORT_SHA_LENGTH: 40
         with:
           images: ghcr.io/doublewordai/control-layer
           sep-tags: "\n"
           tags: |
             type=sha,prefix=sha-
-            type=raw,value=manual,enable=${{ github.event_name == 'workflow_dispatch' }}
 
       - name: Build and push all images
         id: build-step
@@ -233,6 +575,7 @@ jobs:
           echo "Starting Docker build at $(date)"
 
       - name: Build and push with Depot
+        id: preview-image
         uses: depot/build-push-action@v1
         with:
           context: .
@@ -256,12 +599,35 @@ jobs:
 
     outputs:
       image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.preview-image.outputs.digest }}
 
   openresponses-compliance:
-    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    # Runs unconditionally so the matrix expands and BOTH legs report under their
+    # static check names. A job skipped at this level reports once as the
+    # unexpanded `matrix.check`, which never satisfies the required contexts on
+    # release-only pull requests. The steps gate on RUN_COMPLIANCE instead.
+    if: always()
     runs-on: ubuntu-latest
-    needs: build
-    name: Open Responses Compliance
+    needs: [changes, build]
+    # Two legs share the dwctl bring-up below. The dwctl leg runs the suite
+    # against dwctl's edge directly. The onwards leg puts a standalone onwards
+    # (strict mode, no adapter) in front of that same dwctl and runs the suite
+    # against onwards, so native /responses passthrough (schema validation,
+    # forwarding, sanitizers) is exercised with dwctl as the Responses-speaking
+    # upstream.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - surface: dwctl
+            check: dwctl / open responses
+            base_url: http://localhost:3001/ai/v1
+            api_key: sk-openresponses-compliance
+          - surface: onwards-passthrough
+            check: onwards / open responses (passthrough)
+            base_url: http://localhost:3000/v1
+            api_key: test
+    name: ${{ matrix.check }}
 
     permissions:
       contents: read
@@ -269,7 +635,7 @@ jobs:
 
     services:
       postgres:
-        image: postgres:latest
+        image: postgres:17
         env:
           POSTGRES_DB: dwctl
           POSTGRES_USER: postgres
@@ -285,14 +651,22 @@ jobs:
 
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/dwctl
+      RUN_COMPLIANCE: ${{ needs.changes.outputs.run-ci == 'true' && needs.build.result == 'success' && (github.event_name == 'pull_request' || github.event_name == 'merge_group') }}
       TEST_API_KEY: sk-openresponses-compliance
       TEST_MODEL: gemini-2.5-flash
+      COMPLIANCE_BASE_URL: ${{ matrix.base_url }}
+      COMPLIANCE_API_KEY: ${{ matrix.api_key }}
       # Run currently supported HTTP /responses tests. Remove this filter once
       # WebSocket transport (#1178) and /responses/compact (#1179) are supported.
       OPENRESPONSES_COMPLIANCE_FILTER: basic-response,assistant-phase,response-output-phase-schema,streaming-response,system-prompt,tool-calling,image-input,multi-turn
 
     steps:
+      - name: Skip compliance for release-only changes
+        if: env.RUN_COMPLIANCE != 'true'
+        run: echo "Skipping Open Responses compliance because this event has no code changes."
+
       - name: Log in to GitHub Container Registry
+        if: env.RUN_COMPLIANCE == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -300,6 +674,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Select built image
+        if: env.RUN_COMPLIANCE == 'true'
         id: image
         run: |
           IMAGE_LIST="${{ needs.build.outputs.image-tag }}"
@@ -308,6 +683,7 @@ jobs:
           echo "Using image: $IMAGE"
 
       - name: Write config
+        if: env.RUN_COMPLIANCE == 'true'
         run: |
           cat > /tmp/dwctl-openresponses-compliance.yaml <<EOF
           host: "0.0.0.0"
@@ -347,6 +723,7 @@ jobs:
           EOF
 
       - name: Validate Gemini upstream
+        if: env.RUN_COMPLIANCE == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -374,6 +751,7 @@ jobs:
           JSON
 
       - name: Start dwctl
+        if: env.RUN_COMPLIANCE == 'true'
         run: |
           docker run \
             --detach \
@@ -396,6 +774,7 @@ jobs:
           exit 1
 
       - name: Seed compliance fixture
+        if: env.RUN_COMPLIANCE == 'true'
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
@@ -444,8 +823,7 @@ jobs:
             capabilities,
             created_by,
             hosted_on,
-            trusted,
-            open_responses_adapter
+            trusted
           )
           VALUES (
             '10000000-0000-0000-0000-000000000003',
@@ -456,7 +834,6 @@ jobs:
             ARRAY['chat'],
             '10000000-0000-0000-0000-000000000001',
             '10000000-0000-0000-0000-000000000002',
-            true,
             true
           )
           ON CONFLICT (id) DO UPDATE SET
@@ -464,7 +841,6 @@ jobs:
             alias = EXCLUDED.alias,
             hosted_on = EXCLUDED.hosted_on,
             trusted = EXCLUDED.trusted,
-            open_responses_adapter = EXCLUDED.open_responses_adapter,
             deleted = FALSE,
             updated_at = NOW();
 
@@ -529,6 +905,7 @@ jobs:
           SQL
 
       - name: Wait for compliance fixture
+        if: env.RUN_COMPLIANCE == 'true'
         run: |
           for attempt in $(seq 1 30); do
             models_response=$(curl -sf \
@@ -579,10 +956,61 @@ jobs:
           docker logs dwctl-openresponses-compliance
           exit 1
 
+      - name: Checkout code
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build onwards
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        run: cargo build --release --package onwards
+
+      - name: Write onwards passthrough config
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        run: |
+          cat > /tmp/onwards-passthrough-config.json <<EOF
+          {
+            "strict_mode": true,
+            "targets": {
+              "${TEST_MODEL}": {
+                "url": "http://127.0.0.1:3001/ai/v1/",
+                "onwards_key": "${TEST_API_KEY}",
+                "onwards_model": "${TEST_MODEL}",
+                "trusted": true
+              }
+            }
+          }
+          EOF
+
+      - name: Start onwards
+        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        run: |
+          ./target/release/onwards \
+            -f /tmp/onwards-passthrough-config.json \
+            > /tmp/onwards-passthrough.log 2>&1 &
+          echo "$!" > /tmp/onwards-passthrough.pid
+
+          for attempt in $(seq 1 30); do
+            if curl -sf http://localhost:3000/v1/models > /dev/null 2>&1; then
+              echo "onwards is ready"
+              exit 0
+            fi
+            echo "Waiting for onwards (${attempt}/30)"
+            sleep 1
+          done
+          echo "onwards failed to start" >&2
+          cat /tmp/onwards-passthrough.log
+          exit 1
+
       - name: Install bun
+        if: env.RUN_COMPLIANCE == 'true'
         uses: oven-sh/setup-bun@v2
 
       - name: Clone openresponses
+        if: env.RUN_COMPLIANCE == 'true'
         # Track upstream main so CI surfaces newly added compliance coverage.
         run: |
           git clone --depth 1 https://github.com/openresponses/openresponses /tmp/openresponses
@@ -591,21 +1019,24 @@ jobs:
           git log -1 --oneline
 
       - name: Install openresponses dependencies
+        if: env.RUN_COMPLIANCE == 'true'
         run: cd /tmp/openresponses && bun install
 
       - name: Run compliance tests
+        if: env.RUN_COMPLIANCE == 'true'
         run: |
           cd /tmp/openresponses
           echo "Open Responses commit: $(git rev-parse HEAD)"
-          echo "Base URL: http://localhost:3001/ai/v1"
+          echo "Surface: ${{ matrix.surface }}"
+          echo "Base URL: ${COMPLIANCE_BASE_URL}"
           echo "Model: ${TEST_MODEL}"
           echo "Filter: ${OPENRESPONSES_COMPLIANCE_FILTER}"
           echo
 
           set +e
           bun run bin/compliance-test.ts \
-            --base-url http://localhost:3001/ai/v1 \
-            --api-key "${TEST_API_KEY}" \
+            --base-url "${COMPLIANCE_BASE_URL}" \
+            --api-key "${COMPLIANCE_API_KEY}" \
             --model "${TEST_MODEL}" \
             --filter "${OPENRESPONSES_COMPLIANCE_FILTER}" \
             --json > /tmp/openresponses-compliance-results.json
@@ -653,8 +1084,8 @@ jobs:
               echo "=== Retry failed test(s): ${failed_filters} ==="
               set +e
               bun run bin/compliance-test.ts \
-                --base-url http://localhost:3001/ai/v1 \
-                --api-key "${TEST_API_KEY}" \
+                --base-url "${COMPLIANCE_BASE_URL}" \
+                --api-key "${COMPLIANCE_API_KEY}" \
                 --model "${TEST_MODEL}" \
                 --filter "${failed_filters}" \
                 --json > /tmp/openresponses-compliance-retry-results.json
@@ -686,8 +1117,8 @@ jobs:
                 echo
                 echo "=== Verbose rerun of failed test(s): ${failed_filters} ==="
                 bun run bin/compliance-test.ts \
-                  --base-url http://localhost:3001/ai/v1 \
-                  --api-key "${TEST_API_KEY}" \
+                  --base-url "${COMPLIANCE_BASE_URL}" \
+                  --api-key "${COMPLIANCE_API_KEY}" \
                   --model "${TEST_MODEL}" \
                   --filter "${failed_filters}" \
                   --verbose || true
@@ -707,7 +1138,6 @@ jobs:
                 SELECT
                   dm.alias,
                   dm.model_name,
-                  dm.open_responses_adapter,
                   dm.trusted,
                   dm.deleted,
                   ie.url AS endpoint_url,
@@ -726,30 +1156,45 @@ jobs:
           exit "$status"
 
       - name: Show dwctl logs
-        if: always()
+        if: always() && env.RUN_COMPLIANCE == 'true'
         run: |
           echo "=== dwctl Server Logs ==="
           docker logs dwctl-openresponses-compliance 2>&1 | tee /tmp/dwctl-openresponses-compliance.log || echo "No dwctl container found"
 
+      - name: Show onwards logs
+        if: always() && env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        run: |
+          echo "=== onwards passthrough logs ==="
+          cat /tmp/onwards-passthrough.log || echo "No onwards log found"
+
       - name: Upload Open Responses compliance artifacts
-        if: always()
+        if: always() && env.RUN_COMPLIANCE == 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: openresponses-compliance-results
+          name: openresponses-compliance-results-${{ matrix.surface }}
           path: |
             /tmp/openresponses-compliance-results.json
             /tmp/openresponses-compliance-retry-results.json
             /tmp/dwctl-openresponses-compliance.log
+            /tmp/onwards-passthrough.log
           if-no-files-found: ignore
 
+      - name: Stop onwards
+        if: always() && env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        run: |
+          if [[ -f /tmp/onwards-passthrough.pid ]]; then
+            kill "$(cat /tmp/onwards-passthrough.pid)" || true
+          fi
+
       - name: Stop dwctl
-        if: always()
+        if: always() && env.RUN_COMPLIANCE == 'true'
         run: docker rm -f dwctl-openresponses-compliance || true
 
   security-scan:
-    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
+    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    name: dwctl / security
     runs-on: depot-ubuntu-24.04
-    needs: build
+    needs: [changes, build]
 
     permissions:
       contents: read
@@ -822,9 +1267,10 @@ jobs:
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/high-vulnerabilities?value=${HIGH}" || echo "Failed to report high vulnerabilities"
 
   e2e-test-docker:
-    if: (github.event_name == 'pull_request' && !startsWith(github.head_ref, 'release-please--')) || github.event_name == 'merge_group'
+    if: needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    name: workspace / e2e
     runs-on: depot-ubuntu-24.04
-    needs: build
+    needs: [changes, build]
 
     permissions:
       contents: read
@@ -836,6 +1282,8 @@ jobs:
 
       - name: Install just
         uses: extractions/setup-just@v3
+        with:
+          just-version: "1.46.0"
 
       - name: Install pnpm
         uses: pnpm/action-setup@v5

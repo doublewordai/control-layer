@@ -259,6 +259,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             member_id: None,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let req = ApiKeyCreateDBRequest::new(org_id, member_id, create);
         ApiKeys::new(&mut conn).create(&req).await.unwrap().secret

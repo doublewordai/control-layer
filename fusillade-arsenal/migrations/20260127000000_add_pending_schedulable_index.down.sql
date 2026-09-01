@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_requests_pending_batch_not_before_model;

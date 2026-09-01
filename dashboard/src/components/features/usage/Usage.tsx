@@ -7,11 +7,11 @@ import { useUsage } from "@/api/control-layer/hooks";
 const spinKeyframes = `@keyframes spin { to { transform: rotate(360deg) } }`;
 
 
-const RANGE_MINUTES: Record<string, number> = {
-  "5m": 5, "15m": 15, "30m": 30,
-  "1h": 60, "3h": 180, "8h": 480,
-  "1d": 1440, "3d": 4320, "7d": 10080,
-  "30d": 43200, "60d": 86400, "90d": 129600, "180d": 259200,
+// Usage is served from a per-UTC-day rollup, so ranges are whole-day only.
+// Each value is the number of whole UTC days the window spans (today inclusive).
+const RANGE_DAYS: Record<string, number> = {
+  "1d": 1, "3d": 3, "7d": 7,
+  "30d": 30, "60d": 60, "90d": 90, "180d": 180,
 };
 
 function formatCompact(n: number): string {
@@ -28,13 +28,7 @@ function formatNumber(n: number): string {
 }
 
 const RANGE_OPTIONS = [
-  { value: "5m", label: "5m" },
-  { value: "15m", label: "15m" },
-  { value: "30m", label: "30m" },
-  { value: "1h", label: "1h" },
-  { value: "3h", label: "3h" },
-  { value: "8h", label: "8h" },
-  { value: "1d", label: "1d" },
+  { value: "1d", label: "Today" },
   { value: "3d", label: "3d" },
   { value: "7d", label: "7d" },
   { value: "30d", label: "30d" },
@@ -182,16 +176,21 @@ function DonutChart({ data, size = 190, thickness = 24, centerLabel }: { data: D
 }
 
 export function Usage() {
-  const [range, setRange] = useState("1h");
+  const [range, setRange] = useState("7d");
   const [mounted, setMounted] = useState(false);
   useEffect(() => setMounted(true), []);
 
   const { startDate, endDate } = useMemo(() => {
-    const minutes = RANGE_MINUTES[range];
-    if (!minutes) return { startDate: undefined, endDate: undefined };
+    const days = RANGE_DAYS[range];
+    if (!days) return { startDate: undefined, endDate: undefined };
+    // Usage buckets by UTC date, so align the window to whole UTC days: start
+    // at midnight UTC of (today - (days - 1)), end at "now". Full RFC3339 is
+    // sent (the backend truncates both bounds to their UTC date).
     const now = new Date();
-    const from = new Date(now.getTime() - minutes * 60 * 1000);
-    return { startDate: from.toISOString(), endDate: now.toISOString() };
+    const startUtcMidnight = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - (days - 1)),
+    );
+    return { startDate: startUtcMidnight.toISOString(), endDate: now.toISOString() };
   }, [range]);
 
   const { data: usage, isLoading, isFetching, refresh } = useUsage(startDate, endDate);
@@ -248,7 +247,7 @@ export function Usage() {
                 display: "flex", gap: 1, padding: 3, borderRadius: 10,
                 background: "#f1f5f9", border: "1px solid #e2e8f0",
               }}>
-                {["1h","1d","7d","30d","90d","all"].map((v) => {
+                {["1d","7d","30d","90d","all"].map((v) => {
                   const o = RANGE_OPTIONS.find(r => r.value === v);
                   return (
                       <button key={v} onClick={() => setRange(v)} style={{
@@ -264,7 +263,7 @@ export function Usage() {
                 })}
               </div>
               {(() => {
-                const moreValues = ["5m","15m","30m","3h","8h","3d","60d","180d"];
+                const moreValues = ["3d","60d","180d"];
                 const isMoreSelected = moreValues.includes(range);
                 return (
                     <div style={{ position: "relative", display: "inline-block" }}>

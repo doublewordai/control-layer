@@ -16,6 +16,7 @@ import type {
   ModelUpdateRequest,
   CachePricingUpdate,
   ApiKeyCreateRequest,
+  ApiKeyUpdateRequest,
   ApiKeysQuery,
   EndpointCreateRequest,
   EndpointUpdateRequest,
@@ -717,6 +718,29 @@ export function useCreateApiKey() {
   });
 }
 
+export function useUpdateApiKey() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      keyId,
+      data,
+      userId = "current",
+    }: {
+      keyId: string;
+      data: ApiKeyUpdateRequest;
+      userId?: string;
+    }) => dwctlApi.users.apiKeys.update(keyId, data, userId),
+    onSuccess: () => {
+      // Invalidate all API key queries so lists and detail views refresh
+      // (spend/cap fields change server-side state like reset windows).
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.apiKeys.all,
+      });
+    },
+  });
+}
+
 export function useDeleteApiKey() {
   const queryClient = useQueryClient();
 
@@ -743,6 +767,54 @@ export function useDeleteApiKey() {
 }
 
 // Requests hooks
+/**
+ * Rotate an API key's secret in place. Returns the new secret; the key's id,
+ * usage limit, and counted spend are unchanged. In-flight batches keep
+ * running on their execution key — cancel them separately if the old secret
+ * was compromised.
+ */
+/**
+ * One-off reveal of an issued key's secret (holder only). Invalidate on
+ * success so the row's pending-reveal state flips to rotate.
+ */
+export function useRevealApiKey() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      keyId,
+      userId = "current",
+    }: {
+      keyId: string;
+      userId?: string;
+    }) => dwctlApi.users.apiKeys.reveal(keyId, userId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.apiKeys.all,
+      });
+    },
+  });
+}
+
+export function useRotateApiKey() {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      keyId,
+      userId = "current",
+    }: {
+      keyId: string;
+      userId?: string;
+    }) => dwctlApi.users.apiKeys.rotate(keyId, userId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: queryKeys.apiKeys.all,
+      });
+    },
+  });
+}
+
 export function useRequests(
   options?: ListRequestsQuery,
   queryOptions?: { enabled?: boolean },

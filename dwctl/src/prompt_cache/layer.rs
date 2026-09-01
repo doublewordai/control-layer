@@ -10,8 +10,17 @@
 //!   5. on a billing-success completion, **commits** the `PendingWrite` to the index (off path).
 //!
 //! Everything lives in one scope, so the pending write is a local value — no
-//! correlation id, no trait injected into onwards. Failures degrade to "no caching"
-//! (the response is forwarded untouched); the commit is success-gated.
+//! correlation id, no trait injected into onwards. Failures degrade to "no caching"; the
+//! commit is success-gated.
+//!
+//! Inactive requests (cache-disabled model, degraded classify) are NOT forwarded untouched:
+//! their usage still gets provider-written cache fields scrubbed
+//! ([`super::inject::scrub_provider_cache_fields`]). This layer is the sole writer of
+//! customer-visible cache accounting — an upstream's own `cached_tokens` (e.g. OpenRouter
+//! implicit caching on a model without cache pricing) must never reach a customer we billed
+//! at full price. Onwards itself stays a faithful pass-through (the standalone gateway in
+//! front of dynamo must forward engine cache stats for internal capture); the scrub decision
+//! lives here, next to billing.
 //!
 //! Placed **inner to outlet** in the stack so the analytics/billing capture sees the
 //! injected cache fields.
@@ -30,11 +39,11 @@ use http_body_util::BodyExt;
 
 use super::classifier::{Classifier, ClassifyOutcome, ClassifyRequest};
 use super::index::{CacheResult, TierPolicy};
-use super::inject::{inject_into_response_nonstreaming, scan_inject_sse, strip_cache_control};
+use super::inject::{UsageEdit, inject_into_response_nonstreaming, scan_edit_sse, scrub_response_nonstreaming, strip_cache_control};
 use super::metrics as cache_metrics;
 use super::parse::{ParseError, validate_markers};
+use super::query::{self, Inject, InvalidBreakpointValue};
 use super::sse::SseBufferedStream;
-use super::stats::CacheStats;
 
 /// Bound on the index commit (off the response path). A slow/hung DB can't leak the
 /// spawned task or hold a pool connection indefinitely; a miss just drops the write
@@ -55,12 +64,15 @@ pub struct CacheLayerState {
 }
 
 impl CacheLayerState {
-    pub fn new(classifier: Classifier, body_limit: usize) -> Self {
+    /// `deadline` comes from `cache.classify_deadline_secs` (default 5s — onwards' old
+    /// `DEFAULT_CLASSIFY_DEADLINE`); it only bites on an index/tokenizer outage (classify
+    /// normally finishes during generation). Latency-insensitive deployments (the
+    /// fusillade-batch pod, where the join is inline post-response with no first-token
+    /// pressure) set it higher so index retries have room to land.
+    pub fn new(classifier: Classifier, body_limit: usize, deadline: Duration) -> Self {
         Self {
             classifier,
-            // Mirrors onwards' old `DEFAULT_CLASSIFY_DEADLINE`; only bites on an
-            // index/tokenizer outage (classify normally finishes during generation).
-            deadline: Duration::from_secs(5),
+            deadline,
             body_limit,
         }
     }
@@ -106,6 +118,25 @@ fn marker_rejection_response(e: &ParseError, policy: &TierPolicy) -> Response {
     (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
 }
 
+/// Structured 400 for an unrecognized `cacheBreakpoint` query-param value — strict, like the
+/// marker rejections above: a typo must not silently disable caching while the caller believes
+/// it's on. Names the supported value so the client can adjust.
+fn query_rejection_response(e: &InvalidBreakpointValue) -> Response {
+    cache_metrics::record_query_breakpoint("invalid");
+    let body = serde_json::json!({
+        "error": {
+            "message": format!(
+                "invalid {} value {:?}; supported values: \"lastUserMessage\"",
+                query::CACHE_BREAKPOINT_PARAM, e.0
+            ),
+            "type": "invalid_request_error",
+            "code": "invalid_cache_breakpoint",
+            "param": query::CACHE_BREAKPOINT_PARAM,
+        }
+    });
+    (StatusCode::BAD_REQUEST, axum::Json(body)).into_response()
+}
+
 pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Request, next: Next) -> Response {
     if !is_cacheable(&request) {
         return next.run(request).await;
@@ -135,7 +166,42 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
 
     // Parse the body once; reused both for marker validation and to extract `model` (no extra
     // deserialization). `None` if the body isn't JSON — onwards will surface that as a 400.
-    let parsed_body = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
+    let mut parsed_body = serde_json::from_slice::<serde_json::Value>(&body_bytes).ok();
+
+    // `?cacheBreakpoint=lastUserMessage` (see `super::query`): translate the query param into the
+    // top-level automatic-caching marker BEFORE validation, so everything downstream — the 400s
+    // below, classify's hashing, the outbound marker strip — behaves exactly as if the client had
+    // sent the body field. The param itself is stripped from the URI either way: onwards forwards
+    // `path_and_query` verbatim, and it must not leak upstream. The re-serialize below is the one
+    // extra cost, and only on param-carrying requests (whose marker means the outbound sanitiser
+    // was going to rewrite the body anyway).
+    let mut body_bytes = body_bytes;
+    match query::breakpoint_marker(parts.uri.query()) {
+        Ok(None) => {}
+        Ok(Some(marker)) => {
+            parts.uri = query::strip_param(&parts.uri);
+            let outcome = match parsed_body.as_mut() {
+                Some(body) => match query::inject_marker(body, marker) {
+                    Inject::Applied => match serde_json::to_vec(body) {
+                        Ok(b) => {
+                            body_bytes = b.into();
+                            "applied"
+                        }
+                        // Serializing a `Value` we just parsed can't realistically fail; if it
+                        // ever does, forward the original body un-injected (no caching) rather
+                        // than failing the request.
+                        Err(_) => "reserialize_failed",
+                    },
+                    Inject::BodyFieldWins => "body_field_wins",
+                    Inject::NotAnObject => "not_an_object",
+                },
+                // Unparseable JSON: nothing to inject into; onwards will 400 the body itself.
+                None => "not_json",
+            };
+            cache_metrics::record_query_breakpoint(outcome);
+        }
+        Err(e) => return query_rejection_response(&e),
+    }
 
     // Reject disallowed/malformed cache_control markers synchronously, before forking + forwarding
     // — a 400 like a bad parameter, NOT a silent no-cache, so the client learns immediately and
@@ -174,6 +240,8 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
                     virtual_model: &model,
                     body: &body,
                     api_key: api_key.as_deref(),
+                    // Serving always has the bearer token; only historical replay pre-resolves.
+                    principal: None,
                 })
                 .await
         })
@@ -215,8 +283,11 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
 
     let outcome = join_classify(&mut handle, state.deadline, &model_label).await;
     if !outcome.active {
-        // Disabled model (or a degraded classify) → leave the response untouched.
-        return response;
+        // Disabled model (or a degraded classify) → no injection, but the upstream's own cache
+        // accounting must still be scrubbed: this module is the only writer of customer-visible
+        // cache fields, and a provider-reported `cached_tokens` on a model we bill at full price
+        // reads as a discount we didn't give.
+        return scrub_response_nonstreaming(response).await;
     }
     let (response, billing_ok) = inject_into_response_nonstreaming(response, &outcome.stats).await;
     if !outcome.pending.is_empty() {
@@ -389,7 +460,7 @@ fn defer_classify_into_stream(
                 }
             };
             // Detect the billing signals on this chunk (no injection yet).
-            let probe = scan_inject_sse(&chunk, &CacheStats::default(), true);
+            let probe = scan_edit_sse(&chunk, UsageEdit::Probe);
             saw_error |= probe.saw_error;
             // The terminal usage frame is the only place the stats are needed: resolve classify now
             // — the single blocking await, on the *last* frame, bounded by the deadline. Borrow the
@@ -402,12 +473,19 @@ fn defer_classify_into_stream(
                 handle.take();
             }
             saw_usage |= probe.saw_usage;
-            // Inject into the (single) usage frame, but only for an active (cache-enabled) request.
-            let out = if !edited && probe.saw_usage && outcome.as_ref().is_some_and(|o| o.active) {
-                let stats = outcome.as_ref().map(|o| o.stats).unwrap_or_default();
-                let scan = scan_inject_sse(&chunk, &stats, false);
-                // Only mark done once it *actually* rewrote — a (rare) reserialize failure
-                // shouldn't permanently disable injection for a later usage frame.
+            // Edit the (single) usage frame: inject the stats for an active (cache-enabled)
+            // request, otherwise scrub the upstream's own cache accounting — this module is the
+            // only writer of customer-visible cache fields, and a provider-reported
+            // `cached_tokens` on a model we bill at full price reads as a discount we didn't give.
+            let out = if !edited && probe.saw_usage {
+                let scan = match outcome.as_ref() {
+                    Some(o) if o.active => scan_edit_sse(&chunk, UsageEdit::Inject(&o.stats)),
+                    // Inactive — and `None` can't happen (the classify join above runs on the
+                    // first usage frame), so it degrades to the safe edit.
+                    _ => scan_edit_sse(&chunk, UsageEdit::Scrub),
+                };
+                // Only mark done once it *actually* rewrote — a (rare) reserialize failure (or a
+                // scrub with nothing to remove) shouldn't disable editing a later usage frame.
                 edited |= scan.rewritten.is_some();
                 scan.rewritten.unwrap_or(chunk)
             } else {
@@ -509,6 +587,22 @@ mod tests {
         TierPolicy::from_config(&["5m".to_string(), "1h".to_string(), "24h".to_string()], "5m")
     }
 
+    /// Poll until `hash` is visible in the index for `scope`, or panic after ~5s.
+    ///
+    /// The commit runs on a spawned task whose Postgres round-trip needs wall time, not
+    /// scheduler turns — a bounded `yield_now` loop is a race that loses on a loaded CI
+    /// runner (observed as a flake on an unrelated PR's run).
+    async fn await_commit(idx: &PostgresIndex, scope: &IndexScope, hash: &crate::prompt_cache::PrefixHash, what: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if !idx.lookup(scope, std::slice::from_ref(hash)).await.unwrap().is_empty() {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "{what}: write did not commit within 5s");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
     /// Stand-in for onwards/upstream: a chat completion with a `usage` object.
     async fn mock_upstream() -> Json<serde_json::Value> {
         Json(serde_json::json!({
@@ -566,13 +660,17 @@ mod tests {
             PrincipalResolver::new(pool.clone()),
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new(tok.uri()),
-            Arc::new(PostgresIndex::new(pool.clone())),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
+            false,
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream))
-            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
         let server = axum_test::TestServer::new(app).unwrap();
 
         // First request: nothing cached yet → all-creation, response carries zeroed read.
@@ -598,16 +696,8 @@ mod tests {
             .unwrap()
             .cumulative_hashes[0]
             .clone();
-        let idx = PostgresIndex::new(pool.clone());
-        let mut committed = false;
-        for _ in 0..100 {
-            if !idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty() {
-                committed = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(committed, "the write should have committed after a 2xx");
+        let idx = PostgresIndex::new(pool.clone(), 1);
+        await_commit(&idx, &scope, &hash, "the write should have committed after a 2xx").await;
 
         // Second identical request → now a read hit on the committed prefix.
         let r2 = server
@@ -682,13 +772,17 @@ mod tests {
             PrincipalResolver::new(pool.clone()),
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new(tok.uri()),
-            Arc::new(PostgresIndex::new(pool.clone())),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
+            false,
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream_streaming))
-            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
         let server = axum_test::TestServer::new(app).unwrap();
 
         // First stream: the deferred classify resolves at the terminal usage frame, which is then
@@ -719,16 +813,8 @@ mod tests {
         .unwrap()
         .cumulative_hashes[0]
             .clone();
-        let idx = PostgresIndex::new(pool.clone());
-        let mut committed = false;
-        for _ in 0..100 {
-            if !idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty() {
-                committed = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(committed, "streaming write commits after a clean usage frame");
+        let idx = PostgresIndex::new(pool.clone(), 1);
+        await_commit(&idx, &scope, &hash, "streaming write commits after a clean usage frame").await;
 
         // Second identical stream → a read hit, injected into the terminal frame.
         let r2 = server
@@ -791,13 +877,17 @@ mod tests {
             PrincipalResolver::new(pool.clone()),
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new(tok.uri()),
-            Arc::new(PostgresIndex::new(pool.clone())),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
+            false,
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream_streaming_error))
-            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
         let server = axum_test::TestServer::new(app).unwrap();
 
         // Drain the stream: a mid-stream error frame and no usage frame → veto.
@@ -823,7 +913,7 @@ mod tests {
         .unwrap()
         .cumulative_hashes[0]
             .clone();
-        let idx = PostgresIndex::new(pool.clone());
+        let idx = PostgresIndex::new(pool.clone(), 1);
         for _ in 0..50 {
             tokio::task::yield_now().await;
         }
@@ -840,13 +930,15 @@ mod tests {
             PrincipalResolver::new(pool.clone()),
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new("http://127.0.0.1:1"),
-            Arc::new(PostgresIndex::new(pool.clone())),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
             all_tiers(),
             TelemetryPolicy::default(),
+            false,
         );
-        let app = Router::new()
-            .route("/v1/embeddings", post(mock_upstream))
-            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+        let app = Router::new().route("/v1/embeddings", post(mock_upstream)).layer(from_fn_with_state(
+            CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+            cache_middleware,
+        ));
         let server = axum_test::TestServer::new(app).unwrap();
         let r = server
             .post("/v1/embeddings")
@@ -864,13 +956,17 @@ mod tests {
             PrincipalResolver::new(pool.clone()),
             ModelConfigResolver::new(pool.clone()),
             TokenizerClient::new("http://127.0.0.1:1"),
-            Arc::new(PostgresIndex::new(pool.clone())),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
             TierPolicy::from_config(&["5m".to_string()], "5m"),
             TelemetryPolicy::default(),
+            false,
         );
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream)) // must NOT be reached
-            .layer(from_fn_with_state(CacheLayerState::new(classifier, usize::MAX), cache_middleware));
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
         let server = axum_test::TestServer::new(app).unwrap();
 
         let r = server
@@ -890,5 +986,426 @@ mod tests {
         let msg = v["error"]["message"].as_str().unwrap();
         assert!(msg.contains("24h"), "message names the rejected tier: {msg}");
         assert!(msg.contains("available tiers: 5m"), "message names the available tiers: {msg}");
+    }
+
+    /// Upstream stand-in that reports ITS OWN cache accounting — the OpenRouter implicit-cache
+    /// shape observed in prod on kimi-k3 (provider cached 687 of 985 prompt tokens on a model
+    /// with no cache tariff, i.e. billed at full price).
+    async fn mock_upstream_with_provider_cache() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "id": "chatcmpl-1", "object": "chat.completion",
+            "choices": [{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage": {
+                "prompt_tokens": 985, "completion_tokens": 2, "total_tokens": 987,
+                "prompt_tokens_details": {"cached_tokens": 687},
+                "cache_read_input_tokens": 687
+            }
+        }))
+    }
+
+    #[sqlx::test]
+    async fn inactive_model_scrubs_provider_cache_fields(pool: PgPool) {
+        // No deployed model / cache tariff → classify resolves inactive. The provider's own
+        // cache accounting must still be scrubbed: the customer is billed full price, so a
+        // forwarded `cached_tokens: 687` would read as a discount we didn't give.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream_with_provider_cache))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        let r = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({"model": ALIAS, "messages": [{"role":"user","content":"hi"}]}))
+            .await;
+        r.assert_status_ok();
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["usage"]["prompt_tokens"], 985, "token totals untouched");
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0, "provider hit zeroed");
+        assert!(
+            v["usage"].get("cache_read_input_tokens").is_none(),
+            "provider extension field removed: {v}"
+        );
+    }
+
+    /// Streaming variant of [`mock_upstream_with_provider_cache`].
+    async fn mock_upstream_streaming_with_provider_cache() -> Response {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":985,\"completion_tokens\":2,\"total_tokens\":987,\"prompt_tokens_details\":{\"cached_tokens\":687}}}\n\n\
+                   data: [DONE]\n\n";
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from(sse))
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn inactive_model_scrubs_streaming_terminal_frame(pool: PgPool) {
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream_streaming_with_provider_cache))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        let r = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({"model": ALIAS, "stream": true, "messages": [{"role":"user","content":"hi"}]}))
+            .await;
+        r.assert_status_ok();
+        let t = r.text();
+        assert!(t.contains("\"cached_tokens\":0"), "provider hit zeroed in terminal frame: {t}");
+        assert!(!t.contains("687"), "provider value gone: {t}");
+        assert!(t.contains("\"content\":\"hi\""), "delta preserved: {t}");
+        assert!(t.contains("data: [DONE]"), "DONE preserved: {t}");
+    }
+
+    // ---- `?cacheBreakpoint=lastUserMessage` (query-param automatic caching) ----
+
+    /// A body with NO cache_control anywhere — the shape the proxy customer sends.
+    fn body_unmarked() -> serde_json::Value {
+        serde_json::json!({
+            "model": ALIAS,
+            "messages": [
+                {"role": "system", "content": "static system"},
+                {"role": "user", "content": "hi"}
+            ]
+        })
+    }
+
+    /// Tokenizer mocks sized for [`body_unmarked`]'s TWO blocks (the automatic breakpoint's write
+    /// span covers the whole request, unlike the single-marked-block mocks above).
+    async fn mount_tokenizer_two_segments(tok: &MockServer) {
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"alias": ALIAS, "hf_repo": "o/m", "tokenizer_version": TOK_VER}]
+            })))
+            .mount(tok)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/tokenize"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "virtual_model": ALIAS, "tokenizer_version": TOK_VER,
+                "segment_counts": [1500, 10], "cumulative": [1500, 1510], "total": 1510
+            })))
+            .mount(tok)
+            .await;
+    }
+
+    #[sqlx::test]
+    async fn query_param_end_to_end_creates_then_reads(pool: PgPool) {
+        // The customer's whole flow: an unmarked body + the query param behaves exactly like
+        // top-level automatic caching — first request writes the full conversation prefix,
+        // an identical follow-up reads it.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let id = create_test_model(&pool, "m", ALIAS, endpoint, user.id).await;
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens)
+               VALUES ($1, 1.25, 2.0, 2.5, 1024)"#,
+            id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tok = MockServer::start().await;
+        mount_tokenizer_two_segments(&tok).await;
+
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new(tok.uri()),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        let r1 = server
+            .post("/v1/chat/completions")
+            .add_query_param("cacheBreakpoint", "lastUserMessage")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&body_unmarked())
+            .await;
+        r1.assert_status_ok();
+        let v1: serde_json::Value = r1.json();
+        assert_eq!(v1["usage"]["cache_read_input_tokens"], 0);
+        assert_eq!(
+            v1["usage"]["cache_creation_input_tokens"], 1510,
+            "the whole conversation is the written prefix"
+        );
+
+        // The write lands at the LAST block's cumulative hash (markers never enter the hash, so
+        // the unmarked body parses to the same hashes).
+        let scope = IndexScope {
+            principal_id: user.id,
+            virtual_model: ALIAS.into(),
+            tokenizer_version: TOK_VER.into(),
+        };
+        let hash = parse_chat_completions(
+            &serde_json::to_vec(&body_unmarked()).unwrap(),
+            &all_tiers(),
+            &TelemetryPolicy::default(),
+        )
+        .unwrap()
+        .cumulative_hashes[1]
+            .clone();
+        let idx = PostgresIndex::new(pool.clone(), 1);
+        await_commit(&idx, &scope, &hash, "the query-param write should commit after a 2xx").await;
+
+        let r2 = server
+            .post("/v1/chat/completions")
+            .add_query_param("cacheBreakpoint", "lastUserMessage")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&body_unmarked())
+            .await;
+        let v2: serde_json::Value = r2.json();
+        assert_eq!(v2["usage"]["cache_read_input_tokens"], 1510, "second request reads the prefix");
+        assert_eq!(v2["usage"]["cache_creation_input_tokens"], 0);
+    }
+
+    /// Upstream stand-in that echoes what it received (URI query + whether the body still carried
+    /// any `cache_control`), so strip behavior is assertable end-to-end.
+    async fn mock_upstream_echoing(req: Request) -> Json<serde_json::Value> {
+        let (req_parts, body) = req.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let body_has_cache_control = String::from_utf8_lossy(&bytes).contains("cache_control");
+        Json(serde_json::json!({
+            "id": "chatcmpl-1", "object": "chat.completion",
+            "choices": [{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+            "echo": {"query": req_parts.uri.query(), "body_has_cache_control": body_has_cache_control}
+        }))
+    }
+
+    #[sqlx::test]
+    async fn query_param_stripped_before_upstream_others_preserved(pool: PgPool) {
+        // Neither the param (onwards forwards path_and_query verbatim) nor the injected marker
+        // may leak upstream; unrelated query params must survive.
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream_echoing))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        let r = server
+            .post("/v1/chat/completions")
+            .add_query_param("foo", "bar")
+            .add_query_param("cacheBreakpoint", "lastUserMessage")
+            .json(&body_unmarked())
+            .await;
+        r.assert_status_ok();
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["echo"]["query"], "foo=bar", "param stripped, others preserved");
+        assert_eq!(v["echo"]["body_has_cache_control"], false, "injected marker stripped from the body");
+    }
+
+    #[sqlx::test]
+    async fn query_param_invalid_value_rejected_400(pool: PgPool) {
+        // Strict: a typo'd value is a 400 up front, never a silent no-cache.
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream)) // must NOT be reached
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        let r = server
+            .post("/v1/chat/completions")
+            .add_query_param("cacheBreakpoint", "lastusermessage")
+            .json(&body_unmarked())
+            .await;
+        r.assert_status(StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["error"]["code"], "invalid_cache_breakpoint");
+        assert_eq!(v["error"]["param"], "cacheBreakpoint");
+        let msg = v["error"]["message"].as_str().unwrap();
+        assert!(msg.contains("lastusermessage"), "names the rejected value: {msg}");
+        assert!(msg.contains("lastUserMessage"), "names the supported value: {msg}");
+    }
+
+    #[sqlx::test]
+    async fn query_param_composes_with_explicit_markers(pool: PgPool) {
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream_echoing))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        // An explicit 5m marker on the LAST block conflicts with the injected 1h automatic
+        // marker → the existing automatic-caching 400, exactly as if the client had sent the
+        // top-level field itself.
+        let conflicting = serde_json::json!({
+            "model": ALIAS,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "q", "cache_control": {"type": "ephemeral", "ttl": "5m"}}
+            ]}]
+        });
+        let r = server
+            .post("/v1/chat/completions")
+            .add_query_param("cacheBreakpoint", "lastUserMessage")
+            .json(&conflicting)
+            .await;
+        r.assert_status(StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["error"]["code"], "invalid_cache_control");
+        assert!(v["error"]["message"].as_str().unwrap().contains("conflicts"));
+
+        // But a body that EXPLICITLY opted in at the top level wins over the param: top-level 5m
+        // + explicit 5m on the last block is the same-ttl no-op → 200. (If the param's 1h had
+        // overwritten the body field, this would be the conflict 400 above.)
+        let body_wins = serde_json::json!({
+            "model": ALIAS,
+            "cache_control": {"type": "ephemeral", "ttl": "5m"},
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "q", "cache_control": {"type": "ephemeral", "ttl": "5m"}}
+            ]}]
+        });
+        let r = server
+            .post("/v1/chat/completions")
+            .add_query_param("cacheBreakpoint", "lastUserMessage")
+            .json(&body_wins)
+            .await;
+        r.assert_status_ok();
+
+        // An earlier (non-last-block) explicit marker simply composes: system layer + moving
+        // frontier, two breakpoints, no error.
+        let composing = serde_json::json!({
+            "model": ALIAS,
+            "messages": [
+                {"role": "system", "content": [
+                    {"type": "text", "text": "sys", "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+                ]},
+                {"role": "user", "content": "q"}
+            ]
+        });
+        let r = server
+            .post("/v1/chat/completions")
+            .add_query_param("cacheBreakpoint", "lastUserMessage")
+            .json(&composing)
+            .await;
+        r.assert_status_ok();
+    }
+
+    #[sqlx::test]
+    async fn query_param_streaming_injects_terminal_frame(pool: PgPool) {
+        // Streaming + param: the deferred classify path sees the injected marker and edits the
+        // terminal usage frame, same as body-field automatic caching.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let id = create_test_model(&pool, "m", ALIAS, endpoint, user.id).await;
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens)
+               VALUES ($1, 1.25, 2.0, 2.5, 1024)"#,
+            id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tok = MockServer::start().await;
+        mount_tokenizer_two_segments(&tok).await;
+
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new(tok.uri()),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream_streaming))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        let mut body = body_unmarked();
+        body["stream"] = serde_json::json!(true);
+        let r = server
+            .post("/v1/chat/completions")
+            .add_query_param("cacheBreakpoint", "lastUserMessage")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&body)
+            .await;
+        r.assert_status_ok();
+        let t = r.text();
+        assert!(t.contains("\"cache_creation_input_tokens\":1510"), "creation injected: {t}");
+        assert!(t.contains("data: [DONE]"), "DONE preserved: {t}");
     }
 }

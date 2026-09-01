@@ -2,8 +2,7 @@ use std::{str::FromStr, time::Duration};
 
 use onwards::{
     auth::ConstantTimeString,
-    load_balancer::ProviderPool,
-    target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, RoutingAction, TargetSpecOrList},
+    target::{LoadBalanceStrategy as OnwardsLoadBalanceStrategy, RequestClass, RoutingAction, TargetSpecOrList},
 };
 use tokio::{sync::mpsc, time::timeout};
 use tokio_util::sync::CancellationToken;
@@ -36,7 +35,7 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         capacity: None,
         sanitize_responses: true,
         trusted: false,
-        open_responses_adapter: true,
+        reasoning_translation: None,
         endpoint_url: url::Url::parse(endpoint_url).unwrap(),
         routing_rules: Vec::new(),
         fallback_enabled: false,
@@ -53,6 +52,7 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         endpoint_api_key: None,
         auth_header_name: "Authorization".to_string(),
         auth_header_prefix: "Bearer ".to_string(),
+        endpoint_accepts_scheduling_priority: false,
         api_keys: Vec::new(),
     }
 }
@@ -62,13 +62,16 @@ const KEY_A_SECRET: &str = "sk-cache-a";
 const KEY_B_SECRET: &str = "sk-cache-b";
 const KEY_BATCH_SECRET: &str = "sk-cache-batch";
 
-fn pool_has_key(pool: &ProviderPool, key: &str) -> bool {
+fn pool_has_key(pools: &onwards::target::TargetPools, key: &str) -> bool {
     let expected = ConstantTimeString::from(key.to_string());
-    pool.keys().is_some_and(|keys| keys.iter().any(|candidate| candidate == &expected))
+    pools
+        .default_pool()
+        .keys()
+        .is_some_and(|keys| keys.iter().any(|candidate| candidate == &expected))
 }
 
-fn pool_keys_len(pool: &ProviderPool) -> usize {
-    pool.keys().map_or(0, |keys| keys.len())
+fn pool_keys_len(pools: &onwards::target::TargetPools) -> usize {
+    pools.default_pool().keys().map_or(0, |keys| keys.len())
 }
 
 #[test]
@@ -164,7 +167,11 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
 
     let public = targets.targets.get("regular-public").expect("regular-public should exist");
     let public_pool = public.value();
-    assert_eq!(public_pool.len(), 1, "regular-public should map to a single provider pool");
+    assert_eq!(
+        public_pool.default_pool().len(),
+        1,
+        "regular-public should map to a single provider pool"
+    );
     assert_eq!(pool_keys_len(public_pool), 4, "public model should expose system + all user keys");
     assert!(pool_has_key(public_pool, SYSTEM_KEY_SECRET));
     assert!(pool_has_key(public_pool, KEY_A_SECRET));
@@ -173,7 +180,11 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
 
     let private = targets.targets.get("regular-private").expect("regular-private should exist");
     let private_pool = private.value();
-    assert_eq!(private_pool.len(), 1, "regular-private should map to a single provider pool");
+    assert_eq!(
+        private_pool.default_pool().len(),
+        1,
+        "regular-private should map to a single provider pool"
+    );
     assert_eq!(
         pool_keys_len(private_pool),
         2,
@@ -184,7 +195,7 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
     assert!(!pool_has_key(private_pool, KEY_B_SECRET));
     assert!(!pool_has_key(private_pool, KEY_BATCH_SECRET));
 
-    let provider = &private_pool.providers()[0];
+    let provider = &private_pool.default_pool().providers()[0];
     assert_eq!(provider.target.onwards_model.as_deref(), Some("regular-private-model"));
     assert_eq!(provider.target.upstream_auth_header_name.as_deref(), Some("X-API-Key"));
     assert_eq!(provider.target.upstream_auth_header_prefix.as_deref(), Some("Token "));
@@ -192,6 +203,330 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
         provider.target.sanitize_response,
         "sanitize flag should be propagated to regular target"
     );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_endpoint_reasoning_default_reaches_standard_provider(pool: sqlx::PgPool) {
+    let endpoint_config = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["minimal", "xhigh", "max"],
+            "writes": [{
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "low": true, "medium": true, "high": true}
+            }]
+        }
+    });
+    sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = '30000000-0000-0000-0000-000000000002'")
+        .bind(endpoint_config)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("regular-private").unwrap();
+    let provider = &target.value().default_pool().providers()[0];
+    assert_eq!(
+        provider
+            .target
+            .reasoning_translation
+            .as_ref()
+            .unwrap()
+            .chat_completions
+            .as_ref()
+            .unwrap()
+            .writes[0]
+            .target_path,
+        "/chat_template_kwargs/thinking"
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_chat_override_preserves_endpoint_responses_default(pool: sqlx::PgPool) {
+    let endpoint_config = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["minimal", "xhigh", "max"],
+            "writes": [{
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "low": true, "medium": true, "high": true}
+            }]
+        },
+        "responses": {
+            "unsupported_efforts": [],
+            "writes": [{
+                "target_path": "/reasoning/effort",
+                "values": {
+                    "none": "none", "minimal": "minimal", "low": "low", "medium": "medium",
+                    "high": "high", "xhigh": "xhigh", "max": "max"
+                }
+            }]
+        }
+    });
+    sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = '30000000-0000-0000-0000-000000000002'")
+        .bind(endpoint_config)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let model_override = serde_json::json!({
+        "chat_completions": {
+            "mode": "override",
+            "translation": {
+                "unsupported_efforts": ["minimal", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/thinking/type",
+                    "values": {"none": "disabled", "low": "enabled", "medium": "enabled", "high": "enabled"}
+                }]
+            }
+        },
+        "responses": {"mode": "inherit"}
+    });
+    sqlx::query("UPDATE deployed_models SET reasoning_translation_overrides = $1 WHERE alias = 'regular-private'")
+        .bind(model_override)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("regular-private").unwrap();
+    let provider = &target.value().default_pool().providers()[0];
+    assert_eq!(
+        provider
+            .target
+            .reasoning_translation
+            .as_ref()
+            .unwrap()
+            .chat_completions
+            .as_ref()
+            .unwrap()
+            .writes[0]
+            .target_path,
+        "/thinking/type"
+    );
+    assert_eq!(
+        provider
+            .target
+            .reasoning_translation
+            .as_ref()
+            .unwrap()
+            .responses
+            .as_ref()
+            .unwrap()
+            .writes[0]
+            .target_path,
+        "/reasoning/effort"
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_disabling_one_reasoning_surface_preserves_the_other(pool: sqlx::PgPool) {
+    let endpoint_config = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["minimal", "xhigh", "max"],
+            "writes": [{
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "low": true, "medium": true, "high": true}
+            }]
+        },
+        "responses": {
+            "unsupported_efforts": [],
+            "writes": [{
+                "target_path": "/reasoning/effort",
+                "values": {
+                    "none": "none", "minimal": "minimal", "low": "low", "medium": "medium",
+                    "high": "high", "xhigh": "xhigh", "max": "max"
+                }
+            }]
+        }
+    });
+    sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = '30000000-0000-0000-0000-000000000002'")
+        .bind(endpoint_config)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let model_overrides = serde_json::json!({
+        "chat_completions": {"mode": "disabled"},
+        "responses": {"mode": "inherit"}
+    });
+    sqlx::query("UPDATE deployed_models SET reasoning_translation_overrides = $1 WHERE alias = 'regular-private'")
+        .bind(model_overrides)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("regular-private").unwrap();
+    let pool = target.value();
+    let provider = &pool.default_pool().providers()[0];
+    let config = provider.target.reasoning_translation.as_ref().unwrap();
+    assert!(config.chat_completions.is_none());
+    assert!(config.responses.is_some());
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_disabling_both_reasoning_surfaces_removes_provider_config(pool: sqlx::PgPool) {
+    let endpoint_config = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["minimal", "xhigh", "max"],
+            "writes": [{
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "low": true, "medium": true, "high": true}
+            }]
+        },
+        "responses": {
+            "unsupported_efforts": [],
+            "writes": [{
+                "target_path": "/reasoning/effort",
+                "values": {
+                    "none": "none", "minimal": "minimal", "low": "low", "medium": "medium",
+                    "high": "high", "xhigh": "xhigh", "max": "max"
+                }
+            }]
+        }
+    });
+    sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = '30000000-0000-0000-0000-000000000002'")
+        .bind(endpoint_config)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let model_overrides = serde_json::json!({
+        "chat_completions": {"mode": "disabled"},
+        "responses": {"mode": "disabled"}
+    });
+    sqlx::query("UPDATE deployed_models SET reasoning_translation_overrides = $1 WHERE alias = 'regular-private'")
+        .bind(model_overrides)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("regular-private").unwrap();
+    let pool = target.value();
+    let provider = &pool.default_pool().providers()[0];
+    assert!(provider.target.reasoning_translation.is_none());
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_token_budget_multi_write_survives_provider_sync(pool: sqlx::PgPool) {
+    let endpoint_config = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["none", "minimal", "low", "medium", "xhigh", "max"],
+            "writes": [
+                {"target_path": "/reasoning_effort", "values": {"high": "high"}},
+                {"target_path": "/thinking_token_budget", "values": {"high": 8192}}
+            ]
+        }
+    });
+    sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = '30000000-0000-0000-0000-000000000002'")
+        .bind(endpoint_config)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("regular-private").unwrap();
+    let pool = target.value();
+    let provider = &pool.default_pool().providers()[0];
+    let writes = &provider
+        .target
+        .reasoning_translation
+        .as_ref()
+        .unwrap()
+        .chat_completions
+        .as_ref()
+        .unwrap()
+        .writes;
+    assert_eq!(writes.len(), 2);
+    assert_eq!(writes[0].target_path, "/reasoning_effort");
+    assert_eq!(writes[1].target_path, "/thinking_token_budget");
+    assert_eq!(
+        writes[1].values[&onwards::reasoning::ReasoningEffort::High],
+        serde_json::json!(8192)
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_composite_components_keep_distinct_effective_reasoning_translations(pool: sqlx::PgPool) {
+    let endpoint_a = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["minimal", "xhigh", "max"],
+            "writes": [{
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "low": true, "medium": true, "high": true}
+            }]
+        }
+    });
+    let endpoint_b = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": [],
+            "writes": [{
+                "target_path": "/reasoning_effort",
+                "values": {
+                    "none": "none", "minimal": "minimal", "low": "low", "medium": "medium",
+                    "high": "high", "xhigh": "xhigh", "max": "max"
+                }
+            }]
+        }
+    });
+    sqlx::query("UPDATE inference_endpoints SET reasoning_translation = CASE id WHEN '30000000-0000-0000-0000-000000000001' THEN $1::jsonb ELSE $2::jsonb END WHERE id IN ('30000000-0000-0000-0000-000000000001', '30000000-0000-0000-0000-000000000002')")
+        .bind(endpoint_a)
+        .bind(endpoint_b)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let component_b_override = serde_json::json!({
+        "chat_completions": {
+            "mode": "override",
+            "translation": {
+                "unsupported_efforts": ["minimal", "xhigh", "max"],
+                "writes": [{
+                    "target_path": "/thinking/type",
+                    "values": {"none": "disabled", "low": "enabled", "medium": "enabled", "high": "enabled"}
+                }]
+            }
+        }
+    });
+    sqlx::query("UPDATE deployed_models SET reasoning_translation_overrides = $1 WHERE alias = 'component-b'")
+        .bind(component_b_override)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let target = targets.targets.get("composite-priority").unwrap();
+    let pool = target.value();
+    let providers = pool.default_pool().providers();
+    let paths = providers
+        .iter()
+        .map(|provider| {
+            let path = provider
+                .target
+                .reasoning_translation
+                .as_ref()
+                .unwrap()
+                .chat_completions
+                .as_ref()
+                .unwrap()
+                .writes[0]
+                .target_path
+                .as_str();
+            (provider.target.onwards_model.as_deref().unwrap(), path)
+        })
+        .collect::<std::collections::HashMap<_, _>>();
+
+    assert_eq!(paths["component-a-model"], "/chat_template_kwargs/thinking");
+    assert_eq!(paths["component-b-model"], "/thinking/type");
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
@@ -288,6 +623,80 @@ async fn test_balance_change_toggles_paid_access_on_reload(pool: sqlx::PgPool) {
     );
 }
 
+/// Spending-cap gate: an exhausted scope loses paid-model access as a unit
+/// (capped root AND its hidden batch child), free models stay usable, one-off
+/// caps never self-heal, and a windowed cap readmits at the calendar boundary
+/// with no fold or traffic required (the lazy-readmission path the fallback
+/// sync provides).
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
+async fn test_spend_cap_toggles_scope_access_on_reload(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+
+    let tiers = RateLimitTiersConfig::default();
+    let key_a_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
+        .bind(KEY_A_SECRET)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    // Cap key A (one-off, $10) and mint its cap-scope child.
+    sqlx::query("UPDATE api_keys SET spend_limit = 10 WHERE id = $1")
+        .bind(key_a_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let child_secret = {
+        let mut conn = pool.acquire().await.unwrap();
+        let (secret, _) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(key_a_id).await.unwrap();
+        secret
+    };
+
+    // Under the cap: both scope keys are eligible for the paid pool.
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    let metered = targets.targets.get("metered-public").unwrap();
+    assert!(pool_has_key(metered.value(), KEY_A_SECRET));
+    assert!(pool_has_key(metered.value(), &child_secret), "child shares the scope's eligibility");
+
+    // Exhaust the scope: window_spend reaches the limit.
+    sqlx::query("INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend) VALUES ($1, 10, 10)")
+        .bind(key_a_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    let metered = targets.targets.get("metered-public").unwrap();
+    assert!(!pool_has_key(metered.value(), KEY_A_SECRET), "exhausted scope loses the paid pool");
+    assert!(!pool_has_key(metered.value(), &child_secret), "the child is yanked with its root");
+    assert!(
+        pool_has_key(targets.targets.get("regular-public").unwrap().value(), KEY_A_SECRET),
+        "free models stay usable on an exhausted scope, like the balance gate"
+    );
+
+    // One-off caps never roll over: an arbitrarily old window stays exhausted.
+    sqlx::query("UPDATE api_key_spend_checkpoints SET window_started_at = now() - interval '40 days' WHERE api_key_id = $1")
+        .bind(key_a_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(
+        !pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_A_SECRET),
+        "one-off cap must not self-heal"
+    );
+
+    // Windowed cap: the same stale window is no longer current, so the next
+    // reload readmits the whole scope — no fold, no traffic, no reset job.
+    sqlx::query("UPDATE api_keys SET spend_limit_interval = 'daily' WHERE id = $1")
+        .bind(key_a_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    let metered = targets.targets.get("metered-public").unwrap();
+    assert!(pool_has_key(metered.value(), KEY_A_SECRET), "rolled window readmits the root");
+    assert!(pool_has_key(metered.value(), &child_secret), "rolled window readmits the child");
+}
+
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::PgPool) {
     let alias = "escalation-private".to_string();
@@ -313,6 +722,109 @@ async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::
     assert!(pool_has_key(pool_with.value(), KEY_BATCH_SECRET));
 }
 
+/// The global continuation key must enter every composite's keyset regardless
+/// of group gating or pricing — it is SYSTEM-owned precisely so the access and
+/// balance gates exempt it. Owned by anyone else it would be silently absent
+/// from prod-shaped (group-restricted, priced) models, and every resume leg on
+/// them would 403 at onwards key auth.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_composite")))]
+async fn test_continuation_key_reaches_gated_and_priced_composites(pool: sqlx::PgPool) {
+    let secret = crate::continuation::provision_global_key(&pool).await.unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+
+    // composite-priority: group-restricted (group A only) AND priced (tariff
+    // fixture) with no user balances — the shape where every ordinarily-owned
+    // key fails the gates.
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    assert!(
+        pool_has_key(composite.value(), &secret),
+        "the continuation key must be in a gated, priced composite's keyset"
+    );
+
+    // regular-private: the group-restricted REGULAR model — pins the same
+    // exemption through the second (non-composite) keyset query.
+    let private = targets.targets.get("regular-private").expect("regular-private should exist");
+    assert!(
+        pool_has_key(private.value(), &secret),
+        "the continuation key must be in a group-restricted regular model's keyset"
+    );
+}
+
+/// `inference_endpoints.accepts_scheduling_priority` (migration 136) reaches
+/// each provider of every pool it hosts, so onwards can strip the dynamo-only
+/// `priority` field per member instead of per position. component-a is hosted
+/// on endpoint 0001 (unflagged), component-b on 0002 (flagged here).
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_endpoint_accepts_scheduling_priority_reaches_each_provider(pool: sqlx::PgPool) {
+    sqlx::query("UPDATE inference_endpoints SET accepts_scheduling_priority = true WHERE id = '30000000-0000-0000-0000-000000000002'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    let providers = composite.value().default_pool().providers();
+    // Fixture order: component-b (weight 30, sort 0) then component-a.
+    assert_eq!(providers[0].target.onwards_model.as_deref(), Some("component-b-model"));
+    assert!(
+        providers[0].target.accepts_scheduling_priority,
+        "a member hosted on a flagged endpoint accepts the scheduling field"
+    );
+    assert!(
+        !providers[1].target.accepts_scheduling_priority,
+        "a member hosted on an unflagged endpoint does not (default false)"
+    );
+
+    // Regular (non-composite) models carry it too.
+    let private = targets.targets.get("regular-private").expect("regular-private should exist");
+    assert!(
+        private.value().default_pool().providers()[0].target.accepts_scheduling_priority,
+        "regular-private is hosted on the flagged custom endpoint"
+    );
+}
+
+/// A named pool's ordering is a validated failover list (dynamo first, the
+/// harness-validated target behind it), never a load-balancing surface: under
+/// the composite's own strategy (DB default weighted_random) resume legs would
+/// split randomly between the free first hop and the paid provider.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_completions_pool_forces_priority_strategy(pool: sqlx::PgPool) {
+    sqlx::query("UPDATE deployed_models SET lb_strategy = 'weighted_random' WHERE alias = 'composite-priority'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, pool)
+         SELECT composite_model_id, deployed_model_id, 1, true, 0, 'completions'
+         FROM deployed_model_components
+         WHERE composite_model_id = '50000000-0000-0000-0000-000000000001' AND pool = 'default'
+         LIMIT 1",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    assert_eq!(
+        composite.value().default_pool().strategy(),
+        OnwardsLoadBalanceStrategy::WeightedRandom,
+        "the composite's own strategy still governs the default pool"
+    );
+    assert_eq!(
+        composite.value().resolve(RequestClass::Completions).strategy(),
+        OnwardsLoadBalanceStrategy::Priority,
+        "the completions pool is a failover list regardless of the composite's strategy"
+    );
+}
+
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
@@ -321,13 +833,21 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
     let composite_pool = composite.value();
 
-    assert_eq!(composite_pool.len(), 2, "composite pool should have two providers");
-    assert_eq!(composite_pool.strategy(), OnwardsLoadBalanceStrategy::Priority);
-    assert!(composite_pool.fallback_enabled());
-    assert!(!composite_pool.should_fallback_on_rate_limit());
-    assert!(composite_pool.should_fallback_on_status(429));
-    assert!(composite_pool.should_fallback_on_status(503));
-    assert!(!composite_pool.should_fallback_on_status(500));
+    assert_eq!(composite_pool.default_pool().len(), 2, "composite pool should have two providers");
+    assert_eq!(composite_pool.default_pool().strategy(), OnwardsLoadBalanceStrategy::Priority);
+    assert!(composite_pool.default_pool().fallback_enabled());
+    assert!(!composite_pool.default_pool().should_fallback_on_rate_limit());
+    assert!(composite_pool.default_pool().should_fallback_on_status(429));
+    assert!(!composite_pool.default_pool().should_fallback_on_status(499));
+    assert!(composite_pool.default_pool().should_fallback_on_status(503));
+    assert!(!composite_pool.default_pool().should_fallback_on_status(500));
+
+    let fallback = composite_pool.default_pool().fallback().expect("fallback should be set");
+    assert_eq!(
+        fallback.on_status,
+        vec![429, 503],
+        "explicit stored statuses must remain authoritative"
+    );
 
     // Composite model has no tariff in this fixture, so it's free.
     // Free models allow group-authorized keys regardless of balance.
@@ -342,7 +862,7 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     assert!(!pool_has_key(composite_pool, KEY_B_SECRET));
     assert!(!pool_has_key(composite_pool, KEY_BATCH_SECRET));
 
-    let providers = composite_pool.providers();
+    let providers = composite_pool.default_pool().providers();
     assert_eq!(providers[0].target.onwards_model.as_deref(), Some("component-b-model"));
     assert_eq!(providers[1].target.onwards_model.as_deref(), Some("component-a-model"));
     assert_eq!(providers[0].weight, 30);
@@ -353,9 +873,24 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     // Default migration state: no backoff configured. The fallback config
     // surfaces to onwards with `backoff: None`, which preserves the legacy
     // zero-delay retry behavior for composites that haven't opted in.
-    let fallback = composite_pool.fallback().expect("fallback should be set");
     assert!(fallback.backoff.is_none(), "backoff should default to None");
     assert!(fallback.max_total_backoff_ms.is_none());
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_cache_shape_null_composite_uses_application_fallback_status_default(pool: sqlx::PgPool) {
+    sqlx::query("UPDATE deployed_models SET fallback_on_status = NULL WHERE alias = 'composite-priority'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    let fallback = composite.value().default_pool().fallback().expect("fallback should be set");
+
+    assert_eq!(fallback.on_status, vec![429, 499, 500, 502, 503, 504]);
 }
 
 /// When an admin sets the per-model backoff knobs on a composite, the values
@@ -384,7 +919,7 @@ async fn test_cache_shape_composite_backoff_round_trips(pool: sqlx::PgPool) {
         .await
         .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
-    let fallback = composite.value().fallback().expect("fallback should be present");
+    let fallback = composite.value().default_pool().fallback().expect("fallback should be present");
 
     let backoff = fallback.backoff.as_ref().expect("backoff should be Some");
     assert_eq!(backoff.initial_ms, 250);
@@ -421,7 +956,7 @@ async fn test_cache_shape_composite_with_all_components_disabled(pool: sqlx::PgP
         .get("composite-priority")
         .expect("composite should still exist in cache even with all components disabled");
     assert!(
-        pool_entry.is_empty(),
+        pool_entry.default_pool().is_empty(),
         "composite pool should have zero providers when all components are disabled"
     );
 }
@@ -487,7 +1022,7 @@ async fn test_cache_shape_deleted_component_model_is_excluded_from_composite(poo
         .await
         .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
-    let providers = composite.value().providers();
+    let providers = composite.value().default_pool().providers();
     assert_eq!(
         providers.len(),
         1,
@@ -502,7 +1037,7 @@ async fn test_cache_shape_regular_model_routing_rules(pool: sqlx::PgPool) {
         .await
         .unwrap();
     let regular_private = targets.targets.get("regular-private").expect("regular-private should exist");
-    let rules = regular_private.value().routing_rules();
+    let rules = regular_private.value().default_pool().routing_rules();
 
     assert_eq!(rules.len(), 2, "regular-private should expose two routing rules");
 
@@ -522,7 +1057,7 @@ async fn test_cache_shape_composite_model_routing_rules(pool: sqlx::PgPool) {
         .await
         .unwrap();
     let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
-    let rules = composite.value().routing_rules();
+    let rules = composite.value().default_pool().routing_rules();
 
     assert_eq!(rules.len(), 2, "composite-priority should expose two routing rules");
 
@@ -535,6 +1070,48 @@ async fn test_cache_shape_composite_model_routing_rules(pool: sqlx::PgPool) {
     assert_eq!(rules[1].match_labels.get("purpose"), Some(&"realtime".to_string()));
     assert!(matches!(rules[1].action, RoutingAction::Deny));
 }
+/// A model's traffic rules are the DEFAULT pool's rules. A named pool gets the
+/// deny half only: a redirect names another model alias, so following one out of
+/// the completions pool would serve a resume leg — a token-id prefix rendered
+/// against this model — from a different model entirely.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
+async fn test_cache_shape_named_pool_inherits_denies_not_redirects(pool: sqlx::PgPool) {
+    // Give composite-priority a completions pool (it has batch → redirect and
+    // realtime → deny from the fixture).
+    sqlx::query!(
+        "UPDATE deployed_model_components SET pool = 'completions'
+         WHERE deployed_model_id = '40000000-0000-0000-0000-000000000005'"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    assert_eq!(composite.value().pool_count(), 2, "the composite now has two pools");
+
+    // The default pool carries the model's rules unchanged.
+    assert_eq!(composite.value().default_pool().routing_rules().len(), 2);
+
+    let completions = composite.value().resolve(onwards::target::RequestClass::Completions);
+    let rules = completions.routing_rules();
+    assert_eq!(rules.len(), 1, "only the deny travels into the named pool");
+    assert_eq!(rules[0].match_labels.get("purpose"), Some(&"realtime".to_string()));
+    assert!(matches!(rules[0].action, RoutingAction::Deny));
+
+    let batch = std::collections::HashMap::from([("purpose".to_string(), "batch".to_string())]);
+    assert!(
+        completions.evaluate_routing_rules(&batch).is_none(),
+        "batch traffic routes normally within the completions pool instead of being redirected to another model"
+    );
+    assert!(matches!(
+        composite.value().default_pool().evaluate_routing_rules(&batch),
+        Some(RoutingAction::Redirect { .. })
+    ));
+}
+
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_component_b_invalid_endpoint")))]
 #[ignore = "Known limitation: invalid component endpoint cannot be isolated because regular target loading panics on invalid endpoint URLs"]
 async fn test_known_issue_composite_invalid_component_endpoint_should_be_skipped(pool: sqlx::PgPool) {
@@ -643,6 +1220,43 @@ async fn test_system_key_is_immune_to_rate_limit_tiers(pool: sqlx::PgPool) {
     );
 }
 
+/// Endpoint defaults are consumed directly by the Onwards provider cache, so
+/// changing one must wake the listener even when no deployment row changes.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_endpoint_reasoning_update_notifies_onwards_config_listener(pool: sqlx::PgPool) {
+    use crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL;
+    use sqlx::postgres::PgListener;
+
+    let mut listener = PgListener::connect_with(&pool).await.unwrap();
+    listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await.unwrap();
+
+    let endpoint_id = uuid::Uuid::parse_str("30000000-0000-0000-0000-000000000002").unwrap();
+    let reasoning_translation = serde_json::json!({
+        "chat_completions": {
+            "unsupported_efforts": ["minimal", "xhigh", "max"],
+            "writes": [{
+                "target_path": "/chat_template_kwargs/thinking",
+                "values": {"none": false, "low": true, "medium": true, "high": true}
+            }]
+        }
+    });
+    let result = sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = $2")
+        .bind(reasoning_translation)
+        .bind(endpoint_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(result.rows_affected(), 1);
+
+    let notification = timeout(Duration::from_secs(1), listener.recv())
+        .await
+        .expect("endpoint reasoning update should notify Onwards")
+        .unwrap();
+    assert_eq!(notification.channel(), ONWARDS_CONFIG_CHANGED_CHANNEL);
+    let (table, _) = parse_notify_payload(notification.payload()).expect("timestamped notify payload");
+    assert_eq!(table, "inference_endpoints");
+}
+
 /// Test that tariff changes trigger onwards config reload via Postgres NOTIFY
 #[sqlx::test]
 async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
@@ -674,6 +1288,8 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             model_filter: None,
             auth_header_name: Some("Authorization".to_string()),
             auth_header_prefix: Some("Bearer ".to_string()),
+            reasoning_translation: None,
+            accepts_scheduling_priority: false,
         })
         .await
         .unwrap();
@@ -714,7 +1330,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             backoff_max_total_ms: None,
             sanitize_responses: true,
             trusted: false,
-            open_responses_adapter: true,
+            reasoning_translation_overrides: None,
             allowed_batch_completion_windows: None,
             metadata: None,
         })
@@ -895,6 +1511,8 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             model_filter: None,
             auth_header_name: Some("Authorization".to_string()),
             auth_header_prefix: Some("Bearer ".to_string()),
+            reasoning_translation: None,
+            accepts_scheduling_priority: false,
         })
         .await
         .unwrap();
@@ -936,7 +1554,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             metadata: None,
             sanitize_responses: true,
             trusted: false,
-            open_responses_adapter: true,
+            reasoning_translation_overrides: None,
         })
         .await
         .unwrap();
@@ -966,7 +1584,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             lb_strategy: Some(LoadBalancingStrategy::WeightedRandom),
             fallback_enabled: Some(true),
             fallback_on_rate_limit: Some(true),
-            fallback_on_status: Some(vec![429, 500, 502, 503, 504]),
+            fallback_on_status: Some(vec![429, 499, 500, 502, 503, 504]),
             fallback_with_replacement: None,
             allowed_batch_completion_windows: None,
             fallback_max_attempts: None,
@@ -979,7 +1597,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             metadata: None,
             sanitize_responses: true,
             trusted: false,
-            open_responses_adapter: true,
+            reasoning_translation_overrides: None,
         })
         .await
         .unwrap();
@@ -1010,6 +1628,8 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             requests_per_second: None,
             burst_size: None,
             created_by: test_user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
         })
         .await
         .unwrap();
@@ -1030,7 +1650,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
     // Verify batch API key has access
     // Keys are stored as ConstantTimeString in onwards
     let batch_key_ct = ConstantTimeString::from(batch_api_key.secret.clone());
-    let keys = pool_spec.keys().expect("Composite model should have keys");
+    let keys = pool_spec.default_pool().keys().expect("Composite model should have keys");
     let has_batch_key = keys.iter().any(|k| k == &batch_key_ct);
 
     assert!(has_batch_key, "Batch API key should have access to composite escalation target");
@@ -1240,4 +1860,82 @@ mod resolve_key_rate_limit_tests {
         let rl = super::super::resolve_key_rate_limit(None, None, false, &t).unwrap();
         assert_eq!(rl.requests_per_second, NonZeroU32::new(5).unwrap());
     }
+}
+
+/// The sync emits one named pool per composite pool: a composite nobody has
+/// given a second pool keeps the single-pool shape it always had, and attaching
+/// a completions member produces a second pool that chat traffic cannot reach.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool) {
+    // The fixture predates pools, so its components carry the column default.
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    assert_eq!(
+        composite.value().pool_count(),
+        1,
+        "an untouched composite has only its default pool"
+    );
+    let default_members = composite.value().default_pool().len();
+    assert!(default_members >= 2, "fixture has multiple members");
+    assert!(
+        composite
+            .value()
+            .resolved_name(onwards::target::RequestClass::Completions)
+            .is_none(),
+        "completions must resolve to the default pool until somebody adds a completions pool"
+    );
+
+    // Wire the canary: dynamo stays in the default pool AND joins the
+    // completions pool at position 0; the validated target is completions-only.
+    sqlx::query!(
+        "INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, pool)
+         SELECT composite_model_id, deployed_model_id, weight, enabled, 0, 'completions'
+         FROM deployed_model_components
+         WHERE deployed_model_id = '40000000-0000-0000-0000-000000000006'"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query!(
+        "UPDATE deployed_model_components SET pool = 'completions', sort_order = 1
+         WHERE deployed_model_id = '40000000-0000-0000-0000-000000000005'"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").expect("composite-priority should exist");
+    assert_eq!(composite.value().pool_count(), 2, "the composite now has two pools");
+    assert_eq!(
+        composite.value().resolved_name(onwards::target::RequestClass::Completions),
+        Some("completions")
+    );
+
+    let member_urls = |class| {
+        composite
+            .value()
+            .resolve(class)
+            .providers()
+            .iter()
+            .map(|p| p.target.url.to_string())
+            .collect::<Vec<_>>()
+    };
+    let chat = member_urls(onwards::target::RequestClass::Normal);
+    let completions = member_urls(onwards::target::RequestClass::Completions);
+    assert_eq!(completions.len(), 2, "dynamo plus the validated target, in failover order");
+    assert_eq!(
+        chat.len(),
+        default_members - 1,
+        "the validated target left the default pool, so chat can never reach it"
+    );
+
+    // A plain (non-composite) model is its own single pool, unchanged.
+    let regular = targets.targets.get("regular-public").expect("regular-public should exist");
+    assert_eq!(regular.value().pool_count(), 1);
+    assert!(regular.value().resolved_name(onwards::target::RequestClass::Completions).is_none());
 }

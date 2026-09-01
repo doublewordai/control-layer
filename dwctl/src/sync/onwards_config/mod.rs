@@ -1,13 +1,19 @@
 //! Configuration synchronization to onwards routing layer.
 
+use crate::db::models::deployments::DEFAULT_COMPONENT_POOL;
 use crate::metrics::errors::component::ONWARDS_SYNC;
-use std::{collections::HashMap, num::NonZeroU32, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashMap},
+    num::NonZeroU32,
+    sync::Arc,
+};
 
 use metrics::histogram;
 use onwards::target::{
     Auth, BackoffConfig as OnwardsBackoffConfig, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
-    JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, OpenResponsesConfig,
-    PoolSpec, ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
+    JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, PoolsSpec,
+    ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
+    inheritable_routing_rules,
 };
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
@@ -26,6 +32,7 @@ pub enum SyncStatus {
 use crate::{
     config::{ONWARDS_CONFIG_CHANGED_CHANNEL, RateLimitTiersConfig},
     db::models::deployments::LoadBalancingStrategy,
+    reasoning::{ReasoningTranslationConfig, resolve_reasoning_translation},
     types::{ApiKeyId, DeploymentId},
 };
 
@@ -58,7 +65,7 @@ struct OnwardsTarget {
     capacity: Option<i32>,
     sanitize_responses: bool,
     trusted: bool,
-    open_responses_adapter: bool,
+    reasoning_translation: Option<ReasoningTranslationConfig>,
     /// Traffic routing rules from the model_traffic_rules table
     routing_rules: Vec<RoutingRule>,
 
@@ -83,6 +90,10 @@ struct OnwardsTarget {
     endpoint_api_key: Option<String>,
     auth_header_name: String,
     auth_header_prefix: String,
+    /// The endpoint's serving stack understands the scheduling `priority`
+    /// body field (dynamo). Onwards strips the field from named-pool attempts
+    /// to members without it, regardless of position.
+    endpoint_accepts_scheduling_priority: bool,
 
     // API keys that have access to this deployment
     api_keys: Vec<OnwardsApiKey>,
@@ -443,6 +454,9 @@ impl OnwardsConfigSync {
 #[derive(Debug, Clone)]
 struct CompositeModelComponent {
     weight: i32,
+    /// Which of the composite's named pools this membership belongs to,
+    /// straight from `deployed_model_components.pool`.
+    pool: String,
     // Component target info (from the underlying deployed_model)
     target: OnwardsTarget,
 }
@@ -484,8 +498,6 @@ struct OnwardsCompositeModel {
     /// Whether to mark provider as trusted in strict mode
     #[allow(dead_code)] // Stored in DB but composite-level trust is not yet propagated to onwards
     trusted: bool,
-    /// Whether to enable the open_responses adapter at the pool level
-    open_responses_adapter: bool,
     /// Traffic routing rules from the database
     routing_rules: Vec<RoutingRule>,
     components: Vec<CompositeModelComponent>,
@@ -518,10 +530,10 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             cm.fallback_max_attempts,
             cm.sanitize_responses as composite_sanitize_responses,
             cm.trusted as composite_trusted,
-            cm.open_responses_adapter as "composite_open_responses_adapter?",
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
+            dmc.pool as component_pool,
             -- Underlying deployment info
             dm.model_name,
             dm.alias as deployment_alias,
@@ -530,12 +542,14 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             dm.capacity as deployment_capacity,
             dm.sanitize_responses as deployment_sanitize_responses,
             dm.trusted as deployment_trusted,
-            dm.open_responses_adapter as "deployment_open_responses_adapter?",
+            ie.reasoning_translation as endpoint_reasoning_translation,
+            dm.reasoning_translation_overrides as model_reasoning_translation_overrides,
             -- Endpoint info
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
             ie.auth_header_name,
-            ie.auth_header_prefix
+            ie.auth_header_prefix,
+            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority
         FROM deployed_models cm
         INNER JOIN deployed_model_components dmc ON cm.id = dmc.composite_model_id
         INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id
@@ -549,7 +563,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         -- weight/created_at keys break any residual sort_order tie the same way
         -- the admin API does, so the provider shown as "Primary" is the one
         -- onwards actually tries first.
-        ORDER BY cm.id, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
+        ORDER BY cm.id, dmc.pool, dmc.sort_order ASC, dmc.weight DESC, dmc.created_at ASC
         "#
     )
     .fetch_all(db)
@@ -624,6 +638,34 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 )
             )
             AND ak.is_deleted = false
+            -- Spending-cap gate: exclude every key of a cap scope (the capped
+            -- root and its hidden batch child alike) once the scope's
+            -- CALENDAR-ALIGNED (UTC, non-rolling) window spend has reached the
+            -- root's limit. Guarded so the uncapped majority short-circuits on
+            -- the first branch; the subquery is two PK probes. Free models
+            -- stay usable on an exhausted scope, mirroring the balance gate's
+            -- free-model arm. Un-capping needs no job or traffic: the
+            -- window-membership check (shared function, migration 123) turns
+            -- false at the calendar boundary and the periodic fallback sync
+            -- readmits the keys.
+            AND (
+                (ak.spend_limit IS NULL AND ak.parent_api_key_id IS NULL)
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM api_keys root
+                    LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
+                    WHERE root.id = COALESCE(ak.parent_api_key_id, ak.id)
+                      AND root.spend_limit IS NOT NULL
+                      AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
+                      AND ck.window_spend >= root.spend_limit
+                      AND EXISTS (
+                          SELECT 1 FROM model_tariffs mt
+                          WHERE mt.deployed_model_id = cm.id
+                            AND mt.valid_until IS NULL
+                            AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      )
+                )
+            )
             -- Inference data plane only: platform (management) keys must never
             -- enter onwards' key set. Mirrors is_inference_purpose in
             -- db::models::api_keys (SQL cannot call it). The system key is
@@ -631,7 +673,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             -- but is used internally for onwards inference, so it is exempt.
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
-                OR ak.purpose IN ('realtime', 'batch', 'playground')
+                OR ak.purpose IN ('realtime', 'batch', 'playground', 'continuation')
             )
         ) ak
         WHERE cm.is_composite = TRUE
@@ -667,8 +709,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             backoff_jitter,
             backoff_max_total_ms,
             sanitize_responses,
-            trusted,
-            open_responses_adapter as "open_responses_adapter?"
+            trusted
         FROM deployed_models
         WHERE is_composite = TRUE
           AND deleted = FALSE
@@ -697,7 +738,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 lb_strategy,
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
-                fallback_on_status: row.fallback_on_status.unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+                fallback_on_status: row.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 backoff_enabled: row.backoff_enabled,
@@ -708,7 +749,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 backoff_max_total_ms: row.backoff_max_total_ms,
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
-                open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
                 routing_rules: Vec::new(), // Populated from separate query below
                 components: Vec::new(),
                 api_keys: Vec::new(),
@@ -733,6 +773,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         if let Some(composite) = composite_map.get_mut(&row.composite_model_id) {
             composite.components.push(CompositeModelComponent {
                 weight: row.weight,
+                pool: row.component_pool.clone(),
                 target: OnwardsTarget {
                     model_name: row.model_name.clone(),
                     alias: row.deployment_alias.clone(),
@@ -741,7 +782,11 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     capacity: row.deployment_capacity,
                     sanitize_responses: row.deployment_sanitize_responses,
                     trusted: row.deployment_trusted,
-                    open_responses_adapter: row.deployment_open_responses_adapter.unwrap_or(true),
+                    reasoning_translation: resolve_reasoning_translation(
+                        row.endpoint_reasoning_translation,
+                        row.model_reasoning_translation_overrides,
+                        &row.deployment_alias,
+                    ),
                     routing_rules: Vec::new(), // Components don't have their own routing rules
                     // Components don't surface their own fallback/backoff —
                     // the composite's PoolSpec.fallback drives retries across
@@ -761,6 +806,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     endpoint_api_key: row.endpoint_api_key.clone(),
                     auth_header_name: row.auth_header_name.clone(),
                     auth_header_prefix: row.auth_header_prefix.clone(),
+                    endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
                     api_keys: Vec::new(),
                 },
             });
@@ -906,11 +952,12 @@ fn convert_composite_to_target_spec(
         None
     };
 
-    // Build provider specs from components
-    let providers: Vec<ProviderSpec> = composite
-        .components
-        .iter()
-        .map(|component| {
+    // Build provider specs from components, grouped by the pool each membership
+    // belongs to. The query orders by (pool, sort_order), so each pool's members
+    // come out in its own failover order.
+    let mut pool_providers: BTreeMap<String, Vec<ProviderSpec>> = BTreeMap::new();
+    for component in composite.components.iter() {
+        let provider = {
             let target = &component.target;
 
             // Build provider-level rate limiting (from underlying deployment)
@@ -957,9 +1004,6 @@ fn convert_composite_to_target_spec(
                     // For composite models, use the composite model's sanitize_responses setting
                     // This ensures the virtual model's toggle controls all providers
                     sanitize_response: composite.sanitize_responses,
-                    open_responses: Some(OpenResponsesConfig {
-                        adapter: target.open_responses_adapter,
-                    }),
                     request_timeout_secs: None,
                     // Each provider uses its own trusted setting from the database
                     // This allows fine-grained control over which providers bypass error sanitization
@@ -970,40 +1014,82 @@ fn convert_composite_to_target_spec(
                     // (third-party) providers do not, so our trace IDs aren't
                     // leaked to them.
                     propagate_trace_context: None,
+                    reasoning_translation: target.reasoning_translation.clone().map(Into::into),
+                    accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
                 }
             }
-        })
-        .collect();
+        };
+        pool_providers.entry(component.pool.clone()).or_default().push(provider);
+    }
+
+    // A composite always has a default pool, even with no members: an empty pool
+    // answers 503, which is what a composite with nothing enabled did before.
+    pool_providers.entry(DEFAULT_COMPONENT_POOL.to_string()).or_default();
 
     debug!(
-        "Composite model '{}' configured with {} providers, strategy: {:?}, fallback: {}, sanitize_responses: {}",
+        "Composite model '{}' configured with {} pool(s) ({} providers), strategy: {:?}, fallback: {}, sanitize_responses: {}",
         composite.alias,
-        providers.len(),
+        pool_providers.len(),
+        pool_providers.values().map(Vec::len).sum::<usize>(),
         strategy,
         composite.fallback_enabled,
         composite.sanitize_responses
     );
 
-    // Create PoolSpec with weighted providers
+    // Create a PoolSpec per pool, with the composite's settings applied to each.
     // Note: trusted is not set at the pool level for composite models
     // Each provider uses its own trusted setting via ProviderSpec.trusted
-    let pool_spec = PoolSpec {
-        keys,
-        rate_limit,
-        concurrency_limit,
-        fallback,
-        strategy,
+    //
+    // The model's traffic rules are the DEFAULT pool's rules. A named pool gets
+    // only the deny half (see `inheritable_routing_rules`): a redirect names
+    // another model alias, and following one out of a named pool would serve
+    // that class from a different model — for a `completions` resume leg, a
+    // token-id prefix rendered against model X decoded by model Y. Rules are
+    // per-model in the schema, so every pool we emit here is an inheriting
+    // pool; there is no such thing yet as a pool with rules of its own.
+    let make_pool = |pool_name: &str, providers: Vec<ProviderSpec>| PoolSpec {
+        keys: keys.clone(),
+        rate_limit: rate_limit.clone(),
+        concurrency_limit: concurrency_limit.clone(),
+        fallback: fallback.clone(),
+        // A named pool's ordering is a validated failover list (dynamo first,
+        // the harness-validated continuation target behind it), never a
+        // load-balancing surface: under the composite's own strategy (DB
+        // default weighted_random) resume legs would split randomly between
+        // the free first hop and the paid provider.
+        strategy: if pool_name == DEFAULT_COMPONENT_POOL {
+            strategy
+        } else {
+            OnwardsLoadBalanceStrategy::Priority
+        },
         providers,
         response_headers: None,
         sanitize_response: composite.sanitize_responses,
         trusted: false, // Pool-level trusted defaults to false; providers set their own
-        open_responses: Some(OpenResponsesConfig {
-            adapter: composite.open_responses_adapter,
-        }),
-        routing_rules: composite.routing_rules.clone(),
+        routing_rules: if pool_name == DEFAULT_COMPONENT_POOL {
+            composite.routing_rules.clone()
+        } else {
+            inheritable_routing_rules(&composite.routing_rules)
+        },
     };
 
-    (composite.alias.clone(), TargetSpecOrList::Pool(pool_spec))
+    let mut pools: HashMap<String, PoolSpec> = pool_providers
+        .into_iter()
+        .map(|(name, p)| {
+            let spec = make_pool(&name, p);
+            (name, spec)
+        })
+        .collect();
+
+    // A composite with only a default pool emits the single-pool shape it always
+    // emitted — no config churn for the models nobody has given a second pool.
+    let spec = if pools.len() == 1 {
+        TargetSpecOrList::Pool(pools.remove(DEFAULT_COMPONENT_POOL).expect("default pool is always present"))
+    } else {
+        TargetSpecOrList::Pools(PoolsSpec { pools })
+    };
+
+    (composite.alias.clone(), spec)
 }
 
 /// Resolves the rate limit for an API key. A non-NULL per-key
@@ -1127,15 +1213,14 @@ fn convert_to_config_file(
                 response_headers: None,
                 weight: 1,
                 sanitize_response: target.sanitize_responses,
-                open_responses: Some(OpenResponsesConfig {
-                    adapter: target.open_responses_adapter,
-                }),
                 request_timeout_secs: None,
                 trusted: Some(target.trusted),
                 // None → inherit from resolved `trusted` (see composite-model
                 // site above): self-hosted providers propagate W3C trace
                 // context, third-party providers do not.
                 propagate_trace_context: None,
+                reasoning_translation: target.reasoning_translation.clone().map(Into::into),
+                accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
             };
 
             // Build fallback configuration. For single-provider (standard)
@@ -1177,7 +1262,6 @@ fn convert_to_config_file(
                 strategy: OnwardsLoadBalanceStrategy::default(),
                 providers: vec![provider],
                 response_headers: None,
-                open_responses: None,
                 sanitize_response: target.sanitize_responses,
                 trusted: false,
                 routing_rules: target.routing_rules,
@@ -1252,7 +1336,8 @@ pub async fn load_targets_from_db(
             dm.capacity,
             dm.sanitize_responses,
             dm.trusted,
-            dm.open_responses_adapter,
+            ie.reasoning_translation as endpoint_reasoning_translation,
+            dm.reasoning_translation_overrides as model_reasoning_translation_overrides,
             dm.fallback_enabled,
             dm.fallback_on_rate_limit,
             dm.fallback_on_status,
@@ -1269,6 +1354,7 @@ pub async fn load_targets_from_db(
             ie.api_key as endpoint_api_key,
             ie.auth_header_name,
             ie.auth_header_prefix,
+            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,
             ak.id as "api_key_id?",
             ak.secret as "api_key_secret?",
             ak.purpose as "api_key_purpose?",
@@ -1333,6 +1419,34 @@ pub async fn load_targets_from_db(
                 )
             )
             AND ak.is_deleted = false
+            -- Spending-cap gate: exclude every key of a cap scope (the capped
+            -- root and its hidden batch child alike) once the scope's
+            -- CALENDAR-ALIGNED (UTC, non-rolling) window spend has reached the
+            -- root's limit. Guarded so the uncapped majority short-circuits on
+            -- the first branch; the subquery is two PK probes. Free models
+            -- stay usable on an exhausted scope, mirroring the balance gate's
+            -- free-model arm. Un-capping needs no job or traffic: the
+            -- window-membership check (shared function, migration 123) turns
+            -- false at the calendar boundary and the periodic fallback sync
+            -- readmits the keys.
+            AND (
+                (ak.spend_limit IS NULL AND ak.parent_api_key_id IS NULL)
+                OR NOT EXISTS (
+                    SELECT 1
+                    FROM api_keys root
+                    LEFT JOIN api_key_spend_checkpoints ck ON ck.api_key_id = root.id
+                    WHERE root.id = COALESCE(ak.parent_api_key_id, ak.id)
+                      AND root.spend_limit IS NOT NULL
+                      AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
+                      AND ck.window_spend >= root.spend_limit
+                      AND EXISTS (
+                          SELECT 1 FROM model_tariffs mt
+                          WHERE mt.deployed_model_id = dm.id
+                            AND mt.valid_until IS NULL
+                            AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      )
+                )
+            )
             -- Inference data plane only: platform (management) keys must never
             -- enter onwards' key set. Mirrors is_inference_purpose in
             -- db::models::api_keys (SQL cannot call it). The system key is
@@ -1340,7 +1454,7 @@ pub async fn load_targets_from_db(
             -- but is used internally for onwards inference, so it is exempt.
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
-                OR ak.purpose IN ('realtime', 'batch', 'playground')
+                OR ak.purpose IN ('realtime', 'batch', 'playground', 'continuation')
             )
         ) ak ON true
         WHERE dm.deleted = FALSE
@@ -1372,11 +1486,15 @@ pub async fn load_targets_from_db(
                 capacity: row.capacity,
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
-                open_responses_adapter: row.open_responses_adapter.unwrap_or(true),
+                reasoning_translation: resolve_reasoning_translation(
+                    row.endpoint_reasoning_translation.clone(),
+                    row.model_reasoning_translation_overrides.clone(),
+                    &row.alias,
+                ),
                 routing_rules: Vec::new(), // Populated from separate query below
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
-                fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 500, 502, 503, 504]),
+                fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 backoff_enabled: row.backoff_enabled,
@@ -1389,6 +1507,7 @@ pub async fn load_targets_from_db(
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),
                 auth_header_prefix: row.auth_header_prefix.clone(),
+                endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
                 api_keys: Vec::new(),
             }
         });

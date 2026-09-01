@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { Code, Play, Filter, Clock, DollarSign, Check, ChevronsUpDown, Zap, FastForward, Trash2, Loader2 } from "lucide-react";
+import { Code, Play, Filter, Clock, DollarSign, Check, ChevronsUpDown, Zap, FastForward, Moon, Trash2, Loader2 } from "lucide-react";
 import { type ColumnDef } from "@tanstack/react-table";
 import { toast } from "sonner";
 import { Button } from "../../ui/button";
@@ -48,9 +48,10 @@ import { useOrganizationContext } from "../../../contexts/organization/useOrgani
 import { useServerPagination } from "../../../hooks/useServerPagination";
 import { usePersistedFilter } from "../../../hooks/usePersistedFilter";
 import { formatTimestamp, formatLongDuration, copyToClipboard } from "../../../utils";
+import { getServiceTierLabel } from "../../../utils/serviceTier";
 
 const PERSIST_SCOPE = "responses";
-const DEFAULT_TIER_FILTER: string[] = ["flex", "priority"];
+const DEFAULT_TIER_FILTER: string[] = ["flex", "priority", "background"];
 const EMPTY_MODEL_FILTER: string[] = [];
 
 const getStatusColor = (status: string): string => {
@@ -180,7 +181,8 @@ function createColumns(
     cell: ({ row }) => {
       const tier = row.getValue("service_tier") as string | null;
       if (!tier) return <span className="text-sm text-doubleword-neutral-600">-</span>;
-      const Icon = tier === "flex" ? FastForward : Zap;
+      const Icon =
+        tier === "flex" ? FastForward : tier === "background" ? Moon : Zap;
       return (
         <Tooltip>
           <TooltipTrigger asChild>
@@ -189,7 +191,7 @@ function createColumns(
             </span>
           </TooltipTrigger>
           <TooltipContent side="top">
-            {tier.charAt(0).toUpperCase() + tier.slice(1)}
+            {getServiceTierLabel(tier)}
           </TooltipContent>
         </Tooltip>
       );
@@ -244,11 +246,10 @@ function createColumns(
     id: "cost",
     header: "Cost",
     cell: ({ row }) => {
-      const { prompt_tokens, completion_tokens, total_cost } = row.original;
-      const noTokens =
-        (prompt_tokens == null && completion_tokens == null) ||
-        (prompt_tokens === 0 && completion_tokens === 0);
-      if (total_cost == null || noTokens) {
+      const { total_cost } = row.original;
+      // Cost is sourced from the durable credits ledger (COR-524 follow-up), so show it
+      // whenever present — independent of token counts, which age out of http_analytics.
+      if (total_cost == null) {
         return <span className="text-sm text-doubleword-neutral-600">-</span>;
       }
       return (
@@ -501,7 +502,7 @@ export function AsyncRequests() {
                   <div className="flex items-center gap-1.5 truncate">
                     <Filter className="w-3.5 h-3.5 shrink-0 text-gray-500" />
                     <span className="truncate">
-                      {tierFilter.length === 2
+                      {tierFilter.length === DEFAULT_TIER_FILTER.length
                         ? "All tiers"
                         : tierFilter.length === 1
                           ? tierFilter[0].charAt(0).toUpperCase() + tierFilter[0].slice(1)
@@ -512,7 +513,7 @@ export function AsyncRequests() {
                 </Button>
               </PopoverTrigger>
               <PopoverContent className="w-[160px] p-2" align="start">
-                {(["flex", "priority"] as const).map((tier) => (
+                {(["flex", "priority", "background"] as const).map((tier) => (
                   <label
                     key={tier}
                     className="flex items-center gap-2 px-2 py-1.5 text-sm cursor-pointer rounded hover:bg-gray-50"
@@ -530,7 +531,7 @@ export function AsyncRequests() {
                       }}
                       className="rounded border-gray-300"
                     />
-                    {tier === "flex" ? "Flex" : "Priority"}
+                    {getServiceTierLabel(tier)}
                   </label>
                 ))}
               </PopoverContent>

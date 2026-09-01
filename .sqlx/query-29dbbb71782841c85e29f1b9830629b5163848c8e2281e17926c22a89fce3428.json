@@ -132,6 +132,26 @@
         "ordinal": 25,
         "name": "zero_data_retention",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 26,
+        "name": "auto_topup_soft_failure_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 27,
+        "name": "auto_topup_retry_after",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 28,
+        "name": "invoicing_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 29,
+        "name": "auto_join_enabled",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -164,6 +184,10 @@
       true,
       true,
       false,
+      false,
+      false,
+      false,
+      true,
       false,
       false
     ]

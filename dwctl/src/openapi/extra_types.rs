@@ -459,6 +459,11 @@ pub struct ModelObject {
     /// The organization that owns the model.
     #[schema(example = "qwen")]
     pub owned_by: String,
+
+    /// Doubleword extension containing the reasoning efforts supported by
+    /// every provider behind this model. Returned only when requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub supported_reasoning_efforts: Option<crate::reasoning::SupportedReasoningEfforts>,
 }
 
 // ============================================================================

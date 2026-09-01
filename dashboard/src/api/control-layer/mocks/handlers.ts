@@ -92,6 +92,30 @@ const groupsData = groupsDataRaw as Group[];
 const endpointsData = endpointsDataRaw as Endpoint[];
 const modelsData = modelsDataRaw.data as Model[];
 const apiKeysData = apiKeysDataRaw as ApiKey[];
+
+// Next calendar-aligned UTC reset boundary for a usage-limit interval; null
+// for one-off caps. Mirrors the backend's date_trunc semantics (and the
+// spendCap.ts helper — duplicated so mocks stay free of component imports).
+function nextCapResetIso(interval: string | null): string | null {
+  if (!interval) return null;
+  const now = new Date();
+  const y = now.getUTCFullYear();
+  const m = now.getUTCMonth();
+  const d = now.getUTCDate();
+  switch (interval) {
+    case "daily":
+      return new Date(Date.UTC(y, m, d + 1)).toISOString();
+    case "weekly": {
+      const dow = now.getUTCDay();
+      const daysUntilMonday = dow === 0 ? 1 : 8 - dow;
+      return new Date(Date.UTC(y, m, d + daysUntilMonday)).toISOString();
+    }
+    case "monthly":
+      return new Date(Date.UTC(y, m + 1, 1)).toISOString();
+    default:
+      return null;
+  }
+}
 const transactionsData = transactionsDataRaw as Transaction[];
 const organizationsData = organizationsDataRaw as unknown as Organization[];
 let providerDisplayConfigsData: ProviderDisplayConfig[] = [
@@ -116,6 +140,7 @@ const orgMembersData: Record<string, OrganizationMember[]> = {
       role: "owner",
       status: "active",
       created_at: "2025-01-15T10:00:00Z",
+      can_manage_keys: true,
     },
     {
       id: "mem-002",
@@ -123,6 +148,7 @@ const orgMembersData: Record<string, OrganizationMember[]> = {
       role: "member",
       status: "active",
       created_at: "2025-02-01T10:00:00Z",
+      can_manage_keys: false,
     },
     {
       id: "mem-003",
@@ -130,6 +156,7 @@ const orgMembersData: Record<string, OrganizationMember[]> = {
       status: "pending",
       created_at: "2025-06-01T10:00:00Z",
       invite_email: "newuser@acme.com",
+      can_manage_keys: false,
     },
   ],
   "org-550e8400-0002": [
@@ -139,6 +166,7 @@ const orgMembersData: Record<string, OrganizationMember[]> = {
       role: "owner",
       status: "active",
       created_at: "2025-03-20T14:00:00Z",
+      can_manage_keys: true,
     },
   ],
 };
@@ -229,6 +257,7 @@ function resolveComponents(modelId: string): import("../types").ModelComponent[]
       enabled: sc.enabled,
       sort_order: sc.sort_order,
       created_at: "2025-09-15T00:00:00Z",
+      pool: "default" as const,
       model: {
         id: componentModel?.id ?? sc.componentModelId,
         alias: componentModel?.alias ?? "unknown",
@@ -237,7 +266,6 @@ function resolveComponents(modelId: string): import("../types").ModelComponent[]
         model_type: componentModel?.model_type ?? undefined,
         endpoint: endpoint ? { id: endpoint.id, name: endpoint.name } : undefined,
         trusted: componentModel?.trusted,
-        open_responses_adapter: componentModel?.open_responses_adapter,
       },
     };
   });
@@ -997,12 +1025,18 @@ export const handlers = [
     const url = new URL(request.url);
     const skip = parseInt(url.searchParams.get("skip") || "0", 10);
     const limit = parseInt(url.searchParams.get("limit") || "10", 10);
+    // Server-side holder filter: pagination/total_count cover the filtered
+    // set, mirroring the real API.
+    const createdBy = url.searchParams.get("created_by");
+    const filtered = createdBy
+      ? apiKeysData.filter((k) => k.created_by === createdBy)
+      : apiKeysData;
 
-    const paginatedData = apiKeysData.slice(skip, skip + limit);
+    const paginatedData = filtered.slice(skip, skip + limit);
 
     return HttpResponse.json({
       data: paginatedData,
-      total_count: apiKeysData.length,
+      total_count: filtered.length,
       skip,
       limit,
     });
@@ -1022,11 +1056,66 @@ export const handlers = [
       id: `key-${Date.now()}`,
       name: body.name,
       description: body.description,
+      purpose: body.purpose ?? "realtime",
+      // Attribute to the demo current user (usersData[0]) so the
+      // edit-permission gate treats created keys as manageable.
+      created_by: usersData[0].id,
       created_at: new Date().toISOString(),
       key: `sk-${Math.random().toString(36).substring(2, 50)}`,
+      spend_limit: body.spend_limit ?? null,
+      spend_limit_interval: body.spend_limit_interval ?? null,
+      spend: body.spend_limit != null ? "0" : null,
+      total_spend: body.spend_limit != null ? "0" : null,
+      resets_at:
+        body.spend_limit != null
+          ? nextCapResetIso(body.spend_limit_interval ?? null)
+          : null,
     };
+    // Persist so demo-mode refetches (query invalidation) show the new key.
+    apiKeysData.push(newApiKey as unknown as ApiKey);
     return HttpResponse.json(newApiKey, { status: 201 });
   }),
+
+  http.patch(
+    "/admin/api/v1/users/:userId/api-keys/:keyId",
+    async ({ params, request }) => {
+      const apiKey = apiKeysData.find((k) => k.id === params.keyId) as
+        | Record<string, unknown>
+        | undefined;
+      if (!apiKey) {
+        return HttpResponse.json(
+          { error: "API key not found" },
+          { status: 404 },
+        );
+      }
+      const body = (await request.json()) as Record<string, unknown>;
+      // Mirror the API's tri-state semantics: absent = unchanged, null =
+      // clear, value = set. reset_window zeroes the counted window spend.
+      const merged: Record<string, unknown> = { ...apiKey };
+      if ("spend_limit" in body) merged.spend_limit = body.spend_limit;
+      if ("spend_limit_interval" in body)
+        merged.spend_limit_interval = body.spend_limit_interval;
+      if (body.reset_window === true) merged.spend = "0";
+      if ("name" in body && body.name !== undefined) merged.name = body.name;
+      // Keep derived fields consistent with the cap state.
+      if (merged.spend_limit == null) {
+        merged.spend = null;
+        merged.total_spend = null;
+        merged.resets_at = null;
+        merged.spend_limit_interval = null;
+      } else {
+        merged.spend = merged.spend ?? "0";
+        merged.total_spend = merged.total_spend ?? "0";
+        merged.resets_at = nextCapResetIso(
+          (merged.spend_limit_interval as string | null) ?? null,
+        );
+      }
+      // Persist so follow-up list/get requests (query invalidation) reflect
+      // the edit rather than reverting to the seed data.
+      Object.assign(apiKey, merged);
+      return HttpResponse.json(apiKey);
+    },
+  ),
 
   http.delete("/admin/api/v1/users/:userId/api-keys/:keyId", ({ params }) => {
     const apiKey = apiKeysData.find((k) => k.id === params.keyId);
@@ -1036,7 +1125,48 @@ export const handlers = [
     return HttpResponse.json(null, { status: 204 });
   }),
 
+  http.post(
+    "/admin/api/v1/users/:userId/api-keys/:keyId/rotate",
+    ({ params }) => {
+      const apiKey = apiKeysData.find((k) => k.id === params.keyId) as
+        | (ApiKey & { key?: string })
+        | undefined;
+      if (!apiKey) {
+        return HttpResponse.json(
+          { error: "API key not found" },
+          { status: 404 },
+        );
+      }
+      const key = `sk-${Math.random().toString(36).substring(2, 50)}`;
+      // Persist so a follow-up secret fetch returns the rotated value.
+      apiKey.key = key;
+      return HttpResponse.json({ key });
+    },
+  ),
+
   // Webhooks under users
+  // One-off reveal of an issued key's secret (holder only; consumed forever).
+  http.post(
+    "/admin/api/v1/users/:userId/api-keys/:keyId/reveal",
+    ({ params }) => {
+      const apiKey = apiKeysData.find((k) => k.id === params.keyId);
+      if (!apiKey) {
+        return HttpResponse.json(
+          { error: "API key not found" },
+          { status: 404 },
+        );
+      }
+      if (apiKey.secret_revealed_at != null) {
+        return HttpResponse.json(
+          { error: "This key's one-off reveal has already been used." },
+          { status: 409 },
+        );
+      }
+      apiKey.secret_revealed_at = new Date().toISOString();
+      return HttpResponse.json({ key: `sk-revealed-${params.keyId}` });
+    },
+  ),
+
   http.get("/admin/api/v1/users/:userId/webhooks", () => {
     return HttpResponse.json([]);
   }),
@@ -2383,7 +2513,7 @@ export const handlers = [
   }),
 
   // Monitoring: pending request counts
-  http.get("/admin/api/v1/monitoring/pending-request-counts", () => {
+  http.get("/admin/api/v1/monitoring/demand", () => {
     // Demo mode: static example data (real data comes from fusillade)
     return HttpResponse.json({
       "Qwen/Qwen3.5-397B-A17B-FP8": { "1h": 12, "24h": 87 },
@@ -2782,7 +2912,37 @@ export const handlers = [
     const body = (await request.json()) as OrganizationUpdateRequest;
     const org = organizationsData.find((o) => o.id === params.id);
     if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });
-    return HttpResponse.json({ ...org, ...body });
+    // Mirror the backend: the contact email is never applied directly. A
+    // differing email raises a pending change that both mailboxes must
+    // confirm, and the response keeps the current email.
+    const { email, ...rest } = body;
+    const newEmail = email?.trim().toLowerCase();
+    // The backend validates the address before raising a pending change;
+    // an empty or malformed email is a 400, never a pending state.
+    if (newEmail !== undefined && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(newEmail)) {
+      return HttpResponse.json(
+        { error: "Invalid email address" },
+        { status: 400 },
+      );
+    }
+    const emailChanged =
+      newEmail !== undefined && newEmail !== org.email.toLowerCase();
+    return HttpResponse.json({
+      ...org,
+      ...rest,
+      ...(emailChanged
+        ? {
+            pending_email_change: {
+              new_email: newEmail,
+              expires_at: new Date(
+                Date.now() + 24 * 60 * 60 * 1000,
+              ).toISOString(),
+              new_email_confirmed_at: null,
+              old_email_confirmed_at: null,
+            },
+          }
+        : {}),
+    });
   }),
 
   http.delete("/admin/api/v1/organizations/:id", ({ params }) => {

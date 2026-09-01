@@ -107,12 +107,12 @@ describe("AsyncRequests", () => {
     ).toBeInTheDocument();
   });
 
-  it("passes service_tiers=flex,priority to the query", () => {
+  it("includes background requests in the default query", () => {
     render(<AsyncRequests />, { wrapper: createWrapper() });
 
     expect(hooks.useAsyncRequests).toHaveBeenCalledWith(
       expect.objectContaining({
-        service_tiers: "flex,priority",
+        service_tiers: "flex,priority,background",
       }),
     );
   });

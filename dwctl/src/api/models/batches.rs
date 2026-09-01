@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use utoipa::{IntoParams, ToSchema};
 
 use super::dwext::BatchDwExtResponse;
+use crate::types::ApiKeyId;
 
 /// Batch-level errors
 #[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
@@ -65,13 +66,25 @@ pub struct CreateBatchRequest {
     pub endpoint: String,
 
     /// The time window within which the batch should be processed (e.g., "24h", "1h").
-    /// Allowed values are configured per instance.
+    /// The provider extension `"background"` selects no-SLA spare-capacity
+    /// processing and requires the `BackgroundInferenceUser` role. Other
+    /// allowed values are configured per instance.
     #[schema(example = "24h")]
     pub completion_window: String,
 
     /// Optional metadata (up to 16 key-value pairs)
     #[serde(default)]
     pub metadata: Option<HashMap<String, String>>,
+
+    /// Attribute this batch to a specific API key (organization context only).
+    /// The key must belong to the organization and be usable by the caller:
+    /// one they created, or any org key for org owners/admins. The batch's
+    /// spend counts against the selected key's usage limit and its usage is
+    /// attributed to the key's creator. Members of a managed-keys organization
+    /// must select a key when creating batches from the dashboard.
+    #[serde(default)]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub api_key_id: Option<ApiKeyId>,
 }
 
 /// Request body for retrying specific requests
@@ -118,7 +131,8 @@ pub struct BatchResponse {
     #[schema(example = "file-abc123")]
     pub input_file_id: String,
 
-    /// The time window within which the batch should be processed (e.g., "24h", "1h").
+    /// The requested processing window, or `"background"` for no-SLA
+    /// spare-capacity processing.
     #[schema(example = "24h")]
     pub completion_window: String,
 
@@ -165,6 +179,13 @@ pub struct BatchResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<HashMap<String, String>>,
 
+    /// Model alias used by this batch's requests, or `"mixed"` when the input
+    /// file spans multiple models. Cached on the batch at creation time;
+    /// absent on batches created before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = "Qwen/Qwen3-235B-A22B-Instruct-2507")]
+    pub model: Option<String>,
+
     /// Aggregated analytics metrics (only included when requested via `include=analytics`)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analytics: Option<BatchAnalytics>,
@@ -175,7 +196,7 @@ pub struct BatchResponse {
 }
 
 /// Aggregated analytics metrics for batch requests
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 #[schema(example = json!({
     "total_requests": 100,
     "total_prompt_tokens": 50000,
@@ -183,7 +204,8 @@ pub struct BatchResponse {
     "total_tokens": 75000,
     "avg_duration_ms": 1250.5,
     "avg_ttfb_ms": 150.2,
-    "total_cost": "0.75"
+    "total_cost": "0.75",
+    "total_list_cost": "1.50"
 }))]
 pub struct BatchAnalytics {
     /// Total number of requests with analytics data
@@ -217,10 +239,20 @@ pub struct BatchAnalytics {
     #[schema(example = 150.2)]
     pub avg_ttfb_ms: Option<f64>,
 
-    /// Total cost in credits (if pricing is available)
+    /// Total BILLED cost in credits (if pricing is available) — what the batch actually cost
+    /// after prompt-cache discounts, matching the credits ledger / transactions page. (Until
+    /// 2026-07 this field erroneously reported the un-discounted list price; see
+    /// `total_list_cost` for that figure.)
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = "0.75")]
     pub total_cost: Option<String>,
+
+    /// Un-discounted list price of the same requests (no prompt-cache discounts applied).
+    /// `total_list_cost - total_cost` = what caching saved on this batch. Additive field —
+    /// clients that don't know it simply ignore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "1.50")]
+    pub total_list_cost: Option<String>,
 }
 
 /// Object type - always "batch"
@@ -332,6 +364,7 @@ pub struct ListBatchesQuery {
     /// - `24h` — long-running batch jobs
     /// - `1h` — async flex requests
     /// - `0s` — realtime tracking rows for the Open Responses API
+    /// - `background` — best-effort background batches (platform managers only)
     ///
     /// When omitted the server returns batches with any completion window; the
     /// dashboard sends `completion_window=24h` by default so realtime tracking

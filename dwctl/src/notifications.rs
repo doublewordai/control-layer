@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use fusillade::manager::postgres::PostgresRequestManager;
+use fusillade_arsenal::PostgresRequestManager;
 use metrics::counter;
 use rust_decimal::prelude::ToPrimitive;
 use sqlx::PgPool;
@@ -41,7 +41,7 @@ use crate::db::handlers::{Credits, Webhooks};
 use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::db::models::webhooks::WebhookDeliveryCreateDBRequest;
 use crate::email::EmailService;
-use crate::payment_providers::{self, PaymentProvider};
+use crate::payment_providers::{self, AutoTopupDeclineKind, PaymentError, PaymentProvider};
 use crate::webhooks::WebhookDispatcher;
 use crate::webhooks::events::{WebhookEvent, WebhookEventType};
 
@@ -109,6 +109,15 @@ impl BatchNotificationInfo {
             BatchOutcome::PartiallyCompleted
         };
 
+        let completion_window = if batch.service_tier.as_deref() == Some("background") {
+            "background".to_string()
+        } else {
+            batch
+                .completion_window
+                .clone()
+                .expect("non-background batch must have a completion window")
+        };
+
         Some(Self {
             batch_id: format!("{}", *batch.id),
             batch_uuid: *batch.id,
@@ -122,7 +131,7 @@ impl BatchNotificationInfo {
             completed_requests: batch.completed_requests,
             failed_requests: batch.failed_requests,
             cancelled_requests: batch.canceled_requests,
-            completion_window: batch.completion_window.clone(),
+            completion_window,
             filename: notif.input_file_name.clone(),
             description: notif.input_file_description.clone(),
             output_file_id: batch.output_file_id.map(|f| f.0),
@@ -134,7 +143,7 @@ impl BatchNotificationInfo {
 pub async fn run_notification_poller(
     config: NotificationsConfig,
     app_config: crate::config::Config,
-    request_manager: Arc<PostgresRequestManager<DbPools, fusillade::http::ReqwestHttpClient>>,
+    request_manager: Arc<PostgresRequestManager<DbPools>>,
     dwctl_pool: PgPool,
     shutdown: CancellationToken,
 ) {
@@ -266,11 +275,13 @@ pub async fn run_notification_poller(
                 .inspect_err(|e| crate::background_error!(NOTIFICATIONS, "platform_event_process", Warning, error = %e, "Failed to process platform webhook events"));
         }
 
-        // === Step 2: Poll fusillade for completed batches ===
-        match request_manager.poll_completed_batches().await {
+        // === Step 2: Claim finalized batches for notification ===
+        // Finalization itself (stamp + freeze) is the fusillade daemon's
+        // batch-finalizer loop; this poller only consumes frozen batches.
+        match request_manager.claim_batch_notifications().await {
             Ok(batches) => {
                 if !batches.is_empty() {
-                    tracing::info!(count = batches.len(), "Found terminal batches to finalize");
+                    tracing::info!(count = batches.len(), "Claimed finalized batches for notification");
 
                     let infos: Vec<_> = batches.iter().filter_map(BatchNotificationInfo::try_from_batch).collect();
 
@@ -288,7 +299,7 @@ pub async fn run_notification_poller(
                 }
             }
             Err(e) => {
-                crate::background_error!(NOTIFICATIONS, "poll_completed_batches", Warning, error = %e, "Failed to poll for completed batches");
+                crate::background_error!(NOTIFICATIONS, "claim_batch_notifications", Warning, error = %e, "Failed to claim finalized batches for notification");
             }
         }
 
@@ -346,7 +357,15 @@ pub async fn run_notification_poller(
         }
 
         // === Step 7: Auto top-up charges ===
-        if let Some(ref provider) = payment_provider {
+        // Gated on `config.enabled`, like the email steps above, rather than on
+        // payment config alone. Replicas that run this poller purely for batch
+        // finalization and webhooks (fusillade, which disables leader election so
+        // its own daemon always runs) set `enabled: false`, and must not also be
+        // charging customers — several replicas sweeping at once race each other
+        // onto the same idempotency key.
+        if config.enabled
+            && let Some(ref provider) = payment_provider
+        {
             process_auto_topups(provider.as_ref(), &mut conn, email_service.as_ref(), &app_config.credits).await;
         }
 
@@ -847,24 +866,113 @@ async fn process_auto_topups(
             }
         }
 
+        // Invoice-billed accounts branch off before any card is involved.
+        //
+        // They accrue the top-up onto their next invoice and get the credits
+        // now: this is post-pay, so the balance has to be restored immediately
+        // or an invoice-billed account would sit at zero until month end with
+        // auto top-up unable to do anything about it. Stripe raises, emails and
+        // chases one invoice per period covering everything accrued in it.
+        //
+        // Deliberately skips `get_default_payment_method`: these accounts may
+        // have no card at all, and the card-decline machinery below (soft/hard
+        // decline backoff, "auto top-up disabled" emails) describes a failure
+        // mode that cannot happen here. Non-payment of an invoice is a
+        // collections problem, on Stripe's dunning schedule, not a decline.
+        if user.invoicing_enabled {
+            match provider
+                .accrue_invoice_item(amount_cents, &user.payment_provider_id, description, &source_id)
+                .await
+            {
+                Ok(invoice_item_id) => {
+                    tracing::info!(
+                        user_id = %user.id,
+                        %invoice_item_id,
+                        amount_cents,
+                        "Accrued auto top-up onto the account's next invoice"
+                    );
+                }
+                Err(e) => {
+                    crate::background_error!(
+                        AUTO_TOPUP, "invoice_accrual", Error,
+                        user_id = %user.id,
+                        error = %e,
+                        "Failed to accrue auto top-up onto the next invoice"
+                    );
+                    continue;
+                }
+            }
+
+            let request = CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: charge_amount,
+                source_id,
+                description: Some(description.to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            };
+            if let Err(e) = Credits::new(&mut *conn).create_transaction(&request).await {
+                // The accrual landed at the provider, so the customer will be
+                // invoiced for credits they never received. Needs manual repair,
+                // hence Critical rather than a quiet warning.
+                crate::background_error!(
+                    AUTO_TOPUP, "invoice_credit_grant", Critical,
+                    user_id = %user.id,
+                    error = %e,
+                    "Accrued an invoice item but failed to grant the credits"
+                );
+            }
+            continue;
+        }
+
         // Fetch the customer's default payment method from the provider
         let payment_method_id = match provider.get_default_payment_method(&user.payment_provider_id).await {
             Ok(Some(pm_id)) => pm_id,
             Ok(None) => {
-                tracing::warn!(user_id = %user.id, "No default payment method found, skipping auto top-up");
+                tracing::warn!(user_id = %user.id, "No default payment method found, disabling auto top-up");
+                let transition_applied = match Users::new(&mut *conn).disable_auto_topup_after_hard_decline(user.id).await {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        crate::background_error!(
+                            AUTO_TOPUP, "decline_state", Error,
+                            user_id = %user.id,
+                            error = %e,
+                            "Failed to disable auto top-up without a default payment method"
+                        );
+                        continue;
+                    }
+                };
+
+                if !transition_applied {
+                    tracing::info!(
+                        user_id = %user.id,
+                        "Missing payment method was already handled by another poller"
+                    );
+                    continue;
+                }
+
                 if let Some(email_svc) = email_service {
                     let name = user.display_name.as_deref().unwrap_or(&user.username);
                     if let Err(e) = email_svc
-                        .send_auto_topup_failed_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                        .send_auto_topup_disabled_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
                         .await
                     {
-                        crate::background_error!(AUTO_TOPUP, "email_send", Warning, user_id = %user.id, error = %e, "Failed to send auto top-up failure email");
+                        crate::background_error!(AUTO_TOPUP, "email_send", Warning, user_id = %user.id, error = %e, "Failed to send auto top-up disabled email");
                     }
                 }
                 continue;
             }
             Err(e) => {
                 crate::background_error!(AUTO_TOPUP, "payment_method_lookup", Error, user_id = %user.id, error = %e, "Failed to fetch default payment method");
+                if let Err(state_error) = Users::new(&mut *conn).pause_auto_topup_after_provider_failure(user.id).await {
+                    crate::background_error!(
+                        AUTO_TOPUP, "provider_backoff_state", Error,
+                        user_id = %user.id,
+                        error = %state_error,
+                        "Failed to pause auto top-up after payment method lookup failure"
+                    );
+                }
                 continue;
             }
         };
@@ -875,6 +983,87 @@ async fn process_auto_topups(
             .await
         {
             Ok(id) => id,
+            // Another caller is already charging this exact source_id (the provider
+            // rejected our idempotency key as in-flight). That charge will land, so
+            // this is a no-op, not a payment failure - don't count it or email the user.
+            Err(PaymentError::AlreadyProcessed) => {
+                tracing::debug!(user_id = %user.id, "Auto top-up already in flight elsewhere, skipping");
+                continue;
+            }
+            Err(PaymentError::AutoTopupDeclined(kind)) => {
+                tracing::warn!(
+                    user_id = %user.id,
+                    decline_kind = ?kind,
+                    "Auto top-up payment was declined"
+                );
+
+                let transition_applied = {
+                    let mut users = Users::new(&mut *conn);
+                    match kind {
+                        AutoTopupDeclineKind::Soft => {
+                            users
+                                .apply_auto_topup_soft_decline(user.id, user.auto_topup_soft_failure_count)
+                                .await
+                        }
+                        AutoTopupDeclineKind::Hard => users.disable_auto_topup_after_hard_decline(user.id).await,
+                    }
+                };
+
+                let transition_applied = match transition_applied {
+                    Ok(applied) => applied,
+                    Err(e) => {
+                        crate::background_error!(
+                            AUTO_TOPUP, "decline_state", Error,
+                            user_id = %user.id,
+                            error = %e,
+                            "Failed to persist auto top-up decline state"
+                        );
+                        continue;
+                    }
+                };
+
+                if !transition_applied {
+                    tracing::info!(
+                        user_id = %user.id,
+                        "Auto top-up decline was already handled by another poller"
+                    );
+                    continue;
+                }
+
+                let disabled = kind == AutoTopupDeclineKind::Hard || user.auto_topup_soft_failure_count > 0;
+                if disabled {
+                    let decline_kind = match kind {
+                        AutoTopupDeclineKind::Soft => "soft",
+                        AutoTopupDeclineKind::Hard => "hard",
+                    };
+                    counter!("dwctl_auto_topup_decline_disabled_total", "kind" => decline_kind).increment(1);
+                } else {
+                    counter!("dwctl_auto_topup_decline_paused_total").increment(1);
+                }
+
+                if let Some(email_svc) = email_service {
+                    let name = user.display_name.as_deref().unwrap_or(&user.username);
+                    let email_result = if disabled {
+                        email_svc
+                            .send_auto_topup_disabled_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                            .await
+                    } else {
+                        email_svc
+                            .send_auto_topup_retry_email(&user.email, Some(name), &user.auto_topup_amount, &user.auto_topup_threshold)
+                            .await
+                    };
+
+                    if let Err(e) = email_result {
+                        crate::background_error!(
+                            AUTO_TOPUP, "email_send", Warning,
+                            user_id = %user.id,
+                            error = %e,
+                            "Failed to send auto top-up decline email"
+                        );
+                    }
+                }
+                continue;
+            }
             Err(e) => {
                 crate::background_error!(
                     AUTO_TOPUP, "charge", Warning,
@@ -882,6 +1071,28 @@ async fn process_auto_topups(
                     error = %e,
                     "Failed to charge auto top-up"
                 );
+
+                let transition_applied = match Users::new(&mut *conn).pause_auto_topup_after_provider_failure(user.id).await {
+                    Ok(applied) => applied,
+                    Err(state_error) => {
+                        crate::background_error!(
+                            AUTO_TOPUP, "provider_backoff_state", Error,
+                            user_id = %user.id,
+                            error = %state_error,
+                            "Failed to pause auto top-up after provider failure"
+                        );
+                        continue;
+                    }
+                };
+
+                if !transition_applied {
+                    tracing::info!(
+                        user_id = %user.id,
+                        "Auto top-up provider failure was already handled by another poller"
+                    );
+                    continue;
+                }
+
                 if let Some(email_svc) = email_service {
                     let name = user.display_name.as_deref().unwrap_or(&user.username);
                     if let Err(e) = email_svc
@@ -909,6 +1120,15 @@ async fn process_auto_topups(
         // Charge succeeded above (`charge_auto_topup` returned Ok), so the card has
         // been charged regardless of what happens with the credit-transaction insert
         // below. Mark verified now for the onwards rate-limit tier.
+        if let Err(e) = Users::new(&mut *conn).reset_auto_topup_failure_state(user.id).await {
+            crate::background_error!(
+                AUTO_TOPUP, "decline_state_reset", Warning,
+                user_id = %user.id,
+                error = %e,
+                "Failed to reset auto top-up decline state after a successful charge"
+            );
+        }
+
         if let Err(e) = Users::new(&mut *conn).set_verified(user.id).await {
             crate::background_error!(AUTO_TOPUP, "mark_verified", Warning, user_id = %user.id, error = %e, "Failed to mark user verified after auto top-up");
         }
@@ -1011,6 +1231,448 @@ mod tests {
     use crate::payment_providers;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
+
+    async fn configure_auto_topup_decline_test_user(pool: &PgPool, user_id: Uuid, customer_id: &str, failure_count: i32) {
+        sqlx::query!(
+            r#"
+            UPDATE users
+            SET auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                auto_topup_monthly_limit = 100.0,
+                auto_topup_soft_failure_count = $2,
+                auto_topup_retry_after = CASE
+                    WHEN $2 = 0 THEN NULL
+                    ELSE NOW() - INTERVAL '1 minute'
+                END,
+                payment_provider_id = $3
+            WHERE id = $1
+            "#,
+            user_id,
+            failure_count,
+            customer_id,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn dummy_payment_provider() -> Box<dyn PaymentProvider> {
+        payment_providers::create_provider(crate::config::PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }))
+    }
+
+    /// The whole point of the flag: an invoice-billed account gets its credits
+    /// immediately (post-pay) without any card being involved. `cus_test_soft_decline`
+    /// is the dummy provider's "this card always declines" customer, so if the
+    /// branch leaked into the card path this would decline instead of crediting.
+    #[sqlx::test]
+    async fn test_process_auto_topups_invoices_instead_of_charging(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
+        sqlx::query!("UPDATE users SET invoicing_enabled = true WHERE id = $1", user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let credited = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(credited, 1, "credits are granted at accrual, not on payment");
+
+        // None of the card-decline machinery may have run: there is no card.
+        let state = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_soft_failure_count, auto_topup_retry_after FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_amount, Some(25.0), "auto top-up must stay enabled");
+        assert_eq!(state.auto_topup_soft_failure_count, 0);
+        assert!(state.auto_topup_retry_after.is_none(), "must not be paused for a decline");
+    }
+
+    /// The flag defaults false, so every existing account keeps the card path.
+    #[sqlx::test]
+    async fn test_process_auto_topups_defaults_to_charging_a_card(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
+
+        let invoicing = sqlx::query_scalar!("SELECT invoicing_enabled FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!invoicing, "new accounts are not invoice-billed");
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        // Took the card path and hit the decline, rather than silently invoicing.
+        let state = sqlx::query_scalar!("SELECT auto_topup_soft_failure_count FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, 1, "unchanged behaviour for card-billed accounts");
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_first_soft_decline_pauses_without_charging(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            r#"
+            SELECT auto_topup_amount, auto_topup_threshold,
+                   auto_topup_soft_failure_count, auto_topup_retry_after
+            FROM users WHERE id = $1
+            "#,
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_amount, Some(25.0));
+        assert_eq!(state.auto_topup_threshold, Some(10.0));
+        assert_eq!(state.auto_topup_soft_failure_count, 1);
+        assert!(state.auto_topup_retry_after > Some(Utc::now()));
+
+        let transaction_count = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(transaction_count, 0);
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_second_soft_decline_disables_without_charging(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 1).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_amount, None);
+        assert_eq!(state.auto_topup_threshold, None);
+        assert_eq!(state.auto_topup_monthly_limit, None);
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_hard_decline_disables_immediately(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_hard_decline", 0).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_amount, None);
+        assert_eq!(state.auto_topup_threshold, None);
+        assert_eq!(state.auto_topup_monthly_limit, None);
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_provider_error_pauses_without_advancing_decline_state(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_provider_error", 1).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            "SELECT auto_topup_soft_failure_count, auto_topup_retry_after FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_soft_failure_count, 1);
+        assert!(state.auto_topup_retry_after > Some(Utc::now()));
+
+        let transaction_count = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(transaction_count, 0);
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_payment_method_lookup_error_pauses_without_advancing_decline_state(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_payment_method_lookup_error", 0).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            "SELECT auto_topup_soft_failure_count, auto_topup_retry_after FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_soft_failure_count, 0);
+        assert!(state.auto_topup_retry_after > Some(Utc::now()));
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_without_payment_method_disables_auto_topup(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_no_payment_method", 0).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            r#"
+            SELECT auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit,
+                   auto_topup_soft_failure_count, auto_topup_retry_after
+            FROM users WHERE id = $1
+            "#,
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_amount, None);
+        assert_eq!(state.auto_topup_threshold, None);
+        assert_eq!(state.auto_topup_monthly_limit, None);
+        assert_eq!(state.auto_topup_soft_failure_count, 0);
+        assert_eq!(state.auto_topup_retry_after, None);
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_success_resets_soft_decline_state(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_success_after_decline", 1).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let state = sqlx::query!(
+            "SELECT auto_topup_soft_failure_count, auto_topup_retry_after FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_soft_failure_count, 0);
+        assert_eq!(state.auto_topup_retry_after, None);
+
+        let transaction_count = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(transaction_count, 1);
+    }
+
+    fn background_batch_notification() -> fusillade::batch::BatchNotification {
+        let now = Utc::now();
+        fusillade::batch::BatchNotification {
+            batch: fusillade::Batch {
+                id: fusillade::BatchId(Uuid::new_v4()),
+                file_id: Some(fusillade::FileId(Uuid::new_v4())),
+                created_at: now,
+                metadata: None,
+                service_tier: Some("background".to_string()),
+                completion_window: None,
+                endpoint: "/v1/chat/completions".to_string(),
+                output_file_id: None,
+                error_file_id: None,
+                created_by: Uuid::new_v4().to_string(),
+                expires_at: None,
+                cancelling_at: None,
+                errors: None,
+                total_requests: 1,
+                pending_requests: 0,
+                in_progress_requests: 0,
+                completed_requests: 1,
+                failed_requests: 0,
+                canceled_requests: 0,
+                requests_started_at: Some(now),
+                finalizing_at: Some(now),
+                completed_at: Some(now),
+                failed_at: None,
+                cancelled_at: None,
+                deleted_at: None,
+                notification_sent_at: Some(now),
+                api_key_id: None,
+            },
+            model: "model".to_string(),
+            input_file_name: None,
+            input_file_description: None,
+        }
+    }
+
+    #[test]
+    fn background_batch_notification_uses_the_tier_as_its_window_label() {
+        let notification = background_batch_notification();
+
+        let info = BatchNotificationInfo::try_from_batch(&notification).unwrap();
+        assert_eq!(info.completion_window, "background");
+    }
+
+    #[test]
+    #[should_panic(expected = "non-background batch must have a completion window")]
+    fn sla_batch_notification_requires_a_completion_window() {
+        let mut notification = background_batch_notification();
+        notification.batch.service_tier = None;
+        notification.batch.expires_at = Some(Utc::now());
+
+        let _ = BatchNotificationInfo::try_from_batch(&notification);
+    }
+
+    /// Provider that reports the charge as already in flight elsewhere, the way
+    /// Stripe answers a duplicate idempotency key with 409 `idempotency_key_in_use`.
+    ///
+    /// Only the two methods `process_auto_topups` actually calls are implemented.
+    struct AlreadyChargingProvider;
+
+    #[async_trait::async_trait]
+    impl PaymentProvider for AlreadyChargingProvider {
+        async fn accrue_invoice_item(&self, _: i64, _: &str, _: &str, _: &str) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn charge_auto_topup(&self, _: i64, _: &str, _: &str, _: &str) -> crate::payment_providers::Result<String> {
+            Err(PaymentError::AlreadyProcessed)
+        }
+
+        async fn get_default_payment_method(&self, customer_id: &str) -> crate::payment_providers::Result<Option<String>> {
+            Ok(Some(format!("pm_{customer_id}")))
+        }
+
+        async fn create_checkout_session(
+            &self,
+            _: &crate::payment_providers::CheckoutPayer,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+        ) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn get_payment_session(&self, _: &str) -> crate::payment_providers::Result<crate::payment_providers::PaymentSession> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn process_payment_session(&self, _: &PgPool, _: &str, _: &CreditsConfig) -> crate::payment_providers::Result<()> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn validate_webhook(
+            &self,
+            _: &axum::http::HeaderMap,
+            _: &str,
+        ) -> crate::payment_providers::Result<Option<crate::payment_providers::WebhookEvent>> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn process_webhook_event(
+            &self,
+            _: &PgPool,
+            _: &crate::payment_providers::WebhookEvent,
+            _: &CreditsConfig,
+        ) -> crate::payment_providers::Result<()> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn create_billing_portal_session(&self, _: &str, _: &str) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn create_setup_checkout_session(
+            &self,
+            _: &crate::payment_providers::CheckoutPayer,
+            _: &str,
+            _: &str,
+        ) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn create_auto_topup_checkout_session(
+            &self,
+            _: &crate::payment_providers::CheckoutPayer,
+            _: &str,
+            _: &str,
+        ) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn process_auto_topup_session(
+            &self,
+            _: &PgPool,
+            _: &str,
+        ) -> crate::payment_providers::Result<crate::payment_providers::AutoTopupSetupResult> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn customer_has_address(&self, _: &str) -> crate::payment_providers::Result<bool> {
+            unimplemented!("not called by process_auto_topups")
+        }
+        async fn create_customer(&self, _: &str, _: Option<&str>) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_process_auto_topups_skips_when_charge_already_in_flight(pool: PgPool) {
+        // A concurrent sweep on another replica already owns this charge. We must
+        // skip without crediting the user, rather than treating it as a failure.
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        sqlx::query!(
+            r#"UPDATE users SET
+                auto_topup_amount = 25.0,
+                auto_topup_threshold = 10.0,
+                payment_provider_id = 'cus_test_456'
+            WHERE id = $1"#,
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(&AlreadyChargingProvider, &mut conn, None, &CreditsConfig::default()).await;
+
+        // No credit transaction: the replica that won the race writes it, not us.
+        let count = sqlx::query!(
+            "SELECT COUNT(*) as \"count!\" FROM credits_transactions WHERE user_id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(count.count, 0, "must not credit the user when another replica owns the charge");
+    }
 
     #[sqlx::test]
     async fn test_process_auto_topups_charges_below_threshold(pool: PgPool) {

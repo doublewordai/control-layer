@@ -8,7 +8,7 @@ use crate::metrics::errors::component::TASK_WORKER;
 use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::Result;
-use fusillade::PostgresRequestManager;
+use fusillade_arsenal::PostgresRequestManager;
 use sqlx::PgPool;
 use sqlx_pool_router::PoolProvider;
 use tokio_util::sync::CancellationToken;
@@ -35,7 +35,7 @@ type WeakJobRef<I, P> = Arc<OnceLock<Weak<Job<I, TaskState<P>>>>>;
 /// upgraded when enqueueing.
 #[derive(Clone)]
 pub struct TaskState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
-    pub request_manager: Arc<PostgresRequestManager<P, fusillade::ReqwestHttpClient>>,
+    pub request_manager: Arc<PostgresRequestManager<P>>,
     /// dwctl database pool — for querying connections, sync_operations, sync_entries.
     pub dwctl_pool: PgPool,
     /// Shared config for capacity checks and other runtime configuration.

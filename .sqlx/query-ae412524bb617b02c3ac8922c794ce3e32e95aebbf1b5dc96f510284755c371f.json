@@ -57,6 +57,16 @@
         "ordinal": 10,
         "name": "auth_header_prefix",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 11,
+        "name": "reasoning_translation",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 12,
+        "name": "accepts_scheduling_priority",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -76,6 +86,8 @@
       true,
       false,
       false,
+      false,
+      true,
       false
     ]
   },

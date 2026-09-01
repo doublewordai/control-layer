@@ -75,6 +75,15 @@ use thiserror::Error as ThisError;
 /// when the database connection pool is exhausted.
 const POOL_EXHAUSTED_RETRY_AFTER_SECS: &str = "30";
 
+/// Message returned when a bearer API key is not recognised.
+///
+/// API keys are region-bound but carry no region prefix, so a key from the
+/// account's other-region endpoint is indistinguishable from an invalid one.
+/// The copy stays generic (no endpoint URLs enumerated) and points at the
+/// regional-endpoints docs page so users check their base URL before
+/// concluding the key itself is bad.
+pub const INVALID_API_KEY_MESSAGE: &str = "Invalid API key. API keys are region-bound: if you expected this key to work, check that your base URL matches the region the key was created in. See https://docs.doubleword.ai/inference-api/regional-endpoints";
+
 #[derive(ThisError, Debug)]
 pub enum Error {
     /// Authentication required but not provided
@@ -136,6 +145,11 @@ pub enum Error {
     #[error("Insufficient credits: {message}")]
     InsufficientCredits { current_balance: Decimal, message: String },
 
+    /// The API key's spending-cap scope is exhausted (admission checks; the
+    /// per-request rejection is produced by the error-enrichment middleware)
+    #[error("Spending cap exceeded: {message}")]
+    SpendCapExceeded { message: String },
+
     /// User does not have access to the requested model
     #[error("Model access denied: {message}")]
     ModelAccessDenied { model_name: String, message: String },
@@ -191,6 +205,7 @@ impl Error {
             Error::Conflict { .. } => StatusCode::CONFLICT,
             Error::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
             Error::InsufficientCredits { .. } => StatusCode::PAYMENT_REQUIRED,
+            Error::SpendCapExceeded { .. } => StatusCode::PAYMENT_REQUIRED,
             Error::ModelAccessDenied { .. } => StatusCode::FORBIDDEN,
             Error::ModalityAccessDenied { .. } => StatusCode::FORBIDDEN,
             Error::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
@@ -253,6 +268,7 @@ impl Error {
                 }
             }
             Error::InsufficientCredits { message, .. } => message.clone(),
+            Error::SpendCapExceeded { message } => message.clone(),
             Error::ModelAccessDenied { message, .. } => message.clone(),
             Error::ModalityAccessDenied { message, .. } => message.clone(),
             Error::TooManyRequests { message } => message.clone(),
@@ -289,6 +305,9 @@ impl IntoResponse for Error {
             }
             Error::InsufficientCredits { .. } => {
                 tracing::info!("Insufficient credits error: {}", self);
+            }
+            Error::SpendCapExceeded { .. } => {
+                tracing::info!("Spending cap exceeded: {}", self);
             }
             Error::ModelAccessDenied { .. } => {
                 tracing::info!("Model access denied error: {}", self);

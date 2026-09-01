@@ -11,6 +11,7 @@ import {
   Trash2,
   Box,
   FastForward,
+  Moon,
   Zap,
 } from "lucide-react";
 import { Button } from "../../../ui/button";
@@ -22,6 +23,8 @@ import {
   copyToClipboard,
 } from "../../../../utils";
 import type { Batch, BatchStatus } from "../types";
+import { batchModelName } from "../model";
+import { getCompletionWindowLabel } from "../../../../utils/serviceTier";
 
 interface ColumnActions {
   onCancel: (batch: Batch) => void;
@@ -57,6 +60,25 @@ const getStatusColor = (status: BatchStatus) => {
     default:
       return "bg-gray-100 text-gray-800";
   }
+};
+
+const modelColumn: ColumnDef<Batch> = {
+  id: "model",
+  header: "Model",
+  cell: ({ row }) => {
+    const modelName = batchModelName(row.original as Batch);
+    if (!modelName) {
+      return <span className="text-gray-400">-</span>;
+    }
+    return (
+      <span
+        className="font-mono text-xs text-doubleword-neutral-700 truncate max-w-[160px] block cursor-default"
+        title={modelName}
+      >
+        {modelName}
+      </span>
+    );
+  },
 };
 
 const userColumn: ColumnDef<Batch> = {
@@ -112,6 +134,7 @@ export const createBatchColumns = (
       );
     },
   },
+  modelColumn,
   ...(actions.showUserColumn ? [userColumn] : []),
   ...(actions.showTypeColumn !== false
     ? [
@@ -120,16 +143,19 @@ export const createBatchColumns = (
           header: "Type",
           cell: ({ row }: { row: { original: Batch } }) => {
             const batch = row.original;
-            // Three classes today: realtime tracking rows ("0s"), flex/async
-            // ("1h" by default), and regular batches (anything else, typically
-            // "24h"). Anything unrecognised falls into the batch bucket.
             const asyncWindow = actions.asyncCompletionWindow ?? "1h";
-            const { Icon, label } =
-              batch.completion_window === "0s"
-                ? { Icon: Zap, label: "Realtime" }
-                : batch.completion_window === asyncWindow
-                  ? { Icon: FastForward, label: "Async" }
-                  : { Icon: Box, label: "Batch" };
+            const label = getCompletionWindowLabel(
+              batch.completion_window,
+              asyncWindow,
+            );
+            const Icon =
+              label === "Realtime"
+                ? Zap
+                : label === "Async"
+                  ? FastForward
+                  : label === "Background"
+                    ? Moon
+                    : Box;
             return (
               <Tooltip>
                 <TooltipTrigger asChild>

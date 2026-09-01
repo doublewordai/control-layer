@@ -11,8 +11,8 @@ use crate::{
     AppState,
     api::models::{
         deployments::{
-            ComponentEndpointSummary, ComponentModelSummary, DeployedModelCreate, DeployedModelResponse, DeployedModelUpdate,
-            GetModelQuery, ListModelsQuery, ModelComponentResponse, enrichment::DeployedModelEnricher,
+            ComponentEndpointSummary, ComponentModelSummary, ComponentPool, ComponentPoolQuery, DeployedModelCreate, DeployedModelResponse,
+            DeployedModelUpdate, GetModelQuery, ListModelsQuery, ModelComponentResponse, enrichment::DeployedModelEnricher,
         },
         users::CurrentUser,
     },
@@ -25,13 +25,23 @@ use crate::{
         },
     },
     errors::{Error, Result},
-    types::{DeploymentId, Resource},
+    reasoning::ReasoningTranslationOverrides,
+    types::{DeploymentId, InferenceEndpointId, Resource},
 };
 use axum::{
     extract::{Path, Query, State},
     response::Json,
 };
 use sqlx::Acquire;
+
+fn validate_reasoning_translation_overrides(overrides: Option<&ReasoningTranslationOverrides>) -> Result<()> {
+    if let Some(overrides) = overrides {
+        overrides.validate().map_err(|error| Error::BadRequest {
+            message: error.to_string(),
+        })?;
+    }
+    Ok(())
+}
 
 /// Validate the inter-attempt backoff shape. The values argument carries
 /// whatever the request is about to write (which may be the values from a
@@ -138,11 +148,29 @@ async fn resolve_traffic_rules(
     Ok(resolved)
 }
 
+/// A completions-pool member must be reachable over HTTP: a continuation leg is
+/// an ordinary `/v1/completions` call to a provider, so the component's model
+/// needs an inference endpoint. (Composite components always do today; the
+/// check keeps that from becoming an assumption.)
+///
+/// Deliberately NOT limited to one member: a completions pool is a failover
+/// list like any other — dynamo first, the validated third-party target behind
+/// it. Pool membership itself is bounded by the column's CHECK constraint.
+fn validate_pool_member(pool: ComponentPool, component_hosted_on: Option<InferenceEndpointId>) -> Result<()> {
+    if pool == ComponentPool::Completions && component_hosted_on.is_none() {
+        return Err(Error::BadRequest {
+            message: "A completions-pool component must be hosted on an inference endpoint".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Convert a DB component response to an API component response
 fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentResponse {
     ModelComponentResponse {
         weight: c.weight,
         enabled: c.enabled,
+        pool: ComponentPool::from_db(&c.pool),
         sort_order: c.sort_order,
         created_at: c.created_at,
         model: ComponentModelSummary {
@@ -161,7 +189,6 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
                 name: c.endpoint_name.unwrap_or_default(),
             }),
             trusted: c.model_trusted,
-            open_responses_adapter: c.model_open_responses_adapter,
         },
     }
 }
@@ -171,14 +198,16 @@ fn db_component_to_response(c: DeploymentComponentDBResponse) -> ModelComponentR
     path = "/models",
     tag = "models",
     summary = "List deployed models",
-    description = "List all deployed models, optionally filtered by endpoint",
+    description = "List all deployed models, optionally filtered by endpoint, group, or availability",
     params(
         ("endpoint" = Option<i32>, Query, description = "Filter by inference endpoint ID"),
+        ("group" = Option<String>, Query, description = "Filter by group IDs (comma-separated UUIDs)"),
         ("accessible" = Option<bool>, Query, description = "Filter to only models the current user can access (defaults to false for admins, true for users)"),
-        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints', 'facets'). Only platform managers can include groups. Status shows probe monitoring information. Pricing shows simple customer rates for regular users, full pricing structure including current active tariffs for users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details. Facets returns distinct providers, capabilities, and model types for filter dropdowns."),
+        ("include" = Option<String>, Query, description = "Include additional data (comma-separated: 'groups', 'metrics', 'status', 'pricing', 'endpoints', 'facets', 'reasoning_capabilities'). Only platform managers can include groups. Status shows probe monitoring information. Pricing includes active customer tariffs and prompt-cache pricing; provider pricing remains restricted to users with Pricing::ReadAll permission. Endpoints includes full inference endpoint details. Facets returns distinct providers, capabilities, and model types for filter dropdowns. Reasoning capabilities shows efforts supported by every provider behind each model."),
         ("provider" = Option<String>, Query, description = "Filter by provider name (case-insensitive exact match against metadata.provider)"),
         ("model_type" = Option<String>, Query, description = "Filter by model type (CHAT, EMBEDDINGS, RERANKER)"),
         ("capability" = Option<String>, Query, description = "Filter by capability (returns models that have this capability)"),
+        ("available_for_realtime" = Option<bool>, Query, description = "Filter by realtime availability. true returns models without a realtime deny rule; false returns models with one."),
         ("sort" = Option<String>, Query, description = "Sort field: created_at (default), alias, intelligence_index, released_at, context_window, provider, price_from"),
         ("sort_direction" = Option<String>, Query, description = "Sort direction: asc or desc (default depends on sort field)"),
         ("deleted" = Option<bool>, Query, description = "Show deleted models when true (admin only), non-deleted models when false, and all models when not specified"),
@@ -330,6 +359,10 @@ pub async fn list_deployed_models<P: PoolProvider>(
         filter = filter.with_capability(capability.trim().to_string());
     }
 
+    if let Some(available_for_realtime) = query.available_for_realtime {
+        filter = filter.with_realtime_availability(available_for_realtime);
+    }
+
     // Apply sort if specified
     if let Some(sort_field) = query.sort {
         filter = filter.with_sort(sort_field, query.sort_direction);
@@ -407,6 +440,14 @@ pub async fn list_deployed_models<P: PoolProvider>(
     let include_pricing = includes.contains(&"pricing");
     let include_endpoints = includes.contains(&"endpoints");
     let include_components = includes.contains(&"components");
+    let include_reasoning_capabilities = includes.contains(&"reasoning_capabilities");
+
+    let reasoning_policies = if include_reasoning_capabilities {
+        let aliases = models.iter().map(|model| model.alias.clone()).collect::<Vec<_>>();
+        repo.get_reasoning_policies(&aliases).await?
+    } else {
+        Default::default()
+    };
 
     // Use ModelEnricher to add requested data
     let enricher = DeployedModelEnricher {
@@ -424,6 +465,17 @@ pub async fn list_deployed_models<P: PoolProvider>(
     };
 
     let response = enricher.enrich_many(models).await?;
+    let response = if include_reasoning_capabilities {
+        response
+            .into_iter()
+            .map(|model| {
+                let supported_efforts = reasoning_policies.get(&model.alias).and_then(|policy| policy.supported_efforts());
+                model.with_supported_reasoning_efforts(supported_efforts)
+            })
+            .collect()
+    } else {
+        response
+    };
 
     // Fetch facets if requested (reuse existing repo/connection to avoid
     // acquiring a second read connection which could self-deadlock under pool
@@ -538,6 +590,10 @@ pub async fn create_deployed_model<P: PoolProvider>(
     };
     if let Some(m) = metadata {
         validate_metadata(m)?;
+    }
+
+    if let DeployedModelCreate::Standard(standard) = &create {
+        validate_reasoning_translation_overrides(standard.reasoning_translation_overrides.as_ref())?;
     }
 
     // Validate backoff shape. Both standard and composite models surface
@@ -678,6 +734,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
     if let Some(m) = &update.metadata {
         validate_metadata(m)?;
     }
+    validate_reasoning_translation_overrides(update.reasoning_translation_overrides.as_ref().and_then(Option::as_ref))?;
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
@@ -714,6 +771,12 @@ pub async fn update_deployed_model<P: PoolProvider>(
             Err(e) => return Err(e.into()),
         }
     };
+
+    if is_composite && update.reasoning_translation_overrides.is_some() {
+        return Err(Error::BadRequest {
+            message: "reasoning_translation_overrides is only supported for standard models".to_string(),
+        });
+    }
 
     // Validate the backoff state the update would *result in*, merging
     // incoming fields over the stored values. Without merging, a one-sided
@@ -861,7 +924,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
     path = "/models/{id}",
     tag = "models",
     summary = "Get deployed model",
-    description = "Get a specific deployed model",
+    description = "Get a specific deployed model. include=pricing includes active customer tariffs and prompt-cache pricing.",
     params(
         ("id" = uuid::Uuid, Path, description = "Deployment ID to retrieve"),
         GetModelQuery
@@ -1189,23 +1252,26 @@ pub async fn add_model_component<P: PoolProvider>(
                 message: "Cannot add a composite model as a component".to_string(),
             });
         }
+
+        validate_pool_member(body.pool, component.hosted_on)?;
     }
 
     // Add the component. Its priority position is always assigned by the server
-    // as "one past the current last component" so sort_order stays unique and
-    // dense within the composite — the client-supplied `sort_order` is ignored
+    // as "one past the current last component of that pool" so sort_order stays
+    // unique and dense within the pool — the client-supplied `sort_order` is ignored
     // (reordering is done via PATCH, which moves-and-reindexes). Lock the
     // composite first so concurrent adds can't both read the same MAX and
     // collide on a position.
     let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
     repo.lock_composite(id).await?;
-    let sort_order = repo.next_component_sort_order(id).await?;
+    let sort_order = repo.next_component_sort_order(id, body.pool.as_str()).await?;
     let request = DeploymentComponentCreateDBRequest {
         composite_model_id: id,
         deployed_model_id: component_id,
         weight: body.weight,
         enabled: body.enabled,
         sort_order,
+        pool: body.pool.as_str().to_string(),
     };
 
     let component = repo.add_component(&request).await?;
@@ -1223,6 +1289,7 @@ pub async fn add_model_component<P: PoolProvider>(
     params(
         ("id" = String, Path, description = "The composite model ID", format = "uuid"),
         ("component_id" = String, Path, description = "The deployed model ID of the component", format = "uuid"),
+        ComponentPoolQuery,
     ),
     request_body = ModelComponentUpdate,
     responses(
@@ -1242,6 +1309,7 @@ pub async fn add_model_component<P: PoolProvider>(
 pub async fn update_model_component<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
+    Query(query): Query<ComponentPoolQuery>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
     Json(body): Json<ModelComponentUpdate>,
 ) -> Result<Json<ModelComponentResponse>> {
@@ -1254,19 +1322,19 @@ pub async fn update_model_component<P: PoolProvider>(
         });
     }
 
-    // A sort_order change moves the component and renumbers the whole composite,
-    // so run on a transaction to keep that multi-row rewrite atomic.
+    // A sort_order change moves the component and renumbers its pool, so run on
+    // a transaction to keep that multi-row rewrite atomic.
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
     let component = {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         // Serialize with other component mutations on this composite so the
         // move-and-reindex below isn't interleaved with a concurrent add/reorder.
         repo.lock_composite(id).await?;
-        repo.update_component(id, component_id, body.weight, body.enabled, body.sort_order)
+        repo.update_component(id, component_id, query.pool.as_str(), body.weight, body.enabled, body.sort_order)
             .await?
             .ok_or_else(|| Error::NotFound {
                 resource: "component".to_string(),
-                id: format!("{}/{}", id, component_id),
+                id: format!("{}/{}/{}", id, component_id, query.pool.as_str()),
             })?
     };
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
@@ -1283,6 +1351,7 @@ pub async fn update_model_component<P: PoolProvider>(
     params(
         ("id" = String, Path, description = "The composite model ID", format = "uuid"),
         ("component_id" = String, Path, description = "The deployed model ID of the component to remove", format = "uuid"),
+        ComponentPoolQuery,
     ),
     responses(
         (status = 200, description = "Component removed"),
@@ -1300,6 +1369,7 @@ pub async fn update_model_component<P: PoolProvider>(
 pub async fn remove_model_component<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Path((id, component_id)): Path<(DeploymentId, DeploymentId)>,
+    Query(query): Query<ComponentPoolQuery>,
     _: RequiresPermission<resource::CompositeModels, operation::UpdateAll>,
 ) -> Result<Json<String>> {
     // Remove and then compact the remaining components back to a dense 0..n-1
@@ -1311,15 +1381,15 @@ pub async fn remove_model_component<P: PoolProvider>(
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         repo.lock_composite(id).await?;
 
-        let removed = repo.remove_component(id, component_id).await?;
+        let removed = repo.remove_component(id, component_id, query.pool.as_str()).await?;
         if !removed {
             return Err(Error::NotFound {
                 resource: "component".to_string(),
-                id: format!("{}/{}", id, component_id),
+                id: format!("{}/{}/{}", id, component_id, query.pool.as_str()),
             });
         }
 
-        repo.compact_component_sort_order(id).await?;
+        repo.compact_component_sort_order(id, query.pool.as_str()).await?;
     }
     tx.commit().await.map_err(|e| Error::Database(e.into()))?;
 
@@ -1335,8 +1405,8 @@ mod tests {
             models::{pagination::PaginatedResponse, users::Role},
         },
         db::{
-            handlers::{Groups, Repository},
-            models::groups::GroupCreateDBRequest,
+            handlers::{CacheTariffOverrides, CacheTariffs, Deployments, Groups, Repository},
+            models::{api_keys::ApiKeyPurpose, deployments::TrafficRuleAction, groups::GroupCreateDBRequest},
         },
         test::utils::*,
         types::DeploymentId,
@@ -1366,6 +1436,89 @@ mod tests {
         let response_body: PaginatedResponse<DeployedModelResponse> = response.json();
         // Should be empty initially, but test that it returns proper structure
         assert!(response_body.data.is_empty() || !response_body.data.is_empty());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn admin_models_include_pricing_exposes_cache_tariffs(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let priced = create_test_deployment(&pool, admin.id, "priced-model", "priced-model").await;
+        let unpriced = create_test_deployment(&pool, admin.id, "unpriced-model", "unpriced-model").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        CacheTariffs::new(&mut conn)
+            .enable(
+                priced.id,
+                &crate::config::CachePricingConfig::default(),
+                CacheTariffOverrides {
+                    write_multiplier_5m: Some(rust_decimal::Decimal::new(125, 2)),
+                    write_multiplier_1h: Some(rust_decimal::Decimal::new(2, 0)),
+                    write_multiplier_24h: Some(rust_decimal::Decimal::new(25, 1)),
+                    read_multiplier: Some(rust_decimal::Decimal::new(1, 1)),
+                    min_prefix_tokens: Some(2048),
+                },
+            )
+            .await
+            .unwrap();
+
+        let response = app
+            .get("/admin/api/v1/models?include=pricing")
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        let models = body["data"].as_array().expect("list response should contain data");
+        let priced_model = models
+            .iter()
+            .find(|model| model["id"] == priced.id.to_string())
+            .expect("priced model should be listed");
+        let unpriced_model = models
+            .iter()
+            .find(|model| model["id"] == unpriced.id.to_string())
+            .expect("unpriced model should be listed");
+        let cache_pricing = &priced_model["cache_pricing"];
+        assert_eq!(cache_pricing["enabled"], true);
+        assert_eq!(cache_pricing["write_multiplier_5m"], "1.2500");
+        assert_eq!(cache_pricing["write_multiplier_1h"], "2.0000");
+        assert_eq!(cache_pricing["write_multiplier_24h"], "2.5000");
+        assert_eq!(cache_pricing["read_multiplier"], "0.1000");
+        assert_eq!(cache_pricing["min_prefix_tokens"], 2048);
+        assert!(cache_pricing["valid_from"].is_string());
+        assert_eq!(cache_pricing["valid_until"], serde_json::Value::Null);
+        assert_eq!(
+            unpriced_model["cache_pricing"],
+            json!({
+                "enabled": false,
+                "write_multiplier_5m": null,
+                "write_multiplier_1h": null,
+                "write_multiplier_24h": null,
+                "read_multiplier": null,
+                "min_prefix_tokens": null,
+                "valid_from": null,
+                "valid_until": null,
+            })
+        );
+
+        let response = app
+            .get(&format!("/admin/api/v1/models/{}?include=pricing", priced.id))
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let model: serde_json::Value = response.json();
+        assert_eq!(model["cache_pricing"]["enabled"], true);
+        assert_eq!(model["cache_pricing"]["min_prefix_tokens"], 2048);
+
+        let response = app
+            .get(&format!("/admin/api/v1/models/{}", priced.id))
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .await;
+        response.assert_status_ok();
+        let model: serde_json::Value = response.json();
+        assert!(model.get("cache_pricing").is_none());
     }
 
     #[sqlx::test]
@@ -1464,6 +1617,47 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_composite_model_patch_rejects_reasoning_translation_overrides(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&json!({
+                "type": "composite",
+                "model_name": "reasoning-composite",
+                "alias": "reasoning-composite"
+            }))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", model.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .json(&json!({
+                "reasoning_translation_overrides": {
+                    "chat_completions": { "mode": "disabled" }
+                }
+            }))
+            .await;
+
+        response.assert_status_bad_request();
+
+        let stored =
+            sqlx::query_scalar::<_, Option<serde_json::Value>>("SELECT reasoning_translation_overrides FROM deployed_models WHERE id = $1")
+                .bind(model.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, None);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_list_deployments_with_groups_include(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1529,6 +1723,69 @@ mod tests {
                 .data
                 .iter()
                 .any(|it| { it.id == deployment.id && it.groups.as_deref().is_some_and(|gs| gs.iter().any(|g| g.id == group.id)) })
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_deployments_with_reasoning_capabilities_include(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        sqlx::query("UPDATE inference_endpoints SET reasoning_translation = $1 WHERE id = $2")
+            .bind(json!({
+                "chat_completions": {
+                    "unsupported_efforts": ["minimal", "xhigh", "max"],
+                    "writes": [{
+                        "target_path": "/reasoning_effort",
+                        "values": {
+                            "none": "none",
+                            "low": "low",
+                            "medium": "medium",
+                            "high": "high"
+                        }
+                    }]
+                }
+            }))
+            .bind(test_endpoint_id)
+            .execute(&pool)
+            .await
+            .expect("Failed to configure reasoning translation");
+
+        let deployment = create_test_deployment(&pool, admin_user.id, "reasoning-model", "reasoning-alias").await;
+
+        let response = app
+            .get("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        let model = body["data"]
+            .as_array()
+            .and_then(|models| models.iter().find(|model| model["id"] == deployment.id.to_string()))
+            .expect("Created model should be listed");
+        assert!(model.get("supported_reasoning_efforts").is_none());
+
+        let response = app
+            .get("/admin/api/v1/models?include=pricing,reasoning_capabilities")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        let model = body["data"]
+            .as_array()
+            .and_then(|models| models.iter().find(|model| model["id"] == deployment.id.to_string()))
+            .expect("Created model should be listed");
+        assert_eq!(
+            model["supported_reasoning_efforts"],
+            json!({
+                "chat_completions": ["none", "low", "medium", "high"]
+            })
         );
     }
 
@@ -3063,6 +3320,72 @@ mod tests {
         response.assert_status_ok();
         let all_models: PaginatedResponse<DeployedModelResponse> = response.json();
         assert!(all_models.data.len() >= 3, "Empty group list should return all models");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_models_with_available_for_realtime_filter(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let allowed_deployment = create_test_deployment(&pool, admin_user.id, "realtime-allowed-model", "realtime-allowed-alias").await;
+        let denied_deployment = create_test_deployment(&pool, admin_user.id, "realtime-denied-model", "realtime-denied-alias").await;
+        let redirected_deployment =
+            create_test_deployment(&pool, admin_user.id, "realtime-redirected-model", "realtime-redirected-alias").await;
+        let redirect_target = create_test_deployment(&pool, admin_user.id, "realtime-target-model", "realtime-target-alias").await;
+        let other_group_deployment = create_test_deployment(&pool, admin_user.id, "other-group-model", "other-group-alias").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+
+        let group = {
+            let mut group_repo = Groups::new(&mut conn);
+            let group = group_repo
+                .create(&GroupCreateDBRequest {
+                    name: "Realtime Test Group".to_string(),
+                    description: Some("Models used for realtime availability filtering".to_string()),
+                    created_by: admin_user.id,
+                })
+                .await
+                .unwrap();
+
+            for deployment_id in [allowed_deployment.id, denied_deployment.id, redirected_deployment.id] {
+                group_repo
+                    .add_deployment_to_group(deployment_id, group.id, admin_user.id)
+                    .await
+                    .unwrap();
+            }
+
+            group
+        };
+
+        {
+            let mut deployment_repo = Deployments::new(&mut conn);
+            deployment_repo
+                .set_traffic_rules(denied_deployment.id, &[(ApiKeyPurpose::Realtime, TrafficRuleAction::Deny)])
+                .await
+                .unwrap();
+            deployment_repo
+                .set_traffic_rules(
+                    redirected_deployment.id,
+                    &[(ApiKeyPurpose::Realtime, TrafficRuleAction::Redirect(redirect_target.id))],
+                )
+                .await
+                .unwrap();
+        }
+
+        let response = app
+            .get(&format!("/admin/api/v1/models?group={}&available_for_realtime=true", group.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+        response.assert_status_ok();
+
+        let realtime_models: PaginatedResponse<DeployedModelResponse> = response.json();
+        assert_eq!(realtime_models.total_count, 2);
+        assert!(get_model_by_id(allowed_deployment.id, &realtime_models).is_some());
+        assert!(get_model_by_id(redirected_deployment.id, &realtime_models).is_some());
+        assert!(get_model_by_id(denied_deployment.id, &realtime_models).is_none());
+        assert!(get_model_by_id(other_group_deployment.id, &realtime_models).is_none());
     }
 
     // ===== Traffic Routing Rules Tests =====

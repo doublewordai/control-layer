@@ -4,12 +4,15 @@
 //! Conventions:
 //! - Every metric name is `dwctl_cache_*`.
 //! - Low-cardinality labels are `&'static str` literals (`outcome`/`reason`/`tier`/`result`/`marked`).
-//!   The one dynamic label is `model` (owned `String`), attached **only** by `record_token_volumes`,
-//!   which is emitted solely for cache-ENABLED models — a small, validated, bounded set (the alias
-//!   has a tariff). The all-traffic metrics (`marker_requests`, `requests`) carry **no `model` label**,
-//!   because the raw request `model` is unvalidated there (unknown/typo strings) and would be
-//!   unbounded cardinality. Never label `model` from unvalidated input, nor by principal / api-key /
-//!   correlation-id / prefix-hash.
+//!   The dynamic label is `model` (owned `String`), attached in exactly TWO places, each with its
+//!   own bounding guarantee: `record_token_volumes` (emitted solely for cache-ENABLED models — the
+//!   alias has a tariff) and `record_tokenizer_duration` (the caller labels by model only for a name
+//!   tokenizer-svc ACCEPTED — its baked map is the bound; every error path is clamped to a fixed
+//!   value, see `TokenizerClient::tokenize`). The all-traffic metrics (`marker_requests`,
+//!   `requests`) carry **no `model` label**, because the raw request `model` is unvalidated there
+//!   (unknown/typo strings) and would be unbounded cardinality. Never label `model` from
+//!   unvalidated input, nor by principal / api-key / correlation-id / prefix-hash — a new
+//!   model-labelled metric needs a bounding argument like the two above.
 //! - Counters created lazily on first emission (no pre-registration needed, as in
 //!   `errors.rs`); histograms use the recorder's default buckets unless tuned in the
 //!   recorder builder.
@@ -96,14 +99,50 @@ pub fn record_tokenizer_request(outcome: &'static str) {
     counter!("dwctl_cache_tokenizer_requests_total", "outcome" => outcome).increment(1);
 }
 
-/// tokenizer-svc round-trip latency.
-pub fn record_tokenizer_duration(seconds: f64) {
-    histogram!("dwctl_cache_tokenizer_duration_seconds").record(seconds);
+/// tokenizer-svc round-trip latency, attributable per model and payload size.
+///
+/// Labels (added after the 2026-07 deadline-miss investigation, where the unlabelled series
+/// couldn't answer "which model / how big"): `model` is the virtual-model alias — bounded by
+/// the tokenizer-svc map (the caller labels by model only on an svc-accepted name and clamps
+/// every error path to `unmapped`/`error`, see `TokenizerClient::tokenize`); `size` is a coarse
+/// payload bucket (see [`tokenize_size_bucket`]) so slow-call attribution (big cold prefixes
+/// vs service-wide slowness) is a single query.
+///
+/// Existing `sum by (le)` dashboard/alert queries aggregate across these labels unchanged.
+/// Deliberately NOT also recording an unlabelled twin under the same name: every observation
+/// would then be counted twice in any label-agnostic aggregation, corrupting the quantiles.
+pub fn record_tokenizer_duration(model: &str, size: &'static str, seconds: f64) {
+    histogram!("dwctl_cache_tokenizer_duration_seconds", "model" => model.to_owned(), "size" => size).record(seconds);
+}
+
+/// Coarse request-payload bucket for [`record_tokenizer_duration`]: total bytes across the
+/// tokenized segments. Buckets chosen around observed traffic: chat turns land ≤16k, agentic
+/// cold prefixes (the deadline-miss shape) 64k+.
+pub fn tokenize_size_bucket(total_bytes: usize) -> &'static str {
+    match total_bytes {
+        0..=16_383 => "lt16k",
+        16_384..=65_535 => "16k_64k",
+        65_536..=262_143 => "64k_256k",
+        _ => "gte256k",
+    }
 }
 
 /// alias→version moka cache. `result` ∈ `hit` | `miss`.
 pub fn record_tokenizer_version_cache(result: &'static str) {
     counter!("dwctl_cache_tokenizer_version_cache_total", "result" => result).increment(1);
+}
+
+// ── Index resilience ──────────────────────────────────────────────────────────
+
+/// A cache-index op hit a connection-class error and is being retried (bounded by
+/// `cache.index_conn_retries`; see `postgres.rs`). Incremented once per retry ATTEMPT, so a
+/// single op can contribute up to the configured budget under a sustained outage.
+/// `op` ∈ `lookup` | `write` | `refresh`. The rate of THIS counter shows the
+/// underlying connection churn (severed idle conns / handshake storms on the bursty batch
+/// pod) even when the retry succeeds and no classify error surfaces — the before/after
+/// instrument for the burst load test.
+pub fn record_index_conn_retry(op: &'static str) {
+    counter!("dwctl_cache_index_conn_retries_total", "op" => op).increment(1);
 }
 
 // ── Resolver L1 caches ────────────────────────────────────────────────────────
@@ -157,4 +196,15 @@ pub fn record_body_read_failed() {
 /// `malformed_cache_control` (a non-object `cache_control`, a missing/non-string `type`, or a non-string `ttl`).
 pub fn record_markers_rejected(reason: &'static str) {
     counter!("dwctl_cache_markers_rejected_total", "reason" => reason).increment(1);
+}
+
+/// A `cacheBreakpoint` query param was seen on a cacheable request (see `super::query` — the
+/// out-of-band form of the top-level automatic-caching marker). `outcome` ∈ `applied` (marker
+/// injected into the body) | `body_field_wins` (body already had a non-null top-level
+/// `cache_control`; explicit wins) | `invalid` (unrecognized value → 400) | `not_json` /
+/// `not_an_object` (nowhere to inject; onwards rejects the body downstream) |
+/// `reserialize_failed` (defensive: forwarded un-injected). Adoption/rollout signal for the
+/// param, distinct from `marker_requests` which counts the injected marker as body adoption.
+pub fn record_query_breakpoint(outcome: &'static str) {
+    counter!("dwctl_cache_query_breakpoint_total", "outcome" => outcome).increment(1);
 }

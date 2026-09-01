@@ -68,7 +68,11 @@ import { cn } from "@/lib/utils";
 // the UI selector — they're queryable via the API but live on the Responses
 // page in the dashboard.
 const BATCH_COMPLETION_WINDOW = "24h";
-const DEFAULT_COMPLETION_WINDOWS: string[] = [BATCH_COMPLETION_WINDOW];
+const BACKGROUND_COMPLETION_WINDOW = "background";
+const DEFAULT_COMPLETION_WINDOWS: string[] = [
+  BATCH_COMPLETION_WINDOW,
+  BACKGROUND_COMPLETION_WINDOW,
+];
 
 const PERSIST_SCOPE = "batches";
 
@@ -332,13 +336,24 @@ export function Batches({
 
   // Empty selection means "no filter" — same UX as AsyncRequests so the user
   // can't accidentally end up with a query that matches nothing.
+  // Sanitize persisted values against the current role: 'background' is
+  // PM-only server-side, and a filter persisted while the user held that
+  // role would otherwise 400 every list request after demotion (rendering
+  // as a misleading empty state). Same defensive shape as the member_id drop.
+  const allowedWindowFilter = isPlatformManager
+    ? completionWindowFilter
+    : completionWindowFilter.filter((w) => w !== "background");
   const completionWindowParam =
-    completionWindowFilter.length > 0
-      ? completionWindowFilter.join(",")
+    allowedWindowFilter.length > 0
+      ? allowedWindowFilter.join(",")
       : undefined;
 
   // Paginated batches query - include analytics to avoid N+1 requests
-  const { data: batchesResponse, isLoading: batchesLoading } = useBatches({
+  const {
+    data: batchesResponse,
+    isLoading: batchesLoading,
+    error: batchesError,
+  } = useBatches({
     search: debouncedBatchSearch.trim() || undefined,
     include: "analytics",
     member_id: memberIdFilter,
@@ -826,6 +841,17 @@ export function Batches({
             onRowClick={handleBatchClick}
             isLoading={batchesLoading}
             emptyState={
+              batchesError ? (
+                <div className="text-center py-12" role="alert">
+                  <h3 className="text-lg font-medium text-doubleword-neutral-900 mb-2">
+                    Couldn't load batches
+                  </h3>
+                  <p className="text-doubleword-neutral-600 mb-4">
+                    {(batchesError as Error)?.message ||
+                      "The batches request failed. Adjust any active filters or try again."}
+                  </p>
+                </div>
+              ) : (
               <div className="text-center py-12">
                 <div className="p-4 bg-doubleword-neutral-100 rounded-full w-16 h-16 mx-auto mb-4 flex items-center justify-center">
                   <Box className="w-8 h-8 text-doubleword-neutral-600" />
@@ -852,6 +878,7 @@ export function Batches({
                   </Button>
                 )}
               </div>
+              )
             }
             headerActions={
               <div className="flex items-center gap-2 flex-wrap">
@@ -886,6 +913,8 @@ export function Batches({
                                 .map((w) =>
                                   w === asyncCompletionWindow
                                     ? "Async"
+                                    : w === BACKGROUND_COMPLETION_WINDOW
+                                      ? "Background"
                                     : w === BATCH_COMPLETION_WINDOW
                                       ? "Batch"
                                       : w,
@@ -900,6 +929,10 @@ export function Batches({
                     {(
                       [
                         { window: BATCH_COMPLETION_WINDOW, label: "Batch" },
+                        {
+                          window: BACKGROUND_COMPLETION_WINDOW,
+                          label: "Background",
+                        },
                         { window: asyncCompletionWindow, label: "Async" },
                       ] as const
                     ).map(({ window, label }) => (

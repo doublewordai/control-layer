@@ -37,6 +37,8 @@ import {
   downloadFile,
 } from "../../../../utils/batch";
 import BatchResults from "./BatchResults";
+import { batchModelName } from "../model";
+import { getCompletionWindowLabel } from "../../../../utils/serviceTier";
 
 const BatchInfo: React.FC = () => {
   const { batchId } = useParams<{ batchId: string }>();
@@ -222,6 +224,7 @@ const BatchInfo: React.FC = () => {
         )
       : 0;
   const reasoningTokens = analytics?.total_reasoning_tokens ?? 0;
+  const modelName = batchModelName(batch);
 
   const description = batch.metadata?.batch_description;
 
@@ -607,6 +610,14 @@ const BatchInfo: React.FC = () => {
                           {batch.endpoint}
                         </p>
                       </div>
+                      <div>
+                        <p className="text-sm text-gray-600 mb-1">
+                          Service tier
+                        </p>
+                        <p className="font-medium text-sm">
+                          {getCompletionWindowLabel(batch.completion_window)}
+                        </p>
+                      </div>
                       {batch.metadata?.created_by_email && (
                         <div>
                           <p className="text-sm text-gray-600 mb-1">Created by</p>
@@ -744,6 +755,19 @@ const BatchInfo: React.FC = () => {
                         </div>
                       ) : analytics.total_requests > 0 ? (
                         <div className="space-y-2">
+                          <div className="flex justify-between items-center gap-3 text-sm">
+                            <span className="text-gray-600">Model</span>
+                            {modelName ? (
+                              <span
+                                className="font-mono text-xs text-doubleword-neutral-700 bg-doubleword-neutral-100 rounded-md px-1.5 py-0.5 truncate max-w-[180px]"
+                                title={modelName}
+                              >
+                                {modelName}
+                              </span>
+                            ) : (
+                              <span className="text-gray-400">-</span>
+                            )}
+                          </div>
                           <div className="flex justify-between text-sm">
                             <span className="text-gray-600">Prompt</span>
                             <span className="font-medium tabular-nums">

@@ -88,10 +88,13 @@ struct BillingTarget {
     id: crate::types::UserId,
     payment_provider_id: Option<String>,
     email: String,
+    /// Billed by emailed invoice rather than an immediate card charge.
+    invoicing_enabled: bool,
     /// Name to put on the payment-provider customer. Set for organizations
     /// (a real, user-provided org name), but `None` for individuals: their
-    /// display_name is only ever a randomly generated placeholder, never the
-    /// real IdP name, so we don't want it on Stripe customers / receipts.
+    /// display_name is only ever a placeholder derived from the email prefix,
+    /// never the real IdP name, so we don't want it on Stripe customers /
+    /// receipts.
     display_name: Option<String>,
 }
 
@@ -121,15 +124,30 @@ async fn resolve_billing_target(user: &CurrentUser, conn: &mut sqlx::PgConnectio
             id: org.id,
             payment_provider_id: org.payment_provider_id,
             email: org.email,
+            invoicing_enabled: org.invoicing_enabled,
             display_name: org.display_name,
         })
     } else {
+        // Read off the row rather than `CurrentUser`: the auth extractor doesn't
+        // carry this flag, and threading it through all nine of its construction
+        // sites isn't worth it for one boolean on the payment path.
+        let invoicing_enabled = sqlx::query_scalar!("SELECT invoicing_enabled FROM users WHERE id = $1", user.id)
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to read invoicing flag: {:?}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?
+            .unwrap_or(false);
+
         Ok(BillingTarget {
             id: user.id,
             payment_provider_id: user.payment_provider_id.clone(),
             email: user.email.clone(),
+            invoicing_enabled,
             // Intentionally omitted: an individual's display_name is a
-            // generated placeholder, not their real name (see BillingTarget).
+            // placeholder derived from the email prefix, not their real name
+            // (see BillingTarget).
             display_name: None,
         })
     }
@@ -214,6 +232,25 @@ pub async fn create_payment<P: PoolProvider>(
     let target = resolve_billing_target(&user, &mut conn).await?;
     drop(conn);
 
+    // Invoice-billed accounts don't buy credits by card. Sending them to
+    // Checkout would either fail (they may have no card at all) or take a
+    // payment for credits Stripe is also going to invoice them for at the end
+    // of the period - billing them twice for the same top-up.
+    //
+    // Their balance is maintained by auto top-up, which accrues onto the next
+    // invoice (see `process_auto_topups`), so there is nothing for this
+    // endpoint to do.
+    if target.invoicing_enabled {
+        tracing::info!(target_id = %target.id, "Refused card checkout for an invoice-billed account");
+        return Ok((
+            StatusCode::CONFLICT,
+            Json(json!({
+                "message": "This account is billed by invoice. Credits are added automatically and charged to your monthly invoice."
+            })),
+        )
+            .into_response());
+    }
+
     let payer = payment_providers::CheckoutPayer {
         id: target.id,
         email: target.email,
@@ -232,6 +269,85 @@ pub async fn create_payment<P: PoolProvider>(
         })?;
 
     // Return the checkout URL as JSON for the frontend to navigate to
+    Ok(Json(json!({
+        "url": checkout_url
+    }))
+    .into_response())
+}
+
+/// Create a setup-mode checkout session for card verification.
+///
+/// Onboarding needs the user to prove a real payment method before we hand out
+/// signup credits and unlock the verified rate-limit tier, but making them buy
+/// credits to do it is a conversion killer. This creates a hosted checkout in
+/// setup mode: the card is verified and saved, nothing is charged.
+///
+/// The return trip is the same one top-ups take (`payment=success&session_id=...`
+/// → `PATCH /payments/{id}`); `process_payment_session` dispatches on the
+/// session's mode, so the SPA doesn't need a second confirmation endpoint.
+#[utoipa::path(
+    post,
+    path = "/payments/setup",
+    tag = "payments",
+    summary = "Create card verification session",
+    description = "Creates a setup-mode checkout session that verifies and saves a payment method without charging it. Returns a JSON object with the checkout URL for the client to navigate to. Confirm the result with PATCH /payments/{id}, as for a normal payment.",
+    responses(
+        (status = 200, description = "Setup session created successfully. Returns JSON with checkout URL.", body = inline(Object)),
+        (status = 403, description = "Caller cannot manage billing for the active organization"),
+        (status = 503, description = "No payment provider configured"),
+    ),
+    security(
+        ("BearerAuth" = []),
+        ("CookieAuth" = []),
+        ("X-Doubleword-User" = [])
+    )
+)]
+#[tracing::instrument(skip_all)]
+pub async fn create_payment_setup<P: PoolProvider>(State(state): State<AppState<P>>, user: CurrentUser) -> Result<Response, StatusCode> {
+    let config = state.current_config();
+    let payment_config = match config.payment.clone() {
+        Some(config) => config,
+        None => {
+            tracing::warn!("Card verification requested but no payment provider is configured");
+            let error_response = Json(json!({
+                "message": "Payment processing is currently unavailable. Please contact support."
+            }));
+            return Ok((StatusCode::SERVICE_UNAVAILABLE, error_response).into_response());
+        }
+    };
+
+    // Same return path as `create_payment`, so the SPA's existing
+    // `payment=success&session_id=...` handling covers verification too.
+    let origin = config.dashboard_url.clone();
+    let success_url = format!("{}/cost-management?payment=success&session_id={{CHECKOUT_SESSION_ID}}", origin);
+    let cancel_url = format!("{}/cost-management?payment=cancelled&session_id={{CHECKOUT_SESSION_ID}}", origin);
+
+    // Verification applies to the billing entity, not the human clicking the
+    // button: verifying as an org admin verifies the org, matching where the
+    // credits and the rate-limit tier actually live.
+    let mut conn = state.db.write().acquire().await.map_err(|e| {
+        tracing::error!("Failed to acquire database connection: {:?}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+    let target = resolve_billing_target(&user, &mut conn).await?;
+    drop(conn);
+
+    let payer = payment_providers::CheckoutPayer {
+        id: target.id,
+        email: target.email,
+        payment_provider_id: target.payment_provider_id,
+    };
+
+    let provider = payment_providers::create_provider(payment_config);
+
+    let checkout_url = provider
+        .create_setup_checkout_session(&payer, &cancel_url, &success_url)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to create setup checkout session: {:?}", e);
+            StatusCode::from(e)
+        })?;
+
     Ok(Json(json!({
         "url": checkout_url
     }))
@@ -380,6 +496,31 @@ pub async fn webhook_handler<P: PoolProvider>(
         }
         Err(payment_providers::PaymentError::AlreadyProcessed) => {
             tracing::trace!("Webhook event already processed (idempotent): {}", event.event_type);
+            StatusCode::OK
+        }
+        Err(payment_providers::PaymentError::UnknownReference(reference)) => {
+            // Routine in a multi-region deployment, not a fault: one Stripe
+            // account serves both regional planes, and Stripe fans every
+            // account-level event out to every configured endpoint, so each
+            // plane sees the other's sessions.
+            //
+            // Acked explicitly here rather than by the catch-all below, and
+            // deliberately NOT via the shared StatusCode mapping, which returns
+            // 404 for the front-channel caller. Retrying cannot make a user
+            // this plane does not own appear, so the webhook must tell Stripe
+            // to stop.
+            //
+            // warn rather than error because it is expected, and rather than
+            // info because a genuinely orphaned *local* session is
+            // indistinguishable from here and must stay visible. The volume is
+            // the other region's payment count — events, not requests — so this
+            // stays quiet. `client_reference_id` is structured for alerting if
+            // orphans ever need chasing.
+            tracing::warn!(
+                event_type = %event.event_type,
+                client_reference_id = %reference,
+                "Ignoring payment webhook for a user unknown to this plane (expected for another region's events)"
+            );
             StatusCode::OK
         }
         Err(payment_providers::PaymentError::Database(_)) => {
@@ -1428,10 +1569,20 @@ mod tests {
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
 
         // Set up a payment provider ID (dummy provider always returns a payment method)
-        sqlx::query!("UPDATE users SET payment_provider_id = $1 WHERE id = $2", "cus_test_123", user.id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query!(
+            r#"
+            UPDATE users
+            SET payment_provider_id = $1,
+                auto_topup_soft_failure_count = 1,
+                auto_topup_retry_after = NOW() + INTERVAL '24 hours'
+            WHERE id = $2
+            "#,
+            "cus_test_123",
+            user.id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let auth_headers = crate::test::utils::add_auth_headers(&user);
 
@@ -1455,13 +1606,22 @@ mod tests {
         assert_eq!(body["amount"], 25.0);
 
         // Verify settings saved in DB
-        let row = sqlx::query!("SELECT auto_topup_amount, auto_topup_threshold FROM users WHERE id = $1", user.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let row = sqlx::query!(
+            r#"
+            SELECT auto_topup_amount, auto_topup_threshold,
+                   auto_topup_soft_failure_count, auto_topup_retry_after
+            FROM users WHERE id = $1
+            "#,
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
 
         assert_eq!(row.auto_topup_amount, Some(25.0));
         assert_eq!(row.auto_topup_threshold, Some(5.0));
+        assert_eq!(row.auto_topup_soft_failure_count, 0);
+        assert_eq!(row.auto_topup_retry_after, None);
     }
 
     #[sqlx::test]
@@ -1656,5 +1816,248 @@ mod tests {
             .unwrap();
         assert_eq!(user_row.auto_topup_amount, None);
         assert_eq!(user_row.auto_topup_threshold, None);
+    }
+
+    /// Build an app exposing the two endpoints the onboarding verification round
+    /// trip uses, and a config granting `verification_credits` on success.
+    fn setup_flow_config(verification_credits: Decimal) -> crate::config::Config {
+        let mut config = create_test_config();
+        config.payment = Some(PaymentConfig::Dummy(DummyConfig {
+            amount: Decimal::new(100, 0),
+        }));
+        config.credits.verification_credits = verification_credits;
+        config
+    }
+
+    /// Pull the session id back out of the checkout URL, the way Stripe hands it
+    /// to the SPA via `?session_id=`.
+    fn session_id_from(checkout_url: &str) -> String {
+        let url = url::Url::parse(checkout_url).unwrap();
+        let query_pairs: std::collections::HashMap<_, _> = url.query_pairs().collect();
+        query_pairs.get("session_id").expect("session_id in return URL").to_string()
+    }
+
+    /// An invoice-billed account must not be able to run a card checkout: they
+    /// may have no card at all, and taking the payment would bill them twice
+    /// for credits their monthly invoice already covers.
+    #[sqlx::test]
+    async fn test_create_payment_refuses_invoice_billed_accounts(pool: PgPool) {
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::ZERO)).await;
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new().route("/payments", post(create_payment)).with_state(state);
+        let server = TestServer::new(app).unwrap();
+
+        // Card-billed by default: checkout is offered as usual.
+        let mut request = server.post("/payments");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        request.await.assert_status(StatusCode::OK);
+
+        sqlx::query!("UPDATE users SET invoicing_enabled = true WHERE id = $1", user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut request = server.post("/payments");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+        response.assert_status(StatusCode::CONFLICT);
+        assert!(
+            response.text().contains("billed by invoice"),
+            "the refusal should explain why, not just fail"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_payment_setup_returns_checkout_url(pool: PgPool) {
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::ZERO)).await;
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new().route("/payments/setup", post(create_payment_setup)).with_state(state);
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/payments/setup");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+
+        response.assert_status(StatusCode::OK);
+        let body: serde_json::Value = response.json();
+        let url = body["url"].as_str().expect("Should contain checkout URL");
+
+        // The SPA's existing top-up return handling keys off these two params,
+        // which is why setup mode reuses them rather than inventing new ones.
+        assert!(url.contains("payment=success"), "URL should reuse the payment return marker");
+        assert!(url.contains("session_id="), "URL should carry the session id back");
+    }
+
+    #[sqlx::test]
+    async fn test_payment_setup_no_provider(pool: PgPool) {
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), create_test_config()).await;
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new().route("/payments/setup", post(create_payment_setup)).with_state(state);
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/payments/setup");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        request.await.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The whole onboarding round trip: create the setup session, come back
+    /// through the same `PATCH /payments/{id}` a top-up uses, and end up
+    /// verified with signup credits but *no* purchase on the ledger.
+    #[sqlx::test]
+    async fn test_payment_setup_verifies_user_and_grants_signup_credits(pool: PgPool) {
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::new(25, 0))).await;
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new()
+            .route("/payments/setup", post(create_payment_setup))
+            .route("/payments/{id}", patch(process_payment))
+            .with_state(state);
+        let server = TestServer::new(app).unwrap();
+
+        // Assert the "before" state so the test covers the transition, not just
+        // the end state.
+        let before = sqlx::query!("SELECT verified, payment_provider_id FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!before.verified, "user starts unverified");
+        assert!(before.payment_provider_id.is_none());
+
+        let mut request = server.post("/payments/setup");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+        response.assert_status(StatusCode::OK);
+        let body: serde_json::Value = response.json();
+        let session_id = session_id_from(body["url"].as_str().unwrap());
+
+        let mut request = server.patch(&format!("/payments/{}", session_id));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        request.await.assert_status(StatusCode::OK);
+
+        let after = sqlx::query!("SELECT verified, payment_provider_id FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(after.verified, "verifying a card should clear the unverified tier");
+        assert!(after.payment_provider_id.is_some(), "customer ID should be persisted");
+
+        let grant: Option<Decimal> = sqlx::query_scalar!(
+            "SELECT amount FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'verification-credits:%'",
+            user.id
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert_eq!(grant, Some(Decimal::new(25, 0)), "signup credits should be granted");
+
+        // Nothing was charged, so nothing may look like a purchase.
+        let purchases: Option<i64> = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND transaction_type = 'purchase'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(purchases, Some(0), "setup mode must not record a purchase");
+    }
+
+    /// The SPA's front-channel PATCH races the provider webhook; both call the
+    /// same code path, so replaying it must not pay out twice.
+    #[sqlx::test]
+    async fn test_payment_setup_processing_is_idempotent(pool: PgPool) {
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::new(25, 0))).await;
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new()
+            .route("/payments/setup", post(create_payment_setup))
+            .route("/payments/{id}", patch(process_payment))
+            .with_state(state);
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/payments/setup");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let response = request.await;
+        let body: serde_json::Value = response.json();
+        let session_id = session_id_from(body["url"].as_str().unwrap());
+
+        for _ in 0..3 {
+            let mut request = server.patch(&format!("/payments/{}", session_id));
+            for (key, value) in &auth_headers {
+                request = request.add_header(key.as_str(), value.as_str());
+            }
+            request.await.assert_status(StatusCode::OK);
+        }
+
+        let count: Option<i64> = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'verification-credits:%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, Some(1), "replaying the return must not double-grant");
+    }
+
+    #[sqlx::test]
+    async fn test_payment_setup_without_verification_credits_still_verifies(pool: PgPool) {
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::ZERO)).await;
+        let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let auth_headers = crate::test::utils::add_auth_headers(&user);
+
+        let app = Router::new()
+            .route("/payments/setup", post(create_payment_setup))
+            .route("/payments/{id}", patch(process_payment))
+            .with_state(state);
+        let server = TestServer::new(app).unwrap();
+
+        let mut request = server.post("/payments/setup");
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        let body: serde_json::Value = request.await.json();
+        let session_id = session_id_from(body["url"].as_str().unwrap());
+
+        let mut request = server.patch(&format!("/payments/{}", session_id));
+        for (key, value) in &auth_headers {
+            request = request.add_header(key.as_str(), value.as_str());
+        }
+        request.await.assert_status(StatusCode::OK);
+
+        let verified = sqlx::query_scalar!("SELECT verified FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(verified, "verification is independent of the credits promotion");
+
+        let count: Option<i64> = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'verification-credits:%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(count, Some(0), "zero credits configured means no grant row");
     }
 }

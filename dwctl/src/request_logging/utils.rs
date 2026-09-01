@@ -1,8 +1,10 @@
 //! Request logging utility functions.
 
+use crate::inference::translation::anthropic::model::MessagesResponse;
+use crate::inference::translation::responses::types::{ResponsesResponse, ResponsesStreamingEvent};
 use crate::request_logging::models::AiResponse;
-use async_openai::types::responses::{Response, ResponseStreamEvent};
 use outlet_postgres::SerializationError;
+use serde_json::Value;
 use std::io::Read as _;
 use tracing::instrument;
 
@@ -117,121 +119,28 @@ pub(crate) fn parse_non_streaming_response(body_str: &str) -> Result<AiResponse,
     serde_json::from_str(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
-/// Parses a non-streaming /v1/responses response body.
-///
-/// Tries strict deserialization into [`Response`] first. If that fails (e.g.
-/// because the response was serialized by onwards' own `ResponsesResponse`
-/// schema which differs from async-openai's), falls back to extracting usage
-/// fields from raw JSON and constructing a minimal [`Response`].
+/// Parses a non-streaming /v1/responses response body into dwctl's own
+/// [`ResponsesResponse`] - the exact type dwctl's edge translator produces (the
+/// translator sits inside the outlet, so the captured body is always the
+/// backfilled dwctl shape). Error/off-spec bodies fail here and the caller falls
+/// back to [`AiResponse::Other`].
 ///
 /// # Errors
-/// Returns error if the body is not valid JSON with an `"object": "response"` field.
+/// Returns error if the body does not deserialize as a `ResponsesResponse`.
 #[instrument(skip_all, name = "dwctl.parse_responses_non_streaming")]
 pub(crate) fn parse_responses_non_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
-    // Fast path: try strict deserialization.
-    match serde_json::from_str::<Response>(body_str) {
-        Ok(response) => return Ok(AiResponse::Responses(response)),
-        Err(e) => tracing::debug!(error = %e, "async-openai Response deserialization failed, using fallback"),
-    }
-
-    // Slow path: extract fields from raw JSON. This handles responses
-    // serialized by onwards' ResponsesResponse which has a different schema
-    // (e.g. required fields that async-openai marks optional, different
-    // enum representations for service_tier, truncation, etc.).
-    let value: serde_json::Value = serde_json::from_str(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
-
-    // Verify this looks like a Responses API object.
-    if value.get("object").and_then(|v| v.as_str()) != Some("response") {
-        return Err("Not a Responses API response object".into());
-    }
-
-    let model = value.get("model").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
-    let status_str = value.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
-    let status = match status_str {
-        "completed" => async_openai::types::responses::Status::Completed,
-        "failed" => async_openai::types::responses::Status::Failed,
-        "in_progress" => async_openai::types::responses::Status::InProgress,
-        "cancelled" => async_openai::types::responses::Status::Cancelled,
-        "queued" => async_openai::types::responses::Status::Queued,
-        "incomplete" => async_openai::types::responses::Status::Incomplete,
-        _ => async_openai::types::responses::Status::Completed,
-    };
-    let created_at = value.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0);
-    let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-
-    // Extract usage if present.
-    let usage = value.get("usage").and_then(|u| {
-        use async_openai::types::responses::{InputTokenDetails, OutputTokenDetails, ResponseUsage};
-        let input_tokens = u.get("input_tokens")?.as_u64()? as u32;
-        let output_tokens = u.get("output_tokens")?.as_u64()? as u32;
-        let total_tokens = u
-            .get("total_tokens")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as u32)
-            .unwrap_or(input_tokens + output_tokens);
-        Some(ResponseUsage {
-            input_tokens,
-            output_tokens,
-            total_tokens,
-            input_tokens_details: InputTokenDetails {
-                cached_tokens: u
-                    .pointer("/input_tokens_details/cached_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32,
-            },
-            output_tokens_details: OutputTokenDetails {
-                reasoning_tokens: u
-                    .pointer("/output_tokens_details/reasoning_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32,
-            },
-        })
-    });
-
-    let response = Response {
-        id,
-        object: "response".to_string(),
-        created_at,
-        status,
-        model,
-        output: vec![],
-        usage,
-        // All remaining fields are Option — None by default.
-        background: None,
-        billing: None,
-        conversation: None,
-        completed_at: None,
-        error: None,
-        incomplete_details: None,
-        instructions: None,
-        max_output_tokens: None,
-        metadata: None,
-        parallel_tool_calls: None,
-        previous_response_id: None,
-        prompt: None,
-        prompt_cache_key: None,
-        prompt_cache_retention: None,
-        reasoning: None,
-        safety_identifier: None,
-        service_tier: None,
-        temperature: None,
-        text: None,
-        tool_choice: None,
-        tools: None,
-        top_logprobs: None,
-        top_p: None,
-        truncation: None,
-    };
-
-    Ok(AiResponse::Responses(response))
+    serde_json::from_str::<ResponsesResponse>(body_str)
+        .map(AiResponse::Responses)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
 }
 
 /// Parses a streaming /v1/responses SSE body into collected events.
 ///
 /// The Responses API streaming format uses named SSE events (`event: response.completed`, etc.)
 /// with a JSON payload on each `data:` line. This parser collects all the SSE data chunks,
-/// deserializes each as a [`ResponseStreamEvent`], and returns the full collection so that the
-/// caller (e.g. [`TokenMetrics`]) can extract usage from the final `response.completed` event.
+/// deserializes each as a [`ResponsesStreamingEvent`] (dwctl's own type), and returns the full
+/// collection so that the caller (e.g. `TokenMetrics`) can extract usage from the final
+/// `response.completed` event.
 ///
 /// # Errors
 /// Returns error if no valid SSE data fields are found or all chunks fail to parse.
@@ -239,9 +148,9 @@ pub(crate) fn parse_responses_non_streaming_response(body_str: &str) -> Result<A
 pub(crate) fn parse_responses_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
     let chunks = parse_sse_chunks(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
 
-    let events: Vec<ResponseStreamEvent> = chunks
+    let events: Vec<ResponsesStreamingEvent> = chunks
         .into_iter()
-        .filter_map(|chunk| serde_json::from_str::<ResponseStreamEvent>(&chunk).ok())
+        .filter_map(|chunk| serde_json::from_str::<ResponsesStreamingEvent>(&chunk).ok())
         .collect();
 
     if events.is_empty() {
@@ -249,6 +158,45 @@ pub(crate) fn parse_responses_streaming_response(body_str: &str) -> Result<AiRes
     }
 
     Ok(AiResponse::ResponsesStream(events))
+}
+
+/// Parses a non-streaming /v1/messages (Anthropic) response body into dwctl's own
+/// [`MessagesResponse`] - the exact type dwctl's edge translator produces. Error
+/// envelopes and off-spec bodies fail here and the caller falls back to
+/// [`AiResponse::Other`].
+///
+/// # Errors
+/// Returns error if the body does not deserialize as a `MessagesResponse`.
+#[instrument(skip_all, name = "dwctl.parse_anthropic_non_streaming")]
+pub(crate) fn parse_anthropic_non_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
+    serde_json::from_str::<MessagesResponse>(body_str)
+        .map(AiResponse::Anthropic)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+}
+
+/// Parses a streaming /v1/messages (Anthropic) SSE body into its raw event frames.
+///
+/// Anthropic streams a lifecycle of typed events (`message_start`, `content_block_delta`,
+/// `message_delta`, …) that dwctl emits ad-hoc rather than as typed structs, so we collect
+/// each `data:` frame as a [`Value`]. Usage lives on `message_start` (input) and `message_delta`
+/// (final counts); the caller (`TokenMetrics`) scans the frames for it.
+///
+/// # Errors
+/// Returns error if no valid SSE data fields are found or no frame parses as JSON.
+#[instrument(skip_all, name = "dwctl.parse_anthropic_streaming")]
+pub(crate) fn parse_anthropic_streaming_response(body_str: &str) -> Result<AiResponse, Box<dyn std::error::Error>> {
+    let chunks = parse_sse_chunks(body_str).map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+
+    let events: Vec<Value> = chunks
+        .into_iter()
+        .filter_map(|chunk| serde_json::from_str::<Value>(&chunk).ok())
+        .collect();
+
+    if events.is_empty() {
+        return Err(Box::new(SseParseError::InvalidFormat));
+    }
+
+    Ok(AiResponse::AnthropicStream(events))
 }
 
 /// Decompress response body if it's compressed according to headers
@@ -330,7 +278,7 @@ pub(crate) fn extract_header_as_string(request_data: &outlet::RequestData, heade
         .map(|s| s.to_string())
 }
 
-// Mylena & Sebastien 2026 <3 :-)
+// Mylena & Sebastien 2026 <3 :^) <3
 
 #[cfg(test)]
 mod tests {
@@ -339,7 +287,6 @@ mod tests {
         parse_responses_streaming_response, parse_sse_chunks, parse_streaming_response, process_sse_chunks,
     };
     use crate::request_logging::models::{AiResponse, ChatCompletionChunk, SseParseError};
-    use async_openai::types::responses::ResponseStreamEvent;
     use axum::http::{Method, Uri};
     use bytes::Bytes;
     use outlet::RequestData;
@@ -470,7 +417,7 @@ mod tests {
         match result {
             AiResponse::ChatCompletionsStream(parsed_chunks) => {
                 assert_eq!(parsed_chunks.len(), 2);
-                assert!(matches!(parsed_chunks[0], ChatCompletionChunk::Normal(_)));
+                assert!(matches!(parsed_chunks[0], ChatCompletionChunk::Chunk(_)));
                 match &parsed_chunks[1] {
                     ChatCompletionChunk::Error(e) => {
                         assert_eq!(e.error.get("code").and_then(|v| v.as_i64()), Some(500));
@@ -749,14 +696,17 @@ mod tests {
         assert_eq!(uuid.to_string(), "00000000-0000-0000-0000-000000000000");
     }
 
-    // Minimal valid Response JSON (only the non-Option required fields).
+    // A full dwctl `ResponsesResponse` body (all required fields), matching what
+    // dwctl's edge translator produces and the logging/billing parse expects.
     fn minimal_response_json(with_usage: bool) -> String {
         let usage = if with_usage {
             r#","usage":{"input_tokens":15,"input_tokens_details":{"cached_tokens":0},"output_tokens":25,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":40}"#
         } else {
             ""
         };
-        format!(r#"{{"id":"resp_1","object":"response","created_at":1000,"model":"gpt-4o","status":"completed","output":[]{usage}}}"#)
+        format!(
+            r#"{{"id":"resp_1","object":"response","created_at":1000,"status":"completed","model":"gpt-4o","output":[],"tools":[],"tool_choice":"auto","truncation":"disabled","parallel_tool_calls":true,"text":{{"format":{{"type":"text"}}}},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"store":false,"background":false,"service_tier":"default"{usage}}}"#
+        )
     }
 
     #[test]
@@ -795,15 +745,13 @@ mod tests {
         match result {
             AiResponse::ResponsesStream(events) => {
                 assert!(!events.is_empty());
-                let completed = events.iter().find(|e| matches!(e, ResponseStreamEvent::ResponseCompleted(_)));
-                assert!(completed.is_some(), "should contain a ResponseCompleted event");
+                let completed = events.iter().find(|e| e.event_type == "response.completed");
+                assert!(completed.is_some(), "should contain a response.completed event");
 
-                if let ResponseStreamEvent::ResponseCompleted(ev) = completed.unwrap() {
-                    let usage = ev.response.usage.as_ref().unwrap();
-                    assert_eq!(usage.input_tokens, 15);
-                    assert_eq!(usage.output_tokens, 25);
-                    assert_eq!(usage.total_tokens, 40);
-                }
+                let usage = completed.unwrap().response.as_ref().unwrap().usage.as_ref().unwrap();
+                assert_eq!(usage.input_tokens, 15);
+                assert_eq!(usage.output_tokens, 25);
+                assert_eq!(usage.total_tokens, 40);
             }
             _ => panic!("expected AiResponse::ResponsesStream"),
         }

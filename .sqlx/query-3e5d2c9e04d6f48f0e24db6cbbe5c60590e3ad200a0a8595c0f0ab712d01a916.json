@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id FROM batches b\n                WHERE b.location IN ('live', 'split') AND b.counts_frozen_at IS NOT NULL AND b.deleted_at IS NULL\n                  AND b.counts_frozen_at <= NOW() - make_interval(secs => $3)\n                  AND NOT EXISTS (\n                      SELECT 1 FROM requests r\n                      WHERE r.batch_id = b.id\n                        AND r.state = 'canceled'\n                        AND r.claimed_at IS NOT NULL\n                        AND r.canceled_at > NOW() - make_interval(secs => $2)\n                  )\n                ORDER BY b.created_at DESC, b.id DESC\n                LIMIT $1\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Float8",
+        "Float8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3e5d2c9e04d6f48f0e24db6cbbe5c60590e3ad200a0a8595c0f0ab712d01a916"
+}

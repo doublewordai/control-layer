@@ -16,6 +16,40 @@ export type LoadBalancingStrategy = "weighted_random" | "priority";
 
 export type JitterStrategy = "none" | "full";
 
+export type ReasoningEffort =
+  | "none"
+  | "minimal"
+  | "low"
+  | "medium"
+  | "high"
+  | "xhigh"
+  | "max";
+
+export interface ReasoningWrite {
+  target_path: string;
+  values: Partial<Record<ReasoningEffort, unknown>>;
+}
+
+export interface ReasoningTranslation {
+  unsupported_efforts: ReasoningEffort[];
+  writes: ReasoningWrite[];
+}
+
+export interface ReasoningTranslationConfig {
+  chat_completions?: ReasoningTranslation;
+  responses?: ReasoningTranslation;
+}
+
+export type ReasoningSurfaceOverride =
+  | { mode: "inherit" }
+  | { mode: "disabled" }
+  | { mode: "override"; translation: ReasoningTranslation };
+
+export interface ReasoningTranslationOverrides {
+  chat_completions: ReasoningSurfaceOverride;
+  responses: ReasoningSurfaceOverride;
+}
+
 export interface BackoffConfig {
   initial_ms: number;
   max_ms: number;
@@ -48,7 +82,6 @@ export interface ComponentModelSummary {
   model_type?: ModelType;
   endpoint?: ComponentEndpointSummary;
   trusted?: boolean;
-  open_responses_adapter?: boolean;
 }
 
 export interface ModelComponent {
@@ -56,6 +89,12 @@ export interface ModelComponent {
   enabled: boolean;
   sort_order: number; // Lower = higher priority for priority-based routing
   created_at: string;
+  // Which routing pool this membership belongs to. "default" serves chat;
+  // "completions" holds validated continuation targets for /v1/completions.
+  // The same hosted model can be a member of both, with independent ordering,
+  // and component PATCH/DELETE endpoints address one membership at a time
+  // (server default: ?pool=default).
+  pool: "default" | "completions";
   model: ComponentModelSummary;
 }
 
@@ -293,7 +332,7 @@ export interface Model {
   components?: ModelComponent[]; // only present when include=components
   sanitize_responses?: boolean | null; // only present for virtual models
   trusted?: boolean; // Mark provider as trusted in strict mode (bypasses error sanitization)
-  open_responses_adapter?: boolean; // Enable adapter that converts /v1/responses to /v1/chat/completions
+  reasoning_translation_overrides?: ReasoningTranslationOverrides | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
   metadata?: ModelMetadata | null;
@@ -315,7 +354,7 @@ export interface StandardModelCreate {
   batch_capacity?: number;
   throughput?: number;
   trusted?: boolean;
-  open_responses_adapter?: boolean;
+  reasoning_translation_overrides?: ReasoningTranslationOverrides;
   traffic_routing_rules?: TrafficRoutingRule[];
   allowed_batch_completion_windows?: string[];
 }
@@ -370,6 +409,7 @@ export interface Endpoint {
   model_filter?: string[] | null; // Optional list of models to sync
   auth_header_name: string;
   auth_header_prefix: string;
+  reasoning_translation?: ReasoningTranslationConfig | null;
 }
 
 export interface EndpointSyncResponse {
@@ -417,13 +457,19 @@ export interface User {
   auto_topup_threshold: number | null; // Balance threshold that triggers auto top-up (null = disabled)
   has_auto_topup_payment_method: boolean; // Whether user has a saved payment method for auto top-up
   auto_topup_monthly_limit: number | null; // Monthly spending limit for auto top-ups (null = no limit)
-  zero_data_retention: boolean; // Account-wide zero-data-retention flag (admin-set)
+  zero_data_retention: boolean; // Account-wide zero-data-retention flag
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
   active_organization_id?: string; // only present for /users/current
   last_login?: string | null; // ISO 8601 timestamp, null if user has never logged in
   onboarding_redirect_url?: string; // only present for /users/current when last_login is null
 }
+
+// Spending-cap reset period. Windows are CALENDAR-ALIGNED (UTC) — a daily cap
+// resets at UTC midnight, weekly at the ISO week boundary, monthly on the 1st.
+// They are NOT rolling windows. null = one-off cap (counts spend since the cap
+// was set/reset, never resets automatically).
+export type SpendLimitInterval = "daily" | "weekly" | "monthly";
 
 export interface ApiKey {
   id: string;
@@ -434,13 +480,29 @@ export interface ApiKey {
   last_used?: string; // ISO 8601 timestamp
   requests_per_second?: number | null; // Rate limiting: requests per second
   burst_size?: number | null; // Rate limiting: burst capacity
-  created_by?: string; // UUID of the user who created the key
+  created_by: string; // UUID of the user who created the key (always present in API responses)
+  spend_limit?: string | null; // Spending cap in credits (decimal string); null = no cap
+  spend_limit_interval?: SpendLimitInterval | null; // null = one-off cap
+  spend?: string | null; // Spend counted against the cap in the current window (decimal string; null when uncapped)
+  total_spend?: string | null; // Lifetime tracked spend for the cap scope (null when uncapped)
+  resets_at?: string | null; // ISO 8601: next calendar reset (null for one-off caps / uncapped)
+  // When the HOLDER first fetched the secret. null = an issued key whose
+  // one-off reveal is still pending; self-created keys are born revealed.
+  // Rotation never changes this. Admins render it as "opened at".
+  secret_revealed_at?: string | null;
   // Note: actual key value only returned on creation
 }
 
 // Response type for API key creation (includes the actual key)
 export interface ApiKeyCreateResponse extends ApiKey {
   key: string; // The actual API key - only returned on creation
+}
+
+// Response of the dedicated secret-fetch and rotate endpoints. The only
+// places (besides creation) a secret ever appears — every fetch is audited
+// server-side.
+export interface ApiKeySecretResponse {
+  key: string;
 }
 
 // Request payload types for CRUD operations Certain endpoints can have query
@@ -535,11 +597,29 @@ export interface ApiKeyCreateRequest {
   purpose: ApiKeyPurpose; // Required: purpose of the key
   requests_per_second?: number | null;
   burst_size?: number | null;
+  spend_limit?: string | null; // Spending cap in credits (decimal string)
+  spend_limit_interval?: SpendLimitInterval | null; // Requires spend_limit; null = one-off
+  // Issue the key to another org member (org targets only; PlatformManager or
+  // org owner/admin). The key is attributed to — and visible to — the member.
+  member_id?: string;
+}
+
+// PATCH /users/{id}/api-keys/{keyId}. Cap fields are tri-state: omit the field
+// to leave it unchanged, send null to remove, send a value to set.
+export interface ApiKeyUpdateRequest {
+  name?: string;
+  description?: string;
+  spend_limit?: string | null;
+  spend_limit_interval?: SpendLimitInterval | null;
+  reset_window?: boolean; // Re-arm the cap now: zero the counted window spend
 }
 
 export interface ApiKeysQuery {
   skip?: number;
   limit?: number;
+  // Server-side holder filter (org managers/PMs only): pagination and
+  // total_count then cover just that member's keys.
+  created_by?: string;
 }
 
 // Update endpoint bodies
@@ -552,7 +632,7 @@ export interface UserUpdateRequest {
   auto_topup_amount?: number | null; // Set an amount to enable, null to disable
   auto_topup_threshold?: number | null; // Set a threshold to enable, null to disable
   auto_topup_monthly_limit?: number | null; // Set a limit to cap, null to remove limit
-  zero_data_retention?: boolean; // Account-wide zero-data-retention flag (admin-only)
+  zero_data_retention?: boolean; // Users may update this for their own account
 }
 
 export interface GroupUpdateRequest {
@@ -589,7 +669,7 @@ export interface ModelUpdateRequest {
   backoff_max_total_ms?: number | null;
   sanitize_responses?: boolean | null;
   trusted?: boolean | null;
-  open_responses_adapter?: boolean | null;
+  reasoning_translation_overrides?: ReasoningTranslationOverrides | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
   metadata?: ModelMetadata | null;
@@ -607,6 +687,7 @@ export interface EndpointCreateRequest {
   auth_header_prefix?: string; // Prefix for authorization header value (defaults to "Bearer ")
   sync?: boolean; // Whether to sync models during creation (defaults to true)
   skip_fetch?: boolean; // Create deployments directly from model_filter without fetching (defaults to false)
+  reasoning_translation?: ReasoningTranslationConfig;
 }
 
 export interface EndpointUpdateRequest {
@@ -618,6 +699,7 @@ export interface EndpointUpdateRequest {
   alias_mapping?: Record<string, string>;
   auth_header_name?: string;
   auth_header_prefix?: string;
+  reasoning_translation?: ReasoningTranslationConfig | null;
 }
 
 export type EndpointValidateRequest =
@@ -909,6 +991,8 @@ export interface RequestsAggregateResponse {
 }
 
 export interface PendingRequestCountsQuery {
+  /** Comma-separated deadline windows, e.g. "1h,24h" (default). */
+  window?: string;
   service_tiers?: string;
 }
 
@@ -1029,10 +1113,8 @@ export interface Transaction {
   source_id: string;
   description?: string;
   created_at: string; // ISO 8601 timestamp
-  /** Request origin: "api" (direct API), "frontend" (playground), or "fusillade" (batch) */
-  request_origin?: string;
-  /** Batch completion window: "1h", "24h", or empty string for non-batch */
-  batch_sla?: string;
+  /** Service tier: "realtime", "flex", "async", "batch", or "background" */
+  service_tier?: string;
   /** Number of requests in this batch (only present for batch transactions) */
   batch_request_count?: number;
 }
@@ -1267,6 +1349,12 @@ export interface Batch {
   cancelled_at?: number | null;
   request_counts: BatchRequestCounts;
   metadata?: Record<string, string>;
+  /**
+   * Model alias used by the batch's requests, or "mixed" when the input
+   * file spans multiple models. Absent on batches created before the
+   * backend started stamping it.
+   */
+  model?: string | null;
   usage?: BatchUsage;
   /** Included when requesting with include=analytics */
   analytics?: BatchAnalytics;
@@ -1300,6 +1388,10 @@ export interface BatchCreateRequest {
   endpoint: string;
   completion_window: string; // Completion window like "24h", "1h"
   metadata?: Record<string, string>;
+  // Attribute the batch to a specific API key (org context only). Spend
+  // counts against the key's usage limit; usage is attributed to the key's
+  // holder. Required for members of managed-keys orgs.
+  api_key_id?: string;
   output_expires_after?: {
     anchor: "created_at";
     seconds: number;
@@ -1624,11 +1716,33 @@ export interface OrganizationSummary {
   name: string;
   role: string;
   zero_data_retention: boolean; // Whether the organization has zero data retention enabled
+  // Effective key-creation capability in this org: owners/admins always true;
+  // members true only with the additive 'manage_keys' org role. Drives the
+  // API-keys create/edit affordances and the batch key selection requirement.
+  can_manage_keys: boolean;
+}
+
+/**
+ * An organization contact-email change that is still awaiting verification.
+ * The backend never applies an email change directly: both the current and
+ * the new mailbox must click a confirmation link before `email` updates.
+ */
+export interface PendingEmailChange {
+  /** The address `email` will become once both sides confirm. */
+  new_email: string;
+  /** When the confirmation links expire (ISO 8601). */
+  expires_at: string;
+  /** When the new mailbox confirmed; null/absent while still outstanding. */
+  new_email_confirmed_at?: string | null;
+  /** When the current mailbox confirmed; null/absent while still outstanding. */
+  old_email_confirmed_at?: string | null;
 }
 
 /** Organization response — flattened User with org-specific fields */
 export interface Organization extends User {
   member_count?: number;
+  /** Present while an email change is waiting on confirmation. */
+  pending_email_change?: PendingEmailChange;
 }
 
 export interface OrganizationMember {
@@ -1638,6 +1752,8 @@ export interface OrganizationMember {
   status: "active" | "pending";
   created_at: string;
   invite_email?: string;
+  // Effective key-creation capability (owners/admins implicitly true).
+  can_manage_keys: boolean;
 }
 
 export interface OrganizationCreateRequest {
@@ -1658,6 +1774,9 @@ export interface OrganizationUpdateRequest {
 export interface InviteMemberRequest {
   email: string;
   role?: OrgMemberRole;
+  // For role 'member': may they create their own API keys? Defaults to
+  // FALSE server-side (new members are strict until opted in).
+  can_manage_keys?: boolean;
 }
 
 export interface InviteMemberResponse {
@@ -1678,6 +1797,9 @@ export interface InviteDetailsResponse {
 
 export interface UpdateMemberRoleRequest {
   role: OrgMemberRole;
+  // Grant/revoke the 'manage_keys' org role. Absent = unchanged; only
+  // meaningful for role 'member' (owners/admins are implicitly true).
+  can_manage_keys?: boolean;
 }
 
 export interface OrganizationsQuery {

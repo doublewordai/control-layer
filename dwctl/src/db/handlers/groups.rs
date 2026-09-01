@@ -1152,6 +1152,8 @@ mod tests {
             requests_per_second: None,
             burst_size: None,
             created_by: test_user_id,
+            spend_limit: None,
+            spend_limit_interval: None,
         };
         let api_key = api_key_repo.create(&api_key_create).await.expect("Failed to create API key");
 

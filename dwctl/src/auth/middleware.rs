@@ -149,6 +149,8 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -204,6 +206,8 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -371,6 +375,8 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -439,6 +445,8 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -493,6 +501,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -550,6 +559,8 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: jwt_user.id,
             })
             .await
@@ -605,6 +616,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -665,6 +677,8 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -719,6 +733,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 
@@ -778,6 +793,8 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: Uuid::nil(), // Use nil for system creation
             })
             .await
@@ -861,6 +878,8 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -960,6 +979,8 @@ mod tests {
                 model_filter: None,
                 auth_header_name: None,
                 auth_header_prefix: None,
+                reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -1014,6 +1035,7 @@ mod tests {
             payment_provider_id: None,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         };
         let jwt_token = session::create_session_token(&current_user, &config).unwrap();
 

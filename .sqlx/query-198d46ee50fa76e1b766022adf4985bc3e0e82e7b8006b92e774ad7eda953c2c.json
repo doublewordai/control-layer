@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE batches b\n                    SET completed_at = NULL,\n                        failed_at = NULL,\n                        finalizing_at = NULL,\n                        cancelling_at = NULL,\n                        cancelled_at = NULL,\n                        notification_sent_at = NULL,\n                        counts_frozen_at = NULL,\n                        completed_requests = 0,\n                        failed_requests = 0,\n                        canceled_requests = 0,\n                        retry_version = retry_version + 1,\n                        -- Same phase 3 routing transition as the batch retry:\n                        -- archived parents of moved-back rows become 'split'\n                        -- (or fully 'live' if the archive side emptied);\n                        -- archive_bucket is never cleared.\n                        location = CASE\n                            WHEN b.location = 'live' THEN 'live'\n                            WHEN EXISTS (\n                                SELECT 1 FROM batch_requests_archive a\n                                WHERE a.archive_bucket = b.archive_bucket AND a.batch_id = b.id\n                            ) THEN 'split'\n                            ELSE 'live'\n                        END\n                    WHERE b.id = ANY($1)\n                    ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "198d46ee50fa76e1b766022adf4985bc3e0e82e7b8006b92e774ad7eda953c2c"
+}

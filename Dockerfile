@@ -5,15 +5,22 @@ WORKDIR /app
 FROM chef AS planner
 COPY Cargo.toml Cargo.lock ./
 COPY dwctl/ dwctl/
+COPY fusillade/ fusillade/
+COPY fusillade-core/ fusillade-core/
+COPY fusillade-arsenal/ fusillade-arsenal/
+COPY onwards/ onwards/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Backend build stage
 FROM chef AS builder
 
-# Install build dependencies including Node.js
+# Install build dependencies including Node.js.
+# `make` is required by tikv-jemalloc-sys, which builds jemalloc from its C
+# sources via autotools rather than shipping a prebuilt library.
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    make \
     curl \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
@@ -33,9 +40,13 @@ RUN pnpm run build
 WORKDIR /app
 
 # Copy source and build
-COPY .sqlx/ .sqlx/
 COPY Cargo.toml Cargo.lock ./
+COPY .sqlx/ .sqlx/
 COPY dwctl/ dwctl/
+COPY fusillade/ fusillade/
+COPY fusillade-core/ fusillade-core/
+COPY fusillade-arsenal/ fusillade-arsenal/
+COPY onwards/ onwards/
 RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
 ENV SQLX_OFFLINE=true
 RUN cargo build --release -p dwctl

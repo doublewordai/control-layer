@@ -3,7 +3,7 @@
 use super::pagination::Pagination;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::users::UserDBResponse;
-use crate::types::UserId;
+use crate::types::{ApiKeyId, UserId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_with::rust::double_option;
@@ -26,6 +26,8 @@ pub enum Role {
     BillingManager,
     /// Access to batch processing API endpoints
     BatchAPIUser,
+    /// Access to spare-capacity background inference
+    BackgroundInferenceUser,
     /// Access to external data source connections and sync operations
     ConnectionsUser,
 }
@@ -80,8 +82,9 @@ pub struct UserUpdate {
     /// auto top-up charges, set to null to remove the limit. Omit entirely to leave unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub auto_topup_monthly_limit: Option<Option<f32>>,
-    /// Account-wide zero-data-retention flag. Admin-only: only callers with
-    /// UpdateAll on users may set this. Omit to leave unchanged.
+    /// Account-wide zero-data-retention flag. Users may set this on their own
+    /// account; callers with UpdateAll on users may set it for any account.
+    /// Omit to leave unchanged.
     pub zero_data_retention: Option<bool>,
 }
 
@@ -143,8 +146,21 @@ pub struct UserResponse {
     pub auto_topup_monthly_limit: Option<f32>,
     /// User type: 'individual' or 'organization'
     pub user_type: String,
+    /// Whether this account has proven a real payment method — either a
+    /// completed purchase or a setup-mode card verification
+    /// (`POST /payments/setup`). Distinct from `has_payment_provider_id`,
+    /// which only says a customer record exists at the provider and is true
+    /// even for a customer created just to collect a billing address.
+    ///
+    /// Clients gating a capability on "this account can pay" (the onboarding
+    /// ZDR step, for one) should read this, not `has_payment_provider_id`.
+    pub verified: bool,
     /// Account-wide zero-data-retention flag.
     pub zero_data_retention: bool,
+    /// Whether this account is billed by emailed invoice rather than an
+    /// immediate card charge. Enabled by Doubleword after approval, not
+    /// self-service - it extends credit on payment terms.
+    pub invoicing_enabled: bool,
     /// Organizations this user belongs to (only included if `include=organizations` is specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub organizations: Option<Vec<super::organizations::OrganizationSummary>>,
@@ -199,6 +215,13 @@ pub struct CurrentUser {
     /// Active organization ID (from X-Organization-Id header)
     #[schema(value_type = Option<String>, format = "uuid")]
     pub active_organization: Option<UserId>,
+    /// The API key that authenticated this request, when the request was
+    /// authenticated by API key (None for session/JWT/proxy-header auth).
+    /// Internal-only: lets handlers resolve per-key state — e.g. batch/file
+    /// creation picking a capped key's cap-scope child as the execution key.
+    /// Never serialized to clients.
+    #[serde(skip)]
+    pub api_key_id: Option<ApiKeyId>,
 }
 
 /// Context about a user's organization membership
@@ -208,6 +231,9 @@ pub struct UserOrganizationContext {
     pub id: UserId,
     pub name: String,
     pub role: String,
+    /// Effective key-creation capability in this org: owners/admins always
+    /// true; members true only with the additive 'manage_keys' org role.
+    pub can_manage_keys: bool,
 }
 
 impl CurrentUser {
@@ -242,7 +268,9 @@ impl From<UserDBResponse> for UserResponse {
             has_auto_topup_payment_method: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
             auto_topup_monthly_limit: db.auto_topup_monthly_limit,
             user_type: db.user_type,
+            verified: db.verified,
             zero_data_retention: db.zero_data_retention,
+            invoicing_enabled: db.invoicing_enabled,
             organizations: None,
             active_organization_id: None,
             onboarding_redirect_url: None,
@@ -295,6 +323,7 @@ impl From<UserDBResponse> for CurrentUser {
             payment_provider_id: db.payment_provider_id,
             organizations: vec![],
             active_organization: None,
+            api_key_id: None,
         }
     }
 }

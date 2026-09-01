@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO requests (\n                    id, batch_id, template_id, model, custom_id,\n                    state, retry_attempt, service_tier, created_by,\n                    daemon_id, claimed_at, started_at, completed_at, failed_at,\n                    response_status, response_body, response_size, error, created_at\n                )\n                SELECT id, NULL, template_id, model, NULL,\n                       CASE WHEN status BETWEEN 200 AND 299 THEN 'completed' ELSE 'failed' END,\n                       0, 'priority', NULLIF(TRIM(created_by), ''),\n                       $1, started_at, started_at,\n                       CASE WHEN status BETWEEN 200 AND 299 THEN completed_at ELSE NULL END,\n                       CASE WHEN status BETWEEN 200 AND 299 THEN NULL ELSE completed_at END,\n                       status, body, size, error, started_at\n                FROM UNNEST(\n                    $2::uuid[], $3::uuid[], $4::text[], $5::text[],\n                    $6::smallint[], $7::text[], $8::bigint[], $9::text[],\n                    $10::timestamptz[], $11::timestamptz[]\n                ) AS v(id, template_id, model, created_by, status, body, size, error, started_at, completed_at)\n                ON CONFLICT (id) DO NOTHING\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray",
+        "UuidArray",
+        "TextArray",
+        "TextArray",
+        "Int2Array",
+        "TextArray",
+        "Int8Array",
+        "TextArray",
+        "TimestamptzArray",
+        "TimestamptzArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "7c05cbf270bf88931106f291956e61d7a6411da0ead5203755cdb28c9c95244a"
+}
