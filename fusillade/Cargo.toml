@@ -22,8 +22,8 @@ fusillade-arsenal = { path = "../fusillade-arsenal", optional = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 tracing = "0.1"
-tracing-opentelemetry = "0.32.1"
-opentelemetry = "0.31.0"
+tracing-opentelemetry = "0.33.0"
+opentelemetry = "0.32.0"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
