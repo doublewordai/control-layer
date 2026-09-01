@@ -1349,6 +1349,12 @@ export interface Batch {
   cancelled_at?: number | null;
   request_counts: BatchRequestCounts;
   metadata?: Record<string, string>;
+  /**
+   * Model alias used by the batch's requests, or "mixed" when the input
+   * file spans multiple models. Absent on batches created before the
+   * backend started stamping it.
+   */
+  model?: string | null;
   usage?: BatchUsage;
   /** Included when requesting with include=analytics */
   analytics?: BatchAnalytics;
