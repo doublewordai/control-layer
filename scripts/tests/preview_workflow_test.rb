@@ -71,8 +71,12 @@ class PreviewWorkflowTest < Minitest::Test
     assert_includes client_payload, "pull_request: context.payload.pull_request.number"
     assert_includes client_payload, "branch: context.payload.pull_request.head.ref"
     assert_includes client_payload, "sha: context.payload.pull_request.head.sha"
+    payload_property_lines = client_payload.lines.filter do |line|
+      line.match?(/^                \S/)
+    end
+    assert_equal 4, payload_property_lines.length
     assert_equal %w[repository pull_request branch sha],
-                 client_payload.scan(/^                ([a-z_]+):/).flatten
+                 payload_property_lines.map { |line| line[/^                ([a-z_]+):/, 1] }.compact
     refute_includes workflow, "pull_request_target"
   end
 
