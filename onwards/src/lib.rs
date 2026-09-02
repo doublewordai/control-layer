@@ -1372,6 +1372,42 @@ mod tests {
         );
     }
 
+    /// The incident shape behind `ControlLayerProxyErrors`: a provider that
+    /// answers every attempt with a plain HTTP fallback status (429/502/503/504)
+    /// rather than an embedded-error body. Exhausted retries must surface a
+    /// sanitized 503 — the same "the gateway could not place the request" signal
+    /// the embedded-error and empty-body paths produce — never the previous
+    /// `bad_gateway` 502 that misreported an overloaded upstream as broken.
+    #[tokio::test]
+    async fn test_status_fallback_retries_then_exhausts_to_503() {
+        let mock = MockHttpClient::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"Provider returned error"}}"#,
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![429]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            503,
+            "exhausted status-fallback retries must surface a sanitized 503, not a 502"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
+    }
+
     #[tokio::test]
     async fn test_streaming_keepalive_before_error_is_still_detected() {
         // A keep-alive comment precedes the error frame; the peek must skip it

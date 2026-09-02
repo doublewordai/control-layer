@@ -1020,7 +1020,14 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            // When every attempt lands on a fallback status (e.g. a provider that
+            // is rate-limiting or overloaded), the exhausted loop surfaces this
+            // error. Use `service_unavailable` so the client gets a sanitized 503
+            // — the same "the gateway could not place the request" signal the
+            // embedded-error and empty-body paths produce — rather than the
+            // previous `bad_gateway` 502, which misreported an overloaded upstream
+            // as a broken gateway.
+            return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
         }
 
         // Sanitize error responses when sanitize_response is enabled.
