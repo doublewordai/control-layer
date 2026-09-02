@@ -45,8 +45,8 @@ pub struct ChunkRelayConfig {
     /// higher QPS, so a shared instance risks a streaming burst affecting
     /// ZDR keystore latency.
     pub redis_url: String,
-    /// Refreshed on every publish, so a stream expires this long after its
-    /// last message, not from creation.
+    /// Refreshed periodically while a stream is active, so it expires
+    /// roughly this long after its last message, not from creation.
     #[serde(default = "default_stream_ttl_secs")]
     pub stream_ttl_secs: u64,
     #[serde(default = "default_maxlen")]
@@ -81,6 +81,9 @@ fn default_publish_channel_capacity() -> usize {
 fn default_reader_poll_interval_ms() -> u64 {
     75
 }
+
+/// How often (in messages) to refresh a stream's TTL.
+const EXPIRE_REFRESH_EVERY: u64 = 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ChunkRelayError {
@@ -226,8 +229,13 @@ async fn publisher_loop(pool: Pool, mut rx: mpsc::Receiver<PublishMsg>, ttl_secs
             continue;
         }
 
-        if let Err(e) = cmd("EXPIRE").arg(&key).arg(ttl_secs).query_async::<i64>(&mut conn).await {
-            tracing::debug!(request_id = %msg.request_id, error = %e, "chunk relay EXPIRE failed");
+        // Refresh the TTL periodically rather than on every message — halves
+        // command volume, and the stream only needs to outlive its last write
+        // by roughly stream_ttl_secs, not by an exact amount.
+        if msg.seq % EXPIRE_REFRESH_EVERY == 0 || msg.done {
+            if let Err(e) = cmd("EXPIRE").arg(&key).arg(ttl_secs).query_async::<i64>(&mut conn).await {
+                tracing::debug!(request_id = %msg.request_id, error = %e, "chunk relay EXPIRE failed");
+            }
         }
     }
 }
@@ -453,6 +461,9 @@ mod tests {
         let mut cfg = test_config();
         cfg.maxlen = 5;
         cfg.stream_ttl_secs = 120;
+        // This test's burst-publishes far faster than real (paced) traffic
+        // would, so the reader needs a tighter tick to keep up with it.
+        cfg.reader_poll_interval_ms = 1;
         let relay = ChunkRelay::from_config(&cfg).expect("relay should build against local redis");
         let request_id = Uuid::new_v4();
         let key = stream_key(request_id);
@@ -465,6 +476,9 @@ mod tests {
         let mut stream = relay.subscribe(request_id);
         for i in 0..PUBLISHED - 1 {
             relay.publish_nonblocking(request_id, i, "x");
+            // Let the publisher/reader tasks interleave, like real (paced)
+            // traffic would, instead of racing ahead of the reader.
+            tokio::task::yield_now().await;
         }
         relay.publish_done_nonblocking(request_id, PUBLISHED - 1);
         collect_until_done(&mut stream, Duration::from_secs(10)).await;
