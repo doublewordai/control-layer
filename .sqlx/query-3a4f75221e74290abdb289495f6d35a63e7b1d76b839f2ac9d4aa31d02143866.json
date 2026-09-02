@@ -145,12 +145,12 @@
       },
       {
         "ordinal": 28,
-        "name": "auto_join_enabled",
+        "name": "invoicing_enabled",
         "type_info": "Bool"
       },
       {
         "ordinal": 29,
-        "name": "invoicing_enabled",
+        "name": "auto_join_enabled",
         "type_info": "Bool"
       }
     ],

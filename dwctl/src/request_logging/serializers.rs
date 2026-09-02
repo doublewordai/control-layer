@@ -548,7 +548,15 @@ impl UsageMetrics {
         // the raw `usage` object. It only exists on a successful response that carried a
         // usage frame, so an errored/partial stream naturally extracts zero (no cache bill).
         let cache_tokens = extract_cache_tokens(response_data);
-        let engine_cached_tokens = extract_engine_cached_tokens(response_data);
+        // The cache layer (inside outlet) rewrites `prompt_tokens_details.cached_tokens`
+        // before this body is read, so prefer the value it stashed on the way through.
+        // The body is only the truth when no cache layer touched the response.
+        let engine_cached_tokens = response_data
+            .extensions
+            .get::<crate::prompt_cache::UpstreamCachedTokens>()
+            .and_then(|c| c.get())
+            .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+            .or_else(|| extract_engine_cached_tokens(response_data));
 
         // Streams that started with HTTP 200 but ended with an embedded provider error frame
         // get reclassified to 500 so success-rate / availability metrics, the credits-eligibility
@@ -2894,6 +2902,42 @@ mod tests {
         let neg = serde_json::json!({"usage": {"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": -5}}}).to_string();
         assert_eq!(extract_engine_cached_tokens(&response_with_body(neg)), Some(0));
         assert_eq!(extract_engine_cached_tokens(&response_with_body("")), None);
+    }
+
+    /// With the cache layer in front, the body's `cached_tokens` is already zeroed when
+    /// analytics reads it; the value the layer stashed on the response wins.
+    #[test]
+    fn engine_cached_tokens_prefers_the_cache_layers_stashed_value() {
+        let scrubbed = serde_json::json!({
+            "usage": {"prompt_tokens": 985, "completion_tokens": 2, "prompt_tokens_details": {"cached_tokens": 0}}
+        })
+        .to_string();
+        let mut r = response_with_body(scrubbed);
+        let cell = crate::prompt_cache::UpstreamCachedTokens::default();
+        cell.set(687);
+        r.extensions.insert(cell);
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)),
+            trace_id: None,
+            span_id: None,
+        };
+        let parsed = parse_ai_response(&request_data, &r).unwrap();
+        let m = UsageMetrics::extract(uuid::Uuid::nil(), &request_data, &r, &parsed, &crate::config::Config::default());
+        assert_eq!(m.engine_cached_tokens, Some(687));
+
+        // An inserted-but-never-filled cell (no usage frame seen) falls back to the body.
+        let mut r = response_with_body(
+            serde_json::json!({"usage": {"prompt_tokens": 1, "prompt_tokens_details": {"cached_tokens": 3}}}).to_string(),
+        );
+        r.extensions.insert(crate::prompt_cache::UpstreamCachedTokens::default());
+        let parsed = parse_ai_response(&request_data, &r).unwrap();
+        let m = UsageMetrics::extract(uuid::Uuid::nil(), &request_data, &r, &parsed, &crate::config::Config::default());
+        assert_eq!(m.engine_cached_tokens, Some(3));
     }
 
     fn params_for(uri: &str, request_body: &str) -> RequestParams {
