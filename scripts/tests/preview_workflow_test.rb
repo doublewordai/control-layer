@@ -36,7 +36,7 @@ class PreviewWorkflowTest < Minitest::Test
   def test_closing_a_preview_pr_publishes_only_its_source_identity
     workflow = File.read(File.join(ROOT, ".github", "workflows", "preview-close.yml"))
 
-    assert_includes workflow, "types: [closed]"
+    assert_includes workflow, "types: [closed, labeled, unlabeled]"
     assert_includes workflow, "startsWith(github.head_ref, 'preview/')"
     assert_includes workflow, "github.event.pull_request.head.repo.full_name == github.repository"
     assert_includes workflow, "preview-closed"
@@ -44,6 +44,33 @@ class PreviewWorkflowTest < Minitest::Test
     refute_includes workflow, "artifact_kind"
     refute_includes workflow, "pull_request_target"
     refute_includes workflow, "doubleword.ai"
+  end
+
+  def test_load_test_label_changes_dispatch_only_the_authoritative_preview_identity
+    workflow = File.read(File.join(ROOT, ".github", "workflows", "preview-close.yml"))
+    label_dispatch = workflow[/^  load-test-changed:\n.*?(?=^  \S|\z)/m]
+
+    assert_includes workflow, "types: [closed, labeled, unlabeled]"
+    refute_nil label_dispatch
+    assert_includes label_dispatch, "github.event.action == 'labeled' || github.event.action == 'unlabeled'"
+    assert_includes label_dispatch, "github.event.label.name == 'load-test'"
+    assert_includes label_dispatch, "startsWith(github.event.pull_request.head.ref, 'preview/')"
+    assert_includes label_dispatch,
+                    "github.event.pull_request.head.repo.full_name == github.repository"
+    assert_includes label_dispatch, "github-token: ${{ secrets.PREVIEW_DISPATCH_TOKEN }}"
+    assert_includes label_dispatch, "owner: '${{ secrets.DEPLOY_TARGET_OWNER }}'"
+    assert_includes label_dispatch, "repo: '${{ secrets.DEPLOY_TARGET_REPO }}'"
+    assert_includes label_dispatch, "event_type: 'preview-load-test-changed'"
+
+    client_payload = label_dispatch[/client_payload: \{\n.*?^              \}/m]
+    refute_nil client_payload
+    assert_includes client_payload, "repository: context.repo.owner + '/' + context.repo.repo"
+    assert_includes client_payload, "pull_request: context.payload.pull_request.number"
+    assert_includes client_payload, "branch: context.payload.pull_request.head.ref"
+    assert_includes client_payload, "sha: context.payload.pull_request.head.sha"
+    refute_includes client_payload, "labels:"
+    refute_includes client_payload, "enabled:"
+    refute_includes workflow, "pull_request_target"
   end
 
   def test_preview_workflows_pin_reusable_actions
