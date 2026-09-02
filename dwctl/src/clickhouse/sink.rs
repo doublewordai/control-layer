@@ -12,6 +12,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::{ClickHouseClient, ClickHouseError, is_identifier};
+use crate::metrics::errors::component::CLICKHOUSE_SINK;
 
 /// Per-writer settings. The connection is shared; these are not.
 #[derive(Debug, Clone)]
@@ -44,10 +45,21 @@ impl SinkOptions {
 }
 
 /// Producer side. Cheap to clone; `send` never blocks and never fails loudly.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SinkHandle<T> {
     tx: mpsc::Sender<T>,
     table: Arc<str>,
+}
+
+// Not derived: a derive would demand `T: Clone`, and the handle is cloneable whatever the
+// row type is.
+impl<T> Clone for SinkHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            table: self.table.clone(),
+        }
+    }
 }
 
 impl<T> SinkHandle<T> {
@@ -181,15 +193,20 @@ impl<T: Serialize + Send + 'static> ClickHouseSink<T> {
         let table = self.table.to_string();
         let start = Instant::now();
         let mut body = Vec::with_capacity(buffer.len() * 256);
+        let mut scratch = Vec::with_capacity(256);
         let mut rows = 0u64;
         for row in buffer.drain(..) {
-            match serde_json::to_writer(&mut body, &row) {
+            // Serialize into a scratch buffer first: a row that fails half-way must not
+            // leave partial bytes in the batch, which would corrupt every row after it.
+            scratch.clear();
+            match serde_json::to_writer(&mut scratch, &row) {
                 Ok(()) => {
+                    body.extend_from_slice(&scratch);
                     body.push(b'\n');
                     rows += 1;
                 }
                 Err(e) => {
-                    warn!(table = %self.table, error = %e, "ClickHouse row failed to serialize; dropped");
+                    crate::background_error!(CLICKHOUSE_SINK, "serialize", Warning, table = %self.table, error = %e, "ClickHouse row failed to serialize; dropped");
                     counter!("dwctl_clickhouse_dropped_rows_total", "table" => table.clone(), "reason" => "serialize").increment(1);
                 }
             }
@@ -208,7 +225,7 @@ impl<T: Serialize + Send + 'static> ClickHouseSink<T> {
                     tokio::time::sleep(self.options.retry_delay).await;
                 }
                 Err(e) => {
-                    warn!(table = %self.table, rows, error = %e, "ClickHouse insert failed again; batch dropped");
+                    crate::background_error!(CLICKHOUSE_SINK, "insert_failed", Error, table = %self.table, rows, error = %e, "ClickHouse insert failed again; batch dropped");
                     counter!("dwctl_clickhouse_dropped_rows_total", "table" => table.clone(), "reason" => "insert_failed").increment(rows);
                     break "error";
                 }

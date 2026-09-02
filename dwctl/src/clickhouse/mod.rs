@@ -70,7 +70,7 @@ pub struct ClickhouseConfig {
 impl fmt::Debug for ClickhouseConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClickhouseConfig")
-            .field("endpoint_url", &self.endpoint_url)
+            .field("endpoint_url", &redact_url(&self.endpoint_url))
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"<redacted>")
@@ -97,7 +97,29 @@ impl ClickhouseConfig {
         if self.password.is_empty() {
             return Err("clickhouse.password is empty (set DWCTL_CLICKHOUSE__PASSWORD)".to_string());
         }
+        if self.request_timeout.is_zero() {
+            return Err("clickhouse.request_timeout must be > 0".to_string());
+        }
+        if url.password().is_some() || !url.username().is_empty() {
+            return Err("clickhouse.endpoint_url must not embed credentials; use clickhouse.user and clickhouse.password".to_string());
+        }
         Ok(())
+    }
+}
+
+/// A URL safe to put in logs: any userinfo replaced, everything else intact. Falls back
+/// to a placeholder rather than the raw string when the URL does not parse, since an
+/// unparseable value can still hold a secret.
+fn redact_url(raw: &str) -> String {
+    match Url::parse(raw.trim()) {
+        Ok(mut url) => {
+            if url.password().is_some() || !url.username().is_empty() {
+                let _ = url.set_username("<redacted>");
+                let _ = url.set_password(None);
+            }
+            url.to_string()
+        }
+        Err(_) => "<unparseable url>".to_string(),
     }
 }
 
@@ -137,7 +159,7 @@ pub struct ClickHouseClient {
 impl fmt::Debug for ClickHouseClient {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ClickHouseClient")
-            .field("endpoint", &self.endpoint.as_str())
+            .field("endpoint", &redact_url(self.endpoint.as_str()))
             .field("database", &self.database)
             .field("user", &self.user)
             .finish_non_exhaustive()
@@ -256,6 +278,23 @@ mod tests {
         let s = format!("{:?}", config());
         assert!(s.contains("<redacted>"));
         assert!(!s.contains("pw\""));
+    }
+
+    #[test]
+    fn debug_output_redacts_credentials_embedded_in_the_url() {
+        let mut c = config();
+        c.endpoint_url = "https://alice:s3cret@example.clickhouse.cloud:8443".into();
+        let s = format!("{:?}", c);
+        assert!(!s.contains("s3cret") && !s.contains("alice"), "{s}");
+        assert!(c.validate().unwrap_err().contains("embed credentials"));
+        assert_eq!(redact_url("not a url"), "<unparseable url>");
+    }
+
+    #[test]
+    fn zero_timeout_is_rejected() {
+        let mut c = config();
+        c.request_timeout = Duration::ZERO;
+        assert!(c.validate().unwrap_err().contains("request_timeout"));
     }
 
     #[test]
