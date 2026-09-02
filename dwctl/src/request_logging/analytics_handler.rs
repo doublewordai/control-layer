@@ -250,6 +250,8 @@ impl RequestHandler for AnalyticsHandler {
                 // The client to attribute this request to — the batch's creator where there
                 // is one, else whoever is on the wire. See `resolve_user_agent`.
                 user_agent: resolve_user_agent(&request_data),
+                engine_cached_tokens: metrics.engine_cached_tokens,
+                request_params: metrics.request_params,
                 server_address: metrics.server_address,
                 server_port: metrics.server_port,
                 served_by: metrics.served_by,
