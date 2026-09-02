@@ -158,6 +158,64 @@ pub struct UsageMetrics {
     /// place per-request routing attribution is knowable. `None` when the
     /// request never reached an upstream (or predates the extension).
     pub served_by: Option<String>,
+    /// Cached-prompt count as reported by the UPSTREAM in
+    /// `usage.prompt_tokens_details.cached_tokens` (SGLang/vLLM through the dynamo
+    /// frontend, OpenAI-compatible providers). Observational only: distinct from
+    /// `cache_read_input_tokens`, which is dwctl's own cache layer and drives billing.
+    /// `None` when the upstream reported nothing. See `extract_engine_cached_tokens`.
+    pub engine_cached_tokens: Option<i64>,
+    /// Content-free request parameters read off the parsed request body.
+    pub request_params: RequestParams,
+}
+
+/// Content-free request parameters, read off the parsed request body.
+///
+/// All `None` when the body did not parse as a typed chat/completions request
+/// (embeddings, the Responses API, opaque bodies). `stream` is `Some(false)` when a typed
+/// request omitted the field, because "not streaming" is the meaningful value there.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RequestParams {
+    pub stream: Option<bool>,
+    /// `max_completion_tokens` when present, else `max_tokens`.
+    pub max_tokens: Option<i64>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub n: Option<i32>,
+    /// Number of tool definitions on the request (`tools`). Chat completions only.
+    pub tool_count: Option<i32>,
+    /// Number of entries in `messages`. Chat completions only.
+    pub message_count: Option<i32>,
+}
+
+impl RequestParams {
+    /// Read the parameters off a parsed request. Never fails: unsupported shapes yield the
+    /// all-`None` default.
+    pub fn from_parsed(parsed: &ParsedAIRequest) -> Self {
+        if parsed.responses_request.is_some() {
+            return Self::default();
+        }
+        match &parsed.request {
+            AiRequest::ChatCompletions(req) => Self {
+                stream: Some(req.stream.unwrap_or(false)),
+                max_tokens: req.max_completion_tokens.or(req.max_tokens).map(i64::from),
+                temperature: req.temperature,
+                top_p: req.top_p,
+                n: req.n.map(|n| i32::try_from(n).unwrap_or(i32::MAX)),
+                tool_count: Some(req.tools.as_ref().map(|t| t.len()).unwrap_or(0) as i32),
+                message_count: Some(req.messages.len() as i32),
+            },
+            AiRequest::Completions(req) => Self {
+                stream: Some(req.stream.unwrap_or(false)),
+                max_tokens: req.max_tokens.map(i64::from),
+                temperature: req.temperature,
+                top_p: req.top_p,
+                n: req.n.map(|n| i32::try_from(n).unwrap_or(i32::MAX)),
+                tool_count: None,
+                message_count: None,
+            },
+            AiRequest::Embeddings(_) | AiRequest::Other(_) => Self::default(),
+        }
+    }
 }
 
 /// Parses HTTP request body data into structured AI request types.
@@ -433,8 +491,10 @@ impl UsageMetrics {
         // If that fails (e.g. request uses content types the strict schemas don't model,
         // like Responses API's input_text/input_image), fall back to extracting the
         // "model" field from raw JSON.
-        let request_model = match parse_ai_request(request_data) {
-            Ok(parsed_request) => {
+        let parsed_request = parse_ai_request(request_data).ok();
+        let request_params = parsed_request.as_ref().map(RequestParams::from_parsed).unwrap_or_default();
+        let request_model = match parsed_request {
+            Some(parsed_request) => {
                 if let Some(responses_req) = parsed_request.responses_request {
                     responses_req.model
                 } else {
@@ -456,7 +516,7 @@ impl UsageMetrics {
                     }
                 }
             }
-            _ => None,
+            None => None,
         };
 
         // Token metrics come from the single parse of the response into `AiResponse`
@@ -488,6 +548,15 @@ impl UsageMetrics {
         // the raw `usage` object. It only exists on a successful response that carried a
         // usage frame, so an errored/partial stream naturally extracts zero (no cache bill).
         let cache_tokens = extract_cache_tokens(response_data);
+        // The cache layer (inside outlet) rewrites `prompt_tokens_details.cached_tokens`
+        // before this body is read, so prefer the value it stashed on the way through.
+        // The body is only the truth when no cache layer touched the response.
+        let engine_cached_tokens = response_data
+            .extensions
+            .get::<crate::prompt_cache::UpstreamCachedTokens>()
+            .and_then(|c| c.get())
+            .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+            .or_else(|| extract_engine_cached_tokens(response_data));
 
         // Streams that started with HTTP 200 but ended with an embedded provider error frame
         // get reclassified to 500 so success-rate / availability metrics, the credits-eligibility
@@ -525,6 +594,8 @@ impl UsageMetrics {
             server_address: config.host.clone(),
             server_port: config.port,
             served_by: response_data.extensions.get::<onwards::ServedBy>().map(|s| s.url.clone()),
+            engine_cached_tokens,
+            request_params,
         }
     }
 }
@@ -598,6 +669,24 @@ fn cache_tokens_from_usage(usage: &Value) -> CacheTokens {
 /// frame) — which is exactly the no-cache-billing case.
 pub(crate) fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
     extract_from_last_usage(response_data, cache_tokens_from_usage)
+}
+
+/// The upstream's own cached-prompt count: `usage.prompt_tokens_details.cached_tokens`
+/// (the OpenAI-compatible shape SGLang, vLLM and the dynamo frontend emit). This is the
+/// engine's prefix-cache hit for the request, recorded for workload profiling. It is NOT
+/// a dwctl cache read — `cache_tokens_from_usage` keeps ignoring it on purpose — and is
+/// never priced. `None` when the field is absent.
+fn engine_cached_tokens_from_usage(usage: &Value) -> Option<i64> {
+    usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_i64)
+        .map(|v| v.max(0))
+}
+
+/// See [`engine_cached_tokens_from_usage`]; reads the last `usage` block like the other
+/// usage extractors (terminal SSE frame for streams).
+pub(crate) fn extract_engine_cached_tokens(response_data: &ResponseData) -> Option<i64> {
+    extract_from_last_usage(response_data, engine_cached_tokens_from_usage)
 }
 
 /// Token counts read straight from a raw `usage` JSON object, for bodies the typed parse
@@ -1086,7 +1175,10 @@ impl From<&AiResponse> for TokenMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::{UsageMetrics, extract_cache_tokens, extract_finish_reason, parse_ai_request, parse_ai_response};
+    use super::{
+        RequestParams, UsageMetrics, extract_cache_tokens, extract_engine_cached_tokens, extract_finish_reason, parse_ai_request,
+        parse_ai_response,
+    };
     use crate::request_logging::models::{AiRequest, AiResponse};
     use axum::http::{Method, StatusCode, Uri};
     use bytes::Bytes;
@@ -2777,6 +2869,163 @@ mod tests {
         assert_eq!(c.read, 1500);
         assert_eq!(c.creation_24h, 1500);
         assert_eq!(c.creation_1h, 0);
+    }
+
+    /// `prompt_tokens_details.cached_tokens` is the ENGINE's prefix-cache hit (SGLang/vLLM
+    /// via the dynamo frontend). It is recorded on its own column and must keep being
+    /// ignored by the billing split — the two readers look at the same usage object and
+    /// must disagree on purpose.
+    #[test]
+    fn engine_cached_tokens_read_from_prompt_tokens_details_and_not_billed() {
+        let body = serde_json::json!({
+            "usage": {"prompt_tokens": 3607, "completion_tokens": 607,
+                      "prompt_tokens_details": {"cached_tokens": 3456}}
+        })
+        .to_string();
+        let r = response_with_body(body);
+        assert_eq!(extract_engine_cached_tokens(&r), Some(3456));
+        assert_eq!(extract_cache_tokens(&r).read, 0, "engine hits are not dwctl cache reads");
+    }
+
+    #[test]
+    fn engine_cached_tokens_streaming_terminal_frame() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":1984}}}\n\n\
+                   data: [DONE]\n\n";
+        assert_eq!(extract_engine_cached_tokens(&response_with_body(sse)), Some(1984));
+    }
+
+    #[test]
+    fn engine_cached_tokens_absent_is_none_and_negative_is_clamped() {
+        let none = serde_json::json!({"usage": {"prompt_tokens": 10, "completion_tokens": 1}}).to_string();
+        assert_eq!(extract_engine_cached_tokens(&response_with_body(none)), None);
+        let neg = serde_json::json!({"usage": {"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": -5}}}).to_string();
+        assert_eq!(extract_engine_cached_tokens(&response_with_body(neg)), Some(0));
+        assert_eq!(extract_engine_cached_tokens(&response_with_body("")), None);
+    }
+
+    /// With the cache layer in front, the body's `cached_tokens` is already zeroed when
+    /// analytics reads it; the value the layer stashed on the response wins.
+    #[test]
+    fn engine_cached_tokens_prefers_the_cache_layers_stashed_value() {
+        let scrubbed = serde_json::json!({
+            "usage": {"prompt_tokens": 985, "completion_tokens": 2, "prompt_tokens_details": {"cached_tokens": 0}}
+        })
+        .to_string();
+        let mut r = response_with_body(scrubbed);
+        let cell = crate::prompt_cache::UpstreamCachedTokens::default();
+        cell.set(687);
+        r.extensions.insert(cell);
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)),
+            trace_id: None,
+            span_id: None,
+        };
+        let parsed = parse_ai_response(&request_data, &r).unwrap();
+        let m = UsageMetrics::extract(uuid::Uuid::nil(), &request_data, &r, &parsed, &crate::config::Config::default());
+        assert_eq!(m.engine_cached_tokens, Some(687));
+
+        // An inserted-but-never-filled cell (no usage frame seen) falls back to the body.
+        let mut r = response_with_body(
+            serde_json::json!({"usage": {"prompt_tokens": 1, "prompt_tokens_details": {"cached_tokens": 3}}}).to_string(),
+        );
+        r.extensions.insert(crate::prompt_cache::UpstreamCachedTokens::default());
+        let parsed = parse_ai_response(&request_data, &r).unwrap();
+        let m = UsageMetrics::extract(uuid::Uuid::nil(), &request_data, &r, &parsed, &crate::config::Config::default());
+        assert_eq!(m.engine_cached_tokens, Some(3));
+    }
+
+    fn params_for(uri: &str, request_body: &str) -> RequestParams {
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: uri.parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(request_body.to_owned())),
+            trace_id: None,
+            span_id: None,
+        };
+        let response_data = response_with_body(
+            r#"{"id":"r","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}"#,
+        );
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::config::Config::default(),
+        )
+        .request_params
+    }
+
+    /// The content-free request parameters come off the typed chat request.
+    /// `max_completion_tokens` wins over `max_tokens`; `tools` and `messages` are counted.
+    #[test]
+    fn request_params_read_from_a_chat_request() {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u"},
+                {"role": "assistant", "content": "a"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "description": "d",
+                       "parameters": {"type": "object", "properties": {}}}}],
+            "stream": true,
+            "max_tokens": 100,
+            "max_completion_tokens": 512,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "n": 1
+        })
+        .to_string();
+        let p = params_for("/chat/completions", &body);
+        assert_eq!(
+            p,
+            RequestParams {
+                stream: Some(true),
+                max_tokens: Some(512),
+                temperature: Some(0.7),
+                top_p: Some(0.9),
+                n: Some(1),
+                tool_count: Some(1),
+                message_count: Some(3),
+            }
+        );
+    }
+
+    /// A chat request that omits `stream` is a non-streaming request, not an unknown one;
+    /// a body that is not a typed chat/completions request yields all-`None`.
+    #[test]
+    fn request_params_stream_defaults_false_and_untyped_bodies_yield_none() {
+        let p = params_for("/chat/completions", r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
+        assert_eq!(p.stream, Some(false));
+        assert_eq!(p.max_tokens, None);
+        assert_eq!(p.tool_count, Some(0));
+        assert_eq!(p.message_count, Some(1));
+
+        let e = params_for("/embeddings", r#"{"model":"m","input":"hello"}"#);
+        assert_eq!(e, RequestParams::default());
+    }
+
+    #[test]
+    fn request_params_read_from_a_completions_request() {
+        let p = params_for(
+            "/completions",
+            r#"{"model":"m","prompt":"hi","max_tokens":64,"temperature":0.2,"stream":false}"#,
+        );
+        assert_eq!(p.stream, Some(false));
+        assert_eq!(p.max_tokens, Some(64));
+        assert_eq!(p.temperature, Some(0.2));
+        assert_eq!(p.tool_count, None, "completions have no tools");
+        assert_eq!(p.message_count, None, "completions have no messages");
     }
 
     #[test]

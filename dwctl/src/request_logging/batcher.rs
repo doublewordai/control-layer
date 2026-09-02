@@ -41,7 +41,7 @@ use crate::metrics::errors::component::ANALYTICS_BATCHER;
 use crate::pricing::{
     CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, find_best_tariff, list_price, resolve_cache_multipliers,
 };
-use crate::request_logging::serializers::HttpAnalyticsRow;
+use crate::request_logging::serializers::{HttpAnalyticsRow, RequestParams};
 use chrono::{DateTime, Utc};
 use metrics::{counter, histogram};
 use rust_decimal::Decimal;
@@ -103,6 +103,13 @@ pub struct RawAnalyticsRecord {
     /// CLI, curl, own code), as opposed to `uri` (which protocol) and `request_origin`
     /// (which dispatch path). Read straight off the request headers, not the payload.
     pub user_agent: Option<String>,
+    /// The upstream's own cached-prompt count (`usage.prompt_tokens_details.cached_tokens`).
+    /// Observational: distinct from `cache_read_input_tokens`, which is dwctl's cache layer
+    /// and is what gets priced. See `serializers::extract_engine_cached_tokens`.
+    pub engine_cached_tokens: Option<i64>,
+    /// Content-free request parameters (stream, max_tokens, sampling, message and tool
+    /// counts). See `serializers::RequestParams`.
+    pub request_params: RequestParams,
     pub server_address: String,
     pub server_port: u16,
     /// URL of the upstream that served the request (onwards `ServedBy`
@@ -820,6 +827,14 @@ where
         let mut finish_reason_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut user_agent_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut submitted_at_vec: Vec<Option<DateTime<Utc>>> = Vec::with_capacity(records.len());
+        let mut engine_cached_vec: Vec<Option<i64>> = Vec::with_capacity(records.len());
+        let mut stream_vec: Vec<Option<bool>> = Vec::with_capacity(records.len());
+        let mut max_tokens_vec: Vec<Option<i64>> = Vec::with_capacity(records.len());
+        let mut temperature_vec: Vec<Option<f32>> = Vec::with_capacity(records.len());
+        let mut top_p_vec: Vec<Option<f32>> = Vec::with_capacity(records.len());
+        let mut n_vec: Vec<Option<i32>> = Vec::with_capacity(records.len());
+        let mut tool_count_vec: Vec<Option<i32>> = Vec::with_capacity(records.len());
+        let mut message_count_vec: Vec<Option<i32>> = Vec::with_capacity(records.len());
 
         for record in records {
             instance_ids.push(record.raw.instance_id);
@@ -870,6 +885,15 @@ where
             // Already carried for batch-creation pricing; now also persisted, so the
             // queue delay (timestamp - submitted_at) survives past this process.
             submitted_at_vec.push(record.raw.batch_created_at);
+            engine_cached_vec.push(record.raw.engine_cached_tokens);
+            let p = &record.raw.request_params;
+            stream_vec.push(p.stream);
+            max_tokens_vec.push(p.max_tokens);
+            temperature_vec.push(p.temperature);
+            top_p_vec.push(p.top_p);
+            n_vec.push(p.n);
+            tool_count_vec.push(p.tool_count);
+            message_count_vec.push(p.message_count);
         }
 
         let rows = sqlx::query!(
@@ -882,7 +906,8 @@ where
                 request_origin, batch_sla, batch_request_source, api_key_id, trace_id,
                 cache_read_input_tokens, cache_creation_input_tokens,
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
-                total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at
+                total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at,
+                engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -893,7 +918,8 @@ where
                 $27::bigint[], $28::bigint[],
                 $29::bigint[], $30::bigint[], $31::bigint[],
                 $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],
-                $37::timestamptz[]
+                $37::timestamptz[],
+                $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[]
             )
             ON CONFLICT (instance_id, correlation_id)
             DO UPDATE SET
@@ -927,7 +953,15 @@ where
                 served_by = EXCLUDED.served_by,
                 finish_reason = EXCLUDED.finish_reason,
                 user_agent = EXCLUDED.user_agent,
-                submitted_at = EXCLUDED.submitted_at
+                submitted_at = EXCLUDED.submitted_at,
+                engine_cached_tokens = EXCLUDED.engine_cached_tokens,
+                stream = EXCLUDED.stream,
+                max_tokens = EXCLUDED.max_tokens,
+                temperature = EXCLUDED.temperature,
+                top_p = EXCLUDED.top_p,
+                n = EXCLUDED.n,
+                tool_count = EXCLUDED.tool_count,
+                message_count = EXCLUDED.message_count
             RETURNING id, instance_id, correlation_id, (xmax = 0) AS "newly_inserted!"
             "#,
             &instance_ids,
@@ -967,6 +1001,14 @@ where
             &finish_reason_vec as &[Option<String>],
             &user_agent_vec as &[Option<String>],
             &submitted_at_vec as &[Option<DateTime<Utc>>],
+            &engine_cached_vec as &[Option<i64>],
+            &stream_vec as &[Option<bool>],
+            &max_tokens_vec as &[Option<i64>],
+            &temperature_vec as &[Option<f32>],
+            &top_p_vec as &[Option<f32>],
+            &n_vec as &[Option<i32>],
+            &tool_count_vec as &[Option<i32>],
+            &message_count_vec as &[Option<i32>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1705,6 +1747,8 @@ mod tests {
             response_type: "chat_completion".to_string(),
             finish_reason: None,
             user_agent: None,
+            engine_cached_tokens: None,
+            request_params: RequestParams::default(),
             server_address: "localhost".to_string(),
             server_port: 8080,
             bearer_token: Some("test-token".to_string()),
@@ -1755,6 +1799,8 @@ mod tests {
             response_type: "chat_completion".to_string(),
             finish_reason: None,
             user_agent: None,
+            engine_cached_tokens: None,
+            request_params: RequestParams::default(),
             server_address: "x".to_string(),
             server_port: 1,
             bearer_token: None,
@@ -2023,6 +2069,8 @@ mod integration_tests {
             response_type: "chat_completion".to_string(),
             finish_reason: None,
             user_agent: None,
+            engine_cached_tokens: None,
+            request_params: RequestParams::default(),
             server_address: "api.test.com".to_string(),
             server_port: 443,
             bearer_token,
