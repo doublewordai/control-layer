@@ -35,7 +35,7 @@ use sqlx_pool_router::PoolProvider;
 
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
-use super::streaming::{ReplayFrame, flex_stream_response};
+use super::streaming::{LiveRelayConfig, ReplayFrame, flex_stream_response};
 use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::image_normalizer::ImageNormalizer;
 
@@ -72,6 +72,10 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub flex_completion_window: String,
     /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR.
     pub keystore: Option<crate::keystore::Keystore>,
+    /// `None` disables live streaming. See `crate::chunk_relay`.
+    pub chunk_relay: Option<crate::chunk_relay::ChunkRelay>,
+    /// Correctness fallback interval once live streaming is active.
+    pub flex_poll_fallback_interval_ms: u64,
     /// Per-key ZDR policy map (api key secret to the owning account's
     /// `zero_data_retention` flag), kept fresh by [`crate::sync::zdr_keys`].
     /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
@@ -1031,12 +1035,19 @@ async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + 
     request_id: uuid::Uuid,
     include_usage: bool,
 ) -> Response {
+    // Chat-completions only for now; Responses stays on poll-and-replay.
+    let live_relay = state.chunk_relay.clone().map(|relay| LiveRelayConfig {
+        relay,
+        poll_fallback_interval: std::time::Duration::from_millis(state.flex_poll_fallback_interval_ms),
+    });
+
     flex_stream_response(
         state.request_manager.clone(),
         flex_input,
         request_id,
         true,
         state.keystore.clone(),
+        live_relay,
         move |result| match result {
             Ok(detail) => {
                 let (status, body) = response_store::detail_to_chat_completion_object(detail);
@@ -1079,6 +1090,7 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
         request_id,
         false,
         state.keystore.clone(),
+        None, // live relay not wired to Responses yet
         move |result| match result {
             Ok(detail) => {
                 let response = response_store::detail_to_response_object(detail);

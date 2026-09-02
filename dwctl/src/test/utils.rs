@@ -200,6 +200,27 @@ pub async fn create_test_app_with_config(
     app.into_test_server()
 }
 
+/// Like [`create_test_app_with_config`], but binds a real socket first (and
+/// points `config` at it) so the fusillade daemon's own HTTP client can
+/// make a real loopback dispatch — see `Application::into_test_server_on_real_socket`.
+pub async fn create_test_app_with_real_loopback(
+    pool: PgPool,
+    mut config: crate::config::Config,
+) -> (TestServer, crate::BackgroundServices) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind real loopback listener");
+    let real_addr = listener.local_addr().expect("real loopback listener addr");
+    config.host = real_addr.ip().to_string();
+    config.port = real_addr.port();
+
+    let app = crate::Application::new_with_pool(config, Some(pool), None)
+        .await
+        .expect("Failed to create application");
+
+    app.into_test_server_on_real_socket(listener)
+}
+
 pub fn create_test_config() -> crate::config::Config {
     // Use temp directory for test emails
     let temp_dir = std::env::temp_dir().join(format!("dwctl-test-emails-{}", std::process::id()));
@@ -352,6 +373,7 @@ pub fn create_test_config() -> crate::config::Config {
         cache: Default::default(),
         continuation: Default::default(),
         keystore: None,
+        flex_live_streaming: Default::default(),
     }
 }
 

@@ -7,15 +7,65 @@
 //! in `inference/middleware.rs`.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::response::sse::{Event, KeepAlive, Sse};
+use futures::StreamExt;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
+
+use super::zdr;
 
 /// Buffer size for the flex replay channel: a finished request renders to a
 /// small, bounded set of frames, so a shallow buffer is enough.
 const FLEX_REPLAY_BUFFER: usize = 16;
+
+/// `None` means `flex_stream_response` behaves exactly as before: a single
+/// 500ms poll task, no relay subscriber.
+#[derive(Clone)]
+pub struct LiveRelayConfig {
+    pub relay: crate::chunk_relay::ChunkRelay,
+    /// Correctness fallback while the relay is primary — deliberately much
+    /// slower than the 500ms used when live streaming is off.
+    pub poll_fallback_interval: std::time::Duration,
+}
+
+/// Ensures only one of {poll task, relay task} sends the terminal frame(s).
+struct Terminal {
+    claimed: AtomicBool,
+    notify: Notify,
+}
+
+impl Terminal {
+    fn new() -> Self {
+        Self {
+            claimed: AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    /// `true` for exactly one caller, ever; wakes anyone parked in
+    /// `claimed_by_other` so they stand down immediately.
+    fn claim(&self) -> bool {
+        let already_claimed = self.claimed.swap(true, Ordering::SeqCst);
+        if !already_claimed {
+            self.notify.notify_waiters();
+        }
+        !already_claimed
+    }
+
+    /// The `Notified` future must be created before checking `claimed`:
+    /// `notify_waiters()` only wakes already-registered waiters, so
+    /// checking first can miss a concurrent `claim()`.
+    async fn claimed_by_other(&self) {
+        let notified = self.notify.notified();
+        if self.claimed.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+}
 
 /// One SSE frame to replay once a flex request reaches a terminal state.
 pub struct ReplayFrame {
@@ -57,12 +107,16 @@ impl ReplayFrame {
 /// `done_sentinel` appends a trailing `data: [DONE]` (the chat-completions
 /// terminator); the Responses surface ends on `response.completed`/`.failed`
 /// and passes `false`.
+///
+/// `live_relay`, when set, races a relay task against the poll task (see
+/// [`Terminal`]); `None` is exactly today's behavior.
 pub async fn flex_stream_response<P, F>(
     request_manager: Arc<fusillade_arsenal::PostgresRequestManager<P>>,
     flex_input: fusillade::CreateFlexInput,
     request_id: uuid::Uuid,
     done_sentinel: bool,
     keystore: Option<crate::keystore::Keystore>,
+    live_relay: Option<LiveRelayConfig>,
     render: F,
 ) -> axum::response::Response
 where
@@ -88,15 +142,42 @@ where
     }
 
     let (tx, rx) = mpsc::channel::<Result<Event, std::convert::Infallible>>(FLEX_REPLAY_BUFFER);
+    let terminal = Arc::new(Terminal::new());
+
+    // 500ms when live streaming is off; the slower configured fallback once
+    // a relay is racing it.
+    let poll_interval = live_relay
+        .as_ref()
+        .map(|lr| lr.poll_fallback_interval)
+        .unwrap_or(std::time::Duration::from_millis(500));
+
+    if let Some(live_relay) = live_relay {
+        let tx = tx.clone();
+        let keystore = keystore.clone();
+        let terminal = terminal.clone();
+        tokio::spawn(run_live_relay(live_relay.relay, request_id, keystore, tx, terminal, done_sentinel));
+    }
 
     // Poll task: the HTTP response is already returning; this fills the stream
     // once the daemon reaches a terminal state. Until then the channel is idle
     // and axum's keep-alive holds the connection open.
+    //
+    // Races against `terminal.claimed_by_other()` so a relay-delivered
+    // response doesn't sit open until this task's own next poll tick.
     tokio::spawn(async move {
-        let poll_interval = std::time::Duration::from_millis(500);
         let timeout = std::time::Duration::from_secs(3600);
-        let result =
-            crate::inference::store::poll_until_terminal(&request_manager, request_id, poll_interval, timeout, keystore.as_ref()).await;
+
+        let result = tokio::select! {
+            biased;
+
+            _ = terminal.claimed_by_other() => return,
+
+            result = crate::inference::store::poll_until_terminal(&request_manager, request_id, poll_interval, timeout, keystore.as_ref()) => result,
+        };
+
+        if !terminal.claim() {
+            return;
+        }
 
         let frames = match &result {
             Ok(detail) => render(Ok(detail)),
@@ -121,4 +202,67 @@ where
     });
 
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()).into_response()
+}
+
+/// Subscribes to a request's relayed chunks and forwards them live,
+/// decrypting first when ZDR. Races against `terminal` so it never
+/// outlives the request even if the relay never produces a `done`.
+async fn run_live_relay(
+    relay: crate::chunk_relay::ChunkRelay,
+    request_id: uuid::Uuid,
+    keystore: Option<crate::keystore::Keystore>,
+    tx: mpsc::Sender<Result<Event, std::convert::Infallible>>,
+    terminal: Arc<Terminal>,
+    done_sentinel: bool,
+) {
+    // Non-destructive fetch; `None` for a non-ZDR request.
+    let zdr_key = match &keystore {
+        Some(ks) => ks.get(&zdr::key_id(&request_id, zdr::KeyKind::Response)).await.ok().flatten(),
+        None => None,
+    };
+
+    let mut stream = relay.subscribe(request_id);
+
+    loop {
+        tokio::select! {
+            biased;
+
+            _ = terminal.claimed_by_other() => {
+                return;
+            }
+
+            msg = stream.next() => {
+                let Some(msg) = msg else {
+                    return; // relay dropped the subscriber; poll fallback covers it
+                };
+
+                if msg.done {
+                    if terminal.claim() && done_sentinel {
+                        let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                    }
+                    return;
+                }
+
+                let payload = match &zdr_key {
+                    Some(key) => match zdr::decrypt_body(key, &msg.data) {
+                        Ok(plaintext) => plaintext,
+                        Err(e) => {
+                            tracing::debug!(%request_id, error = %e, "failed to decrypt relayed chunk, skipping");
+                            continue;
+                        }
+                    },
+                    None => msg.data,
+                };
+
+                let Ok(parsed) = serde_json::from_str::<Value>(&payload) else {
+                    tracing::debug!(%request_id, "relayed chunk was not valid JSON, skipping");
+                    continue;
+                };
+
+                if tx.send(Ok(Event::default().data(parsed.to_string()))).await.is_err() {
+                    return; // client disconnected
+                }
+            }
+        }
+    }
 }

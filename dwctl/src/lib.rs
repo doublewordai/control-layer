@@ -142,6 +142,7 @@ fn install_crypto_provider() {
 
 pub mod api;
 pub mod auth;
+pub mod chunk_relay;
 pub mod config;
 mod config_watcher;
 pub mod connections;
@@ -316,6 +317,11 @@ where
     /// Encrypted key custody, built from `config.keystore`. `None` means it is
     /// not configured (ZDR flex disabled).
     pub keystore: Option<crate::keystore::Keystore>,
+    /// Flex live-streaming chunk relay, built from
+    /// `config.flex_live_streaming`. `None` means live streaming is
+    /// disabled or unconfigured — flex streaming falls back to the
+    /// existing poll-and-replay path.
+    pub chunk_relay: Option<crate::chunk_relay::ChunkRelay>,
 }
 
 impl<P> AppState<P>
@@ -1703,6 +1709,8 @@ pub async fn build_router(
         let daemon = &state.current_config().background_services.batch_daemon;
         let outbound_config = crate::inference::outbound_request::OutboundConfig {
             timeouts: crate::inference::outbound_request::StreamTimeouts::from_daemon_config(daemon),
+            relay: state.chunk_relay.clone(),
+            keystore: state.keystore.clone(),
         };
         onwards_router.layer(middleware::from_fn_with_state(
             outbound_config,
@@ -3262,6 +3270,14 @@ impl Application {
             Some(c) => Some(crate::keystore::Keystore::from_config(c).map_err(|e| anyhow::anyhow!("failed to initialise keystore: {e}"))?),
             None => None,
         };
+        // `None` unless both `enabled` and `chunk_relay` are set.
+        let chunk_relay = match (config.flex_live_streaming.enabled, config.flex_live_streaming.chunk_relay.as_ref()) {
+            (true, Some(c)) => Some(
+                crate::chunk_relay::ChunkRelay::from_config(c)
+                    .map_err(|e| anyhow::anyhow!("failed to initialise flex chunk relay: {e}"))?,
+            ),
+            _ => None,
+        };
         let response_store = Arc::new(
             crate::inference::store::FusilladeResponseStore::new(request_manager.clone())
                 .with_step_manager(step_manager.clone())
@@ -3415,6 +3431,8 @@ impl Application {
             unverified_requests_per_completion_hour: config.batches.unverified_requests_per_completion_hour,
             flex_completion_window: config.batches.async_requests.completion_window.clone(),
             keystore: bg_services.keystore.clone(),
+            chunk_relay: chunk_relay.clone(),
+            flex_poll_fallback_interval_ms: config.flex_live_streaming.poll_fallback_interval_ms,
             zdr_key_cache: bg_services.zdr_key_cache.clone(),
         };
 
@@ -3458,6 +3476,7 @@ impl Application {
             .limiters(limiters)
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .maybe_keystore(bg_services.keystore.clone())
+            .maybe_chunk_relay(chunk_relay.clone())
             .response_store(response_store)
             .response_step_manager(bg_services.step_manager.clone())
             .image_normalizer(image_normalizer)
@@ -3502,6 +3521,36 @@ impl Application {
         // Apply middleware before path matching for tests
         let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
         let service = middleware.layer(self.router).into_make_service();
+        let server = axum_test::TestServer::new(service).expect("Failed to create test server");
+        (server, self.bg_services)
+    }
+
+    /// Like [`Application::into_test_server`], but also serves the app on a
+    /// real, already-bound socket — for tests where the fusillade daemon
+    /// needs to make a real loopback dispatch (its own HTTP client can't
+    /// reach axum_test's in-process mock transport). Caller must bind the
+    /// listener and set `config.host`/`config.port` from its resolved
+    /// address *before* constructing the `Application`, since
+    /// `loopback_base_url` is baked in then — see
+    /// `test::utils::create_test_app_with_real_loopback`.
+    #[cfg(test)]
+    pub fn into_test_server_on_real_socket(self, listener: TcpListener) -> (axum_test::TestServer, BackgroundServices) {
+        let middleware = middleware::from_fn_with_state(self.app_state, admin_ai_proxy_middleware);
+        let service = middleware.layer(self.router).into_make_service();
+
+        // Tied to bg_services' shutdown token, or this outlives the test's
+        // own shutdown call and races #[sqlx::test]'s database teardown.
+        let shutdown_token = self.bg_services.shutdown_token();
+        let real_socket_service = service.clone();
+        tokio::spawn(async move {
+            let result = axum::serve(listener, real_socket_service)
+                .with_graceful_shutdown(async move { shutdown_token.cancelled().await })
+                .await;
+            if let Err(e) = result {
+                tracing::warn!(error = %e, "test real-socket server exited");
+            }
+        });
+
         let server = axum_test::TestServer::new(service).expect("Failed to create test server");
         (server, self.bg_services)
     }

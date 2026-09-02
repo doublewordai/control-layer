@@ -66,6 +66,11 @@ pub struct StreamTimeouts {
 #[derive(Clone)]
 pub struct OutboundConfig {
     pub timeouts: StreamTimeouts,
+    /// `None` disables live relaying. See `crate::chunk_relay`.
+    pub relay: Option<crate::chunk_relay::ChunkRelay>,
+    /// Encrypts chunks for a ZDR-marked dispatch; `None` means no live
+    /// relay for those (never plaintext).
+    pub keystore: Option<crate::keystore::Keystore>,
 }
 
 /// `batch_metadata` key the daemon's dispatch sets to mark a request for
@@ -125,6 +130,11 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
     // layer already translated to the completions shape - masking the coupling
     // rather than removing it.
     let force_stream = should_force_stream(&parts);
+    let relay_ctx = if force_stream {
+        relay_context_for(&parts, &cfg).await
+    } else {
+        None
+    };
 
     let path = parts.uri.path();
     // `/chat/completions` also ends with `/completions`; both take the stream flags.
@@ -133,7 +143,7 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
         // dispatch still gets its response reassembled.
         let response = next.run(Request::from_parts(parts, body)).await;
         return if force_stream {
-            reassemble_stream(response, cfg.timeouts).await
+            reassemble_stream(response, cfg.timeouts, relay_ctx).await
         } else {
             response
         };
@@ -160,9 +170,86 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
     };
 
     if force_stream {
-        reassemble_stream(response, cfg.timeouts).await
+        reassemble_stream(response, cfg.timeouts, relay_ctx).await
     } else {
         response
+    }
+}
+
+/// Fetches the ZDR key up front (a network call `Sink::absorb` can't make);
+/// a missing keystore or failed fetch means no relay for this dispatch,
+/// never a plaintext one for ZDR content.
+async fn relay_context_for(parts: &axum::http::request::Parts, cfg: &OutboundConfig) -> Option<RelayContext> {
+    let relay = cfg.relay.clone()?;
+    let request_id = parts
+        .headers
+        .get("x-fusillade-request-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| uuid::Uuid::parse_str(s).ok())?;
+
+    let is_zdr = parts
+        .headers
+        .get(crate::inference::zdr::ZDR_MARKER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some("1");
+
+    let zdr_key = if is_zdr {
+        let keystore = cfg.keystore.as_ref()?;
+        let key_id = crate::inference::zdr::key_id(&request_id, crate::inference::zdr::KeyKind::Response);
+        match keystore.get(&key_id).await {
+            Ok(Some(key)) => Some(key),
+            Ok(None) => {
+                debug!(%request_id, "no ZDR response key for live relay; skipping relay for this dispatch");
+                return None;
+            }
+            Err(e) => {
+                debug!(%request_id, error = %e, "failed to fetch ZDR response key for live relay; skipping relay for this dispatch");
+                return None;
+            }
+        }
+    } else {
+        None
+    };
+
+    Some(RelayContext {
+        relay,
+        request_id,
+        zdr_key,
+        seq: 0,
+    })
+}
+
+/// Live-relay state for one dispatch attempt, owned by `Sink`. `Drop`
+/// publishes the terminal sentinel exactly once, covering every
+/// `reassemble_stream` exit path.
+struct RelayContext {
+    relay: crate::chunk_relay::ChunkRelay,
+    request_id: uuid::Uuid,
+    /// Fetched non-destructively; `None` for a non-ZDR dispatch.
+    zdr_key: Option<Vec<u8>>,
+    seq: u64,
+}
+
+impl RelayContext {
+    fn publish(&mut self, data: &str) {
+        let payload = match &self.zdr_key {
+            Some(key) => match crate::inference::zdr::encrypt_body(key, data) {
+                Ok(ciphertext) => ciphertext,
+                Err(e) => {
+                    debug!(request_id = %self.request_id, error = %e, "failed to encrypt chunk for live relay, dropping it");
+                    return;
+                }
+            },
+            None => data.to_string(),
+        };
+        self.relay.publish_nonblocking(self.request_id, self.seq, &payload);
+        self.seq += 1;
+    }
+}
+
+impl Drop for RelayContext {
+    fn drop(&mut self) {
+        self.relay.publish_done_nonblocking(self.request_id, self.seq);
     }
 }
 
@@ -201,7 +288,7 @@ fn transform(bytes: &Bytes, force_stream: bool) -> Option<Vec<u8>> {
 /// Ported from fusillade's streaming client, which used to do this after the
 /// response had already passed request logging. The behaviours it preserves are
 /// load-bearing and are called out individually below.
-async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Response {
+async fn reassemble_stream(response: Response, timeouts: StreamTimeouts, relay_ctx: Option<RelayContext>) -> Response {
     use eventsource_stream::Eventsource;
 
     let (parts, body) = response.into_parts();
@@ -240,8 +327,8 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
 
     // Phase 2: the remainder, under the idle budget per event and the total
     // budget across all of them.
-    let outcome = tokio::time::timeout(timeouts.body, async {
-        let mut sink = Sink::new(reassemble);
+    let outcome = tokio::time::timeout(timeouts.body, async move {
+        let mut sink = Sink::new(reassemble, relay_ctx);
         if let Some(event) = first_event {
             sink.absorb(&event);
         }
@@ -253,7 +340,7 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
                 Err(_) => return Collected::Stalled(sink.seen),
             }
         }
-        Collected::Done(sink)
+        Collected::Done(Box::new(sink))
     })
     .await;
 
@@ -301,7 +388,7 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
 
 /// How the collection phase ended.
 enum Collected {
-    Done(Sink),
+    Done(Box<Sink>),
     /// Idle for longer than the per-event budget, carrying the events seen so far
     /// for the diagnostic.
     Stalled(usize),
@@ -324,16 +411,18 @@ struct Sink {
     /// Events seen, for the stall diagnostic.
     seen: usize,
     reassemble: bool,
+    relay_ctx: Option<RelayContext>,
 }
 
 impl Sink {
-    fn new(reassemble: bool) -> Self {
+    fn new(reassemble: bool, relay_ctx: Option<RelayContext>) -> Self {
         Self {
             reassembler: openai_reassembler::Reassembler::new(),
             raw: String::new(),
             embedded_error: None,
             seen: 0,
             reassemble,
+            relay_ctx,
         }
     }
 
@@ -348,6 +437,10 @@ impl Sink {
 
         if self.reassemble {
             self.reassembler.push(event);
+            // Additive only — never changes what's folded into the reassembler.
+            if let Some(ctx) = self.relay_ctx.as_mut() {
+                ctx.publish(&event.data);
+            }
         } else if !event.data.is_empty() && event.data != "[DONE]" {
             if !self.raw.is_empty() {
                 self.raw.push('\n');
@@ -496,7 +589,7 @@ mod tests {
         let frames = [chunk("Hello"), chunk(" world"), "[DONE]".to_string()];
         let refs: Vec<&str> = frames.iter().map(String::as_str).collect();
 
-        let out = reassemble_stream(sse_response(StatusCode::OK, &refs), timeouts(1000, 1000, 5000)).await;
+        let out = reassemble_stream(sse_response(StatusCode::OK, &refs), timeouts(1000, 1000, 5000), None).await;
 
         assert_eq!(out.status(), StatusCode::OK);
         assert_eq!(
@@ -521,8 +614,8 @@ mod tests {
         let clean = [chunk("Hello"), chunk(" world")];
         let clean_refs: Vec<&str> = clean.iter().map(String::as_str).collect();
 
-        let a = reassemble_stream(sse_response(StatusCode::OK, &noisy_refs), timeouts(1000, 1000, 5000)).await;
-        let b = reassemble_stream(sse_response(StatusCode::OK, &clean_refs), timeouts(1000, 1000, 5000)).await;
+        let a = reassemble_stream(sse_response(StatusCode::OK, &noisy_refs), timeouts(1000, 1000, 5000), None).await;
+        let b = reassemble_stream(sse_response(StatusCode::OK, &clean_refs), timeouts(1000, 1000, 5000), None).await;
 
         assert_eq!(body_string(a).await, body_string(b).await, "keepalives changed the assembled body");
     }
@@ -533,7 +626,7 @@ mod tests {
     async fn embedded_error_is_reclassified_to_a_real_status() {
         let frames = [r#"{"error":{"code":429,"message":"slow down"}}"#];
 
-        let out = reassemble_stream(sse_response(StatusCode::OK, &frames), timeouts(1000, 1000, 5000)).await;
+        let out = reassemble_stream(sse_response(StatusCode::OK, &frames), timeouts(1000, 1000, 5000), None).await;
 
         assert_eq!(out.status(), StatusCode::TOO_MANY_REQUESTS);
         assert!(body_string(out).await.contains("slow down"));
@@ -547,7 +640,7 @@ mod tests {
             r#"{"error":{"code":500,"message":"second"}}"#,
         ];
 
-        let out = reassemble_stream(sse_response(StatusCode::OK, &frames), timeouts(1000, 1000, 5000)).await;
+        let out = reassemble_stream(sse_response(StatusCode::OK, &frames), timeouts(1000, 1000, 5000), None).await;
 
         assert_eq!(out.status(), StatusCode::TOO_MANY_REQUESTS);
         let body = body_string(out).await;
@@ -561,7 +654,7 @@ mod tests {
     async fn error_status_keeps_raw_event_data() {
         let frames = [r#"{"detail":"bad request"}"#, "", "[DONE]"];
 
-        let out = reassemble_stream(sse_response(StatusCode::BAD_REQUEST, &frames), timeouts(1000, 1000, 5000)).await;
+        let out = reassemble_stream(sse_response(StatusCode::BAD_REQUEST, &frames), timeouts(1000, 1000, 5000), None).await;
 
         assert_eq!(out.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
@@ -581,7 +674,7 @@ mod tests {
         resp.headers_mut()
             .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
 
-        let out = reassemble_stream(resp, timeouts(1000, 1000, 5000)).await;
+        let out = reassemble_stream(resp, timeouts(1000, 1000, 5000), None).await;
 
         assert_eq!(out.status(), StatusCode::NOT_FOUND);
         assert_eq!(body_string(out).await, r#"{"error":"no such model"}"#);
@@ -592,7 +685,7 @@ mod tests {
     async fn no_first_event_reports_a_first_chunk_timeout() {
         let response = slow_sse_response(vec![(400, chunk("late"))]);
 
-        let out = reassemble_stream(response, timeouts(50, 5000, 5000)).await;
+        let out = reassemble_stream(response, timeouts(50, 5000, 5000), None).await;
 
         assert_eq!(out.status(), StatusCode::GATEWAY_TIMEOUT);
         assert!(body_string(out).await.contains("first_chunk"));
@@ -604,7 +697,7 @@ mod tests {
     async fn a_stalled_stream_reports_a_chunk_timeout() {
         let response = slow_sse_response(vec![(0, chunk("hi")), (400, chunk(" there"))]);
 
-        let out = reassemble_stream(response, timeouts(1000, 50, 5000)).await;
+        let out = reassemble_stream(response, timeouts(1000, 50, 5000), None).await;
 
         assert_eq!(out.status(), StatusCode::GATEWAY_TIMEOUT);
         assert!(
@@ -618,7 +711,7 @@ mod tests {
     async fn a_long_stream_reports_a_body_timeout() {
         let frames: Vec<(u64, String)> = (0..20).map(|_| (30, chunk("x"))).collect();
 
-        let out = reassemble_stream(slow_sse_response(frames), timeouts(1000, 1000, 120)).await;
+        let out = reassemble_stream(slow_sse_response(frames), timeouts(1000, 1000, 120), None).await;
 
         assert_eq!(out.status(), StatusCode::GATEWAY_TIMEOUT);
         assert!(
@@ -662,6 +755,8 @@ mod tests {
     fn config() -> OutboundConfig {
         OutboundConfig {
             timeouts: timeouts(1000, 1000, 5000),
+            relay: None,
+            keystore: None,
         }
     }
 
@@ -731,5 +826,122 @@ mod tests {
     async fn marked_responses_traffic_is_reassembled() {
         let ct = content_type_through_the_edge("/ai/v1/responses", &[(STREAM_MARKER_HEADER, "1")]).await;
         assert!(ct.starts_with("application/json"), "expected an assembled body, got {ct:?}");
+    }
+
+    // Needs a real Redis; override TEST_REDIS_URL if `just redis-start`'s
+    // default doesn't apply.
+    fn test_relay() -> crate::chunk_relay::ChunkRelay {
+        let cfg = crate::chunk_relay::ChunkRelayConfig {
+            redis_url: std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string()),
+            ..Default::default()
+        };
+        crate::chunk_relay::ChunkRelay::from_config(&cfg).expect("relay should build against local redis")
+    }
+
+    async fn collect_relayed_until_done(stream: &mut crate::chunk_relay::ChunkStream) -> Vec<crate::chunk_relay::ChunkMsg> {
+        use futures::StreamExt;
+        let mut out = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+                Ok(Some(msg)) => {
+                    let done = msg.done;
+                    out.push(msg);
+                    if done {
+                        return out;
+                    }
+                }
+                Ok(None) => panic!("relay stream ended without a done sentinel; collected so far: {out:?}"),
+                Err(_) => panic!("timed out waiting for a relayed chunk; collected so far: {out:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn relaying_does_not_change_the_persisted_body() {
+        let frames = [chunk("Hello"), chunk(" world"), "[DONE]".to_string()];
+        let refs: Vec<&str> = frames.iter().map(String::as_str).collect();
+
+        let without_relay = reassemble_stream(sse_response(StatusCode::OK, &refs), timeouts(1000, 1000, 5000), None).await;
+        let without_relay_body = body_string(without_relay).await;
+
+        let relay_ctx = RelayContext {
+            relay: test_relay(),
+            request_id: uuid::Uuid::new_v4(),
+            zdr_key: None,
+            seq: 0,
+        };
+        let with_relay = reassemble_stream(sse_response(StatusCode::OK, &refs), timeouts(1000, 1000, 5000), Some(relay_ctx)).await;
+        let with_relay_body = body_string(with_relay).await;
+
+        assert_eq!(
+            without_relay_body, with_relay_body,
+            "relaying must never change the persisted/reassembled body"
+        );
+    }
+
+    #[tokio::test]
+    async fn relaying_delivers_one_message_per_frame_in_order_then_done() {
+        let frames = [chunk("Hello"), chunk(" world"), "[DONE]".to_string()];
+        let refs: Vec<&str> = frames.iter().map(String::as_str).collect();
+
+        let relay = test_relay();
+        let request_id = uuid::Uuid::new_v4();
+        let mut relayed = relay.subscribe(request_id);
+        let relay_ctx = RelayContext {
+            relay,
+            request_id,
+            zdr_key: None,
+            seq: 0,
+        };
+
+        reassemble_stream(sse_response(StatusCode::OK, &refs), timeouts(1000, 1000, 5000), Some(relay_ctx)).await;
+
+        let received = collect_relayed_until_done(&mut relayed).await;
+
+        assert_eq!(
+            received.len(),
+            refs.len() + 1,
+            "expected one relayed message per SSE frame plus a trailing done sentinel"
+        );
+        for (relayed_msg, frame) in received.iter().zip(refs.iter()) {
+            assert_eq!(&relayed_msg.data, frame);
+        }
+        assert!(received.last().unwrap().done);
+    }
+
+    /// ZDR chunks must arrive as ciphertext, decrypt correctly, and never
+    /// perturb the persisted body.
+    #[tokio::test]
+    async fn zdr_relay_encrypts_chunks_without_perturbing_the_persisted_body() {
+        let frames = [chunk("secret"), "[DONE]".to_string()];
+        let refs: Vec<&str> = frames.iter().map(String::as_str).collect();
+
+        let plain = reassemble_stream(sse_response(StatusCode::OK, &refs), timeouts(1000, 1000, 5000), None).await;
+        let plain_body = body_string(plain).await;
+
+        let relay = test_relay();
+        let request_id = uuid::Uuid::new_v4();
+        let mut relayed = relay.subscribe(request_id);
+        let key = crate::keystore::generate_key();
+        let relay_ctx = RelayContext {
+            relay,
+            request_id,
+            zdr_key: Some(key.to_vec()),
+            seq: 0,
+        };
+
+        let zdr_response = reassemble_stream(sse_response(StatusCode::OK, &refs), timeouts(1000, 1000, 5000), Some(relay_ctx)).await;
+        let zdr_body = body_string(zdr_response).await;
+        assert_eq!(
+            plain_body, zdr_body,
+            "ZDR chunk encryption must never change the persisted/reassembled body"
+        );
+
+        let received = collect_relayed_until_done(&mut relayed).await;
+        for (relayed_msg, frame) in received.iter().zip(refs.iter()) {
+            assert_ne!(&relayed_msg.data, frame, "ZDR chunks must never be relayed in plaintext");
+            let decrypted = crate::inference::zdr::decrypt_body(&key, &relayed_msg.data).expect("chunk should decrypt with the same key");
+            assert_eq!(decrypted, *frame);
+        }
     }
 }

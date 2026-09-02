@@ -205,6 +205,10 @@ pub struct Config {
     /// (the default) leaves ZDR disabled.
     #[serde(default)]
     pub keystore: Option<crate::keystore::KeystoreConfig>,
+    /// Flex live-streaming (prototype, default off). See
+    /// [`FlexLiveStreamingConfig`].
+    #[serde(default)]
+    pub flex_live_streaming: FlexLiveStreamingConfig,
     /// OpenAPI spec exposure controls. Defaults disable the Admin spec
     /// (which describes internal management endpoints) and enable the
     /// AI spec (which mirrors the publicly-documented OpenAI surface).
@@ -2383,6 +2387,33 @@ impl Default for OnwardsSyncConfig {
     }
 }
 
+/// Relays real per-token SSE deltas over Redis Streams (`crate::chunk_relay`)
+/// instead of the poll-and-replay flex stream. Off by default.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FlexLiveStreamingConfig {
+    /// Has no effect unless `chunk_relay` is also set.
+    pub enabled: bool,
+    pub chunk_relay: Option<crate::chunk_relay::ChunkRelayConfig>,
+    /// Correctness fallback once live streaming is enabled (default: 5000ms).
+    #[serde(default = "default_flex_live_streaming_poll_fallback_ms")]
+    pub poll_fallback_interval_ms: u64,
+}
+
+impl Default for FlexLiveStreamingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            chunk_relay: None,
+            poll_fallback_interval_ms: default_flex_live_streaming_poll_fallback_ms(),
+        }
+    }
+}
+
+fn default_flex_live_streaming_poll_fallback_ms() -> u64 {
+    5000
+}
+
 /// Usage-aggregate refresh daemon configuration.
 ///
 /// The daemon incrementally folds new `http_analytics` rows into the
@@ -2728,6 +2759,7 @@ impl Default for Config {
             responses: ResponsesConfig::default(),
             image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
             keystore: None,
+            flex_live_streaming: FlexLiveStreamingConfig::default(),
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
             continuation: ContinuationConfig::default(),
