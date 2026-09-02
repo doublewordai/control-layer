@@ -39,7 +39,9 @@ use http_body_util::BodyExt;
 
 use super::classifier::{Classifier, ClassifyOutcome, ClassifyRequest};
 use super::index::{CacheResult, TierPolicy};
-use super::inject::{UsageEdit, inject_into_response_nonstreaming, scan_edit_sse, scrub_response_nonstreaming, strip_cache_control};
+use super::inject::{
+    UpstreamCachedTokens, UsageEdit, inject_into_response_nonstreaming, scan_edit_sse, scrub_response_nonstreaming, strip_cache_control,
+};
 use super::metrics as cache_metrics;
 use super::parse::{ParseError, validate_markers};
 use super::query::{self, Inject, InvalidBreakpointValue};
@@ -259,7 +261,12 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     parts
         .headers
         .insert(header::CONTENT_LENGTH, axum::http::HeaderValue::from(forward.len() as u64));
-    let response = next.run(Request::from_parts(parts, Body::from(forward))).await;
+    let mut response = next.run(Request::from_parts(parts, Body::from(forward))).await;
+    // Hand the upstream's own cached-token count to analytics (outlet, outside this
+    // layer) before the rewrites below hide it. Inserted now, at head time, because that
+    // is when outlet clones the extensions; filled when the usage object is seen.
+    let upstream_cached = UpstreamCachedTokens::default();
+    response.extensions_mut().insert(upstream_cached.clone());
 
     // Post-response work — resolve classify, inject the stats, commit on success — differs by
     // transport. The split is the whole point of this layer's latency profile:
@@ -278,7 +285,14 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     };
 
     if is_streaming(&response) {
-        return defer_classify_into_stream(response, handle, state.deadline, model_label, state.classifier.clone());
+        return defer_classify_into_stream(
+            response,
+            handle,
+            state.deadline,
+            model_label,
+            state.classifier.clone(),
+            upstream_cached,
+        );
     }
 
     let outcome = join_classify(&mut handle, state.deadline, &model_label).await;
@@ -287,9 +301,9 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         // accounting must still be scrubbed: this module is the only writer of customer-visible
         // cache fields, and a provider-reported `cached_tokens` on a model we bill at full price
         // reads as a discount we didn't give.
-        return scrub_response_nonstreaming(response).await;
+        return scrub_response_nonstreaming(response, &upstream_cached).await;
     }
-    let (response, billing_ok) = inject_into_response_nonstreaming(response, &outcome.stats).await;
+    let (response, billing_ok) = inject_into_response_nonstreaming(response, &outcome.stats, &upstream_cached).await;
     if !outcome.pending.is_empty() {
         if billing_ok {
             spawn_commit(state.classifier.clone(), outcome.pending);
@@ -431,6 +445,7 @@ fn defer_classify_into_stream(
     deadline: Duration,
     model_label: String,
     classifier: Classifier,
+    upstream_cached: UpstreamCachedTokens,
 ) -> Response {
     let (parts, body) = response.into_parts();
     let status_ok = parts.status.is_success();
@@ -461,6 +476,9 @@ fn defer_classify_into_stream(
             };
             // Detect the billing signals on this chunk (no injection yet).
             let probe = scan_edit_sse(&chunk, UsageEdit::Probe);
+            if let Some(v) = probe.upstream_cached_tokens {
+                upstream_cached.set(v);
+            }
             saw_error |= probe.saw_error;
             // The terminal usage frame is the only place the stats are needed: resolve classify now
             // — the single blocking await, on the *last* frame, bounded by the deadline. Borrow the
@@ -991,6 +1009,19 @@ mod tests {
     /// Upstream stand-in that reports ITS OWN cache accounting — the OpenRouter implicit-cache
     /// shape observed in prod on kimi-k3 (provider cached 687 of 985 prompt tokens on a model
     /// with no cache tariff, i.e. billed at full price).
+    /// Sees the response the way outlet does: extensions cloned at head time, read after
+    /// the body has been consumed.
+    type Observed = Arc<std::sync::Mutex<Option<UpstreamCachedTokens>>>;
+    async fn observe_upstream_cached(
+        axum::extract::State(slot): axum::extract::State<Observed>,
+        req: axum::extract::Request,
+        next: axum::middleware::Next,
+    ) -> Response {
+        let response = next.run(req).await;
+        *slot.lock().unwrap() = response.extensions().get::<UpstreamCachedTokens>().cloned();
+        response
+    }
+
     async fn mock_upstream_with_provider_cache() -> Json<serde_json::Value> {
         Json(serde_json::json!({
             "id": "chatcmpl-1", "object": "chat.completion",
@@ -1019,12 +1050,14 @@ mod tests {
             TelemetryPolicy::default(),
             false,
         );
+        let observed: Observed = Default::default();
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream_with_provider_cache))
             .layer(from_fn_with_state(
                 CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
                 cache_middleware,
-            ));
+            ))
+            .layer(from_fn_with_state(observed.clone(), observe_upstream_cached));
         let server = axum_test::TestServer::new(app).unwrap();
 
         let r = server
@@ -1040,6 +1073,8 @@ mod tests {
             v["usage"].get("cache_read_input_tokens").is_none(),
             "provider extension field removed: {v}"
         );
+        let cell = observed.lock().unwrap().clone().expect("cell inserted at head time");
+        assert_eq!(cell.get(), Some(687), "the engine's hit survives for analytics");
     }
 
     /// Streaming variant of [`mock_upstream_with_provider_cache`].
@@ -1066,12 +1101,14 @@ mod tests {
             TelemetryPolicy::default(),
             false,
         );
+        let observed: Observed = Default::default();
         let app = Router::new()
             .route("/v1/chat/completions", post(mock_upstream_streaming_with_provider_cache))
             .layer(from_fn_with_state(
                 CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
                 cache_middleware,
-            ));
+            ))
+            .layer(from_fn_with_state(observed.clone(), observe_upstream_cached));
         let server = axum_test::TestServer::new(app).unwrap();
 
         let r = server
@@ -1085,6 +1122,8 @@ mod tests {
         assert!(!t.contains("687"), "provider value gone: {t}");
         assert!(t.contains("\"content\":\"hi\""), "delta preserved: {t}");
         assert!(t.contains("data: [DONE]"), "DONE preserved: {t}");
+        let cell = observed.lock().unwrap().clone().expect("cell inserted at head time");
+        assert_eq!(cell.get(), Some(687), "filled at the terminal frame, after the head was cloned");
     }
 
     // ---- `?cacheBreakpoint=lastUserMessage` (query-param automatic caching) ----
