@@ -65,18 +65,17 @@ class PreviewWorkflowTest < Minitest::Test
     assert_includes load_test_changed_job, "repo: '${{ secrets.DEPLOY_TARGET_REPO }}'"
     assert_includes load_test_changed_job, "event_type: 'preview-load-test-changed'"
 
-    client_payload = load_test_changed_job[/client_payload: \{\n(?<fields>.*?)^              \}/m, :fields]
+    client_payload = load_test_changed_job[/client_payload: \{\n(?<fields>(?:^                .*\n)*)^              \}\n            \}\)/m, :fields]
     refute_nil client_payload
-    assert_includes client_payload, "repository: context.repo.owner + '/' + context.repo.repo"
-    assert_includes client_payload, "pull_request: context.payload.pull_request.number"
-    assert_includes client_payload, "branch: context.payload.pull_request.head.ref"
-    assert_includes client_payload, "sha: context.payload.pull_request.head.sha"
-    payload_property_lines = client_payload.lines.filter do |line|
-      line.match?(/^                \S/)
-    end
-    assert_equal 4, payload_property_lines.length
-    assert_equal %w[repository pull_request branch sha],
-                 payload_property_lines.map { |line| line[/^                ([a-z_]+):/, 1] }.compact
+    expected_client_payload = <<~PAYLOAD
+      repository: context.repo.owner + '/' + context.repo.repo,
+      pull_request: context.payload.pull_request.number,
+      branch: context.payload.pull_request.head.ref,
+      sha: context.payload.pull_request.head.sha
+    PAYLOAD
+    normalized_client_payload = client_payload.lines.map(&:strip).reject(&:empty?).join("\n")
+
+    assert_equal expected_client_payload.strip, normalized_client_payload
     refute_includes workflow, "pull_request_target"
   end
 
