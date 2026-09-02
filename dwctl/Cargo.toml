@@ -108,10 +108,12 @@ hickory-resolver = { version = "0.26", default-features = false, features = [
   "tokio",
 ] }
 aes-gcm = "0.10.3"
-# Redis-backed keystore for zero-data-retention flex request keys.
+# Redis-backed keystore for zero-data-retention flex request keys, and the
+# flex live-streaming chunk relay (Redis Streams).
 deadpool-redis = "0.18"
 redis = { version = "0.27", default-features = false, features = [
   "tokio-rustls-comp",
+  "streams",
 ] }
 paste = "1.0"
 serde_with = "3.14.1"

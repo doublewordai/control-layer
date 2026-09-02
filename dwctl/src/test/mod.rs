@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod cache_classifier;
 pub mod databases;
+pub mod flex_live_streaming;
 pub mod responses;
 pub mod sigterm_drain;
 pub mod sla;
