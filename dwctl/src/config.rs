@@ -3195,16 +3195,6 @@ impl Config {
                 operation: format!("Config validation: {e}"),
             });
         }
-        // Capture rides on the analytics handler; without analytics it would advertise a
-        // sink that never sees a request, which is exactly the silent no-op the section's
-        // semantics rule out.
-        if self.prefix_chain.enabled && !self.enable_analytics {
-            return Err(Error::Internal {
-                operation:
-                    "Config validation: prefix_chain.enabled is true but enable_analytics is false; capture runs in the analytics handler"
-                        .to_string(),
-            });
-        }
         // A present `clickhouse` section must be usable: a bad endpoint or a missing
         // password is a startup error, not a sink that fails every insert forever.
         if let Some(ch) = &self.clickhouse

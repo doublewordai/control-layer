@@ -51,7 +51,6 @@ use crate::request_logging::models::AiResponse;
 use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
 use outlet::{RequestData, RequestHandler, ResponseData};
-use std::sync::Arc;
 use tracing::{Instrument, info_span};
 use uuid::Uuid;
 
@@ -114,9 +113,6 @@ pub struct AnalyticsHandler {
     sender: AnalyticsSender,
     instance_id: Uuid,
     config: Config,
-    /// Workload-profiling capture, when enabled. Sees the same request and response this
-    /// handler does and records prompt structure (never content); see `prefix_chain`.
-    prefix_chain: Option<Arc<crate::prefix_chain::PrefixChainRecorder>>,
 }
 
 impl AnalyticsHandler {
@@ -132,14 +128,7 @@ impl AnalyticsHandler {
             sender,
             instance_id,
             config,
-            prefix_chain: None,
         }
-    }
-
-    /// Attach the prefix-chain recorder. `None` leaves capture off.
-    pub fn with_prefix_chain(mut self, recorder: Option<Arc<crate::prefix_chain::PrefixChainRecorder>>) -> Self {
-        self.prefix_chain = recorder;
-        self
     }
 }
 
@@ -234,24 +223,6 @@ impl RequestHandler for AnalyticsHandler {
                 Auth::ApiKey { bearer_token } => Some(bearer_token.clone()),
                 Auth::None => None,
             };
-
-            // Workload profiling: the prompt's structure, keyed and content-free. The
-            // inline part is a parse and a few HMACs; everything slow is spawned inside.
-            // Only served requests: a rejected one (bad key, unknown model, rate limit)
-            // never becomes a principal lookup, a tokenizer call or a row.
-            if let Some(recorder) = &self.prefix_chain
-                && (200..300).contains(&metrics.status_code)
-            {
-                recorder.observe(crate::prefix_chain::Observation {
-                    instance_id: self.instance_id,
-                    correlation_id: metrics.correlation_id,
-                    timestamp: metrics.timestamp,
-                    model: metrics.request_model.clone(),
-                    api_key: bearer_token.clone(),
-                    path: request_data.uri.path().to_string(),
-                    body: request_data.body.clone(),
-                });
-            }
 
             // Build the raw record (no DB enrichment)
             // Note: request_origin is computed in the batcher after api_key_purpose is resolved

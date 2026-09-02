@@ -34,9 +34,8 @@ fn default_database() -> String {
     "clay".to_string()
 }
 
-fn default_request_timeout() -> Duration {
-    Duration::from_secs(30)
-}
+/// Per-insert HTTP timeout. ClickHouse Cloud services can idle and take seconds to wake.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The top-level `clickhouse` config section: connection and credential only.
 ///
@@ -56,10 +55,6 @@ pub struct ClickhouseConfig {
     pub user: String,
     /// Password. `DWCTL_CLICKHOUSE__PASSWORD` in deployments.
     pub password: String,
-    /// Per-insert HTTP timeout. ClickHouse Cloud services can idle and take seconds to
-    /// wake, so keep this generous; the sink is off the request path anyway.
-    #[serde(default = "default_request_timeout", with = "humantime_serde")]
-    pub request_timeout: Duration,
 }
 
 impl fmt::Debug for ClickhouseConfig {
@@ -69,7 +64,6 @@ impl fmt::Debug for ClickhouseConfig {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"<redacted>")
-            .field("request_timeout", &self.request_timeout)
             .finish()
     }
 }
@@ -91,9 +85,6 @@ impl ClickhouseConfig {
         }
         if self.password.is_empty() {
             return Err("clickhouse.password is empty (set DWCTL_CLICKHOUSE__PASSWORD)".to_string());
-        }
-        if self.request_timeout.is_zero() {
-            return Err("clickhouse.request_timeout must be > 0".to_string());
         }
         if url.password().is_some() || !url.username().is_empty() {
             return Err("clickhouse.endpoint_url must not embed credentials; use clickhouse.user and clickhouse.password".to_string());
@@ -166,7 +157,7 @@ impl ClickHouseClient {
         config.validate().map_err(ClickHouseError::Config)?;
         let endpoint = Url::parse(config.endpoint_url.trim()).map_err(|e| ClickHouseError::Config(e.to_string()))?;
         let http = reqwest::Client::builder()
-            .timeout(config.request_timeout)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(ClickHouseError::Transport)?;
         Ok(Self {
@@ -247,7 +238,6 @@ mod tests {
             database: default_database(),
             user: "dwctl".to_string(),
             password: "pw".to_string(),
-            request_timeout: default_request_timeout(),
         }
     }
 
@@ -283,13 +273,6 @@ mod tests {
         assert!(!s.contains("s3cret") && !s.contains("alice"), "{s}");
         assert!(c.validate().unwrap_err().contains("embed credentials"));
         assert_eq!(redact_url("not a url"), "<unparseable url>");
-    }
-
-    #[test]
-    fn zero_timeout_is_rejected() {
-        let mut c = config();
-        c.request_timeout = Duration::ZERO;
-        assert!(c.validate().unwrap_err().contains("request_timeout"));
     }
 
     #[test]

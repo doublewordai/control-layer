@@ -1474,12 +1474,15 @@ pub async fn build_router(
     let request_logging_enabled = state.outlet_db.is_some() && config.enable_request_logging;
     let analytics_enabled = config.enable_analytics;
 
-    let outlet_layer = if request_logging_enabled || analytics_enabled {
+    let outlet_layer = if request_logging_enabled || analytics_enabled || prefix_chain.is_some() {
         // Store the metrics recorder in state (created earlier in Application::new)
         state.metrics_recorder = metrics_recorder;
 
         // Build handler chain based on config
         let mut multi_handler = MultiHandler::new();
+        // One instance id for every handler that writes `(instance_id, correlation_id)`, so
+        // their rows join.
+        let instance_id = uuid::Uuid::new_v4();
 
         // Add PostgresHandler for request logging if enabled
         if request_logging_enabled {
@@ -1504,9 +1507,16 @@ pub async fn build_router(
             // parse (the same value request logging stores), via `TokenMetrics::from`.
             // The outlet sits outer to translation, so it captures the foreign
             // response body; `AiResponse` covers each protocol's own shape.
-            let analytics_handler = request_logging::AnalyticsHandler::new(sender, uuid::Uuid::new_v4(), config.as_ref().clone())
-                .with_prefix_chain(prefix_chain);
+            let analytics_handler = request_logging::AnalyticsHandler::new(sender, instance_id, config.as_ref().clone());
             multi_handler = multi_handler.with(analytics_handler);
+        }
+
+        if let Some(recorder) = prefix_chain {
+            multi_handler = multi_handler.with(crate::prefix_chain::PrefixChainHandler::new(
+                recorder,
+                instance_id,
+                config.as_ref().clone(),
+            ));
         }
 
         // Add FusilladeOutletHandler so completed responses get written to
@@ -3468,7 +3478,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             .ok_or_else(|| anyhow::anyhow!("prefix_chain.enabled requires a clickhouse section"))?;
         let client = crate::clickhouse::ClickHouseClient::from_config(ch_config)?;
         let (sink_handle, sink) =
-            crate::clickhouse::ClickHouseSink::<crate::prefix_chain::PromptChainRow>::new(client, config.prefix_chain.sink_options())?;
+            crate::clickhouse::ClickHouseSink::<crate::prefix_chain::PromptChainRow>::new(client, crate::prefix_chain::sink_options())?;
         let sink_shutdown = shutdown_token.clone();
         background_tasks.spawn("prefix-chain-sink", async move {
             sink.run(sink_shutdown).await;
@@ -3477,7 +3487,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         let key = config.prefix_chain.key_bytes().map_err(|e| anyhow::anyhow!("prefix_chain: {e}"))?;
         let recorder = crate::prefix_chain::PrefixChainRecorder::new(
             key,
-            config.prefix_chain.key_version,
             crate::prefix_chain::ModelFilter::from_config(&config.prefix_chain.models),
             crate::prompt_cache::TierPolicy::from_config(&config.cache.enabled_ttls, &config.cache.default_ttl),
             crate::prompt_cache::TelemetryPolicy::from_config(
@@ -3487,13 +3496,8 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             crate::prompt_cache::TokenizerClient::new(config.cache.tokenizer_url.clone()),
             crate::prompt_cache::PrincipalResolver::new(pool.clone()),
             sink_handle,
-            config.prefix_chain.max_in_flight,
         );
-        info!(
-            models = ?config.prefix_chain.models,
-            table = %config.prefix_chain.table,
-            "Prefix-chain capture enabled"
-        );
+        info!(models = ?config.prefix_chain.models, "Prefix-chain capture enabled");
         Some(Arc::new(recorder))
     } else {
         None

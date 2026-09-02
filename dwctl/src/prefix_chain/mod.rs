@@ -30,7 +30,7 @@ use sha2::Sha256;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::clickhouse::{ClickhouseConfig, SinkHandle, SinkOptions, is_identifier};
+use crate::clickhouse::{ClickhouseConfig, SinkHandle, SinkOptions};
 use crate::metrics::errors::component::PREFIX_CHAIN;
 use crate::prompt_cache::{
     ParseError, PrincipalResolver, TelemetryPolicy, TierPolicy, TokenizerClient, TokenizerError, parse_chat_completions,
@@ -41,77 +41,29 @@ pub const RECORD_VERSION: u8 = 1;
 /// Bytes of the HMAC kept per chain entry (hex-encoded to 32 characters in the row).
 const HASH_BYTES: usize = 16;
 
-fn default_key_version() -> u8 {
-    1
-}
-fn default_table() -> String {
-    "prompt_chains".to_string()
-}
-fn default_flush_interval() -> Duration {
-    Duration::from_secs(5)
-}
-fn default_max_batch_rows() -> usize {
-    5_000
-}
-fn default_queue_capacity() -> usize {
-    20_000
-}
-fn default_retry_delay() -> Duration {
-    Duration::from_millis(500)
-}
-fn default_max_in_flight() -> usize {
-    256
-}
+/// Table the rows land in; its shape is fixed by the warehouse migration.
+const TABLE: &str = "prompt_chains";
+const FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+const MAX_BATCH_ROWS: usize = 5_000;
+const QUEUE_CAPACITY: usize = 20_000;
+const RETRY_DELAY: Duration = Duration::from_millis(500);
+/// Cap on requests whose principal lookup and tokenization are in flight at once; beyond
+/// it a request is skipped (counted `backpressure`) rather than queued holding its prompt.
+const MAX_IN_FLIGHT: usize = 256;
 
 /// The `prefix_chain` config section.
-///
-/// The connection lives on the top-level `clickhouse` section; this holds what is
-/// specific to this writer. The semantics are chosen so that no configuration is a
-/// silent no-op — see [`PrefixChainConfig::validate`].
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct PrefixChainConfig {
-    /// Master switch. `false` is the only off state: no parse, no sink, no records.
+    /// `false` is the only off state.
     pub enabled: bool,
-    /// Which models to capture. `null` / absent: every model. A non-empty list: exactly
-    /// those dwctl aliases, matched exactly and case-sensitively against the alias the
-    /// request resolved to (the string that lands in `http_analytics.model`). An empty
-    /// list is a startup error. Accepts a YAML list or a comma-separated string (env).
+    /// `null`: every model. A non-empty list: exactly these dwctl aliases, matched exactly
+    /// and case-sensitively. An empty list is a startup error. Accepts a YAML list or a
+    /// comma-separated string (env).
     #[serde(deserialize_with = "deserialize_model_list")]
     pub models: Option<Vec<String>>,
     /// 32-byte key, hex-encoded (64 characters). `DWCTL_PREFIX_CHAIN__HMAC_KEY`.
     pub hmac_key: String,
-    /// Recorded on every row so chains under different keys are never joined.
-    pub key_version: u8,
-    /// Table within the `clickhouse` section's database.
-    pub table: String,
-    #[serde(with = "humantime_serde")]
-    pub flush_interval: Duration,
-    pub max_batch_rows: usize,
-    pub queue_capacity: usize,
-    #[serde(with = "humantime_serde")]
-    pub retry_delay: Duration,
-    /// Cap on requests whose principal lookup and tokenization are in flight at once.
-    /// Beyond it, new requests are skipped (counted `backpressure`) rather than queued,
-    /// so a slow tokenizer-svc bounds memory instead of growing a backlog of prompts.
-    pub max_in_flight: usize,
-}
-
-impl Default for PrefixChainConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            models: None,
-            hmac_key: String::new(),
-            key_version: default_key_version(),
-            table: default_table(),
-            flush_interval: default_flush_interval(),
-            max_batch_rows: default_max_batch_rows(),
-            queue_capacity: default_queue_capacity(),
-            retry_delay: default_retry_delay(),
-            max_in_flight: default_max_in_flight(),
-        }
-    }
 }
 
 impl fmt::Debug for PrefixChainConfig {
@@ -120,13 +72,6 @@ impl fmt::Debug for PrefixChainConfig {
             .field("enabled", &self.enabled)
             .field("models", &self.models)
             .field("hmac_key", &if self.hmac_key.is_empty() { "<unset>" } else { "<redacted>" })
-            .field("key_version", &self.key_version)
-            .field("table", &self.table)
-            .field("flush_interval", &self.flush_interval)
-            .field("max_batch_rows", &self.max_batch_rows)
-            .field("queue_capacity", &self.queue_capacity)
-            .field("retry_delay", &self.retry_delay)
-            .field("max_in_flight", &self.max_in_flight)
             .finish()
     }
 }
@@ -149,52 +94,53 @@ fn deserialize_model_list<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Vec<
 }
 
 impl PrefixChainConfig {
-    /// The rules that keep this from being a silent no-op:
-    /// - `enabled: false` ignores everything else.
-    /// - `enabled: true` requires the `clickhouse` section, a tokenizer-svc URL, a
-    ///   well-formed key, a non-empty `models` list if one is given, and sane sink sizes.
+    /// `enabled: false` ignores everything else. `enabled: true` requires the `clickhouse`
+    /// section, a tokenizer-svc URL, a 32-byte key, and a non-empty `models` list if one
+    /// is given.
     pub fn validate(&self, clickhouse: Option<&ClickhouseConfig>, tokenizer_url: &str) -> Result<(), String> {
         if !self.enabled {
             return Ok(());
         }
         if clickhouse.is_none() {
-            return Err("prefix_chain.enabled is true but there is no clickhouse section; add one (endpoint_url, user, password) or set prefix_chain.enabled: false".to_string());
+            return Err("prefix_chain.enabled is true but there is no clickhouse section".to_string());
         }
         if tokenizer_url.trim().is_empty() {
-            return Err("prefix_chain.enabled is true but cache.tokenizer_url is empty; per-block token counts need tokenizer-svc (set DWCTL_CACHE__TOKENIZER_URL)".to_string());
+            return Err("prefix_chain.enabled is true but cache.tokenizer_url is empty".to_string());
         }
         self.key_bytes()?;
         if let Some(models) = &self.models
             && models.is_empty()
         {
-            return Err("prefix_chain.models is an empty list: an armed sink that records nothing is indistinguishable from a broken one. Omit models to capture every model, or set prefix_chain.enabled: false".to_string());
+            return Err(
+                "prefix_chain.models is an empty list; omit it to capture every model, or set prefix_chain.enabled: false".to_string(),
+            );
         }
-        if !is_identifier(&self.table) {
-            return Err(format!("prefix_chain.table {:?} is not a plain identifier", self.table));
-        }
-        if self.max_in_flight == 0 {
-            return Err("prefix_chain.max_in_flight must be > 0".to_string());
-        }
-        self.sink_options().validate().map_err(|e| format!("prefix_chain: {e}"))
+        Ok(())
     }
 
-    /// Decode the hex key. 32 bytes exactly: a shorter key is a typo, a longer one is
-    /// probably the wrong secret.
     pub fn key_bytes(&self) -> Result<[u8; 32], String> {
-        let raw = hex::decode(self.hmac_key.trim())
-            .map_err(|_| "prefix_chain.hmac_key is not hex (expected 64 hex characters, DWCTL_PREFIX_CHAIN__HMAC_KEY)".to_string())?;
+        let raw =
+            hex::decode(self.hmac_key.trim()).map_err(|_| "prefix_chain.hmac_key is not hex (expected 64 hex characters)".to_string())?;
         <[u8; 32]>::try_from(raw).map_err(|v| format!("prefix_chain.hmac_key decodes to {} bytes, expected 32", v.len()))
     }
+}
 
-    pub fn sink_options(&self) -> SinkOptions {
-        SinkOptions {
-            table: self.table.clone(),
-            flush_interval: self.flush_interval,
-            max_batch_rows: self.max_batch_rows,
-            queue_capacity: self.queue_capacity,
-            retry_delay: self.retry_delay,
-        }
+/// Sink settings for the chain table.
+pub fn sink_options() -> SinkOptions {
+    SinkOptions {
+        table: TABLE.to_string(),
+        flush_interval: FLUSH_INTERVAL,
+        max_batch_rows: MAX_BATCH_ROWS,
+        queue_capacity: QUEUE_CAPACITY,
+        retry_delay: RETRY_DELAY,
     }
+}
+
+/// Which key produced a chain: the first byte of SHA-256 over the key. Rows stamped with
+/// different ids never join, and nobody has to remember to bump a version on rotation.
+pub fn key_id(key: &[u8; 32]) -> u8 {
+    use sha2::Digest as _;
+    sha2::Sha256::digest(key)[0]
 }
 
 /// Which models the recorder captures. Built from `prefix_chain.models`.
@@ -236,6 +182,7 @@ pub struct PromptChainRow {
     /// Empty when the model is unmapped on tokenizer-svc or the call failed.
     pub block_tokens: Vec<u32>,
     pub tokenizer_version: String,
+    /// See [`key_id`]; stored in the `key_version` column.
     pub key_version: u8,
     pub v: u8,
 }
@@ -309,20 +256,18 @@ impl ChainHasher {
 
 pub struct PrefixChainRecorder {
     hasher: ChainHasher,
-    key_version: u8,
+    key_id: u8,
     filter: ModelFilter,
     tokenizer: TokenizerClient,
     principal: PrincipalResolver,
     sink: SinkHandle<PromptChainRow>,
-    /// Bounds the spawned tail (principal lookup, tokenization, send). See
-    /// `PrefixChainConfig::max_in_flight`.
     in_flight: Arc<Semaphore>,
 }
 
 impl fmt::Debug for PrefixChainRecorder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PrefixChainRecorder")
-            .field("key_version", &self.key_version)
+            .field("key_id", &self.key_id)
             .field("filter", &self.filter)
             .finish_non_exhaustive()
     }
@@ -349,26 +294,23 @@ fn skipped(reason: &'static str) {
 }
 
 impl PrefixChainRecorder {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         key: [u8; 32],
-        key_version: u8,
         filter: ModelFilter,
         tier_policy: TierPolicy,
         telemetry: TelemetryPolicy,
         tokenizer: TokenizerClient,
         principal: PrincipalResolver,
         sink: SinkHandle<PromptChainRow>,
-        max_in_flight: usize,
     ) -> Self {
         Self {
+            key_id: key_id(&key),
             hasher: ChainHasher::new(key, tier_policy, telemetry),
-            key_version,
             filter,
             tokenizer,
             principal,
             sink,
-            in_flight: Arc::new(Semaphore::new(max_in_flight.max(1))),
+            in_flight: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
         }
     }
 
@@ -485,11 +427,61 @@ impl PrefixChainRecorder {
             block_roles: chain.roles,
             block_tokens,
             tokenizer_version,
-            key_version: self.key_version,
+            key_version: self.key_id,
             v: RECORD_VERSION,
         };
         let outcome = if self.sink.send(row) { "recorded" } else { "dropped" };
         counter!("dwctl_prefix_chain_records_total", "outcome" => outcome).increment(1);
+    }
+}
+
+/// The outlet handler: sees every captured request and response, and hands served
+/// chat-completions requests to the recorder.
+pub struct PrefixChainHandler {
+    recorder: Arc<PrefixChainRecorder>,
+    /// The analytics instance id, so rows join `http_analytics` on
+    /// `(instance_id, correlation_id)`.
+    instance_id: Uuid,
+    config: crate::config::Config,
+}
+
+impl PrefixChainHandler {
+    pub fn new(recorder: Arc<PrefixChainRecorder>, instance_id: Uuid, config: crate::config::Config) -> Self {
+        Self {
+            recorder,
+            instance_id,
+            config,
+        }
+    }
+}
+
+impl outlet::RequestHandler for PrefixChainHandler {
+    async fn handle_request(&self, _data: outlet::RequestData) {}
+
+    async fn handle_response(&self, request_data: outlet::RequestData, response_data: outlet::ResponseData) {
+        // Only served requests: a rejected one (bad key, unknown model, rate limit) never
+        // becomes a principal lookup, a tokenizer call or a row.
+        if !response_data.status.is_success() {
+            return;
+        }
+        let api_key = match crate::request_logging::serializers::Auth::from_request(&request_data, &self.config) {
+            crate::request_logging::serializers::Auth::ApiKey { bearer_token } => Some(bearer_token),
+            crate::request_logging::serializers::Auth::None => None,
+        };
+        let model = request_data
+            .body
+            .as_ref()
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(b).ok())
+            .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(String::from));
+        self.recorder.observe(Observation {
+            instance_id: self.instance_id,
+            correlation_id: request_data.correlation_id as i64,
+            timestamp: DateTime::<Utc>::from(request_data.timestamp),
+            model,
+            api_key,
+            path: request_data.uri.path().to_string(),
+            body: request_data.body.clone(),
+        });
     }
 }
 
@@ -517,14 +509,12 @@ mod tests {
         let (tier, telemetry) = policies();
         let rec = PrefixChainRecorder::new(
             key,
-            1,
             filter,
             tier,
             telemetry,
             TokenizerClient::new("http://127.0.0.1:9"),
             PrincipalResolver::new(pool),
             SinkHandle::for_test(tx, "prompt_chains"),
-            4,
         );
         (Arc::new(rec), rx)
     }
@@ -622,7 +612,6 @@ mod tests {
             database: "clay".into(),
             user: "dwctl".into(),
             password: "pw".into(),
-            request_timeout: Duration::from_secs(30),
         }
     }
 
@@ -632,6 +621,12 @@ mod tests {
             hmac_key: "ab".repeat(32),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn key_id_is_derived_from_the_key() {
+        assert_eq!(key_id(&key(1)), key_id(&key(1)));
+        assert_ne!(key_id(&key(1)), key_id(&key(2)));
     }
 
     #[test]
