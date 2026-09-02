@@ -3195,6 +3195,16 @@ impl Config {
                 operation: format!("Config validation: {e}"),
             });
         }
+        // Capture rides on the analytics handler; without analytics it would advertise a
+        // sink that never sees a request, which is exactly the silent no-op the section's
+        // semantics rule out.
+        if self.prefix_chain.enabled && !self.enable_analytics {
+            return Err(Error::Internal {
+                operation:
+                    "Config validation: prefix_chain.enabled is true but enable_analytics is false; capture runs in the analytics handler"
+                        .to_string(),
+            });
+        }
         // A present `clickhouse` section must be usable: a bad endpoint or a missing
         // password is a startup error, not a sink that fails every insert forever.
         if let Some(ch) = &self.clickhouse
@@ -3218,7 +3228,9 @@ impl Config {
         // Cache TTL tiers: every enabled tier must be a known tier (5m/1h/24h), the set must be
         // non-empty, and the default tier must be one of them — otherwise a no-ttl marker would
         // default straight into a rejected tier. Fail fast at startup with a clear message.
-        if self.cache.enabled {
+        // The cache TTL policy is also consumed by prefix-chain capture, which parses with
+        // the same policies whether or not the cache layer is on.
+        if self.cache.enabled || self.prefix_chain.enabled {
             for ttl in &self.cache.enabled_ttls {
                 if crate::prompt_cache::TtlTier::parse(ttl).is_none() {
                     return Err(Error::Internal {

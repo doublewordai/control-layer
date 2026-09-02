@@ -28,6 +28,8 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use tokio::sync::Semaphore;
+
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
@@ -38,6 +40,7 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::clickhouse::{ClickhouseConfig, SinkHandle, SinkOptions, is_identifier};
+use crate::metrics::errors::component::PREFIX_CHAIN;
 use crate::prompt_cache::{
     ParseError, PrincipalResolver, TelemetryPolicy, TierPolicy, TokenizerClient, TokenizerError, parse_chat_completions,
 };
@@ -64,6 +67,9 @@ fn default_queue_capacity() -> usize {
 }
 fn default_retry_delay() -> Duration {
     Duration::from_millis(500)
+}
+fn default_max_in_flight() -> usize {
+    256
 }
 
 /// The `prefix_chain` config section.
@@ -94,6 +100,10 @@ pub struct PrefixChainConfig {
     pub queue_capacity: usize,
     #[serde(with = "humantime_serde")]
     pub retry_delay: Duration,
+    /// Cap on requests whose principal lookup and tokenization are in flight at once.
+    /// Beyond it, new requests are skipped (counted `backpressure`) rather than queued,
+    /// so a slow tokenizer-svc bounds memory instead of growing a backlog of prompts.
+    pub max_in_flight: usize,
 }
 
 impl Default for PrefixChainConfig {
@@ -108,6 +118,7 @@ impl Default for PrefixChainConfig {
             max_batch_rows: default_max_batch_rows(),
             queue_capacity: default_queue_capacity(),
             retry_delay: default_retry_delay(),
+            max_in_flight: default_max_in_flight(),
         }
     }
 }
@@ -124,6 +135,7 @@ impl fmt::Debug for PrefixChainConfig {
             .field("max_batch_rows", &self.max_batch_rows)
             .field("queue_capacity", &self.queue_capacity)
             .field("retry_delay", &self.retry_delay)
+            .field("max_in_flight", &self.max_in_flight)
             .finish()
     }
 }
@@ -168,6 +180,9 @@ impl PrefixChainConfig {
         }
         if !is_identifier(&self.table) {
             return Err(format!("prefix_chain.table {:?} is not a plain identifier", self.table));
+        }
+        if self.max_in_flight == 0 {
+            return Err("prefix_chain.max_in_flight must be > 0".to_string());
         }
         self.sink_options().validate().map_err(|e| format!("prefix_chain: {e}"))
     }
@@ -308,6 +323,9 @@ pub struct PrefixChainRecorder {
     tokenizer: TokenizerClient,
     principal: PrincipalResolver,
     sink: SinkHandle<PromptChainRow>,
+    /// Bounds the spawned tail (principal lookup, tokenization, send). See
+    /// `PrefixChainConfig::max_in_flight`.
+    in_flight: Arc<Semaphore>,
 }
 
 impl fmt::Debug for PrefixChainRecorder {
@@ -316,6 +334,22 @@ impl fmt::Debug for PrefixChainRecorder {
             .field("key_version", &self.key_version)
             .field("filter", &self.filter)
             .finish_non_exhaustive()
+    }
+}
+
+/// A fixed, content-free name for a parse failure. `ParseError`'s Display can echo the
+/// client's own value (an invalid TTL string, an unsupported content type), so logs and
+/// labels use this instead.
+fn parse_error_kind(e: &ParseError) -> &'static str {
+    match e {
+        ParseError::Json(_) => "json",
+        ParseError::TooManyBreakpoints => "too_many_breakpoints",
+        ParseError::InvalidTtl(_) => "invalid_ttl",
+        ParseError::UnsupportedType(_) => "unsupported_type",
+        ParseError::DisabledTier(_) => "disabled_tier",
+        ParseError::MalformedCacheControl => "malformed_cache_control",
+        ParseError::AutomaticTtlConflict => "automatic_ttl_conflict",
+        ParseError::NoAutomaticSlot => "automatic_no_slot",
     }
 }
 
@@ -334,6 +368,7 @@ impl PrefixChainRecorder {
         tokenizer: TokenizerClient,
         principal: PrincipalResolver,
         sink: SinkHandle<PromptChainRow>,
+        max_in_flight: usize,
     ) -> Self {
         Self {
             hasher: ChainHasher::new(key, tier_policy, telemetry),
@@ -342,6 +377,7 @@ impl PrefixChainRecorder {
             tokenizer,
             principal,
             sink,
+            in_flight: Arc::new(Semaphore::new(max_in_flight.max(1))),
         }
     }
 
@@ -377,15 +413,27 @@ impl PrefixChainRecorder {
                 return;
             }
             Err(e) => {
-                // A body the cache parser rejects (malformed markers, not JSON). Nothing
-                // payload-shaped is logged: the error names the rule, not the content.
-                debug!(correlation_id = obs.correlation_id, error = %e, "prefix chain: prompt not parseable; skipped");
+                // A body the cache parser rejects (malformed markers, not JSON). Only the
+                // rule that fired is logged: some ParseError variants carry the offending
+                // client value in their Display text, which must never reach a log.
+                let kind = parse_error_kind(&e);
+                debug!(
+                    correlation_id = obs.correlation_id,
+                    kind, "prefix chain: prompt not parseable; skipped"
+                );
                 skipped("parse_error");
                 return;
             }
         };
+        // Bound the spawned tail: the task holds the block texts and the key while it waits
+        // on Postgres and tokenizer-svc, so under a slow dependency we drop, not queue.
+        let Ok(permit) = Arc::clone(&self.in_flight).try_acquire_owned() else {
+            skipped("backpressure");
+            return;
+        };
         let this = Arc::clone(self);
         tokio::spawn(async move {
+            let _permit = permit;
             this.finish(model, api_key, chain, obs.instance_id, obs.correlation_id, obs.timestamp)
                 .await;
         });
@@ -404,7 +452,7 @@ impl PrefixChainRecorder {
                 return;
             }
             Err(e) => {
-                warn!(correlation_id, error = %e, "prefix chain: principal lookup failed; skipped");
+                crate::background_error!(PREFIX_CHAIN, "principal_lookup", Error, correlation_id, error = %e, "prefix chain: principal lookup failed; skipped");
                 skipped("principal_error");
                 return;
             }
@@ -430,7 +478,7 @@ impl PrefixChainRecorder {
                 (Vec::new(), String::new())
             }
             Err(e) => {
-                debug!(correlation_id, error = %e, "prefix chain: tokenizer call failed; recorded without counts");
+                crate::background_error!(PREFIX_CHAIN, "tokenize", Warning, correlation_id, error = %e, "prefix chain: tokenizer call failed; recorded without counts");
                 counter!("dwctl_prefix_chain_tokenize_total", "outcome" => "error").increment(1);
                 (Vec::new(), String::new())
             }
@@ -485,6 +533,7 @@ mod tests {
             TokenizerClient::new("http://127.0.0.1:9"),
             PrincipalResolver::new(pool),
             SinkHandle::for_test(tx, "prompt_chains"),
+            4,
         );
         (Arc::new(rec), rx)
     }
@@ -647,6 +696,19 @@ mod tests {
         assert_eq!(absent.models, None);
         let null: PrefixChainConfig = serde_json::from_str(r#"{"models": null}"#).unwrap();
         assert_eq!(null.models, None);
+    }
+
+    #[test]
+    fn parse_errors_log_a_fixed_kind_not_the_client_value() {
+        let (tier, telemetry) = policies();
+        let err = parse_chat_completions(
+            br#"{"model":"m","tools":[{"type":"function","function":{"name":"t"},"cache_control":{"type":"SECRET-VALUE"}}],"messages":[{"role":"user","content":"x"}]}"#,
+            &tier,
+            &telemetry,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("SECRET-VALUE"), "Display echoes the client value: {err}");
+        assert!(!parse_error_kind(&err).contains("SECRET"));
     }
 
     #[test]

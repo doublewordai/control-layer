@@ -526,6 +526,7 @@ prefix_chain:
   max_batch_rows: 5000
   queue_capacity: 20000
   retry_delay: 500ms
+  max_in_flight: 256
 
 continuation:
   # Global kill switch. When false (default), the layer is not added to the

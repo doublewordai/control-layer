@@ -237,7 +237,11 @@ impl RequestHandler for AnalyticsHandler {
 
             // Workload profiling: the prompt's structure, keyed and content-free. The
             // inline part is a parse and a few HMACs; everything slow is spawned inside.
-            if let Some(recorder) = &self.prefix_chain {
+            // Only served requests: a rejected one (bad key, unknown model, rate limit)
+            // never becomes a principal lookup, a tokenizer call or a row.
+            if let Some(recorder) = &self.prefix_chain
+                && (200..300).contains(&metrics.status_code)
+            {
                 recorder.observe(crate::prefix_chain::Observation {
                     instance_id: self.instance_id,
                     correlation_id: metrics.correlation_id,

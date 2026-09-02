@@ -3487,6 +3487,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             crate::prompt_cache::TokenizerClient::new(config.cache.tokenizer_url.clone()),
             crate::prompt_cache::PrincipalResolver::new(pool.clone()),
             sink_handle,
+            config.prefix_chain.max_in_flight,
         );
         info!(
             models = ?config.prefix_chain.models,
