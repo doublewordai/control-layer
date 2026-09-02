@@ -1,27 +1,18 @@
-//! Prefix-chain capture: content-free records of prompt STRUCTURE, per chat-completions
-//! request, written to ClickHouse for workload profiling.
+//! Prefix-chain capture: a content-free record of each chat-completions prompt's
+//! structure, written to ClickHouse.
 //!
-//! Zero-data-retention customers give us no bodies, and the analytics row alone cannot
-//! say which requests share a prefix (a system prompt, a tool set) or how a conversation
-//! grows turn by turn. This module records, per request, a chain of keyed hashes: one per
-//! content block of the prompt in parse order (tool definitions, system, each message,
-//! each tool call), each an HMAC-SHA256 over the cumulative content up to that block,
-//! truncated to 16 bytes. Equal prefixes give equal chain prefixes, so sessions and
-//! shared templates fall out of the data with no content stored; without the key a
-//! leaked table is structure only. Alongside the chain: each block's role and its
-//! token count on its own (tokenizer-svc), so template overhead and per-block sizes are
-//! recoverable, which is what a replay corpus needs.
+//! Per served request: one entry per content block of the prompt in parse order (tool
+//! definitions, system, messages, tool calls), each an HMAC-SHA256 over the cumulative
+//! content up to that block, truncated to 16 bytes and hex-encoded; the block roles; and
+//! each block's own token count from tokenizer-svc. Equal prefixes give equal chain
+//! prefixes, so shared prefixes and multi-turn continuations are recoverable without
+//! storing content, and without the key the table is structure only.
 //!
-//! The block split and the cumulative hashes are the prompt-cache layer's own parser
-//! ([`crate::prompt_cache::parse_chat_completions`]) under the same policies the billing
-//! classifier uses, so a chain entry is exactly `HMAC(prefix_hash)` of what that layer
-//! would index. Nothing here touches the classify path or billing: capture runs in the
-//! outlet analytics handler, after the response, off the request path, and any failure
-//! yields no record and a counter.
-//!
-//! Best effort end to end: the ClickHouse sink drops on a full queue or a twice-failed
-//! insert (see [`crate::clickhouse`]). Design and decisions: notes campaign
-//! `zdr-workload-profiling`, 2026-09-02.
+//! The block split and the cumulative hashes come from the prompt-cache parser
+//! ([`crate::prompt_cache::parse_chat_completions`]) under the same policies the cache
+//! classifier uses. Capture runs in the outlet analytics handler after the response, off
+//! the request path; the classify path is not involved. Any failure yields no record and
+//! a counter. Delivery is best effort (see [`crate::clickhouse`]).
 
 use std::collections::HashSet;
 use std::fmt;
@@ -619,9 +610,9 @@ mod tests {
     #[test]
     fn model_filter_semantics() {
         assert!(ModelFilter::from_config(&None).allows("anything"));
-        let only = ModelFilter::from_config(&Some(vec!["runware-zai/glm-5.2".into()]));
-        assert!(only.allows("runware-zai/glm-5.2"));
-        assert!(!only.allows("Runware-zai/glm-5.2"), "exact, case-sensitive");
+        let only = ModelFilter::from_config(&Some(vec!["vendor/model-a".into()]));
+        assert!(only.allows("vendor/model-a"));
+        assert!(!only.allows("Vendor/model-a"), "exact, case-sensitive");
         assert!(!only.allows("other"));
     }
 

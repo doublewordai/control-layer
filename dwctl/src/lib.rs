@@ -1450,7 +1450,7 @@ fn security_header_pairs(cfg: &crate::config::SecurityHeadersConfig) -> anyhow::
 /// Returns an error if CORS configuration is invalid, a configured security
 /// response header has an invalid value, or metrics initialization fails.
 #[instrument(skip_all)]
-#[allow(clippy::too_many_arguments)] // one optional collaborator per feature; a builder would be more code than the signature
+#[allow(clippy::too_many_arguments)]
 pub async fn build_router(
     state: &mut AppState,
     onwards_router: Router,

@@ -1,17 +1,12 @@
-//! ClickHouse Cloud: the shared warehouse connection and a generic best-effort sink.
+//! ClickHouse: the shared warehouse connection and a generic best-effort sink.
 //!
-//! The warehouse (`clay`) is fed mostly by the Neon → ClickHouse CDC pipe. A few
-//! high-volume, derived, analytics-only records are written directly from dwctl instead,
-//! because they are variable-length, never read back by dwctl, and would only add WAL
-//! and storage to the billing database on their way through. This module is the one
-//! connection those writers share ([`ClickHouseClient`], built from the top-level
-//! `clickhouse` config section) and the sink they hang off ([`sink::ClickHouseSink`]).
+//! [`ClickHouseClient`] is built from the top-level `clickhouse` config section and is
+//! shared by every feature that writes analytics records directly to the warehouse;
+//! [`sink::ClickHouseSink`] is the batched writer they hang off.
 //!
-//! Best effort by design. Nothing on the request path waits on it. A full queue drops
-//! the newest rows, a failed insert is retried once and then dropped, and every drop is
-//! counted (`dwctl_clickhouse_dropped_rows_total`). There is no spill and no replay: a
-//! warehouse outage loses that window's records, which is the agreed trade for these
-//! records (2026-09-02).
+//! Best effort by design. Nothing on the request path waits on it. A full queue drops the
+//! newest rows, a failed insert is retried once and then dropped, and every drop is
+//! counted (`dwctl_clickhouse_dropped_rows_total`). There is no spill and no replay.
 //!
 //! Rows land in batches: one `INSERT ... FORMAT JSONEachRow` per flush, gzip-compressed.
 //! ClickHouse's cost is per insert statement (each creates a part), not per row, so the
