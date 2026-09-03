@@ -463,6 +463,12 @@ mod retention_policy_tests {
                 .archive_terminal_batchless_responses(&policy, &cutoffs, 1, 1)
                 .await,
         );
+
+        assert_maintenance_is_disabled(
+            storage
+                .archive_overdue_batchless_responses(&policy, &cutoffs, 1, 1)
+                .await,
+        );
         assert_maintenance_is_disabled(
             storage
                 .ensure_retained_response_partitions(&policy, 1)
@@ -1673,8 +1679,27 @@ pub trait DaemonStorage: Send + Sync {
     /// must revalidate every graph member against it and may move a graph only
     /// when its conservative deletion day is after
     /// [`RetainedResponseArchiveCutoffs::observed_at`]'s UTC date. Already-due
-    /// live graphs remain for an explicitly gated legacy path.
+    /// live graphs are left to the explicitly gated
+    /// [`DaemonStorage::archive_overdue_batchless_responses`].
     async fn archive_terminal_batchless_responses(
+        &self,
+        _policy: &RetentionPolicy,
+        _cutoffs: &RetainedResponseArchiveCutoffs,
+        _max_groups: i64,
+        _max_bytes: i64,
+    ) -> Result<RetainedResponseArchiveOutcome> {
+        Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
+    }
+
+    /// The gated legacy path for already-due live graphs: like
+    /// [`DaemonStorage::archive_terminal_batchless_responses`] but without the
+    /// per-tier lower bound, so content whose deletion day has already passed
+    /// is discovered oldest-first and moved onto the day after
+    /// [`RetainedResponseArchiveCutoffs::observed_at`] — the earliest day that
+    /// can still be dropped. Retention is only ever extended here; without
+    /// this path such content would stay live, and therefore undeletable,
+    /// forever. Storage backends opt in explicitly; the default is disabled.
+    async fn archive_overdue_batchless_responses(
         &self,
         _policy: &RetentionPolicy,
         _cutoffs: &RetainedResponseArchiveCutoffs,

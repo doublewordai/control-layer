@@ -4062,9 +4062,18 @@ async fn move_graph<P: PoolProvider>(
         }));
     }
     let delete_on = delete_on.ok_or_else(incomplete_graph)?;
-    if delete_on <= cutoffs.observed_at().date_naive() {
-        return Ok(MoveGraphOutcome::Deferred);
-    }
+    // A graph already past its retention period cannot land on a droppable
+    // day: a partition never drops on its own day and past days have no
+    // partition. Deferring it would leave it in the live heap forever, so
+    // it goes into the earliest future day instead. Retention is only ever
+    // extended here, by at most the time the graph spent overdue, and the
+    // content becomes droppable at the next boundary rather than never.
+    let earliest_future = cutoffs
+        .observed_at()
+        .date_naive()
+        .succ_opt()
+        .ok_or_else(incomplete_graph)?;
+    let delete_on = delete_on.max(earliest_future);
 
     let template_by_id = templates
         .into_iter()
@@ -4311,6 +4320,30 @@ pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
     max_groups: i64,
     max_bytes: i64,
 ) -> Result<RetainedResponseArchiveOutcome> {
+    archive_batchless_responses(manager, policy, cutoffs, max_groups, max_bytes, false).await
+}
+
+/// The gated legacy path: no per-tier lower bound, so already-due graphs are
+/// discovered oldest-first; `move_graph` lands them on the day after
+/// observation.
+pub(crate) async fn archive_overdue_batchless_responses<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    policy: &RetentionPolicy,
+    cutoffs: &RetainedResponseArchiveCutoffs,
+    max_groups: i64,
+    max_bytes: i64,
+) -> Result<RetainedResponseArchiveOutcome> {
+    archive_batchless_responses(manager, policy, cutoffs, max_groups, max_bytes, true).await
+}
+
+async fn archive_batchless_responses<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    policy: &RetentionPolicy,
+    cutoffs: &RetainedResponseArchiveCutoffs,
+    max_groups: i64,
+    max_bytes: i64,
+    include_overdue: bool,
+) -> Result<RetainedResponseArchiveOutcome> {
     if max_groups <= 0 || max_bytes <= 0 {
         return Ok(RetainedResponseArchiveOutcome::default());
     }
@@ -4347,15 +4380,21 @@ pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
         let duration = chrono::Duration::try_seconds(seconds).ok_or_else(|| {
             FusilladeError::ValidationError("automated retention period is too large".to_owned())
         })?;
-        archive_after.push(
-            observed_day_start
-                .checked_sub_signed(duration)
-                .ok_or_else(|| {
-                    FusilladeError::ValidationError(
-                        "automated retention cutoff is out of range".to_owned(),
-                    )
-                })?,
-        );
+        let lower_bound = observed_day_start
+            .checked_sub_signed(duration)
+            .ok_or_else(|| {
+                FusilladeError::ValidationError(
+                    "automated retention cutoff is out of range".to_owned(),
+                )
+            })?;
+        // The overdue path has no lower bound: everything terminal before the
+        // dwell cutoff is discoverable, oldest first. No request predates the
+        // Unix epoch, and the epoch is comfortably inside the timestamptz range.
+        archive_after.push(if include_overdue {
+            DateTime::<Utc>::UNIX_EPOCH
+        } else {
+            lower_bound
+        });
     }
     let candidate_limit = max_groups.saturating_add(1);
     let max_probes = candidate_limit.saturating_mul(2);

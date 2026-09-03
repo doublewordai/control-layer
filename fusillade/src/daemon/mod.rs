@@ -782,6 +782,9 @@ async fn run_retained_response_route_cleanup_loop<S>(
 #[derive(Debug, Clone, Copy)]
 struct ArchiveMoverTick {
     worker: &'static str,
+    /// The backfill worker owns the gated legacy path for already-due
+    /// batchless graphs; the sweep never touches them.
+    include_overdue: bool,
     batch_enabled: bool,
     batchless_enabled: bool,
     batch_limit: i64,
@@ -921,12 +924,27 @@ async fn run_batchless_archive_phase<S>(
         shutdown,
         "retained response archive move",
         query_timeout,
-        storage.archive_terminal_batchless_responses(
-            retention_policy,
-            cutoffs,
-            tick.batchless_group_limit,
-            tick.batchless_byte_limit,
-        ),
+        async {
+            if tick.include_overdue {
+                storage
+                    .archive_overdue_batchless_responses(
+                        retention_policy,
+                        cutoffs,
+                        tick.batchless_group_limit,
+                        tick.batchless_byte_limit,
+                    )
+                    .await
+            } else {
+                storage
+                    .archive_terminal_batchless_responses(
+                        retention_policy,
+                        cutoffs,
+                        tick.batchless_group_limit,
+                        tick.batchless_byte_limit,
+                    )
+                    .await
+            }
+        },
     )
     .await
     {
@@ -3310,6 +3328,7 @@ where
                 let retained_runway_ready = retained_runway_ready.clone();
                 let tick = ArchiveMoverTick {
                     worker,
+                    include_overdue: worker == "backfill",
                     batch_enabled,
                     batchless_enabled,
                     batch_limit,
@@ -3808,6 +3827,19 @@ mod tests {
             Ok(crate::RetainedResponseArchiveOutcome::default())
         }
 
+        async fn archive_overdue_batchless_responses(
+            &self,
+            _policy: &RetentionPolicy,
+            cutoffs: &RetainedResponseArchiveCutoffs,
+            _max_groups: i64,
+            _max_bytes: i64,
+        ) -> Result<crate::RetainedResponseArchiveOutcome> {
+            self.batchless_calls.fetch_add(1, Ordering::SeqCst);
+            self.batchless_cutoffs.lock().unwrap().push(*cutoffs);
+            self.record("batchless_overdue_move");
+            Ok(crate::RetainedResponseArchiveOutcome::default())
+        }
+
         async fn ensure_retained_response_partitions(
             &self,
             _policy: &RetentionPolicy,
@@ -3964,6 +3996,7 @@ mod tests {
     fn mover_tick(batch_enabled: bool, batchless_enabled: bool) -> ArchiveMoverTick {
         ArchiveMoverTick {
             worker: "test",
+            include_overdue: false,
             batch_enabled,
             batchless_enabled,
             batch_limit: 1,

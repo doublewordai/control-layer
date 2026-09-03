@@ -6242,3 +6242,55 @@ async fn create_step_sanitizes_unrelated_foreign_key_error_without_active_route(
     }
     assert_eq!(count_ids(&pool, "response_steps", &[proposed_id]).await, 0);
 }
+
+#[sqlx::test]
+async fn overdue_graph_moves_into_the_next_day_instead_of_deferring(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    // One-second retention with no fixture offset: delete_on computes to
+    // 2026-08-02, long before the pinned 2026-08-31 observation, i.e. the
+    // graph is already past its retention period when the mover finds it.
+    let overdue = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T08:00:00Z"),
+        "overdue-graph",
+    )
+    .await;
+    let next_day = exact_date("2026-09-01");
+    ensure_partition(&pool, next_day).await;
+    let manager = manager(&pool).await;
+
+    let observed = timestamp("2026-08-31T00:00:00Z");
+    let cutoffs = RetainedResponseArchiveCutoffs::new(observed, observed, observed).unwrap();
+    let policy = exact_policy(&[("flex", 1)]);
+
+    // Ordinary movement still leaves already-due content alone …
+    let ordinary = manager
+        .archive_terminal_batchless_responses(&policy, &cutoffs, 1, i64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(ordinary.groups_archived, 0);
+
+    // … and the gated overdue path is what moves it.
+    let outcome = manager
+        .archive_overdue_batchless_responses(&policy, &cutoffs, 1, i64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome.groups_archived, 1,
+        "an overdue graph must move rather than stay live forever"
+    );
+    assert_wholly_retained(&pool, &overdue).await;
+    let landed_on: NaiveDate = sqlx::query_scalar(
+        "SELECT DISTINCT delete_on FROM retained_response_objects WHERE group_id = $1",
+    )
+    .bind(overdue.group_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        landed_on, next_day,
+        "overdue content lands on the day after observation, never a droppable day"
+    );
+}
