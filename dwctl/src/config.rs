@@ -3088,7 +3088,11 @@ impl Config {
         }
         let retention_enabled = self.background_services.batch_daemon.retention.is_enabled();
         let daemon = &self.background_services.batch_daemon;
-        let owns_archive_maintenance = !matches!(daemon.mode, DaemonMode::RequestOnly);
+        // A process that never runs the batch daemon owns no archive
+        // maintenance, whatever retention configuration it carries: in a
+        // split topology the API pods share the daemon pods' environment and
+        // must not reject it (the daemon pods validate what they run).
+        let owns_archive_maintenance = !matches!(daemon.mode, DaemonMode::RequestOnly) && daemon.enabled != DaemonEnabled::Never;
         let batchless_policy_configured = !daemon.retention.batchless_seconds_by_service_tier.is_empty();
         let batchless_movement_enabled = daemon.batchless_archive_sweep_enabled || daemon.batchless_archive_backfill_enabled;
         if owns_archive_maintenance
@@ -3157,10 +3161,14 @@ impl Config {
                     .to_string(),
             });
         }
-        if owns_archive_maintenance && retention_enabled && self.background_services.batch_daemon.enabled == DaemonEnabled::Never {
-            return Err(Error::Internal {
-                operation: "Config validation: automated retention requires the batch daemon to run".to_string(),
-            });
+        if retention_enabled && daemon.enabled == DaemonEnabled::Never && !matches!(daemon.mode, DaemonMode::RequestOnly) {
+            // Not an error: another instance is expected to run the daemon.
+            // Surface it so a single-instance deployment cannot silently
+            // configure retention that nothing enforces.
+            tracing::warn!(
+                "automated retention is configured but the batch daemon never runs on this instance; \
+                 another instance must run it for retention to be enforced"
+            );
         }
         if owns_archive_maintenance
             && retention_enabled
@@ -4056,6 +4064,28 @@ secret_key: "test-secret-key"
         config.batches.files.max_expiry_seconds = 3600;
         let result = config.validate();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn retention_config_is_accepted_on_an_instance_that_never_runs_the_daemon() {
+        // Split topology: API pods share the daemon pods' environment but run
+        // with the daemon disabled. They own no maintenance and must not
+        // reject the retention flags the daemon pods act on.
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.background_services.batch_daemon.enabled = DaemonEnabled::Never;
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.retention.batchless_seconds_by_service_tier.insert("flex".to_string(), 60);
+        daemon.retention.max_late_writer_seconds = Some(60);
+        daemon.batchless_archive_sweep_enabled = true;
+        daemon.retained_response_retirement_enabled = true;
+        daemon.batch_archive_retirement_enabled = true;
+        daemon.batch_archive_retention_days = Some(1);
+        daemon.template_generation_writes_enabled = true;
+        daemon.template_retirement_enabled = true;
+        daemon.template_retention_days = Some(1);
+        assert!(config.validate().is_ok(), "{:?}", config.validate().err());
     }
 
     #[test]
