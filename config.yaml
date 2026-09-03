@@ -568,7 +568,9 @@ continuation:
   # have a byte-exactness verdict from the fidelity harness ("dsv4" = the
   # DeepSeek-V4/DSML family). Absent from the map -> plain-content only;
   # reasoning/tool streams disarm safely instead of resuming.
-  # Set via environment: DWCTL_CONTINUATION__MODEL_RECONSTRUCTORS='{"deepseek-ai/DeepSeek-V4-Flash":"dsv4"}'
+  # Set via environment as a figment/TOML inline table ('=' between key and
+  # value — the JSON-colon form fails config parsing and crash-loops the pod):
+  # DWCTL_CONTINUATION__MODEL_RECONSTRUCTORS='{"deepseek-ai/DeepSeek-V4-Flash-0731" = "dsv4"}'
   model_reconstructors: {}
 
 # Background services configuration

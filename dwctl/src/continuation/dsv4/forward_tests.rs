@@ -780,3 +780,68 @@ fn synthetic_a_zero_parameter_call_round_trips() {
     let mut acc = Dsv4Reconstructor::new(CAP, false);
     assert_eq!(reserialize(&mut acc, &deltas), raw);
 }
+
+// ── bounds and finish-time drops (Copilot review round, 2026-09-03) ──────────
+
+/// An unterminated invoke name (a pathological leg with no max_tokens) must
+/// not grow memory without bound: past the structural cap the parser poisons —
+/// consumes everything, emits nothing, leaks nothing.
+#[test]
+fn an_unbounded_invoke_name_poisons_instead_of_growing() {
+    let mut p = Dsv4Forward::new(ForwardSeed::Content);
+    let mut out = p.feed("body text\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"");
+    for _ in 0..40 {
+        out.extend(p.feed(&"q".repeat(1024)));
+    }
+    out.extend(p.finish());
+    let text: String = out
+        .iter()
+        .filter_map(|d| match d {
+            ForwardDelta::Content(t) | ForwardDelta::Reasoning(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(!text.contains('q'), "poisoned input leaked as text: {text:?}");
+    assert!(
+        !out.iter().any(|d| matches!(d, ForwardDelta::ToolCall { .. })),
+        "no call from a poisoned name"
+    );
+}
+
+/// A parameter attribute that never closes accumulates in `hold`; the generic
+/// feed-time bound must poison rather than re-scan a growing buffer forever.
+#[test]
+fn an_unbounded_param_attr_poisons_the_hold() {
+    let mut p = Dsv4Forward::new(ForwardSeed::Content);
+    p.feed("b\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n<｜DSML｜parameter name=\"k\"");
+    let mut out = Vec::new();
+    for _ in 0..40 {
+        out.extend(p.feed(&"y".repeat(1024)));
+    }
+    out.extend(p.finish());
+    let text: String = out
+        .iter()
+        .filter_map(|d| match d {
+            ForwardDelta::Content(t) | ForwardDelta::Reasoning(t) => Some(t.as_str()),
+            ForwardDelta::ToolCall { arguments, .. } => Some(arguments.as_str()),
+        })
+        .collect();
+    assert!(!text.contains('y'), "attr overflow leaked: {text:?}");
+}
+
+/// A leg that dies midway through a tag between invokes must not leak the
+/// partial tag bytes as content at end-of-stream.
+#[test]
+fn a_partial_tag_at_finish_is_dropped_not_leaked() {
+    let mut p = Dsv4Forward::new(ForwardSeed::Content);
+    let mut out = p.feed("done.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"f\">\n</｜DSML｜invoke>\n</｜DSML");
+    out.extend(p.finish());
+    let text: String = out
+        .iter()
+        .filter_map(|d| match d {
+            ForwardDelta::Content(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(!text.contains("DSML"), "partial closing tag leaked: {text:?}");
+}

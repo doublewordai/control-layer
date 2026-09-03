@@ -629,6 +629,22 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     continue;
                 };
                 if let Some((leg_prompt, leg_completion)) = rewrap::usage_of(&value) {
+                    // The parser may still hold bytes that turned out not to be
+                    // a tag — a leg can end with its usage chunk standing in for
+                    // `finish_reason`. Flush them BEFORE the terminal usage
+                    // frame: clients and request logging treat the usage chunk
+                    // as terminal, so a delta emitted after it would be dropped
+                    // or misassembled. Draining here makes the later
+                    // end-of-stream flush a no-op for this leg.
+                    let flushed = parser.as_mut().map(|p| p.finish()).unwrap_or_default();
+                    for delta in flushed {
+                        let chat = rewrap::delta_chunk(&env, delta.into_delta(), Value::Null);
+                        if let Some(died) = death_at.take() {
+                            metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
+                        }
+                        let _ = acc.ingest(&chat);
+                        yield Ok(rewrap::sse_frame(&chat));
+                    }
                     // The leg's terminal usage describes the LEG. Replace it with
                     // the merged accounting for the whole logical request.
                     let render = last_render.as_ref();

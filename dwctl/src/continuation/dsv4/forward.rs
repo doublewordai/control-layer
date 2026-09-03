@@ -79,15 +79,25 @@ enum State {
     ParamValue,
     /// After `</｜DSML｜tool_calls>`. Well-formed DSML ends here.
     AfterBlock,
+    /// A structural buffer breached [`MAX_STRUCTURAL_HOLD`]: the leg is not
+    /// parseable DSML and everything further is consumed and dropped — never
+    /// emitted, never accumulated. Bounds both memory and the re-scan cost.
+    Poisoned,
 }
+
+/// Upper bound on any structural buffer (a held tag prefix, an invoke name, a
+/// parameter attribute). Legitimate DSML structure is tens of bytes; the bound
+/// only exists so a pathological leg (an unterminated name from a model with
+/// no `max_tokens`) cannot grow memory or re-scan cost without limit.
+const MAX_STRUCTURAL_HOLD: usize = 4096;
 
 /// The DSML/think state machine.
 pub struct Dsv4Forward {
     state: State,
     /// Bytes withheld because they may be the start of a tag this state is
-    /// looking for. Bounded by the longest such tag, except in the two
-    /// structural scans (an invoke name, a parameter attribute) where it is
-    /// bounded by the leg's own generation.
+    /// looking for. Bounded by the longest such tag in the streaming states,
+    /// and by [`MAX_STRUCTURAL_HOLD`] everywhere (a breach poisons the parser
+    /// rather than growing without limit).
     hold: String,
     /// The invoke name being read. Buffered rather than streamed because the
     /// reconstructor's slot REPLACES a name instead of appending to it, so a
@@ -216,7 +226,18 @@ impl Dsv4Forward {
             State::ParamName => self.scan_param_name(rest),
             State::ParamAttr => self.scan_param_attr(rest),
             State::ParamValue => self.scan_param_value(rest),
+            // Not parseable: consume and drop. Emitting could leak tag bytes;
+            // buffering could grow without bound.
+            State::Poisoned => rest.len(),
         }
+    }
+
+    /// Enter the dead state and drop everything buffered so far.
+    fn poison(&mut self) {
+        self.state = State::Poisoned;
+        self.hold.clear();
+        self.name.clear();
+        self.pending.clear();
     }
 
     /// A channel that runs until one closing tag: emit everything before it,
@@ -290,6 +311,9 @@ impl Dsv4Forward {
         // A name cannot contain `"`, so only a trailing quote is ambiguous.
         let emittable = rest.len() - hold_len(rest, &[TAG_END]);
         self.name.push_str(&rest[..emittable]);
+        if self.name.len() > MAX_STRUCTURAL_HOLD {
+            self.poison();
+        }
         emittable
     }
 
@@ -395,6 +419,12 @@ impl ForwardParser for Dsv4Forward {
             pos += consumed;
         }
         self.hold = buf[pos..].to_string();
+        // Covers every blocked state generically (a ParamAttr that never sees
+        // its `">`, a tag prefix that never resolves): past the bound this
+        // cannot be real structure, and re-scanning it each feed is quadratic.
+        if self.hold.len() > MAX_STRUCTURAL_HOLD {
+            self.poison();
+        }
         self.flush_args(&mut out);
         out
     }
@@ -405,7 +435,12 @@ impl ForwardParser for Dsv4Forward {
         match self.state {
             State::Reasoning if !hold.is_empty() => self.emit(&mut out, ForwardDelta::Reasoning(hold)),
             State::Content | State::AfterBlock if !hold.is_empty() => self.emit(&mut out, ForwardDelta::Content(hold)),
-            State::Block | State::Invoke => self.structural(&mut out, &hold),
+            // Whatever these scans withheld is a proper prefix of an expected
+            // DSML tag (anything else was surfaced as it streamed). A tag the
+            // leg never finished is structure the client was never shown —
+            // drop it like the half-written open tag below, never emit tag
+            // bytes as answer text.
+            State::Block | State::Invoke => {}
             State::ParamName => {
                 let escaped = escape(&hold);
                 self.push_args(&escaped);

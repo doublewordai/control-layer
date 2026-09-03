@@ -715,6 +715,7 @@ impl StreamAccumulator for Dsv4Reconstructor {
                 // truncated arguments, so disarm instead of corrupting the
                 // prefix.
                 if self.tools.last().is_some_and(|last| last.index != index) && self.tools.iter().any(|t| t.index == index) {
+                    super::metrics::record_unsupported_delta("tool_calls");
                     return self.disarm(AccumulateError::UnsupportedDelta);
                 }
                 let slot = self.slot(index);
