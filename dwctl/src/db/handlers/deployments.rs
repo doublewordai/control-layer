@@ -40,7 +40,7 @@ pub struct DeploymentFilter {
     pub accessible_to: Option<UserId>, // None = show all deployments, Some(user_id) = show only deployments accessible to that user
     pub group_ids: Option<Vec<crate::types::GroupId>>, // None = show all, Some(group_ids) = show only models in any of these groups
     pub aliases: Option<Vec<String>>,
-    pub search: Option<String>,                // Case-insensitive substring search on alias and model_name
+    pub search: Option<String>,                // Case-insensitive substring search
     pub is_composite: Option<bool>,            // None = show all, Some(true) = composite only, Some(false) = non-composite only
     pub provider: Option<String>,              // Filter by metadata provider (case-insensitive exact match)
     pub model_type: Option<ModelType>,         // Filter by model type column
@@ -809,6 +809,8 @@ impl<'c> Deployments<'c> {
             query.push(" AND (LOWER(dm.alias) LIKE ");
             query.push_bind(search_pattern.clone());
             query.push(" OR LOWER(dm.model_name) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(dm.display_name) LIKE ");
             query.push_bind(search_pattern.clone());
             query.push(" OR LOWER(ie.name) LIKE ");
             query.push_bind(search_pattern);
@@ -1715,6 +1717,49 @@ mod tests {
             roles: vec![Role::StandardUser],
         });
         user_repo.create(&user_create).await.unwrap().into()
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn searches_customer_visible_model_fields(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        crate::seed_database(
+            &[crate::config::ModelSource {
+                name: "test".to_string(),
+                url: base_url,
+                api_key: None,
+                sync_interval: std::time::Duration::from_secs(3600),
+                default_models: None,
+            }],
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        let user = create_test_user(&pool).await;
+        let endpoint_id = get_test_endpoint_id(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let created = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("vendor/model-27b".to_string())
+                    .alias("vendor/model-27b".to_string())
+                    .display_name("Qwen3.8 27B".to_string())
+                    .description("Optimized for multilingual retrieval".to_string())
+                    .hosted_on(endpoint_id)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        let results = repo
+            .list(&DeploymentFilter::new(0, 10).with_search("qwen3.8 27b".to_string()))
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, created.id);
     }
 
     fn reasoning_translation_overrides() -> ReasoningTranslationOverrides {

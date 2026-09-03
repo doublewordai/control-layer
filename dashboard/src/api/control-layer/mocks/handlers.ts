@@ -1334,13 +1334,18 @@ export const handlers = [
       models = models.filter((m) => !!m.is_composite === wantComposite);
     }
 
-    // Apply search filter (case-insensitive substring match on alias or model_name)
+    // Apply search filter using the same customer-visible fields as the API
     if (search) {
       const searchLower = search.toLowerCase();
       models = models.filter(
         (m) =>
           m.alias.toLowerCase().includes(searchLower) ||
-          m.model_name.toLowerCase().includes(searchLower),
+          m.model_name.toLowerCase().includes(searchLower) ||
+          (m.display_name?.toLowerCase().includes(searchLower) ?? false) ||
+          (endpointsData
+            .find((endpoint) => endpoint.id === m.hosted_on)
+            ?.name.toLowerCase()
+            .includes(searchLower) ?? false),
       );
     }
 
