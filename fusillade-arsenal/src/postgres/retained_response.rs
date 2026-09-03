@@ -547,7 +547,10 @@ impl fmt::Debug for RetainedTemplateSnapshot {
     }
 }
 
-/// V1 request object payload: one request row and its dedicated template.
+/// V1 request object payload: one request row and a snapshot of its
+/// template. The template is either dedicated (moved and deleted with the
+/// graph) or an external copy of a file's template (the file keeps its row);
+/// the snapshot keeps the retained record self-describing either way.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct RetainedRequestPayloadV1 {
     pub(crate) request: RetainedRequestSnapshot,
@@ -556,10 +559,7 @@ pub(crate) struct RetainedRequestPayloadV1 {
 
 impl RetainedRequestPayloadV1 {
     fn validate(&self) -> std::result::Result<(), RetainedResponseSerializationError> {
-        if self.request.batch_id.is_some()
-            || self.request.template_id != Some(self.template.id)
-            || self.template.file_id.is_some()
-        {
+        if self.request.batch_id.is_some() || self.request.template_id != Some(self.template.id) {
             return Err(RetainedResponseSerializationError::InvalidRequestTemplateAssociation);
         }
         if self.request.created_by.as_deref().is_none_or(str::is_empty) {
@@ -3996,24 +3996,33 @@ async fn move_graph<P: PoolProvider>(
         .iter()
         .map(template_snapshot)
         .collect::<MovementResult<Vec<_>>>()?;
-    if templates.iter().any(|template| template.file_id.is_some()) {
-        return Err(incomplete_graph());
-    }
-    let outside_template_references: i64 = sqlx::query_scalar(
+    // A template is owned by this graph only when it is dedicated (no file)
+    // and nothing outside the graph references it; owned templates move with
+    // the graph and are deleted. Anything else — a file's template (the shape
+    // of the oldest legacy batchless traffic) or a dedicated template shared
+    // with another live request — is external input content governed by its
+    // own lifecycle: it is snapshotted into the retained record so the record
+    // stays self-describing, and its live row is left untouched.
+    let externally_referenced: Vec<Uuid> = sqlx::query_scalar(
         r#"
-        SELECT COUNT(*)
+        SELECT DISTINCT template_id
         FROM requests
         WHERE template_id = ANY($1) AND NOT (id = ANY($2))
         "#,
     )
     .bind(&template_ids)
     .bind(&request_ids)
-    .fetch_one(&mut *tx)
+    .fetch_all(&mut *tx)
     .await
     .map_err(database_failure)?;
-    if outside_template_references != 0 {
-        return Err(incomplete_graph());
-    }
+    let mut owned_template_ids: Vec<Uuid> = templates
+        .iter()
+        .filter(|template| {
+            template.file_id.is_none() && !externally_referenced.contains(&template.id)
+        })
+        .map(|template| template.id)
+        .collect();
+    owned_template_ids.sort_unstable();
 
     let mut max_retention_seconds = 0_u64;
     let mut delete_on = None;
@@ -4154,12 +4163,12 @@ async fn move_graph<P: PoolProvider>(
     }
     let deleted_templates =
         sqlx::query("DELETE FROM request_templates WHERE id = ANY($1) AND file_id IS NULL")
-            .bind(&template_ids)
+            .bind(&owned_template_ids)
             .execute(&mut *tx)
             .await
             .map_err(database_failure)?
             .rows_affected();
-    if deleted_templates != template_ids.len() as u64 {
+    if deleted_templates != owned_template_ids.len() as u64 {
         return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
     }
 
@@ -4173,7 +4182,7 @@ async fn move_graph<P: PoolProvider>(
     )
     .bind(&request_ids)
     .bind(&revalidated_step_ids)
-    .bind(&template_ids)
+    .bind(&owned_template_ids)
     .fetch_one(&mut *tx)
     .await
     .map_err(database_failure)?;
@@ -4184,7 +4193,7 @@ async fn move_graph<P: PoolProvider>(
     Ok(MoveGraphOutcome::Archived {
         requests: request_ids.len() as u64,
         steps: revalidated_step_ids.len() as u64,
-        templates: template_ids.len() as u64,
+        templates: owned_template_ids.len() as u64,
         bytes: payload_bytes,
     })
 }
@@ -4431,7 +4440,7 @@ async fn archive_batchless_responses<P: PoolProvider>(
     };
     for candidate in candidates {
         let remaining_bytes = (max_bytes as u64).saturating_sub(outcome.bytes_archived);
-        match move_graph(
+        let moved = match move_graph(
             manager,
             candidate,
             policy,
@@ -4439,8 +4448,23 @@ async fn archive_batchless_responses<P: PoolProvider>(
             remaining_bytes,
             outcome.groups_archived == 0,
         )
-        .await?
+        .await
         {
+            Ok(moved) => moved,
+            Err(error)
+                if RetainedResponseMaintenanceError::from_fusillade_error(&error)
+                    == Some(RetainedResponseMaintenanceError::IncompleteGraph) =>
+            {
+                // Left live for a human to look at; the pass carries on so
+                // one malformed graph at the head of the queue cannot stall
+                // the worker forever.
+                outcome.incomplete_skipped += 1;
+                outcome.may_have_more = true;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        match moved {
             MoveGraphOutcome::Archived {
                 requests,
                 steps,

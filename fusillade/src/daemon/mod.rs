@@ -961,6 +961,15 @@ async fn run_batchless_archive_phase<S>(
                 .increment(outcome.bytes_archived);
             gauge!("fusillade_retained_response_archive_may_have_more", "worker" => tick.worker)
                 .set(u8::from(outcome.may_have_more) as f64);
+            if outcome.incomplete_skipped > 0 {
+                counter!("fusillade_retained_response_graphs_incomplete_skipped_total", "worker" => tick.worker)
+                    .increment(outcome.incomplete_skipped);
+                tracing::warn!(
+                    worker = tick.worker,
+                    skipped = outcome.incomplete_skipped,
+                    "Left incomplete retained-response graphs live; they need operator attention"
+                );
+            }
             histogram!("fusillade_retained_response_archive_duration_seconds", "worker" => tick.worker)
                 .record(started.elapsed().as_secs_f64());
             if outcome.groups_archived > 0 || outcome.skipped_locked {

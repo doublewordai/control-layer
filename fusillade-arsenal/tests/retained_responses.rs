@@ -3395,19 +3395,19 @@ async fn nonhead_parent_cascade_edge_fails_closed_without_deleting_any_member(po
     graph.step_ids.sort_unstable();
     let manager = manager(&pool).await;
 
-    let error = archive(
+    let outcome = archive(
         &manager,
         &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
         1,
         i64::MAX,
     )
     .await
-    .expect_err("a transitive non-head parent edge must fail closed");
-
+    .expect("a transitive non-head parent edge must fail closed");
     assert_eq!(
-        RetainedResponseMaintenanceError::from_fusillade_error(&error),
-        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+        outcome.incomplete_skipped, 1,
+        "a transitive non-head parent edge must fail closed"
     );
+    assert_eq!(outcome.groups_archived, 0);
     assert_wholly_live(&pool, &graph).await;
 }
 
@@ -3469,19 +3469,19 @@ async fn cross_head_predecessor_cascade_edge_fails_closed_without_deleting_any_m
     graph.step_ids.sort_unstable();
     let manager = manager(&pool).await;
 
-    let error = archive(
+    let outcome = archive(
         &manager,
         &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
         1,
         i64::MAX,
     )
     .await
-    .expect_err("a predecessor edge crossing response heads must fail closed");
-
+    .expect("a predecessor edge crossing response heads must fail closed");
     assert_eq!(
-        RetainedResponseMaintenanceError::from_fusillade_error(&error),
-        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+        outcome.incomplete_skipped, 1,
+        "a predecessor edge crossing response heads must fail closed"
     );
+    assert_eq!(outcome.groups_archived, 0);
     assert_wholly_live(&pool, &graph).await;
 }
 
@@ -3561,14 +3561,15 @@ async fn partially_deleted_discovered_graph_never_returns_already_gone(pool: PgP
         .expect("the selected head request must delete after discovery");
     drop(held_connection);
 
-    let error = mover
+    let outcome = mover
         .await
         .expect("mover task must finish")
-        .expect_err("a partially remaining discovered graph must fail closed");
+        .expect("a partially remaining discovered graph must fail closed");
     assert_eq!(
-        RetainedResponseMaintenanceError::from_fusillade_error(&error),
-        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+        outcome.incomplete_skipped, 1,
+        "a partially remaining discovered graph must fail closed"
     );
+    assert_eq!(outcome.groups_archived, 0);
 
     assert_eq!(count_ids(&pool, "requests", &[head_request_id]).await, 0);
     assert_eq!(
@@ -3623,14 +3624,15 @@ async fn deleting_head_between_seed_and_topology_discovery_never_returns_already
         .expect("the selected head request must delete before topology expansion");
     drop(held_connection);
 
-    let error = mover
+    let outcome = mover
         .await
         .expect("mover task must finish")
-        .expect_err("a partially remaining discovery snapshot must fail closed");
+        .expect("a partially remaining discovery snapshot must fail closed");
     assert_eq!(
-        RetainedResponseMaintenanceError::from_fusillade_error(&error),
-        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+        outcome.incomplete_skipped, 1,
+        "a partially remaining discovery snapshot must fail closed"
     );
+    assert_eq!(outcome.groups_archived, 0);
 
     assert_eq!(count_ids(&pool, "requests", &[head_request_id]).await, 0);
     assert_eq!(
@@ -3976,19 +3978,19 @@ async fn nonterminal_member_fails_the_complete_graph_and_rolls_back(pool: PgPool
     let graph = branching_graph(&pool, TerminalState::Pending).await;
     let manager = manager(&pool).await;
 
-    let error = archive(
+    let outcome = archive(
         &manager,
         &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
         1,
         i64::MAX,
     )
     .await
-    .expect_err("a graph with one live member must fail closed");
-
+    .expect("a graph with one live member must fail closed");
     assert_eq!(
-        RetainedResponseMaintenanceError::from_fusillade_error(&error),
-        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+        outcome.incomplete_skipped, 1,
+        "a graph with one live member must fail closed"
     );
+    assert_eq!(outcome.groups_archived, 0);
     assert_wholly_live(&pool, &graph).await;
 }
 
@@ -4001,19 +4003,19 @@ async fn pending_request_with_terminal_step_fails_closed(pool: PgPool) {
             .await;
     let manager = manager(&pool).await;
 
-    let error = archive(
+    let outcome = archive(
         &manager,
         &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
         1,
         i64::MAX,
     )
     .await
-    .expect_err("a pending request must fail even when its step is terminal");
-
+    .expect("a pending request must fail even when its step is terminal");
     assert_eq!(
-        RetainedResponseMaintenanceError::from_fusillade_error(&error),
-        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+        outcome.incomplete_skipped, 1,
+        "a pending request must fail even when its step is terminal"
     );
+    assert_eq!(outcome.groups_archived, 0);
     assert_wholly_live(&pool, &graph).await;
 }
 
@@ -4026,19 +4028,19 @@ async fn terminal_request_with_pending_step_fails_closed(pool: PgPool) {
             .await;
     let manager = manager(&pool).await;
 
-    let error = archive(
+    let outcome = archive(
         &manager,
         &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
         1,
         i64::MAX,
     )
     .await
-    .expect_err("a pending step must fail even when its request is terminal");
-
+    .expect("a pending step must fail even when its request is terminal");
     assert_eq!(
-        RetainedResponseMaintenanceError::from_fusillade_error(&error),
-        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+        outcome.incomplete_skipped, 1,
+        "a pending step must fail even when its request is terminal"
     );
+    assert_eq!(outcome.groups_archived, 0);
     assert_wholly_live(&pool, &graph).await;
 }
 
@@ -4059,59 +4061,20 @@ async fn shared_template_fails_closed_with_every_reference_live(pool: PgPool) {
     assert_eq!(updated, 1, "fixture must create one shared template");
     let manager = manager(&pool).await;
 
-    let error = archive(
+    let outcome = archive(
         &manager,
         &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
         1,
         i64::MAX,
     )
     .await
-    .expect_err("a template shared inside the graph must not be moved or deleted");
-
+    .expect("a template shared inside the graph must not be moved or deleted");
     assert_eq!(
-        RetainedResponseMaintenanceError::from_fusillade_error(&error),
-        Some(RetainedResponseMaintenanceError::IncompleteGraph)
+        outcome.incomplete_skipped, 1,
+        "a template shared inside the graph must not be moved or deleted"
     );
+    assert_eq!(outcome.groups_archived, 0);
     assert_wholly_live(&pool, &graph).await;
-}
-
-#[sqlx::test]
-async fn file_backed_template_fails_closed_with_the_file_reference_live(pool: PgPool) {
-    install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-03")).await;
-    let graph = singleton(
-        &pool,
-        "flex",
-        TerminalState::Completed,
-        timestamp("2026-08-01T10:00:00Z"),
-        "file-backed-template",
-    )
-    .await;
-    let file_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO files (id, name) VALUES ($1, $2)")
-        .bind(file_id)
-        .bind("retention-file-backed-template.jsonl")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE request_templates SET file_id = $1 WHERE id = $2")
-        .bind(file_id)
-        .bind(graph.template_ids[0])
-        .execute(&pool)
-        .await
-        .unwrap();
-    let manager = manager(&pool).await;
-
-    let error = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
-        .await
-        .expect_err("a file-backed template must not be moved or deleted");
-
-    assert_eq!(
-        RetainedResponseMaintenanceError::from_fusillade_error(&error),
-        Some(RetainedResponseMaintenanceError::IncompleteGraph)
-    );
-    assert_wholly_live(&pool, &graph).await;
-    assert_eq!(count_ids(&pool, "files", &[file_id]).await, 1);
 }
 
 #[sqlx::test]
@@ -6293,4 +6256,125 @@ async fn overdue_graph_moves_into_the_next_day_instead_of_deferring(pool: PgPool
         landed_on, next_day,
         "overdue content lands on the day after observation, never a droppable day"
     );
+}
+
+/// A batchless request whose template belongs to a file: the shape of the
+/// oldest legacy batchless traffic. The response content moves; the file's
+/// template row is shared input content and must survive untouched.
+async fn file_owned_singleton(
+    pool: &PgPool,
+    terminal_at: DateTime<Utc>,
+    suffix: &str,
+) -> (LiveGraph, Uuid) {
+    let graph = singleton(pool, "flex", TerminalState::Completed, terminal_at, suffix).await;
+    let file_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO files (name, size_bytes, size_finalized, status, purpose) \
+         VALUES ('legacy-' || gen_random_uuid(), 0, TRUE, 'processed', 'batch') RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    let template_id: Uuid = sqlx::query_scalar("SELECT template_id FROM requests WHERE id = $1")
+        .bind(graph.request_ids[0])
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE request_templates SET file_id = $2 WHERE id = $1")
+        .bind(template_id)
+        .bind(file_id)
+        .execute(pool)
+        .await
+        .unwrap();
+    (graph, template_id)
+}
+
+#[sqlx::test]
+async fn a_file_owned_template_graph_moves_and_leaves_the_template_in_place(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let (graph, template_id) =
+        file_owned_singleton(&pool, timestamp("2026-08-01T08:00:00Z"), "file-owned").await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let manager = manager(&pool).await;
+
+    let outcome = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.groups_archived, 1, "the response content must move");
+    assert_eq!(
+        outcome.templates_archived, 0,
+        "a shared template is never counted as moved"
+    );
+    assert_eq!(outcome.incomplete_skipped, 0);
+    assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
+    assert_eq!(
+        retained_counts(&pool, graph.group_id).await,
+        (1, graph.request_ids.len() as i64, 0)
+    );
+    let template_survives: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM request_templates WHERE id = $1)")
+            .bind(template_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(
+        template_survives,
+        "the file's template row must not be deleted with the graph"
+    );
+    let carries_template: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM retained_response_objects \
+         WHERE group_id = $1 AND object_kind = 'request' \
+           AND payload::text LIKE '%fixture-file-owned%')",
+    )
+    .bind(graph.group_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        carries_template,
+        "the retained record must stay self-describing"
+    );
+}
+
+#[sqlx::test]
+async fn an_incomplete_graph_is_skipped_and_the_next_graph_still_moves(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let broken = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T08:00:00Z"),
+        "broken",
+    )
+    .await;
+    sqlx::query("UPDATE requests SET template_id = NULL WHERE id = $1")
+        .bind(broken.request_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    let next = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T09:00:00Z"),
+        "after-broken",
+    )
+    .await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let manager = manager(&pool).await;
+
+    let outcome = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome.incomplete_skipped, 1,
+        "the broken graph is counted, not fatal"
+    );
+    assert_eq!(
+        outcome.groups_archived, 1,
+        "a broken head must not stall the pass"
+    );
+    assert_wholly_live(&pool, &broken).await;
+    assert_wholly_retained(&pool, &next).await;
 }

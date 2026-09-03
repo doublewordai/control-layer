@@ -272,6 +272,11 @@ pub struct RetainedResponseArchiveOutcome {
     pub bytes_archived: u64,
     pub skipped_locked: bool,
     pub may_have_more: bool,
+    /// Graphs whose live rows could not be assembled into a complete,
+    /// self-describing retained record and were left live for this pass
+    /// (counted, never fatal, so one malformed legacy graph at the head of
+    /// the queue cannot stall the worker).
+    pub incomplete_skipped: u64,
 }
 
 /// Content-free result of ensuring the complete retained-response partition
@@ -1668,9 +1673,11 @@ pub trait DaemonStorage: Send + Sync {
     /// Each graph must be verified complete, then moved in one atomic commit;
     /// every count in [`RetainedResponseArchiveOutcome`] must describe only
     /// fully committed graphs. If a graph is partial (a required request,
-    /// response step, or template is absent), implementations must return
-    /// [`RetainedResponseMaintenanceError::IncompleteGraph`] and
-    /// leave that entire graph live. Completed earlier groups may remain
+    /// response step, or template is absent), implementations must leave
+    /// that entire graph live, count it in
+    /// [`RetainedResponseArchiveOutcome::incomplete_skipped`], and carry on
+    /// with the next graph — a malformed graph is reported, never fatal, so
+    /// it cannot stall the worker. Completed earlier groups may remain
     /// committed, so callers retry idempotently. Storage backends opt in
     /// explicitly; the default is disabled.
     ///
