@@ -50,8 +50,20 @@ pub const RESIZE_SETTLE: Duration = Duration::from_secs(20);
 const REGISTRY_GC_AFTER: Duration = Duration::from_secs(600);
 
 /// Equal division of `total` across `live_replicas`, floor 1.
+///
+/// The floor keeps a pod runnable, but it is the one place the budget can be
+/// exceeded: `live_replicas` pods with `total < live_replicas` hold
+/// `live_replicas` connections. [`share_is_floored`] flags that case so the
+/// governor can log and export it; the autoscaler's `maxReplicas` must stay
+/// at or below every governed pool's total.
 pub fn share(total: u32, live_replicas: u32) -> u32 {
     (total / live_replicas.max(1)).max(1)
+}
+
+/// True when [`share`] had to fall back to its floor, i.e. the group has more
+/// live replicas than `total` connections and the aggregate is over budget.
+pub fn share_is_floored(total: u32, live_replicas: u32) -> bool {
+    live_replicas.max(1) > total
 }
 
 /// The pool size this pod should run: its share of the total when one is
@@ -217,6 +229,28 @@ fn record_share(name: &'static str, max: u32) {
     metrics::gauge!("dwctl_db_pool_share", "pool" => name).set(max as f64);
 }
 
+/// Export (and log) whether `gp`'s share is pinned at the floor for `live`
+/// replicas: the only condition under which the group exceeds its budget.
+fn record_floor(gp: &GovernedPool, live: u32) {
+    let mut floored = false;
+    if let Some(total) = gp.primary.0.total_max_connections {
+        floored |= share_is_floored(total, live);
+    }
+    if let Some((settings, _)) = &gp.replica
+        && let Some(total) = settings.total_max_connections
+    {
+        floored |= share_is_floored(total, live);
+    }
+    metrics::gauge!("dwctl_db_pool_share_floored", "pool" => gp.name).set(if floored { 1.0 } else { 0.0 });
+    if floored {
+        warn!(
+            pool = gp.name,
+            replicas = live,
+            "more live replicas than total_max_connections: every pod holds 1 connection and the group is OVER BUDGET; lower the autoscaler's maxReplicas or raise the total"
+        );
+    }
+}
+
 /// Rebuild `gp` at the share for `live` replicas if that differs from what it
 /// runs now. The old pools are drained in the background: `close()` shuts idle
 /// connections immediately and checked-out ones as they are returned, so
@@ -236,6 +270,7 @@ fn apply_share(gp: &GovernedPool, live: u32) {
         .map(|((settings, opts), max)| pool_options(settings, max).connect_lazy_with(opts.clone()));
     let (old_primary, old_replica) = gp.target.replace(new_primary, new_replica);
     record_share(gp.name, new_primary_max);
+    record_floor(gp, live);
     info!(
         pool = gp.name,
         from = current_primary,
@@ -257,6 +292,7 @@ fn apply_share(gp: &GovernedPool, live: u32) {
 pub async fn run_governor(pools: Vec<GovernedPool>, mut count_rx: watch::Receiver<u32>, settle: Duration, shutdown: CancellationToken) {
     for gp in &pools {
         record_share(gp.name, gp.current_primary_max());
+        record_floor(gp, *count_rx.borrow());
     }
     loop {
         tokio::select! {
@@ -301,6 +337,14 @@ mod tests {
         assert_eq!(share(1000, 3), 333);
         assert_eq!(share(10, 0), 10, "zero live replicas is treated as one");
         assert_eq!(share(1, 4), 1, "never below one connection");
+    }
+
+    #[test]
+    fn share_is_floored_only_when_replicas_exceed_total() {
+        assert!(!share_is_floored(800, 4));
+        assert!(!share_is_floored(4, 4), "exactly one connection each is still within budget");
+        assert!(share_is_floored(3, 4));
+        assert!(!share_is_floored(1, 0), "zero live replicas counts as one");
     }
 
     #[test]
