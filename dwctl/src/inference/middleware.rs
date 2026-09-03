@@ -35,7 +35,8 @@ use sqlx_pool_router::PoolProvider;
 
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
-use super::streaming::{ReplayFrame, flex_stream_response};
+use super::streaming::{LiveRelayConfig, ReplayFrame, flex_stream_response};
+use super::translation::responses::types::ResponsesRequest;
 use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::image_normalizer::ImageNormalizer;
 
@@ -72,6 +73,10 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     pub flex_completion_window: String,
     /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR.
     pub keystore: Option<crate::keystore::Keystore>,
+    /// `None` disables live streaming. See `crate::chunk_relay`.
+    pub chunk_relay: Option<crate::chunk_relay::ChunkRelay>,
+    /// Correctness fallback interval once live streaming is active.
+    pub flex_poll_fallback_interval_ms: u64,
     /// Per-key ZDR policy map (api key secret to the owning account's
     /// `zero_data_retention` flag), kept fresh by [`crate::sync::zdr_keys`].
     /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
@@ -476,6 +481,14 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // the completed object instead, so it's chat-only.
             let flex_stream_include_usage =
                 flex_stream && is_chat_completions_api && request_value["stream_options"]["include_usage"].as_bool().unwrap_or(false);
+            // Captured before the strip below and before ZDR encryption, since
+            // the daemon-bound body isn't guaranteed to stay plaintext JSON.
+            // Seeds the live relay's per-chunk reframe (`LiveRelayConfig::responses_reframe`).
+            let responses_request_for_live_relay = if flex_stream && is_responses_api {
+                serde_json::from_value::<ResponsesRequest>(request_value.clone()).ok()
+            } else {
+                None
+            };
             if flex_stream && let Some(obj) = request_value.as_object_mut() {
                 obj.remove("stream");
                 obj.remove("stream_options");
@@ -571,7 +584,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 (true, true) => handle_chat_completion_flex_streaming(&state, flex_input, request_id, flex_stream_include_usage).await,
                 (true, false) => handle_chat_completion_flex(&state, flex_input, request_id).await,
                 // Responses (embeddings flex was downgraded to realtime above).
-                (false, true) => handle_responses_flex_streaming(&state, flex_input, request_id).await,
+                (false, true) => handle_responses_flex_streaming(&state, flex_input, request_id, responses_request_for_live_relay).await,
                 (false, false) => handle_flex(&state, flex_input, &resp_id, model, background).await,
             }
         }
@@ -1031,12 +1044,19 @@ async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + 
     request_id: uuid::Uuid,
     include_usage: bool,
 ) -> Response {
+    let live_relay = state.chunk_relay.clone().map(|relay| LiveRelayConfig {
+        relay,
+        poll_fallback_interval: std::time::Duration::from_millis(state.flex_poll_fallback_interval_ms),
+        responses_reframe: None,
+    });
+
     flex_stream_response(
         state.request_manager.clone(),
         flex_input,
         request_id,
         true,
         state.keystore.clone(),
+        live_relay,
         move |result| match result {
             Ok(detail) => {
                 let (status, body) = response_store::detail_to_chat_completion_object(detail);
@@ -1072,13 +1092,26 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
     state: &InferenceMiddlewareState<P>,
     flex_input: fusillade::CreateFlexInput,
     request_id: uuid::Uuid,
+    responses_request_for_live_relay: Option<ResponsesRequest>,
 ) -> Response {
+    // No live relay if the request failed to re-parse (shouldn't happen —
+    // it was already validated) rather than falling back to raw passthrough.
+    let live_relay = match (state.chunk_relay.clone(), responses_request_for_live_relay) {
+        (Some(relay), Some(req)) => Some(LiveRelayConfig {
+            relay,
+            poll_fallback_interval: std::time::Duration::from_millis(state.flex_poll_fallback_interval_ms),
+            responses_reframe: Some((req, request_id.to_string())),
+        }),
+        _ => None,
+    };
+
     flex_stream_response(
         state.request_manager.clone(),
         flex_input,
         request_id,
         false,
         state.keystore.clone(),
+        live_relay,
         move |result| match result {
             Ok(detail) => {
                 let response = response_store::detail_to_response_object(detail);

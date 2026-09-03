@@ -509,6 +509,15 @@ fn state_to_status(state: &str) -> &'static str {
     }
 }
 
+/// Extract the `response` field from the last event in a raw SSE event
+/// sequence (`event: X\ndata: {...}\n\n` blocks). The last event is always
+/// `response.completed`/`.failed`, which carries the full object.
+fn last_sse_event_response(sse_text: &str) -> Option<serde_json::Value> {
+    let last_block = sse_text.split("\n\n").filter(|b| !b.trim().is_empty()).last()?;
+    let data_line = last_block.lines().find_map(|line| line.strip_prefix("data: "))?;
+    serde_json::from_str::<serde_json::Value>(data_line).ok()?.get("response").cloned()
+}
+
 /// Convert a `RequestDetail` into an Open Responses API Response object.
 pub fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_json::Value {
     let status = state_to_status(&detail.status);
@@ -561,22 +570,32 @@ pub fn detail_to_response_object(detail: &fusillade::RequestDetail) -> serde_jso
                 "code": response_status,
                 "message": message,
             });
-        } else if let Some(ref body) = detail.response_body
-            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body)
-        {
-            if let Some(output) = parsed.get("output") {
-                resp["output"] = output.clone();
-            }
-            if let Some(usage) = parsed.get("usage") {
-                resp["usage"] = usage.clone();
-            }
-            // ChatCompletion format (batch results)
-            if parsed.get("choices").is_some() {
-                resp["output"] = serde_json::json!([{
-                    "type": "message",
-                    "role": "assistant",
-                    "content": parsed
-                }]);
+        } else if let Some(ref body) = detail.response_body {
+            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(body) {
+                if let Some(output) = parsed.get("output") {
+                    resp["output"] = output.clone();
+                }
+                if let Some(usage) = parsed.get("usage") {
+                    resp["usage"] = usage.clone();
+                }
+                // ChatCompletion format (batch results)
+                if parsed.get("choices").is_some() {
+                    resp["output"] = serde_json::json!([{
+                        "type": "message",
+                        "role": "assistant",
+                        "content": parsed
+                    }]);
+                }
+            } else if let Some(final_response) = last_sse_event_response(body) {
+                // Responses-surface reassembly stores the raw SSE event
+                // sequence (translated upstream of persist), not a plain
+                // JSON body. The last event carries the full object.
+                if let Some(output) = final_response.get("output") {
+                    resp["output"] = output.clone();
+                }
+                if let Some(usage) = final_response.get("usage") {
+                    resp["usage"] = usage.clone();
+                }
             }
         }
         resp["completed_at"] = serde_json::json!(detail.completed_at.map(|t| t.timestamp()));

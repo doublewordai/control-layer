@@ -2617,6 +2617,7 @@ mod tests {
             clickhouse: None,
             continuation: Default::default(),
             keystore: None,
+            flex_live_streaming: Default::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 

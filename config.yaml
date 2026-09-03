@@ -312,6 +312,21 @@ keystore:
  wrap_keys:
    dev-1: "local-dev-wrap-key-not-a-secret"
 
+# Flex live-streaming (prototype, default off): relays real per-token deltas
+# over Redis Streams instead of poll-and-replay. Absent/enabled:false leaves
+# today's flex streaming unchanged.
+#
+# Local dev: run `just redis-start`, then uncomment the block below.
+# flex_live_streaming:
+#   enabled: false
+#   chunk_relay:
+#     redis_url: "redis://localhost:6379"
+#     stream_ttl_secs: 600
+#     maxlen: 2000
+#     publish_channel_capacity: 1024
+#     reader_poll_interval_ms: 75
+#   poll_fallback_interval_ms: 5000
+
 # Batches API configuration
 batches:
   # Enable batches API endpoints (/files, /batches)
