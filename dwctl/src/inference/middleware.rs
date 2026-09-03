@@ -36,6 +36,7 @@ use sqlx_pool_router::PoolProvider;
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{LiveRelayConfig, ReplayFrame, flex_stream_response};
+use super::translation::responses::types::ResponsesRequest;
 use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::image_normalizer::ImageNormalizer;
 
@@ -480,6 +481,16 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // the completed object instead, so it's chat-only.
             let flex_stream_include_usage =
                 flex_stream && is_chat_completions_api && request_value["stream_options"]["include_usage"].as_bool().unwrap_or(false);
+            // Captured before the `stream`/`stream_options` strip below, and
+            // before ZDR encryption replaces the plaintext body: this is what
+            // seeds the live relay's per-chunk reframing into `response.*`
+            // events (see `LiveRelayConfig::responses_reframe`), since the
+            // daemon-bound body is not guaranteed to still be plaintext JSON.
+            let responses_request_for_live_relay = if flex_stream && is_responses_api {
+                serde_json::from_value::<ResponsesRequest>(request_value.clone()).ok()
+            } else {
+                None
+            };
             if flex_stream && let Some(obj) = request_value.as_object_mut() {
                 obj.remove("stream");
                 obj.remove("stream_options");
@@ -575,7 +586,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 (true, true) => handle_chat_completion_flex_streaming(&state, flex_input, request_id, flex_stream_include_usage).await,
                 (true, false) => handle_chat_completion_flex(&state, flex_input, request_id).await,
                 // Responses (embeddings flex was downgraded to realtime above).
-                (false, true) => handle_responses_flex_streaming(&state, flex_input, request_id).await,
+                (false, true) => handle_responses_flex_streaming(&state, flex_input, request_id, responses_request_for_live_relay).await,
                 (false, false) => handle_flex(&state, flex_input, &resp_id, model, background).await,
             }
         }
@@ -1035,10 +1046,10 @@ async fn handle_chat_completion_flex_streaming<P: PoolProvider + Clone + Send + 
     request_id: uuid::Uuid,
     include_usage: bool,
 ) -> Response {
-    // Chat-completions only for now; Responses stays on poll-and-replay.
     let live_relay = state.chunk_relay.clone().map(|relay| LiveRelayConfig {
         relay,
         poll_fallback_interval: std::time::Duration::from_millis(state.flex_poll_fallback_interval_ms),
+        responses_reframe: None,
     });
 
     flex_stream_response(
@@ -1083,14 +1094,27 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
     state: &InferenceMiddlewareState<P>,
     flex_input: fusillade::CreateFlexInput,
     request_id: uuid::Uuid,
+    responses_request_for_live_relay: Option<ResponsesRequest>,
 ) -> Response {
+    // No live relay at all when the request failed to re-parse (should not
+    // happen — it was already validated on the way in), rather than falling
+    // back to unreframed chat-completions-shaped passthrough.
+    let live_relay = match (state.chunk_relay.clone(), responses_request_for_live_relay) {
+        (Some(relay), Some(req)) => Some(LiveRelayConfig {
+            relay,
+            poll_fallback_interval: std::time::Duration::from_millis(state.flex_poll_fallback_interval_ms),
+            responses_reframe: Some((req, request_id.to_string())),
+        }),
+        _ => None,
+    };
+
     flex_stream_response(
         state.request_manager.clone(),
         flex_input,
         request_id,
         false,
         state.keystore.clone(),
-        None, // live relay not wired to Responses yet
+        live_relay,
         move |result| match result {
             Ok(detail) => {
                 let response = response_store::detail_to_response_object(detail);

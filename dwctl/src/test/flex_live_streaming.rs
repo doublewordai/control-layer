@@ -114,7 +114,7 @@ async fn setup_flex_fixture(pool: &PgPool, live_streaming_enabled: bool) -> Flex
         enabled: DaemonEnabled::Always,
         claim_interval_ms: 50,
         max_retries: Some(0),
-        streamable_endpoints: vec!["/v1/chat/completions".to_string()],
+        streamable_endpoints: vec!["/v1/chat/completions".to_string(), "/v1/responses".to_string()],
         ..Default::default()
     };
     config.flex_live_streaming = FlexLiveStreamingConfig {
@@ -310,6 +310,68 @@ async fn flex_streaming_without_live_relay_still_replays_the_mega_delta(pool: Pg
 
     assert_eq!(response.status_code().as_u16(), 200);
     let deltas = parse_sse_content_deltas(&response.text());
+    assert_eq!(deltas, vec!["Hello world".to_string()], "flag off must behave exactly as before");
+
+    fixture.bg_services.shutdown().await;
+}
+
+async fn send_flex_responses_streaming_request(fixture: &FlexFixture) -> axum_test::TestResponse {
+    fixture
+        .server
+        .post("/ai/v1/responses")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .json(&serde_json::json!({
+            "model": "flex-live-alias",
+            "input": "Hello from flex live-streaming E2E",
+            "stream": true,
+            "service_tier": "flex"
+        }))
+        .await
+}
+
+// Keyed off the JSON payload's own "type" field, not the SSE "event:" line,
+// since axum emits fields in call order (data before event here) rather
+// than a fixed order.
+fn parse_response_output_text_deltas(text: &str) -> Vec<String> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|data| serde_json::from_str::<serde_json::Value>(data).ok())
+        .filter(|v| v["type"] == "response.output_text.delta")
+        .filter_map(|v| v["delta"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Same proof as the chat-completions test, on the Responses surface: real
+/// per-chunk `response.output_text.delta` events, not one delta replaying
+/// the whole answer.
+#[sqlx::test]
+#[test_log::test]
+async fn flex_live_streaming_delivers_real_incremental_response_deltas(pool: PgPool) {
+    let fixture = setup_flex_fixture(&pool, true).await;
+
+    let response = send_flex_responses_streaming_request(&fixture).await;
+
+    assert_eq!(response.status_code().as_u16(), 200);
+    let deltas = parse_response_output_text_deltas(&response.text());
+    assert_eq!(
+        deltas,
+        vec!["Hello".to_string(), " world".to_string()],
+        "expected the upstream's own per-chunk deltas on the Responses surface too"
+    );
+
+    fixture.bg_services.shutdown().await;
+}
+
+/// Control for the Responses surface: same mock, live streaming off.
+#[sqlx::test]
+#[test_log::test]
+async fn flex_responses_streaming_without_live_relay_still_replays_the_mega_delta(pool: PgPool) {
+    let fixture = setup_flex_fixture(&pool, false).await;
+
+    let response = send_flex_responses_streaming_request(&fixture).await;
+
+    assert_eq!(response.status_code().as_u16(), 200);
+    let deltas = parse_response_output_text_deltas(&response.text());
     assert_eq!(deltas, vec!["Hello world".to_string()], "flag off must behave exactly as before");
 
     fixture.bg_services.shutdown().await;
