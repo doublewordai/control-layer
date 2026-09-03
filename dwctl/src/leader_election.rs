@@ -198,8 +198,16 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
 
+    /// Real-time deadline for the polling loops below. The tokio clock is
+    /// paused, so each iteration advances virtual time by a millisecond; a
+    /// fixed iteration count bounds *virtual* time only, and the database
+    /// round-trips these loops wait on take real time (a loaded CI runner
+    /// blew through 1,000 iterations before the unlock landed).
+    const REAL_TIME_DEADLINE: Duration = Duration::from_secs(60);
+
     async fn wait_until(mut predicate: impl FnMut() -> bool) {
-        for _ in 0..1_000 {
+        let deadline = std::time::Instant::now() + REAL_TIME_DEADLINE;
+        while std::time::Instant::now() < deadline {
             if predicate() {
                 return;
             }
@@ -262,7 +270,8 @@ mod tests {
         // finishes, so poll for the release instead of asserting on the first
         // observation.
         let mut acquired = false;
-        for _ in 0..1_000 {
+        let deadline = std::time::Instant::now() + REAL_TIME_DEADLINE;
+        while std::time::Instant::now() < deadline {
             acquired = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock($1)")
                 .bind(lock_id)
                 .fetch_one(&mut *contender)

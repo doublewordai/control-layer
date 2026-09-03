@@ -646,6 +646,66 @@ async fn complete_response_does_not_ignore_an_unproven_synthetic_create_error(po
 
 #[sqlx::test]
 #[test_log::test]
+async fn a_chain_can_extend_a_response_after_its_graph_moved_to_the_retained_store(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+    server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({"model": "gpt-4o", "input": "first turn", "service_tier": "priority"}))
+        .await
+        .assert_status_ok();
+    let id = poll_completed_row(&pool, uuid::Uuid::nil()).await;
+    sqlx::query(
+        "UPDATE fusillade.requests SET created_at = '2026-08-01 08:00:00Z', claimed_at = '2026-08-01 09:58:00Z', started_at = '2026-08-01 09:59:00Z', completed_at = '2026-08-01 10:00:00Z', updated_at = '2026-08-01 10:00:00Z' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Extension works while the first turn is live...
+    server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "second turn while live",
+            "previous_response_id": format!("resp_{id}"),
+            "service_tier": "priority"
+        }))
+        .await
+        .assert_status_ok();
+    // ...and must keep working once its graph has moved to the retained store.
+    archive_response_graphs(&pool, 1).await;
+    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fusillade.requests WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(live, 0, "the first turn must have moved to the retained store");
+
+    let extended = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "second turn",
+            "previous_response_id": format!("resp_{id}"),
+            "service_tier": "priority"
+        }))
+        .await;
+    extended.assert_status_ok();
+    let extended_json: serde_json::Value = extended.json();
+    assert_eq!(extended_json["previous_response_id"], format!("resp_{id}"));
+    assert_ne!(extended_json["id"], format!("resp_{id}"));
+}
+
+#[sqlx::test]
+#[test_log::test]
 async fn read_retained_singleton_preserves_response_and_fails_closed_after_drop(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
     mount_chat_completions_mock(&mock_server).await;
