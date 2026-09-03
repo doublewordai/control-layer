@@ -1,39 +1,26 @@
 //! Outbound request preparation, and the matching response-side reassembly.
 //!
-//! On the way to onwards this injects the streaming usage flags, so the upstream
-//! reports token usage we can bill from:
+//! On the way to onwards, injects streaming usage flags so the upstream
+//! reports token usage to bill from: `stream_options.include_usage = true`
+//! for `/chat/completions`/`/completions` streaming requests, and forces
+//! `stream: true` on batch traffic to a configured path.
 //!
-//! - for `/chat/completions` and legacy `/completions`, set
-//!   `stream_options.include_usage = true` on streaming requests (so the provider
-//!   emits a usage frame in the final SSE chunk), and force `stream: true` on
-//!   batch traffic to a configured path.
+//! On the way back, a forced request's response is read as SSE and
+//! reassembled into one non-streaming body. See [`should_force_stream`] for
+//! how the daemon's own traffic is recognised.
 //!
-//! On the way back, the response to a request this forced is read as SSE and
-//! reassembled into a single non-streaming body. Both halves of that
-//! transformation therefore live here, and the daemon that dispatches the request
-//! is not party to either: see [`should_force_stream`] for how its traffic is
-//! recognised.
-//!
-//! This was dwctl's `stream_usage_transform`, previously wired through onwards'
-//! `BodyTransformFn` hook. It deliberately does NOT scrub caller id fields: the
-//! inference middleware already strips those in the single parse-and-shape it does
-//! at the edge (`scrub_request_id_fields`, ported from onwards #240), so the body
-//! that reaches this layer is already scrubbed - a second scrub here would be a
-//! no-op duplicate.
+//! This was dwctl's `stream_usage_transform`, previously wired through
+//! onwards' `BodyTransformFn` hook. It does not scrub caller id fields — the
+//! inference middleware already does that in its single parse-and-shape at
+//! the edge, so a second scrub here would be a no-op duplicate.
 //!
 //! # Placement
 //!
-//! Innermost dwctl layer: inner to the cache layer (which must hash the original
-//! body) and running last before onwards.
-//!
-//! That position is load-bearing for the response half rather than incidental.
-//! Request logging is applied outer to this layer, so with the reassembly here it
-//! sees one complete body; with the reassembly anywhere outer to request logging
-//! it would see the event stream instead and retain every frame for the life of
-//! the request. A streaming response carries far more bytes on the wire than the
-//! body it assembles to, because each frame is a full JSON envelope around a few
-//! bytes of token delta, so that difference is a large multiplier on per-request
-//! memory rather than a small one.
+//! Innermost dwctl layer, running last before onwards, and inner to request
+//! logging — load-bearing for the response half: reassembling here means
+//! logging sees one complete body instead of the raw event stream, which
+//! can carry far more bytes on the wire than the body it assembles to
+//! (each frame is a full JSON envelope around a few bytes of delta).
 
 use std::time::Duration;
 
@@ -48,10 +35,8 @@ use tracing::{debug, warn};
 
 /// The three stream-shaped timeouts, mirroring the daemon's configuration.
 ///
-/// Three rather than two: the idle check between events is what catches a stream
-/// that opens and then stalls, and it has no equivalent in a single overall
-/// timeout. Without it such a stream is only caught by `body`, which is sized for
-/// a slow upstream and is far longer.
+/// Three, not two: the idle check between events catches a stream that opens
+/// and then stalls, which `body` — sized for a slow upstream — can't.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamTimeouts {
     /// Max time to the first event.
@@ -98,24 +83,18 @@ impl StreamTimeouts {
 
 /// Whether the daemon asked for this response to be streamed and reassembled.
 ///
-/// The daemon marks its own dispatches with this header. Nothing else at this
-/// layer can tell daemon traffic from a client's own request:
-/// `x-fusillade-request-id` is stamped by the edge on everything for
-/// correlation, `batch_id` is absent for batchless flex as well as for realtime,
-/// and the service tier never leaves the database. A client's request reaches
-/// the edge directly and never passes through the daemon's dispatch processor,
-/// which is what makes a mark set there the signal this needs.
-///
-/// Inferring it from the path instead collapses a streaming client's response
-/// into a single body, because the path is identical on both planes.
+/// The daemon marks its own dispatches with this header; nothing else here
+/// distinguishes daemon traffic from a client's own request, since a client
+/// never passes through the dispatch processor that sets it. Inferring this
+/// from the path instead would collapse a streaming client's response into
+/// a single body, because the path is identical on both planes.
 ///
 /// Trusting a header is safe only because the sso-stack ingress strips every
-/// `x-fusillade-*` header from external requests, which is the same perimeter
-/// the `x-fusillade-request-id` early return in `inference::middleware` already
-/// depends on - see the note on `strip_scheduling_priority`. A dwctl reachable
-/// without traversing that proxy would let a caller set this. The blast radius
-/// is narrow either way: a spoofed mark reassembles the caller's own response
-/// and buffers their own body, under the same budgets as any other request.
+/// `x-fusillade-*` header from external requests (the same perimeter
+/// `inference::middleware`'s own `x-fusillade-request-id` check depends on).
+/// A dwctl reachable without that proxy would let a caller set this, but the
+/// blast radius is narrow: a spoofed mark only reassembles and buffers the
+/// caller's own response.
 fn should_force_stream(parts: &axum::http::request::Parts) -> bool {
     parts.headers.get(STREAM_MARKER_HEADER).and_then(|v| v.to_str().ok()) == Some("1")
 }
@@ -123,12 +102,8 @@ fn should_force_stream(parts: &axum::http::request::Parts) -> bool {
 pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, request: Request, next: Next) -> Response {
     let (mut parts, body) = request.into_parts();
 
-    // Two separate questions, and they must not share a condition. Whether the
-    // body can be edited depends on its shape; whether the response is
-    // reassembled depends only on the daemon's mark. Reassembly used to sit
-    // behind the shape guard, which held only because Responses reaches this
-    // layer already translated to the completions shape - masking the coupling
-    // rather than removing it.
+    // Must not share a condition: editing the body depends on its shape,
+    // reassembling the response depends only on the daemon's mark.
     let force_stream = should_force_stream(&parts);
     let relay_ctx = if force_stream {
         relay_context_for(&parts, &cfg).await
@@ -285,9 +260,8 @@ fn transform(bytes: &Bytes, force_stream: bool) -> Option<Vec<u8>> {
 
 /// Read an SSE response to completion and return the body it assembles to.
 ///
-/// Ported from fusillade's streaming client, which used to do this after the
-/// response had already passed request logging. The behaviours it preserves are
-/// load-bearing and are called out individually below.
+/// Ported from fusillade's streaming client (previously ran after request
+/// logging); the behaviours below preserve what that ordering depended on.
 async fn reassemble_stream(response: Response, timeouts: StreamTimeouts, relay_ctx: Option<RelayContext>) -> Response {
     use eventsource_stream::Eventsource;
 
@@ -301,23 +275,21 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts, relay_c
         .and_then(|v| v.split(';').next())
         .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/event-stream"));
 
-    // A streamable request can be rejected before streaming begins, and providers
-    // commonly answer that with an ordinary JSON error body. Feeding one to an SSE
-    // parser produces zero events and loses the diagnostic, so anything that is not
+    // A rejection before streaming begins is a plain JSON error body, and an
+    // SSE parser would yield zero events and lose it, so anything not
     // labelled as a stream passes through untouched.
     if !is_event_stream {
         return Response::from_parts(parts, body);
     }
 
-    // Only successful streams are reassembled into a completion object. An error
-    // status carrying an event stream keeps its raw data lines, because the
-    // reassembler models a completion and would mangle anything else.
+    // Only successful streams reassemble into a completion object; an error
+    // status keeps its raw data lines, since the reassembler models a
+    // completion and would mangle anything else.
     let reassemble = status.as_u16() < 400;
     let mut stream = body.into_data_stream().eventsource();
 
-    // Phase 1: the first event, under the time-to-first-token budget. Headers
-    // alone do not count as progress here: an upstream can return them and then
-    // queue, which is the case this budget exists to catch.
+    // Phase 1: the first event, under the time-to-first-token budget — an
+    // upstream returning only headers and then queuing is what this catches.
     let first_event = match tokio::time::timeout(timeouts.first_chunk, stream.next()).await {
         Err(_) => return timeout_response("first_chunk"),
         Ok(Some(Ok(event))) => Some(event),
@@ -354,9 +326,8 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts, relay_c
         Ok(Collected::Done(sink)) => sink,
     };
 
-    // Some providers answer 200 with an error envelope inside the stream. Surface
-    // it as a real HTTP error so downstream retry classification sees it, rather
-    // than as a successful but empty completion.
+    // Some providers answer 200 with an error envelope inside the stream —
+    // surface it as a real HTTP error so retry classification sees it.
     if let Some(data) = &sink.embedded_error
         && let Ok(envelope) = serde_json::from_str::<EmbeddedErrorEnvelope>(data)
     {
@@ -397,11 +368,10 @@ enum Collected {
 
 /// Folds SSE events into one body as they arrive.
 ///
-/// Incremental by design. A streaming response carries far more bytes on the wire
-/// than the body it assembles to, and some upstreams add content-free keepalive
-/// frames at a high rate for the life of the request, so buffering the frames and
-/// processing them at the end would make memory scale with stream length rather
-/// than with the result.
+/// Incremental by design: a streaming response carries far more bytes on the
+/// wire than the body it assembles to (some upstreams add high-rate
+/// keepalive frames), so buffering it all and processing at the end would
+/// scale memory with stream length instead of with the result.
 struct Sink {
     reassembler: openai_reassembler::Reassembler,
     /// Newline-joined raw event data, built only when not reassembling.
@@ -468,10 +438,9 @@ struct EmbeddedError {
 
 /// Gateway timeout naming which budget expired.
 ///
-/// A plain 504. The daemon already retries those, and retries all three of these
-/// budgets identically, so nothing downstream needs to tell them apart and no
-/// header or error type has to carry the distinction. Which one fired goes in the
-/// body, which is what the failure record keeps.
+/// A plain 504 — the daemon retries all three budgets identically, so
+/// nothing downstream needs to tell them apart. Which one fired goes in
+/// the body, which the failure record keeps.
 fn timeout_response(which: &str) -> Response {
     (StatusCode::GATEWAY_TIMEOUT, format!("upstream stream exceeded its {which} budget")).into_response()
 }
@@ -483,15 +452,11 @@ fn sse_parse_error(detail: &str) -> Response {
 
 /// Swap a reassembled body into the upstream response, keeping its headers.
 ///
-/// Only the headers the swap invalidates are touched. Everything else the
-/// upstream sent (rate limits, request ids, tracing headers) carries through,
-/// because this sits on the batch hot path and is the last thing to see them
-/// before request logging captures the response.
-///
-/// `Content-Length` and `Content-Encoding` go because the body is a different
-/// size and is no longer encoded as the upstream encoded it; leaving either
-/// would describe the old body. `Content-Type` becomes JSON because the response
-/// is no longer a stream.
+/// Only headers the swap invalidates are touched — everything else the
+/// upstream sent (rate limits, request ids, tracing headers) carries
+/// through. `Content-Length`/`Content-Encoding` go because the body is a
+/// different size and no longer encoded; `Content-Type` becomes JSON since
+/// the response is no longer a stream.
 fn json_body_response(mut parts: axum::http::response::Parts, status: StatusCode, body: String) -> Response {
     parts.status = status;
     parts.headers.remove(header::CONTENT_LENGTH);
@@ -664,9 +629,8 @@ mod tests {
         );
     }
 
-    /// A streamable request can be rejected before streaming begins, and the
-    /// answer is then an ordinary JSON body. Feeding that to an SSE parser would
-    /// yield zero events and lose the diagnostic.
+    /// A rejection before streaming begins is a plain JSON body, and an SSE
+    /// parser would yield zero events and lose the diagnostic.
     #[tokio::test]
     async fn non_sse_response_passes_through_untouched() {
         let mut resp = Response::new(Body::from(r#"{"error":"no such model"}"#));
@@ -720,12 +684,10 @@ mod tests {
         );
     }
 
-    /// Drive a real request through a real nest and report the content type the
-    /// caller receives. The upstream always streams; whether the caller sees a
-    /// stream or an assembled body is entirely this layer's decision.
-    ///
-    /// Hand-built `Parts` cannot answer this. They were what let a trigger that
-    /// matched every request through the edge pass as correct.
+    /// Drive a real request through a real nest and report the content type
+    /// the caller receives — whether it's a stream or an assembled body is
+    /// entirely this layer's decision. Hand-built `Parts` can't answer this;
+    /// they let a trigger that matched every request pass as correct.
     async fn content_type_through_the_edge(path: &str, headers: &[(&str, &str)]) -> String {
         use axum::{Router, routing::post};
 
@@ -760,10 +722,9 @@ mod tests {
         }
     }
 
-    /// The budgets have to come from the daemon's own configuration, and the
-    /// three are the same type in the same order, which is exactly the shape that
-    /// transposes silently. Every other test here supplies them directly, so
-    /// nothing else would notice two of them swapped.
+    /// The three budgets are the same type in the same order — exactly the
+    /// shape that transposes silently — and every other test here supplies
+    /// them directly, so nothing else would notice two swapped.
     #[test]
     fn the_budgets_are_read_from_the_daemons_own_configuration() {
         let mut daemon = crate::config::DaemonConfig::default();
@@ -795,10 +756,9 @@ mod tests {
         assert!(ct.starts_with("application/json"), "expected an assembled body, got {ct:?}");
     }
 
-    /// A streaming client must keep receiving a stream.
-    ///
-    /// The correlation header is present, because the edge stamps it on every
-    /// inbound request. That is exactly why it cannot be the signal: keying off
+    /// A streaming client must keep receiving a stream. The correlation
+    /// header is present here too (the edge stamps it on every inbound
+    /// request) — which is exactly why it can't be the signal: keying off
     /// it collapsed every streaming client's response into a single body.
     #[tokio::test]
     async fn client_traffic_still_streams() {

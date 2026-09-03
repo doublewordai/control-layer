@@ -481,11 +481,9 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // the completed object instead, so it's chat-only.
             let flex_stream_include_usage =
                 flex_stream && is_chat_completions_api && request_value["stream_options"]["include_usage"].as_bool().unwrap_or(false);
-            // Captured before the `stream`/`stream_options` strip below, and
-            // before ZDR encryption replaces the plaintext body: this is what
-            // seeds the live relay's per-chunk reframing into `response.*`
-            // events (see `LiveRelayConfig::responses_reframe`), since the
-            // daemon-bound body is not guaranteed to still be plaintext JSON.
+            // Captured before the strip below and before ZDR encryption, since
+            // the daemon-bound body isn't guaranteed to stay plaintext JSON.
+            // Seeds the live relay's per-chunk reframe (`LiveRelayConfig::responses_reframe`).
             let responses_request_for_live_relay = if flex_stream && is_responses_api {
                 serde_json::from_value::<ResponsesRequest>(request_value.clone()).ok()
             } else {
@@ -1096,9 +1094,8 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
     request_id: uuid::Uuid,
     responses_request_for_live_relay: Option<ResponsesRequest>,
 ) -> Response {
-    // No live relay at all when the request failed to re-parse (should not
-    // happen — it was already validated on the way in), rather than falling
-    // back to unreframed chat-completions-shaped passthrough.
+    // No live relay if the request failed to re-parse (shouldn't happen —
+    // it was already validated) rather than falling back to raw passthrough.
     let live_relay = match (state.chunk_relay.clone(), responses_request_for_live_relay) {
         (Some(relay), Some(req)) => Some(LiveRelayConfig {
             relay,

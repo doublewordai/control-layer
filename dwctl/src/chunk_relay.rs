@@ -2,17 +2,15 @@
 //!
 //! Relays the per-token SSE events the daemon already sees
 //! (`crate::inference::outbound_request::Sink::absorb`) to the client-holding
-//! pod. Best-effort: the persisted body stays authoritative, this is just a
-//! live tail on top of it.
+//! pod. Best-effort — the persisted body stays authoritative.
 //!
 //! Streams over pub/sub: `request_id` exists before the daemon claims the
-//! row, so a subscriber can start listening before anything is published —
-//! pub/sub would silently lose those early messages, a stream lets a late
-//! subscriber replay from the start.
+//! row, so a subscriber can listen before anything is published — pub/sub
+//! would silently lose those early messages, a stream lets it replay them.
 //!
 //! Publish (`Sink::absorb`) is synchronous and can't `.await`, so it's a
 //! `try_send` into a channel drained by one background task. Subscribe uses
-//! one shared reader task doing a single `XREAD` per tick across all
+//! one shared reader doing a single `XREAD` per tick across all
 //! subscribers, instead of one blocking connection per client.
 
 use std::collections::HashMap;
