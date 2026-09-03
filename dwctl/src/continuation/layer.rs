@@ -645,6 +645,16 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                         let _ = acc.ingest(&chat);
                         yield Ok(rewrap::sse_frame(&chat));
                     }
+                    if parser.as_ref().is_some_and(|p| p.poisoned()) {
+                        // A poisoned leg must not close as a success — see the
+                        // abort in the frames path. No usage, no [DONE].
+                        warn!(model = %ctx.model, "continuation forward parser poisoned; aborting resume");
+                        if let Some(frame) = first_death.take() {
+                            yield Ok(frame);
+                        }
+                        outcome.record("failed", "parser_overflow");
+                        break 'chain;
+                    }
                     // The leg's terminal usage describes the LEG. Replace it with
                     // the merged accounting for the whole logical request.
                     let render = last_render.as_ref();
@@ -679,6 +689,27 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     None => continue,
                 };
 
+                if parser.as_ref().is_some_and(|p| p.poisoned()) {
+                    // The parser gave up on this leg's output (a structural
+                    // bound breached — see MAX_STRUCTURAL_HOLD). What it
+                    // produced BEFORE the breach is valid and already owed to
+                    // the client, but nothing further can be trusted, and
+                    // closing the stream normally would hand the client a
+                    // silently truncated "success". Emit the pre-poison
+                    // deltas, then abort exactly as an unresumed death ends:
+                    // no usage frame, no [DONE].
+                    for delta in deltas {
+                        let chat = rewrap::delta_chunk(&env, delta.into_delta(), Value::Null);
+                        let _ = acc.ingest(&chat);
+                        yield Ok(rewrap::sse_frame(&chat));
+                    }
+                    warn!(model = %ctx.model, "continuation forward parser poisoned; aborting resume");
+                    if let Some(frame) = first_death.take() {
+                        yield Ok(frame);
+                    }
+                    outcome.record("failed", "parser_overflow");
+                    break 'chain;
+                }
                 let last = deltas.len().saturating_sub(1);
                 let mut frames: Vec<Value> = deltas
                     .into_iter()
@@ -723,6 +754,16 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                             let _ = acc.ingest(&chat);
                             yield Ok(rewrap::sse_frame(&chat));
                         }
+                    }
+                    if parser.as_ref().is_some_and(|p| p.poisoned()) {
+                        // A poisoned leg must not close as a success — see the
+                        // abort in the frames path. No usage, no [DONE].
+                        warn!(model = %ctx.model, "continuation forward parser poisoned; aborting resume");
+                        if let Some(frame) = first_death.take() {
+                            yield Ok(frame);
+                        }
+                        outcome.record("failed", "parser_overflow");
+                        break 'chain;
                     }
                     // The generation finished. If its usage frame never arrived
                     // (death families no_usage / no_done), synthesize one from a

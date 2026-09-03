@@ -576,7 +576,9 @@ impl Dsv4Reconstructor {
         let (_, tail) = parse_partial_args(&last.arguments);
         let closed = last.arguments.trim_end().ends_with('}') && tail.is_none();
         if closed || self.finish_reason {
-            ForwardSeed::BetweenToolCalls { next_index: index + 1 }
+            ForwardSeed::BetweenToolCalls {
+                next_index: index.saturating_add(1),
+            }
         } else {
             ForwardSeed::InToolCall {
                 index,

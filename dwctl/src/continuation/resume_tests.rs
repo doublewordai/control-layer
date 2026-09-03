@@ -1305,3 +1305,38 @@ async fn an_unmapped_model_still_passes_the_leg_through_verbatim(pool: PgPool) {
     );
     assert_eq!(usage_frames(&frames).len(), 1);
 }
+
+/// **A poisoned leg must not end as a silently truncated success.** A leg that
+/// streams an unterminated DSML invoke name past the structural bound poisons
+/// the forward parser; the continuation must ABORT — no usage frame, no
+/// `[DONE]`, `failed` outcome — instead of closing the stream as if the
+/// truncated output were the whole generation.
+#[sqlx::test]
+async fn a_poisoned_leg_aborts_instead_of_closing_as_success(pool: PgPool) {
+    let mut leg = vec![leg_text(
+        "</think>Checking now.\n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"",
+        None,
+    )];
+    for _ in 0..8 {
+        leg.push(leg_text(&"q".repeat(1024), None));
+    }
+    leg.push(leg_text("", Some("stop")));
+    leg.push(leg_usage(1030, 40));
+    leg.push(done());
+    let fake = Fake::new(
+        vec![reasoning("chatcmpl-1", "Let me"), reasoning("chatcmpl-1", " check")],
+        vec![leg],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payloads = collect_payloads(response).await;
+
+    let joined = payloads.join("\n");
+    assert!(!joined.contains("[DONE]"), "a poisoned resume must not close as a success");
+    assert!(!joined.contains("\"usage\""), "no usage frame for an aborted resume");
+    assert!(!joined.contains('q'), "poisoned bytes must never reach the client: {joined:?}");
+    assert!(!joined.contains("\u{ff5c}DSML\u{ff5c}"), "no DSML leak");
+}

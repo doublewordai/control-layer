@@ -142,7 +142,7 @@ impl Dsv4Forward {
             }
             ForwardSeed::InToolCall { index, args_so_far } => {
                 parser.index = index;
-                parser.next_index = index + 1;
+                parser.next_index = index.saturating_add(1);
                 // What the client already holds decides what is still owed:
                 // an opening brace, a separator before the next parameter, and
                 // which half of a parameter is in flight.
@@ -427,6 +427,10 @@ impl ForwardParser for Dsv4Forward {
         }
         self.flush_args(&mut out);
         out
+    }
+
+    fn poisoned(&self) -> bool {
+        matches!(self.state, State::Poisoned)
     }
 
     fn finish(&mut self) -> Vec<ForwardDelta> {

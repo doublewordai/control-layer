@@ -91,6 +91,14 @@ pub trait ForwardParser: Send {
     /// [`ForwardParser::finish`].
     fn feed(&mut self, raw: &str) -> Vec<ForwardDelta>;
 
+    /// Whether the parser has given up on the leg's output (e.g. a structural
+    /// buffer breached its bound). A poisoned parser emits nothing further; the
+    /// caller must ABORT the continuation rather than let the stream end as a
+    /// silently truncated success. `PlainForward` never poisons.
+    fn poisoned(&self) -> bool {
+        false
+    }
+
     /// The leg ended (a `finish_reason` arrived, or the chain closed): flush
     /// whatever is still held back.
     fn finish(&mut self) -> Vec<ForwardDelta>;
