@@ -2334,7 +2334,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 daemon_id = $1,
                 claimed_at = $3
             FROM to_claim tc
-            JOIN active_request_templates t ON tc.template_id = t.id
+            CROSS JOIN LATERAL (
+                -- Per-row lookup by primary key. A plain join on the
+                -- generation-transparent view lets the planner hash the whole
+                -- legacy template table against the handful of claimed rows;
+                -- LIMIT 1 keeps this subquery from being flattened into that join.
+                SELECT * FROM active_request_templates t WHERE t.id = tc.template_id LIMIT 1
+            ) t
             WHERE r.id = tc.id
             RETURNING r.id,
                       r.batch_id,
@@ -2601,7 +2607,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 daemon_id = $1,
                 claimed_at = $3
             FROM to_claim tc
-            JOIN active_request_templates t ON tc.template_id = t.id
+            CROSS JOIN LATERAL (
+                -- Per-row lookup by primary key. A plain join on the
+                -- generation-transparent view lets the planner hash the whole
+                -- legacy template table against the handful of claimed rows;
+                -- LIMIT 1 keeps this subquery from being flattened into that join.
+                SELECT * FROM active_request_templates t WHERE t.id = tc.template_id LIMIT 1
+            ) t
             JOIN batches b ON tc.batch_id = b.id
             WHERE r.id = tc.id
             RETURNING r.id,
@@ -2850,7 +2862,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 daemon_id = $1,
                 claimed_at = $3
             FROM locked claimed
-            JOIN active_request_templates t ON t.id = claimed.template_id
+            CROSS JOIN LATERAL (
+                -- Per-row lookup by primary key. A plain join on the
+                -- generation-transparent view lets the planner hash the whole
+                -- legacy template table against the handful of claimed rows;
+                -- LIMIT 1 keeps this subquery from being flattened into that join.
+                SELECT * FROM active_request_templates t WHERE t.id = claimed.template_id LIMIT 1
+            ) t
             LEFT JOIN batches b ON b.id = claimed.batch_id
             WHERE r.id = claimed.id
             RETURNING r.id,
@@ -3499,9 +3517,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 FROM batch_requests_archive WHERE id = ANY($1)
             ) r
             JOIN batches b ON r.batch_id = b.id
-            LEFT JOIN request_templates_all t
-              ON r.template_id = t.id
-             AND t.file_id = b.file_id
+            -- Per-row primary-key lookup; see the claim paths for why a plain
+            -- join on the two-generation view is avoided.
+            LEFT JOIN LATERAL (
+                SELECT * FROM request_templates_all t
+                WHERE t.id = r.template_id AND t.file_id = b.file_id
+                LIMIT 1
+            ) t ON TRUE
             "#,
             &uuid_ids,
         )
@@ -6181,9 +6203,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                   AND a.batch_id = $1
             ) r
             JOIN batches b ON r.batch_id = b.id
-            LEFT JOIN request_templates_all t
-              ON r.template_id = t.id
-             AND t.file_id = b.file_id
+            -- Per-row primary-key lookup; see the claim paths for why a plain
+            -- join on the two-generation view is avoided.
+            LEFT JOIN LATERAL (
+                SELECT * FROM request_templates_all t
+                WHERE t.id = r.template_id AND t.file_id = b.file_id
+                LIMIT 1
+            ) t ON TRUE
             WHERE b.deleted_at IS NULL
             ORDER BY r.created_at ASC
             "#,
@@ -8018,7 +8044,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     r.response_body,
                     r.error,
                     t.line_number
-                FROM request_templates t
+                FROM request_templates_all t
                 JOIN (
                     SELECT id, custom_id, model, state, response_body, error, template_id
                     FROM requests

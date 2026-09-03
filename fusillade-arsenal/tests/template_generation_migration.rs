@@ -617,3 +617,61 @@ async fn a_batch_materializes_requests_from_generation_two_templates(pool: PgPoo
         "requests must materialize from and resolve back to generation-2 templates"
     );
 }
+
+/// Batch result downloads join each request back to its input template. After
+/// the write cutover that template lives in `request_templates_g2`, so the
+/// results stream must read through the generation-transparent view — a
+/// legacy-table join silently streams nothing for every cutover batch.
+#[sqlx::test]
+async fn batch_results_stream_finds_generation_two_templates(pool: PgPool) {
+    use fusillade_arsenal::{PostgresRequestManager, PostgresStorageConfig, Storage, TestDbPools};
+    use futures::StreamExt;
+
+    let file_id = create_file(&pool).await;
+    let week = monday(&pool, 0).await;
+    sqlx::query("SELECT ensure_request_template_partition($1, NULL)")
+        .bind(week)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let template_id = insert_g2_template(&pool, week, file_id).await;
+    let batch_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO batches (file_id, endpoint, completion_window, created_by, total_requests, expires_at) \
+         VALUES ($1, '/v1/x', '24h', 'tester', 1, NOW() + INTERVAL '1 day') RETURNING id",
+    )
+    .bind(file_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO requests (batch_id, template_id, model, custom_id, state, response_status, \
+                               response_body, completed_at) \
+         VALUES ($1, $2, 'test-model', 'line-0', 'completed', 200, '{\"ok\":true}', NOW())",
+    )
+    .bind(batch_id)
+    .bind(template_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let manager = PostgresRequestManager::new(
+        TestDbPools::new(pool.clone()).await.unwrap(),
+        PostgresStorageConfig::default(),
+    );
+    let items: Vec<_> = manager
+        .get_batch_results_stream(batch_id.into(), 0, None, None)
+        .collect()
+        .await;
+    assert_eq!(
+        items.len(),
+        1,
+        "the cutover batch's single request must stream"
+    );
+    let item = items
+        .into_iter()
+        .next()
+        .unwrap()
+        .expect("stream item must not be an error");
+    assert_eq!(item.custom_id.as_deref(), Some("line-0"));
+    assert_eq!(item.input_body, serde_json::json!({"gen": 2}));
+}
