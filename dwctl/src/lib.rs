@@ -666,26 +666,35 @@ struct RetainedResponseMaintenanceState {
 }
 
 fn partition_maintenance_required(daemon: &config::DaemonConfig, state: RetainedResponseMaintenanceState) -> anyhow::Result<bool> {
-    let archive_daemon_enabled = !matches!(daemon.enabled, config::DaemonEnabled::Never);
     if state.identity_mismatch {
+        // Corruption of the durable lifecycle identity is global: no instance
+        // may start against it, whether or not it runs the daemon.
         anyhow::bail!("retained-response retirement recovery identity is inconsistent");
     }
-    if (daemon.retained_response_retirement_enabled || daemon.batch_archive_retirement_enabled || daemon.template_retirement_enabled)
-        && !archive_daemon_enabled
-    {
-        anyhow::bail!("retained-response partition retirement requires an enabled archive daemon");
-    }
-    if state.unfinished_retirements > 0 && !archive_daemon_enabled {
-        anyhow::bail!("unfinished retained-response retirement requires an enabled archive daemon");
+    if matches!(daemon.enabled, config::DaemonEnabled::Never) {
+        // This instance never runs the archive daemon, so it owns no
+        // maintenance session: in a split topology the daemon pods share this
+        // environment and are the ones that recover journals and clean routes.
+        // Say so loudly when durable work is pending, so a single-instance
+        // deployment that disabled its daemon cannot strand a retirement
+        // silently.
+        if state.unfinished_retirements > 0 || state.retired_routes_exist {
+            tracing::warn!(
+                unfinished_retirements = state.unfinished_retirements,
+                retired_routes_exist = state.retired_routes_exist,
+                "retained-response maintenance work is pending but the batch daemon never runs on this instance; \
+                 another instance must run it"
+            );
+        }
+        return Ok(false);
     }
     if state.retired_routes_exist && daemon.retention.max_late_writer_seconds.is_none() {
         anyhow::bail!("retired response route cleanup requires an explicit late-writer fence period");
     }
-    if state.retired_routes_exist && (!archive_daemon_enabled || daemon.purge_interval_ms == 0 || daemon.purge_batch_size < 1) {
+    if state.retired_routes_exist && (daemon.purge_interval_ms == 0 || daemon.purge_batch_size < 1) {
         anyhow::bail!("retired response route cleanup requires an enabled positive bounded cleanup configuration");
     }
-    Ok(archive_daemon_enabled
-        && (daemon.retained_response_retirement_enabled || daemon.batch_archive_retirement_enabled || state.unfinished_retirements > 0))
+    Ok(daemon.retained_response_retirement_enabled || daemon.batch_archive_retirement_enabled || state.unfinished_retirements > 0)
 }
 
 #[cfg(test)]
@@ -701,12 +710,27 @@ mod retained_response_maintenance_preflight_tests {
     }
 
     #[test]
-    fn disabled_archive_daemon_cannot_abandon_unfinished_retirement() {
+    fn an_instance_that_never_runs_the_daemon_owns_no_maintenance() {
+        // Split topology: the API pods carry the daemon pods' retention
+        // configuration and must start without a maintenance session, even
+        // while durable work is pending — the daemon pods own its recovery.
         let mut daemon = config::DaemonConfig::default();
         daemon.enabled = config::DaemonEnabled::Never;
-        let error =
-            partition_maintenance_required(&daemon, state(1, false, false)).expect_err("durable recovery must have an enabled owner");
-        assert!(error.to_string().contains("unfinished"));
+        daemon.retained_response_retirement_enabled = true;
+        daemon.batch_archive_retirement_enabled = true;
+        assert!(!partition_maintenance_required(&daemon, state(1, false, true)).unwrap());
+        // Corrupted lifecycle identity still stops every instance.
+        assert!(partition_maintenance_required(&daemon, state(0, true, false)).is_err());
+    }
+
+    #[test]
+    fn an_enabled_daemon_owns_maintenance_when_retirement_or_recovery_is_pending() {
+        let mut daemon = config::DaemonConfig::default();
+        daemon.enabled = config::DaemonEnabled::Always;
+        assert!(!partition_maintenance_required(&daemon, state(0, false, false)).unwrap());
+        assert!(partition_maintenance_required(&daemon, state(1, false, false)).unwrap());
+        daemon.retained_response_retirement_enabled = true;
+        assert!(partition_maintenance_required(&daemon, state(0, false, false)).unwrap());
     }
 
     #[test]
