@@ -165,6 +165,13 @@ mod tests {
             Ok((0, 0))
         }
 
+        async fn ensure_request_template_partitions(
+            &self,
+            _weeks_ahead: i32,
+        ) -> Result<(i64, i64)> {
+            Ok((0, 0))
+        }
+
         async fn purge_model_filter_events(
             &self,
             _batch_size: i64,
