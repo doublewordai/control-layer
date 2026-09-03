@@ -329,9 +329,8 @@ async fn send_flex_responses_streaming_request(fixture: &FlexFixture) -> axum_te
         .await
 }
 
-// Keyed off the JSON payload's own "type" field, not the SSE "event:" line,
-// since axum emits fields in call order (data before event here) rather
-// than a fixed order.
+// Keyed off the "type" field, not the SSE "event:" line — axum emits
+// fields in call order here (data before event), not a fixed order.
 fn parse_response_output_text_deltas(text: &str) -> Vec<String> {
     text.lines()
         .filter_map(|line| line.strip_prefix("data: "))

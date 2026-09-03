@@ -32,12 +32,9 @@ pub struct LiveRelayConfig {
     /// Correctness fallback while the relay is primary — deliberately much
     /// slower than the 500ms used when live streaming is off.
     pub poll_fallback_interval: std::time::Duration,
-    /// `Some` on the Responses surface: the client's own request plus its
-    /// tracking id, used to reframe each relayed chunk into `response.*`
-    /// events. Relayed chunks are Chat Completions shaped (Responses reaches
-    /// `outbound_request` already translated to that shape — see its module
-    /// docs), so they need the same reframing `ResponsesStreamReframer` gives
-    /// the live warm path. `None` forwards chunks as-is (chat-completions).
+    /// `Some` on the Responses surface: seeds a per-chunk reframe into
+    /// `response.*` events, since relayed chunks are Chat Completions shaped
+    /// (see `outbound_request`'s module docs). `None` forwards chunks as-is.
     pub responses_reframe: Option<(ResponsesRequest, String)>,
 }
 
@@ -98,28 +95,19 @@ impl ReplayFrame {
 /// Respond-first SSE for the blocking flex streaming surfaces
 /// (chat-completions and responses).
 ///
-/// Flex is daemon-processed and can sit queued for a long time, so we return
-/// `200 text/event-stream` immediately and poll the daemon *inside* the
-/// stream. axum's [`KeepAlive`] injects `:` comments while we wait, keeping
-/// the client connection warm past idle timeouts (a poll-then-respond design
-/// would send no bytes — not even headers — until the daemon finished, and a
-/// client idle timeout could fire first).
+/// Flex can sit queued a long time, so this returns `200 text/event-stream`
+/// immediately and polls the daemon *inside* the stream. `KeepAlive` covers
+/// the wait with `:` comments — a poll-then-respond design would send no
+/// bytes until the daemon finished, risking a client idle timeout first.
+/// Enqueue failure is the exception: it happens before any byte is sent, so
+/// it still returns a clean JSON `500`.
 ///
-/// When the request reaches a terminal state, `render` turns the outcome —
-/// `Ok(detail)` on a terminal row, `Err(msg)` on timeout/poll failure — into
-/// the frames to emit: success chunks/events on 2xx, an in-stream error frame
-/// otherwise. Errors are delivered *down the stream*, not as an HTTP status,
-/// because the `200` was already committed.
-///
-/// Enqueue failure is the one exception: it happens before any byte is sent,
-/// so it still returns a clean JSON `500`.
-///
-/// `done_sentinel` appends a trailing `data: [DONE]` (the chat-completions
-/// terminator); the Responses surface ends on `response.completed`/`.failed`
-/// and passes `false`.
-///
-/// `live_relay`, when set, races a relay task against the poll task (see
-/// [`Terminal`]); `None` is exactly today's behavior.
+/// On a terminal result, `render` turns it into frames; errors go down the
+/// stream, not as an HTTP status, since the `200` is already committed.
+/// `done_sentinel` appends `data: [DONE]` for chat-completions; Responses
+/// ends on `response.completed`/`.failed` and passes `false`. `live_relay`,
+/// when set, races a relay task against the poll task (see [`Terminal`]);
+/// `None` is today's poll-only behavior.
 pub async fn flex_stream_response<P, F>(
     request_manager: Arc<fusillade_arsenal::PostgresRequestManager<P>>,
     flex_input: fusillade::CreateFlexInput,
@@ -176,12 +164,9 @@ where
         ));
     }
 
-    // Poll task: the HTTP response is already returning; this fills the stream
-    // once the daemon reaches a terminal state. Until then the channel is idle
-    // and axum's keep-alive holds the connection open.
-    //
-    // Races against `terminal.claimed_by_other()` so a relay-delivered
-    // response doesn't sit open until this task's own next poll tick.
+    // The HTTP response is already returning; this fills the stream once the
+    // daemon reaches a terminal state. Races `terminal.claimed_by_other()` so
+    // a relay-delivered response doesn't sit open until this task's next poll.
     tokio::spawn(async move {
         let timeout = std::time::Duration::from_secs(3600);
 
@@ -268,10 +253,8 @@ async fn run_live_relay(
                         return;
                     }
                     match reframe.as_mut() {
-                        // Nothing in the raw relayed stream says "response
-                        // complete" — that only exists once reframed, so
-                        // finalize() (response.completed/output_item.done etc.)
-                        // has to run here rather than arriving as a message.
+                        // Nothing in the raw stream says "response complete" —
+                        // only finalize() produces that, so it runs here.
                         Some((state, _, _)) => {
                             for event in state.finalize() {
                                 if send_streaming_event(&tx, &event).await.is_err() {
