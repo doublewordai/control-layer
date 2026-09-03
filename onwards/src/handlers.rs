@@ -1020,7 +1020,21 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            // The status class decides what the exhausted-retry response looks
+            // like when every provider is tried and still fails. A provider rate
+            // limit (429) or overload (529) means the upstream is temporarily at
+            // capacity, not dead: surface the final error as a 503 so the
+            // metrics/alert taxonomy reads "provider overloaded, retry later"
+            // rather than "bad gateway / upstream died". This mirrors the
+            // embedded-error path, which already collapses exhausted retries to
+            // a sanitized 503 rather than leaking the upstream rate limit. Other
+            // fallback statuses (500/502/503/504, or a `5xx` wildcard) keep 502.
+            let fallback_err = if status == 429 || status == 529 {
+                OnwardsErrorResponse::service_unavailable()
+            } else {
+                OnwardsErrorResponse::bad_gateway()
+            };
+            return LoopAction::Continue(Some(fallback_err));
         }
 
         // Sanitize error responses when sanitize_response is enabled.
@@ -1605,18 +1619,19 @@ pub async fn target_message_handler<T: HttpClient>(
         let final_error = last_error
             .unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str()));
         // `status` carries the PRE-sanitization status of the last attempt, which
-        // the response itself discards: a 529 and a 500 both leave here as 503,
-        // so without this the caller cannot tell saturation from failure. This is
-        // the single exit where a candidate error actually becomes the response,
-        // so counting here counts outcomes rather than attempts.
+        // the response itself discards: a 529 and a 429 both leave here as 503,
+        // and a 500 leaves as 502, so without this the caller cannot tell
+        // saturation from failure. This is the single exit where a candidate
+        // error actually becomes the response, so counting here counts outcomes
+        // rather than attempts.
         let status = final_error.status.as_u16();
         metrics::counter!(
             "onwards_upstream_failed_total",
             "reason" => "retries_exhausted",
             // The upstream's own status on the final attempt, NOT the gateway
-            // response above: both a 529 and a 500 sanitize to 503, and only
-            // the former is backpressure. Falls back to the response status
-            // when no attempt got far enough to see one.
+            // response above: a 429 and a 529 sanitize to 503, a 500 to 502, and
+            // only the rate-limit/overload pair is backpressure. Falls back to
+            // the response status when no attempt got far enough to see one.
             "status" => last_upstream_status.unwrap_or(status).to_string(),
             "model" => model_name.to_string(),
         )
