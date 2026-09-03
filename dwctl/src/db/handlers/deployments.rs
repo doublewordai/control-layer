@@ -1744,8 +1744,8 @@ mod tests {
             .create(
                 &DeploymentCreateDBRequest::builder()
                     .created_by(user.id)
-                    .model_name("vendor/model-27b".to_string())
-                    .alias("vendor/model-27b".to_string())
+                    .model_name("Qwen/Qwen3.8-27B-FP8".to_string())
+                    .alias("Qwen/Qwen3.8-27B-FP8".to_string())
                     .display_name("Qwen3.8 27B".to_string())
                     .description("Optimized for multilingual retrieval".to_string())
                     .hosted_on(endpoint_id)
@@ -1754,12 +1754,14 @@ mod tests {
             .await
             .unwrap();
 
-        let results = repo
-            .list(&DeploymentFilter::new(0, 10).with_search("qwen3.8 27b".to_string()))
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, created.id);
+        for search in ["qwen3.8 27b", "qwen3.8-27b"] {
+            let results = repo
+                .list(&DeploymentFilter::new(0, 10).with_search(search.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id, created.id);
+        }
     }
 
     fn reasoning_translation_overrides() -> ReasoningTranslationOverrides {
