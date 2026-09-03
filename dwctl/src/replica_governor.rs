@@ -200,7 +200,9 @@ impl GovernedPool {
     }
 
     fn current_replica_max(&self) -> Option<u32> {
-        self.target.has_replica().then(|| self.target.read().options().get_max_connections())
+        self.target
+            .has_replica()
+            .then(|| self.target.read().options().get_max_connections())
     }
 }
 
@@ -305,7 +307,11 @@ mod tests {
     fn effective_max_prefers_total_over_per_pod() {
         assert_eq!(effective_max(&settings(Some(800), 400), 2), 400);
         assert_eq!(effective_max(&settings(Some(800), 400), 4), 200);
-        assert_eq!(effective_max(&settings(None, 400), 4), 400, "no total: per-pod value, replica count irrelevant");
+        assert_eq!(
+            effective_max(&settings(None, 400), 4),
+            400,
+            "no total: per-pod value, replica count irrelevant"
+        );
     }
 
     #[test]
@@ -336,7 +342,11 @@ mod tests {
         assert_eq!(register_and_count(&pool, a, "api", liveness).await.unwrap(), 1);
         // Deregistration removes the row.
         deregister(&pool, a).await.unwrap();
-        assert_eq!(register_and_count(&pool, c, "api", liveness).await.unwrap(), 1, "only c remains in api");
+        assert_eq!(
+            register_and_count(&pool, c, "api", liveness).await.unwrap(),
+            1,
+            "only c remains in api"
+        );
     }
 
     #[sqlx::test]
@@ -349,12 +359,33 @@ mod tests {
         let shutdown_b = CancellationToken::new();
         let (tx_a, mut rx_a) = watch::channel(1u32);
         let (tx_b, mut rx_b) = watch::channel(1u32);
-        let handle_a = tokio::spawn(run_membership(pool.clone(), Uuid::new_v4(), "api".into(), tx_a, cfg.clone(), shutdown_a.clone()));
-        let _handle_b = tokio::spawn(run_membership(pool.clone(), Uuid::new_v4(), "api".into(), tx_b, cfg.clone(), shutdown_b.clone()));
+        let handle_a = tokio::spawn(run_membership(
+            pool.clone(),
+            Uuid::new_v4(),
+            "api".into(),
+            tx_a,
+            cfg.clone(),
+            shutdown_a.clone(),
+        ));
+        let _handle_b = tokio::spawn(run_membership(
+            pool.clone(),
+            Uuid::new_v4(),
+            "api".into(),
+            tx_b,
+            cfg.clone(),
+            shutdown_b.clone(),
+        ));
         // A member of another group must not be counted.
         let (tx_c, _rx_c) = watch::channel(1u32);
         let shutdown_c = CancellationToken::new();
-        let _handle_c = tokio::spawn(run_membership(pool.clone(), Uuid::new_v4(), "batch".into(), tx_c, cfg.clone(), shutdown_c.clone()));
+        let _handle_c = tokio::spawn(run_membership(
+            pool.clone(),
+            Uuid::new_v4(),
+            "batch".into(),
+            tx_c,
+            cfg.clone(),
+            shutdown_c.clone(),
+        ));
 
         tokio::time::timeout(Duration::from_secs(5), async {
             while !(*rx_a.borrow() == 2 && *rx_b.borrow() == 2) {

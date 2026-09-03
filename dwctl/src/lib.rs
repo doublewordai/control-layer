@@ -867,9 +867,10 @@ async fn setup_database(
                 info!("Setting up fusillade read replica");
                 let replica_pool_settings = config.database.fusillade().replica_pool_settings();
                 let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-                let replica = replica_governor::pool_options(replica_pool_settings, replica_governor::effective_max(replica_pool_settings, live))
-                    .connect_with(replica_opts)
-                    .await?;
+                let replica =
+                    replica_governor::pool_options(replica_pool_settings, replica_governor::effective_max(replica_pool_settings, live))
+                        .connect_with(replica_opts)
+                        .await?;
                 DbPools::with_replica(primary, replica)
             } else {
                 DbPools::new(primary)
@@ -906,12 +907,12 @@ async fn setup_database(
             } => {
                 // Create primary pool using main's connection, with schema-specific search_path
                 let primary = create_schema_pool(
-                name.clone(),
-                main_connect_opts.clone(),
-                pool_settings,
-                replica_governor::effective_max(pool_settings, live),
-            )
-            .await?;
+                    name.clone(),
+                    main_connect_opts.clone(),
+                    pool_settings,
+                    replica_governor::effective_max(pool_settings, live),
+                )
+                .await?;
                 primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
                 // Create replica pool if main has one configured (inherits main's replica connection)
@@ -920,12 +921,12 @@ async fn setup_database(
                     let replica_opts = db_pools.read().connect_options().as_ref().clone();
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
                     let replica = create_schema_pool(
-                    name.clone(),
-                    replica_opts,
-                    replica_pool_settings,
-                    replica_governor::effective_max(replica_pool_settings, live),
-                )
-                .await?;
+                        name.clone(),
+                        replica_opts,
+                        replica_pool_settings,
+                        replica_governor::effective_max(replica_pool_settings, live),
+                    )
+                    .await?;
                     DbPools::with_replica(primary, replica)
                 } else {
                     DbPools::new(primary)
@@ -940,16 +941,17 @@ async fn setup_database(
                 info!("Using dedicated database for outlet");
                 let connect_opts = PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
                 let primary = replica_governor::pool_options(pool_settings, replica_governor::effective_max(pool_settings, live))
-                .connect_with(connect_opts)
+                    .connect_with(connect_opts)
                     .await?;
 
                 if let Some(replica_url) = replica_url {
                     info!("Setting up outlet read replica");
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
                     let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-                    let replica = replica_governor::pool_options(replica_pool_settings, replica_governor::effective_max(replica_pool_settings, live))
-                    .connect_with(replica_opts)
-                        .await?;
+                    let replica =
+                        replica_governor::pool_options(replica_pool_settings, replica_governor::effective_max(replica_pool_settings, live))
+                            .connect_with(replica_opts)
+                            .await?;
                     DbPools::with_replica(primary, replica)
                 } else {
                     DbPools::new(primary)
@@ -986,9 +988,14 @@ async fn setup_database(
         iterations: config.auth.native.password.argon2_iterations,
         parallelism: config.auth.native.password.argon2_parallelism,
     };
-    create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), argon2_params, &db_pools.write())
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
+    create_initial_admin_user(
+        &config.admin_email,
+        config.admin_password.as_deref(),
+        argon2_params,
+        &db_pools.write(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
 
     // Provision the global continuation key (hidden, SYSTEM-owned — system
     // ownership is what admits it to every model's onwards keyset regardless of
@@ -1218,11 +1225,12 @@ pub async fn build_router(
         // Add PostgresHandler for request logging if enabled
         if request_logging_enabled {
             let outlet_pool = state.outlet_db.as_ref().expect("outlet_db checked above");
-            let postgres_handler = PostgresHandler::<sqlx::PgPool, ParsedAIRequest, AiResponse>::from_pool_provider(outlet_pool.write().into_inner())
-                .await
-                .expect("Failed to create PostgresHandler for request logging")
-                .with_request_serializer(parse_ai_request)
-                .with_response_serializer(parse_ai_response);
+            let postgres_handler =
+                PostgresHandler::<sqlx::PgPool, ParsedAIRequest, AiResponse>::from_pool_provider(outlet_pool.write().into_inner())
+                    .await
+                    .expect("Failed to create PostgresHandler for request logging")
+                    .with_request_serializer(parse_ai_request)
+                    .with_response_serializer(parse_ai_response);
             // TRANSITIONAL (dwctl ZDR): guard the analytics logger so plaintext
             // ZDR bodies (decrypted for the upstream call, captured on the
             // loopback) never land in http_requests / http_responses. The marker

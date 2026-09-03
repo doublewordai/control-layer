@@ -1301,10 +1301,9 @@ async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     }
 
     // Real analytics handler wrapped in the scrubber, mirroring lib.rs wiring.
-    let handler =
-        outlet_postgres::PostgresHandler::<sqlx::PgPool, serde_json::Value, serde_json::Value>::from_pool_provider(pool.clone())
-            .await
-            .expect("build PostgresHandler");
+    let handler = outlet_postgres::PostgresHandler::<sqlx::PgPool, serde_json::Value, serde_json::Value>::from_pool_provider(pool.clone())
+        .await
+        .expect("build PostgresHandler");
     let handler = crate::inference::engine::outlet_handler::ZdrBodyScrubber::new(handler);
 
     fn request(correlation_id: u64, zdr: bool) -> RequestData {

@@ -256,7 +256,9 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     .unwrap();
             }
             Some(key) => {
-                if let Err(msg) = crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.write().into_inner(), key, model).await {
+                if let Err(msg) =
+                    crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.write().into_inner(), key, model).await
+                {
                     return Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .header("content-type", "application/json")

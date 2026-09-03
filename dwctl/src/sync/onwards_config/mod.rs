@@ -395,18 +395,19 @@ impl OnwardsConfigSync {
     /// watch channel is closed (all receivers dropped); Err only for fatal
     /// DB errors (closed pool / connection).
     async fn full_reload(&mut self, source: &'static str) -> Result<bool, anyhow::Error> {
-        let new_targets = match load_targets_from_db(&self.db.write(), &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
-            Ok(targets) => targets,
-            Err(e) => {
-                crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
-                if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
-                    error!("Database pool closed, exiting sync task");
-                    return Err(e);
+        let new_targets =
+            match load_targets_from_db(&self.db.write(), &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
+                Ok(targets) => targets,
+                Err(e) => {
+                    crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
+                    if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
+                        error!("Database pool closed, exiting sync task");
+                        return Err(e);
+                    }
+                    // Continue listening for other types of errors
+                    return Ok(true);
                 }
-                // Continue listening for other types of errors
-                return Ok(true);
-            }
-        };
+            };
         debug!("Loaded {} targets from database", new_targets.targets.len());
 
         // Update daemon capacity limits if configured

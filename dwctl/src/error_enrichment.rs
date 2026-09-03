@@ -59,7 +59,11 @@ struct ChatRequest {
 /// - 403 Forbidden errors (cap window rolled, reinstatement pending) → retriable 429
 ///   plus a demand-driven config resync so the retry succeeds within seconds
 #[instrument(name = "dwctl.error_enrichment", skip_all, fields(http.request.method = %request.method(), url.path = %request.uri().path(), url.query = request.uri().query().unwrap_or("")))]
-pub async fn error_enrichment_middleware(State(pools): State<sqlx_pool_router::DynPools>, request: Request<Body>, next: Next) -> Response<Body> {
+pub async fn error_enrichment_middleware(
+    State(pools): State<sqlx_pool_router::DynPools>,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
     // Extract API key from request headers before passing to onwards
     let api_key = request
         .headers()
@@ -644,7 +648,8 @@ mod tests {
                         .unwrap()
                 }),
             )
-            .layer(axum::middleware::from_fn_with_state(sqlx_pool_router::DynPools::new(pool.clone()),
+            .layer(axum::middleware::from_fn_with_state(
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -783,7 +788,8 @@ mod tests {
                         .unwrap()
                 }),
             )
-            .layer(axum::middleware::from_fn_with_state(sqlx_pool_router::DynPools::new(pool.clone()),
+            .layer(axum::middleware::from_fn_with_state(
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
         let server = axum_test::TestServer::new(router).expect("Failed to create test server");
@@ -982,7 +988,8 @@ mod tests {
                         .unwrap()
                 }),
             )
-            .layer(axum::middleware::from_fn_with_state(sqlx_pool_router::DynPools::new(pool.clone()),
+            .layer(axum::middleware::from_fn_with_state(
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -1021,7 +1028,8 @@ mod tests {
                         .unwrap()
                 }),
             )
-            .layer(axum::middleware::from_fn_with_state(sqlx_pool_router::DynPools::new(pool.clone()),
+            .layer(axum::middleware::from_fn_with_state(
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -1049,7 +1057,8 @@ mod tests {
                         .unwrap()
                 }),
             )
-            .layer(axum::middleware::from_fn_with_state(sqlx_pool_router::DynPools::new(pool.clone()),
+            .layer(axum::middleware::from_fn_with_state(
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -1134,7 +1143,8 @@ mod tests {
                         .unwrap()
                 }),
             )
-            .layer(axum::middleware::from_fn_with_state(sqlx_pool_router::DynPools::new(pool.clone()),
+            .layer(axum::middleware::from_fn_with_state(
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -1396,7 +1406,8 @@ mod tests {
                         .unwrap()
                 }),
             )
-            .layer(axum::middleware::from_fn_with_state(sqlx_pool_router::DynPools::new(pool.clone()),
+            .layer(axum::middleware::from_fn_with_state(
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
