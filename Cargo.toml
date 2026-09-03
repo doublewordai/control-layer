@@ -17,7 +17,3 @@ inherits = "test"
 debug = 0
 incremental = false
 
-# Local development of the pool-router 0.3 change; replaced by the published
-# version before merge.
-[patch.crates-io]
-sqlx-pool-router = { path = "/Users/peter/titan/sqlx-pool-router-worktrees/swappable-pools" }
