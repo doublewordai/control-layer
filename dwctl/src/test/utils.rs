@@ -515,6 +515,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         external_user_id: None,
         groups: None, // Groups not included in test users by default
         credit_balance: None,
+        has_purchased: None,
         has_payment_provider_id: false,
         batch_notifications_enabled: false,
         low_balance_threshold: None,
@@ -706,6 +707,7 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         external_user_id: None,
         groups: None,
         credit_balance: None,
+        has_purchased: None,
         has_payment_provider_id: false,
         batch_notifications_enabled: false,
         low_balance_threshold: None,

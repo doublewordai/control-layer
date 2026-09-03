@@ -203,6 +203,40 @@ impl<'c> Credits<'c> {
         })
     }
 
+    /// Has this billing target ever completed a purchase?
+    ///
+    /// The read-side counterpart of [`Self::grant_first_payment_match`]: that
+    /// method decides eligibility from the absence of a prior `purchase` row,
+    /// and this answers the same question for callers that need to know
+    /// *before* any money moves - notably the dashboard's first-deposit-match
+    /// banner, which must not advertise a promotion the ledger will refuse.
+    ///
+    /// Deliberately not `has_payment_provider_id`: a payment-provider customer
+    /// record is created by setup-mode card verification and by
+    /// `POST /auto-topup/enable` (even on the `needs_billing_portal` bail-out),
+    /// so it goes true for accounts that have never bought anything and would
+    /// hide the promotion from people still entitled to it.
+    ///
+    /// Served by the partial `idx_credits_transactions_user_purchases` index
+    /// (migration 100), so it stays a direct lookup no matter how many `usage`
+    /// rows the target has accumulated.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn has_purchased(&mut self, user_id: UserId) -> Result<bool> {
+        let purchased = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM credits_transactions
+                WHERE user_id = $1 AND transaction_type = 'purchase'
+            ) AS "purchased!"
+            "#,
+            user_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(purchased)
+    }
+
     /// Grant a first-payment match bonus to `payee` if eligible.
     ///
     /// The promotion matches a user's first ever payment with bonus credits, up
@@ -2202,6 +2236,65 @@ mod tests {
         .fetch_optional(pool)
         .await
         .expect("query bonus")
+    }
+
+    #[sqlx::test]
+    async fn test_has_purchased_is_false_before_any_purchase(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        assert!(!credits.has_purchased(user).await.unwrap());
+
+        insert_purchase(&mut credits, user, "30.0", "sess-1").await;
+
+        assert!(credits.has_purchased(user).await.unwrap());
+    }
+
+    #[sqlx::test]
+    async fn test_has_purchased_ignores_grants_and_usage(pool: PgPool) {
+        // The regression this guards: signup credits and a verified card both
+        // give an account a balance and a payment-provider record without a
+        // purchase, and the first-payment match is still owed to them.
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        for (transaction_type, source_id) in [
+            (CreditTransactionType::AdminGrant, "signup-credits"),
+            (CreditTransactionType::Usage, "some-request"),
+            (CreditTransactionType::AdminRemoval, "clawback"),
+        ] {
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user,
+                    transaction_type,
+                    amount: Decimal::from_str("1.0").unwrap(),
+                    source_id: source_id.to_string(),
+                    description: None,
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        assert!(!credits.has_purchased(user).await.unwrap());
+    }
+
+    #[sqlx::test]
+    async fn test_has_purchased_is_scoped_to_the_billing_target(pool: PgPool) {
+        // An org admin paying for their org must not lose their own personal
+        // eligibility, and vice versa - the two are separate billing targets.
+        let payer = create_test_user(&pool).await;
+        let other = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        insert_purchase(&mut credits, payer, "30.0", "sess-1").await;
+
+        assert!(credits.has_purchased(payer).await.unwrap());
+        assert!(!credits.has_purchased(other).await.unwrap());
     }
 
     #[sqlx::test]

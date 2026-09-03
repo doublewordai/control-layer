@@ -4,6 +4,8 @@ use axum::{Json, extract::State, response::IntoResponse};
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use rust_decimal::prelude::ToPrimitive;
+
 use crate::{AppState, api::models::users::CurrentUser};
 
 /// Batch processing configuration
@@ -44,6 +46,14 @@ pub struct ConfigResponse {
     pub organization: Option<String>,
     /// Whether payment processing is enabled
     pub payment_enabled: bool,
+    /// First-payment match promotion ceiling, in dollars: a billing target's
+    /// first ever purchase is matched with bonus credits up to this amount.
+    /// `0` means the promotion is switched off on this instance.
+    ///
+    /// Exposed so clients can both gate the promotional UI on the promotion
+    /// actually being live and render the real figure, rather than hard-coding
+    /// an amount that drifts from `credits.first_payment_match_up_to`.
+    pub first_payment_match_up_to: f64,
     /// URL to JSONL documentation for batch file format, if available
     pub docs_jsonl_url: Option<String>,
     /// URL to the documentation site
@@ -101,6 +111,10 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
         organization: metadata.organization.clone(),
         // Compute payment_enabled based on whether payment_processor is configured
         payment_enabled: config.payment.is_some(),
+        // Lossy on paper, exact in practice: the ceiling is a whole-dollar
+        // marketing figure, and this value is only ever displayed or compared
+        // against zero - the money itself is matched in Decimal server-side.
+        first_payment_match_up_to: config.credits.first_payment_match_up_to.to_f64().unwrap_or(0.0),
         docs_url: metadata.docs_url.clone(),
         docs_jsonl_url: metadata.docs_jsonl_url.clone(),
         batches: batches_config,
@@ -117,7 +131,7 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
 mod tests {
     use crate::Application;
     use crate::api::models::users::Role;
-    use crate::test::utils::{add_auth_headers, create_test_app, create_test_user};
+    use crate::test::utils::{add_auth_headers, create_test_app, create_test_app_with_config, create_test_config, create_test_user};
     use axum::http::StatusCode;
     use serde_json::Value;
     use sqlx::PgPool;
@@ -183,6 +197,50 @@ onwards:
         // Check that metadata fields are present
         assert!(json.get("region").is_some());
         assert!(json.get("organization").is_some());
+    }
+
+    /// The promotion ceiling has to reach the client, because the client is what
+    /// decides whether to advertise the promotion at all. Defaulting it off and
+    /// leaving the dashboard to assume a figure is how you end up promising a
+    /// match that `grant_first_payment_match` then declines to pay.
+    #[sqlx::test]
+    async fn test_get_config_exposes_the_first_payment_match_ceiling(pool: PgPool) {
+        let mut config = create_test_config();
+        config.credits.first_payment_match_up_to = rust_decimal::Decimal::new(50, 0);
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let headers = add_auth_headers(&user);
+        let response = app
+            .get("/admin/api/v1/config")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let json: Value = response.json();
+
+        assert_eq!(json.get("first_payment_match_up_to").and_then(|v| v.as_f64()), Some(50.0));
+    }
+
+    /// Off is the default, and it must be legible as off rather than absent -
+    /// a missing field reads as "old server" to a client, not "promo disabled".
+    #[sqlx::test]
+    async fn test_get_config_reports_a_disabled_promotion_as_zero(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let headers = add_auth_headers(&user);
+        let response = app
+            .get("/admin/api/v1/config")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+
+        response.assert_status(StatusCode::OK);
+        let json: Value = response.json();
+
+        assert_eq!(json.get("first_payment_match_up_to").and_then(|v| v.as_f64()), Some(0.0));
     }
 
     #[sqlx::test]
