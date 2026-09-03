@@ -622,14 +622,16 @@ impl DatabaseConfig {
     /// Whether any governed pool declares a `total_max_connections`. When
     /// false the replica governor stays fully dormant: no registry rows, no
     /// heartbeats, pools sized from `max_connections` exactly as before.
+    ///
+    /// Governed pools are `main` and `fusillade` (primaries and replicas).
+    /// `outlet` is not: outlet-postgres pins the pool it is built with, so it
+    /// cannot follow a swap yet. `underway` is per-pod by design.
     pub fn connection_budget_enabled(&self) -> bool {
         let governed = [
             self.main_pool_settings(),
             self.main_replica_pool_settings(),
             self.fusillade().pool_settings(),
             self.fusillade().replica_pool_settings(),
-            self.outlet().pool_settings(),
-            self.outlet().replica_pool_settings(),
         ];
         governed.iter().any(|s| s.total_max_connections.is_some())
     }

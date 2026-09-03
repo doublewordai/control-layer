@@ -959,21 +959,18 @@ async fn setup_database(
             }
         };
         outlet_postgres::migrator().run(&*pools.write()).await?;
-        if governance_seed.is_some() {
-            governed.push(replica_governor::GovernedPool {
-                name: "outlet",
-                primary: (
-                    config.database.outlet().pool_settings().clone(),
-                    pools.write().connect_options().as_ref().clone(),
-                ),
-                replica: pools.has_replica().then(|| {
-                    (
-                        config.database.outlet().replica_pool_settings().clone(),
-                        pools.read().connect_options().as_ref().clone(),
-                    )
-                }),
-                target: pools.clone(),
-            });
+        // NOT governed: outlet-postgres (0.7) still speaks sqlx-pool-router 0.2
+        // and its PostgresHandler pins the PgPool it is built with, so a swap
+        // would close the pool under request logging. Outlet is a separate
+        // Neon project outside the governed budget, so nothing is lost until
+        // outlet-postgres adopts pool-router 1.0 and this can join `governed`.
+        if config.database.outlet().pool_settings().total_max_connections.is_some()
+            || config.database.outlet().replica_pool_settings().total_max_connections.is_some()
+        {
+            tracing::warn!(
+                "database.outlet.pool.total_max_connections is set but the outlet pool is not governed \
+                 (outlet-postgres pins its pool); the per-pod max_connections applies"
+            );
         }
 
         Some(pools)
