@@ -1370,8 +1370,7 @@ mod tests {
                         .unwrap()
                 }),
             )
-            .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+            .layer(axum::middleware::from_fn_with_state(sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
         let proxy = axum_test::TestServer::new(router).unwrap();

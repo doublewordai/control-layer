@@ -1946,7 +1946,7 @@ dependencies = [
  "serial_test",
  "sha2 0.11.0",
  "sqlx",
- "sqlx-pool-router",
+ "sqlx-pool-router 0.3.0",
  "tempfile",
  "test-log",
  "thiserror 2.0.18",
@@ -2396,7 +2396,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
- "sqlx-pool-router",
+ "sqlx-pool-router 0.3.0",
  "test-log",
  "tokio",
  "tokio-stream",
@@ -4549,7 +4549,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
- "sqlx-pool-router",
+ "sqlx-pool-router 0.2.0",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -6468,6 +6468,17 @@ version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0e9b977ec33ab01a8c211001e3e72b5d5a4ef95ef0c16cbf661de859c2c66ba3"
 dependencies = [
+ "sqlx",
+]
+
+[[package]]
+name = "sqlx-pool-router"
+version = "0.3.0"
+dependencies = [
+ "arc-swap",
+ "async-stream",
+ "either",
+ "futures-util",
  "sqlx",
 ]
 

@@ -43,7 +43,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -139,7 +139,7 @@ pub async fn create_test_app_state_with_database_pools(
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -250,6 +250,7 @@ pub fn create_test_config() -> crate::config::Config {
                 min_connections: 0,
                 ..Default::default()
             },
+            replica_group: crate::config::default_replica_group(),
         },
         slow_statement_threshold_ms: 1000,
         host: "127.0.0.1".to_string(),

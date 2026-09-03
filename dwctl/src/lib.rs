@@ -167,6 +167,7 @@ mod probes;
 pub mod prompt_cache;
 pub mod reasoning;
 mod recompute;
+pub mod replica_governor;
 mod request_logging;
 pub mod sample_files;
 mod static_assets;
@@ -653,18 +654,30 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
 }
 
 /// Setup database connections, run migrations, and initialize data
-/// Returns: (embedded_db, main_pools, fusillade_pools, outlet_pools)
+/// Returns: (embedded_db, main_pools, fusillade_pools, outlet_pools, governance)
+///
+/// `governance` is `Some` only when the config declares a connection budget
+/// (`total_max_connections` on some pool): the pod has then already joined its
+/// replica group and every pool was sized at its share; the background
+/// services keep it that way (see `replica_governor`).
 ///
 /// If `pool` is provided, it will be used directly instead of creating a new connection.
 /// This is useful for tests where sqlx::test provides a pool.
+#[allow(clippy::type_complexity)]
 async fn setup_database(
     config: &Config,
     pool: Option<PgPool>,
-) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, DbPools, DbPools, Option<DbPools>)> {
+) -> anyhow::Result<(
+    Option<db::embedded::EmbeddedDatabase>,
+    DbPools,
+    DbPools,
+    Option<DbPools>,
+    Option<replica_governor::PoolGovernance>,
+)> {
     let slow_threshold = std::time::Duration::from_millis(config.slow_statement_threshold_ms);
 
     // If a pool is provided (e.g., from tests), create a TestDbPools which will create a read-only replica
-    let (embedded_db, pool, test_replica_pool) = if let Some(existing_pool) = pool {
+    let (embedded_db, pool, test_replica_pool, governance_seed) = if let Some(existing_pool) = pool {
         info!("Using provided database pool with TestDbPools for read/write separation");
 
         // Create TestDbPools which creates a read-only replica for testing
@@ -673,8 +686,8 @@ async fn setup_database(
             .expect("Failed to create TestDbPools");
 
         // Extract the write and read pools to create a DbPools with proper read/write separation
-        let replica_pool = test_pools.read().clone();
-        (None, existing_pool, Some(replica_pool))
+        let replica_pool = test_pools.read().into_inner();
+        (None, existing_pool, Some(replica_pool), None)
     } else {
         // Database connection - handle both embedded and external
         let (_embedded_db, database_url) = match &config.database {
@@ -707,26 +720,45 @@ async fn setup_database(
 
         let main_settings = config.database.main_pool_settings();
         let connect_opts = PgConnectOptions::from_str(&database_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(main_settings.max_connections)
-            .min_connections(main_settings.min_connections)
-            .acquire_timeout(std::time::Duration::from_secs(main_settings.acquire_timeout_secs))
-            .idle_timeout(if main_settings.idle_timeout_secs > 0 {
-                Some(std::time::Duration::from_secs(main_settings.idle_timeout_secs))
-            } else {
-                None
+
+        // Connection-budget governance (dormant unless some pool declares a
+        // total): join the replica group BEFORE sizing any pool, so a pod that
+        // boots into an existing group starts at its fair share rather than
+        // grabbing the whole budget. A 1-connection bootstrap pool runs the
+        // migrations first (idempotent; the main pool re-runs them below) so
+        // the registry table exists on the very first deploy.
+        let governance_seed = if config.database.connection_budget_enabled() {
+            let instance_id = uuid::Uuid::new_v4();
+            let group = config.database.replica_group().to_string();
+            let bootstrap = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(1)
+                .connect_with(connect_opts.clone())
+                .await?;
+            migrator().run(&bootstrap).await?;
+            let initial_live =
+                replica_governor::register_and_count(&bootstrap, instance_id, &group, replica_governor::LIVENESS_WINDOW).await?;
+            bootstrap.close().await;
+            info!(%instance_id, group, live_replicas = initial_live, "Joined replica group for connection-budget division");
+            Some(replica_governor::GovernanceSeed {
+                instance_id,
+                group,
+                initial_live,
             })
-            .max_lifetime(if main_settings.max_lifetime_secs > 0 {
-                Some(std::time::Duration::from_secs(main_settings.max_lifetime_secs))
-            } else {
-                None
-            })
+        } else {
+            None
+        };
+        let live = governance_seed.as_ref().map_or(1, |seed| seed.initial_live);
+
+        let pool = replica_governor::pool_options(main_settings, replica_governor::effective_max(main_settings, live))
             .connect_with(connect_opts)
             .await?;
-        (_embedded_db, pool, None)
+        (_embedded_db, pool, None, governance_seed)
     };
 
     migrator().run(&pool).await?;
+
+    let live = governance_seed.as_ref().map_or(1, |seed| seed.initial_live);
+    let mut governed: Vec<replica_governor::GovernedPool> = Vec::new();
 
     // Create replica pool if configured (or use test replica if in test mode)
     let db_pools = if let Some(test_replica) = test_replica_pool {
@@ -736,20 +768,7 @@ async fn setup_database(
         info!("Setting up read replica pool");
         let replica_settings = config.database.main_replica_pool_settings();
         let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-        let replica_pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(replica_settings.max_connections)
-            .min_connections(replica_settings.min_connections)
-            .acquire_timeout(std::time::Duration::from_secs(replica_settings.acquire_timeout_secs))
-            .idle_timeout(if replica_settings.idle_timeout_secs > 0 {
-                Some(std::time::Duration::from_secs(replica_settings.idle_timeout_secs))
-            } else {
-                None
-            })
-            .max_lifetime(if replica_settings.max_lifetime_secs > 0 {
-                Some(std::time::Duration::from_secs(replica_settings.max_lifetime_secs))
-            } else {
-                None
-            })
+        let replica_pool = replica_governor::pool_options(replica_settings, replica_governor::effective_max(replica_settings, live))
             .connect_with(replica_opts)
             .await?;
         DbPools::with_replica(pool, replica_pool)
@@ -757,8 +776,25 @@ async fn setup_database(
         DbPools::new(pool)
     };
 
+    if governance_seed.is_some() {
+        governed.push(replica_governor::GovernedPool {
+            name: "main",
+            primary: (
+                config.database.main_pool_settings().clone(),
+                db_pools.write().connect_options().as_ref().clone(),
+            ),
+            replica: db_pools.has_replica().then(|| {
+                (
+                    config.database.main_replica_pool_settings().clone(),
+                    db_pools.read().connect_options().as_ref().clone(),
+                )
+            }),
+            target: db_pools.clone(),
+        });
+    }
+
     // Get connection options from the main pool to create schema-based child pools
-    let main_connect_opts = db_pools.connect_options().as_ref().clone();
+    let main_connect_opts = db_pools.write().connect_options().as_ref().clone();
 
     // Helper to create a pool with schema-specific search_path
     // Reuses connection URLs from main pool (both primary and replica if configured)
@@ -769,29 +805,15 @@ async fn setup_database(
         schema: String,
         opts: sqlx::postgres::PgConnectOptions,
         settings: &config::PoolSettings,
+        max_connections: u32,
     ) -> Result<sqlx::PgPool, sqlx::Error> {
         // Set search_path directly in connection options so PostgreSQL enforces it
         // This is more reliable than after_connect hooks, especially with replicas
         // The options() method formats as: "-c key=value"
-        let search_path_key = "search_path".to_string();
-        let search_path_value = schema.clone();
         info!("Setting search_path={} via connection options for schema pool", schema);
-        let opts_with_schema = opts.options([(search_path_key, search_path_value)]);
+        let opts_with_schema = opts.options([("search_path".to_string(), schema)]);
 
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(settings.max_connections)
-            .min_connections(settings.min_connections)
-            .acquire_timeout(std::time::Duration::from_secs(settings.acquire_timeout_secs))
-            .idle_timeout(if settings.idle_timeout_secs > 0 {
-                Some(std::time::Duration::from_secs(settings.idle_timeout_secs))
-            } else {
-                None
-            })
-            .max_lifetime(if settings.max_lifetime_secs > 0 {
-                Some(std::time::Duration::from_secs(settings.max_lifetime_secs))
-            } else {
-                None
-            })
+        replica_governor::pool_options(settings, max_connections)
             .connect_with(opts_with_schema)
             .await
     }
@@ -803,7 +825,13 @@ async fn setup_database(
             name, pool: pool_settings, ..
         } => {
             // Create primary pool using main's connection, with schema-specific search_path
-            let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings).await?;
+            let primary = create_schema_pool(
+                name.clone(),
+                main_connect_opts.clone(),
+                pool_settings,
+                replica_governor::effective_max(pool_settings, live),
+            )
+            .await?;
             primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
             // Create replica pool if main has one configured (inherits main's replica connection)
@@ -811,7 +839,13 @@ async fn setup_database(
                 info!("Setting up fusillade read replica (schema mode)");
                 let replica_opts = db_pools.read().connect_options().as_ref().clone();
                 let replica_pool_settings = config.database.fusillade().replica_pool_settings();
-                let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings).await?;
+                let replica = create_schema_pool(
+                    name.clone(),
+                    replica_opts,
+                    replica_pool_settings,
+                    replica_governor::effective_max(replica_pool_settings, live),
+                )
+                .await?;
                 DbPools::with_replica(primary, replica)
             } else {
                 DbPools::new(primary)
@@ -825,20 +859,7 @@ async fn setup_database(
         } => {
             info!("Using dedicated database for fusillade");
             let connect_opts = PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-            let primary = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(pool_settings.max_connections)
-                .min_connections(pool_settings.min_connections)
-                .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
-                .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
-                    Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
-                } else {
-                    None
-                })
-                .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
-                    Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
-                } else {
-                    None
-                })
+            let primary = replica_governor::pool_options(pool_settings, replica_governor::effective_max(pool_settings, live))
                 .connect_with(connect_opts)
                 .await?;
 
@@ -846,20 +867,7 @@ async fn setup_database(
                 info!("Setting up fusillade read replica");
                 let replica_pool_settings = config.database.fusillade().replica_pool_settings();
                 let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-                let replica = sqlx::postgres::PgPoolOptions::new()
-                    .max_connections(replica_pool_settings.max_connections)
-                    .min_connections(replica_pool_settings.min_connections)
-                    .acquire_timeout(std::time::Duration::from_secs(replica_pool_settings.acquire_timeout_secs))
-                    .idle_timeout(if replica_pool_settings.idle_timeout_secs > 0 {
-                        Some(std::time::Duration::from_secs(replica_pool_settings.idle_timeout_secs))
-                    } else {
-                        None
-                    })
-                    .max_lifetime(if replica_pool_settings.max_lifetime_secs > 0 {
-                        Some(std::time::Duration::from_secs(replica_pool_settings.max_lifetime_secs))
-                    } else {
-                        None
-                    })
+                let replica = replica_governor::pool_options(replica_pool_settings, replica_governor::effective_max(replica_pool_settings, live))
                     .connect_with(replica_opts)
                     .await?;
                 DbPools::with_replica(primary, replica)
@@ -868,10 +876,26 @@ async fn setup_database(
             }
         }
     };
-    fusillade_arsenal::migrator().run(&*fusillade_pools).await?;
+    if governance_seed.is_some() {
+        governed.push(replica_governor::GovernedPool {
+            name: "fusillade",
+            primary: (
+                config.database.fusillade().pool_settings().clone(),
+                fusillade_pools.write().connect_options().as_ref().clone(),
+            ),
+            replica: fusillade_pools.has_replica().then(|| {
+                (
+                    config.database.fusillade().replica_pool_settings().clone(),
+                    fusillade_pools.read().connect_options().as_ref().clone(),
+                )
+            }),
+            target: fusillade_pools.clone(),
+        });
+    }
+    fusillade_arsenal::migrator().run(&*fusillade_pools.write()).await?;
 
     // Run underway migrations (background task queue)
-    underway::run_migrations(&*db_pools).await?;
+    underway::run_migrations(&*db_pools.write()).await?;
 
     // Setup outlet schema and pool if request logging is enabled
     let outlet_pools = if config.enable_request_logging {
@@ -881,7 +905,13 @@ async fn setup_database(
                 name, pool: pool_settings, ..
             } => {
                 // Create primary pool using main's connection, with schema-specific search_path
-                let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings).await?;
+                let primary = create_schema_pool(
+                name.clone(),
+                main_connect_opts.clone(),
+                pool_settings,
+                replica_governor::effective_max(pool_settings, live),
+            )
+            .await?;
                 primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
 
                 // Create replica pool if main has one configured (inherits main's replica connection)
@@ -889,7 +919,13 @@ async fn setup_database(
                     info!("Setting up outlet read replica (schema mode)");
                     let replica_opts = db_pools.read().connect_options().as_ref().clone();
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
-                    let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings).await?;
+                    let replica = create_schema_pool(
+                    name.clone(),
+                    replica_opts,
+                    replica_pool_settings,
+                    replica_governor::effective_max(replica_pool_settings, live),
+                )
+                .await?;
                     DbPools::with_replica(primary, replica)
                 } else {
                     DbPools::new(primary)
@@ -903,42 +939,16 @@ async fn setup_database(
             } => {
                 info!("Using dedicated database for outlet");
                 let connect_opts = PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-                let primary = sqlx::postgres::PgPoolOptions::new()
-                    .max_connections(pool_settings.max_connections)
-                    .min_connections(pool_settings.min_connections)
-                    .acquire_timeout(std::time::Duration::from_secs(pool_settings.acquire_timeout_secs))
-                    .idle_timeout(if pool_settings.idle_timeout_secs > 0 {
-                        Some(std::time::Duration::from_secs(pool_settings.idle_timeout_secs))
-                    } else {
-                        None
-                    })
-                    .max_lifetime(if pool_settings.max_lifetime_secs > 0 {
-                        Some(std::time::Duration::from_secs(pool_settings.max_lifetime_secs))
-                    } else {
-                        None
-                    })
-                    .connect_with(connect_opts)
+                let primary = replica_governor::pool_options(pool_settings, replica_governor::effective_max(pool_settings, live))
+                .connect_with(connect_opts)
                     .await?;
 
                 if let Some(replica_url) = replica_url {
                     info!("Setting up outlet read replica");
                     let replica_pool_settings = config.database.outlet().replica_pool_settings();
                     let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-                    let replica = sqlx::postgres::PgPoolOptions::new()
-                        .max_connections(replica_pool_settings.max_connections)
-                        .min_connections(replica_pool_settings.min_connections)
-                        .acquire_timeout(std::time::Duration::from_secs(replica_pool_settings.acquire_timeout_secs))
-                        .idle_timeout(if replica_pool_settings.idle_timeout_secs > 0 {
-                            Some(std::time::Duration::from_secs(replica_pool_settings.idle_timeout_secs))
-                        } else {
-                            None
-                        })
-                        .max_lifetime(if replica_pool_settings.max_lifetime_secs > 0 {
-                            Some(std::time::Duration::from_secs(replica_pool_settings.max_lifetime_secs))
-                        } else {
-                            None
-                        })
-                        .connect_with(replica_opts)
+                    let replica = replica_governor::pool_options(replica_pool_settings, replica_governor::effective_max(replica_pool_settings, live))
+                    .connect_with(replica_opts)
                         .await?;
                     DbPools::with_replica(primary, replica)
                 } else {
@@ -946,7 +956,23 @@ async fn setup_database(
                 }
             }
         };
-        outlet_postgres::migrator().run(&*pools).await?;
+        outlet_postgres::migrator().run(&*pools.write()).await?;
+        if governance_seed.is_some() {
+            governed.push(replica_governor::GovernedPool {
+                name: "outlet",
+                primary: (
+                    config.database.outlet().pool_settings().clone(),
+                    pools.write().connect_options().as_ref().clone(),
+                ),
+                replica: pools.has_replica().then(|| {
+                    (
+                        config.database.outlet().replica_pool_settings().clone(),
+                        pools.read().connect_options().as_ref().clone(),
+                    )
+                }),
+                target: pools.clone(),
+            });
+        }
 
         Some(pools)
     } else {
@@ -960,7 +986,7 @@ async fn setup_database(
         iterations: config.auth.native.password.argon2_iterations,
         parallelism: config.auth.native.password.argon2_parallelism,
     };
-    create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), argon2_params, &db_pools)
+    create_initial_admin_user(&config.admin_email, config.admin_password.as_deref(), argon2_params, &db_pools.write())
         .await
         .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
 
@@ -969,15 +995,16 @@ async fn setup_database(
     // group gating or pricing) so it exists and has synced into the onwards key
     // cache before the first resume attempt.
     if config.continuation.enabled {
-        continuation::provision_global_key(&db_pools)
+        continuation::provision_global_key(&db_pools.write())
             .await
             .map_err(|e| anyhow::anyhow!("Failed to provision continuation key: {}", e))?;
     }
 
     // Seed database with initial configuration (only runs once)
-    seed_database(&config.model_sources, &db_pools).await?;
+    seed_database(&config.model_sources, &db_pools.write()).await?;
 
-    Ok((embedded_db, db_pools, fusillade_pools, outlet_pools))
+    let governance = governance_seed.map(|seed| replica_governor::PoolGovernance { seed, pools: governed });
+    Ok((embedded_db, db_pools, fusillade_pools, outlet_pools, governance))
 }
 
 /// Build the base CORS layer (methods, headers, max-age, exposed headers) from
@@ -1191,7 +1218,7 @@ pub async fn build_router(
         // Add PostgresHandler for request logging if enabled
         if request_logging_enabled {
             let outlet_pool = state.outlet_db.as_ref().expect("outlet_db checked above");
-            let postgres_handler = PostgresHandler::<DbPools, ParsedAIRequest, AiResponse>::from_pool_provider(outlet_pool.clone())
+            let postgres_handler = PostgresHandler::<sqlx::PgPool, ParsedAIRequest, AiResponse>::from_pool_provider(outlet_pool.write().into_inner())
                 .await
                 .expect("Failed to create PostgresHandler for request logging")
                 .with_request_serializer(parse_ai_request)
@@ -1724,7 +1751,7 @@ pub async fn build_router(
             enabled: cfg.image_normalizer.enabled,
             normalizer,
             realtime_ttl,
-            pool: Some(state.db.write().clone()),
+            pool: Some(sqlx_pool_router::DynPools::new(state.db.clone())),
         };
         onwards_router.layer(middleware::from_fn_with_state(
             image_normalizer_state,
@@ -1734,7 +1761,7 @@ pub async fn build_router(
 
     // Apply error enrichment middleware to onwards router (before outlet logging)
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        state.db.write().clone(),
+        sqlx_pool_router::DynPools::new(state.db.clone()),
         error_enrichment::error_enrichment_middleware,
     ));
 
@@ -1761,7 +1788,7 @@ pub async fn build_router(
             match crate::continuation::ContinuationState::build(
                 &cfg.continuation,
                 &cfg.cache.tokenizer_url,
-                state.db.write().clone(),
+                sqlx_pool_router::DynPools::new(state.db.clone()),
                 resume_target,
                 body_limit,
             )
@@ -1806,7 +1833,7 @@ pub async fn build_router(
     let onwards_router = {
         let cfg = state.current_config();
         if cfg.cache.enabled {
-            let pool = state.db.write().clone();
+            let pool = sqlx_pool_router::DynPools::new(state.db.clone());
             let classifier = crate::prompt_cache::Classifier::new(
                 crate::prompt_cache::PrincipalResolver::new(pool.clone()),
                 crate::prompt_cache::ModelConfigResolver::new(pool.clone()),
@@ -2210,8 +2237,9 @@ pub struct BackgroundServices {
     /// them up immediately rather than waiting for stale-daemon
     /// detection (~30s).
     onwards_daemon_id: Option<Uuid>,
-    /// Fusillade write pool retained for the SIGTERM drain queries.
-    fusillade_write_pool: Option<sqlx::PgPool>,
+    /// Fusillade pools retained for the SIGTERM drain queries (a live
+    /// provider, so it follows runtime pool swaps).
+    fusillade_write_pool: Option<sqlx_pool_router::DynPools>,
     task_runner: Arc<tasks::TaskRunner>,
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
@@ -2580,14 +2608,17 @@ pub(crate) struct BackgroundServicesInput {
     pub model_capacity_limits: Arc<dashmap::DashMap<String, usize>>,
     /// dwctl primary pool (used for probe scheduler, notification
     /// poller, and the inference middleware setup).
-    pub pool: PgPool,
+    pub db_pools: DbPools,
     /// Fusillade pool wrapper; kept around inside this function only
     /// to clone the write pool for the metrics sampler — fusillade's
     /// daemon already owns its own clone via `request_manager`.
     pub fusillade_pools: DbPools,
     /// Outlet (request-logging) pool. Optional because outlet is
     /// optional.
-    pub outlet_pool: Option<PgPool>,
+    pub outlet_pools: Option<DbPools>,
+    /// Connection-budget governance state from `setup_database`; `None` when
+    /// no pool declares a `total_max_connections` (governor dormant).
+    pub governance: Option<replica_governor::PoolGovernance>,
     pub config: Config,
     pub shared_config: SharedConfig,
     pub shutdown_token: tokio_util::sync::CancellationToken,
@@ -2602,15 +2633,21 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         postgres_daemon,
         step_manager,
         model_capacity_limits,
-        pool,
+        db_pools,
         fusillade_pools,
-        outlet_pool,
+        outlet_pools,
+        governance,
         config,
         shared_config,
         shutdown_token,
         metrics_recorder,
         keystore,
     } = input;
+
+    // Live provider for every long-lived consumer below: a runtime pool swap
+    // (connection-budget re-division across replicas) reaches them on their
+    // next call. Only leader election gets a pinned pool — see there.
+    let dyn_pools = sqlx_pool_router::DynPools::new(db_pools.clone());
 
     // `keystore` comes from the caller (built once and shared). Install the
     // TRANSITIONAL ZDR response transformer on the daemon before it
@@ -2643,7 +2680,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             .collect();
 
         let (onwards_config_sync, initial_targets, onwards_stream) = sync::onwards_config::OnwardsConfigSync::new_with_daemon_limits(
-            pool.clone(),
+            dyn_pools.clone(),
             Some(model_capacity_limits.clone()),
             config.background_services.batch_daemon.default_model_concurrency,
             escalation_models,
@@ -2699,9 +2736,37 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     // LISTEN/NOTIFY refresh loop is gated on onwards config sync, with which it
     // shares the `auth_config_changed` channel; with sync disabled the map is
     // still correct at startup, it just does not pick up later policy changes.
-    let zdr_key_cache = crate::sync::zdr_keys::initial_cache(&pool).await?;
+    // Connection-budget governance: heartbeat this pod's membership in its
+    // replica group and re-divide every governed pool as the group changes.
+    // Both tasks are absent when no pool declares a total.
+    if let Some(governance) = governance {
+        let (count_tx, count_rx) = tokio::sync::watch::channel(governance.seed.initial_live);
+        let membership_pools = dyn_pools.clone();
+        let membership_shutdown = shutdown_token.clone();
+        let instance_id = governance.seed.instance_id;
+        let group = governance.seed.group.clone();
+        background_tasks.spawn("replica-membership", async move {
+            replica_governor::run_membership(
+                membership_pools,
+                instance_id,
+                group,
+                count_tx,
+                replica_governor::MembershipConfig::default(),
+                membership_shutdown,
+            )
+            .await;
+            Ok(())
+        });
+        let governor_shutdown = shutdown_token.clone();
+        background_tasks.spawn("connection-governor", async move {
+            replica_governor::run_governor(governance.pools, count_rx, replica_governor::RESIZE_SETTLE, governor_shutdown).await;
+            Ok(())
+        });
+    }
+
+    let zdr_key_cache = crate::sync::zdr_keys::initial_cache(&db_pools.write()).await?;
     if config.background_services.onwards_sync.enabled {
-        let zdr_pool = pool.clone();
+        let zdr_pool = dyn_pools.clone();
         let zdr_cache = zdr_key_cache.clone();
         let zdr_shutdown = shutdown_token.clone();
         let zdr_fallback = config.background_services.onwards_sync.fallback_interval_milliseconds;
@@ -2715,12 +2780,12 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
-    let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
+    let probe_scheduler = probes::ProbeScheduler::new(dyn_pools.clone(), config.clone());
 
     // Caller owns `request_manager` / `step_manager` construction —
-    // see the function-level doc. We still need a pool clone here for
-    // the metrics sampler; `fusillade_pools` is otherwise unused.
-    let fusillade_pool_for_metrics = fusillade_pools.write().clone();
+    // see the function-level doc. `fusillade_pools` is only sampled by the
+    // metrics sampler here, through a live provider so pool swaps show up.
+    let fusillade_pools_for_metrics = sqlx_pool_router::DynPools::new(fusillade_pools.clone());
     drop(fusillade_pools);
 
     let is_leader: bool;
@@ -2784,7 +2849,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         {
             let daemon_config = config.clone();
             let daemon_request_manager = request_manager.clone();
-            let daemon_pool = pool.clone();
+            let daemon_pool = dyn_pools.clone();
             let daemon_shutdown = shutdown_token.clone();
             background_tasks.spawn("batch-completion", async move {
                 notifications::run_notification_poller(
@@ -2830,7 +2895,11 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         let is_leader_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Spawn leader election background task
-        let leader_election_pool = pool.clone();
+        // Deliberately a pinned pool, NOT the live provider: leader election
+        // holds one session-pinned connection for the advisory lock, and
+        // swapping the pool underneath it would drop the lock.
+        let leader_election_pool = db_pools.write().into_inner();
+        let leader_election_pools_gain = dyn_pools.clone();
         let leader_election_scheduler_gain = probe_scheduler.clone();
         let leader_election_scheduler_lose = probe_scheduler.clone();
         let leader_election_request_manager_gain = request_manager.clone();
@@ -2858,8 +2927,9 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                 leader_election_flag,
                 LEADER_LOCK_ID,
                 leader_election_shutdown,
-                move |pool, config| {
+                move |_pool, config| {
                     // This closure is run when a replica becomes the leader
+                    let gain_pools = leader_election_pools_gain.clone();
                     let scheduler = leader_election_scheduler_gain.clone();
                     let request_manager = leader_election_request_manager_gain.clone();
                     let postgres_daemon = leader_election_postgres_daemon_gain.clone();
@@ -2923,7 +2993,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                                     daemon_config.background_services.notifications.clone(),
                                     daemon_config,
                                     notification_request_manager,
-                                    pool,
+                                    gain_pools,
                                     daemon_session_token,
                                 )
                                 .await;
@@ -2986,7 +3056,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         } else {
             None
         })
-        .connect_with(pool.connect_options().as_ref().clone())
+        .connect_with(db_pools.write().connect_options().as_ref().clone())
         .await?;
 
     // Start pool metrics sampler if metrics are enabled
@@ -2994,21 +3064,21 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         let mut pools = vec![
             db::LabeledPool {
                 name: "main",
-                pool: pool.clone(),
+                pool: dyn_pools.clone(),
             },
             db::LabeledPool {
                 name: "fusillade",
-                pool: fusillade_pool_for_metrics,
+                pool: fusillade_pools_for_metrics,
             },
             db::LabeledPool {
                 name: "main_underway",
-                pool: underway_pool.clone(),
+                pool: sqlx_pool_router::DynPools::new(underway_pool.clone()),
             },
         ];
-        if let Some(outlet) = outlet_pool {
+        if let Some(outlet) = outlet_pools.as_ref() {
             pools.push(db::LabeledPool {
                 name: "outlet",
-                pool: outlet,
+                pool: sqlx_pool_router::DynPools::new(outlet.clone()),
             });
         }
         let metrics_shutdown = shutdown_token.clone();
@@ -3025,7 +3095,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     // this shares an in-process Notify with it rather than round-tripping through Postgres.
     let usage_refresh_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     if config.enable_analytics && config.background_services.usage_refresh.enabled {
-        let daemon_pool = pool.clone();
+        let daemon_pool = dyn_pools.clone();
         let daemon_config = config.background_services.usage_refresh.clone();
         let daemon_notify = usage_refresh_notify.clone();
         let daemon_shutdown = shutdown_token.clone();
@@ -3037,7 +3107,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
     // Start analytics batcher if enabled
     let analytics_sender = if config.enable_analytics {
-        let (batcher, sender) = request_logging::AnalyticsBatcher::new(pool.clone(), config.clone(), metrics_recorder);
+        let (batcher, sender) = request_logging::AnalyticsBatcher::new(dyn_pools.clone(), config.clone(), metrics_recorder);
         let batcher = batcher.with_usage_refresh_notify(usage_refresh_notify.clone());
 
         let batcher_shutdown = shutdown_token.clone();
@@ -3082,7 +3152,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
     let task_state = tasks::TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: dyn_pools.clone(),
         config: shared_config.clone(),
         encryption_key: encryption_key.clone(),
         ingest_file_job: Arc::new(std::sync::OnceLock::new()),
@@ -3191,7 +3261,7 @@ impl Application {
         debug!("Starting control layer with configuration: {:#?}", config);
 
         // Setup database connections, run migrations, and initialize data
-        let (_embedded_db, db_pools, fusillade_pools, outlet_pools) = setup_database(&config, pool).await?;
+        let (_embedded_db, db_pools, fusillade_pools, outlet_pools, governance) = setup_database(&config, pool).await?;
 
         // Install Prometheus recorder BEFORE background services start
         // This ensures metrics set during background service initialization are captured
@@ -3306,9 +3376,10 @@ impl Application {
             postgres_daemon: postgres_daemon.clone(),
             step_manager: step_manager.clone(),
             model_capacity_limits,
-            pool: (*db_pools).clone(),
+            db_pools: db_pools.clone(),
             fusillade_pools: fusillade_pools.clone(),
-            outlet_pool: outlet_pools.as_ref().map(|p| (**p).clone()),
+            outlet_pools: outlet_pools.clone(),
+            governance,
             config: config.clone(),
             shared_config: shared_config.clone(),
             shutdown_token: shutdown_token.clone(),
@@ -3319,7 +3390,7 @@ impl Application {
 
         // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id.
         let onwards_daemon_id = uuid::Uuid::new_v4();
-        let fusillade_write_pool = bg_services.request_manager.pool().clone();
+        let fusillade_write_pool = sqlx_pool_router::DynPools::new(bg_services.request_manager.pools().clone());
         let daemon_insert_result = sqlx::query(
             "INSERT INTO daemons (id, hostname, pid, version, config_snapshot, status, started_at, last_heartbeat)
              VALUES ($1, $2, $3, $4, $5, 'running', NOW(), NOW())",
@@ -3409,7 +3480,7 @@ impl Application {
                 };
                 format!("http://{addr}/ai")
             },
-            dwctl_pool: (*db_pools).write().clone(),
+            dwctl_pool: sqlx_pool_router::DynPools::new(db_pools.clone()),
             response_store: response_store.clone(),
             image_normalizer: image_normalizer.clone(),
             image_normalizer_enabled: config.image_normalizer.enabled,

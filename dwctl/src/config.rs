@@ -286,8 +286,17 @@ impl Default for ResponsesConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PoolSettings {
-    /// Maximum number of connections in the pool
+    /// Maximum number of connections in the pool (per pod).
+    ///
+    /// Ignored for sizing when `total_max_connections` is set; kept so the
+    /// same config still parses on images without the replica governor.
     pub max_connections: u32,
+    /// Connection budget shared by ALL live replicas of this pod's
+    /// `database.replica_group`. Each pod sizes this pool at
+    /// `total / live_replicas` and re-divides at runtime as replicas come and
+    /// go (see `replica_governor`). Takes precedence over `max_connections`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_max_connections: Option<u32>,
     /// Minimum number of idle connections to maintain
     pub min_connections: u32,
     /// Maximum time to wait for a connection (seconds)
@@ -303,6 +312,7 @@ impl Default for PoolSettings {
     fn default() -> Self {
         Self {
             max_connections: 10,
+            total_max_connections: None,
             min_connections: 0,
             acquire_timeout_secs: 30,
             idle_timeout_secs: 600,  // 10 minutes
@@ -374,6 +384,7 @@ pub fn default_fusillade_component() -> ComponentDb {
         name: "fusillade".into(),
         pool: PoolSettings {
             max_connections: 20,
+            total_max_connections: None,
             min_connections: 2,
             acquire_timeout_secs: 30,
             idle_timeout_secs: 600,
@@ -389,6 +400,7 @@ pub fn default_outlet_component() -> ComponentDb {
         name: "outlet".into(),
         pool: PoolSettings {
             max_connections: 5,
+            total_max_connections: None,
             min_connections: 0,
             acquire_timeout_secs: 30,
             idle_timeout_secs: 600,
@@ -442,6 +454,12 @@ pub enum DatabaseConfig {
         /// holds long-lived PgListener connections)
         #[serde(default = "default_underway_pool")]
         underway_pool: PoolSettings,
+        /// Replica group for connection-budget division: pods with the same
+        /// group share every `total_max_connections` in this config equally.
+        /// Set per Deployment (the Helm chart injects
+        /// `DWCTL_DATABASE__REPLICA_GROUP`).
+        #[serde(default = "default_replica_group")]
+        replica_group: String,
     },
     /// Use external PostgreSQL database
     External {
@@ -467,7 +485,19 @@ pub enum DatabaseConfig {
         /// holds long-lived PgListener connections)
         #[serde(default = "default_underway_pool")]
         underway_pool: PoolSettings,
+        /// Replica group for connection-budget division: pods with the same
+        /// group share every `total_max_connections` in this config equally.
+        /// Set per Deployment (the Helm chart injects
+        /// `DWCTL_DATABASE__REPLICA_GROUP`).
+        #[serde(default = "default_replica_group")]
+        replica_group: String,
     },
+}
+
+/// Replica group used when none is configured. Every pod without an explicit
+/// group shares one budget, which is the safe reading of "no groups".
+pub fn default_replica_group() -> String {
+    "default".to_string()
 }
 
 impl Default for DatabaseConfig {
@@ -483,6 +513,7 @@ impl Default for DatabaseConfig {
                 fusillade: default_fusillade_component(),
                 outlet: default_outlet_component(),
                 underway_pool: default_underway_pool(),
+                replica_group: default_replica_group(),
             }
         }
         #[cfg(not(feature = "embedded-db"))]
@@ -495,6 +526,7 @@ impl Default for DatabaseConfig {
                 fusillade: default_fusillade_component(),
                 outlet: default_outlet_component(),
                 underway_pool: default_underway_pool(),
+                replica_group: default_replica_group(),
             }
         }
     }
@@ -577,6 +609,29 @@ impl DatabaseConfig {
             DatabaseConfig::Embedded { underway_pool, .. } => underway_pool,
             DatabaseConfig::External { underway_pool, .. } => underway_pool,
         }
+    }
+
+    /// Replica group this pod counts itself in for connection-budget division.
+    pub fn replica_group(&self) -> &str {
+        match self {
+            DatabaseConfig::Embedded { replica_group, .. } => replica_group,
+            DatabaseConfig::External { replica_group, .. } => replica_group,
+        }
+    }
+
+    /// Whether any governed pool declares a `total_max_connections`. When
+    /// false the replica governor stays fully dormant: no registry rows, no
+    /// heartbeats, pools sized from `max_connections` exactly as before.
+    pub fn connection_budget_enabled(&self) -> bool {
+        let governed = [
+            self.main_pool_settings(),
+            self.main_replica_pool_settings(),
+            self.fusillade().pool_settings(),
+            self.fusillade().replica_pool_settings(),
+            self.outlet().pool_settings(),
+            self.outlet().replica_pool_settings(),
+        ];
+        governed.iter().any(|s| s.total_max_connections.is_some())
     }
 }
 
@@ -2891,6 +2946,7 @@ impl Config {
             let fusillade = config.database.fusillade().clone();
             let outlet = config.database.outlet().clone();
             let underway_pool = config.database.underway_pool_settings().clone();
+            let replica_group = config.database.replica_group().to_string();
 
             // Preserve original replica_pool if it was explicitly configured (not using fallback)
             let original_replica_pool = match &config.database {
@@ -2909,6 +2965,7 @@ impl Config {
                 fusillade,
                 outlet,
                 underway_pool,
+                replica_group,
             };
         } else if let Some(replica_url) = config.database_replica_url.take() {
             // Only replica_url is set via environment variable, apply it to existing config

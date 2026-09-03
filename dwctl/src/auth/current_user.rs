@@ -104,7 +104,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
     state: &crate::AppState<P>,
 ) -> Option<Result<AuthSuccess>> {
     let config = state.current_config();
-    let db: &PgPool = state.db.write();
+    let db: &PgPool = &state.db.write();
     tracing::trace!("Trying proxy header auth, config: {:?}", config.auth.proxy_header);
     // Extract external_user_id from header_name (required)
     let external_user_id = parts
@@ -650,12 +650,12 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         let mut any_auth_attempted = false;
 
         // Try API key authentication first (most specific)
-        match try_api_key_auth(parts, state.db.read()).await {
+        match try_api_key_auth(parts, &state.db.read()).await {
             Some(Ok((mut user, last_login))) => {
                 debug!("Authentication successful via API key");
                 trace!("Authenticated user: {}", user.id);
-                populate_org_context(&mut user, parts, state.db.read()).await;
-                maybe_update_last_login(user.id, last_login, state.db.write());
+                populate_org_context(&mut user, parts, &state.db.read()).await;
+                maybe_update_last_login(user.id, last_login, &state.db.write());
                 return Ok(user);
             }
             Some(Err(e)) => {
@@ -671,12 +671,12 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         // Native authentication (JWT sessions)
         let config = state.current_config();
         if config.auth.native.enabled {
-            match try_jwt_session_auth(parts, &config, state.db.read()).await {
+            match try_jwt_session_auth(parts, &config, &state.db.read()).await {
                 Some(Ok((mut user, last_login))) => {
                     debug!("Authentication successful via JWT session");
                     trace!("Authenticated user: {}", user.id);
-                    populate_org_context(&mut user, parts, state.db.read()).await;
-                    maybe_update_last_login(user.id, last_login, state.db.write());
+                    populate_org_context(&mut user, parts, &state.db.read()).await;
+                    maybe_update_last_login(user.id, last_login, &state.db.write());
                     return Ok(user);
                 }
                 Some(Err(e)) => {
@@ -696,8 +696,8 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
                 Some(Ok((mut user, last_login))) => {
                     debug!("Authentication successful via proxy header");
                     trace!("Authenticated user: {}", user.id);
-                    populate_org_context(&mut user, parts, state.db.read()).await;
-                    maybe_update_last_login(user.id, last_login, state.db.write());
+                    populate_org_context(&mut user, parts, &state.db.read()).await;
+                    maybe_update_last_login(user.id, last_login, &state.db.write());
                     return Ok(user);
                 }
                 Some(Err(e)) => {

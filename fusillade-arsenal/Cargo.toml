@@ -37,7 +37,7 @@ humantime = "2"
 metrics = "0.24"
 rand = "0.10"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"] }
-sqlx-pool-router = "0.2.0"
+sqlx-pool-router = "0.3.0"
 
 [dev-dependencies]
 test-log = "0.2.18"

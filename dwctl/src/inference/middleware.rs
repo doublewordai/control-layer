@@ -49,7 +49,8 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// responses→chat completions conversion.
     pub loopback_base_url: String,
     /// dwctl database pool for model access validation.
-    pub dwctl_pool: sqlx::PgPool,
+    /// Live provider (not a pinned pool): survives runtime pool swaps.
+    pub dwctl_pool: sqlx_pool_router::DynPools,
     /// Fusillade-backed response store. Used by the control plane here for
     /// `previous_response_id` hydration, and by `GET /v1/responses/{id}`.
     pub response_store: Arc<super::store::FusilladeResponseStore<P>>,
@@ -255,7 +256,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     .unwrap();
             }
             Some(key) => {
-                if let Err(msg) = crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.clone(), key, model).await {
+                if let Err(msg) = crate::error_enrichment::validate_api_key_model_access(state.dwctl_pool.write().into_inner(), key, model).await {
                     return Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .header("content-type", "application/json")
@@ -269,7 +270,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     }
 
     if matches!(service_tier, ServiceTier::Background) {
-        match api_key_creator_can_run_background(&state.dwctl_pool, api_key.as_deref()).await {
+        match api_key_creator_can_run_background(&state.dwctl_pool.write(), api_key.as_deref()).await {
             Ok(Some(true)) => {}
             Ok(Some(false)) => {
                 return Response::builder()
@@ -312,12 +313,12 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // exist before returning 202). Flex uses the key owner's hidden batch key
     // below, so resolving it there also supplies the attribution target.
     let created_by = if background && matches!(service_tier, ServiceTier::Realtime) {
-        response_store::lookup_created_by(&state.dwctl_pool, api_key.as_deref()).await
+        response_store::lookup_created_by(&state.dwctl_pool.write(), api_key.as_deref()).await
     } else {
         None
     };
     let queued_batch_key = if is_daemon_processed {
-        match resolve_flex_batch_api_key(&state.dwctl_pool, api_key.as_deref()).await {
+        match resolve_flex_batch_api_key(&state.dwctl_pool.write(), api_key.as_deref()).await {
             Ok(Some(key)) => Some(key),
             Ok(None) => {
                 tracing::warn!(service_tier = %service_tier, "Queued API key disappeared before hidden batch-key resolution");
@@ -437,10 +438,10 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 // keys), mirroring how CurrentUser is derived, so the console's
                 // org-scoped image-view authorization lines up.
                 let attribution = match api_key.as_deref() {
-                    Some(key) => crate::api::handlers::images::resolve_image_attribution(&state.dwctl_pool, key).await,
+                    Some(key) => crate::api::handlers::images::resolve_image_attribution(&state.dwctl_pool.write(), key).await,
                     None => None,
                 };
-                let access_pool = Some(state.dwctl_pool.clone());
+                let access_pool = Some(state.dwctl_pool.write().into_inner());
                 match normalize_value_to_tokens(&mut request_value, &state.image_normalizer, access_pool, attribution).await {
                     Ok(n) => {
                         if n > 0 {

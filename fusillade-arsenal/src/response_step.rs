@@ -56,7 +56,7 @@ impl<P: PoolProvider> PostgresResponseStepManager<P> {
     }
 
     fn write_executor(&self) -> crate::db::RetryingPgPool {
-        crate::db::RetryingPgPool::new(self.pools.write(), &self.db_retry_config)
+        crate::db::RetryingPgPool::new(&self.pools.write(), &self.db_retry_config)
     }
 }
 

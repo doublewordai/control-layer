@@ -5,7 +5,7 @@
 
 use crate::request::AnyRequest;
 use futures::StreamExt;
-pub use sqlx_pool_router::{PoolProvider, TestDbPools};
+pub use sqlx_pool_router::{DynPools, PoolHandle, PoolProvider, TestDbPools};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -415,23 +415,23 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     }
 
     fn read_executor(&self) -> crate::db::RetryingPgPool {
-        crate::db::RetryingPgPool::new(self.pools.read(), &self.db_retry_config)
+        crate::db::RetryingPgPool::new(&self.pools.read(), &self.db_retry_config)
     }
 
     fn write_executor(&self) -> crate::db::RetryingPgPool {
-        crate::db::RetryingPgPool::new(self.pools.write(), &self.db_retry_config)
+        crate::db::RetryingPgPool::new(&self.pools.write(), &self.db_retry_config)
     }
 
     async fn begin_read(
         &self,
     ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
-        crate::db::begin_transaction(self.pools.read(), &self.db_retry_config).await
+        crate::db::begin_transaction(&self.pools.read(), &self.db_retry_config).await
     }
 
     async fn begin_write(
         &self,
     ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
-        crate::db::begin_transaction(self.pools.write(), &self.db_retry_config).await
+        crate::db::begin_transaction(&self.pools.write(), &self.db_retry_config).await
     }
 
     async fn insert_batch_record(&self, input: NewBatchRecord) -> Result<Batch> {
@@ -794,8 +794,17 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// For backward compatibility, this returns the write pool (primary).
     /// Use the pool provider's `.read()` and `.write()` methods directly
     /// for explicit read/write routing.
-    pub fn pool(&self) -> &PgPool {
+    ///
+    /// Returns an owned handle to the pool that is active *now*; do not
+    /// cache it (the provider may replace its pools at runtime).
+    pub fn pool(&self) -> sqlx_pool_router::PoolHandle {
         self.pools.write()
+    }
+
+    /// The pool provider itself, for components that must stay live across
+    /// runtime pool swaps (hold this, not a `PoolHandle`).
+    pub fn pools(&self) -> &P {
+        &self.pools
     }
 
     /// Create a listener for real-time request updates.
@@ -803,7 +812,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// This returns a PgListener that can be used to receive notifications
     /// when requests are updated. Uses the write pool (primary) for consistency.
     pub async fn create_listener(&self) -> Result<PgListener> {
-        crate::db::connect_listener(self.pools.write(), &self.db_retry_config)
+        crate::db::connect_listener(&self.pools.write(), &self.db_retry_config)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e)))
     }
@@ -1159,7 +1168,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
             if is_complete {
                 // Spawn background finalization - don't block listing
-                let pool = self.pools.write().clone();
+                let pool = self.pools.write().into_inner();
                 let retry_config = self.db_retry_config.clone();
 
                 tokio::spawn(async move {
@@ -1226,7 +1235,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
         // Batch is complete - try to finalize this file
         let finalized = Self::finalize_file_size(
-            self.pools.write(),
+            &self.pools.write(),
             &self.db_retry_config,
             file.id,
             estimated_size,
@@ -3927,7 +3936,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         offset: usize,
         search: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>> {
-        let pool = self.pools.read().clone();
+        let pool = self.pools.read().into_inner();
         let retry_config = self.db_retry_config.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
@@ -6086,7 +6095,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         search: Option<String>,
         status: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>> {
-        let pool = self.pools.read().clone();
+        let pool = self.pools.read().into_inner();
         let retry_config = self.db_retry_config.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;

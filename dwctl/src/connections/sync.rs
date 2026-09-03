@@ -79,7 +79,7 @@ pub async fn build_sync_connection_job<P: PoolProvider + Clone + Send + Sync + '
                     "SyncConnectionJob failed"
                 );
                 // Mark the sync operation as failed
-                if let Ok(mut conn) = cx.state.dwctl_pool.acquire().await {
+                if let Ok(mut conn) = cx.state.dwctl_pool.write().acquire().await {
                     let _ = crate::db::handlers::connections::SyncOperations::new(&mut conn)
                         .update_status(input.sync_id, "failed")
                         .await;
@@ -117,7 +117,7 @@ pub async fn build_ingest_file_job<P: PoolProvider + Clone + Send + Sync + 'stat
                         "IngestFileJob failed"
                     );
                     // Mark entry as failed, then check if sync is complete
-                    if let Ok(mut conn) = cx.state.dwctl_pool.acquire().await {
+                    if let Ok(mut conn) = cx.state.dwctl_pool.write().acquire().await {
                         let _ = crate::db::handlers::connections::SyncEntries::new(&mut conn)
                             .update_status(input.sync_entry_id, "failed", Some(&e.to_string()))
                             .await;
@@ -164,7 +164,7 @@ pub async fn build_activate_batch_job<P: PoolProvider + Clone + Send + Sync + 's
             match run_activate_batch(&cx.state, &input).await {
                 Ok(()) => {
                     // Check if sync is now complete
-                    if let Ok(mut conn) = cx.state.dwctl_pool.acquire().await {
+                    if let Ok(mut conn) = cx.state.dwctl_pool.write().acquire().await {
                         let _ = crate::db::handlers::connections::SyncOperations::new(&mut conn)
                             .try_complete(input.sync_id)
                             .await;
@@ -191,7 +191,7 @@ pub async fn build_activate_batch_job<P: PoolProvider + Clone + Send + Sync + 's
                     }
 
                     // Fatal — mark entry as failed and update sync counters
-                    if let Ok(mut conn) = cx.state.dwctl_pool.acquire().await {
+                    if let Ok(mut conn) = cx.state.dwctl_pool.write().acquire().await {
                         let _ = crate::db::handlers::connections::SyncEntries::new(&mut conn)
                             .update_status(input.sync_entry_id, "failed", Some(&e.to_string()))
                             .await;
@@ -229,7 +229,7 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
 
     // 1. Load connection and decrypt config
     let (connection, config_json) = {
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         let connection = Connections::new(&mut conn)
             .get_by_id(input.connection_id)
             .await?
@@ -245,13 +245,13 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
 
     // 2. Update sync status to listing
     {
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         SyncOperations::new(&mut conn).update_status(input.sync_id, "listing").await?;
     }
 
     // 3. Load sync operation to get strategy
     let sync_op = {
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         SyncOperations::new(&mut conn)
             .get_by_id(input.sync_id)
             .await?
@@ -301,7 +301,7 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
             files.iter().map(|f| (f.key.clone(), f.last_modified)).collect();
 
         let already_synced = {
-            let mut conn = dwctl.acquire().await?;
+            let mut conn = dwctl.write().acquire().await?;
             SyncEntries::new(&mut conn)
                 .find_existing(input.connection_id, &keys_and_dates)
                 .await?
@@ -324,7 +324,7 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
         new_files.iter().map(|f| (f.key.clone(), f.last_modified, f.size_bytes)).collect();
 
     let entries = {
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         SyncEntries::new(&mut conn)
             .bulk_create(input.sync_id, input.connection_id, &entry_data)
             .await?
@@ -332,7 +332,7 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
 
     // 7. Update sync operation counters
     {
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         SyncOperations::new(&mut conn)
             .update_counters(input.sync_id, Some(files_found), Some(files_skipped), None, None, None)
             .await?;
@@ -358,7 +358,7 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
 
     if entries.is_empty() {
         // Nothing to ingest — mark sync as completed
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         SyncOperations::new(&mut conn).update_status(input.sync_id, "completed").await?;
     }
 
@@ -385,7 +385,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
 
     // 1. Mark entry as ingesting
     {
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         let updated = SyncEntries::new(&mut conn)
             .update_status(input.sync_entry_id, "ingesting", None)
             .await?;
@@ -397,7 +397,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
 
     // 2. Load connection and build provider
     let (connection, config_json) = {
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         let connection = Connections::new(&mut conn)
             .get_by_id(input.connection_id)
             .await?
@@ -414,7 +414,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
 
     // 3. Load sync config for this operation
     let sync_op = {
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         SyncOperations::new(&mut conn)
             .get_by_id(input.sync_id)
             .await?
@@ -446,7 +446,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
         let owner_id = connection.user_id;
         let triggered_by = sync_op.triggered_by;
 
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         let (_secret, key_id) = ApiKeys::new(&mut conn)
             .get_or_create_hidden_key_with_id(owner_id, ApiKeyPurpose::Batch, triggered_by)
             .await
@@ -791,7 +791,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                 Some(serde_json::json!(errors))
             };
 
-            let mut conn = dwctl.acquire().await?;
+            let mut conn = dwctl.write().acquire().await?;
             let updated = SyncEntries::new(&mut conn)
                 .set_ingested(
                     input.sync_entry_id,
@@ -875,7 +875,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
 
     // 1. Mark entry as activating — abort if entry was soft-deleted
     {
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         let updated = SyncEntries::new(&mut conn)
             .update_status(input.sync_entry_id, "activating", None)
             .await?;
@@ -887,7 +887,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
 
     // 2. Load sync config
     let sync_op = {
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         SyncOperations::new(&mut conn)
             .get_by_id(input.sync_id)
             .await?
@@ -910,7 +910,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     // 3. Load sync entry early — needed for retry detection (batch_id already set)
     //    and for provenance metadata / validation errors later.
     let sync_entry = {
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         SyncEntries::new(&mut conn)
             .get_by_id(input.sync_entry_id)
             .await?
@@ -937,7 +937,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         use crate::db::handlers::users::Users;
 
         let (owner_id, owner_verified) = {
-            let mut conn = dwctl.acquire().await?;
+            let mut conn = dwctl.write().acquire().await?;
             let owner_id = crate::db::handlers::connections::Connections::new(&mut conn)
                 .get_by_id(input.connection_id)
                 .await?
@@ -964,7 +964,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
                     "Skipped — this file wasn't batched because it would exceed your unverified \
                      upload limit. It will be retried automatically on your next sync. {message}"
                 );
-                let mut conn = dwctl.acquire().await?;
+                let mut conn = dwctl.write().acquire().await?;
                 SyncEntries::new(&mut conn)
                     .update_status(input.sync_entry_id, "skipped", Some(&entry_message))
                     .await?;
@@ -1030,12 +1030,12 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
             let model_aliases: Vec<String> = file_model_counts.keys().cloned().collect();
 
             let batch_model_info = {
-                let mut conn = dwctl.acquire().await?;
+                let mut conn = dwctl.write().acquire().await?;
                 Deployments::new(&mut conn).get_batch_model_info(&model_aliases).await?
             };
 
             let model_ids_by_alias = {
-                let mut conn = dwctl.acquire().await?;
+                let mut conn = dwctl.write().acquire().await?;
                 Deployments::new(&mut conn).get_model_ids_by_aliases(&model_aliases).await?
             };
 
@@ -1061,7 +1061,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
                 include_pending_counts: config.batches.pending_capacity_counts_enabled,
             };
 
-            match reserve_capacity(dwctl, &*state.request_manager, &cap_input).await {
+            match reserve_capacity(&dwctl.write(), &*state.request_manager, &cap_input).await {
                 Ok(ids) => ids,
                 Err(CapacityError::InsufficientCapacity { completion_window, models }) => {
                     return Err(ActivateError::Retryable(format!(
@@ -1086,7 +1086,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
             if !ids.is_empty() {
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
-                        if let Err(e) = crate::api::handlers::sla_capacity::release_reservations(&pool, &ids).await {
+                        if let Err(e) = crate::api::handlers::sla_capacity::release_reservations(&pool.write(), &ids).await {
                             tracing::warn!(error = %e, "Failed to release capacity reservations — will expire via TTL");
                         }
                     });
@@ -1102,7 +1102,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         use crate::db::handlers::api_keys::ApiKeys;
         use crate::db::models::api_keys::ApiKeyPurpose;
 
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         let connection = crate::db::handlers::connections::Connections::new(&mut conn)
             .get_by_id(input.connection_id)
             .await?
@@ -1168,7 +1168,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
         // persist fails transiently after create_batch_record succeeded.
         let mut persist_err = None;
         for attempt in 0..3 {
-            match dwctl.acquire().await {
+            match dwctl.write().acquire().await {
                 Ok(mut conn) => {
                     match sqlx::query!(
                         "UPDATE sync_entries SET batch_id = $2 WHERE id = $1 AND status != 'deleted'",
@@ -1248,7 +1248,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
     // Populate succeeded — requests are now in fusillade's pending queue and counted
     // by the capacity system. Release reservations immediately to avoid double-counting,
     // then defuse the guard so it doesn't release again on drop.
-    match crate::api::handlers::sla_capacity::release_reservations(&state.dwctl_pool, &reservation_ids).await {
+    match crate::api::handlers::sla_capacity::release_reservations(&state.dwctl_pool.write(), &reservation_ids).await {
         Ok(()) => {
             scopeguard::ScopeGuard::into_inner(release_guard);
         }
@@ -1276,7 +1276,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
                 sqlx::query_scalar("SELECT id FROM fusillade.request_templates WHERE file_id = $1 AND line_number = ANY($2)")
                     .bind(input.file_id)
                     .bind(&error_indices)
-                    .fetch_all(fusillade_pool)
+                    .fetch_all(&fusillade_pool)
                     .await
                     .map_err(|e| ActivateError::Retryable(format!("query templates: {e}")))?;
 
@@ -1287,7 +1287,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
                 .bind("Request failed validation during ingestion — check sync entry for details")
                 .bind(batch_id)
                 .bind(&template_ids)
-                .execute(fusillade_pool)
+                .execute(&fusillade_pool)
                 .await
                 .map_err(|e| ActivateError::Retryable(format!("fail invalid requests: {e}")))?;
 
@@ -1302,7 +1302,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
 
     // 9. Update sync entry with batch_id and activated status
     {
-        let mut conn = dwctl.acquire().await?;
+        let mut conn = dwctl.write().acquire().await?;
         SyncEntries::new(&mut conn).set_activated(input.sync_entry_id, batch_id).await?;
         SyncOperations::new(&mut conn)
             .increment_counter(input.sync_id, "batches_created")
@@ -1364,7 +1364,7 @@ mod tests {
 
         crate::tasks::TaskState {
             request_manager,
-            dwctl_pool: pool,
+            dwctl_pool: sqlx_pool_router::DynPools::new(pool),
             config: crate::SharedConfig::new(config),
             encryption_key: None,
             ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
