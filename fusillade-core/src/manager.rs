@@ -426,6 +426,13 @@ mod retention_policy_tests {
             Ok((0, 0))
         }
 
+        async fn ensure_request_template_partitions(
+            &self,
+            _weeks_ahead: i32,
+        ) -> Result<(i64, i64)> {
+            Ok((0, 0))
+        }
+
         async fn purge_model_filter_events(
             &self,
             _batch_size: i64,
@@ -1886,6 +1893,13 @@ pub trait DaemonStorage: Send + Sync {
     /// the `fusillade_archive_partitions_ahead` gauge, alert-worthy when it
     /// shrinks below 2.
     async fn ensure_archive_partitions(&self, weeks_ahead: i32) -> Result<(i64, i64)>;
+
+    /// Ensure weekly generation-2 template partitions exist through now +
+    /// `weeks_ahead` so the first upload of a week never pays for CREATE
+    /// TABLE + ATTACH inside its own (large, advisory-locked) transaction.
+    /// Returns `(created, ahead)` with the same meaning as
+    /// [`ensure_archive_partitions`](Self::ensure_archive_partitions).
+    async fn ensure_request_template_partitions(&self, weeks_ahead: i32) -> Result<(i64, i64)>;
 
     /// Purge old `model_filters` events, ALWAYS retaining, per model, the most
     /// recent `keep_per_model` events (so the current-state lookup and a short

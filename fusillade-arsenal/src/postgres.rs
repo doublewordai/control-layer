@@ -9414,6 +9414,30 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         Ok((i64::from(row.created), row.ahead))
     }
 
+    async fn ensure_request_template_partitions(&self, weeks_ahead: i32) -> Result<(i64, i64)> {
+        let (created, ahead): (i32, i64) = sqlx::query_as(
+            r#"
+            SELECT ensure_request_template_partitions(
+                       (date_trunc('week', now() AT TIME ZONE 'UTC'))::date, $1
+                   ),
+                   (SELECT COUNT(*) FROM generate_series(0, $1) AS w(i)
+                    WHERE to_regclass(
+                        'request_templates_g2_y'
+                        || to_char(date_trunc('week', now() AT TIME ZONE 'UTC')::date + (w.i * 7), 'IYYY')
+                        || 'w'
+                        || to_char(date_trunc('week', now() AT TIME ZONE 'UTC')::date + (w.i * 7), 'IW')
+                    ) IS NOT NULL)
+            "#,
+        )
+        .bind(weeks_ahead)
+        .fetch_one(self.write_executor())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to ensure request template partitions: {}", e))
+        })?;
+        Ok((i64::from(created), ahead))
+    }
+
     async fn purge_model_filter_events(
         &self,
         batch_size: i64,

@@ -443,6 +443,33 @@ async fn run_weekly_archive_partition_maintenance_loop<S>(
                 );
             }
         }
+        // Generation-2 templates share the weekly cadence: extend their runway
+        // here so the first upload of a week never creates its partition
+        // inside the upload's own transaction.
+        match maintenance_query(
+            &shutdown,
+            "request template partition ensure",
+            query_timeout,
+            storage.ensure_request_template_partitions(weeks_ahead),
+        )
+        .await
+        {
+            Ok(Some((created, ahead))) => {
+                gauge!("fusillade_request_template_partitions_ahead").set(ahead as f64);
+                if created > 0 {
+                    tracing::info!(created, ahead, "Created request template partitions");
+                }
+            }
+            Ok(None) => break,
+            Err(error) => {
+                crate::background_error!(
+                    "request_template_partition_ensure_failed",
+                    Error,
+                    error = %error,
+                    "Failed to ensure request template partitions"
+                );
+            }
+        }
         tokio::select! {
             _ = tokio::time::sleep(period) => {},
             _ = shutdown.cancelled() => break,
@@ -3990,6 +4017,14 @@ mod tests {
             } else {
                 Ok((0, 4))
             }
+        }
+
+        async fn ensure_request_template_partitions(
+            &self,
+            _weeks_ahead: i32,
+        ) -> Result<(i64, i64)> {
+            self.record("template_runway");
+            Ok((0, 4))
         }
 
         async fn purge_model_filter_events(

@@ -3567,14 +3567,6 @@ fn row_metadata_matches(
         && left.schema_version == right.schema_version
 }
 
-async fn sha256(tx: &mut Transaction<'_, Postgres>, bytes: &[u8]) -> MovementResult<Vec<u8>> {
-    sqlx::query_scalar("SELECT sha256($1::bytea)")
-        .bind(bytes)
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(database_failure)
-}
-
 async fn lock_active_partition(
     tx: &mut Transaction<'_, Postgres>,
     delete_on: NaiveDate,
@@ -3742,9 +3734,10 @@ async fn insert_and_verify_objects(
 
     let expected_bytes = canonical_payload_bytes(expected)?;
     let actual_bytes = canonical_payload_bytes(&actual)?;
-    if expected_bytes.len() != actual_bytes.len()
-        || sha256(tx, &expected_bytes).await? != sha256(tx, &actual_bytes).await?
-    {
+    // Both byte strings are already in memory (the read-back row was decoded
+    // locally), so compare them directly rather than shipping each payload
+    // back to the server to be hashed there.
+    if expected_bytes != actual_bytes {
         return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
     }
     Ok(())
