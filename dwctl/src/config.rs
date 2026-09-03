@@ -215,6 +215,12 @@ pub struct Config {
     /// tokenizer-svc URL, and the default pricing multipliers. See [`CacheConfig`].
     #[serde(default)]
     pub cache: CacheConfig,
+    /// The ClickHouse warehouse connection (endpoint, database, credential), shared by
+    /// every feature that writes analytics records directly to ClickHouse. Absent (the
+    /// default) means no such feature may be enabled. Table names and flush cadence live
+    /// on the writing feature's own section. See [`crate::clickhouse::ClickhouseConfig`].
+    #[serde(default)]
+    pub clickhouse: Option<crate::clickhouse::ClickhouseConfig>,
     /// Mid-stream continuation (stream resume): the on/off flag, per-origin gates,
     /// and resume-behavior knobs. See [`ContinuationConfig`].
     #[serde(default)]
@@ -2732,6 +2738,7 @@ impl Default for Config {
             keystore: None,
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
+            clickhouse: None,
             continuation: ContinuationConfig::default(),
         }
     }
@@ -2964,6 +2971,15 @@ impl Config {
             }
         }
 
+        // A present `clickhouse` section must be usable: a bad endpoint or a missing
+        // password is a startup error, not a sink that fails every insert forever.
+        if let Some(ch) = &self.clickhouse
+            && let Err(e) = ch.validate()
+        {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {e}"),
+            });
+        }
         // Cached-input pricing needs a tokenizer-svc URL to count cache-prefix tokens.
         // Without it, every cacheable request silently degrades to no caching — fail fast
         // at startup instead, so an operator who flips the flag gets a clear error.

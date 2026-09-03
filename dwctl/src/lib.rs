@@ -142,6 +142,7 @@ fn install_crypto_provider() {
 
 pub mod api;
 pub mod auth;
+pub mod clickhouse;
 pub mod config;
 mod config_watcher;
 pub mod connections;

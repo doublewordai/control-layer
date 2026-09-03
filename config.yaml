@@ -498,6 +498,18 @@ cache:
 # completions pool, splicing the result into the client's still-open stream with
 # merged billing. Per-model activation is DATA, not config: a model rescues only
 # when its composite carries a completions pool with an enabled member.
+# ClickHouse warehouse connection, shared by every feature that writes analytics
+# records directly to ClickHouse (none in local dev). Absent = no such feature may be
+# enabled; present = must be complete, or startup fails. Table names and flush cadence
+# live on the writing feature's own section. In deployments the password comes from a
+# Kubernetes secret as DWCTL_CLICKHOUSE__PASSWORD.
+# clickhouse:
+#   endpoint_url: "https://<service>.eu-west-2.aws.clickhouse.cloud:8443"
+#   database: "clay"
+#   user: "dwctl"
+#   password: ""
+#   request_timeout: 30s
+
 continuation:
   # Global kill switch. When false (default), the layer is not added to the
   # stack and the request path is byte-identical to a build without it.

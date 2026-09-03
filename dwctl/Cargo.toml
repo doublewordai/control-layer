@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "11.1.0" # x-release-please-version
+version = "11.1.1" # x-release-please-version
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
@@ -46,14 +46,15 @@ log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # OpenTelemetry
-opentelemetry = "0.31.0"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = [
+opentelemetry = "0.32.0"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
   "http-proto",
+  "http-json",
   "reqwest-blocking-client",
   "reqwest-rustls",
 ] }
-tracing-opentelemetry = "0.32.1"
+tracing-opentelemetry = "0.33.0"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "trace"] }
 async-trait = "0.1"
@@ -90,8 +91,8 @@ axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
-outlet = "0.9.1"
-outlet-postgres = "0.6.0"
+outlet = "0.10.0"
+outlet-postgres = "0.7.0"
 brotli = "8.0"
 flate2 = "1"
 lettre = { version = "0.11", features = [

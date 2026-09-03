@@ -2614,6 +2614,7 @@ mod tests {
             image_normalizer: Default::default(),
             openapi: Default::default(),
             cache: Default::default(),
+            clickhouse: None,
             continuation: Default::default(),
             keystore: None,
         };

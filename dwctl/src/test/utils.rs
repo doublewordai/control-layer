@@ -205,6 +205,7 @@ pub fn create_test_config() -> crate::config::Config {
     let temp_dir = std::env::temp_dir().join(format!("dwctl-test-emails-{}", std::process::id()));
 
     crate::config::Config {
+        clickhouse: None,
         database_url: None,
         database_replica_url: None,
         database: crate::config::DatabaseConfig::External {
