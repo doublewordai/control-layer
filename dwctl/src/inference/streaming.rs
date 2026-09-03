@@ -11,10 +11,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::StreamExt;
+use onwards::strict::schemas::chat_completions::{ChatCompletionChunk, normalize_chat_completion_chunk_value};
 use serde_json::Value;
 use tokio::sync::{Notify, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
+use super::translation::responses::streaming::{StreamingEvent, StreamingState};
+use super::translation::responses::types::ResponsesRequest;
 use super::zdr;
 
 /// Buffer size for the flex replay channel: a finished request renders to a
@@ -29,6 +32,13 @@ pub struct LiveRelayConfig {
     /// Correctness fallback while the relay is primary — deliberately much
     /// slower than the 500ms used when live streaming is off.
     pub poll_fallback_interval: std::time::Duration,
+    /// `Some` on the Responses surface: the client's own request plus its
+    /// tracking id, used to reframe each relayed chunk into `response.*`
+    /// events. Relayed chunks are Chat Completions shaped (Responses reaches
+    /// `outbound_request` already translated to that shape — see its module
+    /// docs), so they need the same reframing `ResponsesStreamReframer` gives
+    /// the live warm path. `None` forwards chunks as-is (chat-completions).
+    pub responses_reframe: Option<(ResponsesRequest, String)>,
 }
 
 /// Ensures only one of {poll task, relay task} sends the terminal frame(s).
@@ -155,7 +165,15 @@ where
         let tx = tx.clone();
         let keystore = keystore.clone();
         let terminal = terminal.clone();
-        tokio::spawn(run_live_relay(live_relay.relay, request_id, keystore, tx, terminal, done_sentinel));
+        tokio::spawn(run_live_relay(
+            live_relay.relay,
+            request_id,
+            keystore,
+            tx,
+            terminal,
+            done_sentinel,
+            live_relay.responses_reframe,
+        ));
     }
 
     // Poll task: the HTTP response is already returning; this fills the stream
@@ -214,12 +232,21 @@ async fn run_live_relay(
     tx: mpsc::Sender<Result<Event, std::convert::Infallible>>,
     terminal: Arc<Terminal>,
     done_sentinel: bool,
+    responses_reframe: Option<(ResponsesRequest, String)>,
 ) {
     // Non-destructive fetch; `None` for a non-ZDR request.
     let zdr_key = match &keystore {
         Some(ks) => ks.get(&zdr::key_id(&request_id, zdr::KeyKind::Response)).await.ok().flatten(),
         None => None,
     };
+
+    // On the Responses surface, relayed chunks are Chat Completions shaped and
+    // need reframing into `response.*` events, mirroring `ResponsesStreamReframer`.
+    let mut reframe = responses_reframe.map(|(req, response_id)| {
+        let model = req.model.clone();
+        let state = StreamingState::new(&req, Some(&response_id));
+        (state, model, response_id)
+    });
 
     let mut stream = relay.subscribe(request_id);
 
@@ -237,8 +264,25 @@ async fn run_live_relay(
                 };
 
                 if msg.done {
-                    if terminal.claim() && done_sentinel {
-                        let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                    if !terminal.claim() {
+                        return;
+                    }
+                    match reframe.as_mut() {
+                        // Nothing in the raw relayed stream says "response
+                        // complete" — that only exists once reframed, so
+                        // finalize() (response.completed/output_item.done etc.)
+                        // has to run here rather than arriving as a message.
+                        Some((state, _, _)) => {
+                            for event in state.finalize() {
+                                if send_streaming_event(&tx, &event).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                        None if done_sentinel => {
+                            let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+                        }
+                        None => {}
                     }
                     return;
                 }
@@ -254,15 +298,38 @@ async fn run_live_relay(
                     None => msg.data,
                 };
 
-                let Ok(parsed) = serde_json::from_str::<Value>(&payload) else {
+                let Ok(mut parsed) = serde_json::from_str::<Value>(&payload) else {
                     tracing::debug!(%request_id, "relayed chunk was not valid JSON, skipping");
                     continue;
                 };
 
-                if tx.send(Ok(Event::default().data(parsed.to_string()))).await.is_err() {
-                    return; // client disconnected
+                match reframe.as_mut() {
+                    Some((state, model, fallback_id)) => {
+                        normalize_chat_completion_chunk_value(&mut parsed, model, fallback_id);
+                        let Ok(chunk) = serde_json::from_value::<ChatCompletionChunk>(parsed) else {
+                            tracing::debug!(%request_id, "relayed chunk did not parse as a chat completion chunk, skipping");
+                            continue;
+                        };
+                        for event in state.process_chunk(&chunk) {
+                            if send_streaming_event(&tx, &event).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                    None => {
+                        if tx.send(Ok(Event::default().data(parsed.to_string()))).await.is_err() {
+                            return; // client disconnected
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+async fn send_streaming_event(tx: &mpsc::Sender<Result<Event, std::convert::Infallible>>, event: &StreamingEvent) -> Result<(), ()> {
+    let data = serde_json::to_string(event).unwrap_or_default();
+    tx.send(Ok(Event::default().event(event.event_type.clone()).data(data)))
+        .await
+        .map_err(|_| ())
 }

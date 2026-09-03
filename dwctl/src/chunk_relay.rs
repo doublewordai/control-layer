@@ -232,10 +232,10 @@ async fn publisher_loop(pool: Pool, mut rx: mpsc::Receiver<PublishMsg>, ttl_secs
         // Refresh the TTL periodically rather than on every message — halves
         // command volume, and the stream only needs to outlive its last write
         // by roughly stream_ttl_secs, not by an exact amount.
-        if msg.seq % EXPIRE_REFRESH_EVERY == 0 || msg.done {
-            if let Err(e) = cmd("EXPIRE").arg(&key).arg(ttl_secs).query_async::<i64>(&mut conn).await {
-                tracing::debug!(request_id = %msg.request_id, error = %e, "chunk relay EXPIRE failed");
-            }
+        if (msg.seq % EXPIRE_REFRESH_EVERY == 0 || msg.done)
+            && let Err(e) = cmd("EXPIRE").arg(&key).arg(ttl_secs).query_async::<i64>(&mut conn).await
+        {
+            tracing::debug!(request_id = %msg.request_id, error = %e, "chunk relay EXPIRE failed");
         }
     }
 }
