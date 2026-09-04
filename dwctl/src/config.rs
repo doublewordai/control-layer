@@ -805,6 +805,19 @@ pub struct SessionConfig {
     pub cookie_same_site: String,
     /// Optional Domain attribute for cookies (e.g. ".doubleword.ai" for cross-subdomain)
     pub cookie_domain: Option<String>,
+    /// Cookie name carrying the caller's active organization.
+    ///
+    /// Deployments that share a parent domain must give this a distinct value
+    /// per environment. A cookie set with `Domain=.example.com` is offered by
+    /// the browser to *every* host under that parent, so a staging or
+    /// second-region host sitting beside production receives production's copy
+    /// as well as its own. Both arrive under the same name in one `Cookie`
+    /// header, and same-name cookies are ordered by path length then creation
+    /// time (RFC 6265 §5.4) — domain specificity is not a tiebreaker — so which
+    /// one wins is decided by whichever the user happened to acquire first.
+    /// `cookie_domain` cannot prevent this from either side; only a distinct
+    /// name gives each environment its own slot.
+    pub org_cookie_name: String,
 }
 
 /// Password validation rules.
@@ -2911,6 +2924,7 @@ impl Default for SessionConfig {
             cookie_secure: true,
             cookie_same_site: "strict".to_string(),
             cookie_domain: None,
+            org_cookie_name: "dw_active_org".to_string(),
         }
     }
 }
@@ -3325,6 +3339,23 @@ impl Config {
                     operation: format!("Config validation: cookie_domain '{domain}' produces an invalid HTTP header value."),
                 });
             }
+        }
+
+        // Validate org_cookie_name — it is interpolated straight into a Set-Cookie
+        // header and matched as a `<name>=` prefix when reading, so it must be a
+        // bare RFC 6265 token.
+        let org_cookie_name = &self.auth.native.session.org_cookie_name;
+        let invalid_name = org_cookie_name.is_empty()
+            || org_cookie_name
+                .chars()
+                .any(|c| !c.is_ascii() || c.is_ascii_control() || c.is_whitespace() || "()<>@,;:\\\"/[]?={}".contains(c));
+        if invalid_name {
+            return Err(Error::Internal {
+                operation: format!(
+                    "Config validation: Invalid org_cookie_name '{org_cookie_name}'. \
+                     Must be a non-empty RFC 6265 cookie name (no whitespace, control characters, or separators)."
+                ),
+            });
         }
 
         // Validate CORS configuration
@@ -4655,6 +4686,60 @@ auth:
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_org_cookie_name_defaults_and_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+auth:
+  native:
+    session:
+      cookie_domain: ".doubleword.ai"
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            // Unset, the name is the historical hard-coded one, so production
+            // keeps working without pinning it.
+            let config = Config::load(&args)?;
+            assert_eq!(config.auth.native.session.org_cookie_name, "dw_active_org");
+
+            // Environments sharing the parent domain override it so prod's
+            // cookie cannot occupy their slot.
+            jail.set_env("DWCTL_AUTH__NATIVE__SESSION__ORG_COOKIE_NAME", "dw_active_org_staging");
+            let config = Config::load(&args)?;
+            assert_eq!(config.auth.native.session.org_cookie_name, "dw_active_org_staging");
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_invalid_org_cookie_name_rejected() {
+        // The names we actually deploy raise no org_cookie_name complaint.
+        for good in ["dw_active_org", "dw_active_org_staging", "dw_active_org_us", "dw_active_org_cl-1234"] {
+            let mut config = Config::default();
+            config.auth.native.session.org_cookie_name = good.to_string();
+            let complaint = config.validate().err().map(|e| e.to_string()).unwrap_or_default();
+            assert!(!complaint.contains("org_cookie_name"), "expected {good:?} to be accepted, got: {complaint}");
+        }
+
+        // Empty, whitespace and RFC 6265 separators would all produce a
+        // malformed Set-Cookie header or a prefix that never matches on read.
+        for bad in ["", "dw active org", "dw_active_org;", "dw=active", "dw_active_org\n", "dw_active_org\u{e9}"] {
+            let mut config = Config::default();
+            config.auth.native.session.org_cookie_name = bad.to_string();
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("org_cookie_name"), "expected {bad:?} to be rejected, got: {error}");
+        }
     }
 
     #[test]

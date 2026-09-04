@@ -156,6 +156,20 @@ auth:
       cookie_name: "dwctl_session"
       cookie_secure: true
       cookie_same_site: "strict"
+      # Cookie carrying the caller's active organization.
+      #
+      # Give this a distinct value per environment whenever several
+      # deployments share a parent domain and cookie_domain is set. A cookie
+      # scoped to `.example.com` is offered to every host beneath it, so a
+      # staging or second-region deployment receives the neighbouring
+      # deployment's copy alongside its own — under the same name, in the same
+      # Cookie header. Same-name cookies are ordered by path length then
+      # creation time (RFC 6265 §5.4); domain specificity is not a tiebreaker,
+      # so the winner is whichever the user acquired first. Narrowing
+      # cookie_domain cannot prevent this: a parent-domain cookie always
+      # reaches its subdomains. Only a distinct name gives each deployment its
+      # own slot.
+      org_cookie_name: "dw_active_org"
     password_reset_token_duration: "30m"
 
   # Proxy header authentication
