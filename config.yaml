@@ -711,15 +711,15 @@ background_services:
     # session-capable maintenance endpoint as response retirement.
     # batch_archive_retirement_enabled: false
     # batch_archive_retention_days: <positive days>
-    # Route NEW file-backed request templates into weekly generation-2
-    # partitions (reads stay generation-transparent). Prerequisite for the
-    # template retention lifecycle; the legacy heap freezes once enabled.
+    # DEPRECATED and ignored: request templates are always written to the
+    # weekly generation-2 partitions now that the generation-1 heap has been
+    # retired. The key still parses so existing values files keep loading,
+    # but it logs a warning at startup. Remove it.
     # template_generation_writes_enabled: false
     # File-content expiry + weekly template partition retirement. Tombstones
     # aged input-file metadata (rows survive) once every referencing batch's
     # content is expired, then drops whole template weeks that no live file
-    # references. Requires the generation-2 write cutover above and the same
-    # session-capable maintenance endpoint.
+    # references. Requires the same session-capable maintenance endpoint.
     # template_retirement_enabled: false
     # template_retention_days: <positive days>
     # retained_response_partition_maintenance_url: <direct session-capable postgres endpoint>

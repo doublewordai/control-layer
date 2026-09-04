@@ -402,18 +402,18 @@ async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
         "messages": [{ "role": "user", "content": ASYNC_PROMPT_SENTINEL }]
     })
     .to_string();
-    sqlx::query(
-        "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method)
-         VALUES ($1, $2, 'pikachu-async', $3, $4, '/v1/chat/completions', $5, 'req-1', 'POST')",
+    crate::test::utils::insert_fusillade_template(
+        &pool,
+        template_id,
+        Some(file_id),
+        "pikachu-async",
+        &batch_api_key,
+        &mock_server.uri(),
+        "/v1/chat/completions",
+        &request_body,
+        Some("req-1"),
     )
-    .bind(template_id)
-    .bind(file_id)
-    .bind(&batch_api_key)
-    .bind(mock_server.uri())
-    .bind(&request_body)
-    .execute(&pool)
-    .await
-    .expect("insert template");
+    .await;
 
     let batch_id = uuid::Uuid::new_v4();
     sqlx::query(

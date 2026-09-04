@@ -1811,13 +1811,13 @@ pub struct DaemonConfig {
     pub batch_metadata_fields: Vec<String>,
 
     /// Interval for running the orphaned row purge task (milliseconds).
-    /// Deletes orphaned request_templates and requests whose parent file/batch
+    /// Deletes orphaned request templates and requests whose parent file/batch
     /// has been soft-deleted, for right-to-erasure compliance.
     /// Set to 0 to disable purging. Default: 600000 (10 minutes).
     pub purge_interval_ms: u64,
 
     /// Maximum number of orphaned rows to delete per purge iteration.
-    /// Each iteration deletes up to this many requests and this many request_templates.
+    /// Each iteration deletes up to this many requests and this many request templates.
     /// Default: 1000.
     pub purge_batch_size: i64,
 
@@ -1872,10 +1872,12 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub batch_archive_retirement_enabled: bool,
 
-    /// Route new file-backed request templates into the weekly generation-2
-    /// store. Reads are generation-transparent either way.
-    #[serde(default)]
-    pub template_generation_writes_enabled: bool,
+    /// Deprecated and ignored: the weekly generation-2 template store is the
+    /// only write path since the generation-1 heap was retired. The key is
+    /// still accepted so existing values files keep parsing; a warning is
+    /// logged at startup when it is set. Remove it from your configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub template_generation_writes_enabled: Option<bool>,
 
     /// Allow file-content expiry and weekly template partition retirement.
     /// Disabled by default and additionally requires an explicit retention
@@ -2246,7 +2248,7 @@ impl Default for DaemonConfig {
             retained_response_retirement_enabled: false,
             batch_archive_retirement_enabled: false,
             batch_archive_retention_days: None,
-            template_generation_writes_enabled: false,
+            template_generation_writes_enabled: None,
             template_retirement_enabled: false,
             template_retention_days: None,
             retained_response_partition_maintenance_url: None,
@@ -3542,7 +3544,6 @@ mod tests {
             "retained_response_retirement_enabled",
             "batch_archive_retirement_enabled",
             "batch_archive_retention_days",
-            "template_generation_writes_enabled",
             "template_retirement_enabled",
             "template_retention_days",
         ] {
@@ -4139,7 +4140,8 @@ secret_key: "test-secret-key"
         daemon.retained_response_retirement_enabled = true;
         daemon.batch_archive_retirement_enabled = true;
         daemon.batch_archive_retention_days = Some(1);
-        daemon.template_generation_writes_enabled = true;
+        // Deprecated no-op key: still parses, never rejects.
+        daemon.template_generation_writes_enabled = Some(true);
         daemon.template_retirement_enabled = true;
         daemon.template_retention_days = Some(1);
         assert!(config.validate().is_ok(), "{:?}", config.validate().err());

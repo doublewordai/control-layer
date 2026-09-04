@@ -123,7 +123,7 @@ fn exact_policy(tiers: &[(&str, u64)]) -> RetentionPolicy {
 async fn assert_wholly_erased(pool: &PgPool, graph: &LiveGraph) {
     assert_eq!(count_ids(pool, "requests", &graph.request_ids).await, 0);
     assert_eq!(
-        count_ids(pool, "request_templates", &graph.template_ids).await,
+        count_ids(pool, "request_templates_all", &graph.template_ids).await,
         0
     );
     assert_eq!(retained_counts(pool, graph.group_id).await, (0, 0));
@@ -558,11 +558,7 @@ async fn erase_live_graph_preserves_a_template_shared_by_an_unrelated_request(po
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM request_templates WHERE id = $1")
-        .bind(survivor.template_ids[0])
-        .execute(&pool)
-        .await
-        .unwrap();
+    delete_template_row(&pool, survivor.template_ids[0]).await;
     let manager = manager(&pool).await;
 
     assert_eq!(
@@ -575,7 +571,7 @@ async fn erase_live_graph_preserves_a_template_shared_by_an_unrelated_request(po
     assert_eq!(count_ids(&pool, "requests", &erased.request_ids).await, 0);
     assert_eq!(count_ids(&pool, "requests", &survivor.request_ids).await, 1);
     assert_eq!(
-        count_ids(&pool, "request_templates", &erased.template_ids).await,
+        count_ids(&pool, "request_templates_all", &erased.template_ids).await,
         1
     );
 }
@@ -967,7 +963,7 @@ async fn erase_racing_same_id_create_rolls_back_request_and_template(pool: PgPoo
     assert_write_error(&error, RetainedResponseWriteError::NotFound);
     assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
     let leaked: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM request_templates WHERE body = 'must_not_survive' OR api_key = 'must-not-survive'",
+        "SELECT COUNT(*) FROM request_templates_all WHERE body = 'must_not_survive' OR api_key = 'must-not-survive'",
     )
     .fetch_one(&pool)
     .await
@@ -1042,7 +1038,7 @@ async fn bulk_duplicate_identical_id_persists_one_request_and_one_template(pool:
         .1
         .expect("the synthesized request must reference a template");
     let templates: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM request_templates \
+        "SELECT COUNT(*) FROM request_templates_all \
          WHERE id = $1 OR body LIKE '%must_not%_synthesized%'",
     )
     .bind(template_id)
@@ -1082,7 +1078,7 @@ async fn bulk_duplicate_conflicting_id_uses_first_record_without_orphans(pool: P
         SELECT request.response_body, request.model, request.created_by,
                template.body, template.api_key
         FROM requests request
-        JOIN request_templates template ON template.id = request.template_id
+        JOIN request_templates_all template ON template.id = request.template_id
         WHERE request.id = $1
         "#,
     )
@@ -1101,7 +1097,7 @@ async fn bulk_duplicate_conflicting_id_uses_first_record_without_orphans(pool: P
         )
     );
     let templates: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM request_templates WHERE body LIKE '%winner%' OR body LIKE '%loser%'",
+        "SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%winner%' OR body LIKE '%loser%'",
     )
     .fetch_one(&pool)
     .await
@@ -1178,7 +1174,7 @@ async fn bulk_mixed_fenced_batch_rolls_back_live_and_fresh_siblings(pool: PgPool
     assert_wholly_retained(&pool, &retained).await;
     assert_wholly_erased(&pool, &erased).await;
     let leaked: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not%_synthesized%'",
+        "SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not%_synthesized%'",
     )
     .fetch_one(&pool)
     .await
@@ -1303,7 +1299,7 @@ async fn late_request_writers_treat_an_active_retained_graph_as_terminal(pool: P
 
     assert_wholly_retained(&pool, &graph).await;
     let orphan_templates: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
+        "SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
     )
     .fetch_one(&pool)
     .await
@@ -1508,7 +1504,7 @@ async fn late_synthesis_is_fenced_after_the_retained_partition_disappears(pool: 
     assert_write_error(&error, RetainedResponseWriteError::NotFound);
     assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
     let orphan_templates: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
+        "SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
     )
     .fetch_one(&pool)
     .await
@@ -1567,7 +1563,7 @@ async fn retiring_route_blocks_late_synthesis_after_archive_fence_expiry(pool: P
     assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM request_templates \
+            "SELECT COUNT(*) FROM request_templates_all \
              WHERE body LIKE '%must_not%' OR api_key = 'must-not-survive'",
         )
         .fetch_one(&pool)
@@ -2011,6 +2007,34 @@ async fn fence_partition_for_retirement(tx: &mut Transaction<'_, Postgres>, dele
     .unwrap();
 }
 
+/// Guarantee this UTC week's generation-2 template partition so fixture
+/// templates can be inserted directly.
+async fn ensure_current_template_week(pool: &PgPool) {
+    sqlx::query(
+        "SELECT ensure_request_template_partition( \
+             date_trunc('week', statement_timestamp() AT TIME ZONE 'UTC')::date, NULL)",
+    )
+    .execute(pool)
+    .await
+    .expect("current template week must exist");
+}
+
+/// Remove one template row and its route, whatever its ownership, to model
+/// an already-erased template.
+async fn delete_template_row(pool: &PgPool, template_id: Uuid) {
+    sqlx::query(
+        "WITH removed AS ( \
+             DELETE FROM request_templates_g2 WHERE id = $1 RETURNING id \
+         ) \
+         DELETE FROM request_template_routes route USING removed \
+         WHERE route.template_id = removed.id",
+    )
+    .bind(template_id)
+    .execute(pool)
+    .await
+    .expect("template row must delete");
+}
+
 async fn insert_request(
     pool: &PgPool,
     tier: &str,
@@ -2021,16 +2045,23 @@ async fn insert_request(
     let request_id = Uuid::new_v4();
     let template_id = Uuid::new_v4();
     let body = format!(r#"{{"prompt":"fixture-{body_suffix}"}}"#);
+    ensure_current_template_week(pool).await;
     sqlx::query(
         r#"
-        INSERT INTO request_templates (
-            id, file_id, custom_id, endpoint, method, path, body, model,
-            api_key, line_number, body_byte_size, metadata, created_at, updated_at
-        ) VALUES (
-            $1, NULL, $2, 'http://retention.invalid', 'POST', '/v1/responses',
-            $3, $4, 'secret-test-key', 7, $5, $6,
-            $7 - INTERVAL '1 hour', $7 - INTERVAL '30 minutes'
+        WITH inserted AS (
+            INSERT INTO request_templates_g2 (
+                created_on, id, file_id, custom_id, endpoint, method, path, body, model,
+                api_key, line_number, body_byte_size, metadata, created_at, updated_at
+            ) VALUES (
+                (statement_timestamp() AT TIME ZONE 'UTC')::date,
+                $1, NULL, $2, 'http://retention.invalid', 'POST', '/v1/responses',
+                $3, $4, 'secret-test-key', 7, $5, $6,
+                $7 - INTERVAL '1 hour', $7 - INTERVAL '30 minutes'
+            )
+            RETURNING id, created_on
         )
+        INSERT INTO request_template_routes (template_id, week_start)
+        SELECT id, date_trunc('week', created_on)::date FROM inserted
         "#,
     )
     .bind(template_id)
@@ -2194,7 +2225,7 @@ async fn assert_wholly_live(pool: &PgPool, graph: &LiveGraph) {
         graph.request_ids.len() as i64
     );
     assert_eq!(
-        count_ids(pool, "request_templates", &graph.template_ids).await,
+        count_ids(pool, "request_templates_all", &graph.template_ids).await,
         graph.template_ids.len() as i64
     );
     assert_eq!(retained_counts(pool, graph.group_id).await, (0, 0));
@@ -2203,7 +2234,7 @@ async fn assert_wholly_live(pool: &PgPool, graph: &LiveGraph) {
 async fn assert_wholly_retained(pool: &PgPool, graph: &LiveGraph) {
     assert_eq!(count_ids(pool, "requests", &graph.request_ids).await, 0);
     assert_eq!(
-        count_ids(pool, "request_templates", &graph.template_ids).await,
+        count_ids(pool, "request_templates_all", &graph.template_ids).await,
         0
     );
     assert_eq!(
@@ -2693,7 +2724,7 @@ async fn discovered_graph_deleted_before_locking_is_a_clean_noop(pool: PgPool) {
 
     assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
     assert_eq!(
-        count_ids(&pool, "request_templates", &graph.template_ids).await,
+        count_ids(&pool, "request_templates_all", &graph.template_ids).await,
         graph.template_ids.len() as i64,
         "the mover must not touch a template whose request it never locked"
     );
@@ -2919,11 +2950,7 @@ async fn a_dedicated_template_shared_with_a_live_request_is_left_in_place(pool: 
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM request_templates WHERE id = $1")
-        .bind(survivor.template_ids[0])
-        .execute(&pool)
-        .await
-        .unwrap();
+    delete_template_row(&pool, survivor.template_ids[0]).await;
     let manager = manager(&pool).await;
 
     let outcome = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
@@ -2939,7 +2966,7 @@ async fn a_dedicated_template_shared_with_a_live_request_is_left_in_place(pool: 
     assert_eq!(retained_counts(&pool, moved.group_id).await, (1, 1));
     assert_eq!(count_ids(&pool, "requests", &survivor.request_ids).await, 1);
     assert_eq!(
-        count_ids(&pool, "request_templates", &moved.template_ids).await,
+        count_ids(&pool, "request_templates_all", &moved.template_ids).await,
         1,
         "the shared template row must survive with its live reference"
     );
@@ -3064,7 +3091,7 @@ async fn exact_idempotent_replay_accepts_matching_objects_and_routes(pool: PgPoo
     )
     .await;
     sqlx::query(
-        "CREATE TABLE retention_test_replay_templates AS SELECT * FROM request_templates WHERE id = ANY($1)",
+        "CREATE TABLE retention_test_replay_templates AS SELECT * FROM request_templates_g2 WHERE id = ANY($1)",
     )
     .bind(&graph.template_ids)
     .execute(&pool)
@@ -3082,10 +3109,17 @@ async fn exact_idempotent_replay_accepts_matching_objects_and_routes(pool: PgPoo
     let first = archive(&manager, &policy, 1, i64::MAX).await.unwrap();
     assert_eq!(first.groups_archived, 1);
 
-    sqlx::query("INSERT INTO request_templates SELECT * FROM retention_test_replay_templates")
+    sqlx::query("INSERT INTO request_templates_g2 SELECT * FROM retention_test_replay_templates")
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query(
+        "INSERT INTO request_template_routes (template_id, week_start) \
+         SELECT id, date_trunc('week', created_on)::date FROM retention_test_replay_templates",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO requests SELECT * FROM retention_test_replay_requests")
         .execute(&pool)
         .await
@@ -4314,14 +4348,20 @@ async fn erase_in_overlap_state_removes_both_copies_and_stays_erased(pool: PgPoo
     // retained copy rather than double-counting one logical request.
     sqlx::query(
         r#"
-        INSERT INTO request_templates (
-            id, file_id, endpoint, method, path, body, model, api_key,
-            line_number, body_byte_size, created_at, updated_at
-        ) VALUES (
-            $1, NULL, 'http://retention.invalid', 'POST', '/v1/responses',
-            '{"prompt":"duplicate"}', $2, 'secret-test-key', 0, 22,
-            '2026-08-01 08:00:00Z', '2026-08-01 10:00:00Z'
+        WITH inserted AS (
+            INSERT INTO request_templates_g2 (
+                created_on, id, file_id, endpoint, method, path, body, model, api_key,
+                line_number, body_byte_size, created_at, updated_at
+            ) VALUES (
+                (statement_timestamp() AT TIME ZONE 'UTC')::date,
+                $1, NULL, 'http://retention.invalid', 'POST', '/v1/responses',
+                '{"prompt":"duplicate"}', $2, 'secret-test-key', 0, 22,
+                '2026-08-01 08:00:00Z', '2026-08-01 10:00:00Z'
+            )
+            RETURNING id, created_on
         )
+        INSERT INTO request_template_routes (template_id, week_start)
+        SELECT id, date_trunc('week', created_on)::date FROM inserted
         "#,
     )
     .bind(first.template_ids[0])
@@ -4454,14 +4494,20 @@ async fn read_mixed_live_and_retained_rows_do_not_double_count_or_split_demand(p
     // retained copy rather than double-counting one logical request.
     sqlx::query(
         r#"
-        INSERT INTO request_templates (
-            id, file_id, endpoint, method, path, body, model, api_key,
-            line_number, body_byte_size, created_at, updated_at
-        ) VALUES (
-            $1, NULL, 'http://retention.invalid', 'POST', '/v1/responses',
-            '{"prompt":"duplicate"}', $2, 'secret-test-key', 0, 22,
-            '2026-08-01 08:00:00Z', '2026-08-01 10:00:00Z'
+        WITH inserted AS (
+            INSERT INTO request_templates_g2 (
+                created_on, id, file_id, endpoint, method, path, body, model, api_key,
+                line_number, body_byte_size, created_at, updated_at
+            ) VALUES (
+                (statement_timestamp() AT TIME ZONE 'UTC')::date,
+                $1, NULL, 'http://retention.invalid', 'POST', '/v1/responses',
+                '{"prompt":"duplicate"}', $2, 'secret-test-key', 0, 22,
+                '2026-08-01 08:00:00Z', '2026-08-01 10:00:00Z'
+            )
+            RETURNING id, created_on
         )
+        INSERT INTO request_template_routes (template_id, week_start)
+        SELECT id, date_trunc('week', created_on)::date FROM inserted
         "#,
     )
     .bind(first.template_ids[0])
@@ -4593,7 +4639,7 @@ async fn read_apis_fail_closed_for_retiring_and_dropped_buckets(pool: PgPool) {
     assert_graph_reads_not_found(&request_manager, &graph).await;
     assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
     assert_eq!(
-        count_ids(&pool, "request_templates", &graph.template_ids).await,
+        count_ids(&pool, "request_templates_all", &graph.template_ids).await,
         0
     );
     assert_eq!(retained_counts(&pool, graph.group_id).await, (0, 0));
@@ -4885,7 +4931,7 @@ async fn file_owned_singleton(
         .fetch_one(pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE request_templates SET file_id = $2 WHERE id = $1")
+    sqlx::query("UPDATE request_templates_g2 SET file_id = $2 WHERE id = $1")
         .bind(template_id)
         .bind(file_id)
         .execute(pool)
@@ -4918,7 +4964,7 @@ async fn a_file_owned_template_graph_moves_and_leaves_the_template_in_place(pool
         (1, graph.request_ids.len() as i64)
     );
     let template_survives: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM request_templates WHERE id = $1)")
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM request_templates_all WHERE id = $1)")
             .bind(template_id)
             .fetch_one(&pool)
             .await

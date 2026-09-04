@@ -870,7 +870,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
         .execute(&pool)
         .await
         .unwrap();
-    MIGRATOR
+    through_retention
         .run(&pool)
         .await
         .expect("the migration must reapply after rollback");
@@ -885,7 +885,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
         .execute(&pool)
         .await
         .unwrap();
-    MIGRATOR
+    through_retention
         .run(&pool)
         .await
         .expect("the empty up/down cycle must remain reversible");

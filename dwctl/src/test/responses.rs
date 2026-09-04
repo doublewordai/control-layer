@@ -506,7 +506,7 @@ async fn complete_response_fails_closed_for_erased_identity_without_synthesis(po
         .await
         .unwrap();
     assert_eq!(live, 0);
-    let leaked_templates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not_leak%'")
+    let leaked_templates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not_leak%'")
         .fetch_one(&fusillade_pool)
         .await
         .unwrap();
@@ -587,7 +587,7 @@ async fn complete_response_rechecks_a_fence_created_after_the_initial_miss(pool:
         0
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not_leak%'",)
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_templates_all WHERE body LIKE '%must_not_leak%'",)
             .fetch_one(&fusillade_pool)
             .await
             .unwrap(),
@@ -613,7 +613,7 @@ async fn complete_response_does_not_ignore_an_unproven_synthetic_create_error(po
     .await
     .unwrap();
     sqlx::query(
-        "CREATE TRIGGER reject_synthetic_template BEFORE INSERT ON request_templates \
+        "CREATE TRIGGER reject_synthetic_template BEFORE INSERT ON request_templates_g2 \
          FOR EACH ROW EXECUTE FUNCTION reject_synthetic_template()",
     )
     .execute(&fusillade_pool)
@@ -1121,7 +1121,7 @@ async fn response_body_len(pool: &PgPool, id: uuid::Uuid) -> i32 {
 async fn request_body_len(pool: &PgPool, id: uuid::Uuid) -> i32 {
     sqlx::query_scalar(
         "SELECT length(coalesce(t.body, '')) \
-         FROM fusillade.requests r JOIN fusillade.request_templates t ON t.id = r.template_id \
+         FROM fusillade.requests r JOIN fusillade.request_templates_all t ON t.id = r.template_id \
          WHERE r.id = $1",
     )
     .bind(id)
