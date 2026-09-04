@@ -1,14 +1,15 @@
 //! Fusillade-backed implementation of onwards' `ResponseStore` trait
 //! and standalone functions for creating/completing response records.
 //!
-//! All fusillade operations go through the `Storage` trait via `request_manager`.
-//! The only raw SQL is the `api_keys` lookup which queries a dwctl-owned table.
+//! All response reads go through fusillade's request store, which resolves
+//! either the live tables or an active retained-response route. The only raw
+//! SQL is the `api_keys` lookup which queries a dwctl-owned table.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fusillade::{RequestId, ResponseStepStore, StepId, Storage};
-use fusillade_arsenal::{PostgresRequestManager, PostgresResponseStepManager};
+use fusillade::{RequestId, RetainedResponseWriteError, Storage};
+use fusillade_arsenal::PostgresRequestManager;
 use sqlx_pool_router::PoolProvider;
 use uuid::Uuid;
 
@@ -25,10 +26,6 @@ pub struct OnwardsDaemonId(pub Uuid);
 /// ResponseStore implementation backed by fusillade's `Storage` trait.
 pub struct FusilladeResponseStore<P: PoolProvider + Clone> {
     request_manager: Arc<PostgresRequestManager<P>>,
-    /// Step manager, used by `get_response` to resolve responses stored as a
-    /// head step (produced before the multi-step loop was retired) back into a
-    /// Responses object. Optional: single-step callers construct without it.
-    step_manager: Option<Arc<PostgresResponseStepManager<P>>>,
     /// Keystore for decrypting ZDR response bodies on retrieval. `None` = no ZDR.
     keystore: Option<crate::keystore::Keystore>,
 }
@@ -37,16 +34,8 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     pub fn new(request_manager: Arc<PostgresRequestManager<P>>) -> Self {
         Self {
             request_manager,
-            step_manager: None,
             keystore: None,
         }
-    }
-
-    /// Wire in the step manager so `get_response` can resolve head-step-backed
-    /// responses (retained from before the multi-step loop was retired).
-    pub fn with_step_manager(mut self, step_manager: Arc<PostgresResponseStepManager<P>>) -> Self {
-        self.step_manager = Some(step_manager);
-        self
     }
 
     /// Wire in the keystore so ZDR response bodies are decrypted on retrieval.
@@ -57,57 +46,19 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
 
     /// Retrieve a response by ID. Used by the GET /v1/responses/{id} handler.
     ///
-    /// Two retrieval paths:
+    /// The id (`resp_<uuid>`) is itself a fusillade request id: a
+    /// `/v1/responses`, `/v1/chat/completions` or `/v1/embeddings` row
+    /// created by the realtime path. The lookup resolves either the live
+    /// row or its active retained-response snapshot.
     ///
-    /// * **Multi-step** — the id is a head step's uuid. We look up the
-    ///   head step, walk to its sub-request fusillade row, build the
-    ///   response envelope from that row (created_at, status, model,
-    ///   response_body) and stamp `resp_<head_step_uuid>` as the id.
-    ///
-    /// * **Single-step** — the id is itself a `fusillade.requests` id
-    ///   (a `/v1/chat/completions` or `/v1/embeddings` row created by
-    ///   the realtime path). When no head step matches, we fall back
-    ///   to the legacy lookup so `/v1/chat/completions` results stay
-    ///   retrievable via `GET /v1/responses/{id}` — the API surface
-    ///   the dashboard depends on.
-    ///
-    /// Returns [`ResponseLookup::NotFound`] only when neither lookup matches,
-    /// and [`ResponseLookup::Gone`] when the row exists but its ZDR response
+    /// Returns [`ResponseLookup::NotFound`] when no row matches, and
+    /// [`ResponseLookup::Gone`] when the row exists but its ZDR response
     /// body is an envelope whose key has been shredded (see the enum docs). The
     /// gone decision is made from the same keystore lookup that would decrypt,
     /// so there is no separate probe and no time-of-check/time-of-use gap.
     pub async fn get_response(&self, response_id: &str) -> Result<ResponseLookup, StoreError> {
         let parsed_uuid = parse_response_id(response_id)?;
 
-        // Multi-step path: try head_step first. Multi-step is the server-side
-        // tool loop, which ZDR rejects at submit, so these are never encrypted -
-        // no gone case here.
-        if let Some(step_manager) = self.step_manager.as_deref()
-            && let Some(head_step) = step_manager.get_step(StepId(parsed_uuid)).await.map_err(map_fusillade_err)?
-        {
-            // Head step exists → resolve via its sub-request fusillade
-            // row. CHECK constraint guarantees model_call ⇒
-            // request_id, so the unwrap below is well-defined for any
-            // committed head step.
-            let Some(sub_request_id) = head_step.request_id else {
-                return Ok(ResponseLookup::NotFound);
-            };
-            let detail = match self.request_manager.get_request_detail(sub_request_id).await {
-                Ok(d) => d,
-                Err(fusillade::FusilladeError::RequestNotFound(_)) => return Ok(ResponseLookup::NotFound),
-                Err(e) => return Err(StoreError::StorageError(format!("fetch head sub-request: {e}"))),
-            };
-            let mut resp = detail_to_response_object(&detail);
-            // Surface the user-facing id (head step uuid), not the
-            // internal sub-request uuid.
-            resp["id"] = serde_json::Value::String(format!("resp_{parsed_uuid}"));
-            return Ok(ResponseLookup::Found(resp));
-        }
-
-        // Single-step fallback: the id is itself a fusillade.requests
-        // row (chat completions / embeddings). Used by callers that
-        // GET a previously-issued non-multi-step request via the same
-        // /v1/responses/{id} endpoint.
         match self.request_manager.get_request_detail(RequestId(parsed_uuid)).await {
             Ok(mut detail) => {
                 if let Some(ks) = self.keystore.as_ref() {
@@ -138,14 +89,10 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
 pub enum ResponseLookup {
     /// The response object, ready to return.
     Found(serde_json::Value),
-    /// Neither the multi-step nor single-step lookup matched.
+    /// No live or retained request row matched the id.
     NotFound,
     /// A ZDR response whose key is gone; permanently unavailable.
     Gone,
-}
-
-fn map_fusillade_err(e: fusillade::FusilladeError) -> StoreError {
-    StoreError::StorageError(format!("fusillade: {e}"))
 }
 
 /// Mark a response as failed.
@@ -223,34 +170,29 @@ pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
     match request_manager.complete_request(RequestId(id), response_body, status_code).await {
         Ok(()) => return Ok(()),
         Err(fusillade::FusilladeError::RequestStateConflict { current_state, .. }) if is_terminal(&current_state) => {
-            tracing::info!(
-                response_id = %response_id,
-                final_state = %current_state,
-                "complete-response: row already in terminal state — idempotent success"
-            );
+            tracing::info!("complete-response observed a terminal row");
             return Ok(());
         }
-        Err(fusillade::FusilladeError::RequestStateConflict { current_state, .. }) => {
+        Err(fusillade::FusilladeError::RequestStateConflict { .. }) => {
             // Row exists in some non-terminal, non-processing state (e.g.
             // 'pending' or 'claimed'). This shouldn't happen for the realtime
             // path, but it's not our place to force-complete. Bubble up.
-            return Err(StoreError::StorageError(format!(
-                "Row exists for response {response_id} in unexpected state '{current_state}'"
-            )));
+            return Err(StoreError::StorageError("Response is not writable in its current state".to_owned()));
         }
         Err(fusillade::FusilladeError::RequestNotFound(_)) => {} // synthesize below
-        Err(e) => return Err(StoreError::StorageError(format!("Failed to complete request: {e}"))),
+        Err(error) => match RetainedResponseWriteError::from_fusillade_error(&error) {
+            Some(RetainedResponseWriteError::AlreadyRetained) => return Ok(()),
+            Some(RetainedResponseWriteError::NotFound) => return Err(response_unavailable()),
+            None => {
+                return Err(StoreError::StorageError("Failed to complete response".to_owned()));
+            }
+        },
     }
 
     // Row doesn't exist — synthesize it. create-response may race us; if it
     // wins between our failed UPDATE and our INSERT, the INSERT hits a PK
     // conflict and the retry UPDATE below sorts it out.
-    tracing::info!(
-        response_id = %response_id,
-        model = %create_ctx.model,
-        endpoint = %create_ctx.endpoint,
-        "complete-response synthesizing row (create-response hasn't run yet)"
-    );
+    tracing::info!("complete-response is synthesizing a missing row");
     if create_ctx.endpoint.is_empty() {
         // Empty endpoint means an upstream header is missing; better to fail
         // loudly than silently insert a row the /responses lookup can't find.
@@ -269,39 +211,40 @@ pub async fn complete_response_idempotent<P: PoolProvider + Clone>(
         api_key: create_ctx.api_key.unwrap_or("").to_string(),
         created_by: created_by.unwrap_or_default(),
     };
-    match request_manager.create_realtime(realtime_input).await {
-        Ok(_) => tracing::info!(
-            response_id = %response_id,
-            "Synthetic create from complete-response succeeded — row now exists in 'processing'"
-        ),
-        Err(e) => tracing::info!(
-            response_id = %response_id,
-            error = %e,
-            "Synthetic create from complete-response failed (likely create-response won the race) — proceeding to UPDATE"
-        ),
-    }
+    let create_failed = match request_manager.create_realtime(realtime_input).await {
+        Ok(_) => false,
+        Err(error) => match RetainedResponseWriteError::from_fusillade_error(&error) {
+            Some(RetainedResponseWriteError::AlreadyRetained) => return Ok(()),
+            Some(RetainedResponseWriteError::NotFound) => return Err(response_unavailable()),
+            None => true,
+        },
+    };
 
     // Retry the UPDATE. Same idempotency rules as the fast path: another
     // writer may have raced ahead to a terminal state in the window between
     // our first UPDATE and this retry.
     match request_manager.complete_request(RequestId(id), response_body, status_code).await {
         Ok(()) => {
-            tracing::info!(response_id = %response_id, "Second-attempt UPDATE succeeded — row now 'completed'");
+            tracing::info!("complete-response persisted the terminal row");
             Ok(())
         }
         Err(fusillade::FusilladeError::RequestStateConflict { current_state, .. }) if is_terminal(&current_state) => {
-            tracing::info!(
-                response_id = %response_id,
-                final_state = %current_state,
-                "complete-response: row already terminal after synthesis — idempotent success"
-            );
+            tracing::info!("complete-response observed a terminal row after synthesis");
             Ok(())
         }
-        Err(e) => {
-            tracing::warn!(response_id = %response_id, error = %e, "Second-attempt UPDATE failed");
-            Err(StoreError::StorageError(format!("Failed to complete after create: {e}")))
+        Err(fusillade::FusilladeError::RequestNotFound(_)) if create_failed => {
+            Err(StoreError::StorageError("Failed to synthesize response row".to_owned()))
         }
+        Err(error) => match RetainedResponseWriteError::from_fusillade_error(&error) {
+            Some(RetainedResponseWriteError::AlreadyRetained) => Ok(()),
+            Some(RetainedResponseWriteError::NotFound) => Err(response_unavailable()),
+            None => Err(StoreError::StorageError("Failed to complete synthesized response".to_owned())),
+        },
     }
+}
+
+fn response_unavailable() -> StoreError {
+    StoreError::NotFound("Response unavailable".to_owned())
 }
 
 /// True when the row has reached a state where re-completing it would be a
@@ -392,11 +335,11 @@ pub async fn lookup_created_by(pool: &sqlx::PgPool, api_key: Option<&str>) -> Op
             Some(user_id.to_string())
         }
         Ok(None) => {
-            tracing::warn!(key_prefix = &key[..8.min(key.len())], "API key not found for attribution");
+            tracing::warn!("API key was not found for response attribution");
             None
         }
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to look up API key for attribution");
+        Err(_) => {
+            tracing::error!("Failed to look up response attribution");
             None
         }
     }
@@ -683,7 +626,7 @@ pub fn detail_to_chat_completion_object(detail: &fusillade::RequestDetail) -> (u
             }),
         ),
         other => {
-            tracing::warn!(state = %other, request_id = %detail.id, "detail_to_chat_completion_object called on non-terminal state");
+            tracing::warn!(state = %other, "detail_to_chat_completion_object called on non-terminal state");
             (
                 500,
                 serde_json::json!({
@@ -922,9 +865,20 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
         Ok(id)
     }
 
-    async fn get_context(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
-        // Multi-step context lookups are never ZDR, so `Gone` cannot arise here;
-        // fold it into `None` alongside `NotFound` for a total mapping.
+    async fn get_context(&self, response_id: &str, owner: &str) -> Result<Option<serde_json::Value>, StoreError> {
+        // Ownership is checked on the resolved row (live or retained) before
+        // any content is returned: a foreign or batch response reads as absent.
+        let parsed_uuid = parse_response_id(response_id)?;
+        let detail = match self.request_manager.get_request_detail(RequestId(parsed_uuid)).await {
+            Ok(detail) => detail,
+            Err(fusillade::FusilladeError::RequestNotFound(_)) => return Ok(None),
+            Err(e) => return Err(StoreError::StorageError(format!("Failed to fetch previous response: {e}"))),
+        };
+        if detail.created_by != owner {
+            return Ok(None);
+        }
+        // Context lookups are never ZDR, so `Gone` cannot arise here; fold it
+        // into `None` alongside `NotFound` for a total mapping.
         Ok(match self.get_response(response_id).await? {
             ResponseLookup::Found(v) => Some(v),
             ResponseLookup::NotFound | ResponseLookup::Gone => None,

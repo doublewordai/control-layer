@@ -304,11 +304,6 @@ where
     /// Response store for Open Responses API lifecycle tracking.
     /// Reads/writes to fusillade's requests table.
     pub response_store: Arc<crate::inference::store::FusilladeResponseStore<P>>,
-    /// Multi-step response_steps storage. Optional so deployments that
-    /// don't use the multi-step Open Responses path can omit the
-    /// wiring; the GET /v1/responses/{id} handler degrades to 404 in
-    /// that case rather than panicking.
-    pub response_step_manager: Option<Arc<fusillade_arsenal::PostgresResponseStepManager<P>>>,
     /// Singleton image normaliser used by the realtime middleware, the
     /// batch ingest path, the dispatcher's JIT-signing step, and the
     /// dashboard `/images/:sha256` endpoint. Built once at startup so
@@ -800,6 +795,10 @@ async fn setup_component_pools(
 
 /// Setup database connections, run migrations, and initialize data.
 ///
+/// Returns the embedded database handle (if any), every database as a
+/// [`db::PoolPair`], and the retained-response partition-maintenance session
+/// pool when this process must run that recovery (always a direct session).
+///
 /// Every database comes back as a [`db::PoolPair`]: `pooled` carries all query
 /// traffic (through the transaction-pooling endpoint when `pooled_url` is
 /// configured) and `direct` the session-scoped work — LISTEN connections, the
@@ -808,10 +807,126 @@ async fn setup_component_pools(
 ///
 /// If `pool` is provided, it will be used directly instead of creating a new connection.
 /// This is useful for tests where sqlx::test provides a pool.
+#[derive(Debug, Clone, Copy)]
+struct RetainedResponseMaintenanceState {
+    unfinished_retirements: i64,
+    identity_mismatch: bool,
+    retired_routes_exist: bool,
+}
+
+fn partition_maintenance_required(daemon: &config::DaemonConfig, state: RetainedResponseMaintenanceState) -> anyhow::Result<bool> {
+    if state.identity_mismatch {
+        // Corruption of the durable lifecycle identity is global: no instance
+        // may start against it, whether or not it runs the daemon.
+        anyhow::bail!("retained-response retirement recovery identity is inconsistent");
+    }
+    if matches!(daemon.enabled, config::DaemonEnabled::Never) {
+        // This instance never runs the archive daemon, so it owns no
+        // maintenance session: in a split topology the daemon pods share this
+        // environment and are the ones that recover journals and clean routes.
+        // Say so loudly when durable work is pending, so a single-instance
+        // deployment that disabled its daemon cannot strand a retirement
+        // silently.
+        if state.unfinished_retirements > 0 || state.retired_routes_exist {
+            tracing::warn!(
+                unfinished_retirements = state.unfinished_retirements,
+                retired_routes_exist = state.retired_routes_exist,
+                "retained-response maintenance work is pending but the batch daemon never runs on this instance; \
+                 another instance must run it"
+            );
+        }
+        return Ok(false);
+    }
+    if state.retired_routes_exist && daemon.retention.max_late_writer_seconds.is_none() {
+        anyhow::bail!("retired response route cleanup requires an explicit late-writer fence period");
+    }
+    if state.retired_routes_exist && (daemon.purge_interval_ms == 0 || daemon.purge_batch_size < 1) {
+        anyhow::bail!("retired response route cleanup requires an enabled positive bounded cleanup configuration");
+    }
+    Ok(daemon.retained_response_retirement_enabled
+        || daemon.batch_archive_retirement_enabled
+        || daemon.template_retirement_enabled
+        || state.unfinished_retirements > 0)
+}
+
+#[cfg(test)]
+mod retained_response_maintenance_preflight_tests {
+    use super::*;
+
+    fn state(unfinished_retirements: i64, identity_mismatch: bool, retired_routes_exist: bool) -> RetainedResponseMaintenanceState {
+        RetainedResponseMaintenanceState {
+            unfinished_retirements,
+            identity_mismatch,
+            retired_routes_exist,
+        }
+    }
+
+    #[test]
+    fn an_instance_that_never_runs_the_daemon_owns_no_maintenance() {
+        // Split topology: the API pods carry the daemon pods' retention
+        // configuration and must start without a maintenance session, even
+        // while durable work is pending — the daemon pods own its recovery.
+        let mut daemon = config::DaemonConfig::default();
+        daemon.enabled = config::DaemonEnabled::Never;
+        daemon.retained_response_retirement_enabled = true;
+        daemon.batch_archive_retirement_enabled = true;
+        assert!(!partition_maintenance_required(&daemon, state(1, false, true)).unwrap());
+        // Corrupted lifecycle identity still stops every instance.
+        assert!(partition_maintenance_required(&daemon, state(0, true, false)).is_err());
+    }
+
+    #[test]
+    fn an_enabled_daemon_owns_maintenance_when_retirement_or_recovery_is_pending() {
+        let mut daemon = config::DaemonConfig::default();
+        daemon.enabled = config::DaemonEnabled::Always;
+        assert!(!partition_maintenance_required(&daemon, state(0, false, false)).unwrap());
+        assert!(partition_maintenance_required(&daemon, state(1, false, false)).unwrap());
+        daemon.retained_response_retirement_enabled = true;
+        assert!(partition_maintenance_required(&daemon, state(0, false, false)).unwrap());
+    }
+
+    #[test]
+    fn orphan_lifecycle_identity_always_fails_startup() {
+        let daemon = config::DaemonConfig::default();
+        let error = partition_maintenance_required(&daemon, state(0, true, false)).expect_err("orphan retiring state is not recoverable");
+        assert!(error.to_string().contains("identity is inconsistent"));
+    }
+
+    #[test]
+    fn retired_route_backlog_requires_fence_and_positive_bounded_cleanup() {
+        let mut daemon = config::DaemonConfig::default();
+        assert!(
+            partition_maintenance_required(&daemon, state(0, false, true))
+                .unwrap_err()
+                .to_string()
+                .contains("fence period")
+        );
+
+        daemon.retention.max_late_writer_seconds = Some(600);
+        daemon.purge_interval_ms = 0;
+        assert!(
+            partition_maintenance_required(&daemon, state(0, false, true))
+                .unwrap_err()
+                .to_string()
+                .contains("positive bounded cleanup")
+        );
+        daemon.purge_interval_ms = 1;
+        daemon.purge_batch_size = 0;
+        assert!(
+            partition_maintenance_required(&daemon, state(0, false, true))
+                .unwrap_err()
+                .to_string()
+                .contains("positive bounded cleanup")
+        );
+        daemon.purge_batch_size = 1;
+        assert!(!partition_maintenance_required(&daemon, state(0, false, true)).unwrap());
+    }
+}
+
 async fn setup_database(
     config: &Config,
     pool: Option<PgPool>,
-) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, db::DatabasePools)> {
+) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, db::DatabasePools, Option<PgPool>)> {
     let slow_threshold = std::time::Duration::from_millis(config.slow_statement_threshold_ms);
 
     let (embedded_db, main) = if let Some(existing_pool) = pool {
@@ -923,6 +1038,177 @@ async fn setup_database(
     // sqlx's migrator holds a session advisory lock: direct connections.
     fusillade_arsenal::migrator().run(&*fusillade.direct.write()).await?;
 
+    // Every batch-capable process performs the content-free preflight, even
+    // when its daemon is disabled. That makes disabling the last archive
+    // owner fail closed while durable retirement or route cleanup remains.
+    // Request-only processes intentionally ignore shared owner configuration.
+    let daemon = &config.background_services.batch_daemon;
+    let batch_capable = !matches!(daemon.mode, config::DaemonMode::RequestOnly);
+    let partition_maintenance_pool = if batch_capable {
+        let (unfinished_retirements, identity_mismatch, retired_routes_exist): (i64, bool, bool) = sqlx::query_as(
+            r#"
+            SELECT
+                (SELECT COUNT(*)::bigint
+                 FROM retention_partition_retirements
+                 WHERE completed_at IS NULL),
+                EXISTS (
+                    SELECT 1
+                    FROM retained_response_buckets bucket
+                    WHERE bucket.state IN ('retiring', 'retired')
+                      AND NOT (
+                        (bucket.state = 'retiring' AND EXISTS (
+                            SELECT 1
+                            FROM retention_partition_retirements journal
+                            JOIN pg_namespace namespace
+                              ON namespace.nspname = bucket.partition_schema
+                             AND namespace.oid = journal.partition_schema_oid
+                            JOIN pg_class parent
+                              ON parent.relnamespace = namespace.oid
+                             AND parent.relname = 'retained_response_objects'
+                             AND parent.oid = journal.parent_oid
+                            JOIN pg_class child
+                              ON child.relnamespace = namespace.oid
+                             AND child.relname = bucket.partition_table
+                             AND child.oid = bucket.partition_oid
+                            WHERE journal.parent_table = 'retained_response_objects'
+                              AND journal.partition_schema = bucket.partition_schema
+                              AND journal.partition_table = bucket.partition_table
+                              AND journal.partition_oid = bucket.partition_oid
+                              AND journal.lower_bound = bucket.delete_on
+                              AND journal.upper_bound = bucket.delete_on + 1
+                              AND journal.completed_at IS NULL
+                              AND bucket.partition_schema = current_schema()
+                              AND bucket.partition_table =
+                                  'retained_response_objects_d'
+                                  || to_char(bucket.delete_on, 'YYYYMMDD')
+                        )) OR (bucket.state = 'retired' AND EXISTS (
+                            SELECT 1
+                            FROM retention_partition_retirements journal
+                            JOIN pg_namespace namespace
+                              ON namespace.nspname = bucket.partition_schema
+                             AND namespace.oid = journal.partition_schema_oid
+                            JOIN pg_class parent
+                              ON parent.relnamespace = namespace.oid
+                             AND parent.relname = 'retained_response_objects'
+                             AND parent.oid = journal.parent_oid
+                            WHERE journal.parent_table = 'retained_response_objects'
+                              AND journal.partition_schema = bucket.partition_schema
+                              AND journal.partition_table = bucket.partition_table
+                              AND journal.partition_oid = bucket.partition_oid
+                              AND journal.lower_bound = bucket.delete_on
+                              AND journal.upper_bound = bucket.delete_on + 1
+                              AND journal.completed_at = bucket.state_changed_at
+                              AND bucket.partition_schema = current_schema()
+                              AND bucket.partition_table =
+                                  'retained_response_objects_d'
+                                  || to_char(bucket.delete_on, 'YYYYMMDD')
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM pg_class child
+                                  WHERE child.oid = bucket.partition_oid
+                              )
+                        ))
+                      )
+                ) OR EXISTS (
+                    SELECT 1
+                    FROM retention_partition_retirements journal
+                    WHERE journal.parent_table = 'retained_response_objects'
+                      AND journal.completed_at IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM retained_response_buckets bucket
+                          JOIN pg_namespace namespace
+                            ON namespace.nspname = bucket.partition_schema
+                           AND namespace.oid = journal.partition_schema_oid
+                          JOIN pg_class parent
+                            ON parent.relnamespace = namespace.oid
+                           AND parent.relname = 'retained_response_objects'
+                           AND parent.oid = journal.parent_oid
+                          JOIN pg_class child
+                            ON child.relnamespace = namespace.oid
+                           AND child.relname = bucket.partition_table
+                           AND child.oid = bucket.partition_oid
+                          WHERE bucket.state = 'retiring'
+                            AND bucket.partition_schema = journal.partition_schema
+                            AND bucket.partition_table = journal.partition_table
+                            AND bucket.partition_oid = journal.partition_oid
+                            AND bucket.delete_on = journal.lower_bound
+                            AND journal.upper_bound = journal.lower_bound + 1
+                            AND bucket.partition_schema = current_schema()
+                            AND bucket.partition_table =
+                                'retained_response_objects_d'
+                                || to_char(bucket.delete_on, 'YYYYMMDD')
+                      )
+                ),
+                EXISTS (
+                    SELECT 1 FROM retained_response_buckets bucket
+                    JOIN retention_partition_retirements journal
+                      ON journal.parent_table = 'retained_response_objects'
+                     AND journal.partition_schema = bucket.partition_schema
+                     AND journal.partition_table = bucket.partition_table
+                     AND journal.partition_oid = bucket.partition_oid
+                     AND journal.lower_bound = bucket.delete_on
+                     AND journal.upper_bound = bucket.delete_on + 1
+                     AND journal.completed_at = bucket.state_changed_at
+                    WHERE bucket.state = 'retired'
+                      AND journal.completed_at IS NOT NULL
+                      AND (
+                          EXISTS (SELECT 1 FROM retained_response_group_routes route
+                                  WHERE route.delete_on = bucket.delete_on)
+                          OR EXISTS (SELECT 1 FROM retained_response_request_routes route
+                                     WHERE route.delete_on = bucket.delete_on)
+                      )
+                )
+            "#,
+        )
+        .fetch_one(fusillade.pooled.write())
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to inspect retained-response retirement recovery state: {error}"))?;
+        let required = partition_maintenance_required(
+            daemon,
+            RetainedResponseMaintenanceState {
+                unfinished_retirements,
+                identity_mismatch,
+                retired_routes_exist,
+            },
+        )?;
+        if required {
+            let connect_options = match config.database.fusillade() {
+                config::ComponentDb::Schema { name, .. } => {
+                    if let Some(url) = daemon.retained_response_partition_maintenance_url.as_ref() {
+                        PgConnectOptions::from_str(url.expose())?.options([("search_path", name.as_str())])
+                    } else {
+                        // Schema mode: use the component's DIRECT pool options —
+                        // a real session (never the pooled endpoint), carrying
+                        // the component search_path startup option.
+                        fusillade.direct.write().connect_options().as_ref().clone()
+                    }
+                }
+                config::ComponentDb::Dedicated { .. } => {
+                    let url = daemon.retained_response_partition_maintenance_url.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!("retained-response recovery on a dedicated database requires an explicit direct session endpoint")
+                    })?;
+                    PgConnectOptions::from_str(url.expose())?
+                }
+            }
+            .log_slow_statements(log::LevelFilter::Warn, slow_threshold);
+            Some(
+                sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .min_connections(0)
+                    .acquire_timeout(std::time::Duration::from_secs(30))
+                    .idle_timeout(Some(std::time::Duration::from_secs(600)))
+                    .max_lifetime(Some(std::time::Duration::from_secs(1_800)))
+                    .connect_with(connect_options)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("failed to connect retained-response partition maintenance session"))?,
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // Underway migrations (background task queue) — one transaction, but keep
     // them on the direct connection like every other migration.
     underway::run_migrations(&*main.direct.write()).await?;
@@ -966,7 +1252,11 @@ async fn setup_database(
     // Seed database with initial configuration (only runs once)
     seed_database(&config.model_sources, &main.pooled.write()).await?;
 
-    Ok((embedded_db, db::DatabasePools { main, fusillade, outlet }))
+    Ok((
+        embedded_db,
+        db::DatabasePools { main, fusillade, outlet },
+        partition_maintenance_pool,
+    ))
 }
 
 /// Build the base CORS layer (methods, headers, max-age, exposed headers) from
@@ -2188,11 +2478,6 @@ async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
     request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
-    /// Step storage for multi-step responses, sharing the same fusillade
-    /// pool as the request manager. Constructed in
-    /// `setup_background_services` so the manager's processor (which
-    /// dwctl wires later in `Application::new_with_pool`) can use it.
-    step_manager: Arc<fusillade_arsenal::PostgresResponseStepManager<DbPools>>,
     /// The onwards-instance daemon id registered in the `daemons` table
     /// for realtime / inline-loop attribution. The graceful-shutdown
     /// drain (`shutdown()`) marks this row Dead and releases any
@@ -2526,6 +2811,130 @@ struct BackgroundTaskBuilder {
     names: std::collections::HashMap<tokio::task::Id, &'static str>,
 }
 
+const FUSILLADE_LEADERSHIP_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn stop_leader_fusillade_daemon(
+    leadership_shutdown: &tokio::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
+    daemon_handle: &tokio::sync::Mutex<Option<tokio::task::JoinHandle<fusillade::Result<()>>>>,
+    grace: std::time::Duration,
+) {
+    // Take both values out of their mutexes before awaiting. Cancellation is
+    // cooperative: Fusillade drains its destructive maintenance workers, so
+    // leadership loss must not abort the outer daemon task first.
+    let token = leadership_shutdown.lock().await.take();
+    if let Some(token) = token {
+        token.cancel();
+    }
+    let Some(mut handle) = daemon_handle.lock().await.take() else {
+        return;
+    };
+
+    match tokio::time::timeout(grace, &mut handle).await {
+        Ok(Ok(Ok(()))) => {
+            tracing::info!("Fusillade daemon stopped cooperatively after leadership loss");
+        }
+        Ok(Ok(Err(error))) => {
+            crate::background_error!(
+                crate::metrics::errors::component::LEADER_ELECTION,
+                "daemon_stop_failed",
+                Error,
+                error = %error,
+                "Fusillade daemon failed while stopping after leadership loss"
+            );
+        }
+        Ok(Err(error)) => {
+            crate::background_error!(
+                crate::metrics::errors::component::LEADER_ELECTION,
+                "daemon_stop_panicked",
+                Error,
+                error = %error,
+                "Fusillade daemon task panicked while stopping after leadership loss"
+            );
+        }
+        Err(_) => {
+            // Maintenance workers were not drained cooperatively: a
+            // destructive phase may have been cut mid-flight (journaled, so
+            // recoverable, but worth paging on).
+            crate::background_error!(
+                crate::metrics::errors::component::LEADER_ELECTION,
+                "daemon_stop_timeout",
+                Critical,
+                grace_seconds = grace.as_secs_f64(),
+                "Fusillade daemon exceeded the cooperative leadership-loss shutdown grace; aborting"
+            );
+            handle.abort();
+            if let Err(error) = handle.await
+                && !error.is_cancelled()
+            {
+                crate::background_error!(
+                    crate::metrics::errors::component::LEADER_ELECTION,
+                    "daemon_stop_abort_failed",
+                    Error,
+                    error = %error,
+                    "Fusillade daemon task failed after leadership-loss abort"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod leadership_shutdown_tests {
+    use super::stop_leader_fusillade_daemon;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn leadership_loss_cancels_and_awaits_daemon_without_holding_mutex() {
+        let token = tokio_util::sync::CancellationToken::new();
+        let token_slot = tokio::sync::Mutex::new(Some(token.clone()));
+        let handle_slot = Arc::new(tokio::sync::Mutex::new(None));
+        let observed_unlocked = Arc::new(AtomicBool::new(false));
+
+        let handle_slot_for_task = handle_slot.clone();
+        let observed_unlocked_for_task = observed_unlocked.clone();
+        let handle = tokio::spawn(async move {
+            token.cancelled().await;
+            observed_unlocked_for_task.store(handle_slot_for_task.try_lock().is_ok(), Ordering::SeqCst);
+            Ok(())
+        });
+        *handle_slot.lock().await = Some(handle);
+
+        stop_leader_fusillade_daemon(&token_slot, handle_slot.as_ref(), Duration::from_secs(1)).await;
+
+        assert!(observed_unlocked.load(Ordering::SeqCst));
+        assert!(token_slot.lock().await.is_none());
+        assert!(handle_slot.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn leadership_loss_aborts_and_awaits_after_explicit_grace() {
+        struct DropFlag(Arc<AtomicBool>);
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let token_slot = tokio::sync::Mutex::new(Some(tokio_util::sync::CancellationToken::new()));
+        let handle_slot = tokio::sync::Mutex::new(None);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = DropFlag(dropped.clone());
+        let handle = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<fusillade::Result<()>>().await
+        });
+        *handle_slot.lock().await = Some(handle);
+        tokio::task::yield_now().await;
+
+        stop_leader_fusillade_daemon(&token_slot, &handle_slot, Duration::from_millis(1)).await;
+
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(handle_slot.lock().await.is_none());
+    }
+}
+
 impl BackgroundTaskBuilder {
     fn new() -> Self {
         Self {
@@ -2553,18 +2962,15 @@ impl BackgroundTaskBuilder {
 }
 
 /// Setup background services (probe scheduler, batch daemon, leader election,
-/// onwards integration). The caller owns construction of `request_manager` and
-/// `step_manager` and passes them in, so they exist before any daemon spawn
-/// inside this function.
+/// onwards integration). The caller owns construction of `request_manager`
+/// and passes it in, so it exists before any daemon spawn inside this
+/// function.
 pub(crate) struct BackgroundServicesInput {
     /// Fusillade's durable DB store, shared with the daemon runtime.
     pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
     /// Fusillade's scheduling daemon. Owns HTTP dispatch and runtime
     /// lifecycle; durable data operations live on `request_manager`.
     pub postgres_daemon: Arc<fusillade::PostgresDaemon<DbPools, fusillade::ReqwestHttpClient>>,
-    /// Fusillade's response-step manager. Shares the same fusillade
-    /// pool as the request manager.
-    pub step_manager: Arc<fusillade_arsenal::PostgresResponseStepManager<DbPools>>,
     /// Shared map between the fusillade daemon's concurrency control
     /// and the onwards config-sync writer. Built once by the caller and
     /// passed in by-clone here.
@@ -2587,7 +2993,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     let BackgroundServicesInput {
         request_manager,
         postgres_daemon,
-        step_manager,
         model_capacity_limits,
         pools,
         config,
@@ -2947,10 +3352,12 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                     let daemon_handle = daemon_handle_lose.clone();
                     let leadership_shutdown = leadership_shutdown_lose.clone();
                     async move {
-                        // Cancel the leadership session token first, which will stop all background tasks gracefully
-                        if let Some(token) = leadership_shutdown.lock().await.take() {
-                            token.cancel();
-                        }
+                        stop_leader_fusillade_daemon(
+                            leadership_shutdown.as_ref(),
+                            daemon_handle.as_ref(),
+                            FUSILLADE_LEADERSHIP_SHUTDOWN_GRACE,
+                        )
+                        .await;
 
                         // Now stop all schedulers if probe scheduler was enabled
                         if config.background_services.probe_scheduler.enabled {
@@ -2958,12 +3365,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                                 .stop_all()
                                 .await
                                 .map_err(|e| anyhow::anyhow!("Failed to stop probe scheduler: {}", e))?;
-                        }
-
-                        // Stop the fusillade daemon
-                        if let Some(handle) = daemon_handle.lock().await.take() {
-                            handle.abort();
-                            tracing::info!("Fusillade batch daemon stopped (lost leadership)");
                         }
 
                         Ok(())
@@ -3129,7 +3530,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
     Ok(BackgroundServices {
         request_manager,
-        step_manager,
         task_runner,
         is_leader,
         onwards_targets: initial_targets,
@@ -3215,7 +3615,7 @@ impl Application {
         debug!("Starting control layer with configuration: {:#?}", config);
 
         // Setup database connections, run migrations, and initialize data
-        let (_embedded_db, pools) = setup_database(&config, pool).await?;
+        let (_embedded_db, pools, partition_maintenance_pool) = setup_database(&config, pool).await?;
         // Query traffic goes through the pooled side; session-scoped work
         // (listeners, leader election) is wired to the direct side inside
         // `setup_background_services`.
@@ -3270,22 +3670,29 @@ impl Application {
             .background_services
             .batch_daemon
             .to_fusillade_config_with_limits(Some(model_capacity_limits.clone()));
+        let retention_maintenance_config = config.background_services.batch_daemon.to_fusillade_retention_maintenance_config();
 
-        let request_manager = Arc::new(
-            fusillade_arsenal::PostgresRequestManager::new(
-                fusillade_pools.clone(),
-                fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
-            )
-            .with_download_buffer_size(config.batches.files.download_buffer_size)
-            .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
-                batch_size: config.batches.files.batch_insert_size,
-            }),
+        let mut request_manager = fusillade_arsenal::PostgresRequestManager::new(
+            fusillade_pools.clone(),
+            fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
+        )
+        .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
+        .with_template_generation_writes(config.background_services.batch_daemon.template_generation_writes_enabled)
+        .with_download_buffer_size(config.batches.files.download_buffer_size)
+        .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
+            batch_size: config.batches.files.batch_insert_size,
+        });
+        if let Some(partition_maintenance_pool) = partition_maintenance_pool {
+            request_manager = request_manager
+                .with_partition_maintenance_pool(partition_maintenance_pool)?
+                .attest_partition_maintenance_pool()
+                .await?;
+        }
+        let request_manager = Arc::new(request_manager);
+        let postgres_daemon = Arc::new(
+            fusillade::PostgresDaemon::from_store(request_manager.clone(), fusillade_daemon_config.clone())
+                .with_retention_maintenance(retention_maintenance_config),
         );
-        let postgres_daemon = Arc::new(fusillade::PostgresDaemon::from_store(
-            request_manager.clone(),
-            fusillade_daemon_config.clone(),
-        ));
-        let step_manager = Arc::new(fusillade_arsenal::PostgresResponseStepManager::new(fusillade_pools.clone()));
         // Build the ZDR keystore once and share it across the response store, the
         // daemon processor, and background services (which install the response
         // transformer). A misconfiguration is fatal.
@@ -3293,11 +3700,8 @@ impl Application {
             Some(c) => Some(crate::keystore::Keystore::from_config(c).map_err(|e| anyhow::anyhow!("failed to initialise keystore: {e}"))?),
             None => None,
         };
-        let response_store = Arc::new(
-            crate::inference::store::FusilladeResponseStore::new(request_manager.clone())
-                .with_step_manager(step_manager.clone())
-                .with_keystore(keystore.clone()),
-        );
+        let response_store =
+            Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()).with_keystore(keystore.clone()));
 
         // Build the image normaliser ONCE — fail loud at startup if
         // `image_normalizer.enabled = true` but no backend is configured.
@@ -3334,7 +3738,6 @@ impl Application {
         let mut bg_services = setup_background_services(BackgroundServicesInput {
             request_manager: request_manager.clone(),
             postgres_daemon: postgres_daemon.clone(),
-            step_manager: step_manager.clone(),
             model_capacity_limits,
             pools: pools.clone(),
             config: config.clone(),
@@ -3488,7 +3891,6 @@ impl Application {
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .maybe_keystore(bg_services.keystore.clone())
             .response_store(response_store)
-            .response_step_manager(bg_services.step_manager.clone())
             .image_normalizer(image_normalizer)
             .build();
 

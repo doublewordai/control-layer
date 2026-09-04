@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                model,\n                COUNT(*)::BIGINT as \"request_count!\",\n                SUM(body_byte_size)::BIGINT as \"total_body_bytes!\"\n            FROM request_templates\n            WHERE file_id = $1\n            GROUP BY model\n            ORDER BY model\n            ",
+  "query": "\n            SELECT\n                model AS \"model!\",\n                COUNT(*)::BIGINT as \"request_count!\",\n                SUM(body_byte_size)::BIGINT as \"total_body_bytes!\"\n            FROM request_templates_all\n            WHERE file_id = $1\n            GROUP BY model\n            ORDER BY model\n            ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "model",
+        "name": "model!",
         "type_info": "Text"
       },
       {
@@ -25,10 +25,10 @@
       ]
     },
     "nullable": [
-      false,
+      true,
       null,
       null
     ]
   },
-  "hash": "89b2bd2a19fcfc5b9138f50b462d86b6596e189459dde6c095c912c6810b7935"
+  "hash": "56e7ec3a433e13cd9ba9ca44dd457026e44976fee786600e67e35c313191937a"
 }

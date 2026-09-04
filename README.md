@@ -308,6 +308,19 @@ background_services:
     processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
     pending_request_counts_timeout_ms: 60000 # Statement timeout for pending request count queries (1 minute)
 
+    # Optional retained-response lifecycle. It has no implicit retention
+    # period; movement and retirement default off. Current scheduled support
+    # covers terminal batchless response tiers only. Each configured tier
+    # requires an explicit positive duration and late-writer fence. Scheduled
+    # file and file-backed batch retention is rejected at startup.
+    # retention:
+    #   batchless_seconds_by_service_tier:
+    #     flex: <seconds>
+    #   max_late_writer_seconds: <seconds>
+    # batchless_archive_sweep_enabled: false
+    # batchless_archive_backfill_enabled: false
+    # retained_response_retirement_enabled: false # Reserved; true is rejected until retirement ships
+
     # Observability
     status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)
 ```

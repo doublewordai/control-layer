@@ -129,7 +129,7 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
             b.created_at                       AS "batch_created_at?"
         FROM http_analytics ha
         LEFT JOIN fusillade.requests r          ON r.id  = ha.fusillade_request_id
-        LEFT JOIN fusillade.request_templates rt ON rt.id = r.template_id
+        LEFT JOIN fusillade.request_templates_all rt ON rt.id = r.template_id
         LEFT JOIN fusillade.batches b            ON b.id  = ha.fusillade_batch_id
         -- Ordered so the planner drives off a timestamp index. There is NO index on
         -- http_analytics.user_id, and ordering by `id` instead makes Postgres walk the
