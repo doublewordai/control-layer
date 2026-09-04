@@ -43,6 +43,16 @@
 --     successor also excludes terminal batches, which makes it 280x smaller
 --     (320 kB vs 90 MB) and is why the planner abandoned this one entirely.
 --
+--     The REPLICA shows ~1.2k lifetime scans for it, from the external
+--     hourly-demand monitor whose batches filter (deleted_at/cancelling_at
+--     only) is looser than the successor's predicate. Verified 2026-09-04:
+--     that query now plans via idx_requests_active_with_template +
+--     batches_pkey and no longer touches this index, even for 60-day
+--     windows; the replica count is history from before 20260320000000.
+--     Worst case post-drop is that monitor degrading to a batches seq scan,
+--     not breakage. Re-check replica pg_stat_user_indexes alongside the
+--     primary before this particular drop.
+--
 --   idx_daemons_created_at, idx_daemons_heartbeat, idx_daemons_status
 --                                     ~2.8 MB      0 scans each
 --
