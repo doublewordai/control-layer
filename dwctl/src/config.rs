@@ -4724,6 +4724,17 @@ auth:
 
     #[test]
     fn test_invalid_org_cookie_name_rejected() {
+        // `validate` returns on its FIRST complaint, and a bare `Config::default()`
+        // trips the missing-secret_key check well before it reaches the cookie
+        // name. Give it enough to get that far, or every case below passes for
+        // the wrong reason.
+        fn config_with_org_cookie_name(name: &str) -> Config {
+            let mut config = Config::default();
+            config.secret_key = Some("test-secret-key".to_string());
+            config.auth.native.session.org_cookie_name = name.to_string();
+            config
+        }
+
         // The names we actually deploy raise no org_cookie_name complaint.
         for good in [
             "dw_active_org",
@@ -4731,9 +4742,11 @@ auth:
             "dw_active_org_us",
             "dw_active_org_cl-1234",
         ] {
-            let mut config = Config::default();
-            config.auth.native.session.org_cookie_name = good.to_string();
-            let complaint = config.validate().err().map(|e| e.to_string()).unwrap_or_default();
+            let complaint = config_with_org_cookie_name(good)
+                .validate()
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default();
             assert!(
                 !complaint.contains("org_cookie_name"),
                 "expected {good:?} to be accepted, got: {complaint}"
@@ -4750,9 +4763,7 @@ auth:
             "dw_active_org\n",
             "dw_active_org\u{e9}",
         ] {
-            let mut config = Config::default();
-            config.auth.native.session.org_cookie_name = bad.to_string();
-            let error = config.validate().unwrap_err().to_string();
+            let error = config_with_org_cookie_name(bad).validate().unwrap_err().to_string();
             assert!(error.contains("org_cookie_name"), "expected {bad:?} to be rejected, got: {error}");
         }
     }
