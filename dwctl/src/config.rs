@@ -4725,16 +4725,31 @@ auth:
     #[test]
     fn test_invalid_org_cookie_name_rejected() {
         // The names we actually deploy raise no org_cookie_name complaint.
-        for good in ["dw_active_org", "dw_active_org_staging", "dw_active_org_us", "dw_active_org_cl-1234"] {
+        for good in [
+            "dw_active_org",
+            "dw_active_org_staging",
+            "dw_active_org_us",
+            "dw_active_org_cl-1234",
+        ] {
             let mut config = Config::default();
             config.auth.native.session.org_cookie_name = good.to_string();
             let complaint = config.validate().err().map(|e| e.to_string()).unwrap_or_default();
-            assert!(!complaint.contains("org_cookie_name"), "expected {good:?} to be accepted, got: {complaint}");
+            assert!(
+                !complaint.contains("org_cookie_name"),
+                "expected {good:?} to be accepted, got: {complaint}"
+            );
         }
 
         // Empty, whitespace and RFC 6265 separators would all produce a
         // malformed Set-Cookie header or a prefix that never matches on read.
-        for bad in ["", "dw active org", "dw_active_org;", "dw=active", "dw_active_org\n", "dw_active_org\u{e9}"] {
+        for bad in [
+            "",
+            "dw active org",
+            "dw_active_org;",
+            "dw=active",
+            "dw_active_org\n",
+            "dw_active_org\u{e9}",
+        ] {
             let mut config = Config::default();
             config.auth.native.session.org_cookie_name = bad.to_string();
             let error = config.validate().unwrap_err().to_string();
