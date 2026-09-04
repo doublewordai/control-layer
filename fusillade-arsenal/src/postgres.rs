@@ -8879,7 +8879,22 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                    counts_frozen_at,
                    COALESCE(
                        archive_bucket,
-                       date_trunc('week', created_at AT TIME ZONE 'UTC')::date
+                       -- A batch that outlived its own week's retirement (it
+                       -- was blocked from moving until after the week was
+                       -- dropped) is routed into the current week instead:
+                       -- a retired week never receives rows, and a later
+                       -- retirement date is the safe direction.
+                       CASE
+                           WHEN EXISTS (
+                               SELECT 1
+                               FROM batch_archive_buckets bucket
+                               WHERE bucket.week_start =
+                                     date_trunc('week', created_at AT TIME ZONE 'UTC')::date
+                                 AND bucket.state <> 'active'
+                           )
+                           THEN date_trunc('week', now() AT TIME ZONE 'UTC')::date
+                           ELSE date_trunc('week', created_at AT TIME ZONE 'UTC')::date
+                       END
                    ) AS "bucket!"
             FROM batches
             WHERE id = $1 AND deleted_at IS NULL
@@ -14051,6 +14066,54 @@ mod tests {
         let (location, _, live, archived) = archive_state(&pool, batch_id).await;
         assert_eq!(location, "live", "batch must stay fully live and served");
         assert_eq!((live, archived), (2, 0));
+    }
+
+    /// A batch that could not move until after its own week was retired (the
+    /// step-guard wedge, historically) must not be retried into a dropped
+    /// partition forever: it is routed into the current week instead.
+    #[sqlx::test]
+    async fn test_archive_batch_outliving_its_retired_week_lands_in_the_current_week(
+        pool: sqlx::PgPool,
+    ) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_frozen_batch(&manager, &pool, "arch-retired-week", 2).await;
+        sqlx::query!(
+            "UPDATE batches SET created_at = '2020-01-06T12:00:00Z' WHERE id = $1",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The 2020 week was retired and its partition dropped; only the
+        // registry row remains (pointing at an arbitrary surviving relation).
+        sqlx::query(
+            "INSERT INTO batch_archive_buckets (week_start, partition_schema, partition_table, partition_oid, state) \
+             VALUES ('2020-01-06', current_schema(), 'batch_requests_archive_y2020w02', 'batches'::regclass::oid, 'retired')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { .. }
+        ));
+        let (location, bucket, live, archived) = archive_state(&pool, batch_id).await;
+        assert_eq!(location, "archive");
+        assert_eq!((live, archived), (0, 2));
+        let current_week: chrono::NaiveDate =
+            sqlx::query_scalar("SELECT date_trunc('week', now() AT TIME ZONE 'UTC')::date")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            bucket,
+            Some(current_week),
+            "the batch must be stamped into the current week"
+        );
     }
 
     #[sqlx::test]
