@@ -976,7 +976,20 @@ async fn run_batchless_archive_phase<S>(
     } else {
         1
     };
+    // Reset on every exit path, including a panic or cancellation inside
+    // the spawned tick, so the gauge can never stay stuck at a stale count.
+    struct MoversGaugeGuard {
+        worker: &'static str,
+    }
+    impl Drop for MoversGaugeGuard {
+        fn drop(&mut self) {
+            gauge!("fusillade_retained_response_movers_active", "worker" => self.worker).set(0.0);
+        }
+    }
     gauge!("fusillade_retained_response_movers_active", "worker" => tick.worker).set(movers as f64);
+    let _movers_gauge_guard = MoversGaugeGuard {
+        worker: tick.worker,
+    };
     let result = maintenance_query(
         shutdown,
         "retained response archive move",
@@ -1005,7 +1018,7 @@ async fn run_batchless_archive_phase<S>(
         },
     )
     .await;
-    gauge!("fusillade_retained_response_movers_active", "worker" => tick.worker).set(0.0);
+    drop(_movers_gauge_guard);
     match result {
         Ok(Some(outcome)) => {
             counter!("fusillade_retained_response_groups_archived_total", "worker" => tick.worker)
