@@ -136,11 +136,13 @@ pub fn sink_options() -> SinkOptions {
     }
 }
 
-/// Which key produced a chain: the first byte of SHA-256 over the key. Rows stamped with
-/// different ids never join, and nobody has to remember to bump a version on rotation.
-pub fn key_id(key: &[u8; 32]) -> u8 {
+/// Which key produced a chain: the first four bytes of SHA-256 over the key, big-endian.
+/// Rows stamped with different ids never join, and nobody has to remember to bump a
+/// version on rotation.
+pub fn key_id(key: &[u8; 32]) -> u32 {
     use sha2::Digest as _;
-    sha2::Sha256::digest(key)[0]
+    let digest = sha2::Sha256::digest(key);
+    u32::from_be_bytes([digest[0], digest[1], digest[2], digest[3]])
 }
 
 /// Which models the recorder captures. Built from `prefix_chain.models`.
@@ -183,7 +185,7 @@ pub struct PromptChainRow {
     pub block_tokens: Vec<u32>,
     pub tokenizer_version: String,
     /// See [`key_id`]; stored in the `key_version` column.
-    pub key_version: u8,
+    pub key_version: u32,
     pub v: u8,
 }
 
@@ -256,7 +258,7 @@ impl ChainHasher {
 
 pub struct PrefixChainRecorder {
     hasher: ChainHasher,
-    key_id: u8,
+    key_id: u32,
     filter: ModelFilter,
     tokenizer: TokenizerClient,
     principal: PrincipalResolver,
@@ -462,6 +464,12 @@ impl outlet::RequestHandler for PrefixChainHandler {
         // Only served requests: a rejected one (bad key, unknown model, rate limit) never
         // becomes a principal lookup, a tokenizer call or a row.
         if !response_data.status.is_success() {
+            return;
+        }
+        // The path check comes before the body parse: every other route is skipped for
+        // the cost of a string compare, not a JSON parse of its request body.
+        if !request_data.uri.path().ends_with("/chat/completions") {
+            skipped("not_chat");
             return;
         }
         let api_key = match crate::request_logging::serializers::Auth::from_request(&request_data, &self.config) {
@@ -728,7 +736,7 @@ mod tests {
         rec.observe(observation("/chat/completions", Some("m"), None, Some(b.clone())));
         rec.observe(observation("/chat/completions", Some("m"), Some("sk"), None));
         rec.observe(observation("/chat/completions", Some("m"), Some("sk"), Some(b"nope".to_vec())));
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(rx.try_recv().is_err(), "nothing recorded");
+        let nothing = tokio::time::timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(nothing.is_err(), "nothing recorded");
     }
 }
