@@ -86,9 +86,12 @@ impl ForwardDelta {
 pub trait ForwardParser: Send {
     /// Feed raw text; emit zero or more client-ready delta payloads.
     ///
-    /// Never reorders and never drops bytes: anything withheld because it might
-    /// be the start of a tag is emitted as soon as that is disproven, or by
-    /// [`ForwardParser::finish`].
+    /// Never reorders or drops bytes belonging to a client-visible channel:
+    /// ordinary text withheld while disambiguating a tag is emitted as soon as
+    /// that is disproven, or by [`ForwardParser::finish`]. Structural syntax is
+    /// different — complete tags are consumed (that is the parser's job), and
+    /// an INCOMPLETE structural prefix at end-of-leg may be discarded by
+    /// `finish` rather than leaked as answer text.
     fn feed(&mut self, raw: &str) -> Vec<ForwardDelta>;
 
     /// Whether the parser has given up on the leg's output (e.g. a structural
@@ -100,10 +103,15 @@ pub trait ForwardParser: Send {
     }
 
     /// Whether the chat-shaped stream this parser is producing carries tool
-    /// calls. A raw completions leg terminates with `"stop"`, but a chat
-    /// stream that emitted `tool_calls` deltas must finish with
-    /// `finish_reason: "tool_calls"` — clients and request logging key the
+    /// calls whose structure has CLOSED. A raw completions leg terminates with
+    /// `"stop"`, but a chat stream that emitted `tool_calls` deltas must finish
+    /// with `finish_reason: "tool_calls"` — clients and request logging key the
     /// tool loop on it. Other reasons (`length`, …) pass through untouched.
+    ///
+    /// Must return `true` only once the tool block is complete: the caller
+    /// synthesizes/maps the finish signal from this, and announcing
+    /// `tool_calls` for a leg that ended mid-arguments would tell clients to
+    /// execute incomplete JSON.
     fn ends_in_tool_calls(&self) -> bool {
         false
     }

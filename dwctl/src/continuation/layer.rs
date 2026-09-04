@@ -437,6 +437,24 @@ impl Drop for OutcomeGuard {
 }
 
 /// The `data:` payload of one complete SSE event, if it has one.
+/// Give the first resumed delta a message-opening `role` when leg 1 never
+/// delivered one. Most providers open with a `role: "assistant"` preamble, but
+/// at least one serves content first and attaches the role to a later frame
+/// (see the `plat` fidelity captures) — when the death lands in that gap, the
+/// frames this layer builds replace the role-carrying frame, and without this
+/// a strict client assembles a roleless message. A stream whose delivered
+/// frames already carried a role gets nothing: re-sending one makes strict
+/// clients open a second message.
+fn ensure_role(chat: &mut Value, role_sent: &mut bool) {
+    if *role_sent {
+        return;
+    }
+    if let Some(delta) = chat.pointer_mut("/choices/0/delta").and_then(Value::as_object_mut) {
+        delta.insert("role".to_string(), Value::String("assistant".to_string()));
+        *role_sent = true;
+    }
+}
+
 fn frame_payload(event: &[u8]) -> Option<&str> {
     event.split(|b| *b == b'\n').find_map(|line| {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -458,8 +476,12 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
     let stream = async_stream::stream! {
         let mut outcome = OutcomeGuard::new(ctx.origin);
         // Which reconstructor this stream gets is a per-model capability lookup;
-        // see `accumulate::for_model`.
-        let mut acc: Box<dyn StreamAccumulator> = accumulate::for_model(&ctx.model, &state.cfg, &ctx.route);
+        // see `accumulate::for_model`. The request's own `chat_template_kwargs`
+        // ride along so the reconstructor's thinking/chat mode matches the
+        // prompt the resume render will actually build (the request overrides
+        // the route key-by-key in both places).
+        let mut acc: Box<dyn StreamAccumulator> =
+            accumulate::for_model(&ctx.model, &state.cfg, &ctx.route, ctx.chat_template_kwargs());
         let mut current: LegStream = Box::pin(SseBufferedStream::new(leg_one));
         // Is `current` a resume leg (text_completion chunks needing reframing)?
         let mut resuming = false;
@@ -478,6 +500,11 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         // point, and rebuilt per leg because each leg picks up somewhere new.
         let mut parser: Option<Box<dyn ForwardParser>> = None;
         let mut saw_usage = false;
+        // Whether any frame DELIVERED to the client has carried a `delta.role`
+        // (leg-1 passthrough, or injected by `ensure_role`). The resumed frames
+        // replace whatever leg 1 would have sent later, so if no role has gone
+        // out yet, the first resumed delta must carry it.
+        let mut role_sent = false;
         // The terminating frames, held rather than forwarded: we may need to put
         // a synthesized usage frame in front of `[DONE]`, and a death frame must
         // only reach the client if the resume chain fails. `first_death` is what
@@ -602,6 +629,10 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                         outcome.record("disarmed", e.reason());
                     }
                     saw_usage |= rewrap::usage_of(&value).is_some();
+                    // Not every provider opens with a `role` preamble (the plat
+                    // captures attach it to a later frame); remember whether the
+                    // client has one so a resume knows if it is still owed.
+                    role_sent |= value.pointer("/choices/0/delta/role").is_some();
                     // Byte passthrough — never a re-serialization.
                     yield Ok(item);
                     continue;
@@ -638,7 +669,8 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     // end-of-stream flush a no-op for this leg.
                     let flushed = parser.as_mut().map(|p| p.finish()).unwrap_or_default();
                     for delta in flushed {
-                        let chat = rewrap::delta_chunk(&env, delta.into_delta(), Value::Null);
+                        let mut chat = rewrap::delta_chunk(&env, delta.into_delta(), Value::Null);
+                        ensure_role(&mut chat, &mut role_sent);
                         if let Some(died) = death_at.take() {
                             metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
                         }
@@ -661,7 +693,8 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     // `finish_reason: "tool_calls"` — so synthesize it, and
                     // BEFORE the usage frame, which clients treat as terminal.
                     if !acc.saw_finish_reason() && parser.as_ref().is_some_and(|p| p.ends_in_tool_calls()) {
-                        let chat = rewrap::delta_chunk(&env, serde_json::json!({}), Value::from("tool_calls"));
+                        let mut chat = rewrap::delta_chunk(&env, serde_json::json!({}), Value::from("tool_calls"));
+                        ensure_role(&mut chat, &mut role_sent);
                         if let Some(died) = death_at.take() {
                             metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
                         }
@@ -712,7 +745,8 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     // deltas, then abort exactly as an unresumed death ends:
                     // no usage frame, no [DONE].
                     for delta in deltas {
-                        let chat = rewrap::delta_chunk(&env, delta.into_delta(), Value::Null);
+                        let mut chat = rewrap::delta_chunk(&env, delta.into_delta(), Value::Null);
+                        ensure_role(&mut chat, &mut role_sent);
                         let _ = acc.ingest(&chat);
                         yield Ok(rewrap::sse_frame(&chat));
                     }
@@ -751,7 +785,8 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     frames.push(rewrap::delta_chunk(&env, serde_json::json!({}), finish_reason));
                 }
 
-                for chat in frames {
+                for mut chat in frames {
+                    ensure_role(&mut chat, &mut role_sent);
                     if let Some(died) = death_at.take() {
                         metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
                     }
@@ -774,7 +809,8 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     let flushed = parser.as_mut().map(|p| p.finish()).unwrap_or_default();
                     if !flushed.is_empty() && let Some(env) = acc.envelope().cloned() {
                         for delta in flushed {
-                            let chat = rewrap::delta_chunk(&env, delta.into_delta(), Value::Null);
+                            let mut chat = rewrap::delta_chunk(&env, delta.into_delta(), Value::Null);
+                            ensure_role(&mut chat, &mut role_sent);
                             let _ = acc.ingest(&chat);
                             yield Ok(rewrap::sse_frame(&chat));
                         }
@@ -799,7 +835,8 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                         && parser.as_ref().is_some_and(|p| p.ends_in_tool_calls())
                         && let Some(env) = acc.envelope().cloned()
                     {
-                        let chat = rewrap::delta_chunk(&env, serde_json::json!({}), Value::from("tool_calls"));
+                        let mut chat = rewrap::delta_chunk(&env, serde_json::json!({}), Value::from("tool_calls"));
+                        ensure_role(&mut chat, &mut role_sent);
                         if let Some(died) = death_at.take() {
                             metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
                         }
@@ -903,7 +940,9 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                                 // The client's own `max_tokens` is already spent —
                                 // finishing is correct, resuming would overrun it.
                                 if let Some(env) = acc.envelope().cloned() {
-                                    yield Ok(rewrap::sse_frame(&rewrap::length_stop_frame(&env)));
+                                    let mut stop = rewrap::length_stop_frame(&env);
+                                    ensure_role(&mut stop, &mut role_sent);
+                                    yield Ok(rewrap::sse_frame(&stop));
                                     if !saw_usage {
                                         let (usage, _) = rewrap::merge_usage(
                                             render.continuation_tokens.unwrap_or(0) as u64,

@@ -139,8 +139,12 @@ pub fn completion_parts(chunk: &Value) -> Option<(&str, Value)> {
 /// One chat chunk on the original stream's envelope, carrying an already-built
 /// `delta` object.
 ///
-/// No `role` delta is ever added: leg 1 already opened the message, and
-/// re-sending one makes strict clients open a second.
+/// No `role` delta is added HERE: most streams have already opened the message
+/// on leg 1, and re-sending one makes strict clients open a second. But not
+/// every provider opens with a role preamble (the plat captures attach it to a
+/// later frame), so the layer tracks whether a role has actually been delivered
+/// and injects one into the first resumed delta only when it is still owed
+/// (`ensure_role` in the layer).
 pub fn delta_chunk(env: &Envelope, delta: Value, finish_reason: Value) -> Value {
     json!({
         "id": env.id,

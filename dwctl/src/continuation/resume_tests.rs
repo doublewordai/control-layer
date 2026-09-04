@@ -67,6 +67,15 @@ fn content(id: &str, text: &str) -> Chunk {
     }))
 }
 
+/// The message-opening preamble MOST providers send first — but not all: the
+/// plat capture serves content first and attaches the role to a later frame.
+fn role_preamble(id: &str) -> Chunk {
+    frame(json!({
+        "id": id, "object": "chat.completion.chunk", "created": 1_700_000_000, "model": MODEL,
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]
+    }))
+}
+
 fn leg_text(text: &str, finish: Option<&str>) -> Chunk {
     frame(json!({
         "id": "cmpl-leg", "object": "text_completion", "created": 1_800_000_000, "model": "continuation-composite",
@@ -327,6 +336,56 @@ async fn a_cut_stream_is_resumed_into_one_seamless_response(pool: PgPool) {
         usage.get("prompt_tokens_details").is_none(),
         "the leg's own cache accounting describes the re-prefill, not the customer's request"
     );
+}
+
+/// Not every provider opens the stream with a `role` preamble (the plat capture
+/// attaches it to a later frame), so a death in that gap would leave the
+/// assembled message roleless — the resumed frames replace whichever later
+/// frame would have carried it. The FIRST resumed delta must supply it, once.
+#[sqlx::test]
+async fn a_resume_supplies_the_role_leg_one_never_delivered(pool: PgPool) {
+    let fake = Fake::new(
+        // Leg 1 dies having sent only roleless content frames.
+        vec![content("chatcmpl-1", "Hello"), content("chatcmpl-1", ", wor")],
+        vec![vec![leg_text("ld!", Some("stop")), leg_usage(1012, 8), done()]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), test_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    let payloads = collect_payloads(response).await;
+    let frames = parsed(&payloads);
+
+    let roles: Vec<&Value> = frames.iter().filter(|f| f["choices"][0]["delta"].get("role").is_some()).collect();
+    assert_eq!(roles.len(), 1, "exactly one role delta on the merged stream");
+    assert_eq!(roles[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(
+        roles[0]["choices"][0]["delta"]["content"], "ld!",
+        "the role rides the FIRST resumed delta, opening the message where leg 1 never did"
+    );
+}
+
+/// The mirror invariant: a role leg 1 already delivered is never re-sent —
+/// strict clients open a second message on a repeated role.
+#[sqlx::test]
+async fn a_role_already_delivered_is_never_resent(pool: PgPool) {
+    let fake = Fake::new(
+        vec![role_preamble("chatcmpl-1"), content("chatcmpl-1", "Hello, wor")],
+        vec![vec![leg_text("ld!", Some("stop")), leg_usage(1012, 8), done()]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), test_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    let payloads = collect_payloads(response).await;
+    let frames = parsed(&payloads);
+
+    assert_eq!(
+        frames.iter().filter(|f| f["choices"][0]["delta"].get("role").is_some()).count(),
+        1,
+        "only leg 1's own preamble carries the role"
+    );
+    assert_eq!(contents(&frames), "Hello, world!", "the rescue itself is unaffected");
 }
 
 /// Batch loopback: fusillade marks stream-intent with `x-fusillade-stream`

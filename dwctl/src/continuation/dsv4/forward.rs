@@ -459,7 +459,12 @@ impl ForwardParser for Dsv4Forward {
     }
 
     fn ends_in_tool_calls(&self) -> bool {
-        self.tool_calls_emitted
+        // Only a CLOSED block earns `finish_reason: "tool_calls"` — the layer
+        // uses this to map/synthesize the signal clients key their tool loop
+        // on, and a leg that ended mid-invoke has handed the client incomplete
+        // arguments JSON that must not be presented as executable. A truncated
+        // tool leg keeps its raw reason (or none), reading as what it is.
+        self.tool_calls_emitted && matches!(self.state, State::AfterBlock)
     }
 
     fn finish(&mut self) -> Vec<ForwardDelta> {

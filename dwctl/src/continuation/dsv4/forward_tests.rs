@@ -412,6 +412,30 @@ fn a_disproven_tag_prefix_is_released_as_text() {
     assert!(channels.calls.is_empty() && channels.reasoning.is_empty());
 }
 
+/// The layer maps/synthesizes `finish_reason: "tool_calls"` from this signal,
+/// so it must stay false while a call's structure is still open — a leg that
+/// ends mid-invoke has handed the client incomplete arguments JSON, and
+/// announcing `tool_calls` there would tell it to execute a half-built call.
+#[test]
+fn tool_calls_are_only_signalled_once_the_block_closes() {
+    let mut parser = Dsv4Forward::new(ForwardSeed::Content);
+    parser.feed("Now.\n\n");
+    assert!(!parser.ends_in_tool_calls(), "no call announced yet");
+    parser.feed(TOOL_CALLS_OPEN);
+    parser.feed("\n");
+    parser.feed(INVOKE_OPEN);
+    parser.feed("get_weather\">\n");
+    assert!(!parser.ends_in_tool_calls(), "announced, but its arguments are still open");
+    parser.feed(&format!("{PARAMETER_OPEN}city\" string=\"true\">Par"));
+    assert!(!parser.ends_in_tool_calls(), "mid-value is the dangerous case: partial JSON");
+    parser.feed(&format!("is{PARAMETER_CLOSE}\n"));
+    parser.feed(INVOKE_CLOSE);
+    assert!(!parser.ends_in_tool_calls(), "the block itself has not closed");
+    parser.feed("\n");
+    parser.feed(TOOL_CALLS_CLOSE);
+    assert!(parser.ends_in_tool_calls(), "a closed block is a complete, executable call");
+}
+
 /// `finish` flushes a hold that never resolved — the stream ended on what could
 /// still have become a tag.
 #[test]
