@@ -3640,7 +3640,7 @@ impl Application {
         pool: Option<PgPool>,
         tracer_provider: Option<telemetry::SdkTracerProvider>,
     ) -> anyhow::Result<Self> {
-        debug!("Starting control layer with configuration: {:#?}", config);
+        debug!("Starting control layer with configuration: {}", config.redacted_for_logging());
 
         // Setup database connections, run migrations, and initialize data
         let (_embedded_db, db_pools, fusillade_pools, outlet_pools, partition_maintenance_pool) = setup_database(&config, pool).await?;
