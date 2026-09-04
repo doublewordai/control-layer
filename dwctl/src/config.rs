@@ -439,7 +439,9 @@ pub fn default_outlet_component() -> ComponentDb {
 /// Direct-connection pool defaults. Every direct connection is a real backend
 /// against the database's hard connection limit, so this stays small: it only
 /// has to cover session-scoped work (LISTEN connections, the leader-election
-/// lock, migrations), never query traffic.
+/// lock, migrations), never query traffic. An API pod holds five of those at
+/// steady state (four listeners + the leader lock), so the default leaves a
+/// little headroom; anything below six is warned about at boot.
 pub fn default_direct_pool() -> PoolSettings {
     PoolSettings {
         max_connections: 8,

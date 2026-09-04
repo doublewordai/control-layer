@@ -899,6 +899,24 @@ async fn setup_database(
         (embedded_db, main)
     };
 
+    if main.is_split() {
+        // Steady-state session consumers on the main direct pool: the onwards
+        // config, webhook-event and ZDR key-sync listeners, the probe-changes
+        // listener on the leader, and the leader-election lock — five — plus
+        // migrations at boot. Observed on a Neon branch: a direct pool of 4
+        // times out setting up the webhook listener.
+        const MIN_DIRECT_FOR_SESSION_WORK: u32 = 6;
+        let direct_max = main.direct.write().options().get_max_connections();
+        if direct_max < MIN_DIRECT_FOR_SESSION_WORK {
+            warn!(
+                direct_max,
+                minimum = MIN_DIRECT_FOR_SESSION_WORK,
+                "database.direct_pool.max_connections is below the number of session-scoped consumers \
+                 (LISTEN loops + leader lock); listeners will fail to acquire a connection"
+            );
+        }
+    }
+
     // Fusillade batch processing pools
     info!("Setting up fusillade batch processing pool");
     let fusillade = setup_component_pools("fusillade", config.database.fusillade(), &main, slow_threshold).await?;
