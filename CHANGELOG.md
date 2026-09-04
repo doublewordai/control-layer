@@ -1,5 +1,13 @@
 # Changelog
 
+## [11.4.1](https://github.com/doublewordai/control-layer/compare/v11.4.0...v11.4.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* Formalize indices missing from migration and drop unused ones ([#1568](https://github.com/doublewordai/control-layer/issues/1568)) ([0866443](https://github.com/doublewordai/control-layer/commit/0866443427b104e17b562fd6bf809da1bb54d855))
+* **fusillade:** drop the stranded-request purge step that times out  ([#1576](https://github.com/doublewordai/control-layer/issues/1576)) ([b9cae7a](https://github.com/doublewordai/control-layer/commit/b9cae7a23c2bd3cafe5c3a20ceb14c62c03f5a90))
+
 ## [11.4.0](https://github.com/doublewordai/control-layer/compare/v11.3.0...v11.4.0) (2026-09-04)
 
 
