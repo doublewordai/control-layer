@@ -1487,7 +1487,6 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
             replica_pool: None,
         },
         underway_pool: crate::config::default_underway_pool(),
-        replica_group: crate::config::default_replica_group(),
     };
 
     // Create application - this will run migrations on the dedicated databases

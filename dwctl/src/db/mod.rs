@@ -95,3 +95,14 @@ pub mod pools;
 
 // Re-export only the metrics types (not DbPools/PoolProvider - use sqlx_pool_router directly)
 pub use pools::{LabeledPool, PoolMetricsConfig, run_pool_metrics_sampler};
+
+/// `PgPoolOptions` for `settings`: the one place the pool knobs are translated.
+pub fn pool_options(settings: &crate::config::PoolSettings) -> sqlx::postgres::PgPoolOptions {
+    use std::time::Duration;
+    sqlx::postgres::PgPoolOptions::new()
+        .max_connections(settings.max_connections)
+        .min_connections(settings.min_connections)
+        .acquire_timeout(Duration::from_secs(settings.acquire_timeout_secs))
+        .idle_timeout((settings.idle_timeout_secs > 0).then(|| Duration::from_secs(settings.idle_timeout_secs)))
+        .max_lifetime((settings.max_lifetime_secs > 0).then(|| Duration::from_secs(settings.max_lifetime_secs)))
+}
