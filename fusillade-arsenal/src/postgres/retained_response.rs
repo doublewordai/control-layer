@@ -1750,6 +1750,49 @@ enum MoveGraphOutcome {
     AlreadyGone,
 }
 
+/// The per-call retained-payload byte budget, shared by every graph move in
+/// one archive pass. Reservations are atomic so concurrent movers cannot
+/// jointly exceed the budget: a graph is reserved only while the running
+/// total plus its bytes still fits, or when nothing has been reserved yet
+/// (the one oversized graph a pass may move, exactly as the sequential mover
+/// allowed the first archived graph to exceed the budget). A reservation is
+/// never released: every path after it either commits the move or returns an
+/// error that aborts the whole pass.
+struct ByteBudget {
+    max_bytes: u64,
+    reserved: std::sync::atomic::AtomicU64,
+}
+
+impl ByteBudget {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            reserved: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// `allow_oversized` is granted only to the first candidate a pass
+    /// dispatches (the oldest), so the one oversized graph a pass may move is
+    /// always the head of the queue rather than whichever mover serialised
+    /// its payload first; a large head can then never be starved by smaller
+    /// siblings that keep winning the race.
+    fn try_reserve(&self, bytes: u64, allow_oversized: bool) -> bool {
+        self.reserved
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |reserved| {
+                    let fits = reserved
+                        .checked_add(bytes)
+                        .is_some_and(|total| total <= self.max_bytes);
+                    (fits || (allow_oversized && reserved == 0))
+                        .then(|| reserved.saturating_add(bytes))
+                },
+            )
+            .is_ok()
+    }
+}
+
 /// The live members of a retained graph. A graph is exactly one request (its
 /// template travels with it), so the topology is always that single request.
 #[derive(Debug, PartialEq, Eq)]
@@ -2743,7 +2786,13 @@ async fn lock_active_partition(
 ) -> MovementResult<bool> {
     sqlx::query(
         r#"
-        SELECT pg_advisory_xact_lock(
+        -- SHARED: movers only need to exclude retirement, which fences a day
+        -- under the exclusive form of this same key (the retirement claim);
+        -- they never need to exclude each other. Concurrent moves into one
+        -- day are safe (distinct graphs, primary keys on every object and
+        -- route), and this is what lets the backfill fan-out overlap the
+        -- write phase instead of queueing on the day.
+        SELECT pg_advisory_xact_lock_shared(
             hashtextextended(
                 'retained_response_objects.partition:' || current_schema() || ':'
                     || to_char($1::date, 'YYYYMMDD'),
@@ -2780,7 +2829,7 @@ async fn lock_active_partition(
           AND pg_get_expr(child.relpartbound, child.oid) = format(
               'FOR VALUES FROM (%L) TO (%L)', $1::date, $1::date + 1
         )
-        FOR UPDATE OF bucket
+        FOR SHARE OF bucket
         "#,
     )
     .bind(delete_on)
@@ -2979,7 +3028,7 @@ async fn move_graph<P: PoolProvider>(
     candidate: Candidate,
     policy: &RetentionPolicy,
     cutoffs: &RetainedResponseArchiveCutoffs,
-    remaining_bytes: u64,
+    budget: &ByteBudget,
     allow_oversized: bool,
 ) -> MovementResult<MoveGraphOutcome> {
     let mut tx = manager.begin_write().await.map_err(database_failure)?;
@@ -3170,7 +3219,7 @@ async fn move_graph<P: PoolProvider>(
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error())
     })?;
-    if payload_bytes > remaining_bytes && !allow_oversized {
+    if !budget.try_reserve(payload_bytes, allow_oversized) {
         return Ok(MoveGraphOutcome::Deferred);
     }
     if !lock_active_partition(&mut tx, delete_on).await? {
@@ -3319,22 +3368,43 @@ pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
     max_groups: i64,
     max_bytes: i64,
 ) -> Result<RetainedResponseArchiveOutcome> {
-    archive_batchless_responses(manager, policy, cutoffs, max_groups, max_bytes, false).await
+    archive_batchless_responses(manager, policy, cutoffs, max_groups, max_bytes, false, 1).await
 }
 
 /// The gated legacy path: no per-tier lower bound, so already-due graphs are
 /// discovered oldest-first; `move_graph` lands them on the day after
-/// observation.
+/// observation. Up to `concurrency` discovered graphs move at the same time.
 pub(crate) async fn archive_overdue_batchless_responses<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     policy: &RetentionPolicy,
     cutoffs: &RetainedResponseArchiveCutoffs,
     max_groups: i64,
     max_bytes: i64,
+    concurrency: usize,
 ) -> Result<RetainedResponseArchiveOutcome> {
-    archive_batchless_responses(manager, policy, cutoffs, max_groups, max_bytes, true).await
+    archive_batchless_responses(
+        manager,
+        policy,
+        cutoffs,
+        max_groups,
+        max_bytes,
+        true,
+        concurrency,
+    )
+    .await
 }
 
+// Concurrency lives here, below discovery, rather than as N whole passes run
+// side by side by the daemon. Discovery is an unlocked oldest-first read, so
+// N simultaneous passes would all discover the same head of the queue and
+// then merely take turns on it through the advisory locks: safe, but no
+// faster than one pass. One serial discovery followed by concurrent moves
+// over a candidate set of distinct graphs (deduplicated by group, with every
+// discovered member excluded from later probes) gives each mover its own
+// graph. Each move is still its own transaction with the per-graph advisory
+// lock, `FOR UPDATE SKIP LOCKED`, and read-back verification, so it stays
+// correct against any other mover — another pass, another pod, or a late
+// writer — exactly as before. The shared byte budget is reserved atomically.
 async fn archive_batchless_responses<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     policy: &RetentionPolicy,
@@ -3342,6 +3412,7 @@ async fn archive_batchless_responses<P: PoolProvider>(
     max_groups: i64,
     max_bytes: i64,
     include_overdue: bool,
+    concurrency: usize,
 ) -> Result<RetainedResponseArchiveOutcome> {
     if max_groups <= 0 || max_bytes <= 0 {
         return Ok(RetainedResponseArchiveOutcome::default());
@@ -3428,18 +3499,37 @@ async fn archive_batchless_responses<P: PoolProvider>(
         may_have_more: candidates.len() as i64 > max_groups || !discovery_exhausted,
         ..Default::default()
     };
-    for candidate in candidates {
-        let remaining_bytes = (max_bytes as u64).saturating_sub(outcome.bytes_archived);
-        let moved = match move_graph(
-            manager,
-            candidate,
-            policy,
-            cutoffs,
-            remaining_bytes,
-            outcome.groups_archived == 0,
-        )
-        .await
+    let budget = ByteBudget::new(max_bytes as u64);
+    let concurrency = concurrency.max(1);
+    let max_groups = max_groups as u64;
+    let mut pending = candidates.into_iter();
+    let mut in_flight = futures::stream::FuturesUnordered::new();
+    let mut dispatched = 0_u64;
+    loop {
+        // Dispatch only while an archived result from every in-flight move
+        // would still fit under the graph budget, so the pass can never
+        // commit more than `max_groups` graphs; the spare discovered
+        // candidate is dispatched only once an earlier move did not archive.
+        while in_flight.len() < concurrency
+            && outcome.groups_archived + in_flight.len() as u64 != max_groups
         {
+            let Some(candidate) = pending.next() else {
+                break;
+            };
+            in_flight.push(move_graph(
+                manager,
+                candidate,
+                policy,
+                cutoffs,
+                &budget,
+                dispatched == 0,
+            ));
+            dispatched += 1;
+        }
+        let Some(result) = futures::StreamExt::next(&mut in_flight).await else {
+            break;
+        };
+        let moved = match result {
             Ok(moved) => moved,
             Err(error)
                 if RetainedResponseMaintenanceError::from_fusillade_error(&error)
@@ -3452,7 +3542,19 @@ async fn archive_batchless_responses<P: PoolProvider>(
                 outcome.may_have_more = true;
                 continue;
             }
-            Err(error) => return Err(error),
+            // Returning drops the other in-flight moves; their uncommitted
+            // transactions roll back when the connections return to the pool.
+            // Graphs this pass already committed stay archived but are not
+            // counted by the caller, so say so (content-free).
+            Err(error) => {
+                if outcome.groups_archived > 0 {
+                    tracing::warn!(
+                        groups_committed_before_failure = outcome.groups_archived,
+                        "Retained-response archive pass aborted after some graphs had committed"
+                    );
+                }
+                return Err(error);
+            }
         };
         match moved {
             MoveGraphOutcome::Archived {
@@ -3464,9 +3566,6 @@ async fn archive_batchless_responses<P: PoolProvider>(
                 outcome.requests_archived += requests;
                 outcome.templates_archived += templates;
                 outcome.bytes_archived += bytes;
-                if outcome.groups_archived == max_groups as u64 {
-                    break;
-                }
             }
             MoveGraphOutcome::SkippedLocked => {
                 outcome.skipped_locked = true;
