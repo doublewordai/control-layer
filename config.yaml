@@ -692,6 +692,9 @@ background_services:
     # batchless_archive_backfill_enabled: false
     # batchless_archive_groups_per_tick: <positive bound>
     # batchless_archive_bytes_per_tick: <positive bound>
+    # batchless_archive_backfill_concurrency: 1  # Graphs the backfill moves at once per tick; the
+    #                                            # one-off drain lever (sweep stays sequential). Needs
+    #                                            # this many spare fusillade write connections.
     # retained_response_partitions_days_ahead: <positive runway>
     # Daily partition retirement irreversibly drops whole expired
     # retained-response partitions. It is independently disabled and needs a

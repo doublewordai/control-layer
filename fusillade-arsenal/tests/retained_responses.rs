@@ -4721,7 +4721,7 @@ async fn overdue_graph_moves_into_the_next_day_instead_of_deferring(pool: PgPool
 
     // … and the gated overdue path is what moves it.
     let outcome = manager
-        .archive_overdue_batchless_responses(&policy, &cutoffs, 1, i64::MAX)
+        .archive_overdue_batchless_responses(&policy, &cutoffs, 1, i64::MAX, 1)
         .await
         .unwrap();
     assert_eq!(
@@ -4739,6 +4739,128 @@ async fn overdue_graph_moves_into_the_next_day_instead_of_deferring(pool: PgPool
     assert_eq!(
         landed_on, next_day,
         "overdue content lands on the day after observation, never a droppable day"
+    );
+}
+
+#[sqlx::test]
+async fn concurrent_overdue_passes_move_every_graph_exactly_once(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    // Twenty already-due singleton graphs with distinct terminal instants, so
+    // every pass discovers the same oldest-first head of the queue.
+    let mut graphs = Vec::new();
+    for index in 0..20 {
+        let terminal_at = timestamp("2026-08-01T08:00:00Z") + TimeDelta::minutes(index);
+        graphs.push(
+            singleton(
+                &pool,
+                "flex",
+                TerminalState::Completed,
+                terminal_at,
+                &format!("concurrent-overdue-{index}"),
+            )
+            .await,
+        );
+    }
+    let next_day = exact_date("2026-09-01");
+    ensure_partition(&pool, next_day).await;
+    let manager = Arc::new(manager(&pool).await);
+
+    let observed = timestamp("2026-08-31T00:00:00Z");
+    let cutoffs = RetainedResponseArchiveCutoffs::new(observed, observed, observed).unwrap();
+    let policy = exact_policy(&[("flex", 1)]);
+
+    // Four passes start together, each fanning out four movers over a wave
+    // of up to eight graphs: intra-pass concurrency over one discovered wave
+    // and inter-pass contention over the same head are both exercised.
+    let barrier = Arc::new(Barrier::new(4));
+    let mut passes = Vec::new();
+    for _ in 0..4 {
+        let manager = manager.clone();
+        let barrier = barrier.clone();
+        let policy = policy.clone();
+        passes.push(tokio::spawn(async move {
+            barrier.wait().await;
+            manager
+                .archive_overdue_batchless_responses(&policy, &cutoffs, 8, i64::MAX, 4)
+                .await
+                .expect("concurrent overdue passes must not fail")
+        }));
+    }
+    let mut outcomes = Vec::new();
+    for pass in passes {
+        outcomes.push(pass.await.expect("overdue pass task must complete"));
+    }
+
+    // Whatever remains after the contended round drains sequentially so the
+    // assertion covers the whole fixture set, not just the contended part.
+    let mut sequential_outcome = RetainedResponseArchiveOutcome::default();
+    let mut drained = false;
+    for _ in 0..20 {
+        let outcome = manager
+            .archive_overdue_batchless_responses(&policy, &cutoffs, 8, i64::MAX, 4)
+            .await
+            .unwrap();
+        sequential_outcome.groups_archived += outcome.groups_archived;
+        sequential_outcome.requests_archived += outcome.requests_archived;
+        if outcome.groups_archived == 0 && !outcome.may_have_more {
+            drained = true;
+            break;
+        }
+    }
+    assert!(
+        drained,
+        "the queue must drain within a bounded number of passes"
+    );
+
+    let contended_groups: u64 = outcomes.iter().map(|outcome| outcome.groups_archived).sum();
+    let contended_requests: u64 = outcomes
+        .iter()
+        .map(|outcome| outcome.requests_archived)
+        .sum();
+    assert!(
+        contended_groups > 0,
+        "the contended round must make progress rather than have every pass skip"
+    );
+    assert_eq!(
+        contended_groups + sequential_outcome.groups_archived,
+        20,
+        "each graph is counted archived exactly once across every pass"
+    );
+    assert_eq!(
+        contended_requests + sequential_outcome.requests_archived,
+        20
+    );
+
+    let request_ids = graphs
+        .iter()
+        .flat_map(|graph| graph.request_ids.iter().copied())
+        .collect::<Vec<_>>();
+    assert_eq!(count_ids(&pool, "requests", &request_ids).await, 0);
+    for graph in &graphs {
+        // One group object, one request object, one delete_on per graph.
+        assert_wholly_retained(&pool, graph).await;
+    }
+    let group_ids = graphs
+        .iter()
+        .map(|graph| graph.group_id)
+        .collect::<Vec<_>>();
+    let (request_routes, group_routes): (i64, i64) = sqlx::query_as(
+        r#"
+        SELECT (SELECT COUNT(*) FROM retained_response_request_routes
+                 WHERE request_id = ANY($1)),
+               (SELECT COUNT(*) FROM retained_response_group_routes
+                 WHERE group_id = ANY($2))
+        "#,
+    )
+    .bind(&request_ids)
+    .bind(&group_ids)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (request_routes, group_routes),
+        (20, 20),
+        "routes map 1:1 onto the moved graphs: nothing lost, nothing moved twice"
     );
 }
 
