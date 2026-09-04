@@ -132,7 +132,7 @@ async fn live_heap_identities(pool: &sqlx::PgPool) -> Vec<(String, i64, i64)> {
         FROM pg_class relation
         JOIN pg_namespace namespace ON namespace.oid = relation.relnamespace
         WHERE namespace.nspname = current_schema()
-          AND relation.relname IN ('requests', 'request_templates', 'response_steps')
+          AND relation.relname IN ('requests', 'request_templates')
         ORDER BY relation.relname
         "#,
     )
@@ -150,7 +150,7 @@ async fn live_heap_index_identities(pool: &sqlx::PgPool) -> Vec<(String, String,
         JOIN pg_class index_relation ON index_relation.oid = index_catalog.indexrelid
         JOIN pg_namespace namespace ON namespace.oid = heap.relnamespace
         WHERE namespace.nspname = current_schema()
-          AND heap.relname IN ('requests', 'request_templates', 'response_steps')
+          AND heap.relname IN ('requests', 'request_templates')
         ORDER BY heap.relname, index_relation.relname
         "#,
     )
@@ -230,14 +230,12 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
             "object_kind",
             "object_id",
             "request_id",
-            "head_step_id",
             "created_by",
             "service_tier",
             "state",
             "model",
             "created_at",
             "terminal_at",
-            "step_sequence",
             "schema_version",
             "payload",
         ]
@@ -278,7 +276,6 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
         "idx_retained_response_objects_request_id",
         "idx_retained_response_objects_request_object_id",
         "idx_retained_response_objects_state_created",
-        "idx_retained_response_objects_step_object_id",
         "idx_retained_response_objects_tier_created",
     ] {
         assert!(
@@ -313,7 +310,6 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
         WHERE table_schema = current_schema()
           AND table_name IN (
               'retained_response_request_routes',
-              'retained_response_step_routes',
               'retained_response_group_routes',
               'retained_response_buckets',
               'retained_response_resurrection_fences',
@@ -325,7 +321,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(control_tables.len(), 6);
+    assert_eq!(control_tables.len(), 5);
 
     let fence_columns: Vec<String> = sqlx::query_scalar(
         r#"
@@ -402,7 +398,6 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
         WHERE table_schema = current_schema()
           AND table_name IN (
               'retained_response_request_routes',
-              'retained_response_step_routes',
               'retained_response_group_routes',
               'retained_response_buckets',
               'retained_response_resurrection_fences',

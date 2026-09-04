@@ -1081,7 +1081,6 @@ async fn route_cleanup_is_bounded_and_fences_every_identifier_before_deletion(po
 
     let groups = [Uuid::new_v4(), Uuid::new_v4()];
     let requests = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
-    let steps = [Uuid::new_v4()];
     sqlx::query(
         "INSERT INTO retained_response_group_routes (group_id, delete_on) \
          SELECT * FROM UNNEST($1::uuid[], $2::date[])",
@@ -1098,16 +1097,6 @@ async fn route_cleanup_is_bounded_and_fences_every_identifier_before_deletion(po
     .bind(requests.to_vec())
     .bind(vec![groups[0], groups[0], groups[1]])
     .bind(vec![today; requests.len()])
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO retained_response_step_routes (step_id, group_id, delete_on) \
-         VALUES ($1, $2, $3)",
-    )
-    .bind(steps[0])
-    .bind(groups[0])
-    .bind(today)
     .execute(&pool)
     .await
     .unwrap();
@@ -1138,10 +1127,9 @@ async fn route_cleanup_is_bounded_and_fences_every_identifier_before_deletion(po
         }
         deleted += chunk;
     }
-    assert_eq!(deleted, 6);
+    assert_eq!(deleted, 5);
     for relation in [
         "retained_response_request_routes",
-        "retained_response_step_routes",
         "retained_response_group_routes",
     ] {
         let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {relation}"))
@@ -1170,7 +1158,7 @@ async fn route_cleanup_is_bounded_and_fences_every_identifier_before_deletion(po
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(fences.len(), 6);
+    assert_eq!(fences.len(), 5);
     for (object_id, reason, expiry, canonical_expiry) in fences {
         if object_id == requests[0] {
             assert_eq!(reason, "erased");

@@ -13,7 +13,7 @@ pub mod manager;
 pub mod processor;
 pub mod transform;
 
-pub use fusillade_core::{batch, error, request, response_step};
+pub use fusillade_core::{batch, error, request};
 
 // Re-export commonly used types
 pub use daemon::{
@@ -22,9 +22,6 @@ pub use daemon::{
 pub use fusillade_core::batch::*;
 pub use fusillade_core::error::{FusilladeError, Result};
 pub use fusillade_core::request::*;
-pub use fusillade_core::response_step::{
-    CreateStepInput, ResponseStep, ResponseStepStore, StepId, StepKind, StepState,
-};
 pub use http::{HttpClient, HttpResponse, MockHttpClient, ReqwestHttpClient};
 #[cfg(feature = "postgres")]
 pub use manager::DaemonExecutor;

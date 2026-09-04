@@ -894,7 +894,6 @@ async fn run_batch_archive_phase<S>(
                         ArchiveOutcome::SkippedNotLive => "skipped_not_live",
                         ArchiveOutcome::SkippedNotFrozen => "skipped_not_frozen",
                         ArchiveOutcome::SkippedNoPartition => "skipped_no_partition",
-                        ArchiveOutcome::SkippedResponseSteps => "skipped_response_steps",
                         ArchiveOutcome::SkippedRetryRaced => "skipped_retry_raced",
                     };
                     counter!("fusillade_archive_moves_total", "worker" => tick.worker, "outcome" => label).increment(1);
@@ -980,8 +979,6 @@ async fn run_batchless_archive_phase<S>(
                 .increment(outcome.groups_archived);
             counter!("fusillade_retained_response_requests_archived_total", "worker" => tick.worker)
                 .increment(outcome.requests_archived);
-            counter!("fusillade_retained_response_steps_archived_total", "worker" => tick.worker)
-                .increment(outcome.steps_archived);
             counter!("fusillade_retained_response_templates_archived_total", "worker" => tick.worker)
                 .increment(outcome.templates_archived);
             counter!("fusillade_retained_response_bytes_archived_total", "worker" => tick.worker)
@@ -1004,7 +1001,6 @@ async fn run_batchless_archive_phase<S>(
                     worker = tick.worker,
                     groups_archived = outcome.groups_archived,
                     requests_archived = outcome.requests_archived,
-                    steps_archived = outcome.steps_archived,
                     templates_archived = outcome.templates_archived,
                     bytes_archived = outcome.bytes_archived,
                     skipped_locked = outcome.skipped_locked,

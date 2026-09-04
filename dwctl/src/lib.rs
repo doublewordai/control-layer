@@ -304,11 +304,6 @@ where
     /// Response store for Open Responses API lifecycle tracking.
     /// Reads/writes to fusillade's requests table.
     pub response_store: Arc<crate::inference::store::FusilladeResponseStore<P>>,
-    /// Multi-step response_steps storage. Optional so deployments that
-    /// don't use the multi-step Open Responses path can omit the
-    /// wiring; the GET /v1/responses/{id} handler degrades to 404 in
-    /// that case rather than panicking.
-    pub response_step_manager: Option<Arc<fusillade_arsenal::PostgresResponseStepManager<P>>>,
     /// Singleton image normaliser used by the realtime middleware, the
     /// batch ingest path, the dispatcher's JIT-signing step, and the
     /// dashboard `/images/:sha256` endpoint. Built once at startup so
@@ -1107,8 +1102,6 @@ async fn setup_database(
                           EXISTS (SELECT 1 FROM retained_response_group_routes route
                                   WHERE route.delete_on = bucket.delete_on)
                           OR EXISTS (SELECT 1 FROM retained_response_request_routes route
-                                     WHERE route.delete_on = bucket.delete_on)
-                          OR EXISTS (SELECT 1 FROM retained_response_step_routes route
                                      WHERE route.delete_on = bucket.delete_on)
                       )
                 )
@@ -2492,11 +2485,6 @@ async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next
 /// the shutdown token, signaling all tasks to stop.
 pub struct BackgroundServices {
     request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
-    /// Step storage for multi-step responses, sharing the same fusillade
-    /// pool as the request manager. Constructed in
-    /// `setup_background_services` so the manager's processor (which
-    /// dwctl wires later in `Application::new_with_pool`) can use it.
-    step_manager: Arc<fusillade_arsenal::PostgresResponseStepManager<DbPools>>,
     /// The onwards-instance daemon id registered in the `daemons` table
     /// for realtime / inline-loop attribution. The graceful-shutdown
     /// drain (`shutdown()`) marks this row Dead and releases any
@@ -2965,18 +2953,15 @@ impl BackgroundTaskBuilder {
 }
 
 /// Setup background services (probe scheduler, batch daemon, leader election,
-/// onwards integration). The caller owns construction of `request_manager` and
-/// `step_manager` and passes them in, so they exist before any daemon spawn
-/// inside this function.
+/// onwards integration). The caller owns construction of `request_manager`
+/// and passes it in, so it exists before any daemon spawn inside this
+/// function.
 pub(crate) struct BackgroundServicesInput {
     /// Fusillade's durable DB store, shared with the daemon runtime.
     pub request_manager: Arc<fusillade_arsenal::PostgresRequestManager<DbPools>>,
     /// Fusillade's scheduling daemon. Owns HTTP dispatch and runtime
     /// lifecycle; durable data operations live on `request_manager`.
     pub postgres_daemon: Arc<fusillade::PostgresDaemon<DbPools, fusillade::ReqwestHttpClient>>,
-    /// Fusillade's response-step manager. Shares the same fusillade
-    /// pool as the request manager.
-    pub step_manager: Arc<fusillade_arsenal::PostgresResponseStepManager<DbPools>>,
     /// Shared map between the fusillade daemon's concurrency control
     /// and the onwards config-sync writer. Built once by the caller and
     /// passed in by-clone here.
@@ -3003,7 +2988,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     let BackgroundServicesInput {
         request_manager,
         postgres_daemon,
-        step_manager,
         model_capacity_limits,
         pool,
         fusillade_pools,
@@ -3120,8 +3104,8 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
     let probe_scheduler = probes::ProbeScheduler::new(pool.clone(), config.clone());
 
-    // Caller owns `request_manager` / `step_manager` construction —
-    // see the function-level doc. We still need a pool clone here for
+    // Caller owns `request_manager` construction — see the
+    // function-level doc. We still need a pool clone here for
     // the metrics sampler; `fusillade_pools` is otherwise unused.
     let fusillade_pool_for_metrics = fusillade_pools.write().clone();
     drop(fusillade_pools);
@@ -3502,7 +3486,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
     Ok(BackgroundServices {
         request_manager,
-        step_manager,
         task_runner,
         is_leader,
         onwards_targets: initial_targets,
@@ -3662,7 +3645,6 @@ impl Application {
             fusillade::PostgresDaemon::from_store(request_manager.clone(), fusillade_daemon_config.clone())
                 .with_retention_maintenance(retention_maintenance_config),
         );
-        let step_manager = Arc::new(fusillade_arsenal::PostgresResponseStepManager::new(fusillade_pools.clone()));
         // Build the ZDR keystore once and share it across the response store, the
         // daemon processor, and background services (which install the response
         // transformer). A misconfiguration is fatal.
@@ -3670,11 +3652,8 @@ impl Application {
             Some(c) => Some(crate::keystore::Keystore::from_config(c).map_err(|e| anyhow::anyhow!("failed to initialise keystore: {e}"))?),
             None => None,
         };
-        let response_store = Arc::new(
-            crate::inference::store::FusilladeResponseStore::new(request_manager.clone())
-                .with_step_manager(step_manager.clone())
-                .with_keystore(keystore.clone()),
-        );
+        let response_store =
+            Arc::new(crate::inference::store::FusilladeResponseStore::new(request_manager.clone()).with_keystore(keystore.clone()));
 
         // Build the image normaliser ONCE — fail loud at startup if
         // `image_normalizer.enabled = true` but no backend is configured.
@@ -3711,7 +3690,6 @@ impl Application {
         let mut bg_services = setup_background_services(BackgroundServicesInput {
             request_manager: request_manager.clone(),
             postgres_daemon: postgres_daemon.clone(),
-            step_manager: step_manager.clone(),
             model_capacity_limits,
             pool: (*db_pools).clone(),
             fusillade_pools: fusillade_pools.clone(),
@@ -3867,7 +3845,6 @@ impl Application {
             .maybe_connections_encryption_key(bg_services.connections_encryption_key.clone())
             .maybe_keystore(bg_services.keystore.clone())
             .response_store(response_store)
-            .response_step_manager(bg_services.step_manager.clone())
             .image_normalizer(image_normalizer)
             .build();
 

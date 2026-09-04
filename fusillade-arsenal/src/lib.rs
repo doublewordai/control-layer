@@ -7,8 +7,6 @@ use fusillade_core::FusilladeError;
 
 mod db;
 pub mod postgres;
-#[path = "response_step.rs"]
-pub mod postgres_response_step;
 pub mod transform;
 mod utils;
 
@@ -17,9 +15,7 @@ pub use fusillade_core::manager::{
     RetainedResponseWriteError, RetentionPolicy, Storage,
 };
 pub use fusillade_core::request::AnyRequest;
-pub use fusillade_core::response_step;
 pub use postgres::{BatchInsertStrategy, PoolProvider, PostgresRequestManager, TestDbPools};
-pub use postgres_response_step::PostgresResponseStepManager;
 pub use transform::ResponseTransformer;
 
 pub mod batch {

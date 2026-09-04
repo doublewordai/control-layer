@@ -356,7 +356,6 @@ pub fn create_test_config() -> crate::config::Config {
         onboarding_url: None,
         support_email: "support@test.com".to_string(),
         connections: Default::default(),
-        responses: Default::default(),
         image_normalizer: Default::default(),
         openapi: Default::default(),
         cache: Default::default(),

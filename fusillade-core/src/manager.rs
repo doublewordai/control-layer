@@ -264,8 +264,6 @@ pub struct RetainedResponseArchiveOutcome {
     pub groups_archived: u64,
     /// Requests belonging only to fully committed graphs.
     pub requests_archived: u64,
-    /// Response steps belonging only to fully committed graphs.
-    pub steps_archived: u64,
     /// Templates belonging only to fully committed graphs.
     pub templates_archived: u64,
     /// Payload bytes belonging only to fully committed graphs.
@@ -614,9 +612,6 @@ pub enum ArchiveOutcome {
     /// batch stays live and fully served; fix partition creation and it
     /// archives on a later pass. Alert-worthy.
     SkippedNoPartition,
-    /// Some row is referenced by `response_steps`; the batch stays live
-    /// until the batchless store re-homes those rows.
-    SkippedResponseSteps,
     /// The `retry_version` CAS on the final stamp failed — a retry raced
     /// the move. Transaction rolled back; nothing moved.
     SkippedRetryRaced,

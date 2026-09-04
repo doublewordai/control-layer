@@ -34,7 +34,6 @@ BEGIN
     END IF;
     IF EXISTS (SELECT 1 FROM retained_response_group_routes LIMIT 1)
        OR EXISTS (SELECT 1 FROM retained_response_request_routes LIMIT 1)
-       OR EXISTS (SELECT 1 FROM retained_response_step_routes LIMIT 1)
        OR EXISTS (SELECT 1 FROM retained_response_resurrection_fences LIMIT 1)
        OR EXISTS (SELECT 1 FROM retained_response_objects LIMIT 1)
        OR EXISTS (
@@ -123,7 +122,6 @@ ALTER TABLE requests
 DROP FUNCTION ensure_retained_response_partitions(DATE, INTEGER);
 DROP FUNCTION ensure_retained_response_partition(DATE, TEXT);
 DROP FUNCTION retained_response_archive_index_ready(TEXT);
-DROP TABLE retained_response_step_routes;
 DROP TABLE retained_response_request_routes;
 DROP TABLE retained_response_group_routes;
 DROP TABLE retained_response_resurrection_fences;

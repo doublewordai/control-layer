@@ -15,7 +15,7 @@ use axum::{
     extract::{Path, State},
     http::HeaderMap,
 };
-use fusillade::{ResponseStepStore, Storage};
+use fusillade::Storage;
 use serde::{Deserialize, Serialize};
 use sqlx_pool_router::PoolProvider;
 use utoipa::ToSchema;
@@ -78,31 +78,18 @@ pub async fn get_response<P: PoolProvider>(
         .map_err(|e| Error::Database(e.into()))?
         .ok_or_else(|| Error::Unauthenticated { message: None })?;
 
-    // Parse the response ID to a head_step UUID. After the
-    // response_steps re-anchoring (fusillade 16.8) `resp_<id>` is the
-    // head step's id, NOT a fusillade.requests id.
+    // Parse the response ID: `resp_<uuid>` is the fusillade.requests id.
     let uuid_str = response_id.strip_prefix("resp_").unwrap_or(&response_id);
-    let head_step_uuid = uuid::Uuid::parse_str(uuid_str).map_err(|_| Error::NotFound {
+    let response_uuid = uuid::Uuid::parse_str(uuid_str).map_err(|_| Error::NotFound {
         resource: "response".to_string(),
         id: response_id.clone(),
     })?;
 
-    // Resolve the live row or retained snapshot that carries `created_by` for ownership.
-    // Two paths, mirroring `FusilladeResponseStore::get_response`:
-    //   * Multi-step — head step → its sub-request fusillade row.
-    //   * Single-step — the id is itself a fusillade.requests row
-    //     (chat completions / embeddings retrieved via the same GET).
-    // The auth resolution happens here on the row that's actually
-    // backing this response; `response_store.get_response` then
+    // Resolve the live row or retained snapshot that carries `created_by`
+    // for ownership. The auth resolution happens here on the row that's
+    // actually backing this response; `response_store.get_response` then
     // assembles the API envelope.
-    let auth_request_id = match state.response_step_manager.as_ref() {
-        Some(step_manager) => match step_manager.get_step(fusillade::StepId(head_step_uuid)).await {
-            Ok(Some(head_step)) => head_step.request_id.unwrap_or(fusillade::RequestId(head_step_uuid)),
-            Ok(None) => fusillade::RequestId(head_step_uuid),
-            Err(e) => return Err(Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("{e}")))),
-        },
-        None => fusillade::RequestId(head_step_uuid),
-    };
+    let auth_request_id = fusillade::RequestId(response_uuid);
 
     let detail = state
         .request_manager
@@ -211,14 +198,14 @@ pub async fn delete_response<P: PoolProvider>(
         .ok_or_else(|| Error::Unauthenticated { message: None })?;
 
     let uuid_str = response_id.strip_prefix("resp_").unwrap_or(&response_id);
-    let head_step_uuid = uuid::Uuid::parse_str(uuid_str).map_err(|_| Error::NotFound {
+    let response_uuid = uuid::Uuid::parse_str(uuid_str).map_err(|_| Error::NotFound {
         resource: "response".to_string(),
         id: response_id.clone(),
     })?;
 
     state
         .request_manager
-        .delete_owned_response_group(head_step_uuid, &owner_id)
+        .delete_owned_response_group(response_uuid, &owner_id)
         .await
         .map_err(|error| match error {
             fusillade::FusilladeError::RequestNotFound(_) => Error::NotFound {

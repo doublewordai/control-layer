@@ -5443,17 +5443,14 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // parent file is deleted.
         //
         // Cascades from this DELETE:
-        //   * response_steps.request_id → ON DELETE CASCADE
         //   * requests.escalated_from_request_id / superseded_by_request_id
         //     (self-references) → ON DELETE SET NULL
         //   * requests.template_id → ON DELETE SET NULL (so deleting the
         //     template below cannot cascade-delete unrelated requests)
         //
         // In-flight handling: a daemon mid-update on this row will see 0 rows
-        // affected on its next UPDATE and log a no-op; a streaming proxy mid-
-        // write of response_steps will FK-violate (the row is gone) and
-        // surface that as an error log without corrupting state. Both are
-        // acceptable failure modes for an explicit user-initiated erasure.
+        // affected on its next UPDATE and log a no-op. That is an acceptable
+        // failure mode for an explicit user-initiated erasure.
         let mut tx = self
             .begin_write()
             .await
@@ -5543,8 +5540,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
         // Stage 0: erase batchless responses in stable whole-graph units.
         // Both live and retained graphs use the same lock/revalidation/fence
-        // primitive, so a bounded creator pass can never strand sibling
-        // requests, steps, routes, or dedicated templates.
+        // primitive, so a bounded creator pass can never strand a request's
+        // routes or dedicated template.
         let batchless_requests = retained_response::delete_creator_response_groups(
             &mut tx,
             creator_id,
@@ -8952,26 +8949,6 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to check archive partition: {}", e)))?;
         if !partition_exists {
             return Ok(ArchiveOutcome::SkippedNoPartition);
-        }
-
-        // Rows referenced by response_steps stay live until the batchless
-        // store re-homes them (phase 6); skip the whole batch — partial
-        // moves outside the retry path would create un-modeled states.
-        let has_response_steps = sqlx::query_scalar!(
-            r#"
-            SELECT EXISTS (
-                SELECT 1 FROM response_steps s
-                JOIN requests r ON r.id = s.request_id
-                WHERE r.batch_id = $1
-            ) AS "has!"
-            "#,
-            *batch_id as Uuid,
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to check response_steps: {}", e)))?;
-        if has_response_steps {
-            return Ok(ArchiveOutcome::SkippedResponseSteps);
         }
 
         // Forward move. Positional alignment (`r.*, $bucket`) is guaranteed
@@ -14105,32 +14082,6 @@ mod tests {
         let (location, _, live, archived) = archive_state(&pool, batch_id).await;
         assert_eq!(location, "archive");
         assert_eq!((live, archived), (0, 3));
-    }
-
-    #[sqlx::test]
-    async fn test_archive_batch_skips_response_steps_referenced(pool: sqlx::PgPool) {
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            Arc::new(MockHttpClient::new()),
-        );
-        let batch_id = setup_frozen_batch(&manager, &pool, "arch-steps", 2).await;
-        sqlx::query(
-            "INSERT INTO response_steps (id, request_id, step_kind, step_sequence, request_payload, response_payload, state, retry_attempt, started_at, completed_at)
-             SELECT gen_random_uuid(), id, 'model_call', 1, '{}', '{}', 'completed', 0, NOW(), NOW()
-             FROM requests WHERE batch_id = $1 LIMIT 1",
-        )
-        .bind(*batch_id as Uuid)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        assert_eq!(
-            manager.archive_batch(batch_id).await.unwrap(),
-            ArchiveOutcome::SkippedResponseSteps
-        );
-        let (location, _, live, _) = archive_state(&pool, batch_id).await;
-        assert_eq!(location, "live");
-        assert_eq!(live, 2);
     }
 
     /// Archived batches stay fully readable: get_batch_requests and
@@ -21160,7 +21111,7 @@ mod tests {
     // DELETE REQUEST
     // =========================================================================
     // Tests for delete_request: right-to-erasure on a single request row.
-    // Cancels in-flight work, then hard-deletes; response_steps cascade via FK.
+    // Cancels in-flight work, then hard-deletes.
 
     #[sqlx::test]
     async fn test_delete_request_batchless(pool: sqlx::PgPool) {
@@ -21216,75 +21167,10 @@ mod tests {
         );
     }
 
+    /// Erasure is scoped to the one request row: an unrelated request created
+    /// by the same owner is untouched (there is no inter-request FK).
     #[sqlx::test]
-    async fn test_delete_request_cascades_response_steps(pool: sqlx::PgPool) {
-        let http_client = Arc::new(MockHttpClient::new());
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client,
-        );
-
-        let request_id = manager
-            .create_realtime(crate::request::CreateRealtimeInput {
-                request_id: uuid::Uuid::new_v4(),
-                body: r#"{"model":"gpt-4","messages":[]}"#.to_string(),
-                model: "gpt-4".to_string(),
-                endpoint: "http://localhost:3001/ai".to_string(),
-                method: "POST".to_string(),
-                path: "/v1/responses".to_string(),
-                api_key: String::new(),
-                created_by: "user-1".to_string(),
-            })
-            .await
-            .unwrap();
-
-        // Insert a response_step row that references the request directly,
-        // exercising the ON DELETE CASCADE FK.
-        let step_id = uuid::Uuid::new_v4();
-        sqlx::query!(
-            r#"
-            INSERT INTO response_steps (
-                id, request_id, step_kind, step_sequence,
-                request_payload, state
-            ) VALUES ($1, $2, 'model_call', 0, '{}'::jsonb, 'pending')
-            "#,
-            step_id,
-            *request_id as Uuid,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        manager.delete_request(request_id).await.unwrap();
-
-        let step_count: i64 = sqlx::query_scalar!(
-            r#"SELECT count(*) as "count!" FROM response_steps WHERE id = $1"#,
-            step_id,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            step_count, 0,
-            "response_steps row should cascade-delete with its request",
-        );
-    }
-
-    /// Validates that the cascade is scoped to a single request row's
-    /// `response_steps`, not the whole chain. After migration `20260430000000`
-    /// re-anchored `response_steps.request_id` to per-step sub-request rows,
-    /// the fusillade primitive only removes the step row(s) whose
-    /// `request_id` matches the deleted request — sibling steps belonging to
-    /// other sub-requests in the same chain are untouched here. Walking the
-    /// chain and erasing every backing sub-request is the caller's job.
-    ///
-    /// Note: `response_steps.parent_step_id` and `prev_step_id` also have
-    /// `ON DELETE CASCADE`, so within a chain, deleting an early step
-    /// transitively removes descendants. To isolate the per-row primitive
-    /// semantic, this test uses two *unrelated* single-step responses (no
-    /// parent/prev links) — neither cascade edge can fire.
-    #[sqlx::test]
-    async fn test_delete_request_cascade_is_per_row(pool: sqlx::PgPool) {
+    async fn test_delete_request_leaves_unrelated_requests_intact(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -21318,40 +21204,11 @@ mod tests {
             .await
             .unwrap();
 
-        let step_a = uuid::Uuid::new_v4();
-        let step_b = uuid::Uuid::new_v4();
-        sqlx::query!(
-            r#"
-            INSERT INTO response_steps (
-                id, request_id, parent_step_id, prev_step_id, step_kind, step_sequence,
-                request_payload, state
-            ) VALUES
-                ($1, $2, NULL, NULL, 'model_call', 0, '{}'::jsonb, 'pending'),
-                ($3, $4, NULL, NULL, 'model_call', 0, '{}'::jsonb, 'pending')
-            "#,
-            step_a,
-            *req_a as Uuid,
-            step_b,
-            *req_b as Uuid,
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
         manager.delete_request(req_a).await.unwrap();
 
-        // step_a is gone (cascade via its request_id); step_b is untouched;
-        // req_b's request row is untouched (no inter-request FK).
-        let step_a_count: i64 = sqlx::query_scalar!(
-            r#"SELECT count(*) as "count!" FROM response_steps WHERE id = $1"#,
-            step_a,
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let step_b_count: i64 = sqlx::query_scalar!(
-            r#"SELECT count(*) as "count!" FROM response_steps WHERE id = $1"#,
-            step_b,
+        let req_a_count: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "count!" FROM requests WHERE id = $1"#,
+            *req_a as Uuid,
         )
         .fetch_one(&pool)
         .await
@@ -21363,8 +21220,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(step_a_count, 0, "step_a should cascade-delete");
-        assert_eq!(step_b_count, 1, "unrelated step_b must survive");
+        assert_eq!(req_a_count, 0, "req_a should be hard-deleted");
         assert_eq!(req_b_count, 1, "unrelated req_b must survive");
     }
 

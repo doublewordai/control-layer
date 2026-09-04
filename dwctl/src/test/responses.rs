@@ -774,7 +774,7 @@ async fn read_retained_singleton_preserves_response_and_fails_closed_after_drop(
 
 #[sqlx::test]
 #[test_log::test]
-async fn read_retained_multistep_preserves_head_public_id_and_owner(pool: PgPool) {
+async fn read_retained_response_preserves_public_id_and_owner(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
     mount_chat_completions_mock(&mock_server).await;
     let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
@@ -783,7 +783,7 @@ async fn read_retained_multistep_preserves_head_public_id_and_owner(pool: PgPool
         .post("/ai/v1/responses")
         .add_header("Authorization", &format!("Bearer {api_key}"))
         .add_header("Content-Type", "application/json")
-        .json(&serde_json::json!({"model": "gpt-4o", "input": "retained multi-step"}))
+        .json(&serde_json::json!({"model": "gpt-4o", "input": "retained response"}))
         .await
         .assert_status_ok();
     let request_id = poll_completed_row(&pool, uuid::Uuid::nil()).await;
@@ -794,19 +794,8 @@ async fn read_retained_multistep_preserves_head_public_id_and_owner(pool: PgPool
     .execute(&pool)
     .await
     .unwrap();
-    let head_id = uuid::Uuid::new_v4();
-    sqlx::query(
-        "INSERT INTO fusillade.response_steps (id, request_id, step_kind, step_sequence, request_payload, response_payload, state, started_at, completed_at, created_at, updated_at) VALUES ($1, $2, 'model_call', 1, $3, $4, 'completed', '2026-08-01 09:59:00Z', '2026-08-01 10:00:00Z', '2026-08-01 09:58:00Z', '2026-08-01 10:00:00Z')",
-    )
-    .bind(head_id)
-    .bind(request_id)
-    .bind(serde_json::json!({"input": "retained multi-step"}))
-    .bind(serde_json::json!({"output": "retained multi-step"}))
-    .execute(&pool)
-    .await
-    .unwrap();
 
-    let response_id = format!("resp_{head_id}");
+    let response_id = format!("resp_{request_id}");
     let before = server
         .get(&format!("/ai/v1/responses/{response_id}"))
         .add_header("Authorization", &format!("Bearer {api_key}"))

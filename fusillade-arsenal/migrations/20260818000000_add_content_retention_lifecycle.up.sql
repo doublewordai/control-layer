@@ -1,7 +1,7 @@
 -- Additive storage for immutable terminal batchless response graphs.
 --
 -- This migration does not scan, copy, rename, replace, or rewrite requests,
--- request_templates, or response_steps. Movement and retirement are runtime
+-- or request_templates. Movement and retirement are runtime
 -- operations and remain disabled unless an operator enables them separately.
 --
 -- Before enabling terminal-response movement, build this payload-free index
@@ -49,17 +49,15 @@ COMMENT ON COLUMN files.retention_expired_at IS
 CREATE TABLE retained_response_objects (
     delete_on DATE NOT NULL,
     group_id UUID NOT NULL,
-    object_kind TEXT NOT NULL CHECK (object_kind IN ('group', 'request', 'step')),
+    object_kind TEXT NOT NULL CHECK (object_kind IN ('group', 'request')),
     object_id UUID NOT NULL,
     request_id UUID,
-    head_step_id UUID,
     created_by TEXT,
     service_tier TEXT,
     state TEXT,
     model TEXT,
     created_at TIMESTAMPTZ,
     terminal_at TIMESTAMPTZ,
-    step_sequence BIGINT,
     schema_version SMALLINT NOT NULL,
     payload JSONB NOT NULL,
     PRIMARY KEY (delete_on, object_kind, object_id)
@@ -72,17 +70,14 @@ COMMENT ON COLUMN retained_response_objects.delete_on IS
 
 CREATE INDEX idx_retained_response_objects_group
     ON retained_response_objects
-       (delete_on, group_id, object_kind, step_sequence, object_id);
+       (delete_on, group_id, object_kind, object_id);
 CREATE INDEX idx_retained_response_objects_request_id
     ON retained_response_objects
-       (delete_on, request_id, step_sequence, object_id)
+       (delete_on, request_id, object_id)
     WHERE request_id IS NOT NULL;
 CREATE INDEX idx_retained_response_objects_request_object_id
     ON retained_response_objects (delete_on, object_id)
     WHERE object_kind = 'request';
-CREATE INDEX idx_retained_response_objects_step_object_id
-    ON retained_response_objects (delete_on, object_id)
-    WHERE object_kind = 'step';
 CREATE INDEX idx_retained_response_objects_owner_created
     ON retained_response_objects
        (created_by, created_at DESC, object_id DESC, delete_on)
@@ -131,22 +126,11 @@ CREATE INDEX idx_retained_response_request_routes_group
 CREATE INDEX idx_retained_response_request_routes_bucket
     ON retained_response_request_routes (delete_on, request_id);
 
-CREATE TABLE retained_response_step_routes (
-    step_id UUID PRIMARY KEY,
-    group_id UUID NOT NULL,
-    delete_on DATE NOT NULL REFERENCES retained_response_buckets(delete_on)
-);
-CREATE INDEX idx_retained_response_step_routes_group
-    ON retained_response_step_routes (group_id, step_id);
-CREATE INDEX idx_retained_response_step_routes_bucket
-    ON retained_response_step_routes (delete_on, step_id);
 
 COMMENT ON TABLE retained_response_group_routes IS
     'Content-free exact group-to-day routing metadata.';
 COMMENT ON TABLE retained_response_request_routes IS
     'Content-free exact request-to-group-and-day routing metadata.';
-COMMENT ON TABLE retained_response_step_routes IS
-    'Content-free exact response-step-to-group-and-day routing metadata.';
 
 CREATE TABLE retained_response_resurrection_fences (
     object_id UUID PRIMARY KEY,

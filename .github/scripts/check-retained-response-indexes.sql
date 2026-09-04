@@ -14,7 +14,6 @@ BEGIN
     IF to_regclass('retained_response_objects') IS NULL
         OR to_regclass('retained_response_buckets') IS NULL
         OR to_regclass('retained_response_request_routes') IS NULL
-        OR to_regclass('retained_response_step_routes') IS NULL
         OR to_regclass('retained_response_group_routes') IS NULL
         OR to_regclass('retained_response_resurrection_fences') IS NULL
         OR to_regclass('retention_partition_retirements') IS NULL THEN

@@ -228,73 +228,6 @@ pub(super) async fn cleanup_retained_response_routes<P: PoolProvider>(
     deleted += u64::try_from(request_deleted).map_err(|_| failed())?;
 
     if remaining > 0 {
-        let step_deleted = sqlx::query_scalar::<_, i64>(
-            r#"
-            WITH candidates AS MATERIALIZED (
-                SELECT route.step_id AS object_id, journal.completed_at
-                FROM retained_response_step_routes route
-                JOIN retained_response_buckets bucket
-                  ON bucket.delete_on = route.delete_on
-                JOIN retention_partition_retirements journal
-                  ON journal.parent_table = 'retained_response_objects'
-                 AND journal.partition_schema = bucket.partition_schema
-                 AND journal.partition_table = bucket.partition_table
-                 AND journal.partition_oid = bucket.partition_oid
-                 AND journal.lower_bound = bucket.delete_on
-                 AND journal.upper_bound = bucket.delete_on + 1
-                 AND journal.completed_at IS NOT NULL
-                 AND journal.completed_at = bucket.state_changed_at
-                JOIN pg_namespace namespace
-                  ON namespace.nspname = bucket.partition_schema
-                 AND namespace.oid = journal.partition_schema_oid
-                JOIN pg_class parent
-                  ON parent.relnamespace = namespace.oid
-                 AND parent.relname = 'retained_response_objects'
-                 AND parent.oid = journal.parent_oid
-                WHERE bucket.state = 'retired'
-                  AND bucket.partition_schema = current_schema()
-                  AND bucket.partition_table = 'retained_response_objects_d'
-                        || to_char(bucket.delete_on, 'YYYYMMDD')
-                ORDER BY route.delete_on, route.step_id
-                FOR UPDATE OF route SKIP LOCKED
-                LIMIT $1
-            ), fenced AS (
-                INSERT INTO retained_response_resurrection_fences (
-                    object_id, reason, expires_at
-                )
-                SELECT object_id, 'retired',
-                       completed_at + ($2::bigint * INTERVAL '1 second')
-                FROM candidates
-                ON CONFLICT (object_id) DO UPDATE
-                SET reason = CASE
-                        WHEN retained_response_resurrection_fences.reason = 'erased'
-                            THEN 'erased'
-                        ELSE 'retired'
-                    END,
-                    expires_at = GREATEST(
-                        retained_response_resurrection_fences.expires_at,
-                        EXCLUDED.expires_at
-                    )
-                RETURNING object_id
-            ), removed AS (
-                DELETE FROM retained_response_step_routes route
-                USING fenced
-                WHERE route.step_id = fenced.object_id
-                RETURNING 1
-            )
-            SELECT COUNT(*)::bigint FROM removed
-            "#,
-        )
-        .bind(remaining)
-        .bind(fence_seconds)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(|_| failed())?;
-        remaining -= step_deleted;
-        deleted += u64::try_from(step_deleted).map_err(|_| failed())?;
-    }
-
-    if remaining > 0 {
         let group_deleted = sqlx::query_scalar::<_, i64>(
             r#"
             WITH candidates AS MATERIALIZED (
@@ -326,10 +259,6 @@ pub(super) async fn cleanup_retained_response_routes<P: PoolProvider>(
                       SELECT 1 FROM retained_response_request_routes request_route
                       WHERE request_route.group_id = route.group_id
                   )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM retained_response_step_routes step_route
-                      WHERE step_route.group_id = route.group_id
-                  )
                 ORDER BY route.delete_on, route.group_id
                 FOR UPDATE OF route SKIP LOCKED
                 LIMIT $1
@@ -358,10 +287,6 @@ pub(super) async fn cleanup_retained_response_routes<P: PoolProvider>(
                   AND NOT EXISTS (
                       SELECT 1 FROM retained_response_request_routes request_route
                       WHERE request_route.group_id = route.group_id
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1 FROM retained_response_step_routes step_route
-                      WHERE step_route.group_id = route.group_id
                   )
                 RETURNING 1
             )

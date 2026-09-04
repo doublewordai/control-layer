@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use fusillade_arsenal::batch::TemplateId;
@@ -8,17 +8,13 @@ use fusillade_arsenal::manager::{
     RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
     RetainedResponseMaintenanceError, RetainedResponseWriteError, RetentionPolicy,
 };
-use fusillade_arsenal::postgres_response_step::{
-    ResponseStepNotFound, RetainedResponseStepConflict,
-};
 use fusillade_arsenal::request::{
     Completed, CreateRealtimeInput, DaemonId, ListRequestsFilter, PersistCompletedRealtimeInput,
     Request, RequestData, RequestId, ServiceTierFilter,
 };
-use fusillade_arsenal::response_step::{CreateStepInput, ResponseStepStore, StepId, StepKind};
 use fusillade_arsenal::{
-    DaemonStorage, PoolProvider, PostgresRequestManager, PostgresResponseStepManager,
-    PostgresStorageConfig, Storage, TestDbPools,
+    DaemonStorage, PoolProvider, PostgresRequestManager, PostgresStorageConfig, Storage,
+    TestDbPools,
 };
 use serde_json::{Value, json};
 use sqlx::pool::PoolConnection;
@@ -43,21 +39,12 @@ enum TerminalState {
     Pending,
 }
 
+/// A live retained-response graph: exactly one request plus its template.
+/// The group id is the request id.
 struct LiveGraph {
     group_id: Uuid,
     request_ids: Vec<Uuid>,
-    step_ids: Vec<Uuid>,
     template_ids: Vec<Uuid>,
-}
-
-struct StepFixture {
-    id: Uuid,
-    request_id: Option<Uuid>,
-    prev_step_id: Option<Uuid>,
-    parent_step_id: Option<Uuid>,
-    sequence: i64,
-    state: TerminalState,
-    terminal_at: DateTime<Utc>,
 }
 
 #[derive(Clone)]
@@ -65,34 +52,6 @@ struct WriteSignalingPools {
     read: PgPool,
     write: PgPool,
     write_requested: Arc<AtomicBool>,
-}
-
-#[derive(Clone)]
-struct DiscoveryReadGatedPools {
-    read: PgPool,
-    gated_read: PgPool,
-    read_selections: Arc<AtomicUsize>,
-    gate_requested: Arc<AtomicBool>,
-}
-
-impl PoolProvider for DiscoveryReadGatedPools {
-    fn read(&self) -> &PgPool {
-        // Zero-based selection 2 is the bounded look-ahead after the index
-        // readiness read and the first atomic candidate snapshot. The archive
-        // clock is supplied immutably by the caller, so it consumes no pool
-        // selection.
-        if self.read_selections.fetch_add(1, Ordering::AcqRel) == 2 {
-            self.gate_requested.store(true, Ordering::Release);
-            &self.gated_read
-        } else {
-            &self.read
-        }
-    }
-
-    fn write(&self) -> &PgPool {
-        self.gate_requested.store(true, Ordering::Release);
-        &self.read
-    }
 }
 
 impl PoolProvider for WriteSignalingPools {
@@ -163,17 +122,15 @@ fn exact_policy(tiers: &[(&str, u64)]) -> RetentionPolicy {
 
 async fn assert_wholly_erased(pool: &PgPool, graph: &LiveGraph) {
     assert_eq!(count_ids(pool, "requests", &graph.request_ids).await, 0);
-    assert_eq!(count_ids(pool, "response_steps", &graph.step_ids).await, 0);
     assert_eq!(
         count_ids(pool, "request_templates", &graph.template_ids).await,
         0
     );
-    assert_eq!(retained_counts(pool, graph.group_id).await, (0, 0, 0));
+    assert_eq!(retained_counts(pool, graph.group_id).await, (0, 0));
     let route_count: i64 = sqlx::query_scalar(
         r#"
         SELECT (SELECT COUNT(*) FROM retained_response_group_routes WHERE group_id = $1)
              + (SELECT COUNT(*) FROM retained_response_request_routes WHERE group_id = $1)
-             + (SELECT COUNT(*) FROM retained_response_step_routes WHERE group_id = $1)
         "#,
     )
     .bind(graph.group_id)
@@ -188,7 +145,6 @@ async fn assert_wholly_erased(pool: &PgPool, graph: &LiveGraph) {
     .bind(
         std::iter::once(graph.group_id)
             .chain(graph.request_ids.iter().copied())
-            .chain(graph.step_ids.iter().copied())
             .collect::<Vec<_>>(),
     )
     .fetch_one(pool)
@@ -196,7 +152,6 @@ async fn assert_wholly_erased(pool: &PgPool, graph: &LiveGraph) {
     .unwrap();
     let expected = std::iter::once(graph.group_id)
         .chain(graph.request_ids.iter().copied())
-        .chain(graph.step_ids.iter().copied())
         .collect::<std::collections::HashSet<_>>()
         .len() as i64;
     assert_eq!(fenced, expected);
@@ -230,31 +185,6 @@ async fn erase_retained_singleton_by_request_id_removes_the_complete_graph(pool:
 }
 
 #[sqlx::test]
-async fn erase_retained_branching_graph_by_head_or_member_is_atomic(pool: PgPool) {
-    install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let manager = manager(&pool).await;
-    archive(
-        &manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(
-        manager
-            .delete_response_group(graph.request_ids[1])
-            .await
-            .unwrap(),
-        2
-    );
-    assert_wholly_erased(&pool, &graph).await;
-}
-
-#[sqlx::test]
 async fn erase_never_shortens_an_existing_fence_expiry(pool: PgPool) {
     install_candidate_index(&pool).await;
     ensure_partition(&pool, archive_date("2026-08-03")).await;
@@ -281,7 +211,6 @@ async fn erase_never_shortens_an_existing_fence_expiry(pool: PgPool) {
     .bind(
         std::iter::once(graph.group_id)
             .chain(graph.request_ids.iter().copied())
-            .chain(graph.step_ids.iter().copied())
             .collect::<Vec<_>>(),
     )
     .execute(&pool)
@@ -297,7 +226,6 @@ async fn erase_never_shortens_an_existing_fence_expiry(pool: PgPool) {
     .bind(
         std::iter::once(graph.group_id)
             .chain(graph.request_ids.iter().copied())
-            .chain(graph.step_ids.iter().copied())
             .collect::<Vec<_>>(),
     )
     .fetch_all(&pool)
@@ -317,40 +245,42 @@ async fn erase_creator_retained_groups_in_stable_bounded_units(pool: PgPool) {
     install_candidate_index(&pool).await;
     ensure_partition(&pool, archive_date("2026-08-03")).await;
     ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let branching = branching_graph(&pool, TerminalState::Completed).await;
-    let singleton = singleton(
+    let later = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-05T10:00:00Z"),
+        "creator-later-group",
+    )
+    .await;
+    let earlier = singleton(
         &pool,
         "flex",
         TerminalState::Completed,
         timestamp("2026-08-01T09:00:00Z"),
-        "creator-second-group",
+        "creator-earlier-group",
     )
     .await;
     let manager = manager(&pool).await;
-    archive(
-        &manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        2,
-        i64::MAX,
-    )
-    .await
-    .unwrap();
+    archive(&manager, &policy(&[("flex", 86_400)]), 2, i64::MAX)
+        .await
+        .unwrap();
+    assert_wholly_retained(&pool, &later).await;
+    assert_wholly_retained(&pool, &earlier).await;
 
-    let first = manager.bulk_delete_data(OWNER, 1).await.unwrap();
-    assert!(matches!(first, 1 | 2));
+    assert_eq!(manager.bulk_delete_data(OWNER, 1).await.unwrap(), 1);
     let remaining = [
-        retained_counts(&pool, branching.group_id).await.0,
-        retained_counts(&pool, singleton.group_id).await.0,
+        retained_counts(&pool, later.group_id).await.0,
+        retained_counts(&pool, earlier.group_id).await.0,
     ]
     .into_iter()
     .sum::<i64>();
     assert_eq!(remaining, 1, "one whole group must remain after one unit");
 
-    let second = manager.bulk_delete_data(OWNER, 1).await.unwrap();
-    assert!(matches!(second, 1 | 2));
+    assert_eq!(manager.bulk_delete_data(OWNER, 1).await.unwrap(), 1);
     assert_eq!(manager.bulk_delete_data(OWNER, 1).await.unwrap(), 0);
-    assert_wholly_erased(&pool, &branching).await;
-    assert_wholly_erased(&pool, &singleton).await;
+    assert_wholly_erased(&pool, &later).await;
+    assert_wholly_erased(&pool, &earlier).await;
 }
 
 #[sqlx::test]
@@ -453,154 +383,6 @@ async fn creator_erasure_reports_progress_when_oldest_graph_is_busy(pool: PgPool
     holder.commit().await.unwrap();
     assert_eq!(manager.bulk_delete_data(OWNER, 1).await.unwrap(), 1);
     assert_wholly_erased(&pool, &graph).await;
-}
-
-#[sqlx::test]
-async fn direct_erasure_restarts_when_a_singleton_gains_a_head_while_waiting(pool: PgPool) {
-    let mut graph = singleton(
-        &pool,
-        "flex",
-        TerminalState::Completed,
-        timestamp("2026-08-01T10:00:00Z"),
-        "erase-canonical-lock-race",
-    )
-    .await;
-    let request_id = graph.request_ids[0];
-    let head_id = Uuid::new_v4();
-
-    let mut singleton_locker = pool.acquire().await.unwrap();
-    let singleton_locker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *singleton_locker)
-        .await
-        .unwrap();
-    lock_session_response_graph(&mut singleton_locker, request_id).await;
-
-    let erase_pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(pool.connect_options().as_ref().clone())
-        .await
-        .unwrap();
-    let erase_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&erase_pool)
-        .await
-        .unwrap();
-    let erase_manager = manager(&erase_pool).await;
-    let mut eraser =
-        tokio::spawn(async move { erase_manager.delete_response_group(request_id).await });
-    tokio::select! {
-        result = &mut eraser => panic!("erasure completed before the tentative singleton lock was released: {result:?}"),
-        () = wait_for_backend_blocked_by(&pool, erase_pid, singleton_locker_pid) => {}
-    }
-
-    insert_step(
-        &pool,
-        StepFixture {
-            id: head_id,
-            request_id: Some(request_id),
-            prev_step_id: None,
-            parent_step_id: None,
-            sequence: 0,
-            state: TerminalState::Pending,
-            terminal_at: timestamp("2026-08-01T10:01:00Z"),
-        },
-    )
-    .await;
-    graph.group_id = head_id;
-    graph.step_ids.push(head_id);
-
-    let mut head_locker = pool.acquire().await.unwrap();
-    let head_locker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *head_locker)
-        .await
-        .unwrap();
-    lock_session_response_graph(&mut head_locker, head_id).await;
-    unlock_session_response_graph(&mut singleton_locker, request_id).await;
-
-    tokio::select! {
-        result = &mut eraser => panic!("erasure used the obsolete singleton lock instead of restarting under the headed graph: {result:?}"),
-        () = wait_for_backend_blocked_by(&pool, erase_pid, head_locker_pid) => {}
-    }
-    unlock_session_response_graph(&mut head_locker, head_id).await;
-
-    assert_eq!(eraser.await.unwrap().unwrap(), 1);
-    assert_wholly_erased(&pool, &graph).await;
-}
-
-#[sqlx::test]
-async fn request_writer_restarts_when_a_singleton_gains_a_head_while_waiting(pool: PgPool) {
-    let mut graph = singleton(
-        &pool,
-        "flex",
-        TerminalState::Pending,
-        timestamp("2026-08-01T10:00:00Z"),
-        "writer-canonical-lock-race",
-    )
-    .await;
-    let request_id = graph.request_ids[0];
-    let head_id = Uuid::new_v4();
-
-    let mut singleton_locker = pool.acquire().await.unwrap();
-    let singleton_locker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *singleton_locker)
-        .await
-        .unwrap();
-    lock_session_response_graph(&mut singleton_locker, request_id).await;
-
-    let writer_pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(pool.connect_options().as_ref().clone())
-        .await
-        .unwrap();
-    let writer_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&writer_pool)
-        .await
-        .unwrap();
-    let writer_manager = manager(&writer_pool).await;
-    let terminal = generic_terminal_write(&graph);
-    let mut writer = tokio::spawn(async move { writer_manager.persist(&terminal).await });
-    tokio::select! {
-        result = &mut writer => panic!("writer completed before the tentative singleton lock was released: {result:?}"),
-        () = wait_for_backend_blocked_by(&pool, writer_pid, singleton_locker_pid) => {}
-    }
-
-    insert_step(
-        &pool,
-        StepFixture {
-            id: head_id,
-            request_id: Some(request_id),
-            prev_step_id: None,
-            parent_step_id: None,
-            sequence: 0,
-            state: TerminalState::Pending,
-            terminal_at: timestamp("2026-08-01T10:01:00Z"),
-        },
-    )
-    .await;
-    graph.group_id = head_id;
-    graph.step_ids.push(head_id);
-
-    let mut head_locker = pool.acquire().await.unwrap();
-    let head_locker_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&mut *head_locker)
-        .await
-        .unwrap();
-    lock_session_response_graph(&mut head_locker, head_id).await;
-    unlock_session_response_graph(&mut singleton_locker, request_id).await;
-
-    tokio::select! {
-        result = &mut writer => panic!("writer used the obsolete singleton lock instead of restarting under the headed graph: {result:?}"),
-        () = wait_for_backend_blocked_by(&pool, writer_pid, head_locker_pid) => {}
-    }
-    unlock_session_response_graph(&mut head_locker, head_id).await;
-
-    writer.await.unwrap().unwrap();
-    assert_wholly_live(&pool, &graph).await;
-    let state: String = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
-        .bind(request_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(state, "completed");
 }
 
 #[sqlx::test]
@@ -799,39 +581,32 @@ async fn erase_live_graph_preserves_a_template_shared_by_an_unrelated_request(po
 }
 
 #[sqlx::test]
-async fn owned_erasure_denies_a_mixed_owner_graph_without_mutation(pool: PgPool) {
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    sqlx::query("UPDATE requests SET created_by = 'different-owner' WHERE id = $1")
-        .bind(graph.request_ids[1])
-        .execute(&pool)
-        .await
-        .unwrap();
+async fn owned_erasure_denies_a_foreign_owner_without_mutation(pool: PgPool) {
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "owned-foreign",
+    )
+    .await;
     let manager = manager(&pool).await;
 
     let error = manager
-        .delete_owned_response_group(graph.group_id, OWNER)
+        .delete_owned_response_group(graph.group_id, "different-owner")
         .await
-        .expect_err("one differently-owned member must deny the whole graph");
+        .expect_err("a differently-owned graph must be denied");
     assert!(matches!(
         error,
         fusillade_arsenal::error::FusilladeError::RequestNotFound(_)
     ));
-    assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 2);
-    assert_eq!(
-        count_ids(&pool, "response_steps", &graph.step_ids).await,
-        graph.step_ids.len() as i64
-    );
-    assert_eq!(
-        count_ids(&pool, "request_templates", &graph.template_ids).await,
-        2
-    );
+    assert_wholly_live(&pool, &graph).await;
     let fences: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM retained_response_resurrection_fences WHERE object_id = ANY($1)",
     )
     .bind(
         std::iter::once(graph.group_id)
             .chain(graph.request_ids.iter().copied())
-            .chain(graph.step_ids.iter().copied())
             .collect::<Vec<_>>(),
     )
     .fetch_one(&pool)
@@ -841,22 +616,29 @@ async fn owned_erasure_denies_a_mixed_owner_graph_without_mutation(pool: PgPool)
 
     assert_eq!(
         manager.delete_response_group(graph.group_id).await.unwrap(),
-        2,
+        1,
         "the explicit privileged erasure path must remain available"
     );
 }
 
 #[sqlx::test]
-async fn owned_erasure_accepts_the_complete_owner_graph(pool: PgPool) {
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
+async fn owned_erasure_accepts_the_owner_graph(pool: PgPool) {
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "owned-accepted",
+    )
+    .await;
     let manager = manager(&pool).await;
 
     assert_eq!(
         manager
-            .delete_owned_response_group(graph.step_ids[1], OWNER)
+            .delete_owned_response_group(graph.request_ids[0], OWNER)
             .await
             .unwrap(),
-        2
+        1
     );
     assert_wholly_erased(&pool, &graph).await;
 }
@@ -882,7 +664,6 @@ async fn assert_retained_erasure_rejects_corruption(
     .bind(
         std::iter::once(graph.group_id)
             .chain(graph.request_ids.iter().copied())
-            .chain(graph.step_ids.iter().copied())
             .collect::<Vec<_>>(),
     )
     .fetch_one(pool)
@@ -894,17 +675,19 @@ async fn assert_retained_erasure_rejects_corruption(
 #[sqlx::test]
 async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let manager = manager(&pool).await;
-    archive(
-        &manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "erasure-validation",
     )
-    .await
-    .unwrap();
+    .await;
+    let manager = manager(&pool).await;
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
     let delete_on: NaiveDate = sqlx::query_scalar(
         "SELECT delete_on FROM retained_response_group_routes WHERE group_id = $1",
     )
@@ -914,7 +697,7 @@ async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: P
     .unwrap();
     let original_request: serde_json::Value = sqlx::query_scalar(
         "SELECT payload FROM retained_response_objects \
-         WHERE delete_on = $1 AND group_id = $2 AND object_id = $3",
+         WHERE delete_on = $1 AND group_id = $2 AND object_id = $3 AND object_kind = 'request'",
     )
     .bind(delete_on)
     .bind(graph.group_id)
@@ -922,13 +705,13 @@ async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: P
     .fetch_one(&pool)
     .await
     .unwrap();
-    let original_step: serde_json::Value = sqlx::query_scalar(
+    let original_group: serde_json::Value = sqlx::query_scalar(
         "SELECT payload FROM retained_response_objects \
-         WHERE delete_on = $1 AND group_id = $2 AND object_id = $3",
+         WHERE delete_on = $1 AND group_id = $2 AND object_id = $3 AND object_kind = 'group'",
     )
     .bind(delete_on)
     .bind(graph.group_id)
-    .bind(graph.step_ids[0])
+    .bind(graph.group_id)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -937,9 +720,9 @@ async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: P
     // the header and route cardinalities still match.
     sqlx::query(
         "UPDATE retained_response_objects SET payload = $1 \
-         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4 AND object_kind = 'request'",
     )
-    .bind(&original_step)
+    .bind(&original_group)
     .bind(delete_on)
     .bind(graph.group_id)
     .bind(graph.request_ids[0])
@@ -949,7 +732,7 @@ async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: P
     assert_retained_erasure_rejects_corruption(&pool, &manager, &graph).await;
     sqlx::query(
         "UPDATE retained_response_objects SET payload = $1 \
-         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4 AND object_kind = 'request'",
     )
     .bind(&original_request)
     .bind(delete_on)
@@ -959,11 +742,11 @@ async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: P
     .await
     .unwrap();
 
-    // Row-vs-payload identities are checked for both request and step objects.
+    // Row-vs-payload identity is checked for the request object.
     sqlx::query(
         "UPDATE retained_response_objects \
          SET payload = jsonb_set(payload, '{request,id}', to_jsonb($1::text)) \
-         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4 AND object_kind = 'request'",
     )
     .bind(uuid::Uuid::new_v4())
     .bind(delete_on)
@@ -975,7 +758,7 @@ async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: P
     assert_retained_erasure_rejects_corruption(&pool, &manager, &graph).await;
     sqlx::query(
         "UPDATE retained_response_objects SET payload = $1 \
-         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4 AND object_kind = 'request'",
     )
     .bind(&original_request)
     .bind(delete_on)
@@ -984,27 +767,27 @@ async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: P
     .execute(&pool)
     .await
     .unwrap();
+
+    // The group header must name exactly its request.
     sqlx::query(
         "UPDATE retained_response_objects \
-         SET payload = jsonb_set(payload, '{step,id}', to_jsonb($1::text)) \
-         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+         SET payload = jsonb_set(payload, '{request_ids}', to_jsonb(ARRAY[$1::text])) \
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $3 AND object_kind = 'group'",
     )
     .bind(uuid::Uuid::new_v4())
     .bind(delete_on)
     .bind(graph.group_id)
-    .bind(graph.step_ids[0])
     .execute(&pool)
     .await
     .unwrap();
     assert_retained_erasure_rejects_corruption(&pool, &manager, &graph).await;
     sqlx::query(
         "UPDATE retained_response_objects SET payload = $1 \
-         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $3 AND object_kind = 'group'",
     )
-    .bind(&original_step)
+    .bind(&original_group)
     .bind(delete_on)
     .bind(graph.group_id)
-    .bind(graph.step_ids[0])
     .execute(&pool)
     .await
     .unwrap();
@@ -1014,7 +797,7 @@ async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: P
     sqlx::query(
         "UPDATE retained_response_objects \
          SET payload = jsonb_set(payload, '{request,template_id}', to_jsonb($1::text)) \
-         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4 AND object_kind = 'request'",
     )
     .bind(uuid::Uuid::new_v4())
     .bind(delete_on)
@@ -1026,7 +809,7 @@ async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: P
     assert_retained_erasure_rejects_corruption(&pool, &manager, &graph).await;
     sqlx::query(
         "UPDATE retained_response_objects SET payload = $1 \
-         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4",
+         WHERE delete_on = $2 AND group_id = $3 AND object_id = $4 AND object_kind = 'request'",
     )
     .bind(&original_request)
     .bind(delete_on)
@@ -1037,7 +820,7 @@ async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: P
     .unwrap();
     sqlx::query(
         "UPDATE retained_response_objects SET created_by = 'different-owner' \
-         WHERE delete_on = $1 AND group_id = $2 AND object_id = $3",
+         WHERE delete_on = $1 AND group_id = $2 AND object_id = $3 AND object_kind = 'request'",
     )
     .bind(delete_on)
     .bind(graph.group_id)
@@ -1048,7 +831,7 @@ async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: P
     assert_retained_erasure_rejects_corruption(&pool, &manager, &graph).await;
     sqlx::query(
         "UPDATE retained_response_objects SET created_by = $1, payload = $2 \
-         WHERE delete_on = $3 AND group_id = $4 AND object_id = $5",
+         WHERE delete_on = $3 AND group_id = $4 AND object_id = $5 AND object_kind = 'request'",
     )
     .bind(OWNER)
     .bind(&original_request)
@@ -1072,11 +855,6 @@ async fn retained_erasure_validates_all_rows_routes_and_payload_topology(pool: P
     // Exact route membership is required even when every object remains.
     sqlx::query("DELETE FROM retained_response_request_routes WHERE request_id = $1")
         .bind(graph.request_ids[0])
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("DELETE FROM retained_response_step_routes WHERE step_id = $1")
-        .bind(graph.step_ids[0])
         .execute(&pool)
         .await
         .unwrap();
@@ -1421,19 +1199,21 @@ fn assert_write_error(
 }
 
 #[sqlx::test]
-async fn late_request_and_step_writers_cannot_resurrect_an_erased_graph(pool: PgPool) {
+async fn late_request_writers_cannot_resurrect_an_erased_graph(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let manager = manager(&pool).await;
-    archive(
-        &manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "late-after-erasure",
     )
-    .await
-    .unwrap();
+    .await;
+    let manager = manager(&pool).await;
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
     manager.delete_response_group(graph.group_id).await.unwrap();
 
     for error in [
@@ -1470,30 +1250,6 @@ async fn late_request_and_step_writers_cannot_resurrect_an_erased_graph(pool: Pg
         .await
         .expect_err("bulk late persistence must report an erased identity");
     assert_write_error(&bulk_error, RetainedResponseWriteError::NotFound);
-
-    let pools = TestDbPools::new(pool.clone()).await.unwrap();
-    let step_manager = PostgresResponseStepManager::new(pools);
-    let create_error = step_manager
-        .create_step(CreateStepInput {
-            id: Some(graph.step_ids[0]),
-            request_id: None,
-            prev_step_id: None,
-            parent_step_id: None,
-            step_kind: StepKind::ToolCall,
-            step_sequence: 100,
-            request_payload: json!({"must_not": "survive"}),
-        })
-        .await
-        .expect_err("an erased step must not be recreated");
-    assert!(matches!(
-        &create_error,
-        fusillade_arsenal::error::FusilladeError::Other(source)
-            if source.downcast_ref::<ResponseStepNotFound>().is_some()
-    ));
-    step_manager
-        .complete_step(StepId(graph.step_ids[0]), json!({"must_not": "survive"}))
-        .await
-        .expect_err("an erased step must remain absent");
 
     assert_wholly_erased(&pool, &graph).await;
 }
@@ -1785,7 +1541,6 @@ async fn retiring_route_blocks_late_synthesis_after_archive_fence_expiry(pool: P
     .bind(
         std::iter::once(graph.group_id)
             .chain(graph.request_ids.iter().copied())
-            .chain(graph.step_ids.iter().copied())
             .collect::<Vec<_>>(),
     )
     .execute(&pool)
@@ -1893,7 +1648,6 @@ async fn explicit_erasure_of_an_already_retired_route_is_idempotently_unavailabl
         0
     );
     assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
-    assert_eq!(count_ids(&pool, "response_steps", &graph.step_ids).await, 0);
 }
 
 #[sqlx::test]
@@ -2070,21 +1824,6 @@ async fn manager(pool: &PgPool) -> PostgresRequestManager<TestDbPools> {
     .with_retained_response_fence_seconds(Some(3_600))
 }
 
-async fn managers(
-    pool: &PgPool,
-) -> (
-    PostgresRequestManager<TestDbPools>,
-    PostgresResponseStepManager<TestDbPools>,
-) {
-    let pools = TestDbPools::new(pool.clone())
-        .await
-        .expect("test pools must initialize");
-    (
-        PostgresRequestManager::new(pools.clone(), PostgresStorageConfig::default()),
-        PostgresResponseStepManager::new(pools),
-    )
-}
-
 async fn write_gated_manager(
     pool: &PgPool,
 ) -> (
@@ -2111,35 +1850,6 @@ async fn write_gated_manager(
         PostgresStorageConfig::default(),
     );
     (manager, held_connection, write_requested)
-}
-
-async fn discovery_read_gated_manager(
-    pool: &PgPool,
-) -> (
-    PostgresRequestManager<DiscoveryReadGatedPools>,
-    PoolConnection<Postgres>,
-    Arc<AtomicBool>,
-) {
-    let gated_read = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(pool.connect_options().as_ref().clone())
-        .await
-        .expect("gated read pool must connect");
-    let held_connection = gated_read
-        .acquire()
-        .await
-        .expect("the sole gated read connection must be held");
-    let gate_requested = Arc::new(AtomicBool::new(false));
-    let manager = PostgresRequestManager::new(
-        DiscoveryReadGatedPools {
-            read: pool.clone(),
-            gated_read,
-            read_selections: Arc::new(AtomicUsize::new(0)),
-            gate_requested: Arc::clone(&gate_requested),
-        },
-        PostgresStorageConfig::default(),
-    );
-    (manager, held_connection, gate_requested)
 }
 
 async fn wait_for_write_request(write_requested: &AtomicBool) {
@@ -2234,56 +1944,6 @@ async fn wait_for_backend_lock_waiter(pool: &PgPool, backend_pid: i32) {
         }
         tokio::task::yield_now().await;
     }
-}
-
-async fn wait_for_backend_blocked_by(pool: &PgPool, waiter_pid: i32, blocker_pid: i32) {
-    loop {
-        let blocked: bool = sqlx::query_scalar("SELECT $2::int4 = ANY(pg_blocking_pids($1))")
-            .bind(waiter_pid)
-            .bind(blocker_pid)
-            .fetch_one(pool)
-            .await
-            .expect("the graph lock blocker must be observable");
-        if blocked {
-            return;
-        }
-        tokio::task::yield_now().await;
-    }
-}
-
-async fn lock_session_response_graph(connection: &mut PoolConnection<Postgres>, group_id: Uuid) {
-    sqlx::query(
-        r#"
-        SELECT pg_advisory_lock(
-            hashtextextended(
-                'retained_response_graph:' || current_schema() || ':' || $1::text,
-                0
-            )
-        )
-        "#,
-    )
-    .bind(group_id)
-    .execute(&mut **connection)
-    .await
-    .expect("the graph lock must be acquired");
-}
-
-async fn unlock_session_response_graph(connection: &mut PoolConnection<Postgres>, group_id: Uuid) {
-    let unlocked: bool = sqlx::query_scalar(
-        r#"
-        SELECT pg_advisory_unlock(
-            hashtextextended(
-                'retained_response_graph:' || current_schema() || ':' || $1::text,
-                0
-            )
-        )
-        "#,
-    )
-    .bind(group_id)
-    .fetch_one(&mut **connection)
-    .await
-    .expect("the graph lock must be released");
-    assert!(unlocked);
 }
 
 async fn install_candidate_index(pool: &PgPool) {
@@ -2478,118 +2138,6 @@ async fn insert_request(
     (request_id, template_id)
 }
 
-async fn insert_step(pool: &PgPool, step: StepFixture) {
-    let StepFixture {
-        id,
-        request_id,
-        prev_step_id,
-        parent_step_id,
-        sequence,
-        state,
-        terminal_at,
-    } = step;
-    let (
-        kind,
-        state_name,
-        started_at,
-        response_payload,
-        completed_at,
-        error,
-        failed_at,
-        canceled_at,
-    ) = match state {
-        TerminalState::Completed => (
-            if request_id.is_some() {
-                "model_call"
-            } else {
-                "tool_call"
-            },
-            "completed",
-            Some(terminal_at - TimeDelta::minutes(1)),
-            Some(json!({"sequence": sequence, "result": "done"})),
-            Some(terminal_at),
-            None,
-            None,
-            None,
-        ),
-        TerminalState::Failed => (
-            if request_id.is_some() {
-                "model_call"
-            } else {
-                "tool_call"
-            },
-            "failed",
-            Some(terminal_at - TimeDelta::minutes(1)),
-            None,
-            None,
-            Some(json!({"sequence": sequence, "error": "failed"})),
-            Some(terminal_at),
-            None,
-        ),
-        TerminalState::Canceled { .. } => (
-            if request_id.is_some() {
-                "model_call"
-            } else {
-                "tool_call"
-            },
-            "canceled",
-            Some(terminal_at - TimeDelta::minutes(1)),
-            None,
-            None,
-            None,
-            None,
-            Some(terminal_at),
-        ),
-        TerminalState::Pending => (
-            if request_id.is_some() {
-                "model_call"
-            } else {
-                "tool_call"
-            },
-            "pending",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        ),
-    };
-    sqlx::query(
-        r#"
-        INSERT INTO response_steps (
-            id, request_id, prev_step_id, parent_step_id, step_kind,
-            step_sequence, request_payload, response_payload, state,
-            started_at, completed_at, failed_at, canceled_at, retry_attempt,
-            error, created_at, updated_at
-        ) VALUES (
-            $1, $2, $3, $4, $5,
-            $6, $7, $8, $9,
-            $10, $11, $12, $13, 1,
-            $14, $15 - INTERVAL '2 hours', $15
-        )
-        "#,
-    )
-    .bind(id)
-    .bind(request_id)
-    .bind(prev_step_id)
-    .bind(parent_step_id)
-    .bind(kind)
-    .bind(sequence)
-    .bind(json!({"sequence": sequence, "input": "fixture"}))
-    .bind(response_payload)
-    .bind(state_name)
-    .bind(started_at)
-    .bind(completed_at)
-    .bind(failed_at)
-    .bind(canceled_at)
-    .bind(error)
-    .bind(terminal_at)
-    .execute(pool)
-    .await
-    .expect("response step must insert");
-}
-
 async fn singleton(
     pool: &PgPool,
     tier: &str,
@@ -2601,121 +2149,7 @@ async fn singleton(
     LiveGraph {
         group_id: request_id,
         request_ids: vec![request_id],
-        step_ids: Vec::new(),
         template_ids: vec![template_id],
-    }
-}
-
-async fn branching_graph(pool: &PgPool, second_request_state: TerminalState) -> LiveGraph {
-    branching_graph_with_tail_states(pool, second_request_state, second_request_state).await
-}
-
-async fn branching_graph_with_tail_states(
-    pool: &PgPool,
-    second_request_state: TerminalState,
-    tail_step_state: TerminalState,
-) -> LiveGraph {
-    let first_terminal = timestamp("2026-08-01T10:00:00Z");
-    let second_terminal = timestamp("2026-08-02T11:00:00Z");
-    let (first_request, first_template) = insert_request(
-        pool,
-        "flex",
-        TerminalState::Completed,
-        first_terminal,
-        "branch-head",
-    )
-    .await;
-    let (second_request, second_template) = insert_request(
-        pool,
-        "priority",
-        second_request_state,
-        second_terminal,
-        "branch-tail",
-    )
-    .await;
-    let head = Uuid::new_v4();
-    let parallel_a = Uuid::new_v4();
-    let parallel_b = Uuid::new_v4();
-    let nested_tool = Uuid::new_v4();
-    let tail_model = Uuid::new_v4();
-
-    insert_step(
-        pool,
-        StepFixture {
-            id: head,
-            request_id: Some(first_request),
-            prev_step_id: None,
-            parent_step_id: None,
-            sequence: 1,
-            state: TerminalState::Completed,
-            terminal_at: first_terminal,
-        },
-    )
-    .await;
-    insert_step(
-        pool,
-        StepFixture {
-            id: parallel_a,
-            request_id: None,
-            prev_step_id: Some(head),
-            parent_step_id: Some(head),
-            sequence: 2,
-            state: TerminalState::Completed,
-            terminal_at: timestamp("2026-08-02T12:00:00Z"),
-        },
-    )
-    .await;
-    insert_step(
-        pool,
-        StepFixture {
-            id: parallel_b,
-            request_id: None,
-            prev_step_id: Some(head),
-            parent_step_id: Some(head),
-            sequence: 3,
-            state: TerminalState::Failed,
-            terminal_at: timestamp("2026-08-02T13:00:00Z"),
-        },
-    )
-    .await;
-    insert_step(
-        pool,
-        StepFixture {
-            id: nested_tool,
-            request_id: None,
-            prev_step_id: Some(parallel_a),
-            parent_step_id: Some(head),
-            sequence: 4,
-            state: TerminalState::Completed,
-            terminal_at: timestamp("2026-08-03T14:00:00Z"),
-        },
-    )
-    .await;
-    insert_step(
-        pool,
-        StepFixture {
-            id: tail_model,
-            request_id: Some(second_request),
-            prev_step_id: Some(nested_tool),
-            parent_step_id: Some(head),
-            sequence: 5,
-            state: tail_step_state,
-            terminal_at: second_terminal,
-        },
-    )
-    .await;
-
-    let mut request_ids = vec![first_request, second_request];
-    request_ids.sort_unstable();
-    let mut step_ids = vec![head, parallel_a, parallel_b, nested_tool, tail_model];
-    step_ids.sort_unstable();
-    let mut template_ids = vec![first_template, second_template];
-    template_ids.sort_unstable();
-    LiveGraph {
-        group_id: head,
-        request_ids,
-        step_ids,
-        template_ids,
     }
 }
 
@@ -2728,12 +2162,11 @@ async fn count_ids(pool: &PgPool, table: &str, ids: &[Uuid]) -> i64 {
         .expect("live count must succeed")
 }
 
-async fn retained_counts(pool: &PgPool, group_id: Uuid) -> (i64, i64, i64) {
+async fn retained_counts(pool: &PgPool, group_id: Uuid) -> (i64, i64) {
     let row = sqlx::query(
         r#"
         SELECT COUNT(*) FILTER (WHERE object_kind = 'group')::BIGINT AS groups,
-               COUNT(*) FILTER (WHERE object_kind = 'request')::BIGINT AS requests,
-               COUNT(*) FILTER (WHERE object_kind = 'step')::BIGINT AS steps
+               COUNT(*) FILTER (WHERE object_kind = 'request')::BIGINT AS requests
         FROM retained_response_objects
         WHERE group_id = $1
         "#,
@@ -2742,11 +2175,7 @@ async fn retained_counts(pool: &PgPool, group_id: Uuid) -> (i64, i64, i64) {
     .fetch_one(pool)
     .await
     .expect("retained counts must succeed");
-    (
-        row.get::<i64, _>("groups"),
-        row.get::<i64, _>("requests"),
-        row.get::<i64, _>("steps"),
-    )
+    (row.get::<i64, _>("groups"), row.get::<i64, _>("requests"))
 }
 
 async fn distinct_delete_on_count(pool: &PgPool, group_id: Uuid) -> i64 {
@@ -2765,30 +2194,21 @@ async fn assert_wholly_live(pool: &PgPool, graph: &LiveGraph) {
         graph.request_ids.len() as i64
     );
     assert_eq!(
-        count_ids(pool, "response_steps", &graph.step_ids).await,
-        graph.step_ids.len() as i64
-    );
-    assert_eq!(
         count_ids(pool, "request_templates", &graph.template_ids).await,
         graph.template_ids.len() as i64
     );
-    assert_eq!(retained_counts(pool, graph.group_id).await, (0, 0, 0));
+    assert_eq!(retained_counts(pool, graph.group_id).await, (0, 0));
 }
 
 async fn assert_wholly_retained(pool: &PgPool, graph: &LiveGraph) {
     assert_eq!(count_ids(pool, "requests", &graph.request_ids).await, 0);
-    assert_eq!(count_ids(pool, "response_steps", &graph.step_ids).await, 0);
     assert_eq!(
         count_ids(pool, "request_templates", &graph.template_ids).await,
         0
     );
     assert_eq!(
         retained_counts(pool, graph.group_id).await,
-        (
-            1,
-            graph.request_ids.len() as i64,
-            graph.step_ids.len() as i64,
-        )
+        (1, graph.request_ids.len() as i64)
     );
     assert_eq!(distinct_delete_on_count(pool, graph.group_id).await, 1);
 }
@@ -3072,63 +2492,6 @@ async fn graph_newer_than_terminal_cutoff_stays_wholly_live(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn mixed_timestamp_graph_waits_for_latest_member_then_moves(pool: PgPool) {
-    install_candidate_index(&pool).await;
-    let (archive_now, _) = archive_clock(&pool).await;
-    let request_terminal = archive_now - TimeDelta::hours(3);
-    let step_terminal = archive_now - TimeDelta::minutes(30);
-    let retention_seconds = 30 * 86_400;
-    let delete_on = RetentionPolicy::delete_on(step_terminal, retention_seconds).unwrap();
-    ensure_partition(&pool, delete_on).await;
-    let mut graph = singleton(
-        &pool,
-        "flex",
-        TerminalState::Completed,
-        request_terminal,
-        "mixed-dwell",
-    )
-    .await;
-    let head = Uuid::new_v4();
-    insert_step(
-        &pool,
-        StepFixture {
-            id: head,
-            request_id: Some(graph.request_ids[0]),
-            prev_step_id: None,
-            parent_step_id: None,
-            sequence: 1,
-            state: TerminalState::Completed,
-            terminal_at: step_terminal,
-        },
-    )
-    .await;
-    graph.group_id = head;
-    graph.step_ids = vec![head];
-    let manager = manager(&pool).await;
-    let policy = exact_policy(&[("flex", retention_seconds)]);
-
-    let waiting = archive_at(
-        &manager,
-        &policy,
-        archive_now - TimeDelta::hours(1),
-        archive_now,
-        1,
-        i64::MAX,
-    )
-    .await
-    .expect("a graph with a member inside dwell is deferred");
-    assert_eq!(waiting.groups_archived, 0);
-    assert!(waiting.may_have_more);
-    assert_wholly_live(&pool, &graph).await;
-
-    let moved = archive_at(&manager, &policy, archive_now, archive_now, 1, i64::MAX)
-        .await
-        .expect("the complete graph moves once its latest member clears dwell");
-    assert_eq!(moved.groups_archived, 1);
-    assert_wholly_retained(&pool, &graph).await;
-}
-
-#[sqlx::test]
 async fn due_legacy_graph_stays_live_and_does_not_report_discoverable_work(pool: PgPool) {
     install_candidate_index(&pool).await;
     let (archive_now, today_start) = archive_clock(&pool).await;
@@ -3253,239 +2616,6 @@ async fn seed_at_utc_window_lower_bound_is_discoverable(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn old_seed_with_newer_step_is_conservatively_left_for_legacy_handling(pool: PgPool) {
-    install_candidate_index(&pool).await;
-    let (archive_now, today_start) = archive_clock(&pool).await;
-    let retention_seconds = 86_400;
-    let request_terminal = today_start - TimeDelta::days(2);
-    let step_terminal = archive_now - TimeDelta::hours(1);
-    let future_delete_on = RetentionPolicy::delete_on(step_terminal, retention_seconds).unwrap();
-    ensure_partition(&pool, future_delete_on).await;
-    let mut graph = singleton(
-        &pool,
-        "flex",
-        TerminalState::Completed,
-        request_terminal,
-        "legacy-seed-new-step",
-    )
-    .await;
-    let head = Uuid::new_v4();
-    insert_step(
-        &pool,
-        StepFixture {
-            id: head,
-            request_id: Some(graph.request_ids[0]),
-            prev_step_id: None,
-            parent_step_id: None,
-            sequence: 1,
-            state: TerminalState::Completed,
-            terminal_at: step_terminal,
-        },
-    )
-    .await;
-    graph.group_id = head;
-    graph.step_ids = vec![head];
-    let manager = manager(&pool).await;
-
-    let outcome = archive_at(
-        &manager,
-        &exact_policy(&[("flex", retention_seconds)]),
-        archive_now,
-        archive_now,
-        1,
-        i64::MAX,
-    )
-    .await
-    .expect("a conservative discovery false negative is a safe no-op");
-
-    assert_eq!(outcome, RetainedResponseArchiveOutcome::default());
-    assert_wholly_live(&pool, &graph).await;
-}
-
-#[sqlx::test]
-async fn stale_singleton_candidate_never_cascade_deletes_a_new_response_graph(pool: PgPool) {
-    install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-03")).await;
-    let mut graph = singleton(
-        &pool,
-        "flex",
-        TerminalState::Completed,
-        timestamp("2026-08-01T10:00:00Z"),
-        "stale-singleton",
-    )
-    .await;
-    let (gated_manager, held_connection, write_requested) = write_gated_manager(&pool).await;
-    let retention_policy = policy(&[("flex", 86_400)]);
-    let mut mover =
-        tokio::spawn(async move { archive(&gated_manager, &retention_policy, 1, i64::MAX).await });
-
-    tokio::select! {
-        result = &mut mover => panic!("mover completed before the write gate: {result:?}"),
-        () = wait_for_write_request(&write_requested) => {}
-    }
-
-    let head = Uuid::new_v4();
-    let child = Uuid::new_v4();
-    insert_step(
-        &pool,
-        StepFixture {
-            id: head,
-            request_id: Some(graph.request_ids[0]),
-            prev_step_id: None,
-            parent_step_id: None,
-            sequence: 1,
-            state: TerminalState::Completed,
-            terminal_at: timestamp("2026-08-01T10:00:00Z"),
-        },
-    )
-    .await;
-    insert_step(
-        &pool,
-        StepFixture {
-            id: child,
-            request_id: None,
-            prev_step_id: Some(head),
-            parent_step_id: Some(head),
-            sequence: 2,
-            state: TerminalState::Completed,
-            terminal_at: timestamp("2026-08-01T11:00:00Z"),
-        },
-    )
-    .await;
-    graph.group_id = head;
-    graph.step_ids = vec![head, child];
-    graph.step_ids.sort_unstable();
-
-    drop(held_connection);
-    match mover.await.expect("mover task must finish") {
-        Ok(outcome) if outcome.groups_archived == 1 => {
-            assert_eq!(outcome.requests_archived, 1);
-            assert_eq!(outcome.steps_archived, 2);
-            assert_wholly_retained(&pool, &graph).await;
-        }
-        _ => assert_wholly_live(&pool, &graph).await,
-    }
-}
-
-#[sqlx::test]
-async fn nonhead_parent_cascade_edge_fails_closed_without_deleting_any_member(pool: PgPool) {
-    install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let mut graph = branching_graph(&pool, TerminalState::Completed).await;
-    let nonhead = *graph
-        .step_ids
-        .iter()
-        .find(|step_id| **step_id != graph.group_id)
-        .unwrap();
-    let malformed = Uuid::new_v4();
-    insert_step(
-        &pool,
-        StepFixture {
-            id: malformed,
-            request_id: None,
-            prev_step_id: Some(nonhead),
-            parent_step_id: Some(nonhead),
-            sequence: 99,
-            state: TerminalState::Completed,
-            terminal_at: timestamp("2026-08-03T15:00:00Z"),
-        },
-    )
-    .await;
-    graph.step_ids.push(malformed);
-    graph.step_ids.sort_unstable();
-    let manager = manager(&pool).await;
-
-    let outcome = archive(
-        &manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
-    )
-    .await
-    .expect("a transitive non-head parent edge must fail closed");
-    assert_eq!(
-        outcome.incomplete_skipped, 1,
-        "a transitive non-head parent edge must fail closed"
-    );
-    assert_eq!(outcome.groups_archived, 0);
-    assert_wholly_live(&pool, &graph).await;
-}
-
-#[sqlx::test]
-async fn cross_head_predecessor_cascade_edge_fails_closed_without_deleting_any_member(
-    pool: PgPool,
-) {
-    install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let mut graph = branching_graph(&pool, TerminalState::Completed).await;
-    let nonhead = *graph
-        .step_ids
-        .iter()
-        .find(|step_id| **step_id != graph.group_id)
-        .unwrap();
-    let other = singleton(
-        &pool,
-        "background",
-        TerminalState::Completed,
-        timestamp("2026-08-04T10:00:00Z"),
-        "cross-head-owner",
-    )
-    .await;
-    let other_head = Uuid::new_v4();
-    insert_step(
-        &pool,
-        StepFixture {
-            id: other_head,
-            request_id: Some(other.request_ids[0]),
-            prev_step_id: None,
-            parent_step_id: None,
-            sequence: 1,
-            state: TerminalState::Completed,
-            terminal_at: timestamp("2026-08-04T10:00:00Z"),
-        },
-    )
-    .await;
-    let malformed = Uuid::new_v4();
-    insert_step(
-        &pool,
-        StepFixture {
-            id: malformed,
-            request_id: None,
-            prev_step_id: Some(nonhead),
-            parent_step_id: Some(other_head),
-            sequence: 100,
-            state: TerminalState::Completed,
-            terminal_at: timestamp("2026-08-04T11:00:00Z"),
-        },
-    )
-    .await;
-    graph.request_ids.extend(other.request_ids.iter().copied());
-    graph.request_ids.sort_unstable();
-    graph
-        .template_ids
-        .extend(other.template_ids.iter().copied());
-    graph.template_ids.sort_unstable();
-    graph.step_ids.extend([other_head, malformed]);
-    graph.step_ids.sort_unstable();
-    let manager = manager(&pool).await;
-
-    let outcome = archive(
-        &manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
-    )
-    .await
-    .expect("a predecessor edge crossing response heads must fail closed");
-    assert_eq!(
-        outcome.incomplete_skipped, 1,
-        "a predecessor edge crossing response heads must fail closed"
-    );
-    assert_eq!(outcome.groups_archived, 0);
-    assert_wholly_live(&pool, &graph).await;
-}
-
-#[sqlx::test]
 async fn duplicate_loser_starting_after_winner_commit_returns_a_clean_noop(pool: PgPool) {
     install_candidate_index(&pool).await;
     ensure_partition(&pool, archive_date("2026-08-03")).await;
@@ -3524,26 +2654,18 @@ async fn duplicate_loser_starting_after_winner_commit_returns_a_clean_noop(pool:
 }
 
 #[sqlx::test]
-async fn partially_deleted_discovered_graph_never_returns_already_gone(pool: PgPool) {
+async fn discovered_graph_deleted_before_locking_is_a_clean_noop(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let head_request_id: Uuid = sqlx::query_scalar(
-        "SELECT request_id FROM response_steps WHERE id = $1 AND request_id IS NOT NULL",
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "deleted-after-discovery",
     )
-    .bind(graph.group_id)
-    .fetch_one(&pool)
-    .await
-    .expect("the response head must identify its request");
-    let sibling_request_ids = graph
-        .request_ids
-        .iter()
-        .copied()
-        .filter(|request_id| *request_id != head_request_id)
-        .collect::<Vec<_>>();
-    assert_eq!(sibling_request_ids.len(), 1);
-
-    let retention_policy = policy(&[("flex", 86_400), ("priority", 3 * 86_400)]);
+    .await;
+    let retention_policy = policy(&[("flex", 86_400)]);
     let (gated_manager, held_connection, write_requested) = write_gated_manager(&pool).await;
     let mover_policy = retention_policy.clone();
     let mut mover =
@@ -3555,96 +2677,27 @@ async fn partially_deleted_discovered_graph_never_returns_already_gone(pool: PgP
     }
 
     sqlx::query("DELETE FROM requests WHERE id = $1")
-        .bind(head_request_id)
+        .bind(graph.request_ids[0])
         .execute(&pool)
         .await
-        .expect("the selected head request must delete after discovery");
+        .expect("the discovered request must delete after discovery");
     drop(held_connection);
 
     let outcome = mover
         .await
         .expect("mover task must finish")
-        .expect("a partially remaining discovered graph must fail closed");
-    assert_eq!(
-        outcome.incomplete_skipped, 1,
-        "a partially remaining discovered graph must fail closed"
-    );
+        .expect("a discovered graph that vanished before locking is a clean no-op");
     assert_eq!(outcome.groups_archived, 0);
+    assert_eq!(outcome.incomplete_skipped, 0);
+    assert!(!outcome.skipped_locked);
 
-    assert_eq!(count_ids(&pool, "requests", &[head_request_id]).await, 0);
-    assert_eq!(
-        count_ids(&pool, "requests", &sibling_request_ids).await,
-        sibling_request_ids.len() as i64
-    );
-    assert_eq!(count_ids(&pool, "response_steps", &graph.step_ids).await, 0);
+    assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
     assert_eq!(
         count_ids(&pool, "request_templates", &graph.template_ids).await,
-        graph.template_ids.len() as i64
+        graph.template_ids.len() as i64,
+        "the mover must not touch a template whose request it never locked"
     );
-    assert_eq!(retained_counts(&pool, graph.group_id).await, (0, 0, 0));
-}
-
-#[sqlx::test]
-async fn deleting_head_between_seed_and_topology_discovery_never_returns_already_gone(
-    pool: PgPool,
-) {
-    install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-03")).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let head_request_id: Uuid = sqlx::query_scalar(
-        "SELECT request_id FROM response_steps WHERE id = $1 AND request_id IS NOT NULL",
-    )
-    .bind(graph.group_id)
-    .fetch_one(&pool)
-    .await
-    .expect("the response head must identify its request");
-    let sibling_request_ids = graph
-        .request_ids
-        .iter()
-        .copied()
-        .filter(|request_id| *request_id != head_request_id)
-        .collect::<Vec<_>>();
-    assert_eq!(sibling_request_ids.len(), 1);
-
-    let (gated_manager, held_connection, gate_requested) =
-        discovery_read_gated_manager(&pool).await;
-    let mut mover = tokio::spawn(async move {
-        archive(&gated_manager, &policy(&[("flex", 86_400)]), 1, i64::MAX).await
-    });
-
-    tokio::select! {
-        result = &mut mover => panic!("mover completed before the discovery gate: {result:?}"),
-        () = wait_for_write_request(&gate_requested) => {}
-    }
-
-    sqlx::query("DELETE FROM requests WHERE id = $1")
-        .bind(head_request_id)
-        .execute(&pool)
-        .await
-        .expect("the selected head request must delete before topology expansion");
-    drop(held_connection);
-
-    let outcome = mover
-        .await
-        .expect("mover task must finish")
-        .expect("a partially remaining discovery snapshot must fail closed");
-    assert_eq!(
-        outcome.incomplete_skipped, 1,
-        "a partially remaining discovery snapshot must fail closed"
-    );
-    assert_eq!(outcome.groups_archived, 0);
-
-    assert_eq!(count_ids(&pool, "requests", &[head_request_id]).await, 0);
-    assert_eq!(
-        count_ids(&pool, "requests", &sibling_request_ids).await,
-        sibling_request_ids.len() as i64
-    );
-    assert_eq!(count_ids(&pool, "response_steps", &graph.step_ids).await, 0);
-    assert_eq!(
-        count_ids(&pool, "request_templates", &graph.template_ids).await,
-        graph.template_ids.len() as i64
-    );
-    assert_eq!(retained_counts(&pool, graph.group_id).await, (0, 0, 0));
+    assert_eq!(retained_counts(&pool, graph.group_id).await, (0, 0));
 }
 
 #[sqlx::test]
@@ -3748,31 +2801,16 @@ async fn locked_oldest_group_does_not_consume_the_movement_budget(pool: PgPool) 
 async fn deferred_oldest_group_does_not_consume_the_movement_budget(pool: PgPool) {
     install_candidate_index(&pool).await;
     ensure_partition(&pool, archive_date("2026-08-03")).await;
-    let mut deferred = singleton(
+    // A dispatched cancellation still inside its grace window is discovered
+    // first (oldest terminal instant) and deferred rather than moved.
+    let deferred = singleton(
         &pool,
         "flex",
-        TerminalState::Completed,
+        TerminalState::Canceled { dispatched: true },
         timestamp("2026-08-01T08:00:00Z"),
         "deferred-lookahead",
     )
     .await;
-    let future_terminal = timestamp("2026-09-01T00:00:00Z");
-    let head = Uuid::new_v4();
-    insert_step(
-        &pool,
-        StepFixture {
-            id: head,
-            request_id: Some(deferred.request_ids[0]),
-            prev_step_id: None,
-            parent_step_id: None,
-            sequence: 1,
-            state: TerminalState::Completed,
-            terminal_at: future_terminal,
-        },
-    )
-    .await;
-    deferred.group_id = head;
-    deferred.step_ids = vec![head];
     let next = singleton(
         &pool,
         "flex",
@@ -3783,101 +2821,21 @@ async fn deferred_oldest_group_does_not_consume_the_movement_budget(pool: PgPool
     .await;
     let manager = manager(&pool).await;
 
-    let outcome = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
-        .await
-        .expect("a deferred oldest group must not hide the next group");
+    let outcome = archive_at(
+        &manager,
+        &policy(&[("flex", 86_400)]),
+        timestamp("2026-08-31T00:00:00Z"),
+        timestamp("2026-08-01T07:00:00Z"),
+        1,
+        i64::MAX,
+    )
+    .await
+    .expect("a deferred oldest group must not hide the next group");
 
     assert_eq!(outcome.groups_archived, 1);
     assert!(outcome.may_have_more);
     assert_wholly_live(&pool, &deferred).await;
     assert_wholly_retained(&pool, &next).await;
-}
-
-#[sqlx::test]
-async fn many_requests_in_one_graph_count_once_toward_the_group_budget(pool: PgPool) {
-    install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-06")).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let mut first = branching_graph(&pool, TerminalState::Completed).await;
-    let (third_request, third_template) = insert_request(
-        &pool,
-        "flex",
-        TerminalState::Completed,
-        timestamp("2026-08-02T12:00:00Z"),
-        "third-request-in-graph",
-    )
-    .await;
-    let third_step = Uuid::new_v4();
-    insert_step(
-        &pool,
-        StepFixture {
-            id: third_step,
-            request_id: Some(third_request),
-            prev_step_id: Some(first.group_id),
-            parent_step_id: Some(first.group_id),
-            sequence: 6,
-            state: TerminalState::Completed,
-            terminal_at: timestamp("2026-08-02T12:00:00Z"),
-        },
-    )
-    .await;
-    first.request_ids.push(third_request);
-    first.template_ids.push(third_template);
-    first.step_ids.push(third_step);
-    for offset in 0_i64..6 {
-        let terminal_at = timestamp("2026-08-02T12:10:00Z") + TimeDelta::minutes(offset);
-        let suffix = format!("fanout-request-{offset}");
-        let (request_id, template_id) = insert_request(
-            &pool,
-            "flex",
-            TerminalState::Completed,
-            terminal_at,
-            &suffix,
-        )
-        .await;
-        let step_id = Uuid::new_v4();
-        insert_step(
-            &pool,
-            StepFixture {
-                id: step_id,
-                request_id: Some(request_id),
-                prev_step_id: Some(first.group_id),
-                parent_step_id: Some(first.group_id),
-                sequence: 7 + offset,
-                state: TerminalState::Completed,
-                terminal_at,
-            },
-        )
-        .await;
-        first.request_ids.push(request_id);
-        first.template_ids.push(template_id);
-        first.step_ids.push(step_id);
-    }
-    first.request_ids.sort_unstable();
-    first.template_ids.sort_unstable();
-    first.step_ids.sort_unstable();
-    let second = singleton(
-        &pool,
-        "flex",
-        TerminalState::Completed,
-        timestamp("2026-08-04T10:00:00Z"),
-        "second-distinct-group",
-    )
-    .await;
-    let manager = manager(&pool).await;
-
-    let outcome = archive(
-        &manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        2,
-        i64::MAX,
-    )
-    .await
-    .expect("request fan-out must not consume distinct-group capacity");
-
-    assert_eq!(outcome.groups_archived, 2);
-    assert_wholly_retained(&pool, &first).await;
-    assert_wholly_retained(&pool, &second).await;
 }
 
 #[sqlx::test]
@@ -3900,45 +2858,9 @@ async fn archives_singleton_request_template_as_one_group(pool: PgPool) {
 
     assert_eq!(outcome.groups_archived, 1);
     assert_eq!(outcome.requests_archived, 1);
-    assert_eq!(outcome.steps_archived, 0);
     assert_eq!(outcome.templates_archived, 1);
     assert!(outcome.bytes_archived > 0);
     assert_wholly_retained(&pool, &graph).await;
-}
-
-#[sqlx::test]
-async fn archives_parallel_and_nested_tool_descendants_with_one_conservative_deadline(
-    pool: PgPool,
-) {
-    install_candidate_index(&pool).await;
-    // Latest member is 2026-08-03 14:00; the longest tier lasts three days,
-    // so exact expiry is on Aug 6 and deletion starts strictly on Aug 7.
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let manager = manager(&pool).await;
-
-    let outcome = archive(
-        &manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
-    )
-    .await
-    .expect("complete branching graph must archive");
-
-    assert_eq!(outcome.groups_archived, 1);
-    assert_eq!(outcome.requests_archived, 2);
-    assert_eq!(outcome.steps_archived, 5);
-    assert_eq!(outcome.templates_archived, 2);
-    assert_wholly_retained(&pool, &graph).await;
-    let delete_on: NaiveDate = sqlx::query_scalar(
-        "SELECT MIN(delete_on) FROM retained_response_objects WHERE group_id = $1",
-    )
-    .bind(graph.group_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
-    assert_eq!(delete_on, archive_date("2026-08-07"));
 }
 
 #[sqlx::test]
@@ -3972,109 +2894,55 @@ async fn locked_candidate_is_skipped_without_loading_or_moving_graph(pool: PgPoo
 }
 
 #[sqlx::test]
-async fn nonterminal_member_fails_the_complete_graph_and_rolls_back(pool: PgPool) {
+async fn a_dedicated_template_shared_with_a_live_request_is_left_in_place(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph = branching_graph(&pool, TerminalState::Pending).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let moved = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "shared-template-moved",
+    )
+    .await;
+    let survivor = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T11:00:00Z"),
+        "shared-template-survivor",
+    )
+    .await;
+    sqlx::query("UPDATE requests SET template_id = $1 WHERE id = $2")
+        .bind(moved.template_ids[0])
+        .bind(survivor.request_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM request_templates WHERE id = $1")
+        .bind(survivor.template_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
     let manager = manager(&pool).await;
 
-    let outcome = archive(
-        &manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
-    )
-    .await
-    .expect("a graph with one live member must fail closed");
+    let outcome = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .expect("a template shared with a live request must not block movement");
+
+    assert_eq!(outcome.groups_archived, 1);
     assert_eq!(
-        outcome.incomplete_skipped, 1,
-        "a graph with one live member must fail closed"
+        outcome.templates_archived, 0,
+        "a template still referenced by a live request is never moved"
     );
-    assert_eq!(outcome.groups_archived, 0);
-    assert_wholly_live(&pool, &graph).await;
-}
-
-#[sqlx::test]
-async fn pending_request_with_terminal_step_fails_closed(pool: PgPool) {
-    install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph =
-        branching_graph_with_tail_states(&pool, TerminalState::Pending, TerminalState::Completed)
-            .await;
-    let manager = manager(&pool).await;
-
-    let outcome = archive(
-        &manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
-    )
-    .await
-    .expect("a pending request must fail even when its step is terminal");
+    assert_eq!(count_ids(&pool, "requests", &moved.request_ids).await, 0);
+    assert_eq!(retained_counts(&pool, moved.group_id).await, (1, 1));
+    assert_eq!(count_ids(&pool, "requests", &survivor.request_ids).await, 1);
     assert_eq!(
-        outcome.incomplete_skipped, 1,
-        "a pending request must fail even when its step is terminal"
-    );
-    assert_eq!(outcome.groups_archived, 0);
-    assert_wholly_live(&pool, &graph).await;
-}
-
-#[sqlx::test]
-async fn terminal_request_with_pending_step_fails_closed(pool: PgPool) {
-    install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph =
-        branching_graph_with_tail_states(&pool, TerminalState::Completed, TerminalState::Pending)
-            .await;
-    let manager = manager(&pool).await;
-
-    let outcome = archive(
-        &manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
+        count_ids(&pool, "request_templates", &moved.template_ids).await,
         1,
-        i64::MAX,
-    )
-    .await
-    .expect("a pending step must fail even when its request is terminal");
-    assert_eq!(
-        outcome.incomplete_skipped, 1,
-        "a pending step must fail even when its request is terminal"
+        "the shared template row must survive with its live reference"
     );
-    assert_eq!(outcome.groups_archived, 0);
-    assert_wholly_live(&pool, &graph).await;
-}
-
-#[sqlx::test]
-async fn shared_template_fails_closed_with_every_reference_live(pool: PgPool) {
-    install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let updated = sqlx::query(
-        "UPDATE requests SET template_id = $1 WHERE id = ANY($2) AND template_id <> $1",
-    )
-    .bind(graph.template_ids[0])
-    .bind(&graph.request_ids)
-    .execute(&pool)
-    .await
-    .unwrap()
-    .rows_affected();
-    assert_eq!(updated, 1, "fixture must create one shared template");
-    let manager = manager(&pool).await;
-
-    let outcome = archive(
-        &manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
-    )
-    .await
-    .expect("a template shared inside the graph must not be moved or deleted");
-    assert_eq!(
-        outcome.incomplete_skipped, 1,
-        "a template shared inside the graph must not be moved or deleted"
-    );
-    assert_eq!(outcome.groups_archived, 0);
-    assert_wholly_live(&pool, &graph).await;
 }
 
 #[sqlx::test]
@@ -4228,21 +3096,28 @@ async fn exact_idempotent_replay_accepts_matching_objects_and_routes(pool: PgPoo
 
     assert_eq!(replay.groups_archived, 1);
     assert_eq!(replay.requests_archived, 1);
-    assert_eq!(retained_counts(&pool, graph.group_id).await, (1, 1, 0));
+    assert_eq!(retained_counts(&pool, graph.group_id).await, (1, 1));
     assert_wholly_retained(&pool, &graph).await;
 }
 
 #[sqlx::test]
 async fn forced_insert_count_mismatch_rolls_back_every_object(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "insert-count-mismatch",
+    )
+    .await;
     sqlx::query(
         r#"
-        CREATE FUNCTION retention_test_skip_step() RETURNS trigger
+        CREATE FUNCTION retention_test_skip_group() RETURNS trigger
         LANGUAGE plpgsql AS $$
         BEGIN
-            IF NEW.object_kind = 'step' THEN
+            IF NEW.object_kind = 'group' THEN
                 RETURN NULL;
             END IF;
             RETURN NEW;
@@ -4254,21 +3129,16 @@ async fn forced_insert_count_mismatch_rolls_back_every_object(pool: PgPool) {
     .await
     .unwrap();
     sqlx::query(
-        "CREATE TRIGGER retention_test_skip_step BEFORE INSERT ON retained_response_objects FOR EACH ROW EXECUTE FUNCTION retention_test_skip_step()",
+        "CREATE TRIGGER retention_test_skip_group BEFORE INSERT ON retained_response_objects FOR EACH ROW EXECUTE FUNCTION retention_test_skip_group()",
     )
     .execute(&pool)
     .await
     .unwrap();
     let manager = manager(&pool).await;
 
-    let error = archive(
-        &manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
-    )
-    .await
-    .expect_err("post-insert count mismatch must abort the graph");
+    let error = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .expect_err("post-insert count mismatch must abort the graph");
 
     assert_eq!(
         error.to_string(),
@@ -4644,47 +3514,9 @@ async fn extra_request_route_for_group_and_bucket_causes_integrity_rollback(pool
     assert_wholly_live(&pool, &graph).await;
 }
 
-#[sqlx::test]
-async fn extra_step_route_for_group_and_bucket_causes_integrity_rollback(pool: PgPool) {
-    install_candidate_index(&pool).await;
-    let delete_on = archive_date("2026-08-03");
-    ensure_partition(&pool, delete_on).await;
-    let graph = singleton(
-        &pool,
-        "flex",
-        TerminalState::Completed,
-        timestamp("2026-08-01T10:00:00Z"),
-        "extra-step-route",
-    )
-    .await;
-    sqlx::query(
-        "INSERT INTO retained_response_step_routes (step_id, group_id, delete_on) VALUES ($1, $2, $3)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(graph.group_id)
-    .bind(delete_on)
-    .execute(&pool)
-    .await
-    .unwrap();
-    let manager = manager(&pool).await;
-
-    let error = archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
-        .await
-        .expect_err("an extra step route must reject the retained graph");
-
-    assert_eq!(
-        error.to_string(),
-        "Retained response integrity verification failed"
-    );
-    assert_wholly_live(&pool, &graph).await;
-}
-
 #[derive(Debug, PartialEq)]
 struct PublicReadSnapshot {
     details: Vec<serde_json::Value>,
-    step: serde_json::Value,
-    step_by_request: serde_json::Value,
-    chain: serde_json::Value,
     lists: Vec<(serde_json::Value, i64)>,
     flex_count: i64,
     trailing: Vec<fusillade_arsenal::manager::TrailingDemandCount>,
@@ -4692,7 +3524,6 @@ struct PublicReadSnapshot {
 
 async fn capture_public_reads(
     request_manager: &PostgresRequestManager<TestDbPools>,
-    step_manager: &PostgresResponseStepManager<TestDbPools>,
     graph: &LiveGraph,
 ) -> PublicReadSnapshot {
     let mut details = Vec::new();
@@ -4707,30 +3538,6 @@ async fn capture_public_reads(
             .unwrap(),
         );
     }
-
-    let step = serde_json::to_value(
-        step_manager
-            .get_step(StepId(graph.group_id))
-            .await
-            .expect("step read must succeed")
-            .expect("head step must exist"),
-    )
-    .unwrap();
-    let step_by_request = serde_json::to_value(
-        step_manager
-            .get_step_by_request(RequestId(graph.request_ids[0]))
-            .await
-            .expect("request step read must succeed")
-            .expect("model step must exist"),
-    )
-    .unwrap();
-    let chain = serde_json::to_value(
-        step_manager
-            .list_chain(StepId(graph.group_id))
-            .await
-            .expect("chain read must succeed"),
-    )
-    .unwrap();
 
     let filters = vec![
         ListRequestsFilter::default(),
@@ -4807,9 +3614,6 @@ async fn capture_public_reads(
 
     PublicReadSnapshot {
         details,
-        step,
-        step_by_request,
-        chain,
         lists,
         flex_count,
         trailing,
@@ -4819,8 +3623,15 @@ async fn capture_public_reads(
 #[sqlx::test]
 async fn read_apis_preserve_exact_values_filters_pages_and_counts_after_move(pool: PgPool) {
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "read-apis",
+    )
+    .await;
     let _pending = singleton(
         &pool,
         "priority",
@@ -4829,28 +3640,22 @@ async fn read_apis_preserve_exact_values_filters_pages_and_counts_after_move(poo
         "still-live-pending",
     )
     .await;
-    let (request_manager, step_manager) = managers(&pool).await;
-    let before = capture_public_reads(&request_manager, &step_manager, &graph).await;
+    let request_manager = manager(&pool).await;
+    let before = capture_public_reads(&request_manager, &graph).await;
 
-    assert_eq!(before.details.len(), 2);
-    assert_eq!(before.chain.as_array().unwrap().len(), 5);
-    assert_eq!(before.lists[0].1, 3);
+    assert_eq!(before.details.len(), 1);
+    assert_eq!(before.lists[0].1, 2);
     assert_eq!(before.lists[2].1, 1);
     assert_eq!(before.flex_count, 1);
-    assert_eq!(before.trailing.iter().map(|row| row.count).sum::<i64>(), 2);
+    assert_eq!(before.trailing.iter().map(|row| row.count).sum::<i64>(), 1);
 
-    let outcome = archive(
-        &request_manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
-    )
-    .await
-    .expect("graph movement must succeed");
+    let outcome = archive(&request_manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .expect("graph movement must succeed");
     assert_eq!(outcome.groups_archived, 1);
     assert_wholly_retained(&pool, &graph).await;
 
-    let after = capture_public_reads(&request_manager, &step_manager, &graph).await;
+    let after = capture_public_reads(&request_manager, &graph).await;
     assert_eq!(after, before);
 }
 
@@ -5316,10 +4121,17 @@ async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool:
     const MOVEMENT_GATE_KEY: i64 = 730_006;
 
     install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let (request_manager, step_manager) = managers(&pool).await;
-    let before = capture_public_reads(&request_manager, &step_manager, &graph).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "atomic-movement-reads",
+    )
+    .await;
+    let request_manager = manager(&pool).await;
+    let before = capture_public_reads(&request_manager, &graph).await;
 
     sqlx::query(
         r#"
@@ -5340,7 +4152,7 @@ async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool:
     sqlx::query(
         r#"
         CREATE TRIGGER test_gate_retained_response_movement
-        BEFORE DELETE ON response_steps
+        BEFORE DELETE ON requests
         FOR EACH STATEMENT
         EXECUTE FUNCTION test_gate_retained_response_movement()
         "#,
@@ -5360,13 +4172,7 @@ async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool:
         .expect("movement gate must lock");
     let mover_manager = manager(&pool).await;
     let mut mover = tokio::spawn(async move {
-        archive(
-            &mover_manager,
-            &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-            1,
-            i64::MAX,
-        )
-        .await
+        archive(&mover_manager, &policy(&[("flex", 86_400)]), 1, i64::MAX).await
     });
     tokio::select! {
         result = &mut mover => panic!("movement completed before its deterministic gate: {result:?}"),
@@ -5374,9 +4180,10 @@ async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool:
     }
 
     // The mover has copied every retained object and route in its transaction
-    // and is paused immediately before deleting live steps. Other snapshots
-    // must still see the complete live graph, never the uncommitted archive.
-    let during = capture_public_reads(&request_manager, &step_manager, &graph).await;
+    // and is paused immediately before deleting the live request. Other
+    // snapshots must still see the complete live graph, never the
+    // uncommitted archive.
+    let during = capture_public_reads(&request_manager, &graph).await;
     assert_eq!(during, before);
 
     let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
@@ -5391,7 +4198,7 @@ async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool:
         .expect("movement must commit after the gate opens");
     assert_eq!(outcome.groups_archived, 1);
 
-    let after = capture_public_reads(&request_manager, &step_manager, &graph).await;
+    let after = capture_public_reads(&request_manager, &graph).await;
     assert_eq!(after, before);
 }
 
@@ -5407,18 +4214,20 @@ async fn set_bucket_state(pool: &PgPool, delete_on: NaiveDate, state: &str) {
 #[sqlx::test]
 async fn read_point_helpers_keep_one_primary_snapshot_across_route_lookup(pool: PgPool) {
     install_candidate_index(&pool).await;
-    let delete_on = archive_date("2026-08-07");
+    let delete_on = archive_date("2026-08-03");
     ensure_partition(&pool, delete_on).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let (request_manager, step_manager) = managers(&pool).await;
-    archive(
-        &request_manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "primary-snapshot",
     )
-    .await
-    .unwrap();
+    .await;
+    let request_manager = manager(&pool).await;
+    archive(&request_manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
 
     let expected_detail = serde_json::to_value(
         request_manager
@@ -5448,83 +4257,6 @@ async fn read_point_helpers_keep_one_primary_snapshot_across_route_lookup(pool: 
         "the retained detail must come from the snapshot established by the live lookup"
     );
     set_bucket_state(&pool, delete_on, "active").await;
-
-    let expected_step =
-        serde_json::to_value(step_manager.get_step(StepId(graph.group_id)).await.unwrap()).unwrap();
-    let mut route_lock = pool.begin().await.unwrap();
-    sqlx::query("LOCK TABLE retained_response_step_routes IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *route_lock)
-        .await
-        .unwrap();
-    let (_, gated_step_manager) = managers(&pool).await;
-    let step_id = StepId(graph.group_id);
-    let mut step_read = tokio::spawn(async move { gated_step_manager.get_step(step_id).await });
-    tokio::select! {
-        result = &mut step_read => panic!("step read crossed its route gate: {result:?}"),
-        () = wait_for_relation_waiter(&pool, "retained_response_step_routes") => {}
-    }
-    set_bucket_state(&pool, delete_on, "retiring").await;
-    route_lock.commit().await.unwrap();
-    assert_eq!(
-        serde_json::to_value(step_read.await.unwrap().unwrap()).unwrap(),
-        expected_step
-    );
-    set_bucket_state(&pool, delete_on, "active").await;
-
-    let expected_request_step = serde_json::to_value(
-        step_manager
-            .get_step_by_request(RequestId(graph.request_ids[0]))
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    let mut route_lock = pool.begin().await.unwrap();
-    sqlx::query("LOCK TABLE retained_response_request_routes IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *route_lock)
-        .await
-        .unwrap();
-    let (_, gated_step_manager) = managers(&pool).await;
-    let request_id = RequestId(graph.request_ids[0]);
-    let mut request_step_read =
-        tokio::spawn(async move { gated_step_manager.get_step_by_request(request_id).await });
-    tokio::select! {
-        result = &mut request_step_read => panic!("step-by-request read crossed its route gate: {result:?}"),
-        () = wait_for_relation_waiter(&pool, "retained_response_request_routes") => {}
-    }
-    set_bucket_state(&pool, delete_on, "retiring").await;
-    route_lock.commit().await.unwrap();
-    assert_eq!(
-        serde_json::to_value(request_step_read.await.unwrap().unwrap()).unwrap(),
-        expected_request_step
-    );
-    set_bucket_state(&pool, delete_on, "active").await;
-
-    let expected_chain = serde_json::to_value(
-        step_manager
-            .list_chain(StepId(graph.group_id))
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    let mut route_lock = pool.begin().await.unwrap();
-    sqlx::query("LOCK TABLE retained_response_group_routes IN ACCESS EXCLUSIVE MODE")
-        .execute(&mut *route_lock)
-        .await
-        .unwrap();
-    let (_, gated_step_manager) = managers(&pool).await;
-    let head_step_id = StepId(graph.group_id);
-    let mut chain_read =
-        tokio::spawn(async move { gated_step_manager.list_chain(head_step_id).await });
-    tokio::select! {
-        result = &mut chain_read => panic!("chain read crossed its route gate: {result:?}"),
-        () = wait_for_relation_waiter(&pool, "retained_response_group_routes") => {}
-    }
-    set_bucket_state(&pool, delete_on, "retiring").await;
-    route_lock.commit().await.unwrap();
-    assert_eq!(
-        serde_json::to_value(chain_read.await.unwrap().unwrap()).unwrap(),
-        expected_chain
-    );
 }
 
 #[sqlx::test]
@@ -5644,7 +4376,6 @@ async fn read_mixed_live_and_retained_rows_do_not_double_count_or_split_demand(p
 
 async fn assert_graph_reads_not_found(
     request_manager: &PostgresRequestManager<TestDbPools>,
-    step_manager: &PostgresResponseStepManager<TestDbPools>,
     graph: &LiveGraph,
 ) {
     for request_id in &graph.request_ids {
@@ -5655,54 +4386,33 @@ async fn assert_graph_reads_not_found(
         assert!(
             matches!(error, fusillade_arsenal::error::FusilladeError::RequestNotFound(id) if id == RequestId(*request_id))
         );
-        assert!(
-            step_manager
-                .get_step_by_request(RequestId(*request_id))
-                .await
-                .expect("step-by-request fence must not error")
-                .is_none()
-        );
     }
-    for step_id in &graph.step_ids {
-        assert!(
-            step_manager
-                .get_step(StepId(*step_id))
-                .await
-                .expect("step fence must not error")
-                .is_none()
-        );
-    }
-    assert!(
-        step_manager
-            .list_chain(StepId(graph.group_id))
-            .await
-            .expect("chain fence must not error")
-            .is_empty()
-    );
 }
 
 #[sqlx::test]
 async fn read_apis_fail_closed_for_retiring_and_dropped_buckets(pool: PgPool) {
     install_candidate_index(&pool).await;
-    let delete_on = archive_date("2026-08-07");
+    let delete_on = archive_date("2026-08-03");
     ensure_partition(&pool, delete_on).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let (request_manager, step_manager) = managers(&pool).await;
-    archive(
-        &request_manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "fail-closed-reads",
     )
-    .await
-    .expect("graph movement must succeed");
+    .await;
+    let request_manager = manager(&pool).await;
+    archive(&request_manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .expect("graph movement must succeed");
 
     sqlx::query("UPDATE retained_response_buckets SET state = 'retiring' WHERE delete_on = $1")
         .bind(delete_on)
         .execute(&pool)
         .await
         .unwrap();
-    assert_graph_reads_not_found(&request_manager, &step_manager, &graph).await;
+    assert_graph_reads_not_found(&request_manager, &graph).await;
     assert_eq!(
         request_manager
             .list_requests(ListRequestsFilter::default())
@@ -5731,42 +4441,43 @@ async fn read_apis_fail_closed_for_retiring_and_dropped_buckets(pool: PgPool) {
     );
 
     sqlx::query(
-        "ALTER TABLE retained_response_objects DETACH PARTITION retained_response_objects_d20260906",
+        "ALTER TABLE retained_response_objects DETACH PARTITION retained_response_objects_d20260902",
     )
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::query("DROP TABLE retained_response_objects_d20260906")
+    sqlx::query("DROP TABLE retained_response_objects_d20260902")
         .execute(&pool)
         .await
         .unwrap();
-    assert_graph_reads_not_found(&request_manager, &step_manager, &graph).await;
+    assert_graph_reads_not_found(&request_manager, &graph).await;
     assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
-    assert_eq!(count_ids(&pool, "response_steps", &graph.step_ids).await, 0);
     assert_eq!(
         count_ids(&pool, "request_templates", &graph.template_ids).await,
         0
     );
-    assert_eq!(retained_counts(&pool, graph.group_id).await, (0, 0, 0));
+    assert_eq!(retained_counts(&pool, graph.group_id).await, (0, 0));
 }
 
 #[sqlx::test]
 async fn read_point_routes_fail_closed_for_wrong_bucket_group_and_partition_oid(pool: PgPool) {
     install_candidate_index(&pool).await;
-    let delete_on = archive_date("2026-08-07");
-    let wrong_delete_on = archive_date("2026-08-08");
+    let delete_on = archive_date("2026-08-03");
+    let wrong_delete_on = archive_date("2026-08-04");
     ensure_partition(&pool, delete_on).await;
     ensure_partition(&pool, wrong_delete_on).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let (request_manager, step_manager) = managers(&pool).await;
-    archive(
-        &request_manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "wrong-route",
     )
-    .await
-    .unwrap();
+    .await;
+    let request_manager = manager(&pool).await;
+    archive(&request_manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
     let request_id = RequestId(graph.request_ids[0]);
     request_manager
         .get_request_detail(request_id)
@@ -5804,36 +4515,10 @@ async fn read_point_routes_fail_closed_for_wrong_bucket_group_and_partition_oid(
         .execute(&pool)
         .await
         .unwrap();
-
-    let step_id = StepId(graph.group_id);
-    step_manager
-        .get_step(step_id)
+    request_manager
+        .get_request_detail(request_id)
         .await
-        .unwrap()
-        .expect("valid retained step route must resolve");
-    sqlx::query("UPDATE retained_response_step_routes SET delete_on = $2 WHERE step_id = $1")
-        .bind(step_id.0)
-        .bind(wrong_delete_on)
-        .execute(&pool)
-        .await
-        .unwrap();
-    assert!(step_manager.get_step(step_id).await.unwrap().is_none());
-    sqlx::query(
-        "UPDATE retained_response_step_routes SET delete_on = $2, group_id = $3 WHERE step_id = $1",
-    )
-    .bind(step_id.0)
-    .bind(delete_on)
-    .bind(Uuid::new_v4())
-    .execute(&pool)
-    .await
-    .unwrap();
-    assert!(step_manager.get_step(step_id).await.unwrap().is_none());
-    sqlx::query("UPDATE retained_response_step_routes SET group_id = $2 WHERE step_id = $1")
-        .bind(step_id.0)
-        .bind(graph.group_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+        .expect("the repaired request route must resolve again");
 
     sqlx::query("UPDATE retained_response_group_routes SET delete_on = $2 WHERE group_id = $1")
         .bind(graph.group_id)
@@ -5845,8 +4530,6 @@ async fn read_point_routes_fail_closed_for_wrong_bucket_group_and_partition_oid(
         request_manager.get_request_detail(request_id).await,
         Err(fusillade_arsenal::error::FusilladeError::RequestNotFound(id)) if id == request_id
     ));
-    assert!(step_manager.get_step(step_id).await.unwrap().is_none());
-    assert!(step_manager.list_chain(step_id).await.unwrap().is_empty());
     sqlx::query("UPDATE retained_response_group_routes SET delete_on = $2 WHERE group_id = $1")
         .bind(graph.group_id)
         .bind(delete_on)
@@ -5865,345 +4548,6 @@ async fn read_point_routes_fail_closed_for_wrong_bucket_group_and_partition_oid(
         request_manager.get_request_detail(request_id).await,
         Err(fusillade_arsenal::error::FusilladeError::RequestNotFound(id)) if id == request_id
     ));
-    assert!(step_manager.get_step(step_id).await.unwrap().is_none());
-}
-
-#[sqlx::test]
-async fn read_response_step_mutations_reject_retained_routes_without_content(pool: PgPool) {
-    install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let (request_manager, step_manager) = managers(&pool).await;
-    archive(
-        &request_manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
-    )
-    .await
-    .unwrap();
-    let step_id = StepId(graph.group_id);
-
-    let create_error = step_manager
-        .create_step(CreateStepInput {
-            id: Some(step_id.0),
-            request_id: None,
-            prev_step_id: None,
-            parent_step_id: None,
-            step_kind: StepKind::ToolCall,
-            step_sequence: 99,
-            request_payload: json!({"must_not": "leak-or-insert"}),
-        })
-        .await
-        .expect_err("retained step id must not be recreated");
-    let mut errors = vec![create_error];
-    errors.push(
-        step_manager
-            .create_step(CreateStepInput {
-                id: Some(Uuid::new_v4()),
-                request_id: None,
-                prev_step_id: Some(step_id),
-                parent_step_id: Some(step_id),
-                step_kind: StepKind::ToolCall,
-                step_sequence: 100,
-                request_payload: json!({"must_not": "leak-or-link"}),
-            })
-            .await
-            .expect_err("a new child must not attach to a retained graph"),
-    );
-    errors.push(
-        step_manager
-            .mark_step_processing(step_id)
-            .await
-            .expect_err("retained step must not be processed"),
-    );
-    errors.push(
-        step_manager
-            .complete_step(step_id, json!({"must_not": "leak"}))
-            .await
-            .expect_err("retained step must not be completed"),
-    );
-    errors.push(
-        step_manager
-            .fail_step(step_id, json!({"must_not": "leak"}))
-            .await
-            .expect_err("retained step must not be failed"),
-    );
-    errors.push(
-        step_manager
-            .cancel_step(step_id)
-            .await
-            .expect_err("retained step must not be canceled"),
-    );
-    errors.push(
-        step_manager
-            .requeue_step_for_retry(step_id)
-            .await
-            .expect_err("retained step must not be requeued"),
-    );
-    for error in errors {
-        assert_eq!(error.to_string(), "Response step is already retained");
-        match &error {
-            fusillade_arsenal::error::FusilladeError::Other(source) => assert!(
-                source
-                    .downcast_ref::<RetainedResponseStepConflict>()
-                    .is_some(),
-                "retained mutations must return the typed conflict"
-            ),
-            other => panic!("unexpected retained mutation error: {other:?}"),
-        }
-        let debug = format!("{error:?}");
-        assert!(!debug.contains(&step_id.0.to_string()));
-        assert!(!debug.contains("must_not"));
-    }
-    assert_eq!(count_ids(&pool, "response_steps", &graph.step_ids).await, 0);
-}
-
-#[sqlx::test]
-async fn create_step_rolls_back_when_movement_commits_route_during_blocked_insert(pool: PgPool) {
-    const MOVEMENT_AFTER_DELETE_GATE: i64 = 730_016;
-
-    install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let retained_step_id = StepId(graph.group_id);
-
-    sqlx::query(
-        r#"
-        CREATE FUNCTION test_gate_after_retained_step_delete()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
-        BEGIN
-            PERFORM pg_advisory_xact_lock(730016);
-            RETURN NULL;
-        END
-        $$
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        r#"
-        CREATE TRIGGER test_gate_after_retained_step_delete
-        AFTER DELETE ON response_steps
-        FOR EACH STATEMENT
-        EXECUTE FUNCTION test_gate_after_retained_step_delete()
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let mut movement_gate = pool.acquire().await.unwrap();
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(MOVEMENT_AFTER_DELETE_GATE)
-        .execute(&mut *movement_gate)
-        .await
-        .unwrap();
-    let mover_manager = manager(&pool).await;
-    let mut mover = tokio::spawn(async move {
-        archive(
-            &mover_manager,
-            &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-            1,
-            i64::MAX,
-        )
-        .await
-    });
-    tokio::select! {
-        result = &mut mover => panic!("movement completed before the after-delete gate: {result:?}"),
-        () = wait_for_advisory_waiter_key(&pool, MOVEMENT_AFTER_DELETE_GATE) => {}
-    }
-
-    // The mover has inserted the active routes and deleted the old step in its
-    // uncommitted transaction. The creator cannot see that route in its first
-    // statement and then waits on the deleted primary-key tuple.
-    let creator_pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect_with(pool.connect_options().as_ref().clone())
-        .await
-        .unwrap();
-    let creator_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
-        .fetch_one(&creator_pool)
-        .await
-        .unwrap();
-    let creator_manager = PostgresResponseStepManager::new(WriteSignalingPools {
-        read: creator_pool.clone(),
-        write: creator_pool,
-        write_requested: Arc::new(AtomicBool::new(false)),
-    });
-    let mut creator = tokio::spawn(async move {
-        creator_manager
-            .create_step(CreateStepInput {
-                id: Some(retained_step_id.0),
-                request_id: None,
-                prev_step_id: None,
-                parent_step_id: None,
-                step_kind: StepKind::ToolCall,
-                step_sequence: 101,
-                request_payload: json!({"must_not": "survive-the-route-race"}),
-            })
-            .await
-    });
-    tokio::select! {
-        result = &mut creator => panic!("same-ID creator did not block on movement: {result:?}"),
-        () = wait_for_backend_lock_waiter(&pool, creator_pid) => {}
-    }
-
-    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
-        .bind(MOVEMENT_AFTER_DELETE_GATE)
-        .fetch_one(&mut *movement_gate)
-        .await
-        .unwrap();
-    assert!(unlocked);
-    let outcome = mover.await.unwrap().unwrap();
-    assert_eq!(outcome.groups_archived, 1);
-
-    let error = creator
-        .await
-        .unwrap()
-        .expect_err("the successful same-ID INSERT must be rolled back after route recheck");
-    assert_eq!(error.to_string(), "Response step is already retained");
-    match &error {
-        fusillade_arsenal::error::FusilladeError::Other(source) => assert!(
-            source
-                .downcast_ref::<RetainedResponseStepConflict>()
-                .is_some()
-        ),
-        other => panic!("unexpected retained mutation error: {other:?}"),
-    }
-    assert_eq!(
-        count_ids(&pool, "response_steps", &[retained_step_id.0]).await,
-        0
-    );
-}
-
-#[sqlx::test]
-async fn movement_starting_after_create_insert_cannot_split_the_live_graph(pool: PgPool) {
-    const CREATE_AFTER_INSERT_GATE: i64 = 730_017;
-
-    install_candidate_index(&pool).await;
-    ensure_partition(&pool, archive_date("2026-08-07")).await;
-    let graph = branching_graph(&pool, TerminalState::Completed).await;
-    let head_step_id = StepId(graph.group_id);
-    let new_step_id = Uuid::new_v4();
-
-    sqlx::query(
-        r#"
-        CREATE FUNCTION test_gate_after_response_step_insert()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
-        BEGIN
-            PERFORM pg_advisory_xact_lock(730017);
-            RETURN NULL;
-        END
-        $$
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query(
-        r#"
-        CREATE TRIGGER test_gate_after_response_step_insert
-        AFTER INSERT ON response_steps
-        FOR EACH STATEMENT
-        EXECUTE FUNCTION test_gate_after_response_step_insert()
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let mut create_gate = pool.acquire().await.unwrap();
-    sqlx::query("SELECT pg_advisory_lock($1)")
-        .bind(CREATE_AFTER_INSERT_GATE)
-        .execute(&mut *create_gate)
-        .await
-        .unwrap();
-    let (_, creator_manager) = managers(&pool).await;
-    let mut creator = tokio::spawn(async move {
-        creator_manager
-            .create_step(CreateStepInput {
-                id: Some(new_step_id),
-                request_id: None,
-                prev_step_id: Some(head_step_id),
-                parent_step_id: Some(head_step_id),
-                step_kind: StepKind::ToolCall,
-                step_sequence: 103,
-                request_payload: json!({"input": "post-insert-boundary"}),
-            })
-            .await
-    });
-    tokio::select! {
-        result = &mut creator => panic!("creator completed before the after-insert gate: {result:?}"),
-        () = wait_for_advisory_waiter_key(&pool, CREATE_AFTER_INSERT_GATE) => {}
-    }
-
-    // The INSERT holds foreign-key protection on its live predecessor until
-    // commit. A mover that starts now must skip the graph instead of moving
-    // the old topology without the uncommitted child.
-    let mover_manager = manager(&pool).await;
-    let outcome = archive(
-        &mover_manager,
-        &policy(&[("flex", 86_400), ("priority", 3 * 86_400)]),
-        1,
-        i64::MAX,
-    )
-    .await
-    .unwrap();
-    assert_eq!(outcome.groups_archived, 0);
-    assert!(outcome.skipped_locked);
-    assert!(outcome.may_have_more);
-
-    let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
-        .bind(CREATE_AFTER_INSERT_GATE)
-        .fetch_one(&mut *create_gate)
-        .await
-        .unwrap();
-    assert!(unlocked);
-    assert_eq!(creator.await.unwrap().unwrap(), StepId(new_step_id));
-    assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 2);
-    assert_eq!(count_ids(&pool, "response_steps", &graph.step_ids).await, 5);
-    assert_eq!(count_ids(&pool, "response_steps", &[new_step_id]).await, 1);
-    assert_eq!(retained_counts(&pool, graph.group_id).await, (0, 0, 0));
-}
-
-#[sqlx::test]
-async fn create_step_sanitizes_unrelated_foreign_key_error_without_active_route(pool: PgPool) {
-    let (_, step_manager) = managers(&pool).await;
-    let proposed_id = Uuid::new_v4();
-    let missing_predecessor = StepId(Uuid::new_v4());
-
-    let error = step_manager
-        .create_step(CreateStepInput {
-            id: Some(proposed_id),
-            request_id: None,
-            prev_step_id: Some(missing_predecessor),
-            parent_step_id: None,
-            step_kind: StepKind::ToolCall,
-            step_sequence: 102,
-            request_payload: json!({"input": "unrelated-fk-error"}),
-        })
-        .await
-        .expect_err("an unrelated missing predecessor must remain a database error");
-
-    assert_eq!(error.to_string(), "Failed to insert response step");
-    let rendered = format!("{error:?}");
-    assert!(!rendered.contains(&missing_predecessor.0.to_string()));
-    assert!(!rendered.contains("unrelated-fk-error"));
-    match &error {
-        fusillade_arsenal::error::FusilladeError::Other(source) => assert!(
-            source
-                .downcast_ref::<RetainedResponseStepConflict>()
-                .is_none()
-        ),
-        other => panic!("unexpected response-step insert error: {other:?}"),
-    }
-    assert_eq!(count_ids(&pool, "response_steps", &[proposed_id]).await, 0);
 }
 
 #[sqlx::test]
@@ -6309,7 +4653,7 @@ async fn a_file_owned_template_graph_moves_and_leaves_the_template_in_place(pool
     assert_eq!(count_ids(&pool, "requests", &graph.request_ids).await, 0);
     assert_eq!(
         retained_counts(&pool, graph.group_id).await,
-        (1, graph.request_ids.len() as i64, 0)
+        (1, graph.request_ids.len() as i64)
     );
     let template_survives: bool =
         sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM request_templates WHERE id = $1)")

@@ -1,15 +1,15 @@
 //! Fusillade-backed implementation of onwards' `ResponseStore` trait
 //! and standalone functions for creating/completing response records.
 //!
-//! All response reads go through fusillade's request/step stores, which resolve
+//! All response reads go through fusillade's request store, which resolves
 //! either the live tables or an active retained-response route. The only raw
 //! SQL is the `api_keys` lookup which queries a dwctl-owned table.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fusillade::{RequestId, ResponseStepStore, RetainedResponseWriteError, StepId, Storage};
-use fusillade_arsenal::{PostgresRequestManager, PostgresResponseStepManager};
+use fusillade::{RequestId, RetainedResponseWriteError, Storage};
+use fusillade_arsenal::PostgresRequestManager;
 use sqlx_pool_router::PoolProvider;
 use uuid::Uuid;
 
@@ -26,10 +26,6 @@ pub struct OnwardsDaemonId(pub Uuid);
 /// ResponseStore implementation backed by fusillade's `Storage` trait.
 pub struct FusilladeResponseStore<P: PoolProvider + Clone> {
     request_manager: Arc<PostgresRequestManager<P>>,
-    /// Step manager, used by `get_response` to resolve responses stored as a
-    /// head step (produced before the multi-step loop was retired) back into a
-    /// Responses object. Optional: single-step callers construct without it.
-    step_manager: Option<Arc<PostgresResponseStepManager<P>>>,
     /// Keystore for decrypting ZDR response bodies on retrieval. `None` = no ZDR.
     keystore: Option<crate::keystore::Keystore>,
 }
@@ -38,16 +34,8 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
     pub fn new(request_manager: Arc<PostgresRequestManager<P>>) -> Self {
         Self {
             request_manager,
-            step_manager: None,
             keystore: None,
         }
-    }
-
-    /// Wire in the step manager so `get_response` can resolve head-step-backed
-    /// responses (retained from before the multi-step loop was retired).
-    pub fn with_step_manager(mut self, step_manager: Arc<PostgresResponseStepManager<P>>) -> Self {
-        self.step_manager = Some(step_manager);
-        self
     }
 
     /// Wire in the keystore so ZDR response bodies are decrypted on retrieval.
@@ -58,57 +46,19 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
 
     /// Retrieve a response by ID. Used by the GET /v1/responses/{id} handler.
     ///
-    /// Two retrieval paths:
+    /// The id (`resp_<uuid>`) is itself a fusillade request id: a
+    /// `/v1/responses`, `/v1/chat/completions` or `/v1/embeddings` row
+    /// created by the realtime path. The lookup resolves either the live
+    /// row or its active retained-response snapshot.
     ///
-    /// * **Multi-step** — the id is a head step's uuid. We look up the
-    ///   live or retained head step, walk to its sub-request snapshot, build
-    ///   the response envelope from that request (created_at, status, model,
-    ///   response_body) and stamp `resp_<head_step_uuid>` as the id.
-    ///
-    /// * **Single-step** — the id is itself a fusillade request id
-    ///   (a `/v1/chat/completions` or `/v1/embeddings` row created by
-    ///   the realtime path). When no head step matches, we fall back
-    ///   to the legacy lookup so `/v1/chat/completions` results stay
-    ///   retrievable via `GET /v1/responses/{id}` — the API surface
-    ///   the dashboard depends on.
-    ///
-    /// Returns [`ResponseLookup::NotFound`] only when neither lookup matches,
-    /// and [`ResponseLookup::Gone`] when the row exists but its ZDR response
+    /// Returns [`ResponseLookup::NotFound`] when no row matches, and
+    /// [`ResponseLookup::Gone`] when the row exists but its ZDR response
     /// body is an envelope whose key has been shredded (see the enum docs). The
     /// gone decision is made from the same keystore lookup that would decrypt,
     /// so there is no separate probe and no time-of-check/time-of-use gap.
     pub async fn get_response(&self, response_id: &str) -> Result<ResponseLookup, StoreError> {
         let parsed_uuid = parse_response_id(response_id)?;
 
-        // Multi-step path: try head_step first. Multi-step is the server-side
-        // tool loop, which ZDR rejects at submit, so these are never encrypted -
-        // no gone case here.
-        if let Some(step_manager) = self.step_manager.as_deref()
-            && let Some(head_step) = step_manager.get_step(StepId(parsed_uuid)).await.map_err(map_fusillade_err)?
-        {
-            // Head step exists → resolve via its sub-request fusillade
-            // row. CHECK constraint guarantees model_call ⇒
-            // request_id, so the unwrap below is well-defined for any
-            // committed head step.
-            let Some(sub_request_id) = head_step.request_id else {
-                return Ok(ResponseLookup::NotFound);
-            };
-            let detail = match self.request_manager.get_request_detail(sub_request_id).await {
-                Ok(d) => d,
-                Err(fusillade::FusilladeError::RequestNotFound(_)) => return Ok(ResponseLookup::NotFound),
-                Err(e) => return Err(StoreError::StorageError(format!("fetch head sub-request: {e}"))),
-            };
-            let mut resp = detail_to_response_object(&detail);
-            // Surface the user-facing id (head step uuid), not the
-            // internal sub-request uuid.
-            resp["id"] = serde_json::Value::String(format!("resp_{parsed_uuid}"));
-            return Ok(ResponseLookup::Found(resp));
-        }
-
-        // Single-step fallback: the id is itself a fusillade.requests
-        // row (chat completions / embeddings). Used by callers that
-        // GET a previously-issued non-multi-step request via the same
-        // /v1/responses/{id} endpoint.
         match self.request_manager.get_request_detail(RequestId(parsed_uuid)).await {
             Ok(mut detail) => {
                 if let Some(ks) = self.keystore.as_ref() {
@@ -139,14 +89,10 @@ impl<P: PoolProvider + Clone> FusilladeResponseStore<P> {
 pub enum ResponseLookup {
     /// The response object, ready to return.
     Found(serde_json::Value),
-    /// Neither the multi-step nor single-step lookup matched.
+    /// No live or retained request row matched the id.
     NotFound,
     /// A ZDR response whose key is gone; permanently unavailable.
     Gone,
-}
-
-fn map_fusillade_err(e: fusillade::FusilladeError) -> StoreError {
-    StoreError::StorageError(format!("fusillade: {e}"))
 }
 
 /// Mark a response as failed.
@@ -920,8 +866,8 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
     }
 
     async fn get_context(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
-        // Multi-step context lookups are never ZDR, so `Gone` cannot arise here;
-        // fold it into `None` alongside `NotFound` for a total mapping.
+        // Context lookups need the plaintext body; a shredded ZDR body is
+        // as good as missing, so fold `Gone` into `None` alongside `NotFound`.
         Ok(match self.get_response(response_id).await? {
             ResponseLookup::Found(v) => Some(v),
             ResponseLookup::NotFound | ResponseLookup::Gone => None,
