@@ -411,12 +411,22 @@ observed healthy:
    finalization-anchored retention period. Every batch in a week must be
    fully archived, frozen, and individually past its period before the week
    drops; completion stamps batch metadata rows (which are never deleted).
-10. Enable the generation-2 template write cutover, then file-content expiry
-    and weekly template retirement with an explicit creation-anchored period.
-    A template week drops only when no live file still owns rows in it; file
-    rows are tombstoned, never deleted. The frozen legacy template heap is
-    dropped later as one relation, in a separately approved forward
-    migration, once its whole horizon has passed.
+10. Enable file-content expiry and weekly template retirement with an
+    explicit creation-anchored period. A template week drops only when no
+    live file still owns rows in it and no dedicated batchless template
+    remains in it; file rows are tombstoned, never deleted.
+11. Retire generation 1. The weekly generation-2 store is the only template
+    write path; the generation-1 heap that predates it is dropped as one
+    relation by the `drop_legacy_request_template_heap` forward migration,
+    which also collapses `active_request_templates` and
+    `request_templates_all` to their generation-2 arm (names and column
+    shapes are unchanged, so no reader changes). The migration refuses to
+    run, failing closed with SQLSTATE 55000, while any generation-1 row is
+    still referenced by a live or archived request, still belongs to an
+    undeleted file, or is at least as new as the newest generation-2 row;
+    apply it only once every retention window that could hold generation-1
+    content has passed. Its down migration restores an empty generation-1
+    heap and the two-arm views; rows are never restored.
 
 Rollback boundaries: before step 5 every change is reversible by disabling
 flags and (only on an empty lifecycle) reverting the expand migration — the
@@ -426,6 +436,10 @@ reader versions; content already in retained partitions is served through
 routes and must not be abandoned by downgrading readers below step 3. After
 the first partition drop, retirement is irreversible by design; an unfinished
 retirement journal must keep an enabled maintenance owner until it completes.
+Step 11 has its own boundary: its down migration recreates an empty
+generation-1 heap and the two-arm views so older readers keep working, but
+the rows it dropped are gone for good — which is exactly why the forward
+guard refuses to run while anything live could still reach them.
 
 Abort and hold conditions: stop the ramp if the preflight fails, the runway
 gauge falls behind the horizon, retirement retries persist, mover integrity

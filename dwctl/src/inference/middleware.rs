@@ -526,6 +526,9 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 api_key: api_key.clone().unwrap_or_default(),
                 created_by: created_by.unwrap_or_default(),
             };
+            // The parsed JSON is no longer needed on the realtime path. Release
+            // its strings before the upstream request is held open.
+            drop(request_value);
             handle_realtime(
                 &state,
                 realtime_input,

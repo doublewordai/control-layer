@@ -57,35 +57,15 @@ async fn generation_two_parent_is_weekly_range_partitioned(pool: PgPool) {
     .unwrap();
     assert!(range_partitioned);
 
-    // The legacy heap remains an ordinary, untouched relation.
-    let legacy_kind: String = sqlx::query_scalar(
-        "SELECT relkind::text FROM pg_class WHERE relname = 'request_templates'",
+    // The generation-1 heap is retired: nothing but the weekly store remains.
+    let legacy_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = 'request_templates' \
+                        AND relkind IN ('r', 'p'))",
     )
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(legacy_kind, "r");
-
-    let columns: Vec<String> = sqlx::query_scalar(
-        "SELECT column_name FROM information_schema.columns \
-         WHERE table_name = 'request_templates' AND column_name <> 'created_on' \
-         ORDER BY column_name",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    let g2_columns: Vec<String> = sqlx::query_scalar(
-        "SELECT column_name FROM information_schema.columns \
-         WHERE table_name = 'request_templates_g2' AND column_name <> 'created_on' \
-         ORDER BY column_name",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        columns, g2_columns,
-        "generation-2 must carry every legacy column plus created_on"
-    );
+    assert!(!legacy_exists, "the legacy template heap must be gone");
 }
 
 #[sqlx::test]
@@ -146,7 +126,7 @@ async fn ensure_helpers_create_exact_weekly_partitions(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn active_view_reads_both_generations_identically(pool: PgPool) {
+async fn active_view_hides_templates_of_soft_deleted_files_but_keeps_dedicated_ones(pool: PgPool) {
     let week = monday(&pool, 0).await;
     sqlx::query("SELECT ensure_request_template_partition($1, NULL)")
         .bind(week)
@@ -154,49 +134,49 @@ async fn active_view_reads_both_generations_identically(pool: PgPool) {
         .await
         .unwrap();
 
-    let legacy_file = create_file(&pool).await;
-    let legacy_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO request_templates (file_id, endpoint, method, path, body, model, api_key) \
-         VALUES ($1, 'https://example.invalid', 'POST', '/v1/x', '{\"gen\":1}', \
-                 'test-model', 'test-key') RETURNING id",
+    let file = create_file(&pool).await;
+    let file_backed = insert_g2_template(&pool, week, file).await;
+    // A dedicated batchless template has no file and must stay visible to
+    // the claim join.
+    let dedicated: Uuid = sqlx::query_scalar(
+        "INSERT INTO request_templates_g2 (created_on, endpoint, method, path, body, model, api_key) \
+         VALUES ($1, 'e', 'POST', '/x', '{\"dedicated\":true}', 'm', 'k') RETURNING id",
     )
-    .bind(legacy_file)
+    .bind(week)
     .fetch_one(&pool)
     .await
     .unwrap();
-
-    let g2_file = create_file(&pool).await;
-    let g2_id = insert_g2_template(&pool, week, g2_file).await;
-
-    let bodies: Vec<(Uuid, String)> = sqlx::query_as(
-        "SELECT id, body FROM active_request_templates WHERE id = ANY($1) ORDER BY body",
-    )
-    .bind(vec![legacy_id, g2_id])
-    .fetch_all(&pool)
-    .await
-    .unwrap();
-    assert_eq!(
-        bodies,
-        vec![
-            (legacy_id, "{\"gen\":1}".to_string()),
-            (g2_id, "{\"gen\":2}".to_string())
-        ],
-        "both generations must be visible through one identical view shape"
-    );
-
-    // A soft-deleted file hides its templates in either generation.
-    sqlx::query("UPDATE files SET deleted_at = NOW() WHERE id = ANY($1)")
-        .bind(vec![legacy_file, g2_file])
+    sqlx::query("INSERT INTO request_template_routes (template_id, week_start) VALUES ($1, $2)")
+        .bind(dedicated)
+        .bind(week)
         .execute(&pool)
         .await
         .unwrap();
-    let remaining: i64 =
+
+    let visible: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM active_request_templates WHERE id = ANY($1)")
-            .bind(vec![legacy_id, g2_id])
+            .bind(vec![file_backed, dedicated])
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(remaining, 0);
+    assert_eq!(visible, 2);
+
+    sqlx::query("UPDATE files SET deleted_at = NOW() WHERE id = $1")
+        .bind(file)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let remaining: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM active_request_templates WHERE id = ANY($1)")
+            .bind(vec![file_backed, dedicated])
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        remaining,
+        vec![dedicated],
+        "a soft-deleted file hides its templates; dedicated templates stay"
+    );
 }
 
 #[sqlx::test]
@@ -241,7 +221,7 @@ async fn a_fenced_bucket_hides_generation_two_templates(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn routes_resolve_generation_and_prune_to_one_partition(pool: PgPool) {
+async fn routes_resolve_to_one_partition(pool: PgPool) {
     let week = monday(&pool, 0).await;
     sqlx::query("SELECT ensure_request_template_partitions($1, 3)")
         .bind(week)
@@ -273,19 +253,10 @@ async fn routes_resolve_generation_and_prune_to_one_partition(pool: PgPool) {
         scanned_children >= 1,
         "the point read must reach a weekly child: {plan:?}"
     );
-
-    // An id without a route is a legacy template by definition.
-    let unrouted: Option<chrono::NaiveDate> = sqlx::query_scalar(
-        "SELECT week_start FROM request_template_routes WHERE template_id = gen_random_uuid()",
-    )
-    .fetch_optional(&pool)
-    .await
-    .unwrap();
-    assert_eq!(unrouted, None);
 }
 
 #[sqlx::test]
-async fn generation_two_writes_land_with_routes_and_read_identically(pool: PgPool) {
+async fn file_writes_land_with_routes_and_erase_with_them(pool: PgPool) {
     use fusillade_arsenal::batch::RequestTemplateInput;
     use fusillade_arsenal::manager::DaemonStorage;
     use fusillade_arsenal::{PostgresRequestManager, PostgresStorageConfig, Storage, TestDbPools};
@@ -300,82 +271,50 @@ async fn generation_two_writes_land_with_routes_and_read_identically(pool: PgPoo
         api_key: "test-key".to_string(),
     };
 
-    let legacy_manager = PostgresRequestManager::new(
+    let manager = PostgresRequestManager::new(
         TestDbPools::new(pool.clone()).await.unwrap(),
         PostgresStorageConfig::default(),
     );
-    let legacy_file = legacy_manager
-        .create_file("legacy-cutover".to_string(), None, vec![template(1)])
+    let file = manager
+        .create_file("g2-file".to_string(), None, vec![template(2), template(3)])
         .await
         .unwrap();
 
-    let g2_manager = PostgresRequestManager::new(
-        TestDbPools::new(pool.clone()).await.unwrap(),
-        PostgresStorageConfig::default(),
-    )
-    .with_template_generation_writes(true);
-    let g2_file = g2_manager
-        .create_file(
-            "g2-cutover".to_string(),
-            None,
-            vec![template(2), template(3)],
-        )
-        .await
-        .unwrap();
-
-    // Physical placement: the flag decides the generation of NEW writes.
-    let legacy_rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM request_templates WHERE file_id = $1")
-            .bind(*legacy_file)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(legacy_rows, 1);
-    let (g2_rows, g2_routes, g2_legacy_rows): (i64, i64, i64) = sqlx::query_as(
+    let (rows, routes): (i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM request_templates_g2 WHERE file_id = $1), \
                 (SELECT COUNT(*) FROM request_template_routes route \
                  JOIN request_templates_g2 g2 ON g2.id = route.template_id \
-                 WHERE g2.file_id = $1), \
-                (SELECT COUNT(*) FROM request_templates WHERE file_id = $1)",
+                 WHERE g2.file_id = $1)",
     )
-    .bind(*g2_file)
+    .bind(*file)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(
-        (g2_rows, g2_routes, g2_legacy_rows),
-        (2, 2, 0),
-        "generation-2 writes must land with routes and never touch the legacy heap"
+        (rows, routes),
+        (2, 2),
+        "every file template must land with its route"
     );
 
-    // Read parity: per-model statistics resolve either generation.
-    let legacy_stats = legacy_manager
-        .get_file_template_stats(legacy_file)
-        .await
-        .unwrap();
-    let g2_stats = legacy_manager
-        .get_file_template_stats(g2_file)
-        .await
-        .unwrap();
-    assert_eq!(legacy_stats.len(), 1);
-    assert_eq!(g2_stats.len(), 1);
-    assert_eq!(g2_stats[0].request_count, 2);
+    let stats = manager.get_file_template_stats(file).await.unwrap();
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].request_count, 2);
 
-    // Explicit erasure reaches generation 2 and removes routes with rows.
-    g2_manager.delete_file(g2_file).await.unwrap();
-    while g2_manager.purge_orphaned_rows(100).await.unwrap() > 0 {}
+    // Explicit erasure removes rows and routes together.
+    manager.delete_file(file).await.unwrap();
+    while manager.purge_orphaned_rows(100).await.unwrap() > 0 {}
     let (left_rows, left_routes): (i64, i64) = sqlx::query_as(
         "SELECT (SELECT COUNT(*) FROM request_templates_g2 WHERE file_id = $1), \
                 (SELECT COUNT(*) FROM request_template_routes)",
     )
-    .bind(*g2_file)
+    .bind(*file)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(
         (left_rows, left_routes),
         (0, 0),
-        "explicit erasure must remove generation-2 rows and their routes"
+        "explicit erasure must remove template rows and their routes"
     );
 }
 
@@ -568,8 +507,7 @@ async fn a_batch_materializes_requests_from_generation_two_templates(pool: PgPoo
     let manager = PostgresRequestManager::new(
         TestDbPools::new(pool.clone()).await.unwrap(),
         PostgresStorageConfig::default(),
-    )
-    .with_template_generation_writes(true);
+    );
     let file_id = manager
         .create_file(
             "g2-batch-source".to_string(),
@@ -587,8 +525,8 @@ async fn a_batch_materializes_requests_from_generation_two_templates(pool: PgPoo
         .await
         .unwrap();
 
-    // Regression: requests.template_id previously carried a foreign key to
-    // the legacy heap, so materializing from generation-2 ids failed.
+    // Regression: requests.template_id once carried a row-level foreign key
+    // to a template heap, so materializing from partitioned ids failed.
     let batch = manager
         .create_batch(BatchInput {
             file_id,
@@ -618,10 +556,8 @@ async fn a_batch_materializes_requests_from_generation_two_templates(pool: PgPoo
     );
 }
 
-/// Batch result downloads join each request back to its input template. After
-/// the write cutover that template lives in `request_templates_g2`, so the
-/// results stream must read through the generation-transparent view — a
-/// legacy-table join silently streams nothing for every cutover batch.
+/// Batch result downloads join each request back to its input template
+/// through `request_templates_all`; a direct heap join would stream nothing.
 #[sqlx::test]
 async fn batch_results_stream_finds_generation_two_templates(pool: PgPool) {
     use fusillade_arsenal::{PostgresRequestManager, PostgresStorageConfig, Storage, TestDbPools};
@@ -662,11 +598,7 @@ async fn batch_results_stream_finds_generation_two_templates(pool: PgPool) {
         .get_batch_results_stream(batch_id.into(), 0, None, None)
         .collect()
         .await;
-    assert_eq!(
-        items.len(),
-        1,
-        "the cutover batch's single request must stream"
-    );
+    assert_eq!(items.len(), 1, "the batch's single request must stream");
     let item = items
         .into_iter()
         .next()

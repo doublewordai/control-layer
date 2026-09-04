@@ -150,7 +150,10 @@ async fn ensure_template(admin: &mut PgConnection, options: &PgConnectOptions, t
     match admin.execute(format!("ALTER DATABASE {build} RENAME TO {template}").as_str()).await {
         Ok(_) => Ok(()),
         // A builder outside this database's advisory lock sealed it first.
-        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P04") => {
+        Err(sqlx::Error::Database(error))
+            if error.code().as_deref() == Some("42P04")
+                || (error.code().as_deref() == Some("23505") && error.constraint() == Some("pg_database_datname_index")) =>
+        {
             admin.execute(format!("DROP DATABASE {build}").as_str()).await?;
             Ok(())
         }
