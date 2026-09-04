@@ -1051,6 +1051,9 @@ pub(crate) async fn get_request_detail<P: PoolProvider>(
     detail.ok_or(FusilladeError::RequestNotFound(request_id))
 }
 
+/// The exact combined count, kept for the planner-shape test; production
+/// counts each arm separately under a budget (see `count_requests_with_budget`).
+#[cfg(test)]
 const LIST_REQUESTS_COUNT_SQL: &str = r#"
     -- Two independent scalar counts, NOT one union CTE: the CTE fences the
     -- planner out of a parallel scan on the large live arm, turning a
