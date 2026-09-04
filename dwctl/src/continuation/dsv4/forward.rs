@@ -339,7 +339,7 @@ impl Dsv4Forward {
         emittable
     }
 
-    fn scan_invoke(&mut self, rest: &str, out: &mut Vec<ForwardDelta>) -> usize {
+    fn scan_invoke(&mut self, rest: &str, out: &mut [ForwardDelta]) -> usize {
         const TAGS: [&str; 2] = [PARAMETER_OPEN, INVOKE_CLOSE];
         if let Some((i, tag)) = find_first(rest, &TAGS) {
             self.structural(out, &rest[..i]);
