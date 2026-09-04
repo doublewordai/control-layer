@@ -313,7 +313,6 @@ pub enum RetainedResponseRetirementOutcome {
 mod retention_policy_tests {
     use super::*;
 
-
     #[test]
     fn batchless_delete_on_is_the_utc_day_after_exact_expiry() {
         let terminal_at = DateTime::parse_from_rfc3339("2026-08-14T15:30:00Z")
