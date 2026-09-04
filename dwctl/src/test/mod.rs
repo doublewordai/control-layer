@@ -1462,11 +1462,15 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
 
     // Configure fusillade to use dedicated database
     config.database = crate::config::DatabaseConfig::External {
+        pooled_url: None,
+        direct_pool: crate::config::default_direct_pool(),
         url: "ignored".to_string(), // Will be overridden by pool
         replica_url: None,
         pool: PoolSettings::default(),
         replica_pool: None,
         fusillade: ComponentDb::Dedicated {
+            pooled_url: None,
+            direct_pool: crate::config::default_direct_pool(),
             url: test_dbs.fusillade_url.clone(),
             replica_url: None,
             pool: PoolSettings {
@@ -1477,6 +1481,8 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
             replica_pool: None,
         },
         outlet: ComponentDb::Dedicated {
+            pooled_url: None,
+            direct_pool: crate::config::default_direct_pool(),
             url: test_dbs.outlet_url.clone(),
             replica_url: None,
             pool: PoolSettings {

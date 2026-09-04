@@ -106,3 +106,40 @@ pub fn pool_options(settings: &crate::config::PoolSettings) -> sqlx::postgres::P
         .idle_timeout((settings.idle_timeout_secs > 0).then(|| Duration::from_secs(settings.idle_timeout_secs)))
         .max_lifetime((settings.max_lifetime_secs > 0).then(|| Duration::from_secs(settings.max_lifetime_secs)))
 }
+
+/// The two ways a component reaches one database: `pooled` (behind a
+/// transaction-mode pooler, for all query traffic) and `direct` (real backend
+/// connections, for session-scoped work only: LISTEN, advisory locks held
+/// across statements, migrations). With no pooled endpoint configured both
+/// fields are the same `DbPools`, which is exactly the pre-pooling behaviour.
+#[derive(Clone, Debug)]
+pub struct PoolPair {
+    pub pooled: sqlx_pool_router::DbPools,
+    pub direct: sqlx_pool_router::DbPools,
+}
+
+impl PoolPair {
+    /// One `DbPools` serving both roles (no pooler configured).
+    pub fn unsplit(pools: sqlx_pool_router::DbPools) -> Self {
+        Self {
+            pooled: pools.clone(),
+            direct: pools,
+        }
+    }
+
+    /// Whether a distinct pooled endpoint is in use.
+    pub fn is_split(&self) -> bool {
+        !std::ptr::eq(
+            std::sync::Arc::as_ptr(&self.pooled.write().connect_options()),
+            std::sync::Arc::as_ptr(&self.direct.write().connect_options()),
+        )
+    }
+}
+
+/// Every database this process talks to, each as a pooled/direct pair.
+#[derive(Clone, Debug)]
+pub struct DatabasePools {
+    pub main: PoolPair,
+    pub fusillade: PoolPair,
+    pub outlet: Option<PoolPair>,
+}

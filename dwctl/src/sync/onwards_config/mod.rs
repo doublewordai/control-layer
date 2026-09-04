@@ -118,7 +118,11 @@ struct OnwardsApiKey {
 
 /// Manages the integration between onwards-pilot and the onwards proxy
 pub struct OnwardsConfigSync {
+    /// Query traffic (pooled endpoint when configured).
     db: sqlx_pool_router::DynPools,
+    /// Direct connections for the LISTEN session; a transaction-mode pooler
+    /// cannot carry a subscription.
+    listener_db: sqlx_pool_router::DynPools,
     sender: watch::Sender<Targets>,
     /// Shared map of model batch capacity limits for the daemon
     daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
@@ -158,7 +162,7 @@ impl OnwardsConfigSync {
     #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        Self::new_with_daemon_limits(db, None, 10, Vec::new(), false, RateLimitTiersConfig::default()).await
+        Self::new_with_daemon_limits(db.clone(), db, None, 10, Vec::new(), false, RateLimitTiersConfig::default()).await
     }
 
     /// Creates a new OnwardsConfigSync with optional daemon capacity limits map and escalation models
@@ -168,9 +172,11 @@ impl OnwardsConfigSync {
     /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
     /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
     /// `rate_limit_tiers` - Default rate limits applied per-key based on the owning user's `verified` flag.
-    #[instrument(skip(db, daemon_capacity_limits, escalation_models, rate_limit_tiers))]
+    /// `listener_db` - Direct (non-pooled) connections for the LISTEN session.
+    #[instrument(skip(db, listener_db, daemon_capacity_limits, escalation_models, rate_limit_tiers))]
     pub async fn new_with_daemon_limits(
         db: impl sqlx_pool_router::PoolProvider,
+        listener_db: impl sqlx_pool_router::PoolProvider,
         daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
         default_batch_capacity: usize,
         escalation_models: Vec<String>,
@@ -204,6 +210,7 @@ impl OnwardsConfigSync {
 
         let integration = Self {
             db,
+            listener_db: sqlx_pool_router::DynPools::new(listener_db),
             sender,
             daemon_capacity_limits,
             default_batch_capacity,
@@ -244,7 +251,7 @@ impl OnwardsConfigSync {
             if let Some(tx) = &config.status_tx {
                 tx.send(SyncStatus::Connecting).await?;
             }
-            let mut listener = PgListener::connect_with(&self.db.write()).await?;
+            let mut listener = PgListener::connect_with(&self.listener_db.write()).await?;
             // Listen to auth config changes
             listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await?;
 

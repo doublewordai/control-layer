@@ -100,16 +100,19 @@ pub async fn initial_cache(pool: &PgPool) -> Result<ZdrKeyCache, sqlx::Error> {
 /// missed notification. Returns when `shutdown` fires.
 pub async fn run(
     pools: impl sqlx_pool_router::PoolProvider,
+    listener_pools: impl sqlx_pool_router::PoolProvider,
     cache: ZdrKeyCache,
     fallback_interval_ms: u64,
     shutdown: CancellationToken,
 ) -> Result<(), anyhow::Error> {
     let pools = sqlx_pool_router::DynPools::new(pools);
+    // LISTEN needs a session: direct connections, never the pooled endpoint.
+    let listener_pools = sqlx_pool_router::DynPools::new(listener_pools);
     const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
     let fallback = (fallback_interval_ms > 0).then(|| std::time::Duration::from_millis(fallback_interval_ms));
 
     'outer: loop {
-        let mut listener = PgListener::connect_with(&pools.write()).await?;
+        let mut listener = PgListener::connect_with(&listener_pools.write()).await?;
         listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await?;
         info!("Started ZDR key sync listener");
 

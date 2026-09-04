@@ -205,10 +205,13 @@ pub fn create_test_config() -> crate::config::Config {
     let temp_dir = std::env::temp_dir().join(format!("dwctl-test-emails-{}", std::process::id()));
 
     crate::config::Config {
+        database_pooled_url: None,
         clickhouse: None,
         database_url: None,
         database_replica_url: None,
         database: crate::config::DatabaseConfig::External {
+            pooled_url: None,
+            direct_pool: crate::config::default_direct_pool(),
             url: "Something".to_string(), // Will get overriden by env var
             replica_url: None,
             pool: PoolSettings {
@@ -218,6 +221,7 @@ pub fn create_test_config() -> crate::config::Config {
             },
             replica_pool: None,
             fusillade: crate::config::ComponentDb::Schema {
+                direct_pool: crate::config::default_direct_pool(),
                 name: "fusillade".to_string(),
                 pool: PoolSettings {
                     max_connections: 4,
@@ -227,6 +231,7 @@ pub fn create_test_config() -> crate::config::Config {
                 replica_pool: None,
             },
             outlet: crate::config::ComponentDb::Schema {
+                direct_pool: crate::config::default_direct_pool(),
                 name: "outlet".to_string(),
                 pool: PoolSettings {
                     max_connections: 4,

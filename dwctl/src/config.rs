@@ -123,6 +123,11 @@ pub struct Config {
     /// Use DATABASE_REPLICA_URL or DWCTL_DATABASE_REPLICA_URL to set this
     #[serde(skip_serializing_if = "Option::is_none")]
     pub database_replica_url: Option<String>,
+    /// Pooled (PgBouncer / Neon `-pooler`) endpoint for the main database.
+    /// Convenience env override (`DATABASE_POOLED_URL` / `DWCTL_DATABASE_POOLED_URL`),
+    /// folded into `database.pooled_url` at load. See `DatabaseConfig::External`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database_pooled_url: Option<String>,
     /// Database configuration - either embedded or external PostgreSQL
     pub database: DatabaseConfig,
     /// Threshold in milliseconds for logging slow SQL statements (default: 1000ms)
@@ -330,15 +335,26 @@ pub enum ComponentDb {
         /// If not specified, uses the same settings as `pool`
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replica_pool: Option<PoolSettings>,
+        /// Direct (non-pooled) connections for this schema, used only for
+        /// session-scoped work: today its migrations. Only meaningful when the
+        /// main database has a `pooled_url`; otherwise every pool is direct
+        /// and this is unused.
+        #[serde(default = "default_direct_pool")]
+        direct_pool: PoolSettings,
     },
     /// Use a dedicated database with its own connection.
     /// Useful for isolating workloads or using read replicas.
     Dedicated {
-        /// Primary database URL
+        /// Primary database URL (direct connections)
         url: String,
         /// Optional read replica URL for read-heavy operations
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replica_url: Option<String>,
+        /// Optional pooled (transaction-pooling) endpoint for the same
+        /// database. When set, `pool` sizes the pooled pool and `direct_pool`
+        /// the direct one; when unset every pool is direct and sized by `pool`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pooled_url: Option<String>,
         /// Connection pool settings for primary (and replica if not specified)
         #[serde(default)]
         pool: PoolSettings,
@@ -346,6 +362,10 @@ pub enum ComponentDb {
         /// If not specified, uses the same settings as `pool`
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replica_pool: Option<PoolSettings>,
+        /// Direct (non-pooled) connections, used only for session-scoped work
+        /// (migrations) when `pooled_url` is set.
+        #[serde(default = "default_direct_pool")]
+        direct_pool: PoolSettings,
     },
 }
 
@@ -355,6 +375,22 @@ impl ComponentDb {
         match self {
             ComponentDb::Schema { pool, .. } => pool,
             ComponentDb::Dedicated { pool, .. } => pool,
+        }
+    }
+
+    /// Settings for this component's direct (non-pooled) pool.
+    pub fn direct_pool_settings(&self) -> &PoolSettings {
+        match self {
+            ComponentDb::Schema { direct_pool, .. } => direct_pool,
+            ComponentDb::Dedicated { direct_pool, .. } => direct_pool,
+        }
+    }
+
+    /// Pooled endpoint for a dedicated component database, if configured.
+    pub fn pooled_url(&self) -> Option<&str> {
+        match self {
+            ComponentDb::Schema { .. } => None,
+            ComponentDb::Dedicated { pooled_url, .. } => pooled_url.as_deref(),
         }
     }
 
@@ -380,6 +416,7 @@ pub fn default_fusillade_component() -> ComponentDb {
             max_lifetime_secs: 1800,
         },
         replica_pool: None,
+        direct_pool: default_direct_pool(),
     }
 }
 
@@ -395,6 +432,19 @@ pub fn default_outlet_component() -> ComponentDb {
             max_lifetime_secs: 1800,
         },
         replica_pool: None,
+        direct_pool: default_direct_pool(),
+    }
+}
+
+/// Direct-connection pool defaults. Every direct connection is a real backend
+/// against the database's hard connection limit, so this stays small: it only
+/// has to cover session-scoped work (LISTEN connections, the leader-election
+/// lock, migrations), never query traffic.
+pub fn default_direct_pool() -> PoolSettings {
+    PoolSettings {
+        max_connections: 8,
+        min_connections: 0,
+        ..Default::default()
     }
 }
 
@@ -442,14 +492,26 @@ pub enum DatabaseConfig {
         /// holds long-lived PgListener connections)
         #[serde(default = "default_underway_pool")]
         underway_pool: PoolSettings,
+        /// Direct-connection pool settings (unused for embedded: there is no
+        /// pooler, so every pool is direct and sized by `pool`).
+        #[serde(default = "default_direct_pool")]
+        direct_pool: PoolSettings,
     },
     /// Use external PostgreSQL database
     External {
-        /// Connection string for the main database
+        /// Connection string for the main database (direct connections)
         url: String,
         /// Optional read replica URL for the main database
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replica_url: Option<String>,
+        /// Optional pooled (transaction-pooling, e.g. Neon `-pooler`) endpoint
+        /// for the same database. When set, all query traffic goes through it
+        /// (sized by `pool`) and only session-scoped work — LISTEN
+        /// connections, the leader-election lock, migrations — uses `url`
+        /// (sized by `direct_pool`). When unset, every pool is direct and
+        /// sized by `pool`, exactly as before pooling existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pooled_url: Option<String>,
         /// Main database connection pool settings for primary (and replica if not specified)
         #[serde(default)]
         pool: PoolSettings,
@@ -467,6 +529,9 @@ pub enum DatabaseConfig {
         /// holds long-lived PgListener connections)
         #[serde(default = "default_underway_pool")]
         underway_pool: PoolSettings,
+        /// Direct-connection pool settings; see `pooled_url`.
+        #[serde(default = "default_direct_pool")]
+        direct_pool: PoolSettings,
     },
 }
 
@@ -483,6 +548,7 @@ impl Default for DatabaseConfig {
                 fusillade: default_fusillade_component(),
                 outlet: default_outlet_component(),
                 underway_pool: default_underway_pool(),
+                direct_pool: default_direct_pool(),
             }
         }
         #[cfg(not(feature = "embedded-db"))]
@@ -490,11 +556,13 @@ impl Default for DatabaseConfig {
             DatabaseConfig::External {
                 url: "postgres://localhost:5432/control_layer".to_string(),
                 replica_url: None,
+                pooled_url: None,
                 pool: PoolSettings::default(),
                 replica_pool: None,
                 fusillade: default_fusillade_component(),
                 outlet: default_outlet_component(),
                 underway_pool: default_underway_pool(),
+                direct_pool: default_direct_pool(),
             }
         }
     }
@@ -519,6 +587,22 @@ impl DatabaseConfig {
         match self {
             DatabaseConfig::External { replica_url, .. } => replica_url.as_deref(),
             DatabaseConfig::Embedded { .. } => None,
+        }
+    }
+
+    /// Pooled endpoint for the main database, if configured (external only).
+    pub fn external_pooled_url(&self) -> Option<&str> {
+        match self {
+            DatabaseConfig::External { pooled_url, .. } => pooled_url.as_deref(),
+            DatabaseConfig::Embedded { .. } => None,
+        }
+    }
+
+    /// Settings for the main database's direct (non-pooled) pool.
+    pub fn direct_pool_settings(&self) -> &PoolSettings {
+        match self {
+            DatabaseConfig::Embedded { direct_pool, .. } => direct_pool,
+            DatabaseConfig::External { direct_pool, .. } => direct_pool,
         }
     }
 
@@ -2707,6 +2791,7 @@ impl Default for Config {
             dashboard_url: "http://localhost:5173".to_string(),
             database_url: None, // Deprecated field
             database_replica_url: None,
+            database_pooled_url: None,
             database: DatabaseConfig::default(),
             slow_statement_threshold_ms: 1000,
             admin_email: "test@doubleword.ai".to_string(),
@@ -2891,6 +2976,11 @@ impl Config {
             let fusillade = config.database.fusillade().clone();
             let outlet = config.database.outlet().clone();
             let underway_pool = config.database.underway_pool_settings().clone();
+            let direct_pool = config.database.direct_pool_settings().clone();
+            let pooled_url = config
+                .database_pooled_url
+                .take()
+                .or_else(|| config.database.external_pooled_url().map(str::to_string));
 
             // Preserve original replica_pool if it was explicitly configured (not using fallback)
             let original_replica_pool = match &config.database {
@@ -2904,11 +2994,13 @@ impl Config {
             config.database = DatabaseConfig::External {
                 url,
                 replica_url,
+                pooled_url,
                 pool,
                 replica_pool: original_replica_pool, // Always preserve original replica_pool if it existed
                 fusillade,
                 outlet,
                 underway_pool,
+                direct_pool,
             };
         } else if let Some(replica_url) = config.database_replica_url.take() {
             // Only replica_url is set via environment variable, apply it to existing config
@@ -3231,11 +3323,16 @@ impl Config {
             .merge(Env::prefixed("DWCTL_").split("__"))
             // Common DATABASE_URL and DATABASE_REPLICA_URL patterns
             // Accept both DATABASE_REPLICA_URL and DWCTL_DATABASE_REPLICA_URL
-            .merge(Env::raw().only(&["DATABASE_URL", "DATABASE_REPLICA_URL"]))
+            .merge(Env::raw().only(&["DATABASE_URL", "DATABASE_REPLICA_URL", "DATABASE_POOLED_URL"]))
             .merge(
                 Env::raw()
                     .only(&["DWCTL_DATABASE_REPLICA_URL"])
                     .map(|_| "database_replica_url".into()),
+            )
+            .merge(
+                Env::raw()
+                    .only(&["DWCTL_DATABASE_POOLED_URL"])
+                    .map(|_| "database_pooled_url".into()),
             )
     }
 
@@ -3363,6 +3460,65 @@ auth:
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn pooled_url_and_direct_pool_parse_and_fold_from_env() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: hello
+database:
+  type: external
+  url: postgres://direct/db
+  pooled_url: postgres://pooled/db
+  pool:
+    max_connections: 400
+  direct_pool:
+    max_connections: 6
+  fusillade:
+    mode: schema
+    name: fusillade
+    direct_pool:
+      max_connections: 3
+"#,
+            )?;
+            let config = Config::load(&Args {
+                config: "test.yaml".into(),
+                validate: false,
+            })?;
+            assert_eq!(config.database.external_url(), Some("postgres://direct/db"));
+            assert_eq!(config.database.external_pooled_url(), Some("postgres://pooled/db"));
+            assert_eq!(config.database.main_pool_settings().max_connections, 400);
+            assert_eq!(config.database.direct_pool_settings().max_connections, 6);
+            assert_eq!(config.database.fusillade().direct_pool_settings().max_connections, 3);
+            assert_eq!(
+                config.database.outlet().direct_pool_settings().max_connections,
+                default_direct_pool().max_connections
+            );
+
+            // The env override rebuilds `database` from DATABASE_URL and must
+            // carry the pooled endpoint and direct settings across.
+            jail.set_env("DATABASE_URL", "postgres://env-direct/db");
+            jail.set_env("DWCTL_DATABASE_POOLED_URL", "postgres://env-pooled/db");
+            let config = Config::load(&Args {
+                config: "test.yaml".into(),
+                validate: false,
+            })?;
+            assert_eq!(config.database.external_url(), Some("postgres://env-direct/db"));
+            assert_eq!(config.database.external_pooled_url(), Some("postgres://env-pooled/db"));
+            assert_eq!(config.database.direct_pool_settings().max_connections, 6);
+            assert!(config.database_pooled_url.is_none(), "folded into database.pooled_url");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn no_pooled_url_by_default() {
+        let config = Config::default();
+        assert!(config.database.external_pooled_url().is_none());
+        assert_eq!(config.database.direct_pool_settings().max_connections, 8);
     }
 
     #[test]

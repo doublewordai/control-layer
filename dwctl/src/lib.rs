@@ -652,32 +652,138 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
     Ok(())
 }
 
-/// Setup database connections, run migrations, and initialize data
-/// Returns: (embedded_db, main_pools, fusillade_pools, outlet_pools)
+/// Build a pool with a schema-specific `search_path`.
+///
+/// Reuses the connection options of the parent (main) pool. The search_path is
+/// set at the connection level (via `PgConnectOptions::options`) rather than
+/// with an `after_connect` hook, so it cannot be unset and works with replicas.
+/// Eager connection (`connect_with`) so `min_connections` is honoured at boot.
+async fn create_schema_pool(
+    schema: &str,
+    opts: sqlx::postgres::PgConnectOptions,
+    settings: &config::PoolSettings,
+) -> Result<sqlx::PgPool, sqlx::Error> {
+    info!("Setting search_path={} via connection options for schema pool", schema);
+    let opts_with_schema = opts.options([("search_path".to_string(), schema.to_string())]);
+    db::pool_options(settings).connect_with(opts_with_schema).await
+}
+
+fn connect_options(url: &str, slow_threshold: std::time::Duration) -> anyhow::Result<PgConnectOptions> {
+    Ok(PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold))
+}
+
+/// Pooled/direct pools for a component database (fusillade, outlet).
+///
+/// Schema mode piggybacks on the main database's endpoints: the component's
+/// pooled pool is a schema-pinned pool over main's pooled connection, its
+/// direct pool one over main's direct connection. Dedicated mode has its own
+/// `url` and optional `pooled_url`. Either way, when no pooled endpoint is in
+/// play the pair is unsplit: one pool, sized by `pool`, exactly as before.
+async fn setup_component_pools(
+    component_name: &str,
+    component: &config::ComponentDb,
+    main: &db::PoolPair,
+    slow_threshold: std::time::Duration,
+) -> anyhow::Result<db::PoolPair> {
+    let replica_settings = component.replica_pool_settings();
+    match component {
+        config::ComponentDb::Schema {
+            name, pool, direct_pool, ..
+        } => {
+            // Query pools follow main's endpoints (pooled + optional replica).
+            let pooled_primary = create_schema_pool(name, main.pooled.write().connect_options().as_ref().clone(), pool).await?;
+            let pooled = if main.pooled.has_replica() {
+                info!("Setting up {component_name} read replica (schema mode)");
+                let replica = create_schema_pool(name, main.pooled.read().connect_options().as_ref().clone(), replica_settings).await?;
+                DbPools::with_replica(pooled_primary, replica)
+            } else {
+                DbPools::new(pooled_primary)
+            };
+            let pair = if main.is_split() {
+                let direct = create_schema_pool(name, main.direct.write().connect_options().as_ref().clone(), direct_pool).await?;
+                db::PoolPair {
+                    pooled,
+                    direct: DbPools::new(direct),
+                }
+            } else {
+                db::PoolPair::unsplit(pooled)
+            };
+            pair.direct.write().execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
+            Ok(pair)
+        }
+        config::ComponentDb::Dedicated {
+            url,
+            replica_url,
+            pooled_url,
+            pool,
+            direct_pool,
+            ..
+        } => {
+            info!("Using dedicated database for {component_name}");
+            let direct_settings = if pooled_url.is_some() { direct_pool } else { pool };
+            let direct = db::pool_options(direct_settings)
+                .connect_with(connect_options(url, slow_threshold)?)
+                .await?;
+            let replica = match replica_url {
+                Some(replica_url) => {
+                    info!("Setting up {component_name} read replica");
+                    Some(
+                        db::pool_options(replica_settings)
+                            .connect_with(connect_options(replica_url, slow_threshold)?)
+                            .await?,
+                    )
+                }
+                None => None,
+            };
+            let with_replica = |primary: sqlx::PgPool, replica: Option<sqlx::PgPool>| match replica {
+                Some(replica) => DbPools::with_replica(primary, replica),
+                None => DbPools::new(primary),
+            };
+            Ok(match pooled_url {
+                Some(pooled_url) => {
+                    info!("Using pooled endpoint for {component_name} query traffic");
+                    let pooled = db::pool_options(pool)
+                        .connect_with(connect_options(pooled_url, slow_threshold)?)
+                        .await?;
+                    db::PoolPair {
+                        pooled: with_replica(pooled, replica),
+                        direct: DbPools::new(direct),
+                    }
+                }
+                None => db::PoolPair::unsplit(with_replica(direct, replica)),
+            })
+        }
+    }
+}
+
+/// Setup database connections, run migrations, and initialize data.
+///
+/// Every database comes back as a [`db::PoolPair`]: `pooled` carries all query
+/// traffic (through the transaction-pooling endpoint when `pooled_url` is
+/// configured) and `direct` the session-scoped work — LISTEN connections, the
+/// leader-election lock, migrations. With no `pooled_url` the two are the same
+/// pool, sized by `pool`, which is the pre-pooling behaviour byte for byte.
 ///
 /// If `pool` is provided, it will be used directly instead of creating a new connection.
 /// This is useful for tests where sqlx::test provides a pool.
 async fn setup_database(
     config: &Config,
     pool: Option<PgPool>,
-) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, DbPools, DbPools, Option<DbPools>)> {
+) -> anyhow::Result<(Option<db::embedded::EmbeddedDatabase>, db::DatabasePools)> {
     let slow_threshold = std::time::Duration::from_millis(config.slow_statement_threshold_ms);
 
-    // If a pool is provided (e.g., from tests), create a TestDbPools which will create a read-only replica
-    let (embedded_db, pool, test_replica_pool) = if let Some(existing_pool) = pool {
+    let (embedded_db, main) = if let Some(existing_pool) = pool {
         info!("Using provided database pool with TestDbPools for read/write separation");
-
-        // Create TestDbPools which creates a read-only replica for testing
+        // TestDbPools adds a read-only replica so tests catch writes routed through `.read()`.
         let test_pools = sqlx_pool_router::TestDbPools::new(existing_pool.clone())
             .await
             .expect("Failed to create TestDbPools");
-
-        // Extract the write and read pools to create a DbPools with proper read/write separation
         let replica_pool = test_pools.read().into_inner();
-        (None, existing_pool, Some(replica_pool))
+        migrator().run(&existing_pool).await?;
+        (None, db::PoolPair::unsplit(DbPools::with_replica(existing_pool, replica_pool)))
     } else {
         // Database connection - handle both embedded and external
-        let (_embedded_db, database_url) = match &config.database {
+        let (embedded_db, database_url) = match &config.database {
             config::DatabaseConfig::Embedded { .. } => {
                 let persistent = config.database.embedded_persistent();
                 info!("Starting with embedded database (persistent: {})", persistent);
@@ -705,161 +811,68 @@ async fn setup_database(
             }
         };
 
-        let main_settings = config.database.main_pool_settings();
-        let connect_opts = PgConnectOptions::from_str(&database_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-
-        let pool = db::pool_options(main_settings).connect_with(connect_opts).await?;
-        (_embedded_db, pool, None)
-    };
-
-    migrator().run(&pool).await?;
-
-    // Create replica pool if configured (or use test replica if in test mode)
-    let db_pools = if let Some(test_replica) = test_replica_pool {
-        info!("Using test replica pool with read-only enforcement");
-        DbPools::with_replica(pool, test_replica)
-    } else if let Some(replica_url) = config.database.external_replica_url() {
-        info!("Setting up read replica pool");
-        let replica_settings = config.database.main_replica_pool_settings();
-        let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-        let replica_pool = db::pool_options(replica_settings)
-            .connect_with(replica_opts)
-            .await?;
-        DbPools::with_replica(pool, replica_pool)
-    } else {
-        DbPools::new(pool)
-    };
-
-    // Get connection options from the main pool to create schema-based child pools
-    let main_connect_opts = db_pools.write().connect_options().as_ref().clone();
-
-    // Helper to create a pool with schema-specific search_path
-    // Reuses connection URLs from main pool (both primary and replica if configured)
-    // Sets search_path at the connection level (via PgConnectOptions) rather than using
-    // after_connect hooks, ensuring it cannot be unset and works reliably with replicas
-    // Uses eager connection (connect_with) to respect min_connections at startup
-    async fn create_schema_pool(
-        schema: String,
-        opts: sqlx::postgres::PgConnectOptions,
-        settings: &config::PoolSettings,
-    ) -> Result<sqlx::PgPool, sqlx::Error> {
-        // Set search_path directly in connection options so PostgreSQL enforces it
-        // This is more reliable than after_connect hooks, especially with replicas
-        // The options() method formats as: "-c key=value"
-        info!("Setting search_path={} via connection options for schema pool", schema);
-        let opts_with_schema = opts.options([("search_path".to_string(), schema)]);
-
-        db::pool_options(settings)
-            .connect_with(opts_with_schema)
-            .await
-    }
-
-    // Setup fusillade batch processing pool
-    info!("Setting up fusillade batch processing pool");
-    let fusillade_pools = match config.database.fusillade() {
-        config::ComponentDb::Schema {
-            name, pool: pool_settings, ..
-        } => {
-            // Create primary pool using main's connection, with schema-specific search_path
-            let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings)
-            .await?;
-            primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
-
-            // Create replica pool if main has one configured (inherits main's replica connection)
-            if db_pools.has_replica() {
-                info!("Setting up fusillade read replica (schema mode)");
-                let replica_opts = db_pools.read().connect_options().as_ref().clone();
-                let replica_pool_settings = config.database.fusillade().replica_pool_settings();
-                let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings)
-                .await?;
-                DbPools::with_replica(primary, replica)
-            } else {
-                DbPools::new(primary)
-            }
-        }
-        config::ComponentDb::Dedicated {
-            url,
-            replica_url,
-            pool: pool_settings,
-            ..
-        } => {
-            info!("Using dedicated database for fusillade");
-            let connect_opts = PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-            let primary = db::pool_options(pool_settings)
-                .connect_with(connect_opts)
-                .await?;
-
-            if let Some(replica_url) = replica_url {
-                info!("Setting up fusillade read replica");
-                let replica_pool_settings = config.database.fusillade().replica_pool_settings();
-                let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-                let replica =
-                    db::pool_options(replica_pool_settings)
-                        .connect_with(replica_opts)
-                        .await?;
-                DbPools::with_replica(primary, replica)
-            } else {
-                DbPools::new(primary)
-            }
-        }
-    };
-    fusillade_arsenal::migrator().run(&*fusillade_pools.write()).await?;
-
-    // Run underway migrations (background task queue)
-    underway::run_migrations(&*db_pools.write()).await?;
-
-    // Setup outlet schema and pool if request logging is enabled
-    let outlet_pools = if config.enable_request_logging {
-        info!("Setting up outlet request logging pool (logging enabled)");
-        let pools = match config.database.outlet() {
-            config::ComponentDb::Schema {
-                name, pool: pool_settings, ..
-            } => {
-                // Create primary pool using main's connection, with schema-specific search_path
-                let primary = create_schema_pool(name.clone(), main_connect_opts.clone(), pool_settings)
-                .await?;
-                primary.execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
-
-                // Create replica pool if main has one configured (inherits main's replica connection)
-                if db_pools.has_replica() {
-                    info!("Setting up outlet read replica (schema mode)");
-                    let replica_opts = db_pools.read().connect_options().as_ref().clone();
-                    let replica_pool_settings = config.database.outlet().replica_pool_settings();
-                    let replica = create_schema_pool(name.clone(), replica_opts, replica_pool_settings)
-                    .await?;
-                    DbPools::with_replica(primary, replica)
-                } else {
-                    DbPools::new(primary)
-                }
-            }
-            config::ComponentDb::Dedicated {
-                url,
-                replica_url,
-                pool: pool_settings,
-                ..
-            } => {
-                info!("Using dedicated database for outlet");
-                let connect_opts = PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-                let primary = db::pool_options(pool_settings)
-                    .connect_with(connect_opts)
-                    .await?;
-
-                if let Some(replica_url) = replica_url {
-                    info!("Setting up outlet read replica");
-                    let replica_pool_settings = config.database.outlet().replica_pool_settings();
-                    let replica_opts = PgConnectOptions::from_str(replica_url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold);
-                    let replica =
-                        db::pool_options(replica_pool_settings)
-                            .connect_with(replica_opts)
-                            .await?;
-                    DbPools::with_replica(primary, replica)
-                } else {
-                    DbPools::new(primary)
-                }
-            }
+        let pooled_url = config.database.external_pooled_url();
+        // Direct connections: real backends. Sized small (`direct_pool`) when a
+        // pooler carries the query traffic, by `pool` otherwise.
+        let direct_settings = if pooled_url.is_some() {
+            config.database.direct_pool_settings()
+        } else {
+            config.database.main_pool_settings()
         };
-        outlet_postgres::migrator().run(&*pools.write()).await?;
-        Some(pools)
+        let direct = db::pool_options(direct_settings)
+            .connect_with(connect_options(&database_url, slow_threshold)?)
+            .await?;
+
+        // Migrations take a session-level advisory lock: always a direct connection.
+        migrator().run(&direct).await?;
+
+        let replica = match config.database.external_replica_url() {
+            Some(replica_url) => {
+                info!("Setting up read replica pool");
+                Some(
+                    db::pool_options(config.database.main_replica_pool_settings())
+                        .connect_with(connect_options(replica_url, slow_threshold)?)
+                        .await?,
+                )
+            }
+            None => None,
+        };
+        let with_replica = |primary: sqlx::PgPool, replica: Option<sqlx::PgPool>| match replica {
+            Some(replica) => DbPools::with_replica(primary, replica),
+            None => DbPools::new(primary),
+        };
+        let main = match pooled_url {
+            Some(pooled_url) => {
+                info!("Using pooled endpoint for main database query traffic");
+                let pooled = db::pool_options(config.database.main_pool_settings())
+                    .connect_with(connect_options(pooled_url, slow_threshold)?)
+                    .await?;
+                db::PoolPair {
+                    pooled: with_replica(pooled, replica),
+                    direct: DbPools::new(direct),
+                }
+            }
+            None => db::PoolPair::unsplit(with_replica(direct, replica)),
+        };
+        (embedded_db, main)
+    };
+
+    // Fusillade batch processing pools
+    info!("Setting up fusillade batch processing pool");
+    let fusillade = setup_component_pools("fusillade", config.database.fusillade(), &main, slow_threshold).await?;
+    // sqlx's migrator holds a session advisory lock: direct connections.
+    fusillade_arsenal::migrator().run(&*fusillade.direct.write()).await?;
+
+    // Underway migrations (background task queue) — one transaction, but keep
+    // them on the direct connection like every other migration.
+    underway::run_migrations(&*main.direct.write()).await?;
+
+    // Outlet request-logging pools, if enabled
+    let outlet = if config.enable_request_logging {
+        info!("Setting up outlet request logging pool (logging enabled)");
+        let outlet = setup_component_pools("outlet", config.database.outlet(), &main, slow_threshold).await?;
+        outlet_postgres::migrator().run(&*outlet.direct.write()).await?;
+        Some(outlet)
     } else {
         info!("Skipping outlet pool setup (logging disabled)");
         None
@@ -875,7 +888,7 @@ async fn setup_database(
         &config.admin_email,
         config.admin_password.as_deref(),
         argon2_params,
-        &db_pools.write(),
+        &main.pooled.write(),
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to create initial admin user: {}", e))?;
@@ -885,15 +898,15 @@ async fn setup_database(
     // group gating or pricing) so it exists and has synced into the onwards key
     // cache before the first resume attempt.
     if config.continuation.enabled {
-        continuation::provision_global_key(&db_pools.write())
+        continuation::provision_global_key(&main.pooled.write())
             .await
             .map_err(|e| anyhow::anyhow!("Failed to provision continuation key: {}", e))?;
     }
 
     // Seed database with initial configuration (only runs once)
-    seed_database(&config.model_sources, &db_pools.write()).await?;
+    seed_database(&config.model_sources, &main.pooled.write()).await?;
 
-    Ok((embedded_db, db_pools, fusillade_pools, outlet_pools))
+    Ok((embedded_db, db::DatabasePools { main, fusillade, outlet }))
 }
 
 /// Build the base CORS layer (methods, headers, max-age, exposed headers) from
@@ -2498,14 +2511,10 @@ pub(crate) struct BackgroundServicesInput {
     pub model_capacity_limits: Arc<dashmap::DashMap<String, usize>>,
     /// dwctl primary pool (used for probe scheduler, notification
     /// poller, and the inference middleware setup).
-    pub db_pools: DbPools,
-    /// Fusillade pool wrapper; kept around inside this function only
-    /// to clone the write pool for the metrics sampler — fusillade's
-    /// daemon already owns its own clone via `request_manager`.
-    pub fusillade_pools: DbPools,
-    /// Outlet (request-logging) pool. Optional because outlet is
-    /// optional.
-    pub outlet_pools: Option<DbPools>,
+    /// Every database as a pooled/direct pair. Query consumers get the
+    /// pooled side; listeners, leader election and the underway worker the
+    /// direct side.
+    pub pools: db::DatabasePools,
     pub config: Config,
     pub shared_config: SharedConfig,
     pub shutdown_token: tokio_util::sync::CancellationToken,
@@ -2520,9 +2529,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         postgres_daemon,
         step_manager,
         model_capacity_limits,
-        db_pools,
-        fusillade_pools,
-        outlet_pools,
+        pools,
         config,
         shared_config,
         shutdown_token,
@@ -2530,10 +2537,15 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         keystore,
     } = input;
 
-    // Live provider for every long-lived consumer below: a runtime pool swap
-    // (connection-budget re-division across replicas) reaches them on their
-    // next call. Only leader election gets a pinned pool — see there.
+    let db_pools = pools.main.pooled.clone();
+    let fusillade_pools = pools.fusillade.pooled.clone();
+    let outlet_pools = pools.outlet.clone();
+    // Live providers for every long-lived consumer below: `dyn_pools` for
+    // query traffic (the pooled endpoint when configured), `direct_pools` for
+    // session-scoped work — LISTEN connections and the leader-election lock —
+    // which a transaction-mode pooler cannot carry.
     let dyn_pools = sqlx_pool_router::DynPools::new(db_pools.clone());
+    let direct_pools = sqlx_pool_router::DynPools::new(pools.main.direct.clone());
 
     // `keystore` comes from the caller (built once and shared). Install the
     // TRANSITIONAL ZDR response transformer on the daemon before it
@@ -2567,6 +2579,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
 
         let (onwards_config_sync, initial_targets, onwards_stream) = sync::onwards_config::OnwardsConfigSync::new_with_daemon_limits(
             dyn_pools.clone(),
+            direct_pools.clone(),
             Some(model_capacity_limits.clone()),
             config.background_services.batch_daemon.default_model_concurrency,
             escalation_models,
@@ -2625,11 +2638,12 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     let zdr_key_cache = crate::sync::zdr_keys::initial_cache(&db_pools.write()).await?;
     if config.background_services.onwards_sync.enabled {
         let zdr_pool = dyn_pools.clone();
+        let zdr_listener_pool = direct_pools.clone();
         let zdr_cache = zdr_key_cache.clone();
         let zdr_shutdown = shutdown_token.clone();
         let zdr_fallback = config.background_services.onwards_sync.fallback_interval_milliseconds;
         background_tasks.spawn("zdr-key-sync", async move {
-            crate::sync::zdr_keys::run(zdr_pool, zdr_cache, zdr_fallback, zdr_shutdown)
+            crate::sync::zdr_keys::run(zdr_pool, zdr_listener_pool, zdr_cache, zdr_fallback, zdr_shutdown)
                 .await
                 .context("ZDR key sync failed")
         });
@@ -2638,7 +2652,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
 
-    let probe_scheduler = probes::ProbeScheduler::new(dyn_pools.clone(), config.clone());
+    let probe_scheduler = probes::ProbeScheduler::new(dyn_pools.clone(), config.clone()).with_listener_pool(direct_pools.clone());
 
     // Caller owns `request_manager` / `step_manager` construction —
     // see the function-level doc. `fusillade_pools` is only sampled by the
@@ -2708,6 +2722,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             let daemon_config = config.clone();
             let daemon_request_manager = request_manager.clone();
             let daemon_pool = dyn_pools.clone();
+            let daemon_listener_pool = direct_pools.clone();
             let daemon_shutdown = shutdown_token.clone();
             background_tasks.spawn("batch-completion", async move {
                 notifications::run_notification_poller(
@@ -2715,6 +2730,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                     daemon_config,
                     daemon_request_manager,
                     daemon_pool,
+                    daemon_listener_pool,
                     daemon_shutdown,
                 )
                 .await;
@@ -2756,8 +2772,9 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         // Deliberately a pinned pool, NOT the live provider: leader election
         // holds one session-pinned connection for the advisory lock, and
         // swapping the pool underneath it would drop the lock.
-        let leader_election_pool = db_pools.write().into_inner();
+        let leader_election_pool = pools.main.direct.write().into_inner();
         let leader_election_pools_gain = dyn_pools.clone();
+        let leader_election_listener_pools_gain = direct_pools.clone();
         let leader_election_scheduler_gain = probe_scheduler.clone();
         let leader_election_scheduler_lose = probe_scheduler.clone();
         let leader_election_request_manager_gain = request_manager.clone();
@@ -2788,6 +2805,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                 move |_pool, config| {
                     // This closure is run when a replica becomes the leader
                     let gain_pools = leader_election_pools_gain.clone();
+                    let gain_listener_pools = leader_election_listener_pools_gain.clone();
                     let scheduler = leader_election_scheduler_gain.clone();
                     let request_manager = leader_election_request_manager_gain.clone();
                     let postgres_daemon = leader_election_postgres_daemon_gain.clone();
@@ -2852,6 +2870,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                                     daemon_config,
                                     notification_request_manager,
                                     gain_pools,
+                                    gain_listener_pools,
                                     daemon_session_token,
                                 )
                                 .await;
@@ -2914,12 +2933,12 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         } else {
             None
         })
-        .connect_with(db_pools.write().connect_options().as_ref().clone())
+        .connect_with(pools.main.direct.write().connect_options().as_ref().clone())
         .await?;
 
     // Start pool metrics sampler if metrics are enabled
     if config.enable_metrics {
-        let mut pools = vec![
+        let mut labeled = vec![
             db::LabeledPool {
                 name: "main",
                 pool: dyn_pools.clone(),
@@ -2933,12 +2952,31 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                 pool: sqlx_pool_router::DynPools::new(underway_pool.clone()),
             },
         ];
-        if let Some(outlet) = outlet_pools.as_ref() {
-            pools.push(db::LabeledPool {
-                name: "outlet",
-                pool: sqlx_pool_router::DynPools::new(outlet.clone()),
+        if pools.main.is_split() {
+            labeled.push(db::LabeledPool {
+                name: "main_direct",
+                pool: direct_pools.clone(),
             });
         }
+        if pools.fusillade.is_split() {
+            labeled.push(db::LabeledPool {
+                name: "fusillade_direct",
+                pool: sqlx_pool_router::DynPools::new(pools.fusillade.direct.clone()),
+            });
+        }
+        if let Some(outlet) = outlet_pools.as_ref() {
+            labeled.push(db::LabeledPool {
+                name: "outlet",
+                pool: sqlx_pool_router::DynPools::new(outlet.pooled.clone()),
+            });
+            if outlet.is_split() {
+                labeled.push(db::LabeledPool {
+                    name: "outlet_direct",
+                    pool: sqlx_pool_router::DynPools::new(outlet.direct.clone()),
+                });
+            }
+        }
+        let pools = labeled;
         let metrics_shutdown = shutdown_token.clone();
         let metrics_config = db::PoolMetricsConfig {
             sample_interval: config.background_services.pool_metrics.sample_interval,
@@ -3073,9 +3111,7 @@ pub struct Application {
     router: Router,
     app_state: AppState,
     config: Config,
-    db_pools: DbPools,
-    _fusillade_pools: DbPools,
-    _outlet_pools: Option<DbPools>,
+    pools: db::DatabasePools,
     _embedded_db: Option<db::embedded::EmbeddedDatabase>,
     _tracer_provider: Option<telemetry::SdkTracerProvider>,
     bg_services: BackgroundServices,
@@ -3119,7 +3155,13 @@ impl Application {
         debug!("Starting control layer with configuration: {:#?}", config);
 
         // Setup database connections, run migrations, and initialize data
-        let (_embedded_db, db_pools, fusillade_pools, outlet_pools) = setup_database(&config, pool).await?;
+        let (_embedded_db, pools) = setup_database(&config, pool).await?;
+        // Query traffic goes through the pooled side; session-scoped work
+        // (listeners, leader election) is wired to the direct side inside
+        // `setup_background_services`.
+        let db_pools = pools.main.pooled.clone();
+        let fusillade_pools = pools.fusillade.pooled.clone();
+        let outlet_pools = pools.outlet.as_ref().map(|p| p.pooled.clone());
 
         // Install Prometheus recorder BEFORE background services start
         // This ensures metrics set during background service initialization are captured
@@ -3234,9 +3276,7 @@ impl Application {
             postgres_daemon: postgres_daemon.clone(),
             step_manager: step_manager.clone(),
             model_capacity_limits,
-            db_pools: db_pools.clone(),
-            fusillade_pools: fusillade_pools.clone(),
-            outlet_pools: outlet_pools.clone(),
+            pools: pools.clone(),
             config: config.clone(),
             shared_config: shared_config.clone(),
             shutdown_token: shutdown_token.clone(),
@@ -3414,9 +3454,7 @@ impl Application {
             router,
             app_state,
             config,
-            db_pools,
-            _fusillade_pools: fusillade_pools,
-            _outlet_pools: outlet_pools,
+            pools,
             _embedded_db,
             _tracer_provider: tracer_provider,
             bg_services,
@@ -3481,7 +3519,15 @@ impl Application {
 
         // Close database connections
         info!("Closing database connections...");
-        self.db_pools.close().await;
+        for pair in [Some(&self.pools.main), Some(&self.pools.fusillade), self.pools.outlet.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            pair.pooled.close().await;
+            if pair.is_split() {
+                pair.direct.close().await;
+            }
+        }
 
         // Flush pending spans without shutting down the processor.
         // We intentionally use force_flush() instead of shutdown() because the

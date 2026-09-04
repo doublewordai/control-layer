@@ -2563,12 +2563,15 @@ mod tests {
 
         // Use the seeded endpoint instead of creating a new one
         let config = crate::config::Config {
+            database_pooled_url: None,
             host: "localhost".to_string(),
             port: 3001,
             dashboard_url: "http://localhost:3001".to_string(),
             database_url: None,
             database_replica_url: None,
             database: crate::config::DatabaseConfig::External {
+                pooled_url: None,
+                direct_pool: crate::config::default_direct_pool(),
                 url: "postgres://test@localhost/test".to_string(),
                 replica_url: None,
                 pool: Default::default(),

@@ -144,9 +144,12 @@ pub async fn run_notification_poller(
     app_config: crate::config::Config,
     request_manager: Arc<PostgresRequestManager<DbPools>>,
     dwctl_pool: impl sqlx_pool_router::PoolProvider,
+    listener_pool: impl sqlx_pool_router::PoolProvider,
     shutdown: CancellationToken,
 ) {
     let dwctl_pool = sqlx_pool_router::DynPools::new(dwctl_pool);
+    // LISTEN needs a session: direct connections, never the pooled endpoint.
+    let listener_pool = sqlx_pool_router::DynPools::new(listener_pool);
     // Webhook dispatcher runs independently of email notifications
     let mut dispatcher = if config.webhooks.enabled {
         Some(WebhookDispatcher::spawn(dwctl_pool.clone(), &config.webhooks, shutdown.clone()))
@@ -174,7 +177,7 @@ pub async fn run_notification_poller(
 
     // Set up PG listener for platform webhook events (user.created, api_key.created)
     let mut listener = if dispatcher.is_some() {
-        match PgListener::connect_with(&dwctl_pool.write()).await {
+        match PgListener::connect_with(&listener_pool.write()).await {
             Ok(mut l) => match l.listen(WEBHOOK_EVENT_CHANNEL).await {
                 Ok(()) => {
                     tracing::info!("Listening on PG channel '{WEBHOOK_EVENT_CHANNEL}' for platform webhook events");
@@ -250,7 +253,7 @@ pub async fn run_notification_poller(
         // Reconnect listener if disconnected
         if listener.is_none()
             && dispatcher.is_some()
-            && let Ok(mut l) = PgListener::connect_with(&dwctl_pool.write()).await
+            && let Ok(mut l) = PgListener::connect_with(&listener_pool.write()).await
             && l.listen(WEBHOOK_EVENT_CHANNEL).await.is_ok()
         {
             tracing::info!("Reconnected webhook event listener");

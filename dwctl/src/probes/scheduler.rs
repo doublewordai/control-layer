@@ -19,8 +19,10 @@ use uuid::Uuid;
 /// It reads probe state from the database and manages background tasks accordingly.
 #[derive(Clone)]
 pub struct ProbeScheduler {
-    /// Live provider (not a pinned pool): survives runtime pool swaps.
+    /// Query traffic (pooled endpoint when configured).
     pool: sqlx_pool_router::DynPools,
+    /// Direct connections for the probe-changes LISTEN session.
+    listener_pool: sqlx_pool_router::DynPools,
     config: crate::config::Config,
     schedulers: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
 }
@@ -28,11 +30,20 @@ pub struct ProbeScheduler {
 impl ProbeScheduler {
     /// Create a new ProbeScheduler instance
     pub fn new(pool: impl sqlx_pool_router::PoolProvider, config: crate::config::Config) -> Self {
+        let pool = sqlx_pool_router::DynPools::new(pool);
         Self {
-            pool: sqlx_pool_router::DynPools::new(pool),
+            listener_pool: pool.clone(),
+            pool,
             config,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Use `listener_pool` (direct connections) for the LISTEN session instead
+    /// of the query pool. Required when the query pool is a pooled endpoint.
+    pub fn with_listener_pool(mut self, listener_pool: impl sqlx_pool_router::PoolProvider) -> Self {
+        self.listener_pool = sqlx_pool_router::DynPools::new(listener_pool);
+        self
     }
 
     /// Initialize schedulers for all active probes in the database.
@@ -355,7 +366,7 @@ impl ProbeScheduler {
             }
 
             // Establish a dedicated connection for LISTEN
-            let mut listener = match sqlx::postgres::PgListener::connect_with(&self.pool.write()).await {
+            let mut listener = match sqlx::postgres::PgListener::connect_with(&self.listener_pool.write()).await {
                 Ok(l) => l,
                 Err(e) => {
                     tracing::error!("Failed to create LISTEN connection: {}", e);
