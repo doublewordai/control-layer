@@ -3465,6 +3465,8 @@ auth:
     #[test]
     fn pooled_url_and_direct_pool_parse_and_fold_from_env() {
         Jail::expect_with(|jail| {
+            // The developer shell exports DATABASE_URL for sqlx; it must not leak in.
+            jail.clear_env();
             jail.create_file(
                 "test.yaml",
                 r#"
