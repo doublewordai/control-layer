@@ -1601,9 +1601,22 @@ pub async fn target_message_handler<T: HttpClient>(
     // All providers exhausted — distinguish "no providers found" from
     // "all providers at concurrency capacity"
     if any_attempted {
-        // We tried at least one provider but all failed
-        let final_error = last_error
-            .unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str()));
+        // We tried at least one provider but all failed.
+        // A provider that rate-limited the final attempt is not a gateway
+        // failure — the request was throttled, not dropped. Surface a 429 so
+        // the client gets the actionable signal and provider throttling does
+        // not register as a 5xx (the class this alert measures). This mirrors
+        // the provider-local rate-limit exhaustion path, which already returns
+        // rate_limited(). Only overrides the generic bad-gateway error the
+        // status-fallback loop stores (502): a final timeout (504) or a real
+        // network failure keeps its own status.
+        let final_error = match last_upstream_status {
+            Some(429) if last_error.as_ref().is_some_and(|e| e.status.as_u16() == 502) => {
+                OnwardsErrorResponse::rate_limited()
+            }
+            _ => last_error
+                .unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str())),
+        };
         // `status` carries the PRE-sanitization status of the last attempt, which
         // the response itself discards: a 529 and a 500 both leave here as 503,
         // so without this the caller cannot tell saturation from failure. This is
