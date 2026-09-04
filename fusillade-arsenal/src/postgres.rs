@@ -2339,11 +2339,16 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                        error = 'request template no longer exists',
                        failed_at = $3
                   FROM to_claim tc
+                  -- Per-row lookup by primary key, like the claim join below:
+                  -- a bare NOT EXISTS on the generation-transparent view gets
+                  -- flattened into an anti-join that hashes the whole legacy
+                  -- template table; LIMIT 1 keeps it a probe per picked row.
+                  LEFT JOIN LATERAL (
+                      SELECT 1 AS present FROM active_request_templates t
+                      WHERE t.id = tc.template_id LIMIT 1
+                  ) t ON true
                  WHERE r.id = tc.id
-                   AND NOT EXISTS (
-                       SELECT 1 FROM active_request_templates t
-                       WHERE t.id = tc.template_id
-                   )
+                   AND t.present IS NULL
                 RETURNING r.id
             )
             UPDATE requests r
@@ -2630,11 +2635,16 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                        error = 'request template no longer exists',
                        failed_at = $3
                   FROM to_claim tc
+                  -- Per-row lookup by primary key, like the claim join below:
+                  -- a bare NOT EXISTS on the generation-transparent view gets
+                  -- flattened into an anti-join that hashes the whole legacy
+                  -- template table; LIMIT 1 keeps it a probe per picked row.
+                  LEFT JOIN LATERAL (
+                      SELECT 1 AS present FROM active_request_templates t
+                      WHERE t.id = tc.template_id LIMIT 1
+                  ) t ON true
                  WHERE r.id = tc.id
-                   AND NOT EXISTS (
-                       SELECT 1 FROM active_request_templates t
-                       WHERE t.id = tc.template_id
-                   )
+                   AND t.present IS NULL
                 RETURNING r.id
             )
             UPDATE requests r
@@ -2904,11 +2914,16 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                        error = 'request template no longer exists',
                        failed_at = $3
                   FROM locked claimed
+                  -- Per-row lookup by primary key, like the claim join below:
+                  -- a bare NOT EXISTS on the generation-transparent view gets
+                  -- flattened into an anti-join that hashes the whole legacy
+                  -- template table; LIMIT 1 keeps it a probe per picked row.
+                  LEFT JOIN LATERAL (
+                      SELECT 1 AS present FROM active_request_templates t
+                      WHERE t.id = claimed.template_id LIMIT 1
+                  ) t ON true
                  WHERE r.id = claimed.id
-                   AND NOT EXISTS (
-                       SELECT 1 FROM active_request_templates t
-                       WHERE t.id = claimed.template_id
-                   )
+                   AND t.present IS NULL
                 RETURNING r.id
             )
             UPDATE requests r
