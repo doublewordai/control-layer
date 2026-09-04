@@ -8705,7 +8705,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // via idx_requests_batch_state — avoiding a seq scan of the
         // (potentially huge) requests table. `batch_id` is that index's
         // leading column, so the equality seek needs no `state` predicate.
-        // (Previously idx_requests_batch_id, dropped in 20260903010000 as a
+        // (Previously idx_requests_batch_id, dropped in 20260904020000 as a
         // strict prefix of the smaller, hotter (batch_id, state) index.)
         // FOR UPDATE SKIP LOCKED enables concurrent daemons to partition work
         // without blocking.

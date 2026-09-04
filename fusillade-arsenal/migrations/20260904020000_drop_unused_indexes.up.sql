@@ -3,9 +3,7 @@
 -- From the index audit in COR-537. Every verdict below is backed by BOTH a code
 -- reading (no query needs the index, or an equivalent index serves the same
 -- shape) and production `pg_stat_user_indexes` from the PRIMARY over a 35-day
--- window. Replica statistics alone were not sufficient: three indexes that
--- looked idle there turned out to have up to 1.92 billion scans on the primary,
--- because the claim/write path never runs on the replica.
+-- window.
 --
 -- Reclaims roughly 8.6 GB, and takes `requests` from 31 indexes to 27 and
 -- `request_templates` from 7 to 5 — the point being write amplification and
@@ -88,10 +86,6 @@
 -- ---------------------------------------------------------------------------
 -- Deliberately NOT dropped
 -- ---------------------------------------------------------------------------
---
---   idx_requests_pending (1.92B scans), idx_requests_state_model (289M),
---   idx_requests_batch_state (88.9M) — flagged by the replica-only pass, all hot
---   on the primary.
 --
 --   idx_batches_created_by — subsumed by the created_by-led index in COR-650;
 --   drop it there, once that index exists.

@@ -31,18 +31,6 @@
 --    review (COR-657). Formalizing it here is deliberate and independent of that
 --    review: if it is later dropped, that should be an explicit migration rather
 --    than a silent divergence between production and the migration set.
---
--- Production deploy: both already exist, so nothing runs. For any deployment
--- where they do not, build them CONCURRENTLY first so this migration stays a
--- no-op:
---
---   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_batches_claimable_expiration_with_id
---     ON batches (expires_at) INCLUDE (id)
---     WHERE cancelling_at IS NULL AND deleted_at IS NULL AND completed_at IS NULL
---       AND failed_at IS NULL AND cancelled_at IS NULL;
---
---   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_requests_completed_at
---     ON requests (completed_at) WHERE completed_at IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_batches_claimable_expiration_with_id
   ON batches (expires_at)
