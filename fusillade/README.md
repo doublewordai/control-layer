@@ -396,9 +396,11 @@ observed healthy:
    its retention period. This is where `batchless_archive_backfill_concurrency`
    matters: the backfill worker discovers one wave of distinct candidate
    graphs per tick and then moves up to that many of them at the same time,
-   each in its own transaction under the per-graph advisory lock, so wall
-   clock per tick shrinks roughly with the concurrency until the database
-   becomes the bottleneck. The steady sweep is always sequential. Concurrent
+   each in its own transaction under the per-graph advisory lock and a
+   shared (not exclusive) lock on the target day, so the moves overlap in
+   full. Discovery stays serial (one index probe per candidate), so scaling
+   flattens well past the recommended range. The steady sweep is always
+   sequential. Concurrent
    passes (several pods, or a pod plus a drain) remain safe because every
    move takes `FOR UPDATE SKIP LOCKED` and verifies by read-back; they simply
    do not add throughput, because every pass discovers the same oldest
@@ -450,15 +452,19 @@ configuration as the batch daemon, with these differences:
 - its own database pool sizing: the fusillade write pool needs at least the
   concurrency in spare connections, plus the pod's ordinary daemon use, and
   the pool must fit under the database's connection ceiling alongside the
-  fleet;
+  fleet. Startup refuses a concurrency that is not below the fusillade
+  pool's `max_connections`;
 - `batch_archive_backfill_interval_ms` low, so ticks run back to back.
 
-Watch `fusillade_retained_response_movers_active{worker="backfill"}` for the
-configured fan-out, `fusillade_retained_response_groups_archived_total` for
+Watch `fusillade_retained_response_movers_active{worker="backfill"}` (the
+configured fan-out, raised only while a tick is running, so read it as a
+max over a window), `fusillade_retained_response_groups_archived_total` for
 progress, and `fusillade_retained_response_graphs_incomplete_skipped_total`
 for graphs an operator must look at. Stop the pod once
 `fusillade_retained_response_archive_may_have_more{worker="backfill"}` stays
-at zero; from then on the fleet's steady sweep keeps up on its own. Ramp the
+at zero AND `retained_response_archive_failed` background errors are zero
+over the same window (a failing pass keeps the signal raised, never lowers
+it); from then on the fleet's steady sweep keeps up on its own. Ramp the
 concurrency gradually while watching replication lag, write pool saturation,
 and request latency on the primary, and lower it or stop the pod when any
 abort condition above appears. Throughput scales with concurrency only until

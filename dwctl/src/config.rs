@@ -3127,6 +3127,22 @@ impl Config {
                 operation: "Config validation: batchless archive group and byte budgets must be positive".to_string(),
             });
         }
+        if owns_archive_maintenance && daemon.batchless_archive_backfill_enabled {
+            let fusillade_pool_max = match self.database.fusillade() {
+                ComponentDb::Schema { pool, .. } | ComponentDb::Dedicated { pool, .. } => pool.max_connections,
+            };
+            // Every concurrent mover holds a write connection for its whole
+            // move; a fan-out at or above the pool ceiling starves the claim
+            // loops and turns into pool timeouts rather than throughput.
+            if daemon.batchless_archive_backfill_concurrency as u64 >= u64::from(fusillade_pool_max) {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: batchless archive backfill concurrency ({}) must be below the fusillade pool max_connections ({})",
+                        daemon.batchless_archive_backfill_concurrency, fusillade_pool_max
+                    ),
+                });
+            }
+        }
         if owns_archive_maintenance && daemon.batchless_archive_backfill_enabled && daemon.batchless_archive_backfill_concurrency == 0 {
             return Err(Error::Internal {
                 operation: "Config validation: batchless archive backfill concurrency must be at least 1 when the backfill is enabled"
@@ -3636,6 +3652,15 @@ mod tests {
         daemon.batch_archive_cancel_grace_secs = 60.0;
         assert!(config.validate().unwrap_err().to_string().contains("backfill concurrency"));
         config.background_services.batch_daemon.batchless_archive_backfill_concurrency = 16;
+        assert!(config.validate().is_ok());
+        // A fan-out at or above the fusillade write pool ceiling would starve
+        // the claim loops rather than add throughput.
+        let pool_max = match config.database.fusillade() {
+            ComponentDb::Schema { pool, .. } | ComponentDb::Dedicated { pool, .. } => pool.max_connections,
+        };
+        config.background_services.batch_daemon.batchless_archive_backfill_concurrency = pool_max as usize;
+        assert!(config.validate().unwrap_err().to_string().contains("below the fusillade pool"));
+        config.background_services.batch_daemon.batchless_archive_backfill_concurrency = pool_max as usize - 1;
         assert!(config.validate().is_ok());
 
         let mut config = Config::default();

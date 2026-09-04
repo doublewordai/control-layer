@@ -4794,7 +4794,8 @@ async fn concurrent_overdue_passes_move_every_graph_exactly_once(pool: PgPool) {
     // Whatever remains after the contended round drains sequentially so the
     // assertion covers the whole fixture set, not just the contended part.
     let mut sequential_outcome = RetainedResponseArchiveOutcome::default();
-    loop {
+    let mut drained = false;
+    for _ in 0..20 {
         let outcome = manager
             .archive_overdue_batchless_responses(&policy, &cutoffs, 8, i64::MAX, 4)
             .await
@@ -4802,9 +4803,14 @@ async fn concurrent_overdue_passes_move_every_graph_exactly_once(pool: PgPool) {
         sequential_outcome.groups_archived += outcome.groups_archived;
         sequential_outcome.requests_archived += outcome.requests_archived;
         if outcome.groups_archived == 0 && !outcome.may_have_more {
+            drained = true;
             break;
         }
     }
+    assert!(
+        drained,
+        "the queue must drain within a bounded number of passes"
+    );
 
     let contended_groups: u64 = outcomes.iter().map(|outcome| outcome.groups_archived).sum();
     let contended_requests: u64 = outcomes

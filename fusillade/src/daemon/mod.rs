@@ -1057,10 +1057,16 @@ async fn run_batchless_archive_phase<S>(
         }
         Ok(None) => {}
         Err(error) => {
+            // A failed pass has not proven the queue empty: keep the
+            // "may have more" signal raised so a drain operator never reads a
+            // failing worker as drained.
+            gauge!("fusillade_retained_response_archive_may_have_more", "worker" => tick.worker)
+                .set(1.0);
             crate::background_error!(
                 "retained_response_archive_failed",
                 Error,
                 worker = tick.worker,
+                error_class = %maintenance_error_class(&error),
                 error = %error,
                 "Failed to archive retained-response graphs"
             );
