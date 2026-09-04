@@ -1,5 +1,13 @@
 # Changelog
 
+## [11.4.2](https://github.com/doublewordai/control-layer/compare/v11.4.1...v11.4.2) (2026-09-04)
+
+
+### Bug Fixes
+
+* **billing:** report first-purchase state so the promo can gate on the ledger ([#1562](https://github.com/doublewordai/control-layer/issues/1562)) ([6a16cdd](https://github.com/doublewordai/control-layer/commit/6a16cddc01ae8c6f515577e61267ca01401bce43))
+* **fusillade:** probe the template per picked row in the claim-time stranded check ([#1580](https://github.com/doublewordai/control-layer/issues/1580)) ([1433908](https://github.com/doublewordai/control-layer/commit/1433908c0fbb17fa3ba7b82c543ef5a40730e54c))
+
 ## [11.4.1](https://github.com/doublewordai/control-layer/compare/v11.4.0...v11.4.1) (2026-09-04)
 
 
