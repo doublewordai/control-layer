@@ -428,7 +428,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
 
     sqlx::query(
         r#"
-        CREATE INDEX idx_requests_batchless_retention_due
+        CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due
         ON requests (service_tier, created_at, id)
         WHERE batch_id IS NULL
           AND state IN ('completed', 'failed', 'canceled')
@@ -453,7 +453,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
 
     sqlx::query(
         r#"
-        CREATE INDEX idx_requests_batchless_retention_due
+        CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due
         ON requests (
             service_tier,
             (CASE state
@@ -742,7 +742,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
 
     sqlx::query(
         r#"
-        CREATE INDEX idx_requests_batchless_retention_due
+        CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due
         ON requests (
             service_tier,
             (CASE state
@@ -916,7 +916,7 @@ async fn preflight_script_verifies_index_partitions_and_journal_state(pool: sqlx
 
     sqlx::raw_sql(
         r#"
-        CREATE INDEX idx_requests_batchless_retention_due
+        CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due
         ON requests (
           service_tier,
           (CASE state WHEN 'completed' THEN completed_at

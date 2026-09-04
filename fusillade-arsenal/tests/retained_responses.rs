@@ -1949,7 +1949,7 @@ async fn wait_for_backend_lock_waiter(pool: &PgPool, backend_pid: i32) {
 async fn install_candidate_index(pool: &PgPool) {
     sqlx::query(
         r#"
-        CREATE INDEX idx_requests_batchless_retention_due
+        CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due
         ON requests (
           service_tier,
           (CASE state WHEN 'completed' THEN completed_at
@@ -2278,7 +2278,7 @@ async fn postgres_reports_exact_retained_response_index_readiness(pool: PgPool) 
             .expect("missing candidate index must be reported")
     );
 
-    sqlx::query("CREATE INDEX idx_requests_batchless_retention_due ON requests (id)")
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due ON requests (id)")
         .execute(&pool)
         .await
         .expect("wrong-shape candidate index must install");
@@ -2296,7 +2296,7 @@ async fn postgres_reports_exact_retained_response_index_readiness(pool: PgPool) 
 
     sqlx::query(
         r#"
-        CREATE INDEX idx_requests_batchless_retention_due
+        CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due
         ON requests (
           service_tier,
           (CASE state WHEN 'completed' THEN completed_at
