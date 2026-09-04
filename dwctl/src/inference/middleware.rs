@@ -149,7 +149,25 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // re-serialised from `request_value` below.
     if is_responses_api && request_value.get("previous_response_id").is_some() {
         use crate::inference::translation::responses::hydrate::{HydrationError, hydrate_previous_response};
-        if let Err(e) = hydrate_previous_response(&*state.response_store, &mut request_value).await {
+        // The prior turn is only ever the caller's own: resolve the key's
+        // owner first, and treat an unresolvable key as "no such response".
+        let owner: Option<String> = match api_key.as_deref() {
+            Some(secret) => {
+                sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
+                    .bind(secret)
+                    .fetch_optional(&state.dwctl_pool)
+                    .await
+                    .unwrap_or(None)
+            }
+            None => None,
+        };
+        let hydration = match owner.as_deref() {
+            Some(owner) => hydrate_previous_response(&*state.response_store, owner, &mut request_value).await,
+            None => Err(HydrationError::NotFound(
+                request_value["previous_response_id"].as_str().unwrap_or_default().to_string(),
+            )),
+        };
+        if let Err(e) = hydration {
             let (status, message) = match e {
                 HydrationError::NotFound(id) => (StatusCode::BAD_REQUEST, format!("previous response not found: {id}")),
                 HydrationError::Internal(msg) => {

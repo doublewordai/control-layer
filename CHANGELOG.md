@@ -1,5 +1,28 @@
 # Changelog
 
+## [11.3.0](https://github.com/doublewordai/control-layer/compare/v11.2.0...v11.3.0) (2026-09-04)
+
+
+### Features
+
+* **prefix_chain:** content-free prompt-structure capture to ClickHouse ([#1555](https://github.com/doublewordai/control-layer/issues/1555)) ([7bf9c92](https://github.com/doublewordai/control-layer/commit/7bf9c922aa0dc4d3df871330af2593c75028e593))
+
+## [11.2.0](https://github.com/doublewordai/control-layer/compare/v11.1.1...v11.2.0) (2026-09-04)
+
+
+### Features
+
+* **analytics:** record engine cached tokens and content-free request params ([#1553](https://github.com/doublewordai/control-layer/issues/1553)) ([411fabc](https://github.com/doublewordai/control-layer/commit/411fabc6cc30b529a7dc11a22d73d69d6864a8c7))
+* **clickhouse:** shared warehouse connection and a generic best-effort insert sink ([#1554](https://github.com/doublewordai/control-layer/issues/1554)) ([6faf6c0](https://github.com/doublewordai/control-layer/commit/6faf6c01bf160e3c594130ebf6925425083e431f))
+* enforce scheduled content retention by partition drop ([#1481](https://github.com/doublewordai/control-layer/issues/1481)) ([fc5aeae](https://github.com/doublewordai/control-layer/commit/fc5aeaeac79d2f73d5fd2175f28877cc150216db))
+
+
+### Bug Fixes
+
+* **deps:** bump browserslist to 4.28.8 (Dependabot [#175](https://github.com/doublewordai/control-layer/issues/175)/[#176](https://github.com/doublewordai/control-layer/issues/176)) ([#1552](https://github.com/doublewordai/control-layer/issues/1552)) ([9f4d912](https://github.com/doublewordai/control-layer/commit/9f4d912fb4bdd3681c85fbaf14e4dda135a33227))
+* **deps:** finish OpenTelemetry 0.32 migration via outlet 0.10 (CVE-2… ([#1550](https://github.com/doublewordai/control-layer/issues/1550)) ([7c6462f](https://github.com/doublewordai/control-layer/commit/7c6462fecba17688364c208fc0d73c608e483ba1))
+* search customer-visible model fields ([#1560](https://github.com/doublewordai/control-layer/issues/1560)) ([486383d](https://github.com/doublewordai/control-layer/commit/486383d594aae9e0f68f231f9c412fec9f210a8c))
+
 ## [11.1.1](https://github.com/doublewordai/control-layer/compare/v11.1.0...v11.1.1) (2026-09-01)
 
 

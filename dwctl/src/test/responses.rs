@@ -7,7 +7,13 @@
 //! - Batch requests (with X-Fusillade-Request-Id) don't create duplicate rows
 
 use crate::api::models::users::Role;
-use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
+use std::collections::HashMap;
+
+use crate::test::utils::{
+    add_auth_headers, create_test_admin_user, create_test_api_key_for_user, create_test_config, create_test_user, setup_fusillade_pool,
+};
+use fusillade::{DaemonStorage, RetainedResponseArchiveCutoffs, RetentionPolicy, Storage};
+use fusillade_arsenal::{PostgresRequestManager, TestDbPools};
 use sqlx::PgPool;
 
 /// Helper to set up a test app with a wiremock endpoint, model, API key, and
@@ -358,6 +364,547 @@ async fn test_get_response_returns_404_for_unknown_id(pool: PgPool) {
     assert_eq!(response.status_code(), 404);
 }
 
+async fn archive_response_graphs(pool: &PgPool, max_groups: i64) {
+    let fusillade_pool = setup_fusillade_pool(pool).await;
+    sqlx::query(
+        "CREATE INDEX idx_requests_batchless_retention_due ON requests (service_tier, (CASE state WHEN 'completed' THEN completed_at WHEN 'failed' THEN failed_at WHEN 'canceled' THEN canceled_at END), id) WHERE batch_id IS NULL AND state IN ('completed', 'failed', 'canceled')",
+    )
+    .execute(&fusillade_pool)
+    .await
+    .unwrap();
+    sqlx::query("SELECT ensure_retained_response_partition('2026-08-02', NULL)")
+        .execute(&fusillade_pool)
+        .await
+        .unwrap();
+    let manager = PostgresRequestManager::new(
+        TestDbPools::new(fusillade_pool).await.unwrap(),
+        fusillade_arsenal::PostgresStorageConfig::default(),
+    )
+    .with_retained_response_fence_seconds(Some(3_600));
+    let observed_at = chrono::DateTime::parse_from_rfc3339("2026-08-01T12:00:00Z").unwrap().to_utc();
+    let terminal_before = chrono::DateTime::parse_from_rfc3339("2026-08-01T10:00:00Z").unwrap().to_utc();
+    let cutoffs = RetainedResponseArchiveCutoffs::new(observed_at, terminal_before, observed_at).unwrap();
+    manager
+        .archive_terminal_batchless_responses(
+            &RetentionPolicy {
+                batchless_seconds_by_service_tier: HashMap::from([("priority".to_owned(), 1)]),
+                max_late_writer_seconds: Some(3_600),
+                ..Default::default()
+            },
+            &cutoffs,
+            max_groups,
+            i64::MAX,
+        )
+        .await
+        .expect("response graph must move into retained storage");
+}
+
+async fn response_lifecycle_manager(pool: &PgPool) -> (PgPool, PostgresRequestManager<TestDbPools>) {
+    let fusillade_pool = setup_fusillade_pool(pool).await;
+    let manager = PostgresRequestManager::new(
+        TestDbPools::new(fusillade_pool.clone()).await.unwrap(),
+        fusillade_arsenal::PostgresStorageConfig::default(),
+    )
+    .with_retained_response_fence_seconds(Some(3_600));
+    (fusillade_pool, manager)
+}
+
+fn synthetic_context<'a>(request_id: uuid::Uuid, api_key: &'a str) -> crate::inference::store::CreateContext<'a> {
+    crate::inference::store::CreateContext {
+        request_id,
+        request_body: r#"{"prompt":"must_not_leak"}"#,
+        model: "store-test-model",
+        endpoint: "/v1/responses",
+        base_url: "https://example.invalid",
+        api_key: Some(api_key),
+    }
+}
+
+async fn seed_archivable_response(pool: &PgPool, manager: &PostgresRequestManager<TestDbPools>, request_id: uuid::Uuid, owner: &str) {
+    manager
+        .create_realtime(fusillade::CreateRealtimeInput {
+            request_id,
+            body: r#"{"prompt":"archived"}"#.to_owned(),
+            model: "store-test-model".to_owned(),
+            endpoint: "https://example.invalid".to_owned(),
+            method: "POST".to_owned(),
+            path: "/v1/responses".to_owned(),
+            api_key: "store-test-key".to_owned(),
+            created_by: owner.to_owned(),
+        })
+        .await
+        .unwrap();
+    manager
+        .complete_request(fusillade::RequestId(request_id), r#"{"answer":"archived"}"#, 200)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE fusillade.requests SET service_tier = 'priority', \
+         created_at = '2026-08-01 08:00:00Z', claimed_at = '2026-08-01 09:58:00Z', \
+         started_at = '2026-08-01 09:59:00Z', completed_at = '2026-08-01 10:00:00Z', \
+         updated_at = '2026-08-01 10:00:00Z' WHERE id = $1",
+    )
+    .bind(request_id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[sqlx::test]
+async fn complete_response_treats_active_retained_graph_as_idempotent(pool: PgPool) {
+    let user = create_test_user(&pool, Role::StandardUser).await;
+    let key = create_test_api_key_for_user(&pool, user.id).await;
+    let (fusillade_pool, manager) = response_lifecycle_manager(&pool).await;
+    let request_id = uuid::Uuid::new_v4();
+    seed_archivable_response(&pool, &manager, request_id, &user.id.to_string()).await;
+    archive_response_graphs(&pool, 1).await;
+
+    crate::inference::store::complete_response_idempotent(
+        &manager,
+        &pool,
+        &format!("resp_{request_id}"),
+        r#"{"must_not":"overwrite"}"#,
+        200,
+        synthetic_context(request_id, &key.secret),
+    )
+    .await
+    .expect("an active retained response is an idempotent terminal write");
+
+    let retained: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM retained_response_request_routes WHERE request_id = $1")
+        .bind(request_id)
+        .fetch_one(&fusillade_pool)
+        .await
+        .unwrap();
+    assert_eq!(retained, 1);
+}
+
+#[sqlx::test]
+async fn complete_response_fails_closed_for_erased_identity_without_synthesis(pool: PgPool) {
+    let user = create_test_user(&pool, Role::StandardUser).await;
+    let key = create_test_api_key_for_user(&pool, user.id).await;
+    let (fusillade_pool, manager) = response_lifecycle_manager(&pool).await;
+    let request_id = uuid::Uuid::new_v4();
+    seed_archivable_response(&pool, &manager, request_id, &user.id.to_string()).await;
+    archive_response_graphs(&pool, 1).await;
+    manager.delete_response_group(request_id).await.unwrap();
+
+    let error = crate::inference::store::complete_response_idempotent(
+        &manager,
+        &pool,
+        &format!("resp_{request_id}"),
+        r#"{"must_not":"survive"}"#,
+        200,
+        synthetic_context(request_id, &key.secret),
+    )
+    .await
+    .expect_err("an erased identity must terminate without synthesis");
+    assert_eq!(error.to_string(), "Response not found: Response unavailable");
+    assert!(!format!("{error:?}").contains("must_not"));
+    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE id = $1")
+        .bind(request_id)
+        .fetch_one(&fusillade_pool)
+        .await
+        .unwrap();
+    assert_eq!(live, 0);
+    let leaked_templates: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not_leak%'")
+        .fetch_one(&fusillade_pool)
+        .await
+        .unwrap();
+    assert_eq!(leaked_templates, 0);
+}
+
+async fn wait_for_api_key_lock_waiter(pool: &PgPool) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS ( \
+                 SELECT 1 FROM pg_locks lock \
+                 JOIN pg_class relation ON relation.oid = lock.relation \
+                 WHERE relation.relname = 'api_keys' AND NOT lock.granted)",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the attribution lookup must reach the deterministic table-lock gate");
+}
+
+#[sqlx::test]
+async fn complete_response_rechecks_a_fence_created_after_the_initial_miss(pool: PgPool) {
+    let user = create_test_user(&pool, Role::StandardUser).await;
+    let key = create_test_api_key_for_user(&pool, user.id).await;
+    let (fusillade_pool, manager) = response_lifecycle_manager(&pool).await;
+    let request_id = uuid::Uuid::new_v4();
+    let mut gate = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE api_keys IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let task_pool = pool.clone();
+    let key_secret = key.secret;
+    let mut completion = tokio::spawn(async move {
+        crate::inference::store::complete_response_idempotent(
+            &manager,
+            &task_pool,
+            &format!("resp_{request_id}"),
+            r#"{"must_not":"survive"}"#,
+            200,
+            synthetic_context(request_id, &key_secret),
+        )
+        .await
+    });
+    tokio::select! {
+        result = &mut completion => panic!("completion passed the attribution gate before fencing: {result:?}"),
+        () = wait_for_api_key_lock_waiter(&pool) => {}
+    }
+    sqlx::query(
+        "INSERT INTO retained_response_resurrection_fences \
+         (object_id, reason, expires_at) VALUES ($1, 'erased', NOW() + INTERVAL '1 hour')",
+    )
+    .bind(request_id)
+    .execute(&fusillade_pool)
+    .await
+    .unwrap();
+    gate.commit().await.unwrap();
+
+    let error = completion
+        .await
+        .unwrap()
+        .expect_err("the post-miss synthesis must recheck the new fence");
+    assert_eq!(error.to_string(), "Response not found: Response unavailable");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM request_templates WHERE body LIKE '%must_not_leak%'",)
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[sqlx::test]
+async fn complete_response_does_not_ignore_an_unproven_synthetic_create_error(pool: PgPool) {
+    let user = create_test_user(&pool, Role::StandardUser).await;
+    let key = create_test_api_key_for_user(&pool, user.id).await;
+    let (fusillade_pool, manager) = response_lifecycle_manager(&pool).await;
+    sqlx::query(
+        r#"
+        CREATE FUNCTION reject_synthetic_template() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN
+            RAISE EXCEPTION 'must_not_leak_database_detail';
+        END
+        $$
+        "#,
+    )
+    .execute(&fusillade_pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "CREATE TRIGGER reject_synthetic_template BEFORE INSERT ON request_templates \
+         FOR EACH ROW EXECUTE FUNCTION reject_synthetic_template()",
+    )
+    .execute(&fusillade_pool)
+    .await
+    .unwrap();
+    let request_id = uuid::Uuid::new_v4();
+
+    let error = crate::inference::store::complete_response_idempotent(
+        &manager,
+        &pool,
+        &format!("resp_{request_id}"),
+        r#"{"must_not":"survive"}"#,
+        200,
+        synthetic_context(request_id, &key.secret),
+    )
+    .await
+    .expect_err("a failed create without a concurrent winner must be returned");
+    assert_eq!(error.to_string(), "Storage error: Failed to synthesize response row");
+    let rendered = format!("{error:?}");
+    assert!(!rendered.contains("must_not"));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_one(&fusillade_pool)
+            .await
+            .unwrap(),
+        0
+    );
+}
+
+#[sqlx::test]
+#[test_log::test]
+async fn a_chain_can_extend_a_response_after_its_graph_moved_to_the_retained_store(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+    server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({"model": "gpt-4o", "input": "first turn", "service_tier": "priority"}))
+        .await
+        .assert_status_ok();
+    let id = poll_completed_row(&pool, uuid::Uuid::nil()).await;
+    sqlx::query(
+        "UPDATE fusillade.requests SET created_at = '2026-08-01 08:00:00Z', claimed_at = '2026-08-01 09:58:00Z', started_at = '2026-08-01 09:59:00Z', completed_at = '2026-08-01 10:00:00Z', updated_at = '2026-08-01 10:00:00Z' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Extension works while the first turn is live...
+    server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "second turn while live",
+            "previous_response_id": format!("resp_{id}"),
+            "service_tier": "priority"
+        }))
+        .await
+        .assert_status_ok();
+    // ...and must keep working once its graph has moved to the retained store.
+    archive_response_graphs(&pool, 1).await;
+    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fusillade.requests WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(live, 0, "the first turn must have moved to the retained store");
+
+    let extended = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "second turn",
+            "previous_response_id": format!("resp_{id}"),
+            "service_tier": "priority"
+        }))
+        .await;
+    extended.assert_status_ok();
+    let extended_json: serde_json::Value = extended.json();
+    assert_eq!(extended_json["previous_response_id"], format!("resp_{id}"));
+    assert_ne!(extended_json["id"], format!("resp_{id}"));
+}
+
+#[sqlx::test]
+#[test_log::test]
+async fn previous_response_id_of_another_users_response_is_rejected(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+    server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({"model": "gpt-4o", "input": "private first turn", "service_tier": "priority"}))
+        .await
+        .assert_status_ok();
+    let id = poll_completed_row(&pool, uuid::Uuid::nil()).await;
+    let other_user = create_test_user(&pool, Role::StandardUser).await;
+    let other_api_key = format!("sk-foreign-chain-{}", uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by) VALUES ($1, $2, $3, 'realtime', $4, $4)")
+        .bind(uuid::Uuid::new_v4())
+        .bind("Foreign chain test key")
+        .bind(&other_api_key)
+        .bind(other_user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The other user needs model access too, so a rejection is about the
+    // previous response and not about the model.
+    let extend = |key: String| {
+        let server = &server;
+        async move {
+            server
+                .post("/ai/v1/responses")
+                .add_header("Authorization", &format!("Bearer {key}"))
+                .add_header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "gpt-4o",
+                    "input": "second turn",
+                    "previous_response_id": format!("resp_{id}"),
+                    "service_tier": "priority"
+                }))
+                .await
+        }
+    };
+    let foreign = extend(other_api_key.clone()).await;
+    assert_eq!(foreign.status_code(), axum::http::StatusCode::BAD_REQUEST, "{}", foreign.text());
+    assert!(foreign.text().contains("previous response not found"));
+    // The first turn itself carried the text upstream once; the foreign
+    // extension must not have sent it again.
+    let private_text_sent_upstream = mock_server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| String::from_utf8_lossy(&r.body).contains("private first turn"))
+        .count();
+    assert_eq!(private_text_sent_upstream, 1, "another user's turn must never reach upstream");
+
+    // After the graph moves to the retained store the answer is the same.
+    sqlx::query(
+        "UPDATE fusillade.requests SET created_at = '2026-08-01 08:00:00Z', claimed_at = '2026-08-01 09:58:00Z', started_at = '2026-08-01 09:59:00Z', completed_at = '2026-08-01 10:00:00Z', updated_at = '2026-08-01 10:00:00Z' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    archive_response_graphs(&pool, 1).await;
+    let foreign_after = extend(other_api_key).await;
+    assert_eq!(foreign_after.status_code(), axum::http::StatusCode::BAD_REQUEST);
+    extend(api_key.clone()).await.assert_status_ok();
+}
+
+#[sqlx::test]
+#[test_log::test]
+async fn read_retained_singleton_preserves_response_and_fails_closed_after_drop(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "retained singleton"}],
+            "service_tier": "priority"
+        }))
+        .await
+        .assert_status_ok();
+    let id = poll_completed_row(&pool, uuid::Uuid::nil()).await;
+    sqlx::query(
+        "UPDATE fusillade.requests SET created_at = '2026-08-01 08:00:00Z', claimed_at = '2026-08-01 09:58:00Z', started_at = '2026-08-01 09:59:00Z', completed_at = '2026-08-01 10:00:00Z', updated_at = '2026-08-01 10:00:00Z' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response_id = format!("resp_{id}");
+    let before = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .await;
+    before.assert_status_ok();
+    let before_json: serde_json::Value = before.json();
+
+    archive_response_graphs(&pool, 1).await;
+    let after = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .await;
+    after.assert_status_ok();
+    assert_eq!(after.json::<serde_json::Value>(), before_json);
+
+    sqlx::query("UPDATE fusillade.retained_response_buckets SET state = 'retiring' WHERE delete_on = '2026-08-02'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let retiring = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .await;
+    retiring.assert_status_not_found();
+
+    sqlx::query("ALTER TABLE fusillade.retained_response_objects DETACH PARTITION fusillade.retained_response_objects_d20260802")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DROP TABLE fusillade.retained_response_objects_d20260802")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let dropped = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .await;
+    dropped.assert_status_not_found();
+}
+
+#[sqlx::test]
+#[test_log::test]
+async fn read_retained_response_preserves_public_id_and_owner(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({"model": "gpt-4o", "input": "retained response"}))
+        .await
+        .assert_status_ok();
+    let request_id = poll_completed_row(&pool, uuid::Uuid::nil()).await;
+    sqlx::query(
+        "UPDATE fusillade.requests SET created_at = '2026-08-01 08:00:00Z', claimed_at = '2026-08-01 09:58:00Z', started_at = '2026-08-01 09:59:00Z', completed_at = '2026-08-01 10:00:00Z', updated_at = '2026-08-01 10:00:00Z' WHERE id = $1",
+    )
+    .bind(request_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let response_id = format!("resp_{request_id}");
+    let before = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .await;
+    before.assert_status_ok();
+    let before_json: serde_json::Value = before.json();
+    assert_eq!(before_json["id"], response_id);
+    let other_user = create_test_user(&pool, Role::StandardUser).await;
+    let other_api_key = format!("sk-retained-owner-{}", uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by) VALUES ($1, $2, $3, 'realtime', $4, $4)")
+        .bind(uuid::Uuid::new_v4())
+        .bind("Retained response ownership test key")
+        .bind(&other_api_key)
+        .bind(other_user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let unauthorized_before = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {other_api_key}"))
+        .await;
+    unauthorized_before.assert_status_not_found();
+
+    archive_response_graphs(&pool, 1).await;
+    let after = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .await;
+    after.assert_status_ok();
+    let after_json: serde_json::Value = after.json();
+    assert_eq!(after_json, before_json);
+    assert_eq!(after_json["id"], response_id);
+    let unauthorized_after = server
+        .get(&format!("/ai/v1/responses/{response_id}"))
+        .add_header("Authorization", &format!("Bearer {other_api_key}"))
+        .await;
+    unauthorized_after.assert_status_not_found();
+}
+
 /// Test that requests with X-Fusillade-Request-Id header don't create
 /// duplicate rows (batch deduplication).
 #[sqlx::test]
@@ -437,6 +984,37 @@ async fn test_delete_response_removes_fusillade_row(pool: PgPool) {
     }
     assert_ne!(id, uuid::Uuid::nil(), "row should reach completed state");
 
+    // Denormalized analytics and billing records are intentionally outside
+    // the response-content graph and must survive right-to-erasure deletion.
+    let analytics_id: i64 = sqlx::query_scalar(
+        "INSERT INTO http_analytics \
+         (instance_id, correlation_id, timestamp, method, uri, fusillade_request_id) \
+         VALUES ($1, 1, NOW(), 'POST', '/ai/v1/responses', $2) RETURNING id",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let owner_id: uuid::Uuid = sqlx::query_scalar("SELECT user_id FROM api_keys WHERE secret = $1")
+        .bind(&api_key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let billing_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO credits_transactions \
+         (id, user_id, transaction_type, amount, source_id, balance_after, fusillade_request_id) \
+         VALUES ($1, $2, 'usage', 0.01, $3, 0, $4)",
+    )
+    .bind(billing_id)
+    .bind(owner_id)
+    .bind(format!("response-erasure-fixture-{billing_id}"))
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
     // DELETE the response — spec returns 200 with {id, object: "response",
     // deleted: true}.
     let response_id = format!("resp_{}", id);
@@ -457,6 +1035,18 @@ async fn test_delete_response_removes_fusillade_row(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(count.0, 0, "fusillade row should be hard-deleted");
+    let analytics_survives: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM http_analytics WHERE id = $1)")
+        .bind(analytics_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let billing_survives: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM credits_transactions WHERE id = $1)")
+        .bind(billing_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(analytics_survives, "analytics fixture must be preserved");
+    assert!(billing_survives, "billing fixture must be preserved");
 
     // GET now returns 404.
     let get = server
