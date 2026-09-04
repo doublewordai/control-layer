@@ -59,9 +59,9 @@ impl PoolProvider for WriteSignalingPools {
         self.read.clone().into()
     }
 
-    fn write(&self) -> &PgPool {
+    fn write(&self) -> sqlx_pool_router::PoolHandle {
         self.write_requested.store(true, Ordering::Release);
-        &self.write
+        self.write.clone().into()
     }
 }
 
