@@ -1403,6 +1403,73 @@ mod tests {
         assert_eq!(mock.get_requests().len(), 2);
     }
 
+    #[tokio::test]
+    async fn test_upstream_429_status_exhausts_to_429_not_502() {
+        // Regression for the `ControlLayerProxyErrors` alert: a provider that
+        // returns a real HTTP 429 on every attempt (rate limited) must surface
+        // as a 429 to the client once the retry loop is exhausted — not as the
+        // generic 502 the status-fallback path used to store. A rate limit is a
+        // 4xx, and letting it leak into 5xx polluted the per-model proxy-error
+        // alert with provider throttling. Mirrors the single-provider pool
+        // shape observed in production (one member, fallback on 429).
+        let mock = MockHttpClient::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"rate limited","type":"rate_limit_error","param":null,"code":"rate_limit_exceeded"}}"#,
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 1, vec![429]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            429,
+            "an upstream rate limit must surface as 429, not 502"
+        );
+        let body: serde_json::Value = serde_json::from_str(&response.text()).unwrap();
+        assert_eq!(body["error"]["code"], "rate_limit");
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "single-provider pool tries once before exhausting"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_500_status_exhausts_to_502_unchanged() {
+        // Control: a non-rate-limit upstream 5xx keeps the existing 502
+        // bad-gateway response when retries are exhausted — only the 429 case
+        // is remapped.
+        let mock = MockHttpClient::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":{"message":"boom","type":"server_error","param":null,"code":"internal_error"}}"#,
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 1, vec![500]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            502,
+            "a non-rate-limit upstream 5xx stays a 502 on exhaustion"
+        );
+    }
+
     // Some upstreams also fail by returning a `200 OK` with an *empty* body (no
     // tokens, no error envelope — just EOF). These tests exercise the
     // empty-body ("Mode C") detection + retry, and crucially that a valid stream

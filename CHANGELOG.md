@@ -1,12 +1,5 @@
 # Changelog
 
-## [11.4.0](https://github.com/doublewordai/control-layer/compare/v11.3.0...v11.4.0) (2026-09-04)
-
-
-### Features
-
-* **fusillade:** move overdue batchless graphs concurrently in the backfill ([#1567](https://github.com/doublewordai/control-layer/issues/1567)) ([b0ed45c](https://github.com/doublewordai/control-layer/commit/b0ed45c09b27d1e87022247ea016b212fa958377))
-
 ## [11.3.0](https://github.com/doublewordai/control-layer/compare/v11.2.0...v11.3.0) (2026-09-04)
 
 
