@@ -38,8 +38,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
 
     let request_manager = std::sync::Arc::new(
         fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default())
-            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
-            .with_template_generation_writes(config.background_services.batch_daemon.template_generation_writes_enabled),
+            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds),
     );
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
@@ -90,6 +89,54 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
 /// test DB and return a small (max 4 conns) fusillade-schema pool. Use
 /// this from integration tests that drive fusillade directly without
 /// constructing the full Application.
+/// Insert a fusillade request template the way the production write path
+/// does: into this week's `request_templates_g2` partition with its
+/// `request_template_routes` row, so `fusillade.requests` can reference it and
+/// the `active_request_templates` / `request_templates_all` views resolve it.
+///
+/// `file_id = None` makes a dedicated (batchless) template.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_fusillade_template(
+    pool: &PgPool,
+    template_id: Uuid,
+    file_id: Option<Uuid>,
+    model: &str,
+    api_key: &str,
+    endpoint: &str,
+    path: &str,
+    body: &str,
+    custom_id: Option<&str>,
+) {
+    sqlx::query(
+        "SELECT fusillade.ensure_request_template_partition( \
+             date_trunc('week', statement_timestamp() AT TIME ZONE 'UTC')::date, NULL)",
+    )
+    .execute(pool)
+    .await
+    .expect("ensure current template partition");
+    sqlx::query(
+        "WITH inserted AS ( \
+             INSERT INTO fusillade.request_templates_g2 \
+                 (created_on, id, file_id, custom_id, endpoint, method, path, body, model, api_key, body_byte_size) \
+             VALUES ((statement_timestamp() AT TIME ZONE 'UTC')::date, $1, $2, $3, $4, 'POST', $5, $6, $7, $8, length($6)) \
+             RETURNING id, created_on \
+         ) \
+         INSERT INTO fusillade.request_template_routes (template_id, week_start) \
+         SELECT id, date_trunc('week', created_on)::date FROM inserted",
+    )
+    .bind(template_id)
+    .bind(file_id)
+    .bind(custom_id)
+    .bind(endpoint)
+    .bind(path)
+    .bind(body)
+    .bind(model)
+    .bind(api_key)
+    .execute(pool)
+    .await
+    .expect("insert request template");
+}
+
 pub async fn setup_fusillade_pool(pool: &PgPool) -> PgPool {
     use sqlx::Executor;
     use sqlx::postgres::PgConnectOptions;
@@ -135,8 +182,7 @@ pub async fn create_test_app_state_with_database_pools(
         .expect("Failed to create fusillade TestDbPools");
     let request_manager = std::sync::Arc::new(
         fusillade_arsenal::PostgresRequestManager::new(fusillade_test_pools, Default::default())
-            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
-            .with_template_generation_writes(config.background_services.batch_daemon.template_generation_writes_enabled),
+            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds),
     );
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);

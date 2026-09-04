@@ -261,16 +261,18 @@ mod tests {
         .unwrap();
 
         let template_id = Uuid::new_v4();
-        sqlx::query!(
-            "INSERT INTO fusillade.request_templates (id, endpoint, method, path, model, api_key, body)
-             VALUES ($1,'http://x','POST',$2,'m','k',$3)",
+        crate::test::utils::insert_fusillade_template(
+            pool,
             template_id,
+            None,
+            "m",
+            "k",
+            "http://x",
             uri,
             r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+            None,
         )
-        .execute(pool)
-        .await
-        .unwrap();
+        .await;
 
         let request_id = Uuid::new_v4();
         sqlx::query!(

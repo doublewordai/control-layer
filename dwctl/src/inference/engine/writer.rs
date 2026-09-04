@@ -633,7 +633,7 @@ mod tests {
         sqlx::query(
             r#"
             CREATE TRIGGER reject_writer_fixture
-            BEFORE INSERT ON fusillade.request_templates
+            BEFORE INSERT ON fusillade.request_templates_g2
             FOR EACH ROW EXECUTE FUNCTION fusillade.reject_writer_fixture()
             "#,
         )

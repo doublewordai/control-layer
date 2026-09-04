@@ -2537,16 +2537,15 @@ mod tests {
         resp.assert_status(StatusCode::CREATED);
     }
 
-    /// After the template write cutover a file's templates live in
-    /// `request_templates_g2`. The per-file model counts feed both the
-    /// batch-creation validation and the cached `dw_model` label, so they must
-    /// be read through the generation-transparent view or every cutover batch
-    /// is created with an empty model.
+    /// A file's templates live in the weekly `request_templates_g2` store.
+    /// The per-file model counts feed both the batch-creation validation and
+    /// the cached `dw_model` label, so they must be read through the
+    /// `request_templates_all` view or every batch is created with an empty
+    /// model.
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_batch_labels_model_when_templates_are_generation_two(pool: PgPool) {
-        let mut config = create_test_config();
-        config.background_services.batch_daemon.template_generation_writes_enabled = true;
+        let config = create_test_config();
         let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
 
         let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
@@ -3496,16 +3495,18 @@ mod tests {
                 "choices": [{"message": {"content": format!("Response {}", i)}}]
             });
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(&custom_id),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(&custom_id)
-            .execute(&pool)
-            .await
-            .expect("Failed to create template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'test-model', 'completed', 200, $4, NOW(), NOW())",
@@ -3634,16 +3635,18 @@ mod tests {
                 "choices": [{"message": {"content": format!("Response {}", i)}}]
             });
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(&custom_id),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(&custom_id)
-            .execute(&pool)
-            .await
-            .expect("Failed to create template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'test-model', 'completed', 200, $4, NOW(), NOW())",
@@ -3664,16 +3667,18 @@ mod tests {
             let custom_id = format!("req-{}", i);
             let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(&custom_id),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(&custom_id)
-            .execute(&pool)
-            .await
-            .expect("Failed to create template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",
@@ -5142,16 +5147,18 @@ mod tests {
             let request_id = Uuid::new_v4();
             let body = serde_json::json!({"model": "thinking-model", "messages": [{"role": "user", "content": "Test"}], "thinking": {"type": "enabled", "budget_tokens": 4096}});
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'thinking-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                &pool,
+                template_id,
+                Some(file_id),
+                "thinking-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(custom_id),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(*custom_id)
-            .execute(&pool)
-            .await
-            .expect("Failed to create template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, created_at, completed_at) VALUES ($1, $2, $3, 'thinking-model', 'completed', 200, $4, NOW(), NOW())",
@@ -5420,16 +5427,18 @@ mod tests {
             let request_id = Uuid::new_v4();
             let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": format!("Test {}", i)}]});
 
-            sqlx::query(
-                "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, $2, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $3, $4, 'POST')",
+            crate::test::utils::insert_fusillade_template(
+                pool,
+                template_id,
+                Some(file_id),
+                "test-model",
+                "test-key",
+                "http://test",
+                "/v1/chat/completions",
+                &serde_json::to_string(&body).unwrap(),
+                Some(&format!("req-{i}")),
             )
-            .bind(template_id)
-            .bind(file_id)
-            .bind(serde_json::to_string(&body).unwrap())
-            .bind(format!("req-{i}"))
-            .execute(pool)
-            .await
-            .expect("insert template");
+            .await;
 
             sqlx::query(
                 "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at) VALUES ($1, $2, $3, 'test-model', 'pending', NOW())",

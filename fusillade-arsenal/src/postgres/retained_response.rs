@@ -13,7 +13,7 @@ use sqlx::postgres::{PgPool, PgRow};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use super::{PoolProvider, PostgresRequestManager};
+use super::{PoolProvider, PostgresRequestManager, template_store};
 use crate::error::{FusilladeError, Result};
 use crate::manager::{
     RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
@@ -448,7 +448,7 @@ impl fmt::Debug for RetainedRequestSnapshot {
     }
 }
 
-/// A complete immutable copy of a dedicated `request_templates` row.
+/// A complete immutable copy of a dedicated request template row.
 #[derive(Clone, PartialEq, Serialize)]
 pub(crate) struct RetainedTemplateSnapshot {
     pub(crate) id: Uuid,
@@ -1975,7 +1975,17 @@ async fn lock_live_graph_for_erasure(
     template_ids.dedup();
     if !template_ids.is_empty() {
         let locked_templates: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM request_templates WHERE id = ANY($1) ORDER BY id FOR UPDATE",
+            r#"
+            SELECT template.id
+            FROM request_template_routes route
+            JOIN request_templates_g2 template
+              ON template.created_on >= route.week_start
+             AND template.created_on < route.week_start + 7
+             AND template.id = route.template_id
+            WHERE route.template_id = ANY($1)
+            ORDER BY template.id
+            FOR UPDATE OF template
+            "#,
         )
         .bind(&template_ids)
         .fetch_all(&mut **tx)
@@ -2482,17 +2492,13 @@ async fn delete_locked_response_group_in_transaction(
             .await
             .map_err(database_failure)?
             .rows_affected();
-        if !template_ids.is_empty() {
-            sqlx::query(
-                "DELETE FROM request_templates template \
-                 WHERE template.id = ANY($1) AND template.file_id IS NULL \
-                   AND NOT EXISTS (SELECT 1 FROM requests WHERE template_id = template.id)",
-            )
-            .bind(&template_ids)
-            .execute(&mut **tx)
-            .await
-            .map_err(database_failure)?;
-        }
+        template_store::delete_dedicated_templates(
+            tx,
+            &template_ids,
+            template_store::DedicatedDeleteScope::Unreferenced,
+        )
+        .await
+        .map_err(database_failure)?;
         if deleted_requests != topology.request_ids.len() as u64 {
             return Err(incomplete_graph());
         }
@@ -3091,12 +3097,18 @@ async fn move_graph<P: PoolProvider>(
     }
     let template_rows = sqlx::query(
         r#"
-        SELECT id, file_id, custom_id, endpoint, method, path, body, model,
-               api_key, line_number, body_byte_size, metadata, created_at, updated_at
-        FROM request_templates
-        WHERE id = ANY($1)
-        ORDER BY id
-        FOR UPDATE SKIP LOCKED
+        SELECT template.id, template.file_id, template.custom_id, template.endpoint,
+               template.method, template.path, template.body, template.model,
+               template.api_key, template.line_number, template.body_byte_size,
+               template.metadata, template.created_at, template.updated_at
+        FROM request_template_routes route
+        JOIN request_templates_g2 template
+          ON template.created_on >= route.week_start
+         AND template.created_on < route.week_start + 7
+         AND template.id = route.template_id
+        WHERE route.template_id = ANY($1)
+        ORDER BY template.id
+        FOR UPDATE OF template SKIP LOCKED
         "#,
     )
     .bind(&template_ids)
@@ -3104,12 +3116,9 @@ async fn move_graph<P: PoolProvider>(
     .await
     .map_err(database_failure)?;
     if template_rows.len() != template_ids.len() {
-        let existing: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM request_templates WHERE id = ANY($1)")
-                .bind(&template_ids)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(database_failure)?;
+        let existing = template_store::count_templates(&mut tx, &template_ids)
+            .await
+            .map_err(database_failure)?;
         if existing == template_ids.len() as i64 {
             return Ok(MoveGraphOutcome::SkippedLocked);
         }
@@ -3249,30 +3258,26 @@ async fn move_graph<P: PoolProvider>(
     if deleted_requests != request_ids.len() as u64 {
         return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
     }
-    let deleted_templates =
-        sqlx::query("DELETE FROM request_templates WHERE id = ANY($1) AND file_id IS NULL")
-            .bind(&owned_template_ids)
-            .execute(&mut *tx)
-            .await
-            .map_err(database_failure)?
-            .rows_affected();
+    let deleted_templates = template_store::delete_dedicated_templates(
+        &mut tx,
+        &owned_template_ids,
+        template_store::DedicatedDeleteScope::Any,
+    )
+    .await
+    .map_err(database_failure)?;
     if deleted_templates != owned_template_ids.len() as u64 {
         return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
     }
 
-    let live_members: i64 = sqlx::query_scalar(
-        r#"
-        SELECT
-            (SELECT COUNT(*) FROM requests WHERE id = ANY($1))
-          + (SELECT COUNT(*) FROM request_templates WHERE id = ANY($2))
-        "#,
-    )
-    .bind(&request_ids)
-    .bind(&owned_template_ids)
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(database_failure)?;
-    if live_members != 0 {
+    let live_requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE id = ANY($1)")
+        .bind(&request_ids)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(database_failure)?;
+    let live_templates = template_store::count_templates(&mut tx, &owned_template_ids)
+        .await
+        .map_err(database_failure)?;
+    if live_requests + live_templates != 0 {
         return Err(RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error());
     }
     tx.commit().await.map_err(database_failure)?;
