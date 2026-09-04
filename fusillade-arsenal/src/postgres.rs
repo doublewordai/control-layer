@@ -8842,45 +8842,14 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             ))
         })?
         .rows_affected() as i64;
-        // Step 2c: a pending request whose template is gone (purged above, or
-        // its weekly partition retired) can never be claimed, and without the
-        // old ON DELETE SET NULL it would otherwise occupy a claim slot on
-        // every tick. Both existence probes are primary-key lookups.
-        let stranded_failed = sqlx::query(
-            r#"
-            UPDATE requests
-               SET state = 'failed',
-                   error = 'request template no longer exists',
-                   failed_at = NOW()
-             WHERE id IN (
-                   SELECT r.id
-                     FROM requests r
-                    WHERE r.state = 'pending'
-                      AND r.template_id IS NOT NULL
-                      AND NOT EXISTS (SELECT 1 FROM request_templates t WHERE t.id = r.template_id)
-                      AND NOT EXISTS (SELECT 1 FROM request_template_routes rt WHERE rt.template_id = r.template_id)
-                    LIMIT $1
-                    FOR UPDATE SKIP LOCKED
-             )
-            "#,
-        )
-        .bind(batch_size)
-        .execute(self.write_executor())
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail stranded requests: {e}")))?
-        .rows_affected() as i64;
-        let total = (requests_deleted
-            + archived_deleted
-            + templates_deleted
-            + g2_templates_deleted
-            + stranded_failed) as u64;
+        let total =
+            (requests_deleted + archived_deleted + templates_deleted + g2_templates_deleted) as u64;
         if total > 0 {
             tracing::info!(
                 requests_deleted,
                 archived_deleted,
                 templates_deleted,
                 g2_templates_deleted,
-                stranded_failed,
                 "Purged orphaned rows"
             );
         }
@@ -14224,48 +14193,6 @@ mod tests {
         assert_eq!(
             landed_in_fenced_week, 0,
             "a fenced week must never receive rows"
-        );
-    }
-
-    /// Without the old ON DELETE SET NULL, a pending request whose template
-    /// was purged would sit in the claim window forever. The orphan purge
-    /// fails it instead.
-    #[sqlx::test]
-    async fn test_purge_fails_pending_requests_whose_template_is_gone(pool: sqlx::PgPool) {
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            Arc::new(MockHttpClient::new()),
-        );
-        let stranded = setup_freeze_test_batch(&manager, "purge-stranded", 2).await;
-        let healthy = setup_freeze_test_batch(&manager, "purge-healthy", 1).await;
-        sqlx::query!(
-            "DELETE FROM request_templates WHERE id IN (SELECT template_id FROM requests WHERE batch_id = $1)",
-            *stranded as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let purged = manager.purge_orphaned_rows(100).await.unwrap();
-        assert_eq!(purged, 2, "both stranded requests must be failed");
-        let states: Vec<(String, Option<String>)> =
-            sqlx::query_as("SELECT state, error FROM requests WHERE batch_id = $1 ORDER BY id")
-                .bind(*stranded as Uuid)
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert!(states.iter().all(|(state, error)| state == "failed"
-            && error.as_deref() == Some("request template no longer exists")));
-        let healthy_pending: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM requests WHERE batch_id = $1 AND state = 'pending'",
-        )
-        .bind(*healthy as Uuid)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            healthy_pending, 1,
-            "requests with a live template are untouched"
         );
     }
 
