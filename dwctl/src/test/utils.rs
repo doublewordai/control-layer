@@ -211,6 +211,7 @@ pub fn create_test_config() -> crate::config::Config {
 
     crate::config::Config {
         clickhouse: None,
+        prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
         database_url: None,
         database_replica_url: None,
         database: crate::config::DatabaseConfig::External {

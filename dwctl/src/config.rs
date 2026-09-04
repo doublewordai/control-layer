@@ -215,6 +215,11 @@ pub struct Config {
     /// on the writing feature's own section. See [`crate::clickhouse::ClickhouseConfig`].
     #[serde(default)]
     pub clickhouse: Option<crate::clickhouse::ClickhouseConfig>,
+    /// Prefix-chain capture for workload profiling: content-free records of prompt
+    /// structure per chat-completions request, written to ClickHouse. Off by default.
+    /// See [`crate::prefix_chain::PrefixChainConfig`].
+    #[serde(default)]
+    pub prefix_chain: crate::prefix_chain::PrefixChainConfig,
     /// Mid-stream continuation (stream resume): the on/off flag, per-origin gates,
     /// and resume-behavior knobs. See [`ContinuationConfig`].
     #[serde(default)]
@@ -2840,6 +2845,7 @@ impl Default for Config {
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
             clickhouse: None,
+            prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: ContinuationConfig::default(),
         }
     }
@@ -3184,6 +3190,13 @@ impl Config {
             }
         }
 
+        // Prefix-chain capture, when on, needs the warehouse connection, tokenizer-svc and a
+        // usable key — every missing piece is a startup error, never a sink that records nothing.
+        if let Err(e) = self.prefix_chain.validate(self.clickhouse.as_ref(), &self.cache.tokenizer_url) {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {e}"),
+            });
+        }
         // A present `clickhouse` section must be usable: a bad endpoint or a missing
         // password is a startup error, not a sink that fails every insert forever.
         if let Some(ch) = &self.clickhouse
@@ -3207,7 +3220,9 @@ impl Config {
         // Cache TTL tiers: every enabled tier must be a known tier (5m/1h/24h), the set must be
         // non-empty, and the default tier must be one of them — otherwise a no-ttl marker would
         // default straight into a rejected tier. Fail fast at startup with a clear message.
-        if self.cache.enabled {
+        // The cache TTL policy is also consumed by prefix-chain capture, which parses with
+        // the same policies whether or not the cache layer is on.
+        if self.cache.enabled || self.prefix_chain.enabled {
             for ttl in &self.cache.enabled_ttls {
                 if crate::prompt_cache::TtlTier::parse(ttl).is_none() {
                     return Err(Error::Internal {

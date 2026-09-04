@@ -498,17 +498,19 @@ cache:
 # completions pool, splicing the result into the client's still-open stream with
 # merged billing. Per-model activation is DATA, not config: a model rescues only
 # when its composite carries a completions pool with an enabled member.
-# ClickHouse warehouse connection, shared by every feature that writes analytics
-# records directly to ClickHouse (none in local dev). Absent = no such feature may be
-# enabled; present = must be complete, or startup fails. Table names and flush cadence
-# live on the writing feature's own section. In deployments the password comes from a
-# Kubernetes secret as DWCTL_CLICKHOUSE__PASSWORD.
+# ClickHouse warehouse connection (unused in local dev). Required by prefix_chain.
 # clickhouse:
-#   endpoint_url: "https://<service>.eu-west-2.aws.clickhouse.cloud:8443"
+#   endpoint_url: "https://<service>.<region>.aws.clickhouse.cloud:8443"
 #   database: "clay"
 #   user: "dwctl"
 #   password: ""
-#   request_timeout: 30s
+
+# Prefix-chain capture: per chat-completions request, keyed hashes of the prompt's
+# content blocks plus per-block token counts, written to ClickHouse. No content.
+prefix_chain:
+  enabled: false
+  models: null # null: every model; a non-empty list: exactly those aliases
+  hmac_key: "" # 32 bytes, hex; from a secret as DWCTL_PREFIX_CHAIN__HMAC_KEY
 
 continuation:
   # Global kill switch. When false (default), the layer is not added to the
