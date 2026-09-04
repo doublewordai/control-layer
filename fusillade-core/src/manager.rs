@@ -313,13 +313,6 @@ pub enum RetainedResponseRetirementOutcome {
 mod retention_policy_tests {
     use super::*;
 
-    fn policy() -> RetentionPolicy {
-        RetentionPolicy {
-            batchless_seconds_by_service_tier: HashMap::from([("flex".to_string(), 90 * 86_400)]),
-            max_late_writer_seconds: Some(3_600),
-            ..Default::default()
-        }
-    }
 
     #[test]
     fn batchless_delete_on_is_the_utc_day_after_exact_expiry() {
