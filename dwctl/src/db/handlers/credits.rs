@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{instrument, trace};
 use uuid::Uuid;
 
@@ -235,6 +235,34 @@ impl<'c> Credits<'c> {
         .await?;
 
         Ok(purchased)
+    }
+
+    /// Which of `user_ids` have ever completed a purchase?
+    ///
+    /// Bulk form of [`Self::has_purchased`], for the list endpoints - one
+    /// query for the page rather than one per row. Returns only the ids that
+    /// have purchased; absent means no purchase, so callers test membership.
+    ///
+    /// `DISTINCT` rather than a count: we only need the boolean, and stopping
+    /// at existence keeps this on the partial purchases index.
+    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    pub async fn has_purchased_bulk(&mut self, user_ids: &[UserId]) -> Result<HashSet<UserId>> {
+        if user_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let rows = sqlx::query_scalar!(
+            r#"
+            SELECT DISTINCT user_id AS "user_id!"
+            FROM credits_transactions
+            WHERE user_id = ANY($1::uuid[]) AND transaction_type = 'purchase'
+            "#,
+            user_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().collect())
     }
 
     /// Grant a first-payment match bonus to `payee` if eligible.

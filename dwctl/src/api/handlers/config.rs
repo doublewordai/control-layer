@@ -106,15 +106,28 @@ pub async fn get_config(State(state): State<AppState>, _user: CurrentUser) -> im
         None
     };
 
+    // Lossy on paper, exact in practice: the ceiling is a whole-dollar marketing
+    // figure, and this value is only ever displayed or compared against zero -
+    // the money itself is matched in Decimal server-side.
+    //
+    // Falling back to 0 turns the promotion off client-side, which is the safe
+    // direction, but 0 is also a legitimate configured value - so a caller
+    // can't tell a disabled promo from a broken conversion. Log it, or an
+    // unrepresentable ceiling silently reads as "no promotion" forever.
+    let match_ceiling = config.credits.first_payment_match_up_to.to_f64().unwrap_or_else(|| {
+        tracing::warn!(
+            configured = %config.credits.first_payment_match_up_to,
+            "credits.first_payment_match_up_to is not representable as f64; reporting the promotion as disabled"
+        );
+        0.0
+    });
+
     let response = ConfigResponse {
         region: metadata.region.clone(),
         organization: metadata.organization.clone(),
         // Compute payment_enabled based on whether payment_processor is configured
         payment_enabled: config.payment.is_some(),
-        // Lossy on paper, exact in practice: the ceiling is a whole-dollar
-        // marketing figure, and this value is only ever displayed or compared
-        // against zero - the money itself is matched in Decimal server-side.
-        first_payment_match_up_to: config.credits.first_payment_match_up_to.to_f64().unwrap_or(0.0),
+        first_payment_match_up_to: match_ceiling,
         docs_url: metadata.docs_url.clone(),
         docs_jsonl_url: metadata.docs_jsonl_url.clone(),
         batches: batches_config,
