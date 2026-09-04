@@ -1343,3 +1343,37 @@ async fn a_poisoned_leg_aborts_instead_of_closing_as_success(pool: PgPool) {
     assert!(!joined.contains('q'), "poisoned bytes must never reach the client: {joined:?}");
     assert!(!joined.contains("\u{ff5c}DSML\u{ff5c}"), "no DSML leak");
 }
+
+/// A resumed TOOL stream whose leg ends without a terminal completion chunk
+/// (usage stands in for it) must still deliver `finish_reason: "tool_calls"` —
+/// the only tool-loop signal clients key on — and BEFORE the usage frame,
+/// which clients treat as terminal.
+#[sqlx::test]
+async fn a_tool_leg_without_a_finish_chunk_still_signals_tool_calls(pool: PgPool) {
+    let fake = Fake::new(
+        vec![reasoning("chatcmpl-1", "Let me"), reasoning("chatcmpl-1", " check")],
+        vec![vec![
+            leg_text(
+                " the weather.</think>Now.\n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Paris</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
+                None,
+            ),
+            // No terminal completion chunk: usage stands in, then [DONE].
+            leg_usage(1030, 40),
+            done(),
+        ]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payloads = collect_payloads(response).await;
+
+    let finish_at = payloads
+        .iter()
+        .position(|p| p.contains("\"finish_reason\":\"tool_calls\""))
+        .expect("a tool stream must carry finish_reason tool_calls");
+    let usage_at = payloads.iter().position(|p| p.contains("\"usage\"")).expect("merged usage frame");
+    assert!(finish_at < usage_at, "finish_reason must precede the terminal usage frame");
+    assert!(payloads.iter().any(|p| p.contains("[DONE]")), "stream closes normally");
+}

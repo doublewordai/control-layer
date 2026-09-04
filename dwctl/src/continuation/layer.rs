@@ -655,6 +655,19 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                         outcome.record("failed", "parser_overflow");
                         break 'chain;
                     }
+                    // A leg whose usage stands in for its terminal chunk never
+                    // delivered a finish_reason. For a tool stream that signal
+                    // is load-bearing — clients key the tool loop on
+                    // `finish_reason: "tool_calls"` — so synthesize it, and
+                    // BEFORE the usage frame, which clients treat as terminal.
+                    if !acc.saw_finish_reason() && parser.as_ref().is_some_and(|p| p.ends_in_tool_calls()) {
+                        let chat = rewrap::delta_chunk(&env, serde_json::json!({}), Value::from("tool_calls"));
+                        if let Some(died) = death_at.take() {
+                            metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
+                        }
+                        let _ = acc.ingest(&chat);
+                        yield Ok(rewrap::sse_frame(&chat));
+                    }
                     // The leg's terminal usage describes the LEG. Replace it with
                     // the merged accounting for the whole logical request.
                     let render = last_render.as_ref();
@@ -775,6 +788,23 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                         }
                         outcome.record("failed", "parser_overflow");
                         break 'chain;
+                    }
+                    // A lost trailer can also swallow the terminal chunk of a
+                    // resumed TOOL stream, and `finish_reason: "tool_calls"` is
+                    // the tool-loop signal clients and request logging key on.
+                    // Synthesize it before any replacement usage and [DONE].
+                    // (The usage-as-terminal branch does the same earlier and
+                    // marks the accumulator, so this cannot double-fire.)
+                    if !acc.saw_finish_reason()
+                        && parser.as_ref().is_some_and(|p| p.ends_in_tool_calls())
+                        && let Some(env) = acc.envelope().cloned()
+                    {
+                        let chat = rewrap::delta_chunk(&env, serde_json::json!({}), Value::from("tool_calls"));
+                        if let Some(died) = death_at.take() {
+                            metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
+                        }
+                        let _ = acc.ingest(&chat);
+                        yield Ok(rewrap::sse_frame(&chat));
                     }
                     // The generation finished. If its usage frame never arrived
                     // (death families no_usage / no_done), synthesize one from a
