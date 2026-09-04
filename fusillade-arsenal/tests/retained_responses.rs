@@ -4260,6 +4260,146 @@ async fn read_point_helpers_keep_one_primary_snapshot_across_route_lookup(pool: 
 }
 
 #[sqlx::test]
+async fn erase_in_overlap_state_removes_both_copies_and_stays_erased(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let first = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "mixed-first",
+    )
+    .await;
+    let second = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-02T10:00:00Z"),
+        "mixed-second",
+    )
+    .await;
+    let request_manager = manager(&pool).await;
+
+    let before_list = request_manager
+        .list_requests(ListRequestsFilter::default())
+        .await
+        .unwrap();
+    let before_flex = request_manager
+        .count_owner_flex_requests_since(OWNER, timestamp("2026-07-01T00:00:00Z"), false)
+        .await
+        .unwrap();
+    let before_trailing = request_manager
+        .get_completed_request_counts_by_model_and_window(
+            &[("retained-window".to_owned(), -31_536_000, 0)],
+            &[MODEL.to_owned()],
+            &ServiceTierFilter::Any,
+        )
+        .await
+        .unwrap();
+    assert_eq!(before_list.total_count, 2);
+    assert_eq!(before_flex, 2);
+    assert_eq!(before_trailing.len(), 1);
+    assert_eq!(before_trailing[0].count, 2);
+
+    let outcome = archive(&request_manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(outcome.groups_archived, 1);
+    assert_wholly_retained(&pool, &first).await;
+    assert_wholly_live(&pool, &second).await;
+
+    // Recreate the retained request's live identity to model a stale route or
+    // repair overlap. Public unions must prefer this live row and suppress the
+    // retained copy rather than double-counting one logical request.
+    sqlx::query(
+        r#"
+        INSERT INTO request_templates (
+            id, file_id, endpoint, method, path, body, model, api_key,
+            line_number, body_byte_size, created_at, updated_at
+        ) VALUES (
+            $1, NULL, 'http://retention.invalid', 'POST', '/v1/responses',
+            '{"prompt":"duplicate"}', $2, 'secret-test-key', 0, 22,
+            '2026-08-01 08:00:00Z', '2026-08-01 10:00:00Z'
+        )
+        "#,
+    )
+    .bind(first.template_ids[0])
+    .bind(MODEL)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"
+        INSERT INTO requests (
+            id, batch_id, template_id, model, state, retry_attempt,
+            claimed_at, started_at, response_status, response_body,
+            completed_at, response_size, routed_model, service_tier,
+            created_by, created_at, updated_at
+        ) VALUES (
+            $1, NULL, $2, $3, 'completed', 2,
+            '2026-08-01 09:58:00Z', '2026-08-01 09:59:00Z', 200,
+            '{"answer":"duplicate"}', '2026-08-01 10:00:00Z', 22,
+            $3, 'flex', $4, '2026-08-01 08:00:00Z', '2026-08-01 10:00:00Z'
+        )
+        "#,
+    )
+    .bind(first.request_ids[0])
+    .bind(first.template_ids[0])
+    .bind(MODEL)
+    .bind(OWNER)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Erasure must take the live copy AND the retained copy, or the
+    // retained snapshot resurfaces the moment the live row is gone.
+    request_manager
+        .delete_response_group(first.request_ids[0])
+        .await
+        .unwrap();
+    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM requests WHERE id = $1")
+        .bind(first.request_ids[0])
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let retained: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM retained_response_objects WHERE object_id = $1 OR group_id = $1",
+    )
+    .bind(first.request_ids[0])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let routes: i64 = sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM retained_response_request_routes WHERE request_id = $1) \
+              + (SELECT COUNT(*) FROM retained_response_group_routes WHERE group_id = $1)",
+    )
+    .bind(first.request_ids[0])
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (live, retained, routes),
+        (0, 0, 0),
+        "both copies must be gone"
+    );
+    assert!(matches!(
+        request_manager
+            .get_request_detail(RequestId(first.request_ids[0]))
+            .await,
+        Err(fusillade_arsenal::error::FusilladeError::RequestNotFound(_))
+    ));
+    let listed = request_manager
+        .list_requests(ListRequestsFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.total_count, 1,
+        "only the untouched second graph remains"
+    );
+}
+
+#[sqlx::test]
 async fn read_mixed_live_and_retained_rows_do_not_double_count_or_split_demand(pool: PgPool) {
     install_candidate_index(&pool).await;
     ensure_partition(&pool, archive_date("2026-08-03")).await;

@@ -212,7 +212,7 @@ pub async fn delete_response<P: PoolProvider>(
                 resource: "response".to_string(),
                 id: response_id.clone(),
             },
-            _ => Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!("Response erasure failed"))),
+            _ => erasure_error(&error),
         })?;
 
     // Echo the id back in the canonical OpenAI form (with `resp_` prefix if
@@ -224,4 +224,23 @@ pub async fn delete_response<P: PoolProvider>(
         object_type: ResponseDeletedObjectType::Response,
         deleted: true,
     }))
+}
+
+/// Map a retained-store erasure failure without leaking payload. A day that
+/// is mid-retirement is a retryable conflict, not a server fault; everything
+/// else keeps only its content-free class so the log line is diagnosable.
+fn erasure_error(error: &fusillade::FusilladeError) -> Error {
+    use fusillade::RetainedResponseMaintenanceError as Maintenance;
+    match Maintenance::from_fusillade_error(error) {
+        Some(Maintenance::RetirementPending) => Error::Conflict {
+            message: "Response erasure is temporarily unavailable while retention maintenance runs; retry shortly".to_string(),
+            conflicts: None,
+        },
+        Some(class) => Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!(
+            "Response erasure failed ({class:?})"
+        ))),
+        None => Error::Database(crate::db::errors::DbError::Other(anyhow::anyhow!(
+            "Response erasure failed (storage)"
+        ))),
+    }
 }

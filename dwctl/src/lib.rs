@@ -689,7 +689,10 @@ fn partition_maintenance_required(daemon: &config::DaemonConfig, state: Retained
     if state.retired_routes_exist && (daemon.purge_interval_ms == 0 || daemon.purge_batch_size < 1) {
         anyhow::bail!("retired response route cleanup requires an enabled positive bounded cleanup configuration");
     }
-    Ok(daemon.retained_response_retirement_enabled || daemon.batch_archive_retirement_enabled || state.unfinished_retirements > 0)
+    Ok(daemon.retained_response_retirement_enabled
+        || daemon.batch_archive_retirement_enabled
+        || daemon.template_retirement_enabled
+        || state.unfinished_retirements > 0)
 }
 
 #[cfg(test)]
@@ -1109,7 +1112,7 @@ async fn setup_database(
         )
         .fetch_one(fusillade_pools.write())
         .await
-        .map_err(|_| anyhow::anyhow!("failed to inspect retained-response retirement recovery state"))?;
+        .map_err(|error| anyhow::anyhow!("failed to inspect retained-response retirement recovery state: {error}"))?;
         let required = partition_maintenance_required(
             daemon,
             RetainedResponseMaintenanceState {
@@ -2840,19 +2843,31 @@ async fn stop_leader_fusillade_daemon(
             tracing::info!("Fusillade daemon stopped cooperatively after leadership loss");
         }
         Ok(Ok(Err(error))) => {
-            tracing::error!(
+            crate::background_error!(
+                crate::metrics::errors::component::LEADER_ELECTION,
+                "daemon_stop_failed",
+                Error,
                 error = %error,
                 "Fusillade daemon failed while stopping after leadership loss"
             );
         }
         Ok(Err(error)) => {
-            tracing::error!(
+            crate::background_error!(
+                crate::metrics::errors::component::LEADER_ELECTION,
+                "daemon_stop_panicked",
+                Error,
                 error = %error,
                 "Fusillade daemon task panicked while stopping after leadership loss"
             );
         }
         Err(_) => {
-            tracing::warn!(
+            // Maintenance workers were not drained cooperatively: a
+            // destructive phase may have been cut mid-flight (journaled, so
+            // recoverable, but worth paging on).
+            crate::background_error!(
+                crate::metrics::errors::component::LEADER_ELECTION,
+                "daemon_stop_timeout",
+                Critical,
                 grace_seconds = grace.as_secs_f64(),
                 "Fusillade daemon exceeded the cooperative leadership-loss shutdown grace; aborting"
             );
@@ -2860,7 +2875,10 @@ async fn stop_leader_fusillade_daemon(
             if let Err(error) = handle.await
                 && !error.is_cancelled()
             {
-                tracing::error!(
+                crate::background_error!(
+                    crate::metrics::errors::component::LEADER_ELECTION,
+                    "daemon_stop_abort_failed",
+                    Error,
                     error = %error,
                     "Fusillade daemon task failed after leadership-loss abort"
                 );

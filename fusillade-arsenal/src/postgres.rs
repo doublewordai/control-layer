@@ -3521,7 +3521,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             -- join on the two-generation view is avoided.
             LEFT JOIN LATERAL (
                 SELECT * FROM request_templates_all t
-                WHERE t.id = r.template_id AND t.file_id = b.file_id
+                WHERE t.id = r.template_id AND t.file_id IS NOT DISTINCT FROM b.file_id
                 LIMIT 1
             ) t ON TRUE
             "#,
@@ -6204,7 +6204,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             -- join on the two-generation view is avoided.
             LEFT JOIN LATERAL (
                 SELECT * FROM request_templates_all t
-                WHERE t.id = r.template_id AND t.file_id = b.file_id
+                WHERE t.id = r.template_id AND t.file_id IS NOT DISTINCT FROM b.file_id
                 LIMIT 1
             ) t ON TRUE
             WHERE b.deleted_at IS NULL
@@ -8836,14 +8836,45 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             ))
         })?
         .rows_affected() as i64;
-        let total =
-            (requests_deleted + archived_deleted + templates_deleted + g2_templates_deleted) as u64;
+        // Step 2c: a pending request whose template is gone (purged above, or
+        // its weekly partition retired) can never be claimed, and without the
+        // old ON DELETE SET NULL it would otherwise occupy a claim slot on
+        // every tick. Both existence probes are primary-key lookups.
+        let stranded_failed = sqlx::query(
+            r#"
+            UPDATE requests
+               SET state = 'failed',
+                   error = 'request template no longer exists',
+                   failed_at = NOW()
+             WHERE id IN (
+                   SELECT r.id
+                     FROM requests r
+                    WHERE r.state = 'pending'
+                      AND r.template_id IS NOT NULL
+                      AND NOT EXISTS (SELECT 1 FROM request_templates t WHERE t.id = r.template_id)
+                      AND NOT EXISTS (SELECT 1 FROM request_template_routes rt WHERE rt.template_id = r.template_id)
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+             )
+            "#,
+        )
+        .bind(batch_size)
+        .execute(self.write_executor())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail stranded requests: {e}")))?
+        .rows_affected() as i64;
+        let total = (requests_deleted
+            + archived_deleted
+            + templates_deleted
+            + g2_templates_deleted
+            + stranded_failed) as u64;
         if total > 0 {
             tracing::info!(
                 requests_deleted,
                 archived_deleted,
                 templates_deleted,
                 g2_templates_deleted,
+                stranded_failed,
                 "Purged orphaned rows"
             );
         }
@@ -8935,6 +8966,21 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         }
         if batch.counts_frozen_at.is_none() {
             return Ok(ArchiveOutcome::SkippedNotFrozen);
+        }
+
+        // Hold a share lock on the target week's registry row for the rest
+        // of the move. Retirement fences a week by UPDATEing this row, so a
+        // fence either waits for this move to commit or was already visible
+        // here; rows can never land in a week after it was fenced.
+        let bucket_state: Option<String> = sqlx::query_scalar(
+            "SELECT state FROM batch_archive_buckets WHERE week_start = $1 FOR SHARE",
+        )
+        .bind(batch.bucket)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock archive bucket: {}", e)))?;
+        if bucket_state.is_some_and(|state| state != "active") {
+            return Ok(ArchiveOutcome::SkippedNoPartition);
         }
 
         // Graceful degradation: a missing partition
@@ -14113,6 +14159,107 @@ mod tests {
             bucket,
             Some(current_week),
             "the batch must be stamped into the current week"
+        );
+    }
+
+    /// A week that is fenced (`retiring`) but whose partition still exists
+    /// must not receive rows either: the mover diverts to the current week.
+    #[sqlx::test]
+    async fn test_archive_batch_in_a_retiring_week_lands_in_the_current_week(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_frozen_batch(&manager, &pool, "arch-retiring-week", 2).await;
+        sqlx::query!(
+            "UPDATE batches SET created_at = '2020-01-06T12:00:00Z' WHERE id = $1",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("SELECT ensure_archive_partitions_for('2020-01-06'::date)")
+            .execute(&pool)
+            .await
+            .ok();
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS batch_requests_archive_y2020w02 PARTITION OF batch_requests_archive FOR VALUES FROM ('2020-01-06') TO ('2020-01-13')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO batch_archive_buckets (week_start, partition_schema, partition_table, partition_oid, state) \
+             VALUES ('2020-01-06', current_schema(), 'batch_requests_archive_y2020w02', 'batch_requests_archive_y2020w02'::regclass::oid, 'retiring') \
+             ON CONFLICT (week_start) DO UPDATE SET state = 'retiring'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { .. }
+        ));
+        let (location, bucket, live, archived) = archive_state(&pool, batch_id).await;
+        assert_eq!(location, "archive");
+        assert_eq!((live, archived), (0, 2));
+        let current_week: chrono::NaiveDate =
+            sqlx::query_scalar("SELECT date_trunc('week', now() AT TIME ZONE 'UTC')::date")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(bucket, Some(current_week));
+        let landed_in_fenced_week: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM batch_requests_archive_y2020w02")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            landed_in_fenced_week, 0,
+            "a fenced week must never receive rows"
+        );
+    }
+
+    /// Without the old ON DELETE SET NULL, a pending request whose template
+    /// was purged would sit in the claim window forever. The orphan purge
+    /// fails it instead.
+    #[sqlx::test]
+    async fn test_purge_fails_pending_requests_whose_template_is_gone(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let stranded = setup_freeze_test_batch(&manager, "purge-stranded", 2).await;
+        let healthy = setup_freeze_test_batch(&manager, "purge-healthy", 1).await;
+        sqlx::query!(
+            "DELETE FROM request_templates WHERE id IN (SELECT template_id FROM requests WHERE batch_id = $1)",
+            *stranded as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let purged = manager.purge_orphaned_rows(100).await.unwrap();
+        assert_eq!(purged, 2, "both stranded requests must be failed");
+        let states: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT state, error FROM requests WHERE batch_id = $1 ORDER BY id")
+                .bind(*stranded as Uuid)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert!(states.iter().all(|(state, error)| state == "failed"
+            && error.as_deref() == Some("request template no longer exists")));
+        let healthy_pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM requests WHERE batch_id = $1 AND state = 'pending'",
+        )
+        .bind(*healthy as Uuid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            healthy_pending, 1,
+            "requests with a live template are untouched"
         );
     }
 

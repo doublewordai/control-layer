@@ -165,7 +165,10 @@ pub async fn leader_election_task<F1, F2, Fut1, Fut2>(
                         tracing::warn!("Lost leadership (connection died): {}", e);
                         info!("Lost leadership");
                         is_leader.store(false, Ordering::Relaxed);
-                        leader_conn = None;
+                        // The ping failing does not prove the session is dead: a
+                        // statement timeout leaves it alive and still holding the
+                        // advisory lock. Never return such a connection to the pool.
+                        release_leader_connection(&mut leader_conn, lock_id).await;
 
                         if let Err(e) = on_lose_leadership(pool.clone(), config.clone()).await {
                             crate::background_error!(

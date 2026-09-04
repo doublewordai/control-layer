@@ -3092,6 +3092,12 @@ impl Config {
                         .to_string(),
             });
         }
+        if owns_archive_maintenance && daemon.template_retirement_enabled && daemon.template_retention_days.is_none_or(|days| days < 1) {
+            return Err(Error::Internal {
+                operation: "Config validation: template partition retirement requires an explicit positive template_retention_days"
+                    .to_string(),
+            });
+        }
         if owns_archive_maintenance
             && batchless_movement_enabled
             && (daemon.batchless_archive_groups_per_tick <= 0 || daemon.batchless_archive_bytes_per_tick <= 0)

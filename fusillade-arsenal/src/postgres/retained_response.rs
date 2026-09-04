@@ -982,7 +982,9 @@ pub(crate) async fn get_request_detail<P: PoolProvider>(
             request.response_body, request.error, request.service_tier,
             request.created_by
         FROM requests request
-        LEFT JOIN request_templates template ON request.template_id = template.id
+        LEFT JOIN LATERAL (
+            SELECT * FROM request_templates_all t WHERE t.id = request.template_id LIMIT 1
+        ) template ON TRUE
         LEFT JOIN files file ON template.file_id = file.id
         WHERE request.id = $1 AND request.created_by IS NOT NULL
         "#,
@@ -1110,6 +1112,130 @@ const LIST_REQUESTS_COUNT_SQL: &str = r#"
           )
     )::bigint
 "#;
+const LIVE_REQUEST_COUNT_SQL: &str = r#"
+        SELECT COUNT(*)
+        FROM requests request
+        WHERE request.created_by IS NOT NULL
+          AND ($1::text IS NULL OR request.created_by = $1)
+          AND ($2::text IS NULL OR request.state = $2)
+          AND ($3::text[] IS NULL OR request.model = ANY($3))
+          AND ($4::timestamptz IS NULL OR request.created_at >= $4)
+          AND ($5::timestamptz IS NULL OR request.created_at <= $5)
+          AND ($6::text[] IS NULL OR request.service_tier = ANY($6))
+"#;
+
+const RETAINED_REQUEST_COUNT_SQL: &str = r#"
+        SELECT COUNT(*)
+        FROM retained_response_buckets bucket
+        JOIN pg_namespace namespace
+          ON namespace.nspname = bucket.partition_schema
+        JOIN pg_class child
+          ON child.relnamespace = namespace.oid
+         AND child.relname = bucket.partition_table
+         AND child.oid = bucket.partition_oid
+        JOIN pg_inherits inheritance
+          ON inheritance.inhrelid = child.oid
+         AND NOT inheritance.inhdetachpending
+        JOIN retained_response_objects object
+          ON object.delete_on = bucket.delete_on
+         AND object.object_kind = 'request'
+        JOIN retained_response_request_routes route
+          ON route.request_id = object.object_id
+         AND route.group_id = object.group_id
+         AND route.delete_on = object.delete_on
+        JOIN retained_response_group_routes group_route
+          ON group_route.group_id = object.group_id
+         AND group_route.delete_on = object.delete_on
+        WHERE bucket.state = 'active'
+          AND bucket.partition_schema = current_schema()
+          AND bucket.partition_table =
+              'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+          AND inheritance.inhparent =
+              to_regclass(format('%I.retained_response_objects', current_schema()))
+          AND pg_get_expr(child.relpartbound, child.oid) = format(
+              'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+          )
+          AND object.created_by IS NOT NULL
+          AND ($1::text IS NULL OR object.created_by = $1)
+          AND ($2::text IS NULL OR object.state = $2)
+          AND ($3::text[] IS NULL OR object.model = ANY($3))
+          AND ($4::timestamptz IS NULL OR object.created_at >= $4)
+          -- V1 proves created_at < delete_on, so this necessary lower
+          -- bound enables daily partition pruning.
+          AND ($4::timestamptz IS NULL OR object.delete_on > ($4 AT TIME ZONE 'UTC')::date)
+          AND ($5::timestamptz IS NULL OR object.created_at <= $5)
+          AND ($6::text[] IS NULL OR object.service_tier = ANY($6))
+          AND NOT EXISTS (
+              SELECT 1 FROM requests live
+              WHERE live.id = object.object_id AND live.created_by IS NOT NULL
+          )
+"#;
+
+/// Total-count budget: an exact count is worth a short wait, but an
+/// unfiltered listing over a 100M-row live table is not allowed to hold a
+/// connection for the full scan. Each arm gets `COUNT_BUDGET`; on timeout
+/// (SQLSTATE 57014) the arm falls back to the planner's row estimate, which
+/// tracks within a few percent when statistics are fresh. Runs on the read
+/// pool in its own transaction so it never pins the primary.
+const COUNT_BUDGET: &str = "100ms";
+
+async fn count_requests_with_budget<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    filter: &ListRequestsFilter,
+) -> Result<i64> {
+    let mut tx = manager.begin_read().await.map_err(read_database_failure)?;
+    sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
+        .execute(&mut *tx)
+        .await
+        .map_err(read_database_failure)?;
+    let mut total = 0_i64;
+    for arm in [LIVE_REQUEST_COUNT_SQL, RETAINED_REQUEST_COUNT_SQL] {
+        let exact: std::result::Result<i64, sqlx::Error> = sqlx::query_scalar(arm)
+            .bind(filter.created_by.as_deref())
+            .bind(filter.status.as_deref())
+            .bind(filter.models.as_deref())
+            .bind(filter.created_after)
+            .bind(filter.created_before)
+            .bind(filter.service_tiers.as_deref())
+            .fetch_one(&mut *tx)
+            .await;
+        total += match exact {
+            Ok(n) => n,
+            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
+                // The failed statement aborted this transaction; estimate on a
+                // fresh one (EXPLAIN is planning only, so it is cheap).
+                tx.rollback().await.map_err(read_database_failure)?;
+                tx = manager.begin_read().await.map_err(read_database_failure)?;
+                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(read_database_failure)?;
+                let plan: serde_json::Value = sqlx::query_scalar(&format!(
+                    "EXPLAIN (FORMAT JSON) {}",
+                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+                ))
+                .bind(filter.created_by.as_deref())
+                .bind(filter.status.as_deref())
+                .bind(filter.models.as_deref())
+                .bind(filter.created_after)
+                .bind(filter.created_before)
+                .bind(filter.service_tiers.as_deref())
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(read_database_failure)?;
+                plan.get(0)
+                    .and_then(|p| p.get("Plan"))
+                    .and_then(|p| p.get("Plan Rows"))
+                    .and_then(|r| r.as_f64())
+                    .map(|r| r.round() as i64)
+                    .unwrap_or(0)
+            }
+            Err(e) => return Err(read_database_failure(e)),
+        };
+    }
+    tx.commit().await.map_err(read_database_failure)?;
+    Ok(total)
+}
 
 fn list_requests_page_sql(active_first: bool) -> String {
     let order_clause = if active_first {
@@ -1271,17 +1397,8 @@ pub(crate) async fn list_requests<P: PoolProvider>(
         ));
     }
 
+    let count = count_requests_with_budget(manager, &filter).await?;
     let mut tx = begin_primary_read(manager).await?;
-    let count: i64 = sqlx::query_scalar(LIST_REQUESTS_COUNT_SQL)
-        .bind(filter.created_by.as_deref())
-        .bind(filter.status.as_deref())
-        .bind(filter.models.as_deref())
-        .bind(filter.created_after)
-        .bind(filter.created_before)
-        .bind(filter.service_tiers.as_deref())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(read_database_failure)?;
 
     let query = list_requests_page_sql(filter.active_first);
     let rows = sqlx::query(&query)
@@ -1790,7 +1907,9 @@ async fn lock_live_graph_for_erasure(
                request.template_id,
                COALESCE(template.file_id IS NULL, FALSE) AS dedicated
         FROM requests request
-        LEFT JOIN request_templates template ON template.id = request.template_id
+        LEFT JOIN LATERAL (
+            SELECT * FROM request_templates_all t WHERE t.id = request.template_id LIMIT 1
+        ) template ON TRUE
         WHERE request.id = ANY($1)
         ORDER BY request.id
         "#,
@@ -2330,6 +2449,22 @@ async fn delete_locked_response_group_in_transaction(
         }
         if deleted_requests != topology.request_ids.len() as u64 {
             return Err(incomplete_graph());
+        }
+        // A late writer may have recreated the live graph after it moved, so
+        // the retained copy can coexist with the live one. Erasure must take
+        // both, or the retained snapshot resurfaces once the live row is gone.
+        if let Some((retained_group_id, delete_on)) =
+            resolve_retained_route(tx, response_id).await?
+        {
+            erase_retained_graph(
+                tx,
+                retained_group_id,
+                response_id,
+                delete_on,
+                expected_creator,
+                max_late_writer_seconds,
+            )
+            .await?;
         }
         return Ok(DeleteResponseGroupOutcome::Deleted(deleted_requests));
     }

@@ -375,9 +375,13 @@ observed healthy:
 1. Build the candidate index with `CREATE INDEX CONCURRENTLY` as a monitored
    standalone operation; application migrations never build indexes on
    existing hot tables.
-2. Apply the expand-only migration. It only adds new relations and helpers;
-   it never scans, rewrites, or locks the existing request, template, or
-   response-step heaps, and deploying it moves no data.
+2. Apply the expand-only migration. It adds new relations and helpers and
+   moves no data. It never scans or rewrites the existing request or
+   template heaps, but two statements take a brief `ACCESS EXCLUSIVE` lock
+   on `requests` (dropping the template foreign key here, and dropping the
+   dead `response_steps` table in the follow-up migration); both run under
+   a short `lock_timeout` so a busy claim path is never queued behind them.
+   Apply in a quiet window and expect one retry if the daemon contends.
 3. Roll out an archive-aware reader fleet everywhere before any movement, so
    every running process can resolve retained routes.
 4. Verify prerequisites with the read-only preflight

@@ -706,6 +706,76 @@ async fn a_chain_can_extend_a_response_after_its_graph_moved_to_the_retained_sto
 
 #[sqlx::test]
 #[test_log::test]
+async fn previous_response_id_of_another_users_response_is_rejected(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+    server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({"model": "gpt-4o", "input": "private first turn", "service_tier": "priority"}))
+        .await
+        .assert_status_ok();
+    let id = poll_completed_row(&pool, uuid::Uuid::nil()).await;
+    let other_user = create_test_user(&pool, Role::StandardUser).await;
+    let other_api_key = format!("sk-foreign-chain-{}", uuid::Uuid::new_v4());
+    sqlx::query("INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by) VALUES ($1, $2, $3, 'realtime', $4, $4)")
+        .bind(uuid::Uuid::new_v4())
+        .bind("Foreign chain test key")
+        .bind(&other_api_key)
+        .bind(other_user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // The other user needs model access too, so a rejection is about the
+    // previous response and not about the model.
+    let extend = |key: String| {
+        let server = &server;
+        async move {
+            server
+                .post("/ai/v1/responses")
+                .add_header("Authorization", &format!("Bearer {key}"))
+                .add_header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "gpt-4o",
+                    "input": "second turn",
+                    "previous_response_id": format!("resp_{id}"),
+                    "service_tier": "priority"
+                }))
+                .await
+        }
+    };
+    let foreign = extend(other_api_key.clone()).await;
+    assert_eq!(foreign.status_code(), axum::http::StatusCode::BAD_REQUEST, "{}", foreign.text());
+    assert!(foreign.text().contains("previous response not found"));
+    // The first turn itself carried the text upstream once; the foreign
+    // extension must not have sent it again.
+    let private_text_sent_upstream = mock_server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| String::from_utf8_lossy(&r.body).contains("private first turn"))
+        .count();
+    assert_eq!(private_text_sent_upstream, 1, "another user's turn must never reach upstream");
+
+    // After the graph moves to the retained store the answer is the same.
+    sqlx::query(
+        "UPDATE fusillade.requests SET created_at = '2026-08-01 08:00:00Z', claimed_at = '2026-08-01 09:58:00Z', started_at = '2026-08-01 09:59:00Z', completed_at = '2026-08-01 10:00:00Z', updated_at = '2026-08-01 10:00:00Z' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    archive_response_graphs(&pool, 1).await;
+    let foreign_after = extend(other_api_key).await;
+    assert_eq!(foreign_after.status_code(), axum::http::StatusCode::BAD_REQUEST);
+    extend(api_key.clone()).await.assert_status_ok();
+}
+
+#[sqlx::test]
+#[test_log::test]
 async fn read_retained_singleton_preserves_response_and_fails_closed_after_drop(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
     mount_chat_completions_mock(&mock_server).await;

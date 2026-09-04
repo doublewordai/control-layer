@@ -865,9 +865,20 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
         Ok(id)
     }
 
-    async fn get_context(&self, response_id: &str) -> Result<Option<serde_json::Value>, StoreError> {
-        // Context lookups need the plaintext body; a shredded ZDR body is
-        // as good as missing, so fold `Gone` into `None` alongside `NotFound`.
+    async fn get_context(&self, response_id: &str, owner: &str) -> Result<Option<serde_json::Value>, StoreError> {
+        // Ownership is checked on the resolved row (live or retained) before
+        // any content is returned: a foreign or batch response reads as absent.
+        let parsed_uuid = parse_response_id(response_id)?;
+        let detail = match self.request_manager.get_request_detail(RequestId(parsed_uuid)).await {
+            Ok(detail) => detail,
+            Err(fusillade::FusilladeError::RequestNotFound(_)) => return Ok(None),
+            Err(e) => return Err(StoreError::StorageError(format!("Failed to fetch previous response: {e}"))),
+        };
+        if detail.created_by != owner {
+            return Ok(None);
+        }
+        // Context lookups are never ZDR, so `Gone` cannot arise here; fold it
+        // into `None` alongside `NotFound` for a total mapping.
         Ok(match self.get_response(response_id).await? {
             ResponseLookup::Found(v) => Some(v),
             ResponseLookup::NotFound | ResponseLookup::Gone => None,

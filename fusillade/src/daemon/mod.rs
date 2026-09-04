@@ -22,6 +22,7 @@ use crate::FusilladeError;
 use crate::batch::BatchId;
 use crate::error::Result;
 use crate::http::HttpClient;
+use crate::manager::RetainedResponseMaintenanceError;
 use crate::manager::{
     ArchiveOutcome, DaemonStorage, RetainedResponseArchiveCutoffs,
     RetainedResponseRetirementOutcome, RetentionPolicy, Storage,
@@ -409,6 +410,21 @@ fn retained_archive_cutoffs_at(
         .map_err(FusilladeError::ValidationError)
 }
 
+/// Content-free classification for maintenance failures: the variant name of
+/// a `RetainedResponseMaintenanceError` when the failure is one, otherwise a
+/// coarse bucket. Never carries payload, so it is safe on the log line and
+/// lets an operator tell an identity mismatch (never self-heals) from a
+/// transient database failure.
+fn maintenance_error_class(error: &FusilladeError) -> String {
+    if let Some(class) = RetainedResponseMaintenanceError::from_fusillade_error(error) {
+        return format!("{class:?}");
+    }
+    match error {
+        FusilladeError::ValidationError(_) => "validation".to_string(),
+        _ => "other".to_string(),
+    }
+}
+
 async fn run_weekly_archive_partition_maintenance_loop<S>(
     storage: Arc<S>,
     shutdown: tokio_util::sync::CancellationToken,
@@ -630,10 +646,11 @@ async fn run_template_retirement_loop<S>(
                         }
                     }
                     Ok(None) => return,
-                    Err(_) => {
+                    Err(error) => {
                         crate::background_error!(
                             "file_content_expiry_failed",
                             Error,
+                            error_class = %maintenance_error_class(&error),
                             "Failed to expire aged file content"
                         );
                         break;
@@ -663,10 +680,11 @@ async fn run_template_retirement_loop<S>(
                 period.min(Duration::from_secs(300))
             }
             Ok(None) => break,
-            Err(_) => {
+            Err(error) => {
                 crate::background_error!(
                     "template_partition_retirement_failed",
                     Error,
+                    error_class = %maintenance_error_class(&error),
                     "Failed to retire template partition"
                 );
                 period.min(Duration::from_secs(30))
@@ -710,10 +728,11 @@ async fn run_batch_archive_retirement_loop<S>(
                 period.min(Duration::from_secs(300))
             }
             Ok(None) => break,
-            Err(_) => {
+            Err(error) => {
                 crate::background_error!(
                     "batch_archive_partition_retirement_failed",
                     Error,
+                    error_class = %maintenance_error_class(&error),
                     "Failed to retire batch-archive partition"
                 );
                 period.min(Duration::from_secs(30))
@@ -748,10 +767,11 @@ async fn run_retained_response_route_cleanup_loop<S>(
                 counter!("fusillade_retained_response_routes_cleaned_total").increment(deleted);
             }
             Ok(None) => break,
-            Err(_) => {
+            Err(error) => {
                 crate::background_error!(
                     "retained_response_route_cleanup_failed",
                     Error,
+                    error_class = %maintenance_error_class(&error),
                     "Failed to clean retained-response routes"
                 );
             }
@@ -769,10 +789,11 @@ async fn run_retained_response_route_cleanup_loop<S>(
                 counter!("fusillade_template_routes_cleaned_total").increment(deleted);
             }
             Ok(None) => break,
-            Err(_) => {
+            Err(error) => {
                 crate::background_error!(
                     "template_route_cleanup_failed",
                     Error,
+                    error_class = %maintenance_error_class(&error),
                     "Failed to clean retired template routes"
                 );
             }
@@ -791,10 +812,11 @@ async fn run_retained_response_route_cleanup_loop<S>(
                 counter!("fusillade_retained_response_fences_cleaned_total").increment(deleted);
             }
             Ok(None) => break,
-            Err(_) => {
+            Err(error) => {
                 crate::background_error!(
                     "retained_response_fence_cleanup_failed",
                     Error,
+                    error_class = %maintenance_error_class(&error),
                     "Failed to clean expired retained-response fences"
                 );
             }
