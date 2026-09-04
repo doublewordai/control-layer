@@ -2269,6 +2269,12 @@ async fn archive_clock(pool: &PgPool) -> (DateTime<Utc>, DateTime<Utc>) {
 
 #[sqlx::test]
 async fn postgres_reports_exact_retained_response_index_readiness(pool: PgPool) {
+    // The migrations build the exact index; start from the "absent" state
+    // this test reasons about.
+    sqlx::query("DROP INDEX IF EXISTS idx_requests_batchless_retention_due")
+        .execute(&pool)
+        .await
+        .unwrap();
     let manager = manager(&pool).await;
     assert!(manager.supports_retained_response_lifecycle());
     assert!(
@@ -2278,7 +2284,7 @@ async fn postgres_reports_exact_retained_response_index_readiness(pool: PgPool) 
             .expect("missing candidate index must be reported")
     );
 
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due ON requests (id)")
+    sqlx::query("CREATE INDEX idx_requests_batchless_retention_due ON requests (id)")
         .execute(&pool)
         .await
         .expect("wrong-shape candidate index must install");
@@ -3396,6 +3402,12 @@ async fn nonpositive_limits_are_noops_even_without_candidate_index(pool: PgPool)
 
 #[sqlx::test]
 async fn missing_validated_candidate_index_fails_closed(pool: PgPool) {
+    // The migrations build the index; remove it to model an environment
+    // where it is missing or was dropped.
+    sqlx::query("DROP INDEX IF EXISTS idx_requests_batchless_retention_due")
+        .execute(&pool)
+        .await
+        .unwrap();
     let graph = singleton(
         &pool,
         "flex",
