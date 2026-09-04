@@ -843,9 +843,6 @@ struct ArchiveMoverTick {
     cancel_grace_secs: f64,
     batchless_group_limit: i64,
     batchless_byte_limit: i64,
-    /// Graphs the overdue path moves at the same time within one tick; the
-    /// sweep's steady path is always sequential.
-    batchless_concurrency: usize,
 }
 
 async fn run_batch_archive_phase<S>(
@@ -971,26 +968,7 @@ async fn run_batchless_archive_phase<S>(
     S: DaemonStorage,
 {
     let started = std::time::Instant::now();
-    let movers = if tick.include_overdue {
-        tick.batchless_concurrency.max(1)
-    } else {
-        1
-    };
-    // Reset on every exit path, including a panic or cancellation inside
-    // the spawned tick, so the gauge can never stay stuck at a stale count.
-    struct MoversGaugeGuard {
-        worker: &'static str,
-    }
-    impl Drop for MoversGaugeGuard {
-        fn drop(&mut self) {
-            gauge!("fusillade_retained_response_movers_active", "worker" => self.worker).set(0.0);
-        }
-    }
-    gauge!("fusillade_retained_response_movers_active", "worker" => tick.worker).set(movers as f64);
-    let _movers_gauge_guard = MoversGaugeGuard {
-        worker: tick.worker,
-    };
-    let result = maintenance_query(
+    match maintenance_query(
         shutdown,
         "retained response archive move",
         query_timeout,
@@ -1002,7 +980,6 @@ async fn run_batchless_archive_phase<S>(
                         cutoffs,
                         tick.batchless_group_limit,
                         tick.batchless_byte_limit,
-                        movers,
                     )
                     .await
             } else {
@@ -1017,9 +994,8 @@ async fn run_batchless_archive_phase<S>(
             }
         },
     )
-    .await;
-    drop(_movers_gauge_guard);
-    match result {
+    .await
+    {
         Ok(Some(outcome)) => {
             counter!("fusillade_retained_response_groups_archived_total", "worker" => tick.worker)
                 .increment(outcome.groups_archived);
@@ -1057,16 +1033,10 @@ async fn run_batchless_archive_phase<S>(
         }
         Ok(None) => {}
         Err(error) => {
-            // A failed pass has not proven the queue empty: keep the
-            // "may have more" signal raised so a drain operator never reads a
-            // failing worker as drained.
-            gauge!("fusillade_retained_response_archive_may_have_more", "worker" => tick.worker)
-                .set(1.0);
             crate::background_error!(
                 "retained_response_archive_failed",
                 Error,
                 worker = tick.worker,
-                error_class = %maintenance_error_class(&error),
                 error = %error,
                 "Failed to archive retained-response graphs"
             );
@@ -1270,13 +1240,6 @@ fn validate_retention_startup(
     {
         return Err(FusilladeError::ValidationError(
             "batchless archive group and byte budgets must be positive".to_string(),
-        ));
-    }
-    if config.batchless_archive_backfill_enabled()
-        && config.batchless_archive_backfill_concurrency() == 0
-    {
-        return Err(FusilladeError::ValidationError(
-            "batchless archive backfill concurrency must be positive when enabled".to_string(),
         ));
     }
     if batchless_policy_configured && config.retained_response_partitions_days_ahead() <= 0 {
@@ -1499,7 +1462,6 @@ fn daemon_config_snapshot(
             "batchless_archive_backfill_enabled": retention.batchless_archive_backfill_enabled(),
             "batchless_archive_groups_per_tick": retention.batchless_archive_groups_per_tick(),
             "batchless_archive_bytes_per_tick": retention.batchless_archive_bytes_per_tick(),
-            "batchless_archive_backfill_concurrency": retention.batchless_archive_backfill_concurrency(),
             "retained_response_partitions_days_ahead": retention.retained_response_partitions_days_ahead(),
             "retained_response_retirement_enabled": retention.retained_response_retirement_enabled(),
         },
@@ -3434,14 +3396,6 @@ where
                     batchless_byte_limit: self
                         .retention_maintenance
                         .batchless_archive_bytes_per_tick(),
-                    // Only the backfill worker owns the overdue path, and only
-                    // that path fans out; the sweep stays sequential.
-                    batchless_concurrency: if worker == "backfill" {
-                        self.retention_maintenance
-                            .batchless_archive_backfill_concurrency()
-                    } else {
-                        1
-                    },
                 };
                 let handle = tokio::spawn(async move {
                     tracing::info!(
@@ -3819,7 +3773,6 @@ mod tests {
         fence_cleanup_calls: AtomicUsize,
         fail_route_cleanup: std::sync::atomic::AtomicBool,
         batchless_cutoffs: std::sync::Mutex<Vec<RetainedResponseArchiveCutoffs>>,
-        overdue_concurrency: std::sync::Mutex<Vec<usize>>,
         fail_weekly: std::sync::atomic::AtomicBool,
         fail_retained: std::sync::atomic::AtomicBool,
         block_retained: std::sync::atomic::AtomicBool,
@@ -3850,7 +3803,6 @@ mod tests {
                 fence_cleanup_calls: AtomicUsize::new(0),
                 fail_route_cleanup: std::sync::atomic::AtomicBool::new(false),
                 batchless_cutoffs: std::sync::Mutex::new(Vec::new()),
-                overdue_concurrency: std::sync::Mutex::new(Vec::new()),
                 fail_weekly: std::sync::atomic::AtomicBool::new(false),
                 fail_retained: std::sync::atomic::AtomicBool::new(false),
                 block_retained: std::sync::atomic::AtomicBool::new(false),
@@ -3935,11 +3887,9 @@ mod tests {
             cutoffs: &RetainedResponseArchiveCutoffs,
             _max_groups: i64,
             _max_bytes: i64,
-            concurrency: usize,
         ) -> Result<crate::RetainedResponseArchiveOutcome> {
             self.batchless_calls.fetch_add(1, Ordering::SeqCst);
             self.batchless_cutoffs.lock().unwrap().push(*cutoffs);
-            self.overdue_concurrency.lock().unwrap().push(concurrency);
             self.record("batchless_overdue_move");
             Ok(crate::RetainedResponseArchiveOutcome::default())
         }
@@ -4118,7 +4068,6 @@ mod tests {
             cancel_grace_secs: 1.0,
             batchless_group_limit: 1,
             batchless_byte_limit: 1,
-            batchless_concurrency: 1,
         }
     }
 
@@ -4527,108 +4476,6 @@ mod tests {
         .await;
         assert_eq!(storage.batchless_calls.load(Ordering::SeqCst), 1);
         assert_eq!(storage.index_readiness_calls.load(Ordering::SeqCst), 3);
-    }
-
-    #[tokio::test]
-    async fn backfill_tick_fans_out_the_overdue_path_and_reports_active_movers() {
-        let recorder = GaugeHistoryRecorder::default();
-        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
-        let storage = Arc::new(FakeMaintenanceStorage::default());
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let policy = configured_batchless_maintenance().policy().clone();
-        let mut tick = mover_tick(false, true);
-        tick.worker = "backfill";
-        tick.include_overdue = true;
-        tick.batchless_concurrency = 6;
-
-        run_archive_mover_tick(
-            storage.clone(),
-            &shutdown,
-            Duration::from_secs(1),
-            &policy,
-            tick,
-            &std::sync::atomic::AtomicBool::new(true),
-        )
-        .await;
-
-        assert_eq!(
-            *storage.overdue_concurrency.lock().unwrap(),
-            vec![6],
-            "the configured concurrency must reach the storage's overdue mover"
-        );
-        assert_eq!(
-            recorder.values("fusillade_retained_response_movers_active"),
-            vec![6.0, 0.0],
-            "active movers are reported for the tick and cleared afterwards"
-        );
-    }
-
-    #[tokio::test]
-    async fn sweep_tick_never_fans_out_the_steady_path() {
-        let recorder = GaugeHistoryRecorder::default();
-        let _recorder_guard = metrics::set_default_local_recorder(&recorder);
-        let storage = Arc::new(FakeMaintenanceStorage::default());
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        let policy = configured_batchless_maintenance().policy().clone();
-        let mut tick = mover_tick(false, true);
-        tick.worker = "sweep";
-        tick.batchless_concurrency = 6;
-
-        run_archive_mover_tick(
-            storage.clone(),
-            &shutdown,
-            Duration::from_secs(1),
-            &policy,
-            tick,
-            &std::sync::atomic::AtomicBool::new(true),
-        )
-        .await;
-
-        assert!(storage.overdue_concurrency.lock().unwrap().is_empty());
-        assert_eq!(*storage.events.lock().unwrap(), vec!["batchless_move"]);
-        assert_eq!(
-            recorder.values("fusillade_retained_response_movers_active"),
-            vec![1.0, 0.0]
-        );
-    }
-
-    #[test]
-    fn backfill_concurrency_must_be_positive_only_while_backfill_is_enabled() {
-        let validate = |config: &RetentionMaintenanceConfig| {
-            validate_retention_startup(
-                config,
-                DaemonMode::Both,
-                true,
-                true,
-                1,
-                1,
-                ArchiveMovementWindows::new(0.0, 30.0),
-            )
-        };
-        let disabled = configured_batchless_maintenance()
-            .with_batchless_archive_backfill_enabled(false)
-            .with_batchless_archive_backfill_concurrency(0);
-        assert!(validate(&disabled).is_ok());
-
-        let enabled = configured_batchless_maintenance()
-            .with_batchless_archive_backfill_enabled(true)
-            .with_batchless_archive_backfill_concurrency(0);
-        assert!(
-            validate(&enabled)
-                .unwrap_err()
-                .to_string()
-                .contains("backfill concurrency")
-        );
-
-        let fanned_out = configured_batchless_maintenance()
-            .with_batchless_archive_backfill_enabled(true)
-            .with_batchless_archive_backfill_concurrency(16);
-        assert!(validate(&fanned_out).is_ok());
-        assert_eq!(
-            daemon_config_snapshot(&DaemonConfig::default(), &fanned_out)["retention_maintenance"]
-                ["controls"]["batchless_archive_backfill_concurrency"],
-            serde_json::json!(16)
-        );
     }
 
     #[tokio::test(start_paused = true)]
