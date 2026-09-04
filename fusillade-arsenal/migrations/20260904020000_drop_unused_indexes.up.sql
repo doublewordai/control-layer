@@ -1,4 +1,4 @@
--- Drop twelve indexes that are unused or strictly redundant (COR-651).
+-- Drop fourteen indexes that are unused or strictly redundant (COR-651).
 --
 -- From the index audit in COR-537. Every verdict below is backed by BOTH a code
 -- reading (no query needs the index, or an equivalent index serves the same
@@ -94,6 +94,37 @@
 --     columns (20,767 such statements in the window).
 --
 -- ---------------------------------------------------------------------------
+-- The same two dead shapes, mirrored onto the generation-2 template table
+-- ---------------------------------------------------------------------------
+--
+--   idx_request_templates_g2_custom_id
+--   idx_request_templates_g2_model
+--
+--     20260818000000 created request_templates_g2 with four indexes under the
+--     comment "Mirror the legacy read paths so per-file streaming, model
+--     grouping, and custom-id lookups keep their index shapes inside each
+--     weekly child" — but two of the four shapes it faithfully mirrored are the
+--     dead ones above, so the new table inherited the legacy table's dead
+--     weight. Every production read of g2 keys on file_id (per-file streaming
+--     and the per-file model counts) or on created_on (retirement and partition
+--     pruning), served by idx_request_templates_g2_file_line,
+--     idx_request_templates_g2_file_model and the (created_on, id) primary key.
+--     A `WHERE file_id = $1 GROUP BY model` shape is served by file_model, so
+--     the standalone model index adds nothing even there.
+--
+--     NOT dropped: idx_request_templates_g2_id, added by 20260903000000 for the
+--     routed by-id probe. It reads as unused while generation-2 writes are
+--     disabled, which is not evidence about the probe.
+--
+--     Mechanics: both are partitioned indexes, so dropping the parent cascades
+--     to every attached child. Because ensure_request_template_partition builds
+--     each weekly partition with `LIKE request_templates_g2 INCLUDING ALL`,
+--     dropping them here also stops future partitions inheriting them — no
+--     change to that function is required. DROP INDEX on a partitioned index
+--     cannot be run CONCURRENTLY, so these two are absent from the
+--     out-of-band list below.
+--
+-- ---------------------------------------------------------------------------
 -- Deliberately NOT dropped
 -- ---------------------------------------------------------------------------
 --
@@ -150,3 +181,6 @@ DROP INDEX IF EXISTS idx_batches_error_file_id;
 DROP INDEX IF EXISTS idx_daemons_created_at;
 DROP INDEX IF EXISTS idx_daemons_heartbeat;
 DROP INDEX IF EXISTS idx_daemons_status;
+
+DROP INDEX IF EXISTS idx_request_templates_g2_custom_id;
+DROP INDEX IF EXISTS idx_request_templates_g2_model;
