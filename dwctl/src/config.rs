@@ -1844,6 +1844,15 @@ pub struct DaemonConfig {
     #[serde(default = "default_batchless_archive_bytes_per_tick")]
     pub batchless_archive_bytes_per_tick: i64,
 
+    /// Graphs the backfill worker moves concurrently within one tick. This
+    /// is the drain-throughput lever for the one-off historical drain: each
+    /// graph move is its own short transaction, so a tick's wall-clock time
+    /// is dominated by per-move round trips. The steady sweep is always
+    /// sequential. Must be at least 1 while the backfill is enabled; size the
+    /// fusillade write pool to hold this many extra connections.
+    #[serde(default = "default_batchless_archive_backfill_concurrency")]
+    pub batchless_archive_backfill_concurrency: usize,
+
     /// Daily retained-response partition runway maintained by the archive owner.
     #[serde(default = "default_retained_response_partitions_days_ahead")]
     pub retained_response_partitions_days_ahead: i32,
@@ -2030,6 +2039,10 @@ fn default_batchless_archive_groups_per_tick() -> i64 {
 
 fn default_batchless_archive_bytes_per_tick() -> i64 {
     fusillade::RetentionMaintenanceConfig::default().batchless_archive_bytes_per_tick()
+}
+
+fn default_batchless_archive_backfill_concurrency() -> usize {
+    fusillade::RetentionMaintenanceConfig::default().batchless_archive_backfill_concurrency()
 }
 
 fn default_retained_response_partitions_days_ahead() -> i32 {
@@ -2223,6 +2236,7 @@ impl Default for DaemonConfig {
             batchless_archive_backfill_enabled: false,
             batchless_archive_groups_per_tick: default_batchless_archive_groups_per_tick(),
             batchless_archive_bytes_per_tick: default_batchless_archive_bytes_per_tick(),
+            batchless_archive_backfill_concurrency: default_batchless_archive_backfill_concurrency(),
             retained_response_partitions_days_ahead: default_retained_response_partitions_days_ahead(),
             retained_response_retirement_enabled: false,
             batch_archive_retirement_enabled: false,
@@ -2262,6 +2276,7 @@ impl DaemonConfig {
             .with_batchless_archive_sweep_enabled(self.batchless_archive_sweep_enabled)
             .with_batchless_archive_backfill_enabled(self.batchless_archive_backfill_enabled)
             .with_batchless_archive_limits(self.batchless_archive_groups_per_tick, self.batchless_archive_bytes_per_tick)
+            .with_batchless_archive_backfill_concurrency(self.batchless_archive_backfill_concurrency)
             .with_retained_response_partitions_days_ahead(self.retained_response_partitions_days_ahead)
             .with_retained_response_retirement_enabled(self.retained_response_retirement_enabled)
             .with_batch_archive_retirement_enabled(self.batch_archive_retirement_enabled)
@@ -3106,6 +3121,12 @@ impl Config {
                 operation: "Config validation: batchless archive group and byte budgets must be positive".to_string(),
             });
         }
+        if owns_archive_maintenance && daemon.batchless_archive_backfill_enabled && daemon.batchless_archive_backfill_concurrency == 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless archive backfill concurrency must be at least 1 when the backfill is enabled"
+                    .to_string(),
+            });
+        }
         if owns_archive_maintenance && batchless_policy_configured && daemon.retained_response_partitions_days_ahead <= 0 {
             return Err(Error::Internal {
                 operation: "Config validation: retained-response partition runway must be positive".to_string(),
@@ -3485,6 +3506,7 @@ mod tests {
             "batchless_archive_backfill_enabled",
             "batchless_archive_groups_per_tick",
             "batchless_archive_bytes_per_tick",
+            "batchless_archive_backfill_concurrency",
             "retained_response_partitions_days_ahead",
             "retained_response_retirement_enabled",
             "batch_archive_retirement_enabled",
@@ -3503,6 +3525,7 @@ mod tests {
         assert!(daemon.retained_response_partition_maintenance_url.is_none());
         assert!(daemon.batchless_archive_groups_per_tick > 0);
         assert!(daemon.batchless_archive_bytes_per_tick > 0);
+        assert_eq!(daemon.batchless_archive_backfill_concurrency, 1);
         assert!(daemon.retained_response_partitions_days_ahead > 0);
 
         let mapped = daemon.to_fusillade_retention_maintenance_config();
@@ -3514,6 +3537,10 @@ mod tests {
         );
         assert_eq!(mapped.batchless_archive_groups_per_tick(), daemon.batchless_archive_groups_per_tick);
         assert_eq!(mapped.batchless_archive_bytes_per_tick(), daemon.batchless_archive_bytes_per_tick);
+        assert_eq!(
+            mapped.batchless_archive_backfill_concurrency(),
+            daemon.batchless_archive_backfill_concurrency
+        );
         assert_eq!(
             mapped.retained_response_partitions_days_ahead(),
             daemon.retained_response_partitions_days_ahead
@@ -3581,6 +3608,20 @@ mod tests {
         daemon.batchless_archive_backfill_enabled = true;
         daemon.batchless_archive_groups_per_tick = 0;
         assert!(config.validate().unwrap_err().to_string().contains("group and byte budgets"));
+
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batchless_archive_backfill_concurrency = 0;
+        assert!(config.validate().is_ok(), "a disabled backfill ignores its concurrency");
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batchless_archive_backfill_enabled = true;
+        // Keep the shared cancellation grace inside the 120s fixture retention
+        // so the only remaining objection is the concurrency itself.
+        daemon.batch_archive_cancel_grace_secs = 60.0;
+        assert!(config.validate().unwrap_err().to_string().contains("backfill concurrency"));
+        config.background_services.batch_daemon.batchless_archive_backfill_concurrency = 16;
+        assert!(config.validate().is_ok());
 
         let mut config = Config::default();
         config.background_services.batch_daemon.retained_response_retirement_enabled = true;

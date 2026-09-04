@@ -8427,9 +8427,15 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         cutoffs: &RetainedResponseArchiveCutoffs,
         max_groups: i64,
         max_bytes: i64,
+        concurrency: usize,
     ) -> Result<RetainedResponseArchiveOutcome> {
         retained_response::archive_overdue_batchless_responses(
-            self, policy, cutoffs, max_groups, max_bytes,
+            self,
+            policy,
+            cutoffs,
+            max_groups,
+            max_bytes,
+            concurrency,
         )
         .await
     }
