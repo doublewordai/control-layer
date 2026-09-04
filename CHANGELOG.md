@@ -1,5 +1,12 @@
 # Changelog
 
+## [11.3.0](https://github.com/doublewordai/control-layer/compare/v11.2.0...v11.3.0) (2026-09-04)
+
+
+### Features
+
+* **prefix_chain:** content-free prompt-structure capture to ClickHouse ([#1555](https://github.com/doublewordai/control-layer/issues/1555)) ([7bf9c92](https://github.com/doublewordai/control-layer/commit/7bf9c922aa0dc4d3df871330af2593c75028e593))
+
 ## [11.2.0](https://github.com/doublewordai/control-layer/compare/v11.1.1...v11.2.0) (2026-09-04)
 
 
