@@ -535,9 +535,14 @@ fn an_in_call_seed_owes_only_what_the_client_has_not_received() {
         (r#"{"ci"#, "ty\" string=\"true\">Paris", r#"ty": "Paris"#),
         (r#"{"city""#, " string=\"true\">Paris", r#": "Paris"#),
         (r#"{"city": "Par"#, "is", "is"),
+        // A closed value quote in the delivered args means leg 1's parser saw
+        // the parameter close tag, so the reconstructed prefix ends AFTER
+        // `</｜DSML｜parameter>` + the rule-1 newline — a real leg resumes at
+        // the next parameter, never by re-emitting the close tag (a repeated
+        // close tag is out of grammar and poisons).
         (
             r#"{"city": "Paris""#,
-            "</｜DSML｜parameter>\n<｜DSML｜parameter name=\"unit\" string=\"true\">c",
+            "<｜DSML｜parameter name=\"unit\" string=\"true\">c",
             r#", "unit": "c"#,
         ),
         (r#"{"n": 12"#, "5", "5"),
@@ -844,4 +849,34 @@ fn a_partial_tag_at_finish_is_dropped_not_leaked() {
         })
         .collect();
     assert!(!text.contains("DSML"), "partial closing tag leaked: {text:?}");
+}
+
+/// Out-of-grammar text inside a tool block must poison, not surface as
+/// content: the reconstructor serializes content BEFORE the tool block, so a
+/// chained continuation would reorder those bytes.
+#[test]
+fn garbage_inside_a_tool_block_poisons() {
+    let mut p = Dsv4Forward::new(ForwardSeed::BetweenToolCalls { next_index: 1 });
+    let out = p.feed("\nwhat is this doing here\n<｜DSML｜invoke name=\"f\">");
+    assert!(p.poisoned());
+    assert!(
+        !out.iter().any(|d| matches!(d, ForwardDelta::Content(t) if t.contains("what is"))),
+        "out-of-grammar block text must not become content: {out:?}"
+    );
+}
+
+/// Trailing non-whitespace after the block close is out of grammar for the
+/// same reason — poison rather than emit content that a second resume would
+/// re-order ahead of the tool block.
+#[test]
+fn trailing_text_after_the_block_poisons() {
+    let mut p = Dsv4Forward::new(ForwardSeed::BetweenToolCalls { next_index: 1 });
+    let mut out = p.feed("\n</｜DSML｜tool_calls>");
+    out.extend(p.feed("\n\nBy the way, here is more prose."));
+    out.extend(p.finish());
+    assert!(p.poisoned());
+    assert!(
+        !out.iter().any(|d| matches!(d, ForwardDelta::Content(t) if t.contains("prose"))),
+        "post-block text must not become content: {out:?}"
+    );
 }

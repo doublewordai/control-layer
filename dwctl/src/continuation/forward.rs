@@ -99,6 +99,15 @@ pub trait ForwardParser: Send {
         false
     }
 
+    /// Whether the chat-shaped stream this parser is producing carries tool
+    /// calls. A raw completions leg terminates with `"stop"`, but a chat
+    /// stream that emitted `tool_calls` deltas must finish with
+    /// `finish_reason: "tool_calls"` — clients and request logging key the
+    /// tool loop on it. Other reasons (`length`, …) pass through untouched.
+    fn ends_in_tool_calls(&self) -> bool {
+        false
+    }
+
     /// The leg ended (a `finish_reason` arrived, or the chain closed): flush
     /// whatever is still held back.
     fn finish(&mut self) -> Vec<ForwardDelta>;

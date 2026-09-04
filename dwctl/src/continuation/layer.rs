@@ -710,6 +710,17 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     outcome.record("failed", "parser_overflow");
                     break 'chain;
                 }
+                // A raw completions leg terminates with "stop"; a chat stream
+                // that carried tool_calls deltas must finish with
+                // finish_reason "tool_calls" — clients and request logging key
+                // the tool loop on it. Other reasons (length, …) pass through.
+                let finish_reason = if finish_reason == "stop"
+                    && parser.as_ref().is_some_and(|p| p.ends_in_tool_calls())
+                {
+                    Value::from("tool_calls")
+                } else {
+                    finish_reason
+                };
                 let last = deltas.len().saturating_sub(1);
                 let mut frames: Vec<Value> = deltas
                     .into_iter()

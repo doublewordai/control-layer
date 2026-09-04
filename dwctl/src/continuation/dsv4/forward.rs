@@ -117,6 +117,11 @@ pub struct Dsv4Forward {
     /// The value being read is a `string="true"` one, so it is JSON-escaped and
     /// wrapped in quotes.
     is_string: bool,
+    /// The client's stream carries at least one tool call (seeded mid-block,
+    /// or a call was emitted by this leg) — the chat-shaped `finish_reason`
+    /// for such a stream is `tool_calls`, whatever the raw completions leg
+    /// reported.
+    tool_calls_emitted: bool,
 }
 
 impl Dsv4Forward {
@@ -132,6 +137,7 @@ impl Dsv4Forward {
             opened: false,
             params: false,
             is_string: false,
+            tool_calls_emitted: false,
         };
         match seed {
             ForwardSeed::Reasoning => parser.state = State::Reasoning,
@@ -139,10 +145,12 @@ impl Dsv4Forward {
             ForwardSeed::BetweenToolCalls { next_index } => {
                 parser.state = State::Block;
                 parser.next_index = next_index;
+                parser.tool_calls_emitted = true;
             }
             ForwardSeed::InToolCall { index, args_so_far } => {
                 parser.index = index;
                 parser.next_index = index.saturating_add(1);
+                parser.tool_calls_emitted = true;
                 // What the client already holds decides what is still owed:
                 // an opening brace, a separator before the next parameter, and
                 // which half of a parameter is in flight.
@@ -198,14 +206,17 @@ impl Dsv4Forward {
     }
 
     /// Text in a position where only whitespace and tags are legal. Whitespace
-    /// is structure (the reconstructor regenerates it); anything else is a shape
-    /// this parser has never been measured against, and is surfaced as content
-    /// rather than swallowed.
-    fn structural(&mut self, out: &mut Vec<ForwardDelta>, text: &str) {
+    /// is structure (the reconstructor regenerates it); anything else is a
+    /// shape this parser has never been measured against — and emitting it as
+    /// content would REORDER a chained continuation, because the reconstructor
+    /// serializes all content before the tool block. Out-of-grammar text
+    /// poisons instead: the resume aborts and the original death surfaces,
+    /// which is strictly safer than a byte-unfaithful second prefix.
+    fn structural(&mut self, _out: &mut [ForwardDelta], text: &str) {
         if text.trim().is_empty() {
             return;
         }
-        self.emit(out, ForwardDelta::Content(text.to_string()));
+        self.poison();
     }
 
     /// One step of the machine over the front of `rest`, returning how many
@@ -215,9 +226,14 @@ impl Dsv4Forward {
             State::Reasoning => self.scan_text(rest, out, THINK_END, State::Content, ForwardDelta::Reasoning),
             State::Content => self.scan_text(rest, out, TOOL_CALLS_OPEN, State::Block, ForwardDelta::Content),
             State::AfterBlock => {
-                // Nothing structural is expected after the block closes; hold
-                // nothing back and hand it to the client as content.
-                self.emit(out, ForwardDelta::Content(rest.to_string()));
+                // Well-formed DSML ends at the block close. Trailing
+                // non-whitespace is out of grammar, and forwarding it as
+                // content would sit BEFORE the tool block in a chained
+                // continuation's prefix — poison instead (whitespace is
+                // dropped as structure).
+                if !rest.trim().is_empty() {
+                    self.poison();
+                }
                 rest.len()
             }
             State::Block => self.scan_block(rest, out),
@@ -268,6 +284,11 @@ impl Dsv4Forward {
         const TAGS: [&str; 2] = [INVOKE_OPEN, TOOL_CALLS_CLOSE];
         if let Some((i, tag)) = find_first(rest, &TAGS) {
             self.structural(out, &rest[..i]);
+            if matches!(self.state, State::Poisoned) {
+                // structural() found out-of-grammar text; don't let the state
+                // transition below un-poison the parser.
+                return rest.len();
+            }
             // The previous call's closing `}` can still be queued here — one
             // chunk may carry an invoke's end and the next one's start — and it
             // belongs to THAT call's index, not the one about to open.
@@ -299,6 +320,7 @@ impl Dsv4Forward {
             self.name.push_str(&rest[..i]);
             let name = std::mem::take(&mut self.name);
             self.flush_args(out);
+            self.tool_calls_emitted = true;
             out.push(ForwardDelta::ToolCall {
                 index: self.index,
                 id: Some(Self::new_id()),
@@ -321,6 +343,9 @@ impl Dsv4Forward {
         const TAGS: [&str; 2] = [PARAMETER_OPEN, INVOKE_CLOSE];
         if let Some((i, tag)) = find_first(rest, &TAGS) {
             self.structural(out, &rest[..i]);
+            if matches!(self.state, State::Poisoned) {
+                return rest.len();
+            }
             let mut frag = String::new();
             if !self.opened {
                 frag.push('{');
@@ -431,6 +456,10 @@ impl ForwardParser for Dsv4Forward {
 
     fn poisoned(&self) -> bool {
         matches!(self.state, State::Poisoned)
+    }
+
+    fn ends_in_tool_calls(&self) -> bool {
+        self.tool_calls_emitted
     }
 
     fn finish(&mut self) -> Vec<ForwardDelta> {

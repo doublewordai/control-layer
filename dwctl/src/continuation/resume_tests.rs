@@ -1215,7 +1215,10 @@ async fn a_resumed_dsml_leg_reaches_the_client_as_parsed_channels(pool: PgPool) 
             leg_text("<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Par", None),
             leg_text(
                 "is</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
-                Some("tool_calls"),
+                // The RAW completions termination; the layer maps it to the
+                // chat-shaped "tool_calls" because the stream carried
+                // tool-call deltas.
+                Some("stop"),
             ),
             leg_usage(1030, 40),
             done(),
