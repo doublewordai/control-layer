@@ -1020,7 +1020,12 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            // This becomes `last_error` if every attempt is exhausted. Collapse to a
+            // sanitized 503 — never 502 — matching the embedded-error and empty-body
+            // paths and the contract below: the caller cannot tell an upstream 429
+            // from a 500, and fusillade's adaptive-concurrency controller treats a
+            // 503 as "the gateway could not place the request with any provider".
+            return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
         }
 
         // Sanitize error responses when sanitize_response is enabled.

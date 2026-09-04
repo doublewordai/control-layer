@@ -1352,6 +1352,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_plain_status_429_exhausts_to_503() {
+        // A real upstream 429 on every attempt (the OpenRouter rate-limit shape
+        // behind the ControlLayerProxyErrors 502s) must exhaust to a sanitized
+        // 503, not a 502 "internal error" — consistent with the embedded-error
+        // and empty-body paths, and a signal fusillade's adaptive-concurrency
+        // controller can act on.
+        let mock = MockHttpClient::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"code":"rate_limit","message":"Provider returned error"}}"#,
+        );
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            503,
+            "exhausted status-fallback retries must collapse to a sanitized 503, not 502"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
+    }
+
+    #[tokio::test]
     async fn test_unary_embedded_error_collapses_to_503() {
         // The same envelope on a non-streaming 200 body collapses to a 503.
         let body = r#"{"error":{"code":429,"message":"Provider returned error"}}"#;
