@@ -41,7 +41,10 @@ pub trait ResponseStore: Send + Sync {
     async fn store(&self, response: &Value) -> Result<String, StoreError>;
 
     /// Retrieve a prior response's context (for `previous_response_id` hydration).
-    async fn get_context(&self, response_id: &str) -> Result<Option<Value>, StoreError>;
+    /// `owner` is the caller's user id; a response created by anyone else must
+    /// resolve to `None` so one tenant's turn can never be spliced into
+    /// another's prompt.
+    async fn get_context(&self, response_id: &str, owner: &str) -> Result<Option<Value>, StoreError>;
 }
 
 /// No-op store: returns a generated id and never resolves context. Used where a
@@ -54,7 +57,7 @@ impl ResponseStore for NoOpResponseStore {
     async fn store(&self, _response: &Value) -> Result<String, StoreError> {
         Ok("noop".to_string())
     }
-    async fn get_context(&self, _response_id: &str) -> Result<Option<Value>, StoreError> {
+    async fn get_context(&self, _response_id: &str, _owner: &str) -> Result<Option<Value>, StoreError> {
         Ok(None)
     }
 }

@@ -1273,7 +1273,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
             let fusillade_pool = state.request_manager.pool();
 
             let template_ids: Vec<Uuid> =
-                sqlx::query_scalar("SELECT id FROM fusillade.request_templates WHERE file_id = $1 AND line_number = ANY($2)")
+                sqlx::query_scalar("SELECT id FROM fusillade.request_templates_all WHERE file_id = $1 AND line_number = ANY($2)")
                     .bind(input.file_id)
                     .bind(&error_indices)
                     .fetch_all(fusillade_pool)

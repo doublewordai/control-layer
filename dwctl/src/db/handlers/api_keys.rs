@@ -2610,7 +2610,6 @@ mod tests {
             onwards: Default::default(),
             onboarding_url: None,
             connections: Default::default(),
-            responses: Default::default(),
             image_normalizer: Default::default(),
             openapi: Default::default(),
             cache: Default::default(),

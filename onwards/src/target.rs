@@ -3545,7 +3545,11 @@ mod tests {
         let batch = HashMap::from([("purpose".to_string(), "batch".to_string())]);
 
         let completions = entry.resolve(RequestClass::Completions);
-        assert_eq!(completions.routing_rules().len(), 1, "no inherited deny is added");
+        assert_eq!(
+            completions.routing_rules().len(),
+            1,
+            "no inherited deny is added"
+        );
         assert!(matches!(
             completions.evaluate_routing_rules(&batch),
             Some(RoutingAction::Redirect { target }) if target == "dsv4-flash-batch"

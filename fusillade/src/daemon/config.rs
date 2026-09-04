@@ -162,6 +162,174 @@ impl DaemonMode {
     }
 }
 
+/// Additive controls for retained-response maintenance.
+///
+/// This configuration is installed with [`super::Daemon::with_retention_maintenance`]
+/// so existing exhaustive [`DaemonConfig`] literals remain source compatible.
+/// The policy carries no implicit retention duration and every destructive
+/// action is disabled by default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionMaintenanceConfig {
+    policy: crate::RetentionPolicy,
+    batchless_archive_sweep_enabled: bool,
+    batchless_archive_backfill_enabled: bool,
+    batchless_archive_groups_per_tick: i64,
+    batchless_archive_bytes_per_tick: i64,
+    retained_response_partitions_days_ahead: i32,
+    retained_response_retirement_enabled: bool,
+    batch_archive_retirement_enabled: bool,
+    batch_archive_retention_days: Option<u32>,
+    template_retirement_enabled: bool,
+    template_retention_days: Option<u32>,
+}
+
+impl Default for RetentionMaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            policy: crate::RetentionPolicy::default(),
+            batchless_archive_sweep_enabled: false,
+            batchless_archive_backfill_enabled: false,
+            batchless_archive_groups_per_tick: 4,
+            batchless_archive_bytes_per_tick: 64 * 1_024 * 1_024,
+            retained_response_partitions_days_ahead: 7,
+            retained_response_retirement_enabled: false,
+            batch_archive_retirement_enabled: false,
+            batch_archive_retention_days: None,
+            template_retirement_enabled: false,
+            template_retention_days: None,
+        }
+    }
+}
+
+impl RetentionMaintenanceConfig {
+    /// Create disabled maintenance controls for an explicit retention policy.
+    pub fn new(policy: crate::RetentionPolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
+    }
+
+    /// Enable or disable steady movement of newly terminal batchless graphs.
+    pub fn with_batchless_archive_sweep_enabled(mut self, enabled: bool) -> Self {
+        self.batchless_archive_sweep_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable historical batchless archive movement.
+    pub fn with_batchless_archive_backfill_enabled(mut self, enabled: bool) -> Self {
+        self.batchless_archive_backfill_enabled = enabled;
+        self
+    }
+
+    /// Set the complete-graph and retained-payload byte bounds per mover tick.
+    pub fn with_batchless_archive_limits(mut self, max_groups: i64, max_bytes: i64) -> Self {
+        self.batchless_archive_groups_per_tick = max_groups;
+        self.batchless_archive_bytes_per_tick = max_bytes;
+        self
+    }
+
+    /// Set the daily retained-response partition runway.
+    pub fn with_retained_response_partitions_days_ahead(mut self, days_ahead: i32) -> Self {
+        self.retained_response_partitions_days_ahead = days_ahead;
+        self
+    }
+
+    /// Enable or disable selection of newly eligible daily response buckets.
+    /// Durable unfinished retirements remain recoverable while this is false.
+    pub fn with_retained_response_retirement_enabled(mut self, enabled: bool) -> Self {
+        self.retained_response_retirement_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable selection of newly eligible weekly batch-archive
+    /// buckets. Durable unfinished retirements remain recoverable while this
+    /// is false.
+    pub fn with_batch_archive_retirement_enabled(mut self, enabled: bool) -> Self {
+        self.batch_archive_retirement_enabled = enabled;
+        self
+    }
+
+    /// Set the finalization-anchored batch content retention period. There is
+    /// deliberately no default; enabling batch-archive retirement without an
+    /// explicit period fails validation.
+    pub fn with_batch_archive_retention_days(mut self, days: Option<u32>) -> Self {
+        self.batch_archive_retention_days = days;
+        self
+    }
+
+    /// Return the operator-supplied retention policy.
+    pub fn policy(&self) -> &crate::RetentionPolicy {
+        &self.policy
+    }
+
+    /// Whether steady batchless archive movement is enabled.
+    pub fn batchless_archive_sweep_enabled(&self) -> bool {
+        self.batchless_archive_sweep_enabled
+    }
+
+    /// Whether historical batchless archive movement is enabled.
+    pub fn batchless_archive_backfill_enabled(&self) -> bool {
+        self.batchless_archive_backfill_enabled
+    }
+
+    /// Maximum complete response graphs moved per tick.
+    pub fn batchless_archive_groups_per_tick(&self) -> i64 {
+        self.batchless_archive_groups_per_tick
+    }
+
+    /// Maximum retained payload bytes moved per tick.
+    pub fn batchless_archive_bytes_per_tick(&self) -> i64 {
+        self.batchless_archive_bytes_per_tick
+    }
+
+    /// Number of future daily retained-response partitions to ensure.
+    pub fn retained_response_partitions_days_ahead(&self) -> i32 {
+        self.retained_response_partitions_days_ahead
+    }
+
+    /// Whether selection of newly eligible retained-response buckets is enabled.
+    pub fn retained_response_retirement_enabled(&self) -> bool {
+        self.retained_response_retirement_enabled
+    }
+
+    /// Whether selection of newly eligible batch-archive buckets is enabled.
+    pub fn batch_archive_retirement_enabled(&self) -> bool {
+        self.batch_archive_retirement_enabled
+    }
+
+    /// The finalization-anchored batch content retention period, when set.
+    pub fn batch_archive_retention_days(&self) -> Option<u32> {
+        self.batch_archive_retention_days
+    }
+
+    /// Enable or disable file-content expiry and selection of newly eligible
+    /// weekly template buckets. Durable unfinished retirements remain
+    /// recoverable while this is false.
+    pub fn with_template_retirement_enabled(mut self, enabled: bool) -> Self {
+        self.template_retirement_enabled = enabled;
+        self
+    }
+
+    /// Set the creation-anchored input-content retention period. There is
+    /// deliberately no default; enabling template retirement without an
+    /// explicit period fails validation.
+    pub fn with_template_retention_days(mut self, days: Option<u32>) -> Self {
+        self.template_retention_days = days;
+        self
+    }
+
+    /// Whether file-content expiry and template bucket selection are enabled.
+    pub fn template_retirement_enabled(&self) -> bool {
+        self.template_retirement_enabled
+    }
+
+    /// The creation-anchored input-content retention period, when set.
+    pub fn template_retention_days(&self) -> Option<u32> {
+        self.template_retention_days
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
     /// Claim-loop mode for this daemon process.
@@ -656,6 +824,19 @@ mod tests {
             status,
             body: body.to_string(),
         }
+    }
+
+    #[test]
+    fn retention_maintenance_defaults_are_safe_and_bounded() {
+        let config = RetentionMaintenanceConfig::default();
+
+        assert!(!config.policy.is_enabled());
+        assert!(!config.batchless_archive_sweep_enabled);
+        assert!(!config.batchless_archive_backfill_enabled);
+        assert!(!config.retained_response_retirement_enabled);
+        assert!(config.batchless_archive_groups_per_tick > 0);
+        assert!(config.batchless_archive_bytes_per_tick > 0);
+        assert!(config.retained_response_partitions_days_ahead > 0);
     }
 
     #[test]
