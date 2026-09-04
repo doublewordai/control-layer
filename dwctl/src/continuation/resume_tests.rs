@@ -350,7 +350,7 @@ async fn a_resume_supplies_the_role_leg_one_never_delivered(pool: PgPool) {
         vec![vec![leg_text("ld!", Some("stop")), leg_usage(1012, 8), done()]],
     );
     let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
-    let st = state(pool, &fake, tokenizer.uri(), test_config());
+    let st = state(pool, &fake, tokenizer.uri(), dsv4_config());
 
     let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
     let payloads = collect_payloads(response).await;
@@ -365,6 +365,52 @@ async fn a_resume_supplies_the_role_leg_one_never_delivered(pool: PgPool) {
     );
 }
 
+/// The deployment-posture invariant: role repair rides the per-model
+/// reconstructor flip. An UNMAPPED model's resumed frames stay byte-identical
+/// to the pre-v2 layer — shipping this image changes nothing for any model
+/// until it is flipped in `model_reconstructors`.
+#[sqlx::test]
+async fn an_unmapped_model_never_gains_an_injected_role(pool: PgPool) {
+    let fake = Fake::new(
+        vec![content("chatcmpl-1", "Hello"), content("chatcmpl-1", ", wor")],
+        vec![vec![leg_text("ld!", Some("stop")), leg_usage(1012, 8), done()]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), test_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    let payloads = collect_payloads(response).await;
+    let frames = parsed(&payloads);
+
+    assert!(
+        frames.iter().all(|f| f["choices"][0]["delta"].get("role").is_none()),
+        "no role is ever injected for a model outside the reconstructor map"
+    );
+    assert_eq!(contents(&frames), "Hello, world!", "the plain rescue is otherwise identical");
+}
+
+/// A resume can complete without producing a single client delta (its usage
+/// frame stands in for the terminal chunk). An owed role must still be
+/// delivered, and BEFORE the terminal usage frame.
+#[sqlx::test]
+async fn an_owed_role_is_delivered_even_when_the_resume_emits_no_delta(pool: PgPool) {
+    let fake = Fake::new(vec![content("chatcmpl-1", "Hello")], vec![vec![leg_usage(1012, 0), done()]]);
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    let payloads = collect_payloads(response).await;
+    let frames = parsed(&payloads);
+
+    let role_at = frames
+        .iter()
+        .position(|f| f["choices"][0]["delta"]["role"] == "assistant")
+        .expect("the owed role is delivered even with no resumed delta");
+    let usage_at = frames.iter().position(|f| f.get("usage").is_some()).expect("merged usage frame");
+    assert!(role_at < usage_at, "the role must precede the terminal usage frame");
+    assert_eq!(contents(&frames), "Hello", "nothing else is fabricated");
+}
+
 /// The mirror invariant: a role leg 1 already delivered is never re-sent —
 /// strict clients open a second message on a repeated role.
 #[sqlx::test]
@@ -374,7 +420,7 @@ async fn a_role_already_delivered_is_never_resent(pool: PgPool) {
         vec![vec![leg_text("ld!", Some("stop")), leg_usage(1012, 8), done()]],
     );
     let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
-    let st = state(pool, &fake, tokenizer.uri(), test_config());
+    let st = state(pool, &fake, tokenizer.uri(), dsv4_config());
 
     let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
     let payloads = collect_payloads(response).await;

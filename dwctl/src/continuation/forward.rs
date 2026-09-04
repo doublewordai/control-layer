@@ -247,7 +247,10 @@ mod tests {
         ];
 
         for chunk in cases {
-            // ── the middleware's emitter, verbatim ──
+            // ── the middleware's emitter, verbatim for an UNMAPPED model:
+            // the one extra thing the live path does (`ensure_role`) is armed
+            // only for models in `model_reconstructors`, and the layer test
+            // `an_unmapped_model_never_gains_an_injected_role` pins that ──
             let (text, finish_reason) = rewrap::completion_parts(&chunk).expect("a chunk with a choice");
             let mut parser = PlainForward;
             let mut deltas = parser.feed(text);

@@ -436,7 +436,6 @@ impl Drop for OutcomeGuard {
     }
 }
 
-/// The `data:` payload of one complete SSE event, if it has one.
 /// Give the first resumed delta a message-opening `role` when leg 1 never
 /// delivered one. Most providers open with a `role: "assistant"` preamble, but
 /// at least one serves content first and attaches the role to a later frame
@@ -445,6 +444,10 @@ impl Drop for OutcomeGuard {
 /// a strict client assembles a roleless message. A stream whose delivered
 /// frames already carried a role gets nothing: re-sending one makes strict
 /// clients open a second message.
+///
+/// Part of the per-model reconstructor rollout, not the inert baseline: the
+/// caller arms it only for models in `model_reconstructors`, so an unmapped
+/// model's resumed frames stay byte-identical to the pre-v2 layer.
 fn ensure_role(chat: &mut Value, role_sent: &mut bool) {
     if *role_sent {
         return;
@@ -455,6 +458,7 @@ fn ensure_role(chat: &mut Value, role_sent: &mut bool) {
     }
 }
 
+/// The `data:` payload of one complete SSE event, if it has one.
 fn frame_payload(event: &[u8]) -> Option<&str> {
     event.split(|b| *b == b'\n').find_map(|line| {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
@@ -503,8 +507,12 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         // Whether any frame DELIVERED to the client has carried a `delta.role`
         // (leg-1 passthrough, or injected by `ensure_role`). The resumed frames
         // replace whatever leg 1 would have sent later, so if no role has gone
-        // out yet, the first resumed delta must carry it.
-        let mut role_sent = false;
+        // out yet, the first resumed delta must carry it. Role repair rides the
+        // per-model reconstructor flip: an UNMAPPED model starts as "already
+        // sent" so every `ensure_role` call no-ops and its resumed frames stay
+        // byte-identical to the pre-v2 layer — the deployment-posture invariant
+        // that makes shipping this image inert until a model is flipped.
+        let mut role_sent = !state.cfg.model_reconstructors.contains_key(&ctx.model);
         // The terminating frames, held rather than forwarded: we may need to put
         // a synthesized usage frame in front of `[DONE]`, and a death frame must
         // only reach the client if the resume chain fails. `first_death` is what
@@ -701,6 +709,16 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                         let _ = acc.ingest(&chat);
                         yield Ok(rewrap::sse_frame(&chat));
                     }
+                    // A resume can complete without producing any delta at all
+                    // (a `</think>`-only leg whose usage stands in for its
+                    // terminal chunk); if the message is still roleless, this
+                    // is the last chance to open it before the terminal frame.
+                    if !role_sent {
+                        let mut chat = rewrap::delta_chunk(&env, serde_json::json!({}), Value::Null);
+                        ensure_role(&mut chat, &mut role_sent);
+                        let _ = acc.ingest(&chat);
+                        yield Ok(rewrap::sse_frame(&chat));
+                    }
                     // The leg's terminal usage describes the LEG. Replace it with
                     // the merged accounting for the whole logical request.
                     let render = last_render.as_ref();
@@ -840,6 +858,19 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                         if let Some(died) = death_at.take() {
                             metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
                         }
+                        let _ = acc.ingest(&chat);
+                        yield Ok(rewrap::sse_frame(&chat));
+                    }
+                    // Same terminal role repair as the usage-as-terminal branch:
+                    // a resumed chain can close producing no delta, leaving the
+                    // message roleless. Gated on `attempts > 0` — a stream that
+                    // never resumed closes exactly as it arrived.
+                    if attempts > 0
+                        && !role_sent
+                        && let Some(env) = acc.envelope().cloned()
+                    {
+                        let mut chat = rewrap::delta_chunk(&env, serde_json::json!({}), Value::Null);
+                        ensure_role(&mut chat, &mut role_sent);
                         let _ = acc.ingest(&chat);
                         yield Ok(rewrap::sse_frame(&chat));
                     }
