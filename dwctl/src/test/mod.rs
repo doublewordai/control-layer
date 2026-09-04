@@ -805,13 +805,12 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
 // The original test proxied a streaming `/v1/responses` request to a
 // wiremock that returned an SSE response and asserted the proxied
 // stream made it through unchanged. Since commit `6a7c24d7`,
-// `/v1/responses` doesn't proxy — it engages the multi-step warm
-// path which builds chat-completions payloads itself and fires per-
-// step model_calls over an HTTP loopback (unreachable from the
-// axum_test in-memory transport). Streaming coverage of the warm
-// path's SSE event sink lives in `responses::streaming`'s unit tests
-// and the `multi_step_executor` integration test; an e2e proxy test
-// for `/v1/responses` would need a real loopback listener.
+// `/v1/responses` doesn't proxy — the edge translates it to a
+// chat-completions call itself (the multi-step tool loop that once
+// lived here was removed in 2026-08, along with `response_steps`).
+// Streaming coverage lives in `responses::streaming`'s unit tests;
+// an e2e proxy test for `/v1/responses` would need a real loopback
+// listener.
 
 /// End-to-end test: Traffic routing rules are enforced by onwards after sync.
 /// Covers three scenarios: baseline allow, deny by purpose, and redirect by purpose.

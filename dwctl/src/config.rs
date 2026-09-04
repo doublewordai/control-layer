@@ -185,12 +185,6 @@ pub struct Config {
     /// External data source connections configuration
     #[serde(default)]
     pub connections: ConnectionsConfig,
-    /// Multi-step Open Responses orchestration configuration. Only the
-    /// safety caps are exposed today; storage and dispatch are wired
-    /// implicitly when the multi-step processor is registered with
-    /// fusillade.
-    #[serde(default)]
-    pub responses: ResponsesConfig,
     /// Image-input normalisation configuration.
     ///
     /// When enabled, image references in `/v1/chat/completions` and
@@ -253,29 +247,6 @@ impl Default for OpenApiConfig {
         Self {
             admin_enabled: true,
             ai_enabled: true,
-        }
-    }
-}
-
-/// Configuration for `/v1/responses` multi-step orchestration.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct ResponsesConfig {
-    /// Maximum sub-agent recursion depth (per plan §C11). A
-    /// `tool_call` step whose sub-agent dispatch would exceed this
-    /// depth is failed with `max_depth_exceeded`.
-    pub max_response_step_depth: u32,
-    /// Maximum model_call ↔ tool_call iterations within a single loop
-    /// level (per plan §C11). A loop level that hits this cap fails
-    /// with `max_iterations_exceeded`.
-    pub max_response_iterations: u32,
-}
-
-impl Default for ResponsesConfig {
-    fn default() -> Self {
-        Self {
-            max_response_step_depth: 8,
-            max_response_iterations: 10,
         }
     }
 }
@@ -1628,6 +1599,33 @@ pub enum DaemonMode {
     BatchOnly,
 }
 
+/// A database endpoint accepted from configuration but never exposed through
+/// debug output or serialized configuration snapshots.
+#[derive(Clone, Deserialize)]
+#[serde(transparent)]
+pub struct SensitiveDatabaseUrl(String);
+
+impl SensitiveDatabaseUrl {
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SensitiveDatabaseUrl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("<redacted>")
+    }
+}
+
+impl Serialize for SensitiveDatabaseUrl {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str("<redacted>")
+    }
+}
+
 impl From<DaemonMode> for fusillade::DaemonMode {
     fn from(mode: DaemonMode) -> Self {
         match mode {
@@ -1823,6 +1821,72 @@ pub struct DaemonConfig {
     /// exist. Default: 100.
     pub purge_throttle_ms: u64,
 
+    /// Optional automated content-expiration rules. The application ships
+    /// with no time-based content deletion until an operator configures it.
+    #[serde(default)]
+    pub retention: fusillade::RetentionPolicy,
+
+    /// Move newly terminal batchless response graphs with the steady archive
+    /// worker. Disabled by default.
+    #[serde(default)]
+    pub batchless_archive_sweep_enabled: bool,
+
+    /// Move historical nonexpired batchless response graphs with the backfill
+    /// worker. Disabled by default.
+    #[serde(default)]
+    pub batchless_archive_backfill_enabled: bool,
+
+    /// Maximum complete response graphs moved by either worker per tick.
+    #[serde(default = "default_batchless_archive_groups_per_tick")]
+    pub batchless_archive_groups_per_tick: i64,
+
+    /// Maximum retained payload bytes moved by either worker per tick.
+    #[serde(default = "default_batchless_archive_bytes_per_tick")]
+    pub batchless_archive_bytes_per_tick: i64,
+
+    /// Daily retained-response partition runway maintained by the archive owner.
+    #[serde(default = "default_retained_response_partitions_days_ahead")]
+    pub retained_response_partitions_days_ahead: i32,
+
+    /// Allow daily retained-response partition retirement. Disabled by default;
+    /// the retirement implementation is introduced separately.
+    #[serde(default)]
+    pub retained_response_retirement_enabled: bool,
+
+    /// Allow weekly batch-archive partition retirement. Disabled by default
+    /// and additionally requires an explicit retention period.
+    #[serde(default)]
+    pub batch_archive_retirement_enabled: bool,
+
+    /// Route new file-backed request templates into the weekly generation-2
+    /// store. Reads are generation-transparent either way.
+    #[serde(default)]
+    pub template_generation_writes_enabled: bool,
+
+    /// Allow file-content expiry and weekly template partition retirement.
+    /// Disabled by default and additionally requires an explicit retention
+    /// period.
+    #[serde(default)]
+    pub template_retirement_enabled: bool,
+
+    /// Creation-anchored input-content retention period in days. No default:
+    /// enabling template retirement without it fails startup.
+    #[serde(default)]
+    pub template_retention_days: Option<u32>,
+
+    /// Finalization-anchored batch content retention period in days. No
+    /// default: enabling batch-archive retirement without it fails startup.
+    #[serde(default)]
+    pub batch_archive_retention_days: Option<u32>,
+
+    /// Explicit direct/session-capable primary endpoint used only for
+    /// retained-response partition DDL. Dedicated Fusillade databases require
+    /// this attestation; schema mode may reuse the application's already-direct
+    /// primary while preserving its search path. Never serialized in config
+    /// snapshots and redacted from debug output.
+    #[serde(default, skip_serializing)]
+    pub retained_response_partition_maintenance_url: Option<SensitiveDatabaseUrl>,
+
     /// Request paths whose batch traffic is dispatched as a stream so the provider
     /// reports token usage, then reassembled back into a single JSON body before it
     /// is stored or returned. Batch traffic is identified by the correlation header
@@ -1958,6 +2022,18 @@ pub struct DaemonConfig {
 
 fn default_batch_archive_sweep_interval_ms() -> u64 {
     5_000
+}
+
+fn default_batchless_archive_groups_per_tick() -> i64 {
+    fusillade::RetentionMaintenanceConfig::default().batchless_archive_groups_per_tick()
+}
+
+fn default_batchless_archive_bytes_per_tick() -> i64 {
+    fusillade::RetentionMaintenanceConfig::default().batchless_archive_bytes_per_tick()
+}
+
+fn default_retained_response_partitions_days_ahead() -> i32 {
+    fusillade::RetentionMaintenanceConfig::default().retained_response_partitions_days_ahead()
 }
 
 fn default_batch_archive_moves_per_tick() -> i64 {
@@ -2142,6 +2218,19 @@ impl Default for DaemonConfig {
             purge_interval_ms: 600_000,
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
+            retention: fusillade::RetentionPolicy::default(),
+            batchless_archive_sweep_enabled: false,
+            batchless_archive_backfill_enabled: false,
+            batchless_archive_groups_per_tick: default_batchless_archive_groups_per_tick(),
+            batchless_archive_bytes_per_tick: default_batchless_archive_bytes_per_tick(),
+            retained_response_partitions_days_ahead: default_retained_response_partitions_days_ahead(),
+            retained_response_retirement_enabled: false,
+            batch_archive_retirement_enabled: false,
+            batch_archive_retention_days: None,
+            template_generation_writes_enabled: false,
+            template_retirement_enabled: false,
+            template_retention_days: None,
+            retained_response_partition_maintenance_url: None,
             streamable_endpoints: Vec::new(),
             urgency_weight: default_urgency_weight(),
             inject_deadline_priority: false,
@@ -2168,6 +2257,19 @@ impl Default for DaemonConfig {
 }
 
 impl DaemonConfig {
+    pub fn to_fusillade_retention_maintenance_config(&self) -> fusillade::RetentionMaintenanceConfig {
+        fusillade::RetentionMaintenanceConfig::new(self.retention.clone())
+            .with_batchless_archive_sweep_enabled(self.batchless_archive_sweep_enabled)
+            .with_batchless_archive_backfill_enabled(self.batchless_archive_backfill_enabled)
+            .with_batchless_archive_limits(self.batchless_archive_groups_per_tick, self.batchless_archive_bytes_per_tick)
+            .with_retained_response_partitions_days_ahead(self.retained_response_partitions_days_ahead)
+            .with_retained_response_retirement_enabled(self.retained_response_retirement_enabled)
+            .with_batch_archive_retirement_enabled(self.batch_archive_retirement_enabled)
+            .with_batch_archive_retention_days(self.batch_archive_retention_days)
+            .with_template_retirement_enabled(self.template_retirement_enabled)
+            .with_template_retention_days(self.template_retention_days)
+    }
+
     /// Convert to fusillade daemon config
     pub fn to_fusillade_config(&self) -> fusillade::daemon::DaemonConfig {
         self.to_fusillade_config_with_limits(None)
@@ -2731,7 +2833,6 @@ impl Default for Config {
             onboarding_url: None,
             support_email: "support@doubleword.ai".to_string(),
             connections: ConnectionsConfig::default(),
-            responses: ResponsesConfig::default(),
             image_normalizer: crate::image_normalizer::ImageNormalizerConfig::default(),
             keystore: None,
             openapi: OpenApiConfig::default(),
@@ -2942,6 +3043,118 @@ impl Config {
 
     /// Validate the configuration for consistency and required fields
     pub fn validate(&self) -> Result<(), Error> {
+        if let Err(error) = self.background_services.batch_daemon.retention.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: batch retention is invalid: {error}"),
+            });
+        }
+        if self.background_services.batch_daemon.retention.expire_files
+            || self.background_services.batch_daemon.retention.terminal_batch_seconds.is_some()
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: scheduled file and batch retention is not supported by retained-response maintenance"
+                    .to_string(),
+            });
+        }
+        let retention_enabled = self.background_services.batch_daemon.retention.is_enabled();
+        let daemon = &self.background_services.batch_daemon;
+        // A process that never runs the batch daemon owns no archive
+        // maintenance, whatever retention configuration it carries: in a
+        // split topology the API pods share the daemon pods' environment and
+        // must not reject it (the daemon pods validate what they run).
+        let owns_archive_maintenance = !matches!(daemon.mode, DaemonMode::RequestOnly) && daemon.enabled != DaemonEnabled::Never;
+        let batchless_policy_configured = !daemon.retention.batchless_seconds_by_service_tier.is_empty();
+        let batchless_movement_enabled = daemon.batchless_archive_sweep_enabled || daemon.batchless_archive_backfill_enabled;
+        if owns_archive_maintenance
+            && (batchless_movement_enabled || daemon.retained_response_retirement_enabled)
+            && !batchless_policy_configured
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless retention policy is required for retained-response maintenance".to_string(),
+            });
+        }
+        if owns_archive_maintenance
+            && (daemon.retained_response_retirement_enabled || daemon.batch_archive_retirement_enabled)
+            && matches!(self.database.fusillade(), ComponentDb::Dedicated { .. })
+            && daemon.retained_response_partition_maintenance_url.is_none()
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: retained-response partition retirement on a dedicated database requires an explicit direct session endpoint".to_string(),
+            });
+        }
+        if owns_archive_maintenance
+            && daemon.batch_archive_retirement_enabled
+            && daemon.batch_archive_retention_days.is_none_or(|days| days < 1)
+        {
+            return Err(Error::Internal {
+                operation:
+                    "Config validation: batch-archive partition retirement requires an explicit positive batch_archive_retention_days"
+                        .to_string(),
+            });
+        }
+        if owns_archive_maintenance && daemon.template_retirement_enabled && daemon.template_retention_days.is_none_or(|days| days < 1) {
+            return Err(Error::Internal {
+                operation: "Config validation: template partition retirement requires an explicit positive template_retention_days"
+                    .to_string(),
+            });
+        }
+        if owns_archive_maintenance
+            && batchless_movement_enabled
+            && (daemon.batchless_archive_groups_per_tick <= 0 || daemon.batchless_archive_bytes_per_tick <= 0)
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless archive group and byte budgets must be positive".to_string(),
+            });
+        }
+        if owns_archive_maintenance && batchless_policy_configured && daemon.retained_response_partitions_days_ahead <= 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: retained-response partition runway must be positive".to_string(),
+            });
+        }
+        if owns_archive_maintenance
+            && batchless_movement_enabled
+            && daemon
+                .retention
+                .batchless_seconds_by_service_tier
+                .values()
+                .any(|seconds| daemon.batch_archive_sweep_dwell_secs >= *seconds as f64)
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless archive sweep dwell must be shorter than every configured retention period"
+                    .to_string(),
+            });
+        }
+        if owns_archive_maintenance
+            && batchless_movement_enabled
+            && daemon
+                .retention
+                .batchless_seconds_by_service_tier
+                .values()
+                .any(|seconds| daemon.batch_archive_cancel_grace_secs >= *seconds as f64)
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless archive cancellation grace must be shorter than every configured retention period"
+                    .to_string(),
+            });
+        }
+        if retention_enabled && daemon.enabled == DaemonEnabled::Never && !matches!(daemon.mode, DaemonMode::RequestOnly) {
+            // Not an error: another instance is expected to run the daemon.
+            // Surface it so a single-instance deployment cannot silently
+            // configure retention that nothing enforces.
+            tracing::warn!(
+                "automated retention is configured but the batch daemon never runs on this instance; \
+                 another instance must run it for retention to be enforced"
+            );
+        }
+        if owns_archive_maintenance
+            && retention_enabled
+            && (self.background_services.batch_daemon.purge_interval_ms == 0 || self.background_services.batch_daemon.purge_batch_size < 1)
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: automated retention requires an enabled orphan purge and a positive purge batch size"
+                    .to_string(),
+            });
+        }
         // Validate native authentication requirements
         if self.auth.native.enabled {
             if self.secret_key.is_none() {
@@ -3254,6 +3467,192 @@ mod tests {
         assert!(AuthConfig::default().default_user_roles.contains(&Role::BackgroundInferenceUser));
     }
 
+    #[test]
+    fn obsolete_retention_sweep_interval_is_rejected_on_a_complete_config() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        serialized["retention_sweep_interval_ms"] = serde_json::json!(1_000);
+
+        let error = serde_json::from_value::<DaemonConfig>(serialized).expect_err("the removed standalone scheduler key must be rejected");
+
+        assert!(error.to_string().contains("retention_sweep_interval_ms"));
+    }
+
+    #[test]
+    fn retention_maintenance_controls_default_off_and_map_explicitly() {
+        let mut serialized = serde_json::to_value(DaemonConfig::default()).unwrap();
+        for key in [
+            "batchless_archive_sweep_enabled",
+            "batchless_archive_backfill_enabled",
+            "batchless_archive_groups_per_tick",
+            "batchless_archive_bytes_per_tick",
+            "retained_response_partitions_days_ahead",
+            "retained_response_retirement_enabled",
+            "batch_archive_retirement_enabled",
+            "batch_archive_retention_days",
+            "template_generation_writes_enabled",
+            "template_retirement_enabled",
+            "template_retention_days",
+        ] {
+            serialized.as_object_mut().unwrap().remove(key);
+        }
+
+        let daemon: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        assert!(!daemon.batchless_archive_sweep_enabled);
+        assert!(!daemon.batchless_archive_backfill_enabled);
+        assert!(!daemon.retained_response_retirement_enabled);
+        assert!(daemon.retained_response_partition_maintenance_url.is_none());
+        assert!(daemon.batchless_archive_groups_per_tick > 0);
+        assert!(daemon.batchless_archive_bytes_per_tick > 0);
+        assert!(daemon.retained_response_partitions_days_ahead > 0);
+
+        let mapped = daemon.to_fusillade_retention_maintenance_config();
+        assert_eq!(mapped.policy(), &daemon.retention);
+        assert_eq!(mapped.batchless_archive_sweep_enabled(), daemon.batchless_archive_sweep_enabled);
+        assert_eq!(
+            mapped.batchless_archive_backfill_enabled(),
+            daemon.batchless_archive_backfill_enabled
+        );
+        assert_eq!(mapped.batchless_archive_groups_per_tick(), daemon.batchless_archive_groups_per_tick);
+        assert_eq!(mapped.batchless_archive_bytes_per_tick(), daemon.batchless_archive_bytes_per_tick);
+        assert_eq!(
+            mapped.retained_response_partitions_days_ahead(),
+            daemon.retained_response_partitions_days_ahead
+        );
+        assert_eq!(
+            mapped.retained_response_retirement_enabled(),
+            daemon.retained_response_retirement_enabled
+        );
+        assert_eq!(mapped.batch_archive_retirement_enabled(), daemon.batch_archive_retirement_enabled);
+        assert_eq!(mapped.batch_archive_retention_days(), daemon.batch_archive_retention_days);
+    }
+
+    #[test]
+    fn retention_rejects_unknown_batchless_tiers() {
+        let mut config = Config::default();
+        config
+            .background_services
+            .batch_daemon
+            .retention
+            .batchless_seconds_by_service_tier
+            .insert("unknown".to_string(), 60);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("unsupported service tier"));
+    }
+
+    #[test]
+    fn scheduled_file_and_batch_retention_fail_closed() {
+        let mut config = Config::default();
+        config.background_services.batch_daemon.retention.expire_files = true;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("file and batch retention is not supported"));
+
+        let mut config = Config::default();
+        config.background_services.batch_daemon.retention.terminal_batch_seconds = Some(60);
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("file and batch retention is not supported"));
+    }
+
+    fn configure_batchless_retention(config: &mut Config) {
+        config.secret_key = Some("test-secret-key".to_string());
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.retention.batchless_seconds_by_service_tier.insert("flex".to_string(), 120);
+        daemon.retention.max_late_writer_seconds = Some(30);
+    }
+
+    #[test]
+    fn batchless_retention_validation_matrix_is_fail_closed() {
+        let mut config = Config::default();
+        config.background_services.batch_daemon.batchless_archive_sweep_enabled = true;
+        assert!(config.validate().unwrap_err().to_string().contains("batchless retention policy"));
+
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        assert!(
+            config.validate().is_ok(),
+            "a configured policy must permit reader-safe runway preflight"
+        );
+
+        config.background_services.batch_daemon.retained_response_partitions_days_ahead = 0;
+        assert!(config.validate().unwrap_err().to_string().contains("partition runway"));
+
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batchless_archive_backfill_enabled = true;
+        daemon.batchless_archive_groups_per_tick = 0;
+        assert!(config.validate().unwrap_err().to_string().contains("group and byte budgets"));
+
+        let mut config = Config::default();
+        config.background_services.batch_daemon.retained_response_retirement_enabled = true;
+        assert!(config.validate().unwrap_err().to_string().contains("batchless retention policy"));
+    }
+
+    #[test]
+    fn retained_response_retirement_accepts_a_valid_batchless_policy_in_schema_mode() {
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        config.background_services.batch_daemon.retained_response_retirement_enabled = true;
+
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn maintenance_endpoint_is_redacted_and_never_serialized() {
+        let mut daemon = DaemonConfig::default();
+        daemon.retained_response_partition_maintenance_url = Some(SensitiveDatabaseUrl(
+            "postgres://secret-user:secret-password@db.invalid/fusillade".to_string(),
+        ));
+        let debug = format!("{daemon:?}");
+        assert!(!debug.contains("secret-user"));
+        assert!(!debug.contains("secret-password"));
+        let serialized = serde_json::to_value(&daemon).unwrap();
+        assert!(serialized.get("retained_response_partition_maintenance_url").is_none());
+
+        let mut input = serde_json::to_value(DaemonConfig::default()).unwrap();
+        input["retained_response_partition_maintenance_url"] = serde_json::json!("postgres://configured.invalid/fusillade");
+        let parsed: DaemonConfig = serde_json::from_value(input).unwrap();
+        assert_eq!(
+            parsed
+                .retained_response_partition_maintenance_url
+                .as_ref()
+                .map(SensitiveDatabaseUrl::expose),
+            Some("postgres://configured.invalid/fusillade")
+        );
+    }
+
+    #[test]
+    fn request_only_ignores_shared_retirement_selection_configuration() {
+        let mut config = Config::default();
+        config.secret_key = Some("test-secret-key".to_string());
+        config.background_services.batch_daemon.mode = DaemonMode::RequestOnly;
+        config.background_services.batch_daemon.retained_response_retirement_enabled = true;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn batchless_movement_windows_precede_retention() {
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batchless_archive_sweep_enabled = true;
+        daemon.batch_archive_sweep_dwell_secs = 120.0;
+        assert!(config.validate().unwrap_err().to_string().contains("sweep dwell"));
+
+        let mut backfill = Config::default();
+        configure_batchless_retention(&mut backfill);
+        let daemon = &mut backfill.background_services.batch_daemon;
+        daemon.batchless_archive_backfill_enabled = true;
+        daemon.batch_archive_sweep_dwell_secs = 120.0;
+        assert!(backfill.validate().unwrap_err().to_string().contains("sweep dwell"));
+
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batch_archive_sweep_dwell_secs = 119.0;
+        daemon.batch_archive_cancel_grace_secs = 120.0;
+        assert!(config.validate().unwrap_err().to_string().contains("cancellation grace"));
+
+        config.background_services.batch_daemon.batch_archive_cancel_grace_secs = 119.0;
+        assert!(config.validate().is_ok());
+    }
     /// Stamping a key into a batch's metadata does NOTHING unless the key is also on this
     /// list: fusillade copies only the listed keys onto each claimed request, so an
     /// unlisted one is written, persisted, and silently never sent as a header — and the
@@ -3641,6 +4040,28 @@ secret_key: "test-secret-key"
         config.batches.files.max_expiry_seconds = 3600;
         let result = config.validate();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn retention_config_is_accepted_on_an_instance_that_never_runs_the_daemon() {
+        // Split topology: API pods share the daemon pods' environment but run
+        // with the daemon disabled. They own no maintenance and must not
+        // reject the retention flags the daemon pods act on.
+        let mut config = Config::default();
+        config.auth.native.enabled = true;
+        config.secret_key = Some("test-secret-key".to_string());
+        config.background_services.batch_daemon.enabled = DaemonEnabled::Never;
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.retention.batchless_seconds_by_service_tier.insert("flex".to_string(), 60);
+        daemon.retention.max_late_writer_seconds = Some(60);
+        daemon.batchless_archive_sweep_enabled = true;
+        daemon.retained_response_retirement_enabled = true;
+        daemon.batch_archive_retirement_enabled = true;
+        daemon.batch_archive_retention_days = Some(1);
+        daemon.template_generation_writes_enabled = true;
+        daemon.template_retirement_enabled = true;
+        daemon.template_retention_days = Some(1);
+        assert!(config.validate().is_ok(), "{:?}", config.validate().err());
     }
 
     #[test]
