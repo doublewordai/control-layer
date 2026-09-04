@@ -672,6 +672,25 @@ fn connect_options(url: &str, slow_threshold: std::time::Duration) -> anyhow::Re
     Ok(PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold))
 }
 
+/// A schema-mode component behind a pooler relies on the server-side default
+/// `search_path` (see `setup_component_pools`). Fail at boot, with the exact
+/// statement to run, rather than at the first bare-table query.
+async fn verify_schema_on_default_search_path(component_name: &str, schema: &str, pooled: &DbPools) -> anyhow::Result<()> {
+    for pool in [pooled.write(), pooled.read()] {
+        let search_path: String = sqlx::query_scalar("SELECT current_setting('search_path')")
+            .fetch_one(&*pool)
+            .await?;
+        let on_path = search_path.split(',').any(|entry| entry.trim().trim_matches('"') == schema);
+        anyhow::ensure!(
+            on_path,
+            "{component_name}: schema `{schema}` is not on the pooled endpoint's default search_path ({search_path}). \
+             A transaction-mode pooler rejects the startup search_path option, so set it server-side: \
+             ALTER DATABASE <db> SET search_path = public, {schema}  (or ALTER ROLE <user> SET search_path = …)"
+        );
+    }
+    Ok(())
+}
+
 /// Pooled/direct pools for a component database (fusillade, outlet).
 ///
 /// Schema mode piggybacks on the main database's endpoints: the component's
@@ -690,25 +709,48 @@ async fn setup_component_pools(
         config::ComponentDb::Schema {
             name, pool, direct_pool, ..
         } => {
-            // Query pools follow main's endpoints (pooled + optional replica).
-            let pooled_primary = create_schema_pool(name, main.pooled.write().connect_options().as_ref().clone(), pool).await?;
-            let pooled = if main.pooled.has_replica() {
-                info!("Setting up {component_name} read replica (schema mode)");
-                let replica = create_schema_pool(name, main.pooled.read().connect_options().as_ref().clone(), replica_settings).await?;
-                DbPools::with_replica(pooled_primary, replica)
-            } else {
-                DbPools::new(pooled_primary)
-            };
             let pair = if main.is_split() {
+                // Behind a transaction-mode pooler the startup `options=-c
+                // search_path` parameter is rejected (Neon: "unsupported startup
+                // parameter in options"), and a session `SET` would not survive
+                // the next transaction. The schema must instead be on the
+                // server-side default search_path — `ALTER DATABASE … SET
+                // search_path = public, <schema>` (or per role) — which every
+                // pooled backend inherits. Build the pooled pool without the
+                // option and verify that default below.
+                let pooled_primary = db::pool_options(pool)
+                    .connect_with(main.pooled.write().connect_options().as_ref().clone())
+                    .await?;
+                let pooled = if main.pooled.has_replica() {
+                    info!("Setting up {component_name} read replica (schema mode, pooled)");
+                    let replica = db::pool_options(replica_settings)
+                        .connect_with(main.pooled.read().connect_options().as_ref().clone())
+                        .await?;
+                    DbPools::with_replica(pooled_primary, replica)
+                } else {
+                    DbPools::new(pooled_primary)
+                };
+                // Direct connections accept the startup option as before.
                 let direct = create_schema_pool(name, main.direct.write().connect_options().as_ref().clone(), direct_pool).await?;
                 db::PoolPair {
                     pooled,
                     direct: DbPools::new(direct),
                 }
             } else {
-                db::PoolPair::unsplit(pooled)
+                let primary = create_schema_pool(name, main.pooled.write().connect_options().as_ref().clone(), pool).await?;
+                let pools = if main.pooled.has_replica() {
+                    info!("Setting up {component_name} read replica (schema mode)");
+                    let replica = create_schema_pool(name, main.pooled.read().connect_options().as_ref().clone(), replica_settings).await?;
+                    DbPools::with_replica(primary, replica)
+                } else {
+                    DbPools::new(primary)
+                };
+                db::PoolPair::unsplit(pools)
             };
             pair.direct.write().execute(&*format!("CREATE SCHEMA IF NOT EXISTS {name}")).await?;
+            if main.is_split() {
+                verify_schema_on_default_search_path(component_name, name, &pair.pooled).await?;
+            }
             Ok(pair)
         }
         config::ComponentDb::Dedicated {
