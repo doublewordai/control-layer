@@ -74,8 +74,8 @@ pub async fn list_probes(
     Query(query): Query<ProbesQuery>,
 ) -> Result<Json<Vec<Probe>>, Error> {
     let probes = match query.status.as_deref() {
-        Some("active") => ProbeManager::list_active_probes(&state.db.write()).await?,
-        _ => ProbeManager::list_probes(&state.db.write()).await?,
+        Some("active") => ProbeManager::list_active_probes(&state.db.read()).await?,
+        _ => ProbeManager::list_probes(&state.db.read()).await?,
     };
     Ok(Json(probes))
 }
@@ -108,7 +108,7 @@ pub async fn get_probe(
     _: RequiresPermission<resource::Probes, operation::ReadAll>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Probe>, Error> {
-    let probe = ProbeManager::get_probe(&state.db.write(), id).await?;
+    let probe = ProbeManager::get_probe(&state.db.read(), id).await?;
     Ok(Json(probe))
 }
 
@@ -346,7 +346,7 @@ pub async fn get_probe_results(
     Path(id): Path<Uuid>,
     Query(query): Query<ResultsQuery>,
 ) -> Result<Json<Vec<ProbeResult>>, Error> {
-    let results = ProbeManager::get_probe_results(&state.db.write(), id, query.start_time, query.end_time, query.limit).await?;
+    let results = ProbeManager::get_probe_results(&state.db.read(), id, query.start_time, query.end_time, query.limit).await?;
     Ok(Json(results))
 }
 
@@ -380,7 +380,7 @@ pub async fn get_statistics(
     Path(id): Path<Uuid>,
     Query(query): Query<StatsQuery>,
 ) -> Result<Json<ProbeStatistics>, Error> {
-    let stats = ProbeManager::get_statistics(&state.db.write(), id, query.start_time, query.end_time).await?;
+    let stats = ProbeManager::get_statistics(&state.db.read(), id, query.start_time, query.end_time).await?;
     Ok(Json(stats))
 }
 
