@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT user_id AS \"user_id!\"\n            FROM credits_transactions\n            WHERE user_id = ANY($1::uuid[]) AND transaction_type = 'purchase'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id!",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5b6961cfc0c2851e60130a38d7adbb75c06fbb04fa33104828dbe1bce97767fa"
+}
