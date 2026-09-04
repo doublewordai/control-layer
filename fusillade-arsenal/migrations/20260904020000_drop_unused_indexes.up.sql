@@ -1,4 +1,4 @@
--- Drop ten indexes that are unused or strictly redundant (COR-651).
+-- Drop twelve indexes that are unused or strictly redundant (COR-651).
 --
 -- From the index audit in COR-537. Every verdict below is backed by BOTH a code
 -- reading (no query needs the index, or an equivalent index serves the same
