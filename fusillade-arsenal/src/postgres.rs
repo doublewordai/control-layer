@@ -8129,9 +8129,13 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         //
         // Uses LATERAL so Postgres resolves the small set of soft-deleted
         // batch IDs first, then does an index lookup into requests per batch
-        // via idx_requests_batch_id — avoiding a seq scan of the (potentially
-        // huge) requests table. FOR UPDATE SKIP LOCKED enables concurrent
-        // daemons to partition work without blocking.
+        // via idx_requests_batch_state — avoiding a seq scan of the
+        // (potentially huge) requests table. `batch_id` is that index's
+        // leading column, so the equality seek needs no `state` predicate.
+        // (Previously idx_requests_batch_id, dropped in 20260903010000 as a
+        // strict prefix of the smaller, hotter (batch_id, state) index.)
+        // FOR UPDATE SKIP LOCKED enables concurrent daemons to partition work
+        // without blocking.
         let requests_deleted = sqlx::query!(
             r#"
             DELETE FROM requests
