@@ -1206,14 +1206,21 @@ async fn count_requests_with_budget<P: PoolProvider>(
             Ok(n) => n,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
                 // The failed statement aborted this transaction; estimate on a
-                // fresh one (EXPLAIN is planning only, so it is cheap).
+                // fresh one. EXPLAIN is planning only, so it runs without the
+                // count budget: under the 100ms budget the retained arm's
+                // EXPLAIN (planning over the partition catalog) is itself
+                // cancelled with 57014, and that cancellation propagated as a
+                // 500 on GET /admin/api/v1/batches/requests ("Retained response
+                // read failed"). Re-apply the budget afterwards so the next
+                // COUNT arm is still capped. A failed estimate degrades to 0
+                // rather than failing the whole listing.
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
-                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
+                sqlx::query("SET LOCAL statement_timeout = 0")
                     .execute(&mut *tx)
                     .await
                     .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
+                let plan = sqlx::query_scalar::<_, serde_json::Value>(&format!(
                     "EXPLAIN (FORMAT JSON) {}",
                     arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
                 ))
@@ -1224,14 +1231,24 @@ async fn count_requests_with_budget<P: PoolProvider>(
                 .bind(filter.created_before)
                 .bind(filter.service_tiers.as_deref())
                 .fetch_one(&mut *tx)
-                .await
-                .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                .await;
+                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(read_database_failure)?;
+                match plan {
+                    Ok(plan) => plan
+                        .get(0)
+                        .and_then(|p| p.get("Plan"))
+                        .and_then(|p| p.get("Plan Rows"))
+                        .and_then(|r| r.as_f64())
+                        .map(|r| r.round() as i64)
+                        .unwrap_or(0),
+                    Err(error) => {
+                        tracing::warn!(%error, "count estimate for list_requests arm unavailable; using 0");
+                        0
+                    }
+                }
             }
             Err(e) => return Err(read_database_failure(e)),
         };
