@@ -1603,20 +1603,38 @@ pub async fn target_message_handler<T: HttpClient>(
     // All providers exhausted — distinguish "no providers found" from
     // "all providers at concurrency capacity"
     if any_attempted {
-        // We tried at least one provider but all failed
-        let final_error = last_error
-            .unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str()));
+        // We tried at least one provider but all failed. The last loop error (a
+        // generic 502 for status-fallback failures) becomes the response, except
+        // for a rate-limited upstream: a 429 means "slow down and retry", not
+        // "upstream is broken", so surface it as the same 429 the proxy already
+        // returns for its own pool/key limits instead of a 502. This matches the
+        // strict handler's documented stance that 429 is a real user-facing
+        // signal and must surface, and it keeps upstream rate limits out of the
+        // 5xx proxy-error view (ControlLayerProxyErrors). The discriminator is
+        // the status-fallback marker (last_error is the generic 502): an
+        // *embedded* 429 (200 body carrying `{"error":{"code":429}}`) keeps its
+        // deliberate 503 collapse, and account-class codes (401/402/403/451)
+        // stay masked as 502 for untrusted providers.
+        let final_error = match (
+            last_upstream_status,
+            last_error.as_ref().map(|e| e.status.as_u16()),
+        ) {
+            (Some(429), Some(502)) => OnwardsErrorResponse::rate_limited(),
+            _ => last_error
+                .unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str())),
+        };
         // `status` carries the PRE-sanitization status of the last attempt, which
-        // the response itself discards: a 529 and a 500 both leave here as 503,
-        // so without this the caller cannot tell saturation from failure. This is
-        // the single exit where a candidate error actually becomes the response,
-        // so counting here counts outcomes rather than attempts.
+        // the response itself discards: a 500 and a 529 both leave here as 502
+        // (a 429 now surfaces as 429), so without this the caller cannot tell
+        // saturation from failure. This is the single exit where a candidate
+        // error actually becomes the response, so counting here counts outcomes
+        // rather than attempts.
         let status = final_error.status.as_u16();
         metrics::counter!(
             "onwards_upstream_failed_total",
             "reason" => "retries_exhausted",
             // The upstream's own status on the final attempt, NOT the gateway
-            // response above: both a 529 and a 500 sanitize to 503, and only
+            // response above: a 500 and a 529 both leave here as 502, and only
             // the former is backpressure. Falls back to the response status
             // when no attempt got far enough to see one.
             "status" => last_upstream_status.unwrap_or(status).to_string(),

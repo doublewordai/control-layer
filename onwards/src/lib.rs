@@ -1609,6 +1609,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_exhausted_retries_on_upstream_429_surface_as_429() {
+        // A provider that rate-limits on every attempt: the proxy retries across
+        // the pool and, when the budget is exhausted, must surface a 429 (rate
+        // limit — retryable) rather than a generic 502 ("upstream is broken").
+        // The proxy already returns 429 for its own pool/key limits, and the
+        // strict handler documents 429 as a real user-facing signal that must
+        // surface — an upstream rate limit is the same condition, so it must not
+        // be reclassified into the 5xx proxy-error view either.
+        let mock = MockHttpClient::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"rate limited"}}"#,
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![429]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            429,
+            "exhausted retries on an upstream 429 must surface as 429, not a generic 502"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_exhausted_retries_on_upstream_5xx_still_surface_as_502() {
+        // An upstream that genuinely fails (502) on every attempt must keep
+        // collapsing to the generic 502 gateway error — a 5xx is "the provider
+        // failed", which the caller must not read as its own mistake, and only
+        // 429 (a retryable rate limit) is preserved on the response.
+        let mock = MockHttpClient::new(
+            StatusCode::BAD_GATEWAY,
+            r#"{"error":{"message":"upstream failed"}}"#,
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            502,
+            "exhausted retries on an upstream 5xx must keep collapsing to 502"
+        );
+        assert_eq!(mock.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_streaming_keepalive_then_token_is_forwarded_not_retried() {
         // A valid stream that leads with a keep-alive comment and only *then*
         // emits its first token must be forwarded as-is — the keep-alive is not
