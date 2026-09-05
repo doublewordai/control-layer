@@ -929,23 +929,16 @@ fn to_payload<T: Serialize>(
     serde_json::to_value(value).map_err(|_| RetainedResponseSerializationError::EncodeFailure)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetainedResponseReadError {
-    DatabaseFailure,
-}
-
-impl fmt::Display for RetainedResponseReadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Retained response read failed")
-    }
-}
-
-impl std::error::Error for RetainedResponseReadError {}
-
-fn read_database_failure<T>(_: T) -> FusilladeError {
-    FusilladeError::Other(anyhow::Error::new(
-        RetainedResponseReadError::DatabaseFailure,
-    ))
+/// Wrap a read-path database error into a [`FusilladeError`], preserving the
+/// underlying cause.
+///
+/// The previous version discarded the error, so every read failure — a
+/// statement timeout, a missing relation, a cancelled query — surfaced in
+/// logs as the same opaque "Retained response read failed". Keeping the cause
+/// makes these actionable (e.g. "…: error returned from database: canceling
+/// statement due to statement timeout").
+fn read_database_failure(err: impl std::fmt::Display) -> FusilladeError {
+    FusilladeError::Other(anyhow::anyhow!("Retained response read failed: {err}"))
 }
 
 async fn begin_primary_read<P: PoolProvider>(
@@ -1182,6 +1175,17 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 /// pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
 
+/// Budget for the EXPLAIN (FORMAT JSON) planner-estimate fallback.
+///
+/// Deliberately larger than [`COUNT_BUDGET`]: the fallback only runs because
+/// an exact count already exceeded `COUNT_BUDGET`, and the retained arm's
+/// partition-pruning plan routinely crosses 100ms as well. Reusing
+/// `COUNT_BUDGET` here cancels the EXPLAIN with SQLSTATE 57014 and turns a
+/// best-effort total-count estimate into a hard 500 on the responses list
+/// endpoint. `EXPLAIN` is planning-only (no row scan), so this upper bound
+/// still protects the connection from pathological plan/lock waits.
+const ESTIMATE_BUDGET: &str = "2s";
+
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
@@ -1206,38 +1210,104 @@ async fn count_requests_with_budget<P: PoolProvider>(
             Ok(n) => n,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
                 // The failed statement aborted this transaction; estimate on a
-                // fresh one (EXPLAIN is planning only, so it is cheap).
+                // fresh one (EXPLAIN is planning only, so it is cheap). The
+                // estimate must NOT run under `COUNT_BUDGET`: this branch runs
+                // precisely because the arm exceeded it, and the retained arm's
+                // partition-pruning plan routinely crosses 100ms too — reusing
+                // the budget cancels the EXPLAIN with 57014 and turns a
+                // best-effort total_count into a hard 500.
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
-                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+                sqlx::query(&format!(
+                    "SET LOCAL statement_timeout = '{ESTIMATE_BUDGET}'"
                 ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
+                .execute(&mut *tx)
                 .await
                 .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                match estimate_count_arm(arm, filter, &mut tx).await {
+                    Some(estimate) => {
+                        // `SET LOCAL` persists for the whole transaction, so
+                        // undo the estimate budget we just applied: any later
+                        // exact-count arm must still run under `COUNT_BUDGET`
+                        // (an unfiltered scan is not allowed to hold a
+                        // connection for long just because a sibling arm fell
+                        // back to an estimate).
+                        sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(read_database_failure)?;
+                        estimate
+                    }
+                    None => {
+                        // The estimate is best-effort; a total_count can never
+                        // justify a 500. Restart the transaction so the next
+                        // arm (or the page query) runs clean, and report 0.
+                        tracing::warn!(
+                            arm = estimate_arm_label(arm),
+                            "total_count estimate unavailable; reporting 0"
+                        );
+                        tx.rollback().await.map_err(read_database_failure)?;
+                        tx = manager.begin_read().await.map_err(read_database_failure)?;
+                        sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(read_database_failure)?;
+                        0
+                    }
+                }
             }
             Err(e) => return Err(read_database_failure(e)),
         };
     }
     tx.commit().await.map_err(read_database_failure)?;
     Ok(total)
+}
+
+/// Run `EXPLAIN (FORMAT JSON)` against a count arm's `SELECT 1` form and
+/// return the planner's row estimate. Returns `None` when the plan cannot be
+/// produced within `ESTIMATE_BUDGET` so callers can degrade gracefully instead
+/// of failing a read over a total-count estimate.
+async fn estimate_count_arm(
+    arm: &str,
+    filter: &ListRequestsFilter,
+    tx: &mut Transaction<'static, Postgres>,
+) -> Option<i64> {
+    let plan: serde_json::Value = match sqlx::query_scalar(&format!(
+        "EXPLAIN (FORMAT JSON) {}",
+        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+    ))
+    .bind(filter.created_by.as_deref())
+    .bind(filter.status.as_deref())
+    .bind(filter.models.as_deref())
+    .bind(filter.created_after)
+    .bind(filter.created_before)
+    .bind(filter.service_tiers.as_deref())
+    .fetch_one(&mut **tx)
+    .await
+    {
+        Ok(plan) => plan,
+        Err(e) => {
+            tracing::warn!(error = %e, "total_count estimate EXPLAIN failed");
+            return None;
+        }
+    };
+    Some(
+        plan.get(0)
+            .and_then(|p| p.get("Plan"))
+            .and_then(|p| p.get("Plan Rows"))
+            .and_then(|r| r.as_f64())
+            .map(|r| r.round() as i64)
+            .unwrap_or(0),
+    )
+}
+
+/// Short label identifying a count arm for logs.
+fn estimate_arm_label(arm: &str) -> &str {
+    if arm.contains("retained_response_buckets") {
+        "retained"
+    } else {
+        "live"
+    }
 }
 
 fn list_requests_page_sql(active_first: bool) -> String {
