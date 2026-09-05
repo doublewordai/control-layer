@@ -1376,6 +1376,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_unary_real_http_429_exhausts_to_503() {
+        // The upstream returns a real HTTP 429 (not a 200-with-embedded-error)
+        // on every attempt. When every provider is rate-limited and the retries
+        // are exhausted, the client must get a sanitized 503 (no capacity) —
+        // never a 502 that says "upstream died" and never the upstream's 429.
+        // Regression for ControlLayerProxyErrors: an OpenRouter leg that 429s
+        // every attempt was surfacing as `502 Bad Gateway` on exhaustion.
+        let mock = MockHttpClient::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"Rate limit exceeded","type":"rate_limit_error","code":429}}"#,
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![429]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            503,
+            "exhausted rate-limit fallbacks must surface a sanitized 503, not a 502"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_unary_real_http_500_exhausts_to_502() {
+        // A genuine upstream failure (500) on every attempt keeps surfacing as
+        // 502 on exhaustion — only the rate-limit class changed to 503.
+        let mock = MockHttpClient::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            r#"{"error":{"message":"Internal server error","type":"api_error","code":500}}"#,
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![500]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            502,
+            "non-rate-limit fallback exhaustion keeps the existing 502"
+        );
+        assert_eq!(mock.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_streaming_keepalive_before_error_is_still_detected() {
         // A keep-alive comment precedes the error frame; the peek must skip it
         // and still detect the 429, retry, and exhaust to 503.

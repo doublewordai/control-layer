@@ -1020,7 +1020,19 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            // An exhausted rate-limit fallback must surface as a sanitized 503
+            // (no capacity), never the upstream's 429 and never a 502 that says
+            // "upstream died". This matches the embedded-error path below and
+            // the documented intent ("the caller gets a sanitized 503 — never
+            // the upstream's rate limit"), and lets fusillade classify the
+            // outcome as downstream overload. Other retryable statuses keep the
+            // 502 they have always carried.
+            let exhausted_error = if status == 429 {
+                OnwardsErrorResponse::service_unavailable()
+            } else {
+                OnwardsErrorResponse::bad_gateway()
+            };
+            return LoopAction::Continue(Some(exhausted_error));
         }
 
         // Sanitize error responses when sanitize_response is enabled.
