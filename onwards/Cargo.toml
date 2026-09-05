@@ -1,6 +1,6 @@
 [package]
 name = "onwards"
-version = "0.38.1"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88.0"
 description = "A flexible LLM proxy library"
