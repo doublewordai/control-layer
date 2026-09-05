@@ -3161,6 +3161,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_provider_reasoning_fields_pass_through_only_in_non_strict_mode() {
+        for strict_mode in [false, true] {
+            for stream in [false, true] {
+                for path in ["/v1/chat/completions", "/v1/responses", "/v1/completions"] {
+                    let targets_map = Arc::new(DashMap::new());
+                    targets_map.insert(
+                        "model".to_string(),
+                        pool(
+                            Target::builder()
+                                .url("https://engine.example.com".parse().unwrap())
+                                .build(),
+                        ),
+                    );
+                    let targets = Targets {
+                        targets: targets_map,
+                        key_rate_limiters: Arc::new(DashMap::new()),
+                        key_concurrency_limiters: Arc::new(DashMap::new()),
+                        key_labels: Arc::new(DashMap::new()),
+                        strict_mode,
+                        http_pool_config: None,
+                    };
+                    let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+                    let server = TestServer::new(build_router(AppState::with_client(
+                        targets,
+                        mock_client.clone(),
+                    )))
+                    .unwrap();
+                    // Already translated by the public gateway; some mappings retain
+                    // the canonical effort alongside the provider-native controls.
+                    let mut body = json!({
+                        "model": "model", "messages": [], "input": "hello", "prompt": "hello",
+                        "stream": stream,
+                        "chat_template_kwargs": {"enable_thinking": true},
+                        "thinking_token_budget": 512
+                    });
+                    if path.ends_with("chat/completions") {
+                        body["reasoning_effort"] = json!("high");
+                    }
+                    let response = server.post(path).json(&body).await;
+                    let requests = mock_client.get_requests();
+                    if strict_mode {
+                        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+                        assert!(requests.is_empty());
+                    } else {
+                        assert_eq!(response.status_code(), StatusCode::OK);
+                        assert_eq!(requests.len(), 1);
+                        let forwarded: serde_json::Value =
+                            serde_json::from_slice(&requests[0].body).unwrap();
+                        assert_eq!(forwarded, body);
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_provider_reasoning_translation_applies_to_upstream_body() {
         let reasoning_translation = serde_json::from_value(json!({
             "chat_completions": {

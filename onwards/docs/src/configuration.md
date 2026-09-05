@@ -204,3 +204,11 @@ See [Authentication](authentication.md) for details.
   }
 }
 ```
+
+### Reasoning controls through internal gateways
+
+Non-strict gateways forward provider-native reasoning fields such as
+`chat_template_kwargs.enable_thinking` unchanged. This permits an internal
+gateway to receive requests already translated by a public gateway. Strict
+mode rejects these fields in favor of canonical reasoning controls. Configured
+`reasoning_effort` translations still apply in either mode.
