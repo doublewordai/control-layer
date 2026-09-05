@@ -1,5 +1,28 @@
 # Changelog
 
+## [4.1.0](https://github.com/doublewordai/control-layer/compare/fusillade-arsenal-v4.0.0...fusillade-arsenal-v4.1.0) (2026-09-05)
+
+
+### Features
+
+* enforce scheduled content retention by partition drop ([#1481](https://github.com/doublewordai/control-layer/issues/1481)) ([fc5aeae](https://github.com/doublewordai/control-layer/commit/fc5aeaeac79d2f73d5fd2175f28877cc150216db))
+* **fusillade:** move overdue batchless graphs concurrently in the backfill ([#1567](https://github.com/doublewordai/control-layer/issues/1567)) ([b0ed45c](https://github.com/doublewordai/control-layer/commit/b0ed45c09b27d1e87022247ea016b212fa958377))
+* **fusillade:** own batch finalization in a daemon loop, decouple no… ([#1462](https://github.com/doublewordai/control-layer/issues/1462)) ([83066bb](https://github.com/doublewordai/control-layer/commit/83066bb951405f67569d2776ad96ca61a5c372e6))
+
+
+### Bug Fixes
+
+* **dwctl:** count pending requests outside the admission lock; index the batched demand branch ([#1531](https://github.com/doublewordai/control-layer/issues/1531)) ([73e8f80](https://github.com/doublewordai/control-layer/commit/73e8f8083eb4c7125526b71e89684cc857bb8d6f))
+* Formalize indices missing from migration and drop unused ones ([#1568](https://github.com/doublewordai/control-layer/issues/1568)) ([0866443](https://github.com/doublewordai/control-layer/commit/0866443427b104e17b562fd6bf809da1bb54d855))
+* **fusillade:** drop the stranded-request purge step that times out  ([#1576](https://github.com/doublewordai/control-layer/issues/1576)) ([b9cae7a](https://github.com/doublewordai/control-layer/commit/b9cae7a23c2bd3cafe5c3a20ceb14c62c03f5a90))
+* **fusillade:** probe the template per picked row in the claim-time stranded check ([#1580](https://github.com/doublewordai/control-layer/issues/1580)) ([1433908](https://github.com/doublewordai/control-layer/commit/1433908c0fbb17fa3ba7b82c543ef5a40730e54c))
+* prune retained partitions in the trailing-demand query by retent… ([#1587](https://github.com/doublewordai/control-layer/issues/1587)) ([909ec68](https://github.com/doublewordai/control-layer/commit/909ec68d89b5e25d9ea56ce42c15a5166d80a3d3))
+
+
+### Performance Improvements
+
+* **fusillade:** index the batchless branch of the demand query ([#1516](https://github.com/doublewordai/control-layer/issues/1516)) ([6833cb0](https://github.com/doublewordai/control-layer/commit/6833cb08f464b0df14782d3b3eeb1fc4126c7c9c))
+
 ## [4.0.0](https://github.com/doublewordai/control-layer/compare/fusillade-arsenal-v3.1.0...fusillade-arsenal-v4.0.0) (2026-08-06)
 
 
