@@ -18,7 +18,7 @@ name = "fusillade_arsenal"
 path = "src/lib.rs"
 
 [dependencies]
-fusillade-core = { version = "5.0.0", path = "../fusillade-core", features = ["sqlx-postgres"] }
+fusillade-core = { version = "6.0.0", path = "../fusillade-core", features = ["sqlx-postgres"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
