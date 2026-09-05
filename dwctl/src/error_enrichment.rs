@@ -59,7 +59,11 @@ struct ChatRequest {
 /// - 403 Forbidden errors (cap window rolled, reinstatement pending) → retriable 429
 ///   plus a demand-driven config resync so the retry succeeds within seconds
 #[instrument(name = "dwctl.error_enrichment", skip_all, fields(http.request.method = %request.method(), url.path = %request.uri().path(), url.query = request.uri().query().unwrap_or("")))]
-pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Request<Body>, next: Next) -> Response<Body> {
+pub async fn error_enrichment_middleware(
+    State(pools): State<sqlx_pool_router::DynPools>,
+    request: Request<Body>,
+    next: Next,
+) -> Response<Body> {
     // Extract API key from request headers before passing to onwards
     let api_key = request
         .headers()
@@ -98,7 +102,7 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         // One lookup of the key's owner + purpose, reused by the checks below so
         // a 403 does not fan out into several by-secret queries. None for an
         // unknown/invalid token, in which case the checks fall through.
-        let key_info = get_api_key_user_and_purpose(pool.clone(), &key).await.ok().flatten();
+        let key_info = get_api_key_user_and_purpose(pools.write().into_inner(), &key).await.ok().flatten();
 
         // Order matters: the more fundamental the failure, the earlier it runs, so
         // when several conditions could explain the 403 we surface the one that's
@@ -138,7 +142,7 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         // 1. Model access via group membership
         if let Some(model) = &model_name
             && let Some((user_id, _)) = key_info.as_ref()
-            && let Ok(has_access) = check_user_has_model_access(pool.clone(), *user_id, model).await
+            && let Ok(has_access) = check_user_has_model_access(pools.write().into_inner(), *user_id, model).await
             && !has_access
         {
             return Error::ModelAccessDenied {
@@ -153,7 +157,7 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
 
         // 2. Modality blocked by a traffic routing rule on this model.
         if let Some(model) = &model_name
-            && let Ok(Some(purpose)) = check_modality_blocked(pool.clone(), &key, model).await
+            && let Ok(Some(purpose)) = check_modality_blocked(pools.write().into_inner(), &key, model).await
         {
             return Error::ModalityAccessDenied {
                 model_name: model.clone(),
@@ -164,7 +168,7 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         }
 
         // 3. Insufficient balance.
-        if let Ok(balance) = get_balance_of_api_key(pool.clone(), &key).await
+        if let Ok(balance) = get_balance_of_api_key(pools.write().into_inner(), &key).await
             && balance <= Decimal::ZERO
         {
             return Error::InsufficientCredits {
@@ -180,7 +184,7 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
         //    post-boundary lag: a key whose window has rolled but which the
         //    periodic fallback sync hasn't readmitted yet is never reported
         //    as "cap exceeded".
-        if let Ok(Some(cap)) = get_spend_cap_state(pool.clone(), &key).await
+        if let Ok(Some(cap)) = get_spend_cap_state(pools.write().into_inner(), &key).await
             && cap.window_spend >= cap.limit
         {
             if cap.window_current {
@@ -215,7 +219,7 @@ pub async fn error_enrichment_middleware(State(pool): State<PgPool>, request: Re
             // into a resync storm by a burst of 403s; if the notify is
             // throttled or lost, the periodic fallback sync readmits within
             // one interval anyway).
-            maybe_fire_boundary_resync(&pool).await;
+            maybe_fire_boundary_resync(&pools.write()).await;
 
             // And tell the triggering request the truth: its cap has reset
             // and the key is being reinstated. 429 deliberately, because it
@@ -645,7 +649,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -785,7 +789,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
         let server = axum_test::TestServer::new(router).expect("Failed to create test server");
@@ -985,7 +989,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -1025,7 +1029,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -1054,7 +1058,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -1140,7 +1144,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 
@@ -1403,7 +1407,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
 

@@ -47,7 +47,7 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -144,7 +144,7 @@ pub async fn create_test_app_state_with_database_pools(
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -210,11 +210,14 @@ pub fn create_test_config() -> crate::config::Config {
     let temp_dir = std::env::temp_dir().join(format!("dwctl-test-emails-{}", std::process::id()));
 
     crate::config::Config {
+        database_pooled_url: None,
         clickhouse: None,
         prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
         database_url: None,
         database_replica_url: None,
         database: crate::config::DatabaseConfig::External {
+            pooled_url: None,
+            direct_pool: crate::config::default_direct_pool(),
             url: "Something".to_string(), // Will get overriden by env var
             replica_url: None,
             pool: PoolSettings {
@@ -224,6 +227,7 @@ pub fn create_test_config() -> crate::config::Config {
             },
             replica_pool: None,
             fusillade: crate::config::ComponentDb::Schema {
+                direct_pool: crate::config::default_direct_pool(),
                 name: "fusillade".to_string(),
                 pool: PoolSettings {
                     max_connections: 4,
@@ -233,6 +237,7 @@ pub fn create_test_config() -> crate::config::Config {
                 replica_pool: None,
             },
             outlet: crate::config::ComponentDb::Schema {
+                direct_pool: crate::config::default_direct_pool(),
                 name: "outlet".to_string(),
                 pool: PoolSettings {
                     max_connections: 4,

@@ -6,7 +6,6 @@
 
 use crate::metrics::errors::component::PROBE_SCHEDULER;
 use crate::probes::db::ProbeManager;
-use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -20,19 +19,31 @@ use uuid::Uuid;
 /// It reads probe state from the database and manages background tasks accordingly.
 #[derive(Clone)]
 pub struct ProbeScheduler {
-    pool: PgPool,
+    /// Query traffic (pooled endpoint when configured).
+    pool: sqlx_pool_router::DynPools,
+    /// Direct connections for the probe-changes LISTEN session.
+    listener_pool: sqlx_pool_router::DynPools,
     config: crate::config::Config,
     schedulers: Arc<RwLock<HashMap<Uuid, JoinHandle<()>>>>,
 }
 
 impl ProbeScheduler {
     /// Create a new ProbeScheduler instance
-    pub fn new(pool: PgPool, config: crate::config::Config) -> Self {
+    pub fn new(pool: impl sqlx_pool_router::PoolProvider, config: crate::config::Config) -> Self {
+        let pool = sqlx_pool_router::DynPools::new(pool);
         Self {
+            listener_pool: pool.clone(),
             pool,
             config,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Use `listener_pool` (direct connections) for the LISTEN session instead
+    /// of the query pool. Required when the query pool is a pooled endpoint.
+    pub fn with_listener_pool(mut self, listener_pool: impl sqlx_pool_router::PoolProvider) -> Self {
+        self.listener_pool = sqlx_pool_router::DynPools::new(listener_pool);
+        self
     }
 
     /// Initialize schedulers for all active probes in the database.
@@ -45,7 +56,7 @@ impl ProbeScheduler {
             return Ok(());
         }
 
-        let probes = ProbeManager::list_active_probes(&self.pool).await?;
+        let probes = ProbeManager::list_active_probes(&self.pool.write()).await?;
 
         tracing::info!("Initializing schedulers for {} active probes", probes.len());
 
@@ -77,10 +88,10 @@ impl ProbeScheduler {
         // Spawn the scheduler task
         let handle = tokio::spawn(async move {
             // Check when the probe last executed to avoid immediate execution on restart
-            let _should_delay = match ProbeManager::get_recent_results(&pool, probe_id, 1).await {
+            let _should_delay = match ProbeManager::get_recent_results(&pool.write(), probe_id, 1).await {
                 Ok(results) => {
                     if let Some(last_result) = results.first() {
-                        let probe = match ProbeManager::get_probe(&pool, probe_id).await {
+                        let probe = match ProbeManager::get_probe(&pool.write(), probe_id).await {
                             Ok(p) => p,
                             Err(e) => {
                                 crate::background_error!(
@@ -144,7 +155,7 @@ impl ProbeScheduler {
                 }
 
                 // Get the probe to check if it's still active and get the interval
-                let probe = match ProbeManager::get_probe(&pool, probe_id).await {
+                let probe = match ProbeManager::get_probe(&pool.write(), probe_id).await {
                     Ok(p) => p,
                     Err(e) => {
                         crate::background_error!(PROBE_SCHEDULER, "probe_fetch", Warning, "Error fetching probe {}: {}", probe_id, e);
@@ -159,7 +170,7 @@ impl ProbeScheduler {
                 }
 
                 // Execute the probe
-                match ProbeManager::execute_probe(&pool, probe_id, &config).await {
+                match ProbeManager::execute_probe(&pool.write(), probe_id, &config).await {
                     Ok(result) => {
                         if result.success {
                             tracing::debug!(
@@ -240,7 +251,7 @@ impl ProbeScheduler {
     /// - Start schedulers for newly activated probes
     /// - Stop schedulers for deactivated/deleted probes
     pub async fn sync_with_database(&self, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
-        let active_probes = ProbeManager::list_active_probes(&self.pool).await?;
+        let active_probes = ProbeManager::list_active_probes(&self.pool.write()).await?;
         let active_probe_ids: std::collections::HashSet<Uuid> = active_probes.iter().map(|p| p.id).collect();
 
         let schedulers = self.schedulers.read().await;
@@ -355,7 +366,7 @@ impl ProbeScheduler {
             }
 
             // Establish a dedicated connection for LISTEN
-            let mut listener = match sqlx::postgres::PgListener::connect_with(&self.pool).await {
+            let mut listener = match sqlx::postgres::PgListener::connect_with(&self.listener_pool.write()).await {
                 Ok(l) => l,
                 Err(e) => {
                     tracing::error!("Failed to create LISTEN connection: {}", e);
@@ -454,9 +465,8 @@ mod tests {
     use super::*;
     use crate::api::models::probes::CreateProbe;
     use crate::probes::db::ProbeManager;
-    use sqlx::PgPool;
 
-    async fn setup_test_deployment(pool: &PgPool) -> Uuid {
+    async fn setup_test_deployment(pool: &sqlx::PgPool) -> Uuid {
         // Generate unique names using UUID
         let unique_id = Uuid::new_v4();
         let endpoint_name = format!("test-endpoint-{}", unique_id);
@@ -492,7 +502,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_scheduler_initialize(pool: PgPool) {
+    async fn test_scheduler_initialize(pool: sqlx::PgPool) {
         // Create separate deployments for each probe
         let deployment_id1 = setup_test_deployment(&pool).await;
         let deployment_id2 = setup_test_deployment(&pool).await;
@@ -537,7 +547,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_sync_starts_new_schedulers(pool: PgPool) {
+    async fn test_sync_starts_new_schedulers(pool: sqlx::PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
         let config = create_test_config();
@@ -571,7 +581,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_sync_stops_deactivated_schedulers(pool: PgPool) {
+    async fn test_sync_stops_deactivated_schedulers(pool: sqlx::PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
         let probe = ProbeManager::create_probe(
@@ -603,7 +613,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_stop_all_schedulers(pool: PgPool) {
+    async fn test_stop_all_schedulers(pool: sqlx::PgPool) {
         // Create separate deployment for each probe
         for i in 0..3 {
             let deployment_id = setup_test_deployment(&pool).await;
@@ -634,7 +644,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_scheduler_ignores_inactive_probes(pool: PgPool) {
+    async fn test_scheduler_ignores_inactive_probes(pool: sqlx::PgPool) {
         let deployment_id = setup_test_deployment(&pool).await;
 
         // Create probe and immediately deactivate

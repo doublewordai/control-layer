@@ -118,7 +118,11 @@ struct OnwardsApiKey {
 
 /// Manages the integration between onwards-pilot and the onwards proxy
 pub struct OnwardsConfigSync {
-    db: PgPool,
+    /// Query traffic (pooled endpoint when configured).
+    db: sqlx_pool_router::DynPools,
+    /// Direct connections for the LISTEN session; a transaction-mode pooler
+    /// cannot carry a subscription.
+    listener_db: sqlx_pool_router::DynPools,
     sender: watch::Sender<Targets>,
     /// Shared map of model batch capacity limits for the daemon
     daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
@@ -158,7 +162,7 @@ impl OnwardsConfigSync {
     #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        Self::new_with_daemon_limits(db, None, 10, Vec::new(), false, RateLimitTiersConfig::default()).await
+        Self::new_with_daemon_limits(db.clone(), db, None, 10, Vec::new(), false, RateLimitTiersConfig::default()).await
     }
 
     /// Creates a new OnwardsConfigSync with optional daemon capacity limits map and escalation models
@@ -168,26 +172,30 @@ impl OnwardsConfigSync {
     /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
     /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
     /// `rate_limit_tiers` - Default rate limits applied per-key based on the owning user's `verified` flag.
-    #[instrument(skip(db, daemon_capacity_limits, escalation_models, rate_limit_tiers))]
+    /// `listener_db` - Direct (non-pooled) connections for the LISTEN session.
+    #[instrument(skip(db, listener_db, daemon_capacity_limits, escalation_models, rate_limit_tiers))]
     pub async fn new_with_daemon_limits(
-        db: PgPool,
+        db: impl sqlx_pool_router::PoolProvider,
+        listener_db: impl sqlx_pool_router::PoolProvider,
         daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
         default_batch_capacity: usize,
         escalation_models: Vec<String>,
         strict_mode: bool,
         rate_limit_tiers: RateLimitTiersConfig,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
+        // Live provider (not a pinned pool): survives runtime pool swaps.
+        let db = sqlx_pool_router::DynPools::new(db);
         // Load initial configuration (including composite models)
-        let initial_targets = load_targets_from_db(&db, &escalation_models, strict_mode, &rate_limit_tiers).await?;
+        let initial_targets = load_targets_from_db(&db.write(), &escalation_models, strict_mode, &rate_limit_tiers).await?;
 
         // If daemon limits are provided, populate them
         if let Some(ref limits) = daemon_capacity_limits {
-            update_daemon_capacity_limits(&db, limits, default_batch_capacity).await?;
+            update_daemon_capacity_limits(&db.write(), limits, default_batch_capacity).await?;
         }
 
         // Populate cache info metrics on startup
         let mut cache_info_state = crate::metrics::CacheInfoState::new();
-        if let Err(e) = crate::metrics::update_cache_info_metrics(&db, &initial_targets, &mut cache_info_state).await {
+        if let Err(e) = crate::metrics::update_cache_info_metrics(&db.write(), &initial_targets, &mut cache_info_state).await {
             crate::background_error!(
                 ONWARDS_SYNC,
                 "cache_info_metrics",
@@ -202,6 +210,7 @@ impl OnwardsConfigSync {
 
         let integration = Self {
             db,
+            listener_db: sqlx_pool_router::DynPools::new(listener_db),
             sender,
             daemon_capacity_limits,
             default_batch_capacity,
@@ -242,7 +251,7 @@ impl OnwardsConfigSync {
             if let Some(tx) = &config.status_tx {
                 tx.send(SyncStatus::Connecting).await?;
             }
-            let mut listener = PgListener::connect_with(&self.db).await?;
+            let mut listener = PgListener::connect_with(&self.listener_db.write()).await?;
             // Listen to auth config changes
             listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await?;
 
@@ -393,23 +402,24 @@ impl OnwardsConfigSync {
     /// watch channel is closed (all receivers dropped); Err only for fatal
     /// DB errors (closed pool / connection).
     async fn full_reload(&mut self, source: &'static str) -> Result<bool, anyhow::Error> {
-        let new_targets = match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
-            Ok(targets) => targets,
-            Err(e) => {
-                crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
-                if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
-                    error!("Database pool closed, exiting sync task");
-                    return Err(e);
+        let new_targets =
+            match load_targets_from_db(&self.db.write(), &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
+                Ok(targets) => targets,
+                Err(e) => {
+                    crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
+                    if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
+                        error!("Database pool closed, exiting sync task");
+                        return Err(e);
+                    }
+                    // Continue listening for other types of errors
+                    return Ok(true);
                 }
-                // Continue listening for other types of errors
-                return Ok(true);
-            }
-        };
+            };
         debug!("Loaded {} targets from database", new_targets.targets.len());
 
         // Update daemon capacity limits if configured
         if let Some(ref limits) = self.daemon_capacity_limits
-            && let Err(e) = update_daemon_capacity_limits(&self.db, limits, self.default_batch_capacity).await
+            && let Err(e) = update_daemon_capacity_limits(&self.db.write(), limits, self.default_batch_capacity).await
         {
             crate::background_error!(
                 ONWARDS_SYNC,
@@ -421,7 +431,7 @@ impl OnwardsConfigSync {
         }
 
         // Update cache info metrics
-        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
+        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db.write(), &new_targets, &mut self.cache_info_state).await {
             crate::background_error!(
                 ONWARDS_SYNC,
                 "cache_info_metrics",

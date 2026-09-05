@@ -1155,7 +1155,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
 
     // Use the write pool for the reservation transaction
     let pool = state.db.write();
-    reserve_capacity(pool, &*state.request_manager, &input).await.map_err(|e| match e {
+    reserve_capacity(&pool, &*state.request_manager, &input).await.map_err(|e| match e {
         CapacityError::InsufficientCapacity { completion_window, models } => Error::TooManyRequests {
             message: format!(
                 "Insufficient capacity for {} completion window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
@@ -1167,7 +1167,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
 }
 
 async fn release_capacity_reservations<P: PoolProvider>(state: &AppState<P>, reservation_ids: &[Uuid]) -> Result<()> {
-    super::sla_capacity::release_reservations(state.db.write(), reservation_ids)
+    super::sla_capacity::release_reservations(&state.db.write(), reservation_ids)
         .await
         .map_err(|msg| Error::Internal { operation: msg })
 }
@@ -1379,7 +1379,7 @@ pub async fn get_batch_analytics<P: PoolProvider>(
     // hasn't been folded yet (brand new / no completed requests), not that data aged out, so
     // return a zero-valued payload rather than 404. Ownership/existence is already enforced
     // above, and platform managers expect to see metrics for any batch they can access.
-    let analytics = crate::db::handlers::analytics::get_batch_analytics(state.db.read(), &batch_id)
+    let analytics = crate::db::handlers::analytics::get_batch_analytics(&state.db.read(), &batch_id)
         .await
         .map_err(|e| Error::Internal {
             operation: format!("fetch batch analytics: {}", e),
@@ -1620,7 +1620,7 @@ pub async fn cancel_batch<P: PoolProvider>(
     tracing::debug!("Batch {} cancelled", batch_id);
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
+    let creator_email = fetch_creator_email(&state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -1773,7 +1773,7 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
         })?;
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
+    let creator_email = fetch_creator_email(&state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -1887,7 +1887,7 @@ pub async fn retry_specific_requests<P: PoolProvider>(
         })?;
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
+    let creator_email = fetch_creator_email(&state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -2104,7 +2104,7 @@ pub async fn list_batches<P: PoolProvider>(
 
     // Fetch analytics in bulk if requested
     let analytics_map: HashMap<Uuid, BatchAnalytics> = if include_analytics && !batches.is_empty() {
-        crate::db::handlers::analytics::get_batches_analytics_bulk(state.db.read(), &batch_ids)
+        crate::db::handlers::analytics::get_batches_analytics_bulk(&state.db.read(), &batch_ids)
             .await
             .map_err(|e| Error::Internal {
                 operation: format!("fetch bulk batch analytics: {}", e),
