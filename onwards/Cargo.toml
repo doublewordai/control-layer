@@ -43,6 +43,7 @@ tokio = { version = "1.45.1", features = [
   "fs",
   "sync",
   "time",
+  "signal",
 ] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1.41"
@@ -65,3 +66,5 @@ futures-util = "0.3"
 rstest = "0.26.1"
 tower = "0.5"
 wiremock = "0.6"
+reqwest = { version = "0.13", features = ["json", "stream"] }
+tokio = { version = "1.45.1", features = ["process", "io-util"] }
