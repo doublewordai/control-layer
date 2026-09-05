@@ -1022,7 +1022,15 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            // An upstream 429 is a transient, client-retryable condition. Carry
+            // it to the caller when the fallback pool exhausts rather than
+            // collapsing it to a 502 that reads as a server failure.
+            let fallback_error = if status == 429 {
+                OnwardsErrorResponse::rate_limited()
+            } else {
+                OnwardsErrorResponse::bad_gateway()
+            };
+            return LoopAction::Continue(Some(fallback_error));
         }
 
         // Sanitize error responses when sanitize_response is enabled.

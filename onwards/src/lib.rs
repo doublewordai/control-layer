@@ -1403,6 +1403,58 @@ mod tests {
         assert_eq!(mock.get_requests().len(), 2);
     }
 
+    /// A real HTTP 429 from the sole provider is a transient, client-retryable
+    /// condition: after the fallback pool exhausts, the caller must get a 429 —
+    /// not the 502 that reads as a server failure. This is the shape that made
+    /// ControlLayerProxyErrors page on synthetic-probe traffic for OpenRouter
+    /// rate limits.
+    #[tokio::test]
+    async fn test_upstream_429_single_provider_surfaces_429_not_502() {
+        let mock = MockHttpClient::new(StatusCode::TOO_MANY_REQUESTS, "{}");
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 1), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "an upstream rate limit on the only provider must surface as 429"
+        );
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "rate_limit");
+    }
+
+    /// Control: a 5xx from the sole provider still collapses to a gateway 502 on
+    /// exhaustion — only the rate-limit status is preserved.
+    #[tokio::test]
+    async fn test_upstream_5xx_single_provider_still_exhausts_to_502() {
+        let mock = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, "{}");
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 1, vec![500]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            StatusCode::BAD_GATEWAY,
+            "a 5xx on the only provider must still exhaust to a gateway error"
+        );
+    }
+
     // Some upstreams also fail by returning a `200 OK` with an *empty* body (no
     // tokens, no error envelope — just EOF). These tests exercise the
     // empty-body ("Mode C") detection + retry, and crucially that a valid stream
