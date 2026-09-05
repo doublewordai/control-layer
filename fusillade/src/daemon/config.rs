@@ -175,7 +175,6 @@ pub struct RetentionMaintenanceConfig {
     batchless_archive_backfill_enabled: bool,
     batchless_archive_groups_per_tick: i64,
     batchless_archive_bytes_per_tick: i64,
-    batchless_archive_backfill_concurrency: usize,
     retained_response_partitions_days_ahead: i32,
     retained_response_retirement_enabled: bool,
     batch_archive_retirement_enabled: bool,
@@ -192,7 +191,6 @@ impl Default for RetentionMaintenanceConfig {
             batchless_archive_backfill_enabled: false,
             batchless_archive_groups_per_tick: 4,
             batchless_archive_bytes_per_tick: 64 * 1_024 * 1_024,
-            batchless_archive_backfill_concurrency: 1,
             retained_response_partitions_days_ahead: 7,
             retained_response_retirement_enabled: false,
             batch_archive_retirement_enabled: false,
@@ -228,14 +226,6 @@ impl RetentionMaintenanceConfig {
     pub fn with_batchless_archive_limits(mut self, max_groups: i64, max_bytes: i64) -> Self {
         self.batchless_archive_groups_per_tick = max_groups;
         self.batchless_archive_bytes_per_tick = max_bytes;
-        self
-    }
-
-    /// Set how many graphs the backfill worker moves concurrently within one
-    /// tick. The steady sweep always moves sequentially. Values below 1 fail
-    /// startup validation while the backfill is enabled.
-    pub fn with_batchless_archive_backfill_concurrency(mut self, concurrency: usize) -> Self {
-        self.batchless_archive_backfill_concurrency = concurrency;
         self
     }
 
@@ -291,11 +281,6 @@ impl RetentionMaintenanceConfig {
     /// Maximum retained payload bytes moved per tick.
     pub fn batchless_archive_bytes_per_tick(&self) -> i64 {
         self.batchless_archive_bytes_per_tick
-    }
-
-    /// Graphs the backfill worker moves concurrently within one tick.
-    pub fn batchless_archive_backfill_concurrency(&self) -> usize {
-        self.batchless_archive_backfill_concurrency
     }
 
     /// Number of future daily retained-response partitions to ensure.
@@ -851,7 +836,6 @@ mod tests {
         assert!(!config.retained_response_retirement_enabled);
         assert!(config.batchless_archive_groups_per_tick > 0);
         assert!(config.batchless_archive_bytes_per_tick > 0);
-        assert_eq!(config.batchless_archive_backfill_concurrency, 1);
         assert!(config.retained_response_partitions_days_ahead > 0);
     }
 

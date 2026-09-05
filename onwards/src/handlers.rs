@@ -1020,7 +1020,16 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            // The upstream produced a response (the fallback status), so carry it
+            // on the error: if every attempt fails this is the "last upstream that
+            // answered" and request-logging must be able to name it.
+            let answered = ServedBy {
+                url: target.url.to_string(),
+                onwards_model: target.onwards_model.clone(),
+            };
+            return LoopAction::Continue(
+                Some(OnwardsErrorResponse::bad_gateway().with_served_by(answered)),
+            );
         }
 
         // Sanitize error responses when sanitize_response is enabled.
@@ -1043,6 +1052,13 @@ pub async fn target_message_handler<T: HttpClient>(
                 "Upstream provider returned error, sanitizing before forwarding to client"
             );
 
+            // The upstream answered with a non-2xx status; keep its identity on
+            // the sanitized error so request-logging can attribute the 5xx/4xx to
+            // the concrete provider rather than an empty `served_by`.
+            let answered = ServedBy {
+                url: target.url.to_string(),
+                onwards_model: target.onwards_model.clone(),
+            };
             let sanitized_error = if (400..500).contains(&status) {
                 OnwardsErrorResponse::builder()
                     .body(ErrorResponseBody {
@@ -1052,6 +1068,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         code: "upstream_error".to_string(),
                     })
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST))
+                    .served_by(answered.clone())
                     .build()
             } else {
                 OnwardsErrorResponse::builder()
@@ -1062,6 +1079,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         code: "internal_error".to_string(),
                     })
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
+                    .served_by(answered)
                     .build()
             };
 

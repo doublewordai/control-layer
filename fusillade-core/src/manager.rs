@@ -523,7 +523,7 @@ mod retention_policy_tests {
 
         assert_maintenance_is_disabled(
             storage
-                .archive_overdue_batchless_responses(&policy, &cutoffs, 1, 1, 1)
+                .archive_overdue_batchless_responses(&policy, &cutoffs, 1, 1)
                 .await,
         );
         assert_maintenance_is_disabled(
@@ -1759,18 +1759,12 @@ pub trait DaemonStorage: Send + Sync {
     /// can still be dropped. Retention is only ever extended here; without
     /// this path such content would stay live, and therefore undeletable,
     /// forever. Storage backends opt in explicitly; the default is disabled.
-    ///
-    /// `concurrency` is how many discovered graphs an implementation may move
-    /// at the same time within this one call. The graph and byte budgets
-    /// bound the whole call, not each concurrent mover; values below 1
-    /// behave as 1.
     async fn archive_overdue_batchless_responses(
         &self,
         _policy: &RetentionPolicy,
         _cutoffs: &RetainedResponseArchiveCutoffs,
         _max_groups: i64,
         _max_bytes: i64,
-        _concurrency: usize,
     ) -> Result<RetainedResponseArchiveOutcome> {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }
