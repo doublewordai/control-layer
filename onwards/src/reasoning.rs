@@ -407,8 +407,21 @@ pub fn validate_canonical_reasoning(
     path: &str,
     body: &Value,
 ) -> Result<Option<CanonicalReasoningRequest>, ReasoningError> {
+    parse_reasoning_request(path, body, true)
+}
+
+/// Parse canonical controls while optionally rejecting provider-native fields.
+/// Internal non-strict gateways must accept bodies translated by an earlier hop.
+pub(crate) fn parse_reasoning_request(
+    path: &str,
+    body: &Value,
+    strict: bool,
+) -> Result<Option<CanonicalReasoningRequest>, ReasoningError> {
     let surface = ApiSurface::from_path(path);
     if surface == ApiSurface::Completions {
+        if !strict {
+            return Ok(None);
+        }
         let unsupported = [
             ("/reasoning_effort", "reasoning_effort"),
             ("/reasoning", "reasoning"),
@@ -465,7 +478,7 @@ pub fn validate_canonical_reasoning(
         .find(|(pointer, _)| body.pointer(pointer).is_some()),
         ApiSurface::Completions | ApiSurface::Other => None,
     };
-    if let Some((_, param)) = unsupported {
+    if strict && let Some((_, param)) = unsupported {
         let canonical = surface
             .parameter_name()
             .expect("reasoning API surfaces have canonical parameters");
