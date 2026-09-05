@@ -123,8 +123,10 @@ impl PaymentProvider for DummyProvider {
 
             {
                 let mut users = crate::db::handlers::users::Users::new(&mut conn);
+                // Mirrors the Stripe provider: an unknown target is a foreign
+                // region's session, not bad data, so it acks rather than errors.
                 if users.get_by_id(target_id).await?.is_none() {
-                    return Err(PaymentError::InvalidData("Setup session target user not found".to_string()));
+                    return Err(PaymentError::UnknownReference(target_id.to_string()));
                 }
                 users
                     .set_payment_provider_id_if_empty(target_id, &format!("dummy_cus_{}", target_id))
@@ -477,6 +479,52 @@ mod tests {
         .unwrap();
 
         assert_eq!(count.count.unwrap(), 1, "Should only have one transaction (idempotent)");
+    }
+
+    /// A setup session naming a user this plane does not own is the expected
+    /// shape of another region's event, since one payment account serves both
+    /// planes and every endpoint receives every plane's events.
+    ///
+    /// It must surface as `UnknownReference`, which the webhook acks with a
+    /// single warn, and NOT as `InvalidData` — that routes through the
+    /// handler's catch-all and logs an ERROR blaming data integrity for a
+    /// routine cross-region delivery.
+    #[sqlx::test]
+    async fn setup_session_for_a_foreign_user_is_an_unknown_reference(pool: PgPool) {
+        let provider = DummyProvider::from(crate::config::DummyConfig {
+            amount: Decimal::new(100, 0),
+        });
+
+        // A well-formed id that simply does not exist in this plane's DB —
+        // exactly what a foreign region's client_reference_id looks like here.
+        let foreign_id = uuid::Uuid::new_v4();
+        let session_id = format!("{}{}_{}", DUMMY_SETUP_SESSION_PREFIX, foreign_id, uuid::Uuid::new_v4());
+
+        let err = provider
+            .process_payment_session(&pool, &session_id, &crate::config::CreditsConfig::default())
+            .await
+            .expect_err("a setup session for an unknown user must not succeed");
+
+        match err {
+            PaymentError::UnknownReference(reference) => {
+                assert_eq!(reference, foreign_id.to_string(), "the reference must name the user, for triage");
+            }
+            other => panic!("expected UnknownReference so the webhook acks quietly, got {other:?}"),
+        }
+
+        // The ack must not have credited anybody on the way through.
+        let credited = sqlx::query!(
+            r#"
+            SELECT COUNT(*) as count
+            FROM credits_transactions
+            WHERE source_id = $1
+            "#,
+            session_id.to_string()
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(credited.count.unwrap(), 0, "a foreign session must never create a credit");
     }
 
     #[test]
