@@ -1022,6 +1022,10 @@ jobs:
         if: env.RUN_COMPLIANCE == 'true'
         run: cd /tmp/openresponses && bun install
 
+      - name: Test compliance runner adapter
+        if: env.RUN_COMPLIANCE == 'true'
+        run: bun test ./.github/scripts/openresponses-compliance.test.mjs
+
       - name: Run compliance tests
         if: env.RUN_COMPLIANCE == 'true'
         run: |
@@ -1034,7 +1038,7 @@ jobs:
           echo
 
           set +e
-          bun run bin/compliance-test.ts \
+          bun run "${GITHUB_WORKSPACE}/.github/scripts/openresponses-compliance.mjs" \
             --base-url "${COMPLIANCE_BASE_URL}" \
             --api-key "${COMPLIANCE_API_KEY}" \
             --model "${TEST_MODEL}" \
@@ -1083,7 +1087,7 @@ jobs:
               echo
               echo "=== Retry failed test(s): ${failed_filters} ==="
               set +e
-              bun run bin/compliance-test.ts \
+              bun run "${GITHUB_WORKSPACE}/.github/scripts/openresponses-compliance.mjs" \
                 --base-url "${COMPLIANCE_BASE_URL}" \
                 --api-key "${COMPLIANCE_API_KEY}" \
                 --model "${TEST_MODEL}" \
@@ -1116,7 +1120,7 @@ jobs:
               else
                 echo
                 echo "=== Verbose rerun of failed test(s): ${failed_filters} ==="
-                bun run bin/compliance-test.ts \
+                bun run "${GITHUB_WORKSPACE}/.github/scripts/openresponses-compliance.mjs" \
                   --base-url "${COMPLIANCE_BASE_URL}" \
                   --api-key "${COMPLIANCE_API_KEY}" \
                   --model "${TEST_MODEL}" \
