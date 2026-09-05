@@ -59,7 +59,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
           just-version: "1.46.0"
 
@@ -170,7 +170,7 @@ jobs:
           cache-on-failure: true
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
           just-version: "1.46.0"
 
@@ -305,7 +305,7 @@ jobs:
 
       - name: Install just
         if: env.RUN_CI == 'true'
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
           just-version: "1.46.0"
 
@@ -381,7 +381,7 @@ jobs:
           shared-key: backend-lint
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
           just-version: "1.46.0"
 
@@ -1285,7 +1285,7 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Install just
-        uses: extractions/setup-just@v3
+        uses: extractions/setup-just@v4
         with:
           just-version: "1.46.0"
 
