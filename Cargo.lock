@@ -4314,7 +4314,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "onwards"
-version = "0.38.1"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4341,6 +4341,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "rand 0.9.4",
+ "reqwest",
  "rstest",
  "serde",
  "serde_json",
