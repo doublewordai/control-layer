@@ -514,8 +514,9 @@ impl FromRequestParts<AppState> for HasApiKey {
 pub const ORGANIZATION_HEADER: &str = "x-organization-id";
 
 /// Populate organization context on an authenticated user.
-/// Reads the `X-Organization-Id` header and queries the user's org memberships.
-async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool) {
+/// Reads the org cookie (`org_cookie_name`, falling back to the
+/// `X-Organization-Id` header) and queries the user's org memberships.
+async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool, org_cookie_name: &str) {
     // Query all organizations the user belongs to
     let mut conn = match db.acquire().await {
         Ok(conn) => conn,
@@ -576,9 +577,14 @@ async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool
         }
     }
 
-    // Read active organization from dw_active_org cookie, falling back to X-Organization-Id header.
+    // Read active organization from the org cookie, falling back to X-Organization-Id header.
     // The cookie is set by POST /session/organization and sent automatically by the browser.
     // The header is used by CLI tools and API clients without access to an API key (likely none).
+    //
+    // The name is configurable (`auth.native.session.org_cookie_name`) because
+    // this takes the FIRST match in the header: environments sharing a parent
+    // domain otherwise deliver two same-named cookies here and the winner is
+    // decided by acquisition order, not by which host the request reached.
     let org_id_str = parts
         .headers
         .get_all("cookie")
@@ -586,8 +592,14 @@ async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool
         .filter_map(|v| v.to_str().ok())
         .flat_map(|s| s.split(';'))
         .find_map(|cookie| {
-            let cookie = cookie.trim();
-            cookie.strip_prefix("dw_active_org=").filter(|v| !v.is_empty())
+            // Split the name and the `=` rather than formatting a joined prefix:
+            // this runs on every authenticated request, and the joined form would
+            // allocate a String per request to compare against.
+            cookie
+                .trim()
+                .strip_prefix(org_cookie_name)
+                .and_then(|rest| rest.strip_prefix('='))
+                .filter(|v| !v.is_empty())
         })
         .map(String::from)
         .or_else(|| {
@@ -649,12 +661,18 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         let mut auth_errors = Vec::new();
         let mut any_auth_attempted = false;
 
+        // Read once up front: every auth path below needs the org cookie name.
+        // Borrowed from the config snapshot rather than cloned — this is the
+        // per-request authentication path.
+        let config = state.current_config();
+        let org_cookie_name = config.auth.native.session.org_cookie_name.as_str();
+
         // Try API key authentication first (most specific)
         match try_api_key_auth(parts, state.db.read()).await {
             Some(Ok((mut user, last_login))) => {
                 debug!("Authentication successful via API key");
                 trace!("Authenticated user: {}", user.id);
-                populate_org_context(&mut user, parts, state.db.read()).await;
+                populate_org_context(&mut user, parts, state.db.read(), org_cookie_name).await;
                 maybe_update_last_login(user.id, last_login, state.db.write());
                 return Ok(user);
             }
@@ -669,13 +687,12 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         }
 
         // Native authentication (JWT sessions)
-        let config = state.current_config();
         if config.auth.native.enabled {
             match try_jwt_session_auth(parts, &config, state.db.read()).await {
                 Some(Ok((mut user, last_login))) => {
                     debug!("Authentication successful via JWT session");
                     trace!("Authenticated user: {}", user.id);
-                    populate_org_context(&mut user, parts, state.db.read()).await;
+                    populate_org_context(&mut user, parts, state.db.read(), org_cookie_name).await;
                     maybe_update_last_login(user.id, last_login, state.db.write());
                     return Ok(user);
                 }
@@ -696,7 +713,7 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
                 Some(Ok((mut user, last_login))) => {
                     debug!("Authentication successful via proxy header");
                     trace!("Authenticated user: {}", user.id);
-                    populate_org_context(&mut user, parts, state.db.read()).await;
+                    populate_org_context(&mut user, parts, state.db.read(), org_cookie_name).await;
                     maybe_update_last_login(user.id, last_login, state.db.write());
                     return Ok(user);
                 }
