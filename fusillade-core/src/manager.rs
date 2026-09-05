@@ -76,6 +76,23 @@ impl RetentionPolicy {
             || !self.batchless_seconds_by_service_tier.is_empty()
     }
 
+    /// The (min, max) batchless retention in seconds across configured tiers,
+    /// or `None` when no batchless tier is configured.
+    ///
+    /// Feeds the trailing-demand query's partition-prune bounds: every
+    /// sweep-landed retained row satisfies `delete_on ≈ terminal_at + its
+    /// tier's retention`, so a trailing window over `terminal_at` can only
+    /// match rows in partitions between `window_start + min retention` and
+    /// `window_end + max retention`. Backfill-landed overdue rows (whose
+    /// `delete_on` is clamped to the day after observation) are strictly
+    /// older than any trailing window, and the lower bound prunes their
+    /// partitions without scanning them.
+    pub fn batchless_retention_bounds_seconds(&self) -> Option<(u64, u64)> {
+        let min = self.batchless_seconds_by_service_tier.values().min()?;
+        let max = self.batchless_seconds_by_service_tier.values().max()?;
+        Some((*min, *max))
+    }
+
     /// Reject labels that cannot match a persisted service tier safely.
     pub fn validate(&self) -> std::result::Result<(), String> {
         if self.terminal_batch_seconds == Some(0)
@@ -1112,7 +1129,11 @@ pub trait Storage: Send + Sync {
     /// identified by `service_tier = 'priority' AND batch_id IS NULL` instead,
     /// because the orphan purger may null `template_id` on old realtime rows.
     ///
-    /// Reads the live `requests` table only. Batchless tiers (flex/priority)
+    /// Reads the live `requests` table unioned with the retained-response
+    /// store (batchless rows keep counting after the archiver moves them;
+    /// partition pruning there relies on the configured retention bounds —
+    /// see [`RetentionPolicy::batchless_retention_bounds_seconds`]).
+    /// Batchless tiers (flex/priority)
     /// are exact; batch-tier rows are moved to `batch_requests_archive` once
     /// their parent batch is terminal and frozen, so batch-tier counts cover
     /// only not-yet-archived rows (a lower bound that decays with sweep
