@@ -27,6 +27,7 @@ use crate::config::ContinuationConfig;
 use super::RouteInfo;
 
 use super::dsv4::Dsv4Reconstructor;
+use super::forward::{ForwardParser, PlainForward};
 use super::rewrap::Envelope;
 
 /// Why a stream stopped being reconstructable. Each maps to a bounded
@@ -93,10 +94,35 @@ pub trait StreamAccumulator: Send {
     /// holds content, so always. A structured reconstructor must say no when
     /// the seam sits inside reasoning or tool syntax: the completions leg
     /// would emit raw model markup (`</think>`, DSML) that plain reframing
-    /// exposes as answer text. v2's forward parser lifts this by decoding the
+    /// exposes as answer text. The forward parser lifts this by decoding the
     /// leg back into chat deltas.
     fn plain_resume_ok(&self) -> bool {
         true
+    }
+
+    /// The parser for the resume leg this accumulator's prefix will start,
+    /// seeded with the structure that was open at the death point.
+    ///
+    /// Deliberately a method on the accumulator rather than a second lookup in
+    /// [`for_model`]: the reconstructor is the only thing that knows both which
+    /// syntax the leg will come back in and where in that syntax the generation
+    /// stopped, so a reconstructor without its parser (or a parser seeded from
+    /// somewhere else) cannot be expressed. The default is
+    /// [`PlainForward`] — raw text is content — which is what every model
+    /// without a `model_reconstructors` entry keeps.
+    ///
+    /// Called once per leg, BEFORE any of that leg's output is fed back in.
+    fn forward_parser(&self) -> Box<dyn ForwardParser> {
+        Box::new(PlainForward)
+    }
+
+    /// Whether the layer may inject a message-opening `role` into the first
+    /// resumed delta when leg 1 never delivered one. A capability of the
+    /// SELECTED accumulator — not of the config key — so an unrecognised
+    /// `model_reconstructors` value that falls back to [`PlainContent`] keeps
+    /// the plain path's byte-identical guarantee along with its parser.
+    fn repairs_role(&self) -> bool {
+        false
     }
 }
 
@@ -110,14 +136,16 @@ pub trait StreamAccumulator: Send {
 ///   and until then it gets [`PlainContent`] — the same behaviour as before any
 ///   reconstructor existed. An unrecognised value falls back the same way, so a
 ///   typo degrades resumability instead of corrupting a prefix.
-/// - HOW it reconstructs comes from the route's `render_kwargs`, because that is
-///   literally what the resume prefix will be rendered with. A DeepSeek route
-///   serving chat mode must not have a `</think>` spliced in, and the mode
+/// - HOW it reconstructs comes from the route's `render_kwargs` overlaid with
+///   the request's own `chat_template_kwargs` ([`RouteInfo::thinking_for`]) —
+///   the exact merge the resume prefix will be rendered with, so a request that
+///   overrides the route's serving mode is seeded to match its own prompt. A
+///   chat-mode prompt must not have a `</think>` spliced in, and the mode
 ///   cannot be inferred from the deltas (a thinking turn that does no thinking
 ///   emits `</think>` first with no `reasoning_content` at all).
-pub fn for_model(model: &str, cfg: &ContinuationConfig, route: &RouteInfo) -> Box<dyn StreamAccumulator> {
+pub fn for_model(model: &str, cfg: &ContinuationConfig, route: &RouteInfo, request_kwargs: Option<&Value>) -> Box<dyn StreamAccumulator> {
     match cfg.model_reconstructors.get(model).map(String::as_str) {
-        Some("dsv4") => Box::new(Dsv4Reconstructor::new(cfg.max_buffer_bytes, route.thinking())),
+        Some("dsv4") => Box::new(Dsv4Reconstructor::new(cfg.max_buffer_bytes, route.thinking_for(request_kwargs))),
         _ => Box::new(PlainContent::new(cfg.max_buffer_bytes)),
     }
 }
@@ -219,8 +247,10 @@ impl StreamAccumulator for PlainContent {
         // interleaved the two, and we only have one of them.
         let unsupported = ["reasoning_content", "reasoning", "tool_calls", "function_call"]
             .iter()
-            .any(|k| delta.get(*k).is_some_and(|v| !v.is_null()));
-        if unsupported {
+            .copied()
+            .find(|k| delta.get(*k).is_some_and(|v| !v.is_null()));
+        if let Some(kind) = unsupported {
+            super::metrics::record_unsupported_delta(kind);
             return self.disarm(AccumulateError::UnsupportedDelta);
         }
 
@@ -414,7 +444,7 @@ mod tests {
     #[test]
     fn a_mapped_model_gets_its_family_reconstructor() {
         let cfg = cfg_with(&[("deepseek-ai/DeepSeek-V4-Flash", "dsv4")]);
-        let mut acc = for_model("deepseek-ai/DeepSeek-V4-Flash", &cfg, &RouteInfo::default());
+        let mut acc = for_model("deepseek-ai/DeepSeek-V4-Flash", &cfg, &RouteInfo::default(), None);
         assert!(survives_reasoning(acc.as_mut()));
         assert_eq!(acc.continuation_text().as_deref(), Some("hmm"));
     }
@@ -423,7 +453,7 @@ mod tests {
     fn every_other_model_keeps_the_plain_content_behaviour() {
         let cfg = cfg_with(&[("deepseek-ai/DeepSeek-V4-Flash", "dsv4")]);
         for model in ["gpt-4o", "deepseek-ai/DeepSeek-V4-Flash-0731", ""] {
-            let mut acc = for_model(model, &cfg, &RouteInfo::default());
+            let mut acc = for_model(model, &cfg, &RouteInfo::default(), None);
             assert!(!survives_reasoning(acc.as_mut()), "{model} must not be reconstructed as dsv4");
         }
         // Including when nothing is configured at all.
@@ -431,6 +461,7 @@ mod tests {
             "deepseek-ai/DeepSeek-V4-Flash",
             &ContinuationConfig::default(),
             &RouteInfo::default(),
+            None,
         );
         assert!(!survives_reasoning(acc.as_mut()));
     }
@@ -439,7 +470,7 @@ mod tests {
     fn an_unrecognised_family_falls_back_instead_of_guessing() {
         let cfg = cfg_with(&[("m", "glm5"), ("n", "DSV4")]);
         for model in ["m", "n"] {
-            let mut acc = for_model(model, &cfg, &RouteInfo::default());
+            let mut acc = for_model(model, &cfg, &RouteInfo::default(), None);
             assert!(
                 !survives_reasoning(acc.as_mut()),
                 "{model}: a typo degrades resumability, never fidelity"
@@ -454,7 +485,7 @@ mod tests {
             ..cfg_with(&[("dsv4-model", "dsv4")])
         };
         for model in ["dsv4-model", "plain-model"] {
-            let mut acc = for_model(model, &cfg, &RouteInfo::default());
+            let mut acc = for_model(model, &cfg, &RouteInfo::default(), None);
             let err = acc.ingest(&content_chunk("12345")).unwrap_err();
             assert_eq!(err, AccumulateError::CapExceeded, "{model}");
         }
@@ -472,7 +503,7 @@ mod tests {
             strip_leading_bos: false,
         };
 
-        let mut chat = for_model("dsv4-flash", &cfg, &chat_route);
+        let mut chat = for_model("dsv4-flash", &cfg, &chat_route, None);
         chat.ingest(&json!({"id": "c", "choices": [{"delta": {"content": "Hello"}}]}))
             .unwrap();
         assert_eq!(
@@ -483,11 +514,56 @@ mod tests {
 
         // The same model on a thinking route (or an unconfigured one) still
         // closes it.
-        let mut thinking = for_model("dsv4-flash", &cfg, &RouteInfo::default());
+        let mut thinking = for_model("dsv4-flash", &cfg, &RouteInfo::default(), None);
         thinking
             .ingest(&json!({"id": "c", "choices": [{"delta": {"content": "Hello"}}]}))
             .unwrap();
         assert_eq!(thinking.continuation_text().as_deref(), Some("</think>Hello"));
+    }
+
+    /// The request's own `chat_template_kwargs` override the route key-by-key
+    /// in the resume render, so they must override the reconstructor's mode the
+    /// same way — a prompt rendered in thinking mode with a chat-seeded
+    /// reconstructor leaks resumed reasoning (and its `</think>`) into
+    /// `delta.content`, and the mirror image splices a `</think>` into a chat
+    /// prompt.
+    #[test]
+    fn the_request_kwargs_override_the_route_mode() {
+        let cfg = cfg_with(&[("dsv4-flash", "dsv4")]);
+        let chat_route = RouteInfo {
+            render_kwargs: Some(json!({"thinking_mode": "chat"})),
+            strip_leading_bos: false,
+        };
+
+        // Chat-default route, request asks for thinking → thinking seeding.
+        let request = json!({"thinking_mode": "thinking"});
+        let mut thinking = for_model("dsv4-flash", &cfg, &chat_route, Some(&request));
+        thinking
+            .ingest(&json!({"id": "c", "choices": [{"delta": {"content": "Hello"}}]}))
+            .unwrap();
+        assert_eq!(thinking.continuation_text().as_deref(), Some("</think>Hello"));
+
+        // Thinking-default route, request asks for chat → chat seeding.
+        let request = json!({"thinking_mode": "chat"});
+        let mut chat = for_model("dsv4-flash", &cfg, &RouteInfo::default(), Some(&request));
+        chat.ingest(&json!({"id": "c", "choices": [{"delta": {"content": "Hello"}}]}))
+            .unwrap();
+        assert_eq!(chat.continuation_text().as_deref(), Some("Hello"));
+    }
+
+    /// Role repair follows the SELECTED accumulator, not the config key: an
+    /// unrecognised `model_reconstructors` value falls back to the plain path
+    /// and must keep ALL of that path's guarantees — parser and byte-identical
+    /// frames alike.
+    #[test]
+    fn an_unrecognised_reconstructor_value_keeps_the_full_plain_path() {
+        let typo = cfg_with(&[("dsv4-flash", "DSV4")]);
+        let acc = for_model("dsv4-flash", &typo, &RouteInfo::default(), None);
+        assert!(!acc.repairs_role(), "a typo'd value must not enable role repair");
+
+        let mapped = cfg_with(&[("dsv4-flash", "dsv4")]);
+        let acc = for_model("dsv4-flash", &mapped, &RouteInfo::default(), None);
+        assert!(acc.repairs_role(), "the recognised family reconstructor carries the capability");
     }
 
     #[test]

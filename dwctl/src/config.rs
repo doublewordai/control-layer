@@ -1265,7 +1265,9 @@ pub struct ContinuationConfig {
     /// per-route DB row next to the `continuation` traffic rule once more than one
     /// family is live.
     ///
-    /// Set via environment: `DWCTL_CONTINUATION__MODEL_RECONSTRUCTORS='{"deepseek-ai/DeepSeek-V4-Flash":"dsv4"}'`
+    /// Set via environment as a figment/TOML inline table — `=`, not JSON colons
+    /// (the JSON form fails config parsing and crash-loops the pod):
+    /// `DWCTL_CONTINUATION__MODEL_RECONSTRUCTORS='{"deepseek-ai/DeepSeek-V4-Flash-0731" = "dsv4"}'`
     pub model_reconstructors: HashMap<String, String>,
 }
 

@@ -39,7 +39,8 @@ pub fn record_layer_wired(wired: bool) {
 /// `cap_exceeded` | `multi_choice` | `no_route` | `origin_disabled` | `throttled`
 /// | `deadline` | `attempts_exhausted` | `client_disconnect` |
 /// `not_streaming` | `unparseable` | `no_model` | `render_failed` | `no_envelope`
-/// | `needs_forward_parser` | `logprobs`
+/// | `parser_overflow` (the forward parser hit a structural bound or
+/// out-of-grammar leg output and the resume was aborted) | `logprobs`
 /// | death families from [`super::detect`] (`transport_error`, `truncated`,
 /// `error_envelope`, `error_envelope_4xx`, `cancelled_499`, `stall`) | `ok` for
 /// a clean completion.
@@ -114,6 +115,16 @@ pub fn record_eaten_prompt_tokens(model: &str, tokens: u64) {
 /// without one, so the synthesized frame is render-derived).
 pub fn record_usage_anomaly(kind: &'static str) {
     counter!("dwctl_continuation_usage_anomaly_total", "kind" => kind).increment(1);
+}
+
+/// Which delta key caused an `unsupported_delta` disarm. The outcome metric
+/// keeps its single stable `unsupported_delta` reason; this side counter is the
+/// per-kind split that sizes reconstructor work per family: `reasoning_content`
+/// / `tool_calls` (a family reconstructor lifts these), `reasoning` (foreign
+/// dialect — reasoning text with no measured position in the raw sequence),
+/// `function_call` (legacy encoding, never measured).
+pub fn record_unsupported_delta(kind: &'static str) {
+    counter!("dwctl_continuation_unsupported_delta_total", "kind" => kind).increment(1);
 }
 
 /// The largest inter-frame gap observed on an armed stream, recorded once at

@@ -52,6 +52,7 @@ use crate::prompt_cache::sse::SseBufferedStream;
 
 use super::accumulate::{self, StreamAccumulator};
 use super::detect::{self, DeathEvent, Verdict};
+use super::forward::ForwardParser;
 use super::metrics;
 use super::render::{RenderClient, RenderPrefix, RenderedPrefix};
 use super::resume::{self, LegError, LegStream};
@@ -435,6 +436,30 @@ impl Drop for OutcomeGuard {
     }
 }
 
+/// Give the first resumed delta a message-opening `role` when leg 1 never
+/// delivered one. Most providers open with a `role: "assistant"` preamble, but
+/// at least one serves content first and attaches the role to a later frame
+/// (see the `plat` fidelity captures) — when the death lands in that gap, the
+/// frames this layer builds replace the role-carrying frame, and without this
+/// a strict client assembles a roleless message. A stream whose delivered
+/// frames already carried a role gets nothing: re-sending one makes strict
+/// clients open a second message.
+///
+/// Part of the per-model reconstructor rollout, not the inert baseline: the
+/// caller arms it only when the selected accumulator says `repairs_role()` —
+/// a family reconstructor, never the plain fallback — so a model on the plain
+/// path (unmapped, or an unrecognised map value) keeps resumed frames
+/// byte-identical to the pre-v2 layer.
+fn ensure_role(chat: &mut Value, role_sent: &mut bool) {
+    if *role_sent {
+        return;
+    }
+    if let Some(delta) = chat.pointer_mut("/choices/0/delta").and_then(Value::as_object_mut) {
+        delta.insert("role".to_string(), Value::String("assistant".to_string()));
+        *role_sent = true;
+    }
+}
+
 /// The `data:` payload of one complete SSE event, if it has one.
 fn frame_payload(event: &[u8]) -> Option<&str> {
     event.split(|b| *b == b'\n').find_map(|line| {
@@ -457,8 +482,12 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
     let stream = async_stream::stream! {
         let mut outcome = OutcomeGuard::new(ctx.origin);
         // Which reconstructor this stream gets is a per-model capability lookup;
-        // see `accumulate::for_model`.
-        let mut acc: Box<dyn StreamAccumulator> = accumulate::for_model(&ctx.model, &state.cfg, &ctx.route);
+        // see `accumulate::for_model`. The request's own `chat_template_kwargs`
+        // ride along so the reconstructor's thinking/chat mode matches the
+        // prompt the resume render will actually build (the request overrides
+        // the route key-by-key in both places).
+        let mut acc: Box<dyn StreamAccumulator> =
+            accumulate::for_model(&ctx.model, &state.cfg, &ctx.route, ctx.chat_template_kwargs());
         let mut current: LegStream = Box::pin(SseBufferedStream::new(leg_one));
         // Is `current` a resume leg (text_completion chunks needing reframing)?
         let mut resuming = false;
@@ -471,7 +500,24 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         // Some(_) until the leg's first frame arrives, then None — reads fall
         // through to the inter-frame stall timer.
         let mut leg_deadline: Option<tokio::time::Instant> = None;
+        // The current leg's forward parser: raw generated text back into the
+        // chat deltas the client expects. Built from the accumulator when a leg
+        // starts, so it is seeded with the structure that was open at the death
+        // point, and rebuilt per leg because each leg picks up somewhere new.
+        let mut parser: Option<Box<dyn ForwardParser>> = None;
         let mut saw_usage = false;
+        // Whether any frame DELIVERED to the client has carried a `delta.role`
+        // (leg-1 passthrough, or injected by `ensure_role`). The resumed frames
+        // replace whatever leg 1 would have sent later, so if no role has gone
+        // out yet, the first resumed delta must carry it. Role repair is a
+        // capability of the SELECTED accumulator (`repairs_role`), so it rides
+        // the per-model reconstructor flip and nothing else: a model without a
+        // family reconstructor — including an unrecognised map value that fell
+        // back to PlainContent — starts as "already sent", every `ensure_role`
+        // call no-ops, and its resumed frames stay byte-identical to the
+        // pre-v2 layer. That is the deployment-posture invariant that makes
+        // shipping this image inert until a model is flipped.
+        let mut role_sent = !acc.repairs_role();
         // The terminating frames, held rather than forwarded: we may need to put
         // a synthesized usage frame in front of `[DONE]`, and a death frame must
         // only reach the client if the resume chain fails. `first_death` is what
@@ -596,6 +642,10 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                         outcome.record("disarmed", e.reason());
                     }
                     saw_usage |= rewrap::usage_of(&value).is_some();
+                    // Not every provider opens with a `role` preamble (the plat
+                    // captures attach it to a later frame); remember whether the
+                    // client has one so a resume knows if it is still owed.
+                    role_sent |= value.pointer("/choices/0/delta/role").is_some();
                     // Byte passthrough — never a re-serialization.
                     yield Ok(item);
                     continue;
@@ -623,6 +673,57 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     continue;
                 };
                 if let Some((leg_prompt, leg_completion)) = rewrap::usage_of(&value) {
+                    // The parser may still hold bytes that turned out not to be
+                    // a tag — a leg can end with its usage chunk standing in for
+                    // `finish_reason`. Flush them BEFORE the terminal usage
+                    // frame: clients and request logging treat the usage chunk
+                    // as terminal, so a delta emitted after it would be dropped
+                    // or misassembled. Draining here makes the later
+                    // end-of-stream flush a no-op for this leg.
+                    let flushed = parser.as_mut().map(|p| p.finish()).unwrap_or_default();
+                    for delta in flushed {
+                        let mut chat = rewrap::delta_chunk(&env, delta.into_delta(), Value::Null);
+                        ensure_role(&mut chat, &mut role_sent);
+                        if let Some(died) = death_at.take() {
+                            metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
+                        }
+                        let _ = acc.ingest(&chat);
+                        yield Ok(rewrap::sse_frame(&chat));
+                    }
+                    if parser.as_ref().is_some_and(|p| p.poisoned()) {
+                        // A poisoned leg must not close as a success — see the
+                        // abort in the frames path. No usage, no [DONE].
+                        warn!(model = %ctx.model, "continuation forward parser poisoned; aborting resume");
+                        if let Some(frame) = first_death.take() {
+                            yield Ok(frame);
+                        }
+                        outcome.record("failed", "parser_overflow");
+                        break 'chain;
+                    }
+                    // A leg whose usage stands in for its terminal chunk never
+                    // delivered a finish_reason. For a tool stream that signal
+                    // is load-bearing — clients key the tool loop on
+                    // `finish_reason: "tool_calls"` — so synthesize it, and
+                    // BEFORE the usage frame, which clients treat as terminal.
+                    if !acc.saw_finish_reason() && parser.as_ref().is_some_and(|p| p.ends_in_tool_calls()) {
+                        let mut chat = rewrap::delta_chunk(&env, serde_json::json!({}), Value::from("tool_calls"));
+                        ensure_role(&mut chat, &mut role_sent);
+                        if let Some(died) = death_at.take() {
+                            metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
+                        }
+                        let _ = acc.ingest(&chat);
+                        yield Ok(rewrap::sse_frame(&chat));
+                    }
+                    // A resume can complete without producing any delta at all
+                    // (a `</think>`-only leg whose usage stands in for its
+                    // terminal chunk); if the message is still roleless, this
+                    // is the last chance to open it before the terminal frame.
+                    if !role_sent {
+                        let mut chat = rewrap::delta_chunk(&env, serde_json::json!({}), Value::Null);
+                        ensure_role(&mut chat, &mut role_sent);
+                        let _ = acc.ingest(&chat);
+                        yield Ok(rewrap::sse_frame(&chat));
+                    }
                     // The leg's terminal usage describes the LEG. Replace it with
                     // the merged accounting for the whole logical request.
                     let render = last_render.as_ref();
@@ -636,7 +737,79 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     yield Ok(rewrap::sse_frame(&rewrap::usage_frame(&env, merged)));
                     continue;
                 }
-                if let Some(chat) = rewrap::reframe_chunk(&value, &env) {
+                // The leg's text is the model's RAW sequence, so it goes through
+                // the parser rather than straight into `delta.content`: one
+                // completions chunk yields 0..n chat chunks (reasoning, content
+                // and tool-call deltas), each on the client's own envelope. A
+                // `finish_reason` flushes the parser's held-back bytes first, so
+                // nothing a split tag was hiding is lost at the end of the leg.
+                let Some((text, finish_reason)) = rewrap::completion_parts(&value) else {
+                    continue;
+                };
+                let deltas = match parser.as_mut() {
+                    Some(p) => {
+                        let mut deltas = p.feed(text);
+                        if !finish_reason.is_null() {
+                            deltas.extend(p.finish());
+                        }
+                        deltas
+                    }
+                    // Unreachable: `resuming` is only ever set alongside a parser.
+                    None => continue,
+                };
+
+                if parser.as_ref().is_some_and(|p| p.poisoned()) {
+                    // The parser gave up on this leg's output (a structural
+                    // bound breached — see MAX_STRUCTURAL_HOLD). What it
+                    // produced BEFORE the breach is valid and already owed to
+                    // the client, but nothing further can be trusted, and
+                    // closing the stream normally would hand the client a
+                    // silently truncated "success". Emit the pre-poison
+                    // deltas, then abort exactly as an unresumed death ends:
+                    // no usage frame, no [DONE].
+                    for delta in deltas {
+                        let mut chat = rewrap::delta_chunk(&env, delta.into_delta(), Value::Null);
+                        ensure_role(&mut chat, &mut role_sent);
+                        let _ = acc.ingest(&chat);
+                        yield Ok(rewrap::sse_frame(&chat));
+                    }
+                    warn!(model = %ctx.model, "continuation forward parser poisoned; aborting resume");
+                    if let Some(frame) = first_death.take() {
+                        yield Ok(frame);
+                    }
+                    outcome.record("failed", "parser_overflow");
+                    break 'chain;
+                }
+                // A raw completions leg terminates with "stop"; a chat stream
+                // that carried tool_calls deltas must finish with
+                // finish_reason "tool_calls" — clients and request logging key
+                // the tool loop on it. Other reasons (length, …) pass through.
+                let finish_reason = if finish_reason == "stop"
+                    && parser.as_ref().is_some_and(|p| p.ends_in_tool_calls())
+                {
+                    Value::from("tool_calls")
+                } else {
+                    finish_reason
+                };
+                let last = deltas.len().saturating_sub(1);
+                let mut frames: Vec<Value> = deltas
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, delta)| {
+                        // Only the final frame of a chunk carries its
+                        // finish_reason, which is where the client expects it.
+                        let finish = if i == last { finish_reason.clone() } else { Value::Null };
+                        rewrap::delta_chunk(&env, delta.into_delta(), finish)
+                    })
+                    .collect();
+                if frames.is_empty() && !finish_reason.is_null() {
+                    // A terminal chunk whose text produced nothing still has to
+                    // deliver the finish_reason.
+                    frames.push(rewrap::delta_chunk(&env, serde_json::json!({}), finish_reason));
+                }
+
+                for mut chat in frames {
+                    ensure_role(&mut chat, &mut role_sent);
                     if let Some(died) = death_at.take() {
                         metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
                     }
@@ -650,6 +823,62 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
             match verdict {
                 Verdict::Alive => unreachable!("Alive never breaks the frame loop"),
                 Verdict::Complete | Verdict::LostTrailer => {
+                    // A leg can end without ever sending a finish_reason chunk
+                    // (a lost trailer, or a usage frame that stood in for one),
+                    // and the parser may still be holding bytes that turned out
+                    // not to be the start of a tag. Flush before closing rather
+                    // than dropping them. `PlainForward` holds nothing back, so
+                    // this is inert for every unmapped model.
+                    let flushed = parser.as_mut().map(|p| p.finish()).unwrap_or_default();
+                    if !flushed.is_empty() && let Some(env) = acc.envelope().cloned() {
+                        for delta in flushed {
+                            let mut chat = rewrap::delta_chunk(&env, delta.into_delta(), Value::Null);
+                            ensure_role(&mut chat, &mut role_sent);
+                            let _ = acc.ingest(&chat);
+                            yield Ok(rewrap::sse_frame(&chat));
+                        }
+                    }
+                    if parser.as_ref().is_some_and(|p| p.poisoned()) {
+                        // A poisoned leg must not close as a success — see the
+                        // abort in the frames path. No usage, no [DONE].
+                        warn!(model = %ctx.model, "continuation forward parser poisoned; aborting resume");
+                        if let Some(frame) = first_death.take() {
+                            yield Ok(frame);
+                        }
+                        outcome.record("failed", "parser_overflow");
+                        break 'chain;
+                    }
+                    // A lost trailer can also swallow the terminal chunk of a
+                    // resumed TOOL stream, and `finish_reason: "tool_calls"` is
+                    // the tool-loop signal clients and request logging key on.
+                    // Synthesize it before any replacement usage and [DONE].
+                    // (The usage-as-terminal branch does the same earlier and
+                    // marks the accumulator, so this cannot double-fire.)
+                    if !acc.saw_finish_reason()
+                        && parser.as_ref().is_some_and(|p| p.ends_in_tool_calls())
+                        && let Some(env) = acc.envelope().cloned()
+                    {
+                        let mut chat = rewrap::delta_chunk(&env, serde_json::json!({}), Value::from("tool_calls"));
+                        ensure_role(&mut chat, &mut role_sent);
+                        if let Some(died) = death_at.take() {
+                            metrics::record_seam(&ctx.model, leg_provider.unwrap_or("external"), died.elapsed().as_secs_f64());
+                        }
+                        let _ = acc.ingest(&chat);
+                        yield Ok(rewrap::sse_frame(&chat));
+                    }
+                    // Same terminal role repair as the usage-as-terminal branch:
+                    // a resumed chain can close producing no delta, leaving the
+                    // message roleless. Gated on `attempts > 0` — a stream that
+                    // never resumed closes exactly as it arrived.
+                    if attempts > 0
+                        && !role_sent
+                        && let Some(env) = acc.envelope().cloned()
+                    {
+                        let mut chat = rewrap::delta_chunk(&env, serde_json::json!({}), Value::Null);
+                        ensure_role(&mut chat, &mut role_sent);
+                        let _ = acc.ingest(&chat);
+                        yield Ok(rewrap::sse_frame(&chat));
+                    }
                     // The generation finished. If its usage frame never arrived
                     // (death families no_usage / no_done), synthesize one from a
                     // render so the request still bills and still reports.
@@ -693,17 +922,11 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     if first_death_reason.is_none() {
                         first_death_reason = Some(reason);
                     }
-                    // A structured reconstructor may hold a perfect prefix the
-                    // PLAIN reframer still cannot faithfully continue (seam
-                    // inside reasoning/tool syntax). Surface the death as
-                    // today; v2's forward parser lifts this per model.
-                    if !acc.plain_resume_ok() {
-                        if let Some(frame) = first_death.take() {
-                            yield Ok(frame);
-                        }
-                        outcome.record("failed", "needs_forward_parser");
-                        break 'chain;
-                    }
+                    // A seam inside reasoning/tool syntax no longer blocks the
+                    // resume: the leg's raw output goes through the
+                    // accumulator's paired forward parser (seeded at dispatch
+                    // below), which re-frames `</think>`/DSML back into chat
+                    // deltas instead of leaking them as answer text.
                     let Some(text) = acc.continuation_text() else {
                         // Disarmed, or nothing generated yet: resume-from-zero is
                         // a plain retry, which is not this feature's job.
@@ -753,7 +976,9 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                                 // The client's own `max_tokens` is already spent —
                                 // finishing is correct, resuming would overrun it.
                                 if let Some(env) = acc.envelope().cloned() {
-                                    yield Ok(rewrap::sse_frame(&rewrap::length_stop_frame(&env)));
+                                    let mut stop = rewrap::length_stop_frame(&env);
+                                    ensure_role(&mut stop, &mut role_sent);
+                                    yield Ok(rewrap::sse_frame(&stop));
                                     if !saw_usage {
                                         let (usage, _) = rewrap::merge_usage(
                                             render.continuation_tokens.unwrap_or(0) as u64,
@@ -779,6 +1004,11 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                         Some(l) => {
                             last_render = Some(l.render);
                             current = l.stream;
+                            // Seeded HERE, before any of the leg's own output is
+                            // fed back in: the accumulator is at the death point
+                            // exactly now, and that is the structure the leg's
+                            // first token continues.
+                            parser = Some(acc.forward_parser());
                             resuming = true;
                             leg_provider = None;
                             leg_deadline = Some(l.deadline);

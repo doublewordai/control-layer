@@ -57,7 +57,12 @@ use serde_json::ser::Formatter;
 use serde_json::{Number, Value};
 
 use super::accumulate::{AccumulateError, StreamAccumulator, capture_envelope, single_choice};
+use super::forward::{ForwardParser, ForwardSeed};
 use super::rewrap::Envelope;
+
+pub mod forward;
+
+use forward::Dsv4Forward;
 
 // The DSML tags. `｜` is U+FF5C FULLWIDTH VERTICAL LINE, not an ASCII pipe.
 const TOOL_CALLS_OPEN: &str = "<｜DSML｜tool_calls>";
@@ -525,6 +530,63 @@ impl Dsv4Reconstructor {
         self.tools.last_mut().expect("just pushed")
     }
 
+    /// Where in the DSML sequence the resume leg's first token lands.
+    ///
+    /// This is the same state [`Self::reconstruct`] renders the tail of the
+    /// prefix from, read out instead of written down — which is the point:
+    /// the forward parser must believe exactly what the prefix says, or the
+    /// resumed text is interpreted in a structure the model is not in. Each
+    /// arm below is the inverse of one branch of [`encode_tool_call`]:
+    ///
+    /// | prefix ends … | seed |
+    /// |---|---|
+    /// | mid-reasoning, `<think>` still open | [`ForwardSeed::Reasoning`] |
+    /// | in the body, before any tool frame | [`ForwardSeed::Content`] |
+    /// | `<｜DSML｜tool_calls>` / a closed `</｜DSML｜invoke>` | [`ForwardSeed::BetweenToolCalls`] |
+    /// | inside an invoke (open tag, partial name, partial value) | [`ForwardSeed::InToolCall`] |
+    ///
+    /// The last two are told apart by exactly the test `encode_tool_call` uses
+    /// to decide whether to close the invoke — complete-JSON arguments — so a
+    /// prefix that ends `</｜DSML｜invoke>` can never be seeded as if it were
+    /// still inside that call.
+    pub fn forward_seed(&self) -> ForwardSeed {
+        if !self.saw_any_tool_frame {
+            // A `</think>` is in the prefix iff the body started, so anything
+            // else is still inside the think block — but only a thinking-mode
+            // leg HAS one to close; a chat-mode prompt already ended with it.
+            let started_body = !self.content.is_empty();
+            return if self.thinking && !started_body {
+                ForwardSeed::Reasoning
+            } else {
+                ForwardSeed::Content
+            };
+        }
+
+        let Some(last) = self.tools.last() else {
+            return ForwardSeed::BetweenToolCalls { next_index: 0 };
+        };
+        let index = u32::try_from(last.index).unwrap_or(0);
+        // A slot with no name renders as nothing at all (see `encode_tool_call`),
+        // so the prefix stops before this call — but its index is already spent
+        // as far as the client is concerned, so the next invoke reuses it rather
+        // than restarting the numbering.
+        if last.name.is_none() {
+            return ForwardSeed::BetweenToolCalls { next_index: index };
+        }
+        let (_, tail) = parse_partial_args(&last.arguments);
+        let closed = last.arguments.trim_end().ends_with('}') && tail.is_none();
+        if closed || self.finish_reason {
+            ForwardSeed::BetweenToolCalls {
+                next_index: index.saturating_add(1),
+            }
+        } else {
+            ForwardSeed::InToolCall {
+                index,
+                args_so_far: last.arguments.clone(),
+            }
+        }
+    }
+
     /// Rebuild the raw emitted text from the accumulated channels.
     fn reconstruct(&self) -> String {
         let mut out = String::new();
@@ -612,6 +674,7 @@ impl StreamAccumulator for Dsv4Reconstructor {
         // reasoning text we have no measured position for in the sequence.
         let present = |k: &str| delta.get(k).is_some_and(|v| !v.is_null());
         if present("function_call") || (present("reasoning") && !present("reasoning_content")) {
+            super::metrics::record_unsupported_delta(if present("function_call") { "function_call" } else { "reasoning" });
             return self.disarm(AccumulateError::UnsupportedDelta);
         }
 
@@ -654,6 +717,7 @@ impl StreamAccumulator for Dsv4Reconstructor {
                 // truncated arguments, so disarm instead of corrupting the
                 // prefix.
                 if self.tools.last().is_some_and(|last| last.index != index) && self.tools.iter().any(|t| t.index == index) {
+                    super::metrics::record_unsupported_delta("tool_calls");
                     return self.disarm(AccumulateError::UnsupportedDelta);
                 }
                 let slot = self.slot(index);
@@ -706,11 +770,28 @@ impl StreamAccumulator for Dsv4Reconstructor {
     /// nothing but content: no tool syntax anywhere in the turn, and the
     /// think block (if the turn has one) already closed — for this family
     /// content only begins after `</think>`, so non-empty content is that
-    /// proof. Anything else waits for the paired forward parser (v2).
+    /// proof. Anything else goes through the paired forward parser below.
     fn plain_resume_ok(&self) -> bool {
         !self.saw_any_tool_frame && (!self.thinking || !self.content.is_empty())
+    }
+
+    /// The DSML parser, seeded from this reconstructor's death-point state.
+    /// Pairing them here is what lifts the reasoning/tool disarm for this
+    /// family and nothing else.
+    fn forward_parser(&self) -> Box<dyn ForwardParser> {
+        Box::new(Dsv4Forward::new(self.forward_seed()))
+    }
+
+    /// Role repair rides the family reconstructor, alongside its parser: this
+    /// family's captures include a provider that delivers `role` only on a
+    /// late frame, so a rescue can otherwise leave the message roleless.
+    fn repairs_role(&self) -> bool {
+        true
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod forward_tests;

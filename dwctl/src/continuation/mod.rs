@@ -39,6 +39,7 @@
 pub mod accumulate;
 pub mod detect;
 pub mod dsv4;
+pub mod forward;
 pub mod layer;
 pub mod metrics;
 pub mod render;
@@ -135,7 +136,21 @@ impl RouteInfo {
     /// `"chat"`) or a boolean `thinking`. Absent ⇒ true, matching
     /// tokenizer-svc's own default for the families that have one.
     pub fn thinking(&self) -> bool {
-        let Some(kwargs) = self.render_kwargs.as_ref() else {
+        Self::thinking_from(self.render_kwargs.as_ref())
+    }
+
+    /// Whether THIS stream's leg generates in thinking mode: the route's serving
+    /// mode overlaid with the request's own `chat_template_kwargs` — the same
+    /// merge [`Self::merged_render_kwargs`] feeds to the resume render, so the
+    /// reconstructor's mode can never diverge from the prompt it splices for. A
+    /// request that overrides `thinking_mode` on a chat-default route must be
+    /// seeded as a thinking stream, and vice versa.
+    pub fn thinking_for(&self, request_kwargs: Option<&serde_json::Value>) -> bool {
+        Self::thinking_from(self.merged_render_kwargs(request_kwargs).as_ref())
+    }
+
+    fn thinking_from(kwargs: Option<&serde_json::Value>) -> bool {
+        let Some(kwargs) = kwargs else {
             return true;
         };
         if let Some(mode) = kwargs.get("thinking_mode").and_then(|v| v.as_str()) {
