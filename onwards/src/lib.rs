@@ -1376,6 +1376,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_real_status_429_exhausts_to_503() {
+        // A real HTTP 429 (rate limit) from the upstream, retried across
+        // providers and exhausted, must surface a sanitized 503 — the provider
+        // is temporarily at capacity, not dead — matching the embedded-error
+        // path rather than a 502 "bad gateway". Regression for the 2026-09-03
+        // ControlLayerProxyErrors incident where an OpenRouter 429 retried 6x
+        // and reached the client as 502.
+        let body = r#"{"error":{"message":"Rate limit exceeded","type":"rate_limit_error"}}"#;
+        let mock = MockHttpClient::new(StatusCode::TOO_MANY_REQUESTS, body);
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![429]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            503,
+            "exhausted status-based 429 retries must surface a 503, not a 502"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
+    }
+
+    #[tokio::test]
     async fn test_streaming_keepalive_before_error_is_still_detected() {
         // A keep-alive comment precedes the error frame; the peek must skip it
         // and still detect the 429, retry, and exhaust to 503.
