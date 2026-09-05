@@ -144,6 +144,11 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
     retained_response_fence_seconds: Option<u64>,
+    /// (min, max) batchless retention seconds across configured tiers, from
+    /// [`fusillade_core::RetentionPolicy::batchless_retention_bounds_seconds`].
+    /// Lets the trailing-demand query prune retained partitions that cannot
+    /// contain in-window rows; `None` falls back to the weak necessary bound.
+    retained_response_retention_bounds_seconds: Option<(u64, u64)>,
     template_generation_writes_enabled: bool,
     partition_maintenance_pool: Option<sqlx::PgPool>,
     partition_maintenance_attested: bool,
@@ -377,6 +382,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             pools,
             config,
             retained_response_fence_seconds: None,
+            retained_response_retention_bounds_seconds: None,
             template_generation_writes_enabled: false,
             partition_maintenance_pool: None,
             partition_maintenance_attested: false,
@@ -433,6 +439,19 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// Return the configured content-free resurrection-fence lifetime.
     pub fn retained_response_fence_seconds(&self) -> Option<u64> {
         self.retained_response_fence_seconds
+    }
+
+    /// Configure the (min, max) batchless retention seconds used to prune
+    /// retained partitions in the trailing-demand query. `None` (the
+    /// default, and the state on instances without a batchless policy) keeps
+    /// the weak necessary bound; correctness never depends on this value
+    /// being present, only scan cost does.
+    pub fn with_retained_response_retention_bounds_seconds(
+        mut self,
+        bounds: Option<(u64, u64)>,
+    ) -> Self {
+        self.retained_response_retention_bounds_seconds = bounds;
+        self
     }
 
     /// Route new file-backed template writes into the weekly generation-2
@@ -2044,11 +2063,46 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // Scalar params + force_custom_plan get real histogram selectivity,
         // which keeps the trailing partial indexes in play. Trailing windows
         // are few (typically one), so per-window round trips are cheap.
+        // Retained-partition prune bounds ($7/$8): sweep-landed rows have
+        // delete_on ~ terminal_at + tier retention, so only partitions in
+        // [window_start + min retention, window_end + max retention] can hold
+        // in-window rows. The slack absorbs day rounding at both ends and a
+        // retention-period CHANGE's transition: for up to (window + sweep
+        // dwell) after a config flip, in-window rows landed under the
+        // previous period sit against the bound the change moved — a raise
+        // presses the lower bound, a decrease the upper — and a change
+        // larger than the slack undercounts those rows for that transition
+        // window only. Retention changes are rare, deliberate ops events;
+        // widening the slack to cover arbitrary changes would permanently
+        // scan extra full-day partitions to protect a transient, so the
+        // slack stays small and the exposure is documented instead.
+        // Without configured bounds the SQL falls back to its weak necessary
+        // bound — correct, but it scans every active partition, including the
+        // multi-million-row delete-tomorrow buckets the overdue backfill
+        // lands (the 2026-09-05 scouter timeout).
+        const RETENTION_PRUNE_SLACK_DAYS: i64 = 2;
+        let retention_bounds = self.retained_response_retention_bounds_seconds;
         let now = Utc::now();
         let mut result: Vec<TrailingDemandCount> = Vec::new();
         for (label, start, end) in windows {
             let start_ts = now + chrono::Duration::seconds(*start);
             let end_ts = now + chrono::Duration::seconds(*end);
+            let (prune_lower, prune_upper) = match retention_bounds {
+                Some((min_secs, max_secs)) => {
+                    let min_days = (min_secs / 86_400) as i64;
+                    let max_days = max_secs.div_ceil(86_400) as i64;
+                    // Never weaker than the SQL's fallback bound (> start date).
+                    let lower_offset = (min_days - RETENTION_PRUNE_SLACK_DAYS).max(1);
+                    (
+                        Some(start_ts.date_naive() + chrono::Duration::days(lower_offset)),
+                        Some(
+                            end_ts.date_naive()
+                                + chrono::Duration::days(max_days + RETENTION_PRUNE_SLACK_DAYS),
+                        ),
+                    )
+                }
+                None => (None, None),
+            };
             let rows = sqlx::query(retained_response::TRAILING_DEMAND_SQL)
                 .bind(start_ts)
                 .bind(end_ts)
@@ -2056,6 +2110,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 .bind(&tier_names)
                 .bind(tier_include_null)
                 .bind(tier_mode)
+                .bind(prune_lower)
+                .bind(prune_upper)
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| {

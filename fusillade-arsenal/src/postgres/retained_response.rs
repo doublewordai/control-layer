@@ -1610,9 +1610,18 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       AND retained.state = 'completed'
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
-      -- V1 proves terminal_at < delete_on, so this necessary lower
-      -- bound enables daily partition pruning for the trailing window.
-      AND retained.delete_on > ($1 AT TIME ZONE 'UTC')::date
+      -- Partition-prune bounds. Sweep-landed rows satisfy
+      -- delete_on ~ terminal_at + tier retention, so a trailing terminal_at
+      -- window can only match partitions between window_start + min
+      -- retention and window_end + max retention ($7/$8, computed with
+      -- day-rounding and retention-raise slack). Backfill-landed overdue
+      -- rows (delete_on clamped to observation + 1) are strictly older
+      -- than any trailing window, so the lower bound prunes their
+      -- partitions outright instead of scanning them row by row. When the
+      -- policy is unknown ($7/$8 NULL) fall back to the weak necessary
+      -- bound: V1 proves terminal_at < delete_on.
+      AND retained.delete_on >= COALESCE($7::date, ($1 AT TIME ZONE 'UTC')::date + 1)
+      AND ($8::date IS NULL OR retained.delete_on <= $8::date)
       AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
       AND retained.service_tier IS DISTINCT FROM 'background'
       AND (
@@ -1671,9 +1680,18 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       AND retained.state = 'failed'
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
-      -- V1 proves terminal_at < delete_on, so this necessary lower
-      -- bound enables daily partition pruning for the trailing window.
-      AND retained.delete_on > ($1 AT TIME ZONE 'UTC')::date
+      -- Partition-prune bounds. Sweep-landed rows satisfy
+      -- delete_on ~ terminal_at + tier retention, so a trailing terminal_at
+      -- window can only match partitions between window_start + min
+      -- retention and window_end + max retention ($7/$8, computed with
+      -- day-rounding and retention-raise slack). Backfill-landed overdue
+      -- rows (delete_on clamped to observation + 1) are strictly older
+      -- than any trailing window, so the lower bound prunes their
+      -- partitions outright instead of scanning them row by row. When the
+      -- policy is unknown ($7/$8 NULL) fall back to the weak necessary
+      -- bound: V1 proves terminal_at < delete_on.
+      AND retained.delete_on >= COALESCE($7::date, ($1 AT TIME ZONE 'UTC')::date + 1)
+      AND ($8::date IS NULL OR retained.delete_on <= $8::date)
       AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
       AND retained.service_tier IS DISTINCT FROM 'background'
       AND (
@@ -3803,6 +3821,8 @@ mod tests {
             .bind(vec!["flex".to_owned()])
             .bind(false)
             .bind("include")
+            .bind(Option::<NaiveDate>::None)
+            .bind(Option::<NaiveDate>::None)
             .fetch_all(&pool)
             .await
             .expect("exact trailing-demand SQL must execute");
@@ -3819,6 +3839,8 @@ mod tests {
             .bind(vec!["flex".to_owned()])
             .bind(false)
             .bind("include")
+            .bind(Option::<NaiveDate>::None)
+            .bind(Option::<NaiveDate>::None)
             .fetch_one(&pool)
             .await
             .expect("exact trailing-demand SQL must be explainable");
@@ -3831,6 +3853,128 @@ mod tests {
             0,
             "trailing plan must remove or avoid scanning the irrelevant daily child: {trailing_plan}"
         );
+    }
+
+    #[sqlx::test]
+    async fn trailing_demand_retention_bounds_prune_backfill_partitions(pool: PgPool) {
+        // A sweep-landed row inside the window: delete_on ~ terminal + 5d.
+        let sweep_delete_on = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+        // A backfill-landed bucket just past the window start: months-old
+        // terminal_at, delete_on clamped to the day after observation. The
+        // weak necessary bound (delete_on > window start) cannot prune it;
+        // the retention-derived lower bound must.
+        let backfill_delete_on = NaiveDate::from_ymd_opt(2026, 8, 11).unwrap();
+        for delete_on in [backfill_delete_on, sweep_delete_on] {
+            sqlx::query("SELECT ensure_retained_response_partition($1, NULL)")
+                .bind(delete_on)
+                .execute(&pool)
+                .await
+                .expect("bounds fixture partition must be available");
+        }
+        for (delete_on, group, request, terminal_at) in [
+            (
+                sweep_delete_on,
+                Uuid::from_u128(0xdddddddddddddddddddddddddddddddd),
+                Uuid::from_u128(0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee),
+                "2026-08-12T10:00:00Z",
+            ),
+            (
+                backfill_delete_on,
+                Uuid::from_u128(0x1dddddddddddddddddddddddddddddd1),
+                Uuid::from_u128(0x1eeeeeeeeeeeeeeeeeeeeeeeeeeeeee1),
+                "2026-05-01T10:00:00Z",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO retained_response_objects (
+                    delete_on, group_id, object_kind, object_id, request_id,
+                    created_by, service_tier, state, model,
+                    created_at, terminal_at, schema_version, payload
+                ) VALUES (
+                    $1, $2, 'request', $3, $3,
+                    'bounds-owner', 'flex', 'completed', 'bounds-model',
+                    '2026-05-01T09:00:00Z', $4::timestamptz, 1, '{}'::jsonb
+                )
+                "#,
+            )
+            .bind(delete_on)
+            .bind(group)
+            .bind(request)
+            .bind(terminal_at)
+            .execute(&pool)
+            .await
+            .expect("bounds fixture row must insert");
+            sqlx::query(
+                "INSERT INTO retained_response_group_routes (group_id, delete_on) VALUES ($1, $2)",
+            )
+            .bind(group)
+            .bind(delete_on)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) VALUES ($1, $2, $3)",
+            )
+            .bind(request)
+            .bind(group)
+            .bind(delete_on)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Bounds as the impl computes them for min retention 5d / max 6d over
+        // the window [08-10, 08-15): lower = start + (5 - 2), upper =
+        // end + 6 + 2.
+        let prune_lower = NaiveDate::from_ymd_opt(2026, 8, 13).unwrap();
+        let prune_upper = NaiveDate::from_ymd_opt(2026, 8, 23).unwrap();
+
+        for (label, lower, upper, expect_backfill_scanned) in [
+            ("bounded", Some(prune_lower), Some(prune_upper), false),
+            ("unbounded", None, None, true),
+        ] {
+            let explain = format!("EXPLAIN (ANALYZE, FORMAT JSON) {TRAILING_DEMAND_SQL}");
+            let plan: serde_json::Value = sqlx::query_scalar(&explain)
+                .bind(timestamp("2026-08-10T00:00:00Z"))
+                .bind(timestamp("2026-08-15T00:00:00Z"))
+                .bind(vec!["bounds-model".to_owned()])
+                .bind(vec!["flex".to_owned()])
+                .bind(false)
+                .bind("include")
+                .bind(lower)
+                .bind(upper)
+                .fetch_one(&pool)
+                .await
+                .expect("bounded trailing-demand SQL must be explainable");
+            assert!(
+                relation_actual_loops(&plan, "retained_response_objects_d20260820") > 0,
+                "{label}: plan must execute the sweep-landed child: {plan}"
+            );
+            assert_eq!(
+                relation_actual_loops(&plan, "retained_response_objects_d20260811") > 0,
+                expect_backfill_scanned,
+                "{label}: backfill child scanned={expect_backfill_scanned} expected: {plan}"
+            );
+
+            // Same counts either way: the bounds change what is SCANNED,
+            // never what is counted (the backfill row is out-of-window).
+            let rows = sqlx::query(TRAILING_DEMAND_SQL)
+                .bind(timestamp("2026-08-10T00:00:00Z"))
+                .bind(timestamp("2026-08-15T00:00:00Z"))
+                .bind(vec!["bounds-model".to_owned()])
+                .bind(vec!["flex".to_owned()])
+                .bind(false)
+                .bind("include")
+                .bind(lower)
+                .bind(upper)
+                .fetch_all(&pool)
+                .await
+                .expect("bounded trailing-demand SQL must execute");
+            assert_eq!(rows.len(), 1, "{label}: exactly the in-window row counts");
+            assert_eq!(rows[0].get::<String, _>("model"), "bounds-model");
+            assert_eq!(rows[0].get::<i64, _>("count"), 1);
+        }
     }
 
     #[sqlx::test]
