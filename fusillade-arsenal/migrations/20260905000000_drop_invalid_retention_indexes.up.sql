@@ -1,5 +1,5 @@
 -- The permanent indexes behind scheduled content retention are built by the
--- five migrations that follow this one, each with CREATE INDEX CONCURRENTLY
+-- migrations that follow this one, each with CREATE INDEX CONCURRENTLY
 -- outside the migrator's transaction (one statement per file: Postgres runs
 -- a multi-statement string as one implicit transaction, which CONCURRENTLY
 -- refuses). They were previously documented as operator-built statements.
@@ -21,9 +21,7 @@ BEGIN
           AND NOT i.indisvalid
           AND c.relname IN (
               'idx_requests_batchless_retention_due',
-              'idx_files_retention_due',
               'idx_files_content_expiry_due',
-              'idx_batches_retention_due',
               'idx_batches_archive_bucket_retirement'
           )
     LOOP
