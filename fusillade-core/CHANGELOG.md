@@ -1,5 +1,28 @@
 # Changelog
 
+## [6.0.0](https://github.com/doublewordai/control-layer/compare/fusillade-core-v5.0.0...fusillade-core-v6.0.0) (2026-09-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* **dwctl:** move stream reassembly out of the batch daemon ([#1535](https://github.com/doublewordai/control-layer/issues/1535))
+
+### Features
+
+* enforce scheduled content retention by partition drop ([#1481](https://github.com/doublewordai/control-layer/issues/1481)) ([fc5aeae](https://github.com/doublewordai/control-layer/commit/fc5aeaeac79d2f73d5fd2175f28877cc150216db))
+* **fusillade:** move overdue batchless graphs concurrently in the backfill ([#1567](https://github.com/doublewordai/control-layer/issues/1567)) ([b0ed45c](https://github.com/doublewordai/control-layer/commit/b0ed45c09b27d1e87022247ea016b212fa958377))
+* **fusillade:** own batch finalization in a daemon loop, decouple no… ([#1462](https://github.com/doublewordai/control-layer/issues/1462)) ([83066bb](https://github.com/doublewordai/control-layer/commit/83066bb951405f67569d2776ad96ca61a5c372e6))
+
+
+### Bug Fixes
+
+* prune retained partitions in the trailing-demand query by retent… ([#1587](https://github.com/doublewordai/control-layer/issues/1587)) ([909ec68](https://github.com/doublewordai/control-layer/commit/909ec68d89b5e25d9ea56ce42c15a5166d80a3d3))
+
+
+### Code Refactoring
+
+* **dwctl:** move stream reassembly out of the batch daemon ([#1535](https://github.com/doublewordai/control-layer/issues/1535)) ([e9c1795](https://github.com/doublewordai/control-layer/commit/e9c1795043f9de5aef1dc4d62b9915f5b8194f5f))
+
 ## [5.0.0](https://github.com/doublewordai/control-layer/compare/fusillade-core-v4.1.0...fusillade-core-v5.0.0) (2026-08-05)
 
 
