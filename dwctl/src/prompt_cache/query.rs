@@ -28,7 +28,6 @@
 //! unknown query params), but only `/chat/completions` honours it.
 
 use axum::http::Uri;
-use axum::http::uri::PathAndQuery;
 use serde_json::{Value, json};
 
 /// The query parameter name, on `/chat/completions` only.
@@ -37,10 +36,10 @@ pub const CACHE_BREAKPOINT_PARAM: &str = "cacheBreakpoint";
 /// The one supported value: mark the last cacheable block of the request (Anthropic automatic-
 /// caching semantics — for turn-based chat that's the latest user message; for a request ending
 /// in tool results it's the last tool block, i.e. a strictly larger prefix).
-const LAST_USER_MESSAGE: &str = "lastUserMessage";
+pub(crate) const LAST_USER_MESSAGE: &str = "lastUserMessage";
 
 /// The marker injected for [`LAST_USER_MESSAGE`]. Explicit `1h` tier (not the policy default).
-fn last_user_message_marker() -> Value {
+pub(crate) fn last_user_message_marker() -> Value {
     json!({"type": "ephemeral", "ttl": "1h"})
 }
 
@@ -95,29 +94,11 @@ pub fn inject_marker(body: &mut Value, marker: Value) -> Inject {
 /// Remove every `cacheBreakpoint` pair from the URI's query (other params are preserved in
 /// order; the `?` is dropped entirely if nothing remains). Must run before forwarding: onwards
 /// sends `path_and_query` verbatim upstream. Returns the URI unchanged when the param is absent.
+///
+/// Delegates to the generalised [`crate::inference::params::strip_params`], which strips the
+/// whole family of out-of-band params; the tests below pin this single-param case unchanged.
 pub fn strip_param(uri: &Uri) -> Uri {
-    fn param_key(pair: &str) -> &str {
-        pair.split_once('=').map(|(k, _)| k).unwrap_or(pair)
-    }
-    let Some(query) = uri.query() else { return uri.clone() };
-    if !query.split('&').any(|p| param_key(p) == CACHE_BREAKPOINT_PARAM) {
-        return uri.clone();
-    }
-    let kept: Vec<&str> = query.split('&').filter(|p| param_key(p) != CACHE_BREAKPOINT_PARAM).collect();
-    let path_and_query = if kept.is_empty() {
-        uri.path().to_string()
-    } else {
-        format!("{}?{}", uri.path(), kept.join("&"))
-    };
-    // The path and the kept pairs are substrings of an already-valid URI, so this re-parse can't
-    // fail; if it somehow does, keep the original URI (an unknown upstream query param) rather
-    // than failing the request.
-    let mut parts = uri.clone().into_parts();
-    match path_and_query.parse::<PathAndQuery>() {
-        Ok(pq) => parts.path_and_query = Some(pq),
-        Err(_) => return uri.clone(),
-    }
-    Uri::from_parts(parts).unwrap_or_else(|_| uri.clone())
+    crate::inference::params::strip_params(uri, &[CACHE_BREAKPOINT_PARAM])
 }
 
 #[cfg(test)]

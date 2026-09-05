@@ -2608,6 +2608,7 @@ mod tests {
             limits: Default::default(),
             email: Default::default(),
             onwards: Default::default(),
+            request_params: Default::default(),
             onboarding_url: None,
             connections: Default::default(),
             image_normalizer: Default::default(),

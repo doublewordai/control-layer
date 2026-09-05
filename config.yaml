@@ -442,6 +442,57 @@ onwards:
   # Set via environment: DWCTL_ONWARDS__STRICT_MODE=true
   strict_mode: false
 
+# Out-of-band functional request parameters.
+#
+# Clients that can only configure base_url and model_name (coding-agent harnesses, proxy
+# middlemen) cannot set body fields, so service_tier and the automatic-caching marker are
+# also accepted as a URL query parameter and as a suffix on the model name. Both are
+# normalised into the body at the edge, so every downstream layer sees a request identical
+# to one the client could have sent itself.
+#
+#   ?serviceTier=flex   ?cacheBreakpoint=lastUserMessage   my-model-dw-flex
+#
+# The model-name form is in the spirit of the convention OpenRouter established with
+# deepseek/deepseek-r1:free, but on the vendor-marked -dw- delimiter rather than a colon:
+# harnesses already use model:token for their own knobs (thinking strength — :xhigh), and
+# colons are real inside Bedrock and Ollama model ids.
+#
+# Note cacheBreakpoint is only recognised when `cache.enabled` is true: without the cache
+# layer in the stack there would be nothing to strip the injected marker before it reached
+# the provider.
+request_params:
+  # Honour owned query parameters on the inference routes. The parameter is stripped from
+  # the forwarded URI, so it never reaches the provider.
+  # Set via environment: DWCTL_REQUEST_PARAMS__QUERY_PARAMS=false
+  query_params: true
+
+  # Honour a functional suffix on the model field (e.g. my-model-dw-flex).
+  #
+  # Opt-in, because it changes model-resolution semantics. It is safe by construction — an
+  # exact alias match always wins, and a suffix is only stripped when what remains is itself
+  # a real routing alias — but enabling it per deployment allows a soak first.
+  #
+  # SET THIS THE SAME WAY ON EVERY REPLICA IN AN ENVIRONMENT. It is per-process, so with it
+  # on for some pods and off for others the same request is a flex request on one and a 404
+  # on another. Nothing ends up in a bad state — the submit path stores the already-resolved
+  # alias and queued requests bypass this parse entirely — so the fix is just to finish the
+  # rollout or roll it back. Watch dwctl_request_params_suffix_ignored_total: non-zero means
+  # some pods are receiving suffixed requests with the feature off.
+  # Set via environment: DWCTL_REQUEST_PARAMS__MODEL_SUFFIX=true
+  model_suffix: false
+
+  # Delimiter separating the alias from its suffix tokens. Aliases have no character-class
+  # validation, so this is configurable for a deployment whose aliases already contain the
+  # default.
+  #
+  # The default is deliberately not ":". Harnesses use model:token for their own per-request
+  # knobs (thinking strength — :xhigh, :high), and colons are real inside model ids: Bedrock
+  # anthropic.claude-v2:0, Ollama llama3.1:8b. Under -dw- all of those are inert — they never
+  # match, so such names route exactly as they do with the feature off. Setting this to ":"
+  # re-adopts a namespace we don't own and will 400 a harness appending :xhigh to a live alias.
+  # Set via environment: DWCTL_REQUEST_PARAMS__MODEL_SUFFIX_DELIMITER=::
+  model_suffix_delimiter: "-dw-"
+
 # Cached-input pricing (the dwctl-owned cache layer)
 cache:
   # Enable cached-input pricing. When false (default), the cache layer is not added to

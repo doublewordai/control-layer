@@ -354,6 +354,7 @@ pub fn create_test_config() -> crate::config::Config {
             ..Default::default()
         },
         onwards: crate::config::OnwardsConfig::default(),
+        request_params: crate::config::RequestParamsConfig::default(),
         onboarding_url: None,
         support_email: "support@test.com".to_string(),
         connections: Default::default(),
