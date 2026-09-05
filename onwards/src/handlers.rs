@@ -1020,7 +1020,18 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            // Preserve an upstream rate-limit as a 429 when retries are
+            // exhausted: a 429 means "slow down", not "gateway fault", and
+            // collapsing it to 502 misreports rate-limited requests as 5xx
+            // (paging the proxy-errors alert on non-5xx failures). The strict
+            // sanitizer's masking policy already treats 429 as a real
+            // user-facing signal that must surface.
+            let fallback_error = if status == 429 {
+                OnwardsErrorResponse::rate_limited()
+            } else {
+                OnwardsErrorResponse::bad_gateway()
+            };
+            return LoopAction::Continue(Some(fallback_error));
         }
 
         // Sanitize error responses when sanitize_response is enabled.

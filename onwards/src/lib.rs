@@ -1284,6 +1284,40 @@ mod tests {
     // tests exercise the embedded-error detection + retry in target_message_handler.
 
     #[tokio::test]
+    async fn test_upstream_429_exhausts_to_429_not_502() {
+        // An upstream HTTP 429 is a rate limit, not a gateway fault. When every
+        // attempt is rate-limited and the retry budget is exhausted, the client
+        // must receive a 429 (rate_limit_error), not a 502 that would page the
+        // proxy-errors alert on a non-5xx failure.
+        let mock = MockHttpClient::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"rate limited"}}"#,
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![429]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            429,
+            "exhausted upstream rate limits must surface as 429, not 502"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
+    }
+
+    #[tokio::test]
     async fn test_streaming_embedded_error_retries_then_exhausts_to_503() {
         // 200 stream whose first frame is a `429` error envelope. onwards must
         // retry across providers and, when exhausted, return a sanitized 503 —
