@@ -1,13 +1,5 @@
 # Changelog
 
-## [11.4.3](https://github.com/doublewordai/control-layer/compare/v11.4.2...v11.4.3) (2026-09-05)
-
-
-### Bug Fixes
-
-* **onwards:** drain active responses during shutdown ([#1586](https://github.com/doublewordai/control-layer/issues/1586)) ([416ef7f](https://github.com/doublewordai/control-layer/commit/416ef7f1b3cf506a6d4bcec658a3e1ea3d3e7402))
-* prune retained partitions in the trailing-demand query by retent… ([#1587](https://github.com/doublewordai/control-layer/issues/1587)) ([909ec68](https://github.com/doublewordai/control-layer/commit/909ec68d89b5e25d9ea56ce42c15a5166d80a3d3))
-
 ## [11.4.2](https://github.com/doublewordai/control-layer/compare/v11.4.1...v11.4.2) (2026-09-04)
 
 

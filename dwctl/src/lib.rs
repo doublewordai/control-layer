@@ -3699,13 +3699,6 @@ impl Application {
             fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
         )
         .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
-        .with_retained_response_retention_bounds_seconds(
-            config
-                .background_services
-                .batch_daemon
-                .retention
-                .batchless_retention_bounds_seconds(),
-        )
         .with_template_generation_writes(config.background_services.batch_daemon.template_generation_writes_enabled)
         .with_download_buffer_size(config.batches.files.download_buffer_size)
         .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
