@@ -1403,6 +1403,26 @@ pub(crate) async fn list_requests<P: PoolProvider>(
     let count = count_requests_with_budget(manager, &filter).await?;
     let mut tx = begin_primary_read(manager).await?;
 
+    // Force a fresh custom plan for the page query. The statement is a
+    // UNION ALL of a live arm over `requests` (tens of millions of rows) and
+    // a retained arm over the retained-response store, filtered by
+    // parameters that are highly selective in practice (per-user
+    // `created_by`, status, model, tier, date range). Under
+    // `plan_cache_mode = auto` PostgreSQL settles on a GENERIC plan after a
+    // few executions (plan_cache_mode is auto by default, and this statement
+    // runs hundreds of times), and the generic plan cannot know the filter
+    // selectivity, so it chooses a full sort/scan of the large arms instead
+    // of the bounded index plans a per-call custom plan picks. In production
+    // that degraded plan ran for 70s on average and up to ~35 minutes,
+    // spilling ~84 GB/call to temp files (pg_stat_statements
+    // queryid 3109690922995476866), which is what surfaced as the 5xx on
+    // /admin/api/v1/batches/requests. Forcing a custom plan trades a few ms
+    // of per-execution planning for bounded index access on every call.
+    sqlx::query("SET LOCAL plan_cache_mode = force_custom_plan")
+        .execute(&mut *tx)
+        .await
+        .map_err(read_database_failure)?;
+
     let query = list_requests_page_sql(filter.active_first);
     let rows = sqlx::query(&query)
         .bind(filter.created_by.as_deref())
