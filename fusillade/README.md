@@ -309,11 +309,14 @@ pass. The dwell and grace must each be shorter than every enabled retention
 period.
 
 The candidate index and the other retention indexes are permanent and are
-built by migrations `20260905000001` to `20260905000005`, one
+built by migrations `20260905000001` to `20260905000003`, one
 `CREATE INDEX CONCURRENTLY` per file outside the migrator's transaction, so
 they are created online without blocking writes. Migration
 `20260905000000` runs first and only drops an INVALID leftover of the same
-name from an interrupted build, so a retried start always ends valid. The first build on a
+name from an interrupted build, so a retried start always ends valid.
+Migration `20260905000004` adds the retained store's by-id index on the
+partitioned parent (a plain build: partitioned parents cannot be built
+concurrently, and new daily partitions inherit it). The first build on a
 production-sized `requests` table takes several minutes; deploy that
 migration in a quiet window, or pre-build the identical statements by hand
 so the migration finds them and does nothing.
@@ -366,9 +369,10 @@ The complete deployment sequence is expand-only and each destructive control
 is enabled separately, in order, only after the previous stage has been
 observed healthy:
 
-1. Apply migrations `20260905000000` (drops any INVALID leftover index)
-   and `20260905000001` to `20260905000005` (build the candidate and
-   retirement indexes concurrently, online, one per file). Pre-building the
+1. Apply migrations `20260905000000` (drops any INVALID leftover index),
+   `20260905000001` to `20260905000003` (build the candidate and
+   retirement indexes concurrently, online, one per file) and
+   `20260905000004` (the retained store's by-id index). Pre-building the
    same statements by hand is allowed and makes the builds no-ops.
 2. Apply the expand-only migration. It adds new relations and helpers and
    moves no data. It never scans or rewrites the existing request or
