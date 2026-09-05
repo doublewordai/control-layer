@@ -957,7 +957,7 @@ jobs:
           exit 1
 
       - name: Checkout code
-        if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
+        if: env.RUN_COMPLIANCE == 'true'
         uses: actions/checkout@v6
 
       - name: Install Rust
