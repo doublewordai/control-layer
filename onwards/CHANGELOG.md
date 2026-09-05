@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1](https://github.com/doublewordai/control-layer/compare/onwards-v1.0.0...onwards-v1.0.1) (2026-09-05)
+
+
+### Bug Fixes
+
+* **onwards:** pass provider reasoning fields through non-strict gateways ([#1591](https://github.com/doublewordai/control-layer/issues/1591)) ([81e0d38](https://github.com/doublewordai/control-layer/commit/81e0d38b4ff98f1e1d0eb02ed523c19499a94e18))
+
 ## [1.0.0](https://github.com/doublewordai/control-layer/compare/onwards-v0.38.1...onwards-v1.0.0) (2026-09-05)
 
 
