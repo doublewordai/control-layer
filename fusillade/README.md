@@ -308,21 +308,18 @@ dwell, and cancellation-grace boundary for every graph considered in that
 pass. The dwell and grace must each be shorter than every enabled retention
 period.
 
-Before enabling retained-response movement, an operator must build the exact
-payload-free candidate index outside a transaction:
-
-```sql
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_requests_batchless_retention_due
-  ON requests (
-    service_tier,
-    (CASE state WHEN 'completed' THEN completed_at
-                WHEN 'failed' THEN failed_at
-                WHEN 'canceled' THEN canceled_at END),
-    id
-  )
-  WHERE batch_id IS NULL
-    AND state IN ('completed', 'failed', 'canceled');
-```
+The candidate index and the other retention indexes are permanent and are
+built by migrations `20260905000001` to `20260905000003`, one
+`CREATE INDEX CONCURRENTLY` per file outside the migrator's transaction, so
+they are created online without blocking writes. Migration
+`20260905000000` runs first and only drops an INVALID leftover of the same
+name from an interrupted build, so a retried start always ends valid.
+Migration `20260905000004` adds the retained store's by-id index on the
+partitioned parent (a plain build: partitioned parents cannot be built
+concurrently, and new daily partitions inherit it). The first build on a
+production-sized `requests` table takes several minutes; deploy that
+migration in a quiet window, or pre-build the identical statements by hand
+so the migration finds them and does nothing.
 
 Verify its keys, predicate, validity, and readiness through the migration-owned
 guard rather than by name alone:
@@ -372,9 +369,11 @@ The complete deployment sequence is expand-only and each destructive control
 is enabled separately, in order, only after the previous stage has been
 observed healthy:
 
-1. Build the candidate index with `CREATE INDEX CONCURRENTLY` as a monitored
-   standalone operation; application migrations never build indexes on
-   existing hot tables.
+1. Apply migrations `20260905000000` (drops any INVALID leftover index),
+   `20260905000001` to `20260905000003` (build the candidate and
+   retirement indexes concurrently, online, one per file) and
+   `20260905000004` (the retained store's by-id index). Pre-building the
+   same statements by hand is allowed and makes the builds no-ops.
 2. Apply the expand-only migration. It adds new relations and helpers and
    moves no data. It never scans or rewrites the existing request or
    template heaps, but two statements take a brief `ACCESS EXCLUSIVE` lock

@@ -3981,7 +3981,7 @@ mod tests {
     async fn candidate_discovery_plan_uses_batchless_retention_due_index(pool: PgPool) {
         sqlx::query(
             r#"
-            CREATE INDEX idx_requests_batchless_retention_due
+            CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due
             ON requests (
               service_tier,
               (CASE state WHEN 'completed' THEN completed_at

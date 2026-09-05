@@ -367,7 +367,7 @@ async fn test_get_response_returns_404_for_unknown_id(pool: PgPool) {
 async fn archive_response_graphs(pool: &PgPool, max_groups: i64) {
     let fusillade_pool = setup_fusillade_pool(pool).await;
     sqlx::query(
-        "CREATE INDEX idx_requests_batchless_retention_due ON requests (service_tier, (CASE state WHEN 'completed' THEN completed_at WHEN 'failed' THEN failed_at WHEN 'canceled' THEN canceled_at END), id) WHERE batch_id IS NULL AND state IN ('completed', 'failed', 'canceled')",
+        "CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due ON requests (service_tier, (CASE state WHEN 'completed' THEN completed_at WHEN 'failed' THEN failed_at WHEN 'canceled' THEN canceled_at END), id) WHERE batch_id IS NULL AND state IN ('completed', 'failed', 'canceled')",
     )
     .execute(&fusillade_pool)
     .await
