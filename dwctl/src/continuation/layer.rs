@@ -446,8 +446,10 @@ impl Drop for OutcomeGuard {
 /// clients open a second message.
 ///
 /// Part of the per-model reconstructor rollout, not the inert baseline: the
-/// caller arms it only for models in `model_reconstructors`, so an unmapped
-/// model's resumed frames stay byte-identical to the pre-v2 layer.
+/// caller arms it only when the selected accumulator says `repairs_role()` —
+/// a family reconstructor, never the plain fallback — so a model on the plain
+/// path (unmapped, or an unrecognised map value) keeps resumed frames
+/// byte-identical to the pre-v2 layer.
 fn ensure_role(chat: &mut Value, role_sent: &mut bool) {
     if *role_sent {
         return;
@@ -507,12 +509,15 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         // Whether any frame DELIVERED to the client has carried a `delta.role`
         // (leg-1 passthrough, or injected by `ensure_role`). The resumed frames
         // replace whatever leg 1 would have sent later, so if no role has gone
-        // out yet, the first resumed delta must carry it. Role repair rides the
-        // per-model reconstructor flip: an UNMAPPED model starts as "already
-        // sent" so every `ensure_role` call no-ops and its resumed frames stay
-        // byte-identical to the pre-v2 layer — the deployment-posture invariant
-        // that makes shipping this image inert until a model is flipped.
-        let mut role_sent = !state.cfg.model_reconstructors.contains_key(&ctx.model);
+        // out yet, the first resumed delta must carry it. Role repair is a
+        // capability of the SELECTED accumulator (`repairs_role`), so it rides
+        // the per-model reconstructor flip and nothing else: a model without a
+        // family reconstructor — including an unrecognised map value that fell
+        // back to PlainContent — starts as "already sent", every `ensure_role`
+        // call no-ops, and its resumed frames stay byte-identical to the
+        // pre-v2 layer. That is the deployment-posture invariant that makes
+        // shipping this image inert until a model is flipped.
+        let mut role_sent = !acc.repairs_role();
         // The terminating frames, held rather than forwarded: we may need to put
         // a synthesized usage frame in front of `[DONE]`, and a death frame must
         // only reach the client if the resume chain fails. `first_death` is what

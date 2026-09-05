@@ -115,6 +115,15 @@ pub trait StreamAccumulator: Send {
     fn forward_parser(&self) -> Box<dyn ForwardParser> {
         Box::new(PlainForward)
     }
+
+    /// Whether the layer may inject a message-opening `role` into the first
+    /// resumed delta when leg 1 never delivered one. A capability of the
+    /// SELECTED accumulator — not of the config key — so an unrecognised
+    /// `model_reconstructors` value that falls back to [`PlainContent`] keeps
+    /// the plain path's byte-identical guarantee along with its parser.
+    fn repairs_role(&self) -> bool {
+        false
+    }
 }
 
 /// Pick the accumulator for `model`, configured for how `route` serves it.
@@ -540,6 +549,21 @@ mod tests {
         chat.ingest(&json!({"id": "c", "choices": [{"delta": {"content": "Hello"}}]}))
             .unwrap();
         assert_eq!(chat.continuation_text().as_deref(), Some("Hello"));
+    }
+
+    /// Role repair follows the SELECTED accumulator, not the config key: an
+    /// unrecognised `model_reconstructors` value falls back to the plain path
+    /// and must keep ALL of that path's guarantees — parser and byte-identical
+    /// frames alike.
+    #[test]
+    fn an_unrecognised_reconstructor_value_keeps_the_full_plain_path() {
+        let typo = cfg_with(&[("dsv4-flash", "DSV4")]);
+        let acc = for_model("dsv4-flash", &typo, &RouteInfo::default(), None);
+        assert!(!acc.repairs_role(), "a typo'd value must not enable role repair");
+
+        let mapped = cfg_with(&[("dsv4-flash", "dsv4")]);
+        let acc = for_model("dsv4-flash", &mapped, &RouteInfo::default(), None);
+        assert!(acc.repairs_role(), "the recognised family reconstructor carries the capability");
     }
 
     #[test]

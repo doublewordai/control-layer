@@ -781,6 +781,13 @@ impl StreamAccumulator for Dsv4Reconstructor {
     fn forward_parser(&self) -> Box<dyn ForwardParser> {
         Box::new(Dsv4Forward::new(self.forward_seed()))
     }
+
+    /// Role repair rides the family reconstructor, alongside its parser: this
+    /// family's captures include a provider that delivers `role` only on a
+    /// late frame, so a rescue can otherwise leave the message roleless.
+    fn repairs_role(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
