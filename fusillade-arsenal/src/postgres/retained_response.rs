@@ -929,22 +929,39 @@ fn to_payload<T: Serialize>(
     serde_json::to_value(value).map_err(|_| RetainedResponseSerializationError::EncodeFailure)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// A database-level failure while reading retained responses.
+///
+/// Unlike [`RetainedResponseSerializationError`] (which deliberately drops its
+/// source because JSON/SQL decode errors can embed customer-controlled values),
+/// this error carries the underlying `sqlx::Error` so the actual DB failure —
+/// SQLSTATE, lock/statement timeout, dropped connection — surfaces in the
+/// error chain and in the request log. Without it, every failure in this read
+/// path collapses to a static "Retained response read failed", which makes
+/// 5xxes on `GET /admin/api/v1/batches/requests` un-triagable.
+#[derive(Debug)]
 enum RetainedResponseReadError {
-    DatabaseFailure,
+    DatabaseFailure(sqlx::Error),
 }
 
 impl fmt::Display for RetainedResponseReadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Retained response read failed")
+        match self {
+            Self::DatabaseFailure(e) => write!(formatter, "Retained response read failed: {e}"),
+        }
     }
 }
 
-impl std::error::Error for RetainedResponseReadError {}
+impl std::error::Error for RetainedResponseReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DatabaseFailure(e) => Some(e),
+        }
+    }
+}
 
-fn read_database_failure<T>(_: T) -> FusilladeError {
+fn read_database_failure(e: sqlx::Error) -> FusilladeError {
     FusilladeError::Other(anyhow::Error::new(
-        RetainedResponseReadError::DatabaseFailure,
+        RetainedResponseReadError::DatabaseFailure(e),
     ))
 }
 
@@ -4514,5 +4531,33 @@ mod tests {
             assert!(!display.contains("untrusted-kind"));
             assert!(!display.contains(&request_id().to_string()));
         }
+    }
+
+    #[test]
+    fn read_database_failure_preserves_underlying_sqlx_error() {
+        // Regression guard for the intermittent 5xx on GET /admin/api/v1/batches/requests:
+        // the retained-response read path used to collapse every database failure into a
+        // static "Retained response read failed", hiding the actual SQLSTATE and message
+        // from the request log. Unlike the serialization errors (which deliberately stay
+        // content-free), database errors here are server-side, so preserving them is safe.
+        let source = sqlx::Error::RowNotFound;
+        let fusillade = read_database_failure(source);
+        let display = fusillade.to_string();
+        assert!(
+            display.contains("Retained response read failed"),
+            "display should keep the stable prefix: {display}"
+        );
+        assert!(
+            display.contains("no rows returned"),
+            "display should carry the underlying sqlx message: {display}"
+        );
+        let FusilladeError::Other(anyhow_error) = fusillade else {
+            panic!("read_database_failure must produce FusilladeError::Other");
+        };
+        let chain: Vec<String> = anyhow_error.chain().map(|e| e.to_string()).collect();
+        assert!(
+            chain.iter().any(|link| link.contains("no rows returned")),
+            "the underlying sqlx error should appear in the source chain: {chain:?}"
+        );
     }
 }
