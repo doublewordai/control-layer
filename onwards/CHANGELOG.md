@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0](https://github.com/doublewordai/control-layer/compare/onwards-v0.38.1...onwards-v1.0.0) (2026-09-05)
+
+
+### ⚠ BREAKING CHANGES
+
+* remove tool injection, tool_sources, and the onwards Responses adapter ([#1518](https://github.com/doublewordai/control-layer/issues/1518))
+
+### Features
+
+* enforce scheduled content retention by partition drop ([#1481](https://github.com/doublewordai/control-layer/issues/1481)) ([fc5aeae](https://github.com/doublewordai/control-layer/commit/fc5aeaeac79d2f73d5fd2175f28877cc150216db))
+* midstream retries ([#1453](https://github.com/doublewordai/control-layer/issues/1453)) ([48be316](https://github.com/doublewordai/control-layer/commit/48be3169869cad3344a01b9ee4c3952ca8f597d8))
+* **onwards:** count gateway failures by reason and upstream status ([#1519](https://github.com/doublewordai/control-layer/issues/1519)) ([fce9cbd](https://github.com/doublewordai/control-layer/commit/fce9cbdc88cbdc81a850bd86660743e3e710758c))
+* remove tool injection, tool_sources, and the onwards Responses adapter ([#1518](https://github.com/doublewordai/control-layer/issues/1518)) ([4276d91](https://github.com/doublewordai/control-layer/commit/4276d91a4c320bf884ed3ba88004d1ca9265fe12))
+
+
+### Bug Fixes
+
+* **dwctl:** tolerate backend-omitted fields in Responses translation, stop retry loops on translate failure ([#1544](https://github.com/doublewordai/control-layer/issues/1544)) ([04c07c9](https://github.com/doublewordai/control-layer/commit/04c07c9fad947668b6d0be77a38475528dbdc6de))
+* fold SSE streams incrementally and drop async-openai from dwctl ([#1503](https://github.com/doublewordai/control-layer/issues/1503)) ([2995d73](https://github.com/doublewordai/control-layer/commit/2995d734bd966070ca337e61e50cd2dc7cd5392e))
+* **onwards:** drain active responses during shutdown ([#1586](https://github.com/doublewordai/control-layer/issues/1586)) ([416ef7f](https://github.com/doublewordai/control-layer/commit/416ef7f1b3cf506a6d4bcec658a3e1ea3d3e7402))
+* **onwards:** retry slow empty SSE streams ([#1510](https://github.com/doublewordai/control-layer/issues/1510)) ([4df7a30](https://github.com/doublewordai/control-layer/commit/4df7a30f657dd3f87bfc6cf9c07c0a33180cd3a5))
+
 ## [0.38.1](https://github.com/doublewordai/control-layer/compare/onwards-v0.38.0...onwards-v0.38.1) (2026-08-13)
 
 
