@@ -76,8 +76,8 @@ impl RetentionPolicy {
             || !self.batchless_seconds_by_service_tier.is_empty()
     }
 
-    /// The (min, max) batchless retention in seconds across configured tiers,
-    /// or `None` when no batchless tier is configured.
+    /// The (min, max) batchless retention in seconds across configured
+    /// NON-background tiers, or `None` when none is configured.
     ///
     /// Feeds the trailing-demand query's partition-prune bounds: every
     /// sweep-landed retained row satisfies `delete_on ≈ terminal_at + its
@@ -87,10 +87,23 @@ impl RetentionPolicy {
     /// `delete_on` is clamped to the day after observation) are strictly
     /// older than any trailing window, and the lower bound prunes their
     /// partitions without scanning them.
+    ///
+    /// The background tier is excluded because the trailing-demand query
+    /// excludes background rows in every arm (`service_tier IS DISTINCT
+    /// FROM 'background'`); letting an outlier background retention widen
+    /// the bounds would only weaken pruning for rows the query can never
+    /// count.
     pub fn batchless_retention_bounds_seconds(&self) -> Option<(u64, u64)> {
-        let min = self.batchless_seconds_by_service_tier.values().min()?;
-        let max = self.batchless_seconds_by_service_tier.values().max()?;
-        Some((*min, *max))
+        let mut non_background = self
+            .batchless_seconds_by_service_tier
+            .iter()
+            .filter(|(tier, _)| tier.as_str() != "background")
+            .map(|(_, seconds)| *seconds);
+        let first = non_background.next()?;
+        let (min, max) = non_background.fold((first, first), |(min, max), seconds| {
+            (min.min(seconds), max.max(seconds))
+        });
+        Some((min, max))
     }
 
     /// Reject labels that cannot match a persisted service tier safely.
@@ -329,6 +342,31 @@ pub enum RetainedResponseRetirementOutcome {
 #[cfg(test)]
 mod retention_policy_tests {
     use super::*;
+
+    #[test]
+    fn retention_bounds_span_non_background_tiers_only() {
+        let mut policy = RetentionPolicy::default();
+        assert_eq!(policy.batchless_retention_bounds_seconds(), None);
+
+        // Background alone configures no bounds: the trailing-demand query
+        // excludes background rows in every arm.
+        policy
+            .batchless_seconds_by_service_tier
+            .insert("background".to_owned(), 86_400);
+        assert_eq!(policy.batchless_retention_bounds_seconds(), None);
+
+        policy
+            .batchless_seconds_by_service_tier
+            .insert("flex".to_owned(), 30 * 86_400);
+        policy
+            .batchless_seconds_by_service_tier
+            .insert("priority".to_owned(), 60 * 86_400);
+        // The background outlier (1 day) must not widen the bounds.
+        assert_eq!(
+            policy.batchless_retention_bounds_seconds(),
+            Some((30 * 86_400, 60 * 86_400))
+        );
+    }
 
     #[test]
     fn batchless_delete_on_is_the_utc_day_after_exact_expiry() {

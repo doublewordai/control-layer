@@ -2066,9 +2066,16 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // Retained-partition prune bounds ($7/$8): sweep-landed rows have
         // delete_on ~ terminal_at + tier retention, so only partitions in
         // [window_start + min retention, window_end + max retention] can hold
-        // in-window rows. The slack absorbs day rounding at both ends and the
-        // short transition after a retention-period raise (rows landed under
-        // the previous, smaller period while the window still covers them).
+        // in-window rows. The slack absorbs day rounding at both ends and a
+        // retention-period CHANGE's transition: for up to (window + sweep
+        // dwell) after a config flip, in-window rows landed under the
+        // previous period sit against the bound the change moved — a raise
+        // presses the lower bound, a decrease the upper — and a change
+        // larger than the slack undercounts those rows for that transition
+        // window only. Retention changes are rare, deliberate ops events;
+        // widening the slack to cover arbitrary changes would permanently
+        // scan extra full-day partitions to protect a transient, so the
+        // slack stays small and the exposure is documented instead.
         // Without configured bounds the SQL falls back to its weak necessary
         // bound — correct, but it scans every active partition, including the
         // multi-million-row delete-tomorrow buckets the overdue backfill
