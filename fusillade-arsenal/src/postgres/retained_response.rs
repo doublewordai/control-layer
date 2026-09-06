@@ -1182,6 +1182,18 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 /// pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
 
+/// Budget for the planner-estimate fallback, deliberately separate from
+/// `COUNT_BUDGET`. `EXPLAIN` without `ANALYZE` only plans the query — it never
+/// scans rows — so the count budget's reason to exist (never hold a connection
+/// for a full scan) does not apply. Reusing `COUNT_BUDGET` here made the
+/// fallback itself trip `statement_timeout` (SQLSTATE 57014) and turn the whole
+/// listing into a 500 whenever planning the retained arm (dozens of daily
+/// partitions joined to the catalog tables) exceeded 100ms. The budget stays
+/// bounded so a stuck planner cannot stall the request indefinitely; if even
+/// this times out, `count_requests_with_budget` degrades the arm to 0 rather
+/// than fail the listing — `total_count` is documented as best-effort.
+const EXPLAIN_BUDGET: &str = "5s";
+
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
@@ -1209,29 +1221,49 @@ async fn count_requests_with_budget<P: PoolProvider>(
                 // fresh one (EXPLAIN is planning only, so it is cheap).
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
+                sqlx::query(&format!("SET LOCAL statement_timeout = '{EXPLAIN_BUDGET}'"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(read_database_failure)?;
+                let plan: std::result::Result<serde_json::Value, sqlx::Error> =
+                    sqlx::query_scalar(&format!(
+                        "EXPLAIN (FORMAT JSON) {}",
+                        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+                    ))
+                    .bind(filter.created_by.as_deref())
+                    .bind(filter.status.as_deref())
+                    .bind(filter.models.as_deref())
+                    .bind(filter.created_after)
+                    .bind(filter.created_before)
+                    .bind(filter.service_tiers.as_deref())
+                    .fetch_one(&mut *tx)
+                    .await;
+                let estimate = match plan {
+                    Ok(plan) => plan
+                        .get(0)
+                        .and_then(|p| p.get("Plan"))
+                        .and_then(|p| p.get("Plan Rows"))
+                        .and_then(|r| r.as_f64())
+                        .map(|r| r.round() as i64)
+                        .unwrap_or(0),
+                    Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
+                        // Planning exceeded even the relaxed budget — the
+                        // planner itself is under pressure. Degrade this arm
+                        // to 0 on a fresh transaction instead of failing the
+                        // whole listing; total_count is best-effort.
+                        tx.rollback().await.map_err(read_database_failure)?;
+                        tx = manager.begin_read().await.map_err(read_database_failure)?;
+                        0
+                    }
+                    Err(e) => return Err(read_database_failure(e)),
+                };
+                // Restore the count budget so any remaining arms are bounded
+                // the same way the first one was.
                 sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
                     .execute(&mut *tx)
                     .await
                     .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
-                ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                estimate
             }
             Err(e) => return Err(read_database_failure(e)),
         };
