@@ -1309,6 +1309,13 @@ fn build_pool(
     // Convert provider specs to providers
     // Pool-level sanitize_response enables sanitization for all providers
     let pool_sanitize = pool_config.sanitize_response;
+    // Pool-level response_headers are applied to every provider in the pool;
+    // provider-level headers take precedence on key collisions (per
+    // docs/src/response-headers.md). The HTTP handler only reads each
+    // provider's Target.response_headers, so the pool defaults must be
+    // materialised onto each Target here — there is no pool-level field on
+    // ProviderPool to carry them.
+    let pool_response_headers = pool_config.response_headers.clone();
     let providers: Vec<Provider> = pool_config
         .providers
         .into_iter()
@@ -1320,6 +1327,19 @@ fn build_pool(
                 .map(|cl| cl.max_concurrent_requests);
             // Enable sanitization if either pool or provider level is true
             spec.sanitize_response = pool_sanitize || spec.sanitize_response;
+            // Merge pool-level response headers underneath the provider's own;
+            // `or_insert` keeps the provider value where both set the same key.
+            spec.response_headers =
+                match (pool_response_headers.clone(), spec.response_headers.take()) {
+                    (None, provider_headers) => provider_headers,
+                    (Some(pool), None) => Some(pool),
+                    (Some(pool), Some(mut provider_headers)) => {
+                        for (key, value) in pool {
+                            provider_headers.entry(key).or_insert(value);
+                        }
+                        Some(provider_headers)
+                    }
+                };
             let target: Target = spec.into();
             match concurrency_limit {
                 Some(limit) => Provider::with_concurrency_limit(target, weight, limit),
@@ -3674,5 +3694,179 @@ mod tests {
         }
         assert_eq!(RequestClass::Completions.pool_name(), COMPLETIONS_POOL);
         assert_eq!(RequestClass::Normal.pool_name(), DEFAULT_POOL);
+    }
+
+    /// Pool-level `response_headers` (set on the `Pool`/`Pools` config form) must
+    /// reach each provider's `Target.response_headers` — the field the HTTP
+    /// handler reads. Before the fix, `build_pool` parsed the field into
+    /// `PoolConfig` and then dropped it, so `Target.response_headers` stayed
+    /// `None`.
+    #[test]
+    fn pool_level_response_headers_reach_provider_target() {
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "providers": [
+                        { "url": "https://api.openai.com/v1/", "onwards_key": "sk-1" }
+                    ],
+                    "response_headers": {
+                        "Input-Price-Per-Token": "0.0001",
+                        "Output-Price-Per-Token": "0.0002"
+                    }
+                }
+            }
+        }"#;
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+        let pool = default_pool(&targets, "gpt-4");
+        let target = pool.first_target().unwrap();
+        assert_eq!(
+            target.response_headers,
+            Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("Input-Price-Per-Token".to_string(), "0.0001".to_string());
+                m.insert("Output-Price-Per-Token".to_string(), "0.0002".to_string());
+                m
+            })
+        );
+    }
+
+    /// The same `Pool` config form with `response_headers` on the per-provider
+    /// entry is the documented provider-level path and must keep working. This
+    /// is the masking contrast that hid the pool-level drop: only the placement
+    /// of the `response_headers` block differs from the test above.
+    #[test]
+    fn per_provider_response_headers_within_pool_form_are_present() {
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "providers": [
+                        {
+                            "url": "https://api.openai.com/v1/",
+                            "onwards_key": "sk-1",
+                            "response_headers": {
+                                "Input-Price-Per-Token": "0.00003"
+                            }
+                        }
+                    ]
+                }
+            }
+        }"#;
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+        let pool = default_pool(&targets, "gpt-4");
+        let target = pool.first_target().unwrap();
+        assert_eq!(
+            target.response_headers,
+            Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert("Input-Price-Per-Token".to_string(), "0.00003".to_string());
+                m
+            })
+        );
+    }
+
+    /// When pool-level and per-provider `response_headers` coexist, the
+    /// provider-level value wins on key collision and pool-only keys are
+    /// kept — the documented "provider-level headers take precedence" rule
+    /// (docs/src/response-headers.md). Pins the `or_insert` merge against an
+    /// `insert` (over-writes provider value) or wrong-operand-order regression.
+    #[test]
+    fn pool_and_provider_response_headers_merge_with_provider_precedence() {
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "response_headers": {
+                        "A": "poolA",
+                        "B": "poolB"
+                    },
+                    "providers": [
+                        {
+                            "url": "https://api.openai.com/v1/",
+                            "onwards_key": "sk-1",
+                            "response_headers": {
+                                "B": "provB",
+                                "C": "provC"
+                            }
+                        }
+                    ]
+                }
+            }
+        }"#;
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+        let pool = default_pool(&targets, "gpt-4");
+        let target = pool.first_target().unwrap();
+        let mut expected = std::collections::HashMap::new();
+        expected.insert("A".to_string(), "poolA".to_string()); // pool-only, kept
+        expected.insert("B".to_string(), "provB".to_string()); // collision, provider wins
+        expected.insert("C".to_string(), "provC".to_string()); // provider-only, kept
+        assert_eq!(target.response_headers, Some(expected));
+    }
+
+    /// Pool-level `response_headers` must reach every provider in a
+    /// multi-provider pool, not just the first. Guards against a fix that
+    /// accidentally drains the shared pool map on the first iteration.
+    #[test]
+    fn pool_level_response_headers_reach_all_providers_in_pool() {
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "response_headers": {
+                        "X-Pool": "pool"
+                    },
+                    "providers": [
+                        { "url": "https://a.example.com/v1/", "onwards_key": "sk-1" },
+                        { "url": "https://b.example.com/v1/", "onwards_key": "sk-2" }
+                    ]
+                }
+            }
+        }"#;
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+        let pool = default_pool(&targets, "gpt-4");
+        assert_eq!(pool.len(), 2);
+        for provider in pool.providers() {
+            assert_eq!(
+                provider.target.response_headers,
+                Some(std::collections::HashMap::from([(
+                    "X-Pool".to_string(),
+                    "pool".to_string()
+                )])),
+                "pool-level headers missing for {}",
+                provider.target.url
+            );
+        }
+    }
+
+    /// The `Single`-provider and legacy `List` forms hardcode
+    /// `PoolConfig.response_headers: None`, carrying the spec's own headers
+    /// directly onto each `ProviderSpec`. The pool-defaults merge must not
+    /// clobber that path: `PoolConfig.response_headers == None` leaves the
+    /// provider headers untouched.
+    #[test]
+    fn single_provider_form_response_headers_unaffected_by_pool_merge() {
+        let json = r#"{
+            "targets": {
+                "gpt-4": {
+                    "url": "https://api.openai.com/v1/",
+                    "onwards_key": "sk-1",
+                    "response_headers": {
+                        "X-Form": "single"
+                    }
+                }
+            }
+        }"#;
+        let config: ConfigFile = serde_json::from_str(json).unwrap();
+        let targets = Targets::from_config(config).unwrap();
+        let pool = default_pool(&targets, "gpt-4");
+        let target = pool.first_target().unwrap();
+        assert_eq!(
+            target.response_headers,
+            Some(std::collections::HashMap::from([(
+                "X-Form".to_string(),
+                "single".to_string()
+            )]))
+        );
     }
 }
