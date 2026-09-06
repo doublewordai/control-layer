@@ -158,7 +158,7 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         state,
         headers,
         extensions,
-        "/chat/completions",
+        "/v1/chat/completions",
         body_bytes.to_vec(),
     )
     .await;
@@ -300,7 +300,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         trusted,
         authenticated_api_key_id,
         internal_error,
-    } = forward_request(state.clone(), headers, extensions, "/responses", body_bytes).await;
+    } = forward_request(state.clone(), headers, extensions, "/v1/responses", body_bytes).await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -368,7 +368,7 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         state,
         headers,
         extensions,
-        "/embeddings",
+        "/v1/embeddings",
         body_bytes.to_vec(),
     )
     .await;
@@ -456,7 +456,7 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         state,
         headers,
         extensions,
-        "/completions",
+        "/v1/completions",
         body_bytes.to_vec(),
     )
     .await;
