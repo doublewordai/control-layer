@@ -4,6 +4,7 @@
 //! on the leader replica. It periodically polls the database for active probes
 //! and manages background tasks that execute each probe at its configured interval.
 
+use crate::errors::Error as AppError;
 use crate::metrics::errors::component::PROBE_SCHEDULER;
 use crate::probes::db::ProbeManager;
 use std::collections::HashMap;
@@ -12,6 +13,14 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+/// Backoff applied after a transient (non-`NotFound`) `get_probe` failure before
+/// the per-probe scheduler retries. This keeps a momentary pool-acquire or
+/// statement timeout from terminating the probe's background task: the task
+/// backs off and retries instead of exiting, so the probe is not left
+/// unmonitored. (`sync_with_database`/`is_scheduler_running` still prune a
+/// finished handle as a safety net for any other exit path.)
+const PROBE_FETCH_RETRY_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_secs(30);
 
 /// Background scheduler daemon for managing probe execution.
 ///
@@ -87,54 +96,63 @@ impl ProbeScheduler {
 
         // Spawn the scheduler task
         let handle = tokio::spawn(async move {
-            // Check when the probe last executed to avoid immediate execution on restart
-            let _should_delay = match ProbeManager::get_recent_results(&pool.write(), probe_id, 1).await {
+            // Check when the probe last executed to avoid immediate execution on restart.
+            // On a transient fetch error we skip the startup delay and let the main loop
+            // retry, rather than aborting the whole scheduler task (which would leave a
+            // stale handle in the map until the next leader churn).
+            match ProbeManager::get_recent_results(&pool.write(), probe_id, 1).await {
                 Ok(results) => {
                     if let Some(last_result) = results.first() {
-                        let probe = match ProbeManager::get_probe(&pool.write(), probe_id).await {
-                            Ok(p) => p,
+                        match ProbeManager::get_probe(&pool.write(), probe_id).await {
+                            Ok(probe) => {
+                                let now = chrono::Utc::now();
+                                let time_since_last = now - last_result.executed_at;
+                                let interval = chrono::Duration::seconds(probe.interval_seconds as i64);
+
+                                if time_since_last < interval {
+                                    // Calculate how long to wait until next scheduled execution
+                                    let wait_duration = interval - time_since_last;
+                                    let wait_secs = wait_duration.num_seconds().max(0) as u64;
+
+                                    tracing::info!(
+                                        "Probe {} last executed {}s ago, waiting {}s until next execution",
+                                        probe.name,
+                                        time_since_last.num_seconds(),
+                                        wait_secs
+                                    );
+
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs)) => {}
+                                        _ = shutdown_token.cancelled() => {
+                                            tracing::info!("Shutdown signal received during startup delay, stopping scheduler for probe {}", probe_id);
+                                            return;
+                                        }
+                                    }
+                                } else {
+                                    tracing::info!(
+                                        "Probe {} last executed {}s ago (>{}s interval), executing immediately",
+                                        probe.name,
+                                        time_since_last.num_seconds(),
+                                        probe.interval_seconds
+                                    );
+                                }
+                            }
+                            Err(AppError::NotFound { .. }) => {
+                                tracing::info!("Probe {} not found at startup, not starting scheduler", probe_id);
+                                return;
+                            }
                             Err(e) => {
                                 crate::background_error!(
                                     PROBE_SCHEDULER,
                                     "probe_fetch",
                                     Warning,
-                                    "Error fetching probe {}: {}",
+                                    "Error fetching probe {} at startup: {}, will retry from main loop",
                                     probe_id,
                                     e
                                 );
-                                return;
+                                // Skip the startup delay; the main loop retries the fetch.
                             }
-                        };
-
-                        let now = chrono::Utc::now();
-                        let time_since_last = now - last_result.executed_at;
-                        let interval = chrono::Duration::seconds(probe.interval_seconds as i64);
-
-                        if time_since_last < interval {
-                            // Calculate how long to wait until next scheduled execution
-                            let wait_duration = interval - time_since_last;
-                            let wait_secs = wait_duration.num_seconds().max(0) as u64;
-
-                            tracing::info!(
-                                "Probe {} last executed {}s ago, waiting {}s until next execution",
-                                probe.name,
-                                time_since_last.num_seconds(),
-                                wait_secs
-                            );
-
-                            tokio::time::sleep(tokio::time::Duration::from_secs(wait_secs)).await;
-                            false // Don't delay again
-                        } else {
-                            tracing::info!(
-                                "Probe {} last executed {}s ago (>{}s interval), executing immediately",
-                                probe.name,
-                                time_since_last.num_seconds(),
-                                probe.interval_seconds
-                            );
-                            true // Execute immediately
                         }
-                    } else {
-                        true // No previous results, execute immediately
                     }
                 }
                 Err(e) => {
@@ -143,9 +161,8 @@ impl ProbeScheduler {
                         probe_id,
                         e
                     );
-                    true
                 }
-            };
+            }
 
             loop {
                 // Check for shutdown signal
@@ -154,12 +171,36 @@ impl ProbeScheduler {
                     break;
                 }
 
-                // Get the probe to check if it's still active and get the interval
+                // Get the probe to check if it's still active and get the interval.
+                // A `NotFound` means the probe was deleted, so stop scheduling it.
+                // Any other error is treated as transient (e.g. pool-acquire/statement
+                // timeout): back off and retry instead of exiting, so a momentary DB
+                // blip does not leave the probe unmonitored. finished handles are also
+                // pruned by `sync_with_database`/`is_scheduler_running` as a safety net.
                 let probe = match ProbeManager::get_probe(&pool.write(), probe_id).await {
                     Ok(p) => p,
-                    Err(e) => {
-                        crate::background_error!(PROBE_SCHEDULER, "probe_fetch", Warning, "Error fetching probe {}: {}", probe_id, e);
+                    Err(AppError::NotFound { .. }) => {
+                        tracing::info!("Probe {} not found, stopping scheduler", probe_id);
                         break;
+                    }
+                    Err(e) => {
+                        crate::background_error!(
+                            PROBE_SCHEDULER,
+                            "probe_fetch",
+                            Warning,
+                            "Error fetching probe {}: {}, retrying in {:?}",
+                            probe_id,
+                            e,
+                            PROBE_FETCH_RETRY_BACKOFF
+                        );
+                        tokio::select! {
+                            _ = tokio::time::sleep(PROBE_FETCH_RETRY_BACKOFF) => {}
+                            _ = shutdown_token.cancelled() => {
+                                tracing::info!("Shutdown signal received during fetch retry, stopping scheduler for probe {}", probe_id);
+                                break;
+                            }
+                        }
+                        continue;
                     }
                 };
 
@@ -254,9 +295,16 @@ impl ProbeScheduler {
         let active_probes = ProbeManager::list_active_probes(&self.pool.write()).await?;
         let active_probe_ids: std::collections::HashSet<Uuid> = active_probes.iter().map(|p| p.id).collect();
 
-        let schedulers = self.schedulers.read().await;
+        // Prune handles for scheduler tasks that have exited on their own (e.g. a
+        // transient `get_probe` sqlx error that slipped past the in-loop retry, or a
+        // panic/early return). Without this, a finished JoinHandle would keep its
+        // probe in `running_probe_ids`, making both the start and stop set-differences
+        // skip it and leaving the probe unmonitored for the rest of the leadership
+        // session. Dropping a finished handle is harmless; live handles are retained.
+        let mut schedulers = self.schedulers.write().await;
+        schedulers.retain(|_, handle| !handle.is_finished());
         let running_probe_ids: std::collections::HashSet<Uuid> = schedulers.keys().copied().collect();
-        drop(schedulers); // Release read lock
+        drop(schedulers); // Release write lock
 
         // Start schedulers for probes that are active but not running
         for probe_id in active_probe_ids.difference(&running_probe_ids) {
@@ -311,7 +359,12 @@ impl ProbeScheduler {
 
     /// Check if a scheduler is running for a probe
     async fn is_scheduler_running(&self, probe_id: Uuid) -> bool {
-        let schedulers = self.schedulers.read().await;
+        // Prune any finished tasks first so a probe whose scheduler died (e.g. on a
+        // transient DB error) is reported as not running and becomes eligible for
+        // restart by `handle_probe_change`. Otherwise `contains_key` would return
+        // true for a stale handle and the probe would never be rescheduled.
+        let mut schedulers = self.schedulers.write().await;
+        schedulers.retain(|_, handle| !handle.is_finished());
         schedulers.contains_key(&probe_id)
     }
 
@@ -671,5 +724,180 @@ mod tests {
 
         // Should not have any schedulers
         assert_eq!(scheduler.schedulers.read().await.len(), 0);
+    }
+
+    /// Helper: create an already-finished `JoinHandle` that simulates a per-probe
+    /// scheduler task which has exited on its own (e.g. a transient `get_probe`
+    /// sqlx error), leaving a stale handle behind in the `schedulers` map.
+    async fn finished_join_handle() -> JoinHandle<()> {
+        let handle = tokio::spawn(async {});
+        // The trivial task completes as soon as the runtime polls it; wait for
+        // `is_finished()` to flip so callers can rely on it.
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !handle.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("trivial spawned task should finish immediately");
+        handle
+    }
+
+    async fn create_active_probe(pool: &PgPool, name: &str) -> crate::db::models::probes::Probe {
+        let deployment_id = setup_test_deployment(pool).await;
+        ProbeManager::create_probe(
+            pool,
+            CreateProbe {
+                name: name.to_string(),
+                deployment_id,
+                interval_seconds: 60,
+                http_method: "POST".to_string(),
+                request_path: None,
+                request_body: None,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Regression: the periodic fallback `sync_with_database` must prune a
+    /// finished scheduler handle and restart the probe's scheduler, so a probe
+    /// whose task died on a transient (non-`NotFound`) DB error is monitored
+    /// again. Without the prune, the stale handle keeps the probe in both the
+    /// "active" and "running" sets, so neither set-difference acts on it.
+    #[sqlx::test]
+    async fn test_sync_restarts_probe_with_finished_scheduler(pool: PgPool) {
+        let probe = create_active_probe(&pool, "Finished-handle probe").await;
+
+        let config = create_test_config();
+        let scheduler = ProbeScheduler::new(pool.clone(), config);
+
+        // Simulate a scheduler task that has died on its own while the probe is
+        // still active in the DB.
+        {
+            let mut schedulers = scheduler.schedulers.write().await;
+            schedulers.insert(probe.id, finished_join_handle().await);
+        }
+        assert!(
+            scheduler.schedulers.read().await.get(&probe.id).unwrap().is_finished(),
+            "precondition: probe's scheduler handle should be finished"
+        );
+
+        scheduler.sync_with_database(CancellationToken::new()).await.unwrap();
+
+        let schedulers = scheduler.schedulers.read().await;
+        assert_eq!(schedulers.len(), 1, "still-active probe should have exactly one scheduler");
+        let handle = schedulers.get(&probe.id).expect("probe scheduler should have been restarted");
+        assert!(
+            !handle.is_finished(),
+            "restarted scheduler task should be live, not the stale finished handle"
+        );
+    }
+
+    /// Regression: `is_scheduler_running` must prune a finished handle and
+    /// report the probe as not running, so `handle_probe_change` can restart it
+    /// on a (re)activation notification instead of skipping it due to a stale
+    /// handle.
+    #[sqlx::test]
+    async fn test_is_scheduler_running_prunes_finished_scheduler(pool: PgPool) {
+        let probe = create_active_probe(&pool, "Finished-handle probe").await;
+
+        let config = create_test_config();
+        let scheduler = ProbeScheduler::new(pool, config);
+
+        {
+            let mut schedulers = scheduler.schedulers.write().await;
+            schedulers.insert(probe.id, finished_join_handle().await);
+        }
+
+        assert!(
+            !scheduler.is_scheduler_running(probe.id).await,
+            "a probe with only a finished handle should not be considered running"
+        );
+        assert!(
+            !scheduler.schedulers.read().await.contains_key(&probe.id),
+            "the finished handle should have been pruned from the map"
+        );
+    }
+
+    /// Regression: an activation change notification must (re)start a scheduler
+    /// for a probe whose previous scheduler died, rather than skipping it
+    /// because a stale finished handle is still keyed in the map.
+    #[sqlx::test]
+    async fn test_handle_probe_change_restarts_finished_scheduler(pool: PgPool) {
+        let probe = create_active_probe(&pool, "Finished-handle probe").await;
+
+        let config = create_test_config();
+        let scheduler = ProbeScheduler::new(pool.clone(), config);
+
+        {
+            let mut schedulers = scheduler.schedulers.write().await;
+            schedulers.insert(probe.id, finished_join_handle().await);
+        }
+
+        scheduler
+            .handle_probe_change(probe.id, true, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let schedulers = scheduler.schedulers.read().await;
+        assert_eq!(schedulers.len(), 1);
+        assert!(
+            !schedulers.get(&probe.id).unwrap().is_finished(),
+            "a live scheduler should have been (re)started for the probe"
+        );
+    }
+
+    /// Regression: pruning must not disturb a live (still-running) scheduler.
+    /// When a probe is active and its scheduler is running, `sync_with_database`
+    /// should leave it untouched (not pruned, not replaced).
+    #[sqlx::test]
+    async fn test_sync_keeps_running_scheduler(pool: PgPool) {
+        let _probe = create_active_probe(&pool, "Live probe").await;
+
+        let config = create_test_config();
+        let scheduler = ProbeScheduler::new(pool, config);
+
+        scheduler.initialize(CancellationToken::new()).await.unwrap();
+        assert_eq!(scheduler.schedulers.read().await.len(), 1);
+
+        let live_before = scheduler.schedulers.read().await.values().next().unwrap().is_finished();
+        assert!(!live_before, "precondition: scheduler should be live after initialize");
+
+        scheduler.sync_with_database(CancellationToken::new()).await.unwrap();
+
+        let schedulers = scheduler.schedulers.read().await;
+        assert_eq!(schedulers.len(), 1, "live scheduler should not have been churned");
+        assert!(
+            !schedulers.values().next().unwrap().is_finished(),
+            "running scheduler should still be live after sync"
+        );
+    }
+
+    /// Regression: a `NotFound` (probe deleted while the probe is no longer
+    /// active in the DB) self-heals via the stop branch of `sync_with_database`.
+    /// The finished handle is pruned; since the probe is absent from active IDs,
+    /// no restart occurs and the map ends empty.
+    #[sqlx::test]
+    async fn test_sync_prunes_finished_and_does_not_restart_deleted(pool: PgPool) {
+        let probe = create_active_probe(&pool, "Deleted probe").await;
+
+        let config = create_test_config();
+        let scheduler = ProbeScheduler::new(pool.clone(), config);
+
+        // Simulate a scheduler that died and a probe that was then deleted.
+        {
+            let mut schedulers = scheduler.schedulers.write().await;
+            schedulers.insert(probe.id, finished_join_handle().await);
+        }
+        ProbeManager::delete_probe(&pool, probe.id).await.unwrap();
+
+        scheduler.sync_with_database(CancellationToken::new()).await.unwrap();
+
+        assert_eq!(
+            scheduler.schedulers.read().await.len(),
+            0,
+            "deleted probe's finished handle should be pruned and not restarted"
+        );
     }
 }
