@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use fusillade_arsenal::batch::TemplateId;
@@ -19,7 +20,7 @@ use fusillade_arsenal::{
 use serde_json::{Value, json};
 use sqlx::pool::PoolConnection;
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{Acquire, PgPool, Postgres, Row, Transaction};
 use tokio::sync::Barrier;
 use uuid::Uuid;
 
@@ -62,6 +63,22 @@ impl PoolProvider for WriteSignalingPools {
     fn write(&self) -> &PgPool {
         self.write_requested.store(true, Ordering::Release);
         &self.write
+    }
+}
+
+/// A `PoolProvider` that routes both reads and writes to one pool, so a table
+/// lock taken on any connection is visible to every query issued through the
+/// manager (no replica to obscure it).
+#[derive(Clone)]
+struct SinglePool(PgPool);
+
+impl PoolProvider for SinglePool {
+    fn read(&self) -> &PgPool {
+        &self.0
+    }
+
+    fn write(&self) -> &PgPool {
+        &self.0
     }
 }
 
@@ -1944,6 +1961,86 @@ async fn wait_for_backend_lock_waiter(pool: &PgPool, backend_pid: i32) {
         }
         tokio::task::yield_now().await;
     }
+}
+
+/// Regression test for the production 500 on `GET /admin/api/v1/batches/requests`
+/// ("Retained response read failed") when the retained-response total-count arm
+/// exceeds the 100ms `COUNT_BUDGET`.
+///
+/// The exact count blocks behind an `ACCESS EXCLUSIVE` lock on `requests`, so
+/// `statement_timeout` cancels it after 100ms (SQLSTATE 57014) and the code
+/// falls back to an `EXPLAIN (FORMAT JSON)` planner estimate. The EXPLAIN also
+/// blocks on the same lock. The count-budget fallback must run under its own
+/// generous `EXPLAIN_BUDGET` (planning-only) rather than reusing `COUNT_BUDGET`:
+/// reusing it cancels the EXPLAIN too and turns a recoverable estimate into a
+/// hard 500. This test holds the lock for 500ms — past both the 100ms count
+/// budget and the old 100ms estimate budget — so a regression that reuses the
+/// count budget for the fallback is canceled before the lock is released and
+/// fails the assertion below.
+#[sqlx::test]
+async fn list_requests_falls_back_to_plan_estimate_when_exact_count_times_out(pool: PgPool) {
+    // A live batchless response for the owner so the exact total-count must
+    // observe at least one row and the page has something to return.
+    insert_request(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T10:00:00Z"),
+        "estimate-fallback",
+    )
+    .await;
+    // Fresh stats keep the planner's row estimate meaningful (the fallback
+    // "tracks within a few percent when statistics are fresh").
+    sqlx::query("ANALYZE requests")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let manager =
+        PostgresRequestManager::new(SinglePool(pool.clone()), PostgresStorageConfig::default());
+    let filter = ListRequestsFilter {
+        created_by: Some(OWNER.to_string()),
+        skip: 0,
+        limit: 50,
+        active_first: false,
+        ..Default::default()
+    };
+
+    // Hold ACCESS EXCLUSIVE on `requests` so the exact total-count blocks.
+    // statement_timeout cancels it after the 100ms count budget (SQLSTATE
+    // 57014); the planner's EXPLAIN fallback then blocks on the same lock and,
+    // under the estimate budget introduced to fix the production 500, survives
+    // until we release. A regression that reuses the count budget for the
+    // fallback would cancel the EXPLAIN too and surface a hard error here.
+    let mut blocker = pool.acquire().await.unwrap();
+    let mut lock_tx = blocker.begin().await.unwrap();
+    sqlx::query("LOCK TABLE requests IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock_tx)
+        .await
+        .expect("ACCESS EXCLUSIVE lock must be acquirable");
+
+    let handle = tokio::spawn(async move { manager.list_requests(filter).await });
+
+    // Wait until the count is actually blocked on the lock, then hold it well
+    // past both the 100ms count budget and the old 100ms estimate budget so a
+    // fallback that reuses the count budget is canceled before we release.
+    wait_for_relation_waiter(&pool, "requests").await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    lock_tx.rollback().await.unwrap();
+    drop(blocker);
+
+    let result = handle
+        .await
+        .expect("list_requests task must not panic")
+        .expect("list_requests must return a plan estimate, not a hard error");
+    assert!(
+        result.total_count >= 1,
+        "the fallback estimate must account for the seeded owner request",
+    );
+    assert!(
+        !result.data.is_empty(),
+        "the seeded owner request must be returned",
+    );
 }
 
 async fn install_candidate_index(pool: &PgPool) {
