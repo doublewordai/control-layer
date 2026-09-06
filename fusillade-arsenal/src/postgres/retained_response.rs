@@ -1206,13 +1206,15 @@ async fn count_requests_with_budget<P: PoolProvider>(
             Ok(n) => n,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
                 // The failed statement aborted this transaction; estimate on a
-                // fresh one (EXPLAIN is planning only, so it is cheap).
+                // fresh one. The EXPLAIN is deliberately run WITHOUT the COUNT
+                // budget: it is planning only (it never executes the scan), and
+                // the retained arm's dynamic partition-route query already takes
+                // ~100ms just to plan — under the 100ms budget a cancelled
+                // EXPLAIN (SQLSTATE 57014) here would surface as a 500 on
+                // GET /admin/api/v1/batches/requests. The next arm's exact count
+                // re-applies the budget below.
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
-                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(read_database_failure)?;
                 let plan: serde_json::Value = sqlx::query_scalar(&format!(
                     "EXPLAIN (FORMAT JSON) {}",
                     arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
@@ -1226,12 +1228,19 @@ async fn count_requests_with_budget<P: PoolProvider>(
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(read_database_failure)?;
-                plan.get(0)
+                let estimate = plan
+                    .get(0)
                     .and_then(|p| p.get("Plan"))
                     .and_then(|p| p.get("Plan Rows"))
                     .and_then(|r| r.as_f64())
                     .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                    .unwrap_or(0);
+                // Re-apply the budget so the next arm's exact count stays bounded.
+                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(read_database_failure)?;
+                estimate
             }
             Err(e) => return Err(read_database_failure(e)),
         };
