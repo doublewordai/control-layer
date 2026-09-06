@@ -565,6 +565,111 @@ async fn custom_processor_can_synthesize_terminal_failure(pool: sqlx::PgPool) {
     shutdown_token.cancel();
 }
 
+/// Regression test: a non-retriable `RequestBuilderError` surfaced from the
+/// HTTP client must be persisted to `state='failed'` by `complete()`'s
+/// `Some(Err)` arm. Before the fix that arm returned a `Failed` request without
+/// calling `storage.persist`, so the row stayed `processing`, was recycled to
+/// `pending` by the stale-request reaper, and looped forever.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+#[test_log::test]
+async fn builder_error_is_persisted_as_terminal_failure(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    http_client.add_response(
+        "POST /v1/test",
+        Err(fusillade::FusilladeError::HttpRequestBuilder(
+            "simulated builder error".to_string(),
+        )),
+    );
+
+    let shutdown_token = CancellationToken::new();
+    let config = fast_test_config();
+    let manager = postgres_store(pool, &config).await;
+    let daemon = Arc::new(postgres_daemon(
+        manager.clone(),
+        http_client.clone(),
+        config,
+    ));
+    let _handle = daemon.run(shutdown_token.clone()).unwrap();
+
+    let request_id = submit_one_request(&manager).await;
+    // Before the fix the row never left `processing`, so this would time out.
+    wait_until_completed(&manager, request_id).await;
+
+    let AnyRequest::Failed(req) = fetch_any_request(&manager, request_id).await else {
+        panic!("expected Failed variant");
+    };
+
+    match &req.state.reason {
+        fusillade::request::FailureReason::RequestBuilderError { error } => {
+            assert!(
+                error.contains("simulated builder error"),
+                "builder error message should propagate: {error}"
+            );
+        }
+        other => panic!("expected RequestBuilderError, got {other:?}"),
+    }
+    assert!(
+        !req.state.reason.is_retriable(),
+        "RequestBuilderError must be classified non-retriable"
+    );
+
+    shutdown_token.cancel();
+}
+
+/// Guard: retriable errors produced by the same `Some(Err)` arm (here a
+/// `NetworkError` from the fallback `_` arm) must NOT be persisted as terminal
+/// by `complete()`. They stay `processing` and are retried via
+/// `reschedule_for_retry` (which only matches `state='processing'`). An
+/// over-broad fix persisting every `Some(Err)` failure would strand the row in
+/// `failed` and starve the retry, never reaching `Completed`.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+#[test_log::test]
+async fn retriable_error_from_err_arm_still_retries_to_success(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    http_client.add_response(
+        "POST /v1/test",
+        Err(fusillade::FusilladeError::HttpClient(
+            "transient network error".to_string(),
+        )),
+    );
+    http_client.add_response(
+        "POST /v1/test",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"ok":true}"#.into(),
+        }),
+    );
+
+    let shutdown_token = CancellationToken::new();
+    let config = fast_test_config();
+    let manager = postgres_store(pool, &config).await;
+    let daemon = Arc::new(postgres_daemon(
+        manager.clone(),
+        http_client.clone(),
+        config,
+    ));
+    let _handle = daemon.run(shutdown_token.clone()).unwrap();
+
+    let request_id = submit_one_request(&manager).await;
+    wait_until_completed(&manager, request_id).await;
+
+    let AnyRequest::Completed(req) = fetch_any_request(&manager, request_id).await else {
+        panic!("expected Completed variant after retrying the transient error");
+    };
+    assert!(
+        req.state.response_body.contains("\"ok\":true"),
+        "successful retry response should propagate: {}",
+        req.state.response_body
+    );
+    assert_eq!(
+        http_client.call_count(),
+        2,
+        "first attempt should fail transiently and the second should succeed"
+    );
+
+    shutdown_token.cancel();
+}
+
 // Compile-time check: the typestate Completed variant of RequestCompletionResult
 // is reachable from our trait, ensuring downstream consumers can construct any
 // terminal state if they need to.

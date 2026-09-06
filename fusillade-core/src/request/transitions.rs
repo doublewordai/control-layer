@@ -484,6 +484,9 @@ impl Request<Processing> {
                     data: self.data,
                     state: failed_state,
                 };
+                if !request.state.reason.is_retriable() {
+                    storage.persist(&request).await?;
+                }
                 Ok(RequestCompletionResult::Failed(request))
             }
             None => {
