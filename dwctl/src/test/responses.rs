@@ -129,7 +129,7 @@ async fn setup_ai_test(
 /// Mount a wiremock mock for chat completions
 async fn mount_chat_completions_mock(mock_server: &wiremock::MockServer) {
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/chat/completions"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "chatcmpl-test123",
             "object": "chat.completion",
