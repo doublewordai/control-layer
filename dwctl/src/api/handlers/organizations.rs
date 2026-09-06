@@ -270,12 +270,21 @@ pub async fn create_organization<P: PoolProvider>(
     // several workspaces - prod and dev being the obvious pair. `~` can't occur
     // in a domain, which is what makes the match exact on the way back out.
     //
-    // Falls back to the submitted name when the owner is on a personal email
-    // domain: there's nothing worth matching on, and an organization claiming
-    // "gmail.com" would catch every consumer signup.
+    // When the owner is on a personal email domain there is nothing worth
+    // matching on - "there's nothing worth matching on, and a workspace
+    // claiming gmail.com would catch every consumer signup" (commit 3d75ff05)
+    // - so the workspace is *not* domain-routable. The username is therefore an
+    // opaque `user~{suffix}` rather than the submitted name: anything the user
+    // typed here would flow into the same `username` column that
+    // `find_by_domain`'s `username = $1 OR username LIKE $1 || '~%'` arms match
+    // on, so a personal-email owner typing a third party's non-personal domain
+    // (say `acme.com`) as the name would otherwise be planted as a bare-domain
+    // username that hijacks every future signup at that domain. The name the
+    // user typed still becomes the display name (below); only the routed
+    // username is opaque.
     let username = match claimable_domain.as_deref() {
         Some(domain) => format!("{domain}~{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
-        None => data.name.clone(),
+        None => format!("user~{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
     };
 
     let display_name = data.display_name.clone().or_else(|| Some(data.name.clone()));
@@ -2898,6 +2907,169 @@ mod tests {
             .unwrap()
             .expect("a workspace matches the domain");
         assert_eq!(matched.id.to_string(), ids[0], "the oldest surviving workspace wins");
+    }
+
+    /// A personal-email owner's workspace is not domain-routable, so its
+    /// username must be an opaque `user~{suffix}` rather than the submitted
+    /// name. Otherwise the owner could type a third party's non-personal domain
+    /// (say `acme.test`) as the name, the fallback would store it as the
+    /// username verbatim, and `find_by_domain`'s `username = $1` arm would
+    /// match it on every future signup at that domain - hijacking the domain.
+    /// The name the user typed still becomes the display name.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_personal_email_owner_username_is_opaque(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "gmail.com").await;
+        let headers = add_auth_headers(&owner);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "acme.test", "email": "billing@acme.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let body = resp.json::<serde_json::Value>();
+        let username = body["username"].as_str().unwrap();
+        assert!(
+            username.starts_with("user~") && username.len() == "user~".len() + 8,
+            "personal-email fallback must use an opaque user~<8 hex> username, got {username}"
+        );
+        assert_ne!(username, "acme.test", "the planted domain must not become the username");
+        assert_eq!(body["display_name"].as_str().unwrap(), "acme.test");
+
+        // The opaque username does not collide with any domain lookup, so the
+        // victim's domain remains unclaimed.
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            crate::db::handlers::Organizations::new(&mut conn)
+                .find_by_domain("acme.test")
+                .await
+                .unwrap()
+                .is_none(),
+            "an opaque username must not match domain routing"
+        );
+    }
+
+    /// The full hijack scenario, inverted: after the fix, a personal-email
+    /// owner cannot pre-register a third party's non-personal domain, enable
+    /// auto-join, and silently enroll a victim who signs up at that domain via
+    /// proxy-header auth. The victim's signup finds no workspace for the
+    /// domain, so no membership is granted and the attacker's member list
+    /// discloses no victim PII.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_personal_email_owner_cannot_hijack_unclaimed_domain(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+
+        // Attacker signs up with a personal email (gmail.com is personal).
+        let attacker = create_test_user_on_domain(&pool, Role::StandardUser, "gmail.com").await;
+        let attacker_headers = add_auth_headers(&attacker);
+
+        // Attacker POSTs /organizations with name = a third party's non-personal
+        // domain. After the fix the username is an opaque `user~<8 hex>`, not
+        // the planted domain, so domain routing never sees it.
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&attacker_headers[0].0, &attacker_headers[0].1)
+            .add_header(&attacker_headers[1].0, &attacker_headers[1].1)
+            .json(&json!({ "name": "acme.test", "email": "billing@acme.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let body = resp.json::<serde_json::Value>();
+        let org_id = body["id"].as_str().unwrap().to_string();
+        assert_ne!(
+            body["username"].as_str().unwrap(),
+            "acme.test",
+            "the planted domain must not be stored as the username"
+        );
+
+        // Attacker enables auto-join on their org.
+        set_auto_join(&pool, uuid::Uuid::parse_str(&org_id).unwrap(), true).await;
+
+        // The bare-equality arm no longer matches the attacker's org, so
+        // `find_by_domain("acme.test")` returns None.
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            assert!(
+                crate::db::handlers::Organizations::new(&mut conn)
+                    .find_by_domain("acme.test")
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "the planted workspace must not be reachable by domain routing"
+            );
+        }
+
+        // Victim arrives via proxy-header auth (first-time signup). The auto-org
+        // block in current_user.rs runs inside `if was_created`, calls
+        // find_by_domain("acme.test"), finds nothing, and does not enroll the
+        // victim.
+        let victim_ext = format!("victim{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+        let victim_email = format!("{victim_ext}@acme.test");
+        let resp = server
+            .get("/admin/api/v1/users/current/onboarding-context")
+            .add_header("x-doubleword-user", victim_ext.as_str())
+            .add_header("x-doubleword-email", victim_email.as_str())
+            .await;
+        resp.assert_status_ok();
+        let ctx = resp.json::<serde_json::Value>();
+        assert!(
+            ctx["domain_match"].is_null(),
+            "the victim must be offered no domain match, got {}",
+            ctx["domain_match"]
+        );
+
+        // The attacker (org owner) lists members and must NOT see the victim.
+        let resp = server
+            .get(&format!("/admin/api/v1/organizations/{org_id}/members"))
+            .add_header(&attacker_headers[0].0, &attacker_headers[0].1)
+            .add_header(&attacker_headers[1].0, &attacker_headers[1].1)
+            .await;
+        resp.assert_status_ok();
+        let members = resp.json::<serde_json::Value>();
+        let serialized = serde_json::to_string(&members).unwrap();
+        assert!(
+            !serialized.contains(&victim_email),
+            "the attacker must not see the victim's email in the member list: {serialized}"
+        );
+        // Only the attacker (owner) is a member.
+        assert_eq!(members.as_array().unwrap().len(), 1, "no victim may be silently enrolled");
+    }
+
+    /// The fix preserves the business-email path: an owner on a non-personal
+    /// domain still claims that domain as `{domain}~{suffix}` and remains
+    /// findable by colleagues. (Regression guard.)
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_business_email_owner_still_claims_domain(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let headers = add_auth_headers(&owner);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Acme Corporation", "email": "billing@acme.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let body = resp.json::<serde_json::Value>();
+        let username = body["username"].as_str().unwrap();
+        assert!(
+            username.starts_with("acme.test~"),
+            "a business-email owner must still claim their domain, got {username}"
+        );
+        assert_eq!(body["display_name"].as_str().unwrap(), "Acme Corporation");
+
+        let mut conn = pool.acquire().await.unwrap();
+        let matched = crate::db::handlers::Organizations::new(&mut conn)
+            .find_by_domain("acme.test")
+            .await
+            .unwrap()
+            .expect("the business-email claim is still routable");
+        assert_eq!(matched.id.to_string(), body["id"].as_str().unwrap());
     }
 
     /// A soft-deleted workspace must never receive join requests - nobody is
