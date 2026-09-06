@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Dialog,
   DialogContent,
@@ -52,6 +52,17 @@ export function AddFundsModal({
   const targetLabel = targetUser.display_name || targetUser.email;
   const isRemove = mode === "remove";
   const verb = isRemove ? "remove" : "add";
+
+  // The parent keeps this modal mounted and only toggles `isOpen`, so React
+  // state persists across close→reopen cycles. Close paths call `handleClose`
+  // which resets the form, but if the parent flips `isOpen` directly the
+  // close handler never runs — clear any stale error whenever the modal is
+  // (re)opened so a fresh form never re-surfaces the previous attempt's banner.
+  useEffect(() => {
+    if (isOpen) {
+      setError(null);
+    }
+  }, [isOpen]);
 
   const handleModeChange = (value: string) => {
     setMode(value as FundsMode);
