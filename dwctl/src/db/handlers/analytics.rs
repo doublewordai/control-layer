@@ -1308,6 +1308,14 @@ pub async fn get_user_model_breakdown_for_range(
 /// Get distinct batch count for a date range from `batch_aggregates` (one row per batch,
 /// filtered by `created_at`). Batch counts are not summable across day boundaries, so they
 /// come from `batch_aggregates` rather than the daily rollup.
+///
+/// The range is matched at **day** granularity to mirror
+/// `get_user_model_breakdown_for_range`: the start/end timestamps are truncated to their
+/// UTC date (start inclusive, end exclusive of the next day — i.e. the whole of `end`'s
+/// UTC day). Sub-day bounds therefore collapse to whole days, keeping `total_batch_count`
+/// consistent with the day-granular rollup and the midnight-truncated usage cache key, so
+/// `avg_requests_per_batch = total_requests / total_batch_count` divides two
+/// day-granular quantities instead of mixing granularities.
 #[instrument(skip(pool), err)]
 pub async fn get_user_batch_count_for_range(pool: &PgPool, user_id: Uuid, start: DateTime<Utc>, end: DateTime<Utc>) -> Result<i64> {
     let row = sqlx::query_scalar!(
@@ -1315,7 +1323,8 @@ pub async fn get_user_batch_count_for_range(pool: &PgPool, user_id: Uuid, start:
         SELECT COUNT(*) as "count!"
         FROM batch_aggregates
         WHERE user_id = $1
-          AND created_at >= $2 AND created_at <= $3
+          AND created_at >= ($2::timestamptz AT TIME ZONE 'UTC')::date
+          AND created_at <  (($3::timestamptz AT TIME ZONE 'UTC')::date + INTERVAL '1 day')
         "#,
         user_id,
         start,
@@ -2880,5 +2889,76 @@ mod tests {
         let count = get_user_batch_count_for_range(&pool, user_id, one_hour_ago, now).await.unwrap();
         // Only the in-window batch is counted.
         assert_eq!(count, 1);
+    }
+
+    /// Regression for the bound-semantics asymmetry fixed alongside
+    /// `get_user_model_breakdown_for_range`. The batch-count range must be
+    /// UTC-day-granular (start inclusive, end exclusive of the next day) so a
+    /// batch completed on `end`'s UTC day but after a sub-day `end` is still
+    /// counted — matching the day-granular rollup. Before the fix this query
+    /// filtered on the exact timestamp and excluded such a batch.
+    #[sqlx::test]
+    async fn test_batch_count_for_range_is_day_granular_on_end(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+
+        // A batch completed at 15:00Z on 2025-03-11.
+        let batch_day = DateTime::parse_from_rfc3339("2025-03-11T15:00:00Z").unwrap().with_timezone(&Utc);
+        insert_batch_aggregate(&pool, user_id, batch_day, 1).await;
+
+        // Caller passes a sub-day `end` of 03:00Z on the same UTC day — before the batch.
+        let start = DateTime::parse_from_rfc3339("2025-03-11T00:00:00Z").unwrap().with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2025-03-11T03:00:00Z").unwrap().with_timezone(&Utc);
+
+        let count = get_user_batch_count_for_range(&pool, user_id, start, end).await.unwrap();
+        // Day-granular: the whole of 2025-03-11 is included, so the 15:00 batch counts.
+        // (Pre-fix exact-timestamp filtering returned 0 here.)
+        assert_eq!(count, 1, "batch on end's UTC day but after sub-day end must be counted");
+    }
+
+    /// End-to-end consistency at the DB layer: with a sub-day `end` on a completed UTC
+    /// day, `get_user_batch_count_for_range` and `get_user_model_breakdown_for_range`
+    /// must cover the same day-granular interval. Before the fix the rollup counted the
+    /// whole end day while the batch count used the exact sub-day timestamp, so
+    /// `avg_requests_per_batch = total_requests / total_batch_count` divided a
+    /// whole-day numerator by a sub-day denominator.
+    #[sqlx::test]
+    async fn test_batch_count_for_range_matches_breakdown_granularity(pool: PgPool) {
+        let user_id = create_usage_test_user(&pool).await;
+
+        // One successful request folded into the 2025-03-11 rollup row.
+        let request_ts = DateTime::parse_from_rfc3339("2025-03-11T12:00:00Z").unwrap().with_timezone(&Utc);
+        insert_usage_analytics(
+            &pool,
+            UsageAnalyticsParams {
+                user_id,
+                model: "claude-3",
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_cost: 0.0,
+                timestamp: request_ts,
+                fusillade_batch_id: None,
+                status_code: 200,
+            },
+        )
+        .await;
+        refresh_user_model_usage_daily(&pool).await.unwrap();
+
+        // One batch at 20:00Z on 2025-03-11 — after the sub-day `end` of 03:00Z.
+        let batch_ts = DateTime::parse_from_rfc3339("2025-03-11T20:00:00Z").unwrap().with_timezone(&Utc);
+        insert_batch_aggregate(&pool, user_id, batch_ts, 1).await;
+
+        // Caller passes a sub-day `end` of 03:00Z on 2025-03-11.
+        let start = DateTime::parse_from_rfc3339("2025-03-11T00:00:00Z").unwrap().with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2025-03-11T03:00:00Z").unwrap().with_timezone(&Utc);
+
+        let breakdown = get_user_model_breakdown_for_range(&pool, user_id, start, end).await.unwrap();
+        let batch_count = get_user_batch_count_for_range(&pool, user_id, start, end).await.unwrap();
+        let total_requests: i64 = breakdown.iter().map(|e| e.request_count).sum();
+
+        // Both must include the whole of 2025-03-11 — one request and one batch.
+        assert_eq!(total_requests, 1, "rollup includes the whole end day");
+        assert_eq!(batch_count, 1, "batch count must be day-granular like the rollup");
+        // The derived average is therefore consistent (1 / 1), not inflated (1 / 0).
+        assert_eq!(total_requests as f64 / batch_count as f64, 1.0);
     }
 }

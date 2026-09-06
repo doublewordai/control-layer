@@ -1194,4 +1194,94 @@ mod tests {
         );
         assert_eq!(org_models[0]["model"], "org-model");
     }
+
+    /// Regression for the bound-semantics asymmetry between the two queries
+    /// `get_usage` dispatches for date-filtered requests. A back-dated admin
+    /// query with a sub-day `end_date` on a completed UTC day must keep
+    /// `total_batch_count` and the derived `avg_requests_per_batch` consistent
+    /// with the day-granular rollup (`total_request_count` / `by_model`).
+    ///
+    /// Before the fix, `get_user_batch_count_for_range` filtered on the exact
+    /// timestamp, so a batch completed later on `end`'s UTC day was excluded
+    /// from the count while the rollup still included the whole day — producing
+    /// an inconsistent `avg_requests_per_batch` (1 / 0 → 0.0) in a single
+    /// response. The cache key also truncates bounds to UTC midnight, so a
+    /// second caller with the same UTC days but a later sub-day `end` hit the
+    /// cache and inherited the first caller's under-count. After the fix both
+    /// callers compute the same, correct day-granular count (1 / 1 → 1.0).
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_usage_sub_day_end_date_is_day_granular(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // One request folded into the 2025-03-11 rollup row (day-granular).
+        let request_ts = DateTime::parse_from_rfc3339("2025-03-11T12:00:00Z").unwrap().with_timezone(&Utc);
+        insert_test_analytics_for_user(&pool, user.id, request_ts, "claude-3", 100, 50).await;
+
+        // One batch completed at 15:00Z on 2025-03-11 — after the sub-day `end` below.
+        let batch_ts = DateTime::parse_from_rfc3339("2025-03-11T15:00:00Z").unwrap().with_timezone(&Utc);
+        sqlx::query!(
+            r#"
+            INSERT INTO batch_aggregates (fusillade_batch_id, user_id, total_amount, transaction_count, max_seq, created_at)
+            VALUES ($1, $2, 0, 1, $3, $4)
+            "#,
+            uuid::Uuid::new_v4(),
+            user.id,
+            1_i64,
+            batch_ts,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to insert batch_aggregate");
+
+        let auth = add_auth_headers(&user);
+        use chrono::SecondsFormat;
+        // ≥30-day window → cache on; `end` is a sub-day timestamp on a completed UTC day.
+        let start = DateTime::parse_from_rfc3339("2025-02-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        let end_a = DateTime::parse_from_rfc3339("2025-03-11T03:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        let end_b = DateTime::parse_from_rfc3339("2025-03-11T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+            .to_rfc3339_opts(SecondsFormat::Secs, true);
+        let url_a = format!("/admin/api/v1/usage?start_date={}&end_date={}", start, end_a);
+        let url_b = format!("/admin/api/v1/usage?start_date={}&end_date={}", start, end_b);
+
+        // Call A — cold cache. The rollup counts the whole of 2025-03-11 (1 request);
+        // the batch count must include it too (post-fix). Pre-fix the exact-timestamp
+        // filter excluded the 15:00 batch and `total_batch_count` was 0 (avg 0.0).
+        let resp_a = app
+            .get(&url_a)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp_a.assert_status_ok();
+        let body_a: UserBatchUsageResponse = resp_a.json();
+        assert_eq!(body_a.total_request_count, 1, "rollup counts the whole end day");
+        assert_eq!(body_a.total_batch_count, 1, "batch count must be day-granular like the rollup");
+        assert_eq!(body_a.avg_requests_per_batch, 1.0, "avg divides two day-granular quantities");
+
+        // Call B — same UTC days as A, so the midnight-truncated cache key is identical
+        // and this is a cache hit. Pre-fix it returned A's under-count (0) for B's later
+        // sub-day `end`; post-fix both callers share the correct day-granular value.
+        let resp_b = app
+            .get(&url_b)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp_b.assert_status_ok();
+        let body_b: UserBatchUsageResponse = resp_b.json();
+        assert_eq!(body_b.total_request_count, 1);
+        assert_eq!(
+            body_b.total_batch_count, 1,
+            "cache collision must return the correct day-granular count"
+        );
+        assert_eq!(body_b.avg_requests_per_batch, 1.0);
+    }
 }
