@@ -1182,6 +1182,14 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 /// pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
 
+/// Budget for the EXPLAIN estimate fallback in `count_requests_with_budget`.
+/// EXPLAIN plans the query but never scans rows, so it can afford a far more
+/// generous budget than the exact count. Applying the exact-count budget here
+/// meant the fallback itself timed out whenever the arm was genuinely slow
+/// (planning a catalog-heavy retained-response arm over many partitions),
+/// turning a recoverable estimate miss into a hard 500 on the responses list.
+const ESTIMATE_BUDGET: &str = "2s";
+
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
@@ -1206,32 +1214,60 @@ async fn count_requests_with_budget<P: PoolProvider>(
             Ok(n) => n,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
                 // The failed statement aborted this transaction; estimate on a
-                // fresh one (EXPLAIN is planning only, so it is cheap).
+                // fresh one (EXPLAIN is planning only, so it is cheap). It gets
+                // its own, larger budget: the exact count only timed out because
+                // this arm is expensive, so sharing the 100ms budget made the
+                // fallback fail too.
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
+                sqlx::query(&format!(
+                    "SET LOCAL statement_timeout = '{ESTIMATE_BUDGET}'"
+                ))
+                .execute(&mut *tx)
+                .await
+                .map_err(read_database_failure)?;
+                let plan: std::result::Result<serde_json::Value, sqlx::Error> =
+                    sqlx::query_scalar(&format!(
+                        "EXPLAIN (FORMAT JSON) {}",
+                        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+                    ))
+                    .bind(filter.created_by.as_deref())
+                    .bind(filter.status.as_deref())
+                    .bind(filter.models.as_deref())
+                    .bind(filter.created_after)
+                    .bind(filter.created_before)
+                    .bind(filter.service_tiers.as_deref())
+                    .fetch_one(&mut *tx)
+                    .await;
+                let estimate = match plan {
+                    Ok(plan) => plan
+                        .get(0)
+                        .and_then(|p| p.get("Plan"))
+                        .and_then(|p| p.get("Plan Rows"))
+                        .and_then(|r| r.as_f64())
+                        .map(|r| r.round() as i64)
+                        .unwrap_or(0),
+                    Err(error) => {
+                        // Even planning exceeded the estimate budget. The total
+                        // only feeds pagination display, so undercount this arm
+                        // rather than fail the whole list. The aborted
+                        // transaction is replaced so the loop can continue.
+                        tracing::warn!(
+                            error = %error,
+                            "failed to estimate request-count arm; contributing 0"
+                        );
+                        tx.rollback().await.map_err(read_database_failure)?;
+                        tx = manager.begin_read().await.map_err(read_database_failure)?;
+                        0
+                    }
+                };
+                // Restore the exact-count budget for any remaining arm; a fresh
+                // transaction (above) otherwise inherits the session default.
                 sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
                     .execute(&mut *tx)
                     .await
                     .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
-                ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                estimate
             }
             Err(e) => return Err(read_database_failure(e)),
         };
