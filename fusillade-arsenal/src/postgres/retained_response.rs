@@ -1176,21 +1176,68 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 
 /// Total-count budget: an exact count is worth a short wait, but an
 /// unfiltered listing over a 100M-row live table is not allowed to hold a
-/// connection for the full scan. Each arm gets `COUNT_BUDGET`; on timeout
-/// (SQLSTATE 57014) the arm falls back to the planner's row estimate, which
-/// tracks within a few percent when statistics are fresh. Runs on the read
-/// pool in its own transaction so it never pins the primary.
+/// connection for the full scan. Each arm's exact COUNT gets `COUNT_BUDGET`;
+/// on timeout (SQLSTATE 57014) the arm falls back to the planner's row
+/// estimate, which tracks within a few percent when statistics are fresh.
+/// Runs on the read pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
+
+/// Budget for the fallback EXPLAIN, deliberately separate from
+/// `COUNT_BUDGET`. Merely planning the retained arm takes hundreds of
+/// milliseconds once it spans dozens of daily partitions joined to the
+/// catalog tables, so an estimate under the count budget failed in exactly
+/// the cases it exists to rescue (HTTP 500s on the admin request list).
+/// EXPLAIN without ANALYZE reads no rows and takes only planner locks, so it
+/// needs no scan guard; this bound only stops a request handler from waiting
+/// indefinitely behind a lock queue.
+const ESTIMATE_BUDGET: &str = "5s";
+
+/// `SET LOCAL` is transaction-scoped: it is applied once per transaction and
+/// re-applied whenever the fallback replaces the transaction.
+async fn apply_statement_budget(tx: &mut Transaction<'_, Postgres>, budget: &str) -> Result<()> {
+    sqlx::query(&format!("SET LOCAL statement_timeout = '{budget}'"))
+        .execute(&mut **tx)
+        .await
+        .map_err(read_database_failure)?;
+    Ok(())
+}
+
+/// Planner row estimate for one count arm, taken under `ESTIMATE_BUDGET`
+/// rather than `COUNT_BUDGET` (see the latter's docs for why).
+async fn estimate_arm_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    arm: &str,
+    filter: &ListRequestsFilter,
+) -> Result<i64> {
+    apply_statement_budget(tx, ESTIMATE_BUDGET).await?;
+    let plan: serde_json::Value = sqlx::query_scalar(&format!(
+        "EXPLAIN (FORMAT JSON) {}",
+        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+    ))
+    .bind(filter.created_by.as_deref())
+    .bind(filter.status.as_deref())
+    .bind(filter.models.as_deref())
+    .bind(filter.created_after)
+    .bind(filter.created_before)
+    .bind(filter.service_tiers.as_deref())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(read_database_failure)?;
+    Ok(plan
+        .get(0)
+        .and_then(|p| p.get("Plan"))
+        .and_then(|p| p.get("Plan Rows"))
+        .and_then(|r| r.as_f64())
+        .map(|r| r.round() as i64)
+        .unwrap_or(0))
+}
 
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
 ) -> Result<i64> {
     let mut tx = manager.begin_read().await.map_err(read_database_failure)?;
-    sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-        .execute(&mut *tx)
-        .await
-        .map_err(read_database_failure)?;
+    apply_statement_budget(&mut tx, COUNT_BUDGET).await?;
     let mut total = 0_i64;
     for arm in [LIVE_REQUEST_COUNT_SQL, RETAINED_REQUEST_COUNT_SQL] {
         let exact: std::result::Result<i64, sqlx::Error> = sqlx::query_scalar(arm)
@@ -1206,32 +1253,13 @@ async fn count_requests_with_budget<P: PoolProvider>(
             Ok(n) => n,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
                 // The failed statement aborted this transaction; estimate on a
-                // fresh one (EXPLAIN is planning only, so it is cheap).
+                // fresh one, then restore the scan guard for the next arm's
+                // exact count.
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
-                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
-                ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                let estimate = estimate_arm_rows(&mut tx, arm, filter).await?;
+                apply_statement_budget(&mut tx, COUNT_BUDGET).await?;
+                estimate
             }
             Err(e) => return Err(read_database_failure(e)),
         };
@@ -3601,6 +3629,7 @@ async fn archive_batchless_responses<P: PoolProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TestDbPools;
     use chrono::{DateTime, NaiveDate, Utc};
     use serde_json::json;
     use sqlx::PgPool;
@@ -4014,6 +4043,81 @@ mod tests {
         assert!(
             plan_uses_index(&plan, "idx_requests_batchless_retention_due"),
             "candidate seed must use the validated retention-due index: {plan}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn estimate_runs_under_its_own_budget_not_the_count_budget(pool: PgPool) {
+        let mut tx = pool.begin().await.expect("estimate transaction must begin");
+        apply_statement_budget(&mut tx, COUNT_BUDGET)
+            .await
+            .expect("count budget must apply");
+        let estimate = estimate_arm_rows(&mut tx, RETAINED_REQUEST_COUNT_SQL, &Default::default())
+            .await
+            .expect("estimate must succeed on an empty database");
+        assert!(estimate >= 0);
+        let budget: String = sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("statement_timeout must be readable");
+        assert_eq!(
+            budget, ESTIMATE_BUDGET,
+            "the fallback EXPLAIN must not inherit the exact-count budget"
+        );
+    }
+
+    /// Reproduces the production failure shape: the exact count cannot finish
+    /// inside `COUNT_BUDGET`, and the fallback EXPLAIN is itself slow (here,
+    /// queued behind an exclusive lock rather than a 300 ms plan). The
+    /// estimate must still come back instead of surfacing a read failure.
+    #[sqlx::test]
+    async fn count_falls_back_to_estimate_when_exact_count_and_planning_exceed_count_budget(
+        pool: PgPool,
+    ) {
+        let manager = PostgresRequestManager::new(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Default::default(),
+        );
+        let hold_lock = tokio::time::Duration::from_millis(600);
+        let blocker = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let mut tx = pool.begin().await.expect("blocking transaction must begin");
+                sqlx::query("LOCK TABLE requests IN ACCESS EXCLUSIVE MODE")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("exclusive lock must be taken");
+                tokio::time::sleep(hold_lock).await;
+                tx.rollback()
+                    .await
+                    .expect("blocking transaction must release");
+            })
+        };
+        // Wait until the lock is held before counting.
+        loop {
+            let locked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'requests'::regclass \
+                 AND mode = 'AccessExclusiveLock' AND granted)",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("pg_locks must be readable");
+            if locked {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+
+        let started = tokio::time::Instant::now();
+        let total = count_requests_with_budget(&manager, &Default::default())
+            .await
+            .expect("count must fall back to the planner estimate rather than fail");
+        blocker.await.expect("blocking task must finish");
+
+        assert!(total >= 0);
+        assert!(
+            started.elapsed() >= tokio::time::Duration::from_millis(100),
+            "the exact count should have spent its budget waiting on the lock"
         );
     }
 
