@@ -874,6 +874,7 @@ mod tests {
     use crate::api::models::provider_display_configs::ProviderDisplayConfigResponse;
     use crate::api::models::users::Role;
     use crate::test::utils::*;
+    use serde_json::json;
     use sqlx::PgPool;
 
     /// Helper: create a deployed model with provider metadata and return its ID
@@ -895,6 +896,38 @@ mod tests {
         .execute(pool)
         .await
         .expect("Failed to create test model with provider");
+        deployment_id
+    }
+
+    /// Helper: create a deployed model with an explicit `model_name`, `alias`,
+    /// endpoint, and provider, so a test can construct multiple deployments that
+    /// share a `model_name` across different endpoints (the HA/failover shape the
+    /// deployments CREATE API supports). `model_name` is unconstrained on
+    /// `deployed_models` (only `alias` is unique), so such rows coexist.
+    async fn create_model_with_provider_on_endpoint(
+        pool: &PgPool,
+        alias: &str,
+        model_name: &str,
+        provider: &str,
+        endpoint_id: uuid::Uuid,
+        created_by: uuid::Uuid,
+    ) -> uuid::Uuid {
+        let deployment_id = uuid::Uuid::new_v4();
+        sqlx::query!(
+            r#"
+            INSERT INTO deployed_models (id, model_name, alias, hosted_on, created_by, deleted, metadata)
+            VALUES ($1, $2, $3, $4, $5, false, $6)
+            "#,
+            deployment_id,
+            model_name,
+            alias,
+            endpoint_id,
+            created_by,
+            serde_json::json!({ "provider": provider }),
+        )
+        .execute(pool)
+        .await
+        .expect("Failed to create test model with provider on endpoint");
         deployment_id
     }
 
@@ -988,5 +1021,373 @@ mod tests {
         let providers: Vec<ProviderDisplayConfigResponse> = response.json();
         let provider_keys: Vec<&str> = providers.iter().map(|p| p.provider_key.as_str()).collect();
         assert!(provider_keys.contains(&"google"), "Should see provider from Everyone group");
+    }
+
+    /// Regression test for the `model_count` overcount: when the same upstream
+    /// `model_name` is deployed to two different inference endpoints under the
+    /// same `metadata.provider` (a standard HA/failover configuration), the
+    /// provider's `model_count` must reflect distinct models, not deployment
+    /// rows. `deployed_models` is keyed by `alias` (unique); `model_name` is
+    /// unconstrained, so two rows can share it. With the buggy `COUNT(*)` the
+    /// provider below would report `model_count == 2`; the fixed
+    /// `COUNT(DISTINCT model_name)` reports `1`.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_model_count_counts_distinct_models_not_deployments(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Two inference endpoints so one logical model can be deployed to both.
+        let endpoint_a = get_test_endpoint_id(&pool).await;
+        let endpoint_b = create_test_endpoint(&pool, "test-secondary", admin.id).await;
+
+        // Provider "OpenAI": one logical model ("gpt-4") deployed to two
+        // endpoints, each under a distinct alias. Both inserts succeed because
+        // only `alias` is unique on `deployed_models`.
+        create_model_with_provider_on_endpoint(&pool, "gpt-4", "gpt-4", "OpenAI", endpoint_a, admin.id).await;
+        create_model_with_provider_on_endpoint(&pool, "gpt-4-azure", "gpt-4", "OpenAI", endpoint_b, admin.id).await;
+
+        // Provider "Anthropic": two distinct model names, so the fixed query
+        // must still report 2 (regression guard against under-counting).
+        create_model_with_provider_on_endpoint(&pool, "claude-3", "claude-3", "Anthropic", endpoint_a, admin.id).await;
+        create_model_with_provider_on_endpoint(&pool, "claude-3-opus", "claude-3-opus", "Anthropic", endpoint_b, admin.id).await;
+
+        let headers = add_auth_headers(&admin);
+        let response = app
+            .get("/admin/api/v1/provider-display-configs")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let providers: Vec<ProviderDisplayConfigResponse> = response.json();
+
+        let openai = providers
+            .iter()
+            .find(|p| p.provider_key == "openai")
+            .expect("openai provider should be present");
+        assert_eq!(
+            openai.model_count, 1,
+            "one logical model deployed to two endpoints must count as 1, not 2"
+        );
+
+        let anthropic = providers
+            .iter()
+            .find(|p| p.provider_key == "anthropic")
+            .expect("anthropic provider should be present");
+        assert_eq!(
+            anthropic.model_count, 2,
+            "two distinct model names under one provider must count as 2"
+        );
+    }
+
+    /// Helper: insert a `provider_display_configs` row (the operator-configured
+    /// display name/icon) for `provider_key`. Mirrors what the create API does.
+    async fn insert_provider_display_config(pool: &PgPool, provider_key: &str, display_name: &str, created_by: uuid::Uuid) {
+        sqlx::query!(
+            r#"
+            INSERT INTO provider_display_configs (provider_key, display_name, icon, created_by)
+            VALUES ($1, $2, $3, $4)
+            "#,
+            provider_key,
+            display_name,
+            Option::<String>::None,
+            created_by
+        )
+        .execute(pool)
+        .await
+        .expect("Failed to create provider display config");
+    }
+
+    /// Helper: insert a `deployed_models` row with arbitrary `metadata` JSON, so a
+    /// test can exercise the query's filter on `metadata->>'provider'` (null,
+    /// empty, whitespace-only) without going through the provider helper.
+    async fn create_model_with_metadata(
+        pool: &PgPool,
+        alias: &str,
+        model_name: &str,
+        endpoint_id: uuid::Uuid,
+        created_by: uuid::Uuid,
+        deleted: bool,
+        metadata: serde_json::Value,
+    ) -> uuid::Uuid {
+        let deployment_id = uuid::Uuid::new_v4();
+        sqlx::query!(
+            r#"
+            INSERT INTO deployed_models (id, model_name, alias, hosted_on, created_by, deleted, metadata)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+            deployment_id,
+            model_name,
+            alias,
+            endpoint_id,
+            created_by,
+            deleted,
+            metadata
+        )
+        .execute(pool)
+        .await
+        .expect("Failed to create test model with metadata");
+        deployment_id
+    }
+
+    /// G8: soft-deleted rows (`deleted = true`) carrying `metadata.provider` are
+    /// excluded from `model_count` and do not add a provider.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_model_count_excludes_soft_deleted_deployments(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let endpoint = get_test_endpoint_id(&pool).await;
+
+        // One live model under OpenAI, plus a soft-deleted deployment of a
+        // different model_name under the same provider. The deleted row must not
+        // inflate the count.
+        create_model_with_metadata(&pool, "gpt-4", "gpt-4", endpoint, admin.id, false, json!({ "provider": "OpenAI" })).await;
+        create_model_with_metadata(&pool, "gpt-4o", "gpt-4o", endpoint, admin.id, true, json!({ "provider": "OpenAI" })).await;
+
+        let headers = add_auth_headers(&admin);
+        let response = app
+            .get("/admin/api/v1/provider-display-configs")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        response.assert_status_ok();
+        let providers: Vec<ProviderDisplayConfigResponse> = response.json();
+        let openai = providers.iter().find(|p| p.provider_key == "openai").expect("openai present");
+        assert_eq!(openai.model_count, 1, "soft-deleted deployment must not count");
+    }
+
+    /// G9: rows with `metadata` lacking a `provider` key are excluded.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_model_count_excludes_rows_with_null_provider(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let endpoint = get_test_endpoint_id(&pool).await;
+
+        // A control provider with one model, plus a row whose metadata has no
+        // "provider" key at all (metadata == '{}').
+        create_model_with_metadata(
+            &pool,
+            "gemini-pro",
+            "gemini-pro",
+            endpoint,
+            admin.id,
+            false,
+            json!({ "provider": "Google" }),
+        )
+        .await;
+        create_model_with_metadata(&pool, "orphan-model", "orphan-model", endpoint, admin.id, false, json!({})).await;
+
+        let headers = add_auth_headers(&admin);
+        let response = app
+            .get("/admin/api/v1/provider-display-configs")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        response.assert_status_ok();
+        let providers: Vec<ProviderDisplayConfigResponse> = response.json();
+        assert!(
+            !providers.iter().any(|p| p.provider_key.is_empty()),
+            "no empty provider_key should appear from null-provider rows"
+        );
+        let google = providers.iter().find(|p| p.provider_key == "google").expect("google present");
+        assert_eq!(google.model_count, 1, "null-provider row must not contribute to any provider");
+    }
+
+    /// G10: rows whose `metadata.provider` is empty or whitespace-only are
+    /// excluded (`BTRIM(...) = ''`).
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_model_count_excludes_rows_with_whitespace_only_provider(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let endpoint = get_test_endpoint_id(&pool).await;
+
+        create_model_with_metadata(
+            &pool,
+            "claude-3",
+            "claude-3",
+            endpoint,
+            admin.id,
+            false,
+            json!({ "provider": "Anthropic" }),
+        )
+        .await;
+        // whitespace-only provider — must be filtered out, not become an empty key
+        create_model_with_metadata(
+            &pool,
+            "ws-model",
+            "ws-model",
+            endpoint,
+            admin.id,
+            false,
+            json!({ "provider": "   " }),
+        )
+        .await;
+        // empty-string provider — same
+        create_model_with_metadata(
+            &pool,
+            "empty-model",
+            "empty-model",
+            endpoint,
+            admin.id,
+            false,
+            json!({ "provider": "" }),
+        )
+        .await;
+
+        let headers = add_auth_headers(&admin);
+        let response = app
+            .get("/admin/api/v1/provider-display-configs")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        response.assert_status_ok();
+        let providers: Vec<ProviderDisplayConfigResponse> = response.json();
+        assert!(
+            !providers.iter().any(|p| p.provider_key.is_empty()),
+            "no empty provider_key should appear from whitespace/empty-provider rows"
+        );
+        let anthropic = providers.iter().find(|p| p.provider_key == "anthropic").expect("anthropic present");
+        assert_eq!(anthropic.model_count, 1, "whitespace/empty-provider rows must not contribute");
+    }
+
+    /// G11: provider grouping is case-insensitive and trims whitespace, so
+    /// `metadata.provider` values `"OpenAI"`, `" openai "`, and `"OPENAI"`
+    /// collapse into a single `openai` provider, and `COUNT(DISTINCT
+    /// model_name)` counts distinct models across the collapsed group.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_model_count_collapses_provider_case_and_whitespace(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let endpoint = get_test_endpoint_id(&pool).await;
+
+        // Three rows under the same logical provider (different casings /
+        // surrounding whitespace), each a distinct model_name.
+        create_model_with_metadata(&pool, "m1", "m1", endpoint, admin.id, false, json!({ "provider": "OpenAI" })).await;
+        create_model_with_metadata(&pool, "m2", "m2", endpoint, admin.id, false, json!({ "provider": " openai " })).await;
+        create_model_with_metadata(&pool, "m3", "m3", endpoint, admin.id, false, json!({ "provider": "OPENAI" })).await;
+
+        let headers = add_auth_headers(&admin);
+        let response = app
+            .get("/admin/api/v1/provider-display-configs")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        response.assert_status_ok();
+        let providers: Vec<ProviderDisplayConfigResponse> = response.json();
+        let openai_entries: Vec<&ProviderDisplayConfigResponse> = providers.iter().filter(|p| p.provider_key == "openai").collect();
+        assert_eq!(
+            openai_entries.len(),
+            1,
+            "all casings/whitespace variants collapse to one openai entry"
+        );
+        assert_eq!(
+            openai_entries[0].model_count, 3,
+            "three distinct model_names across the collapsed provider"
+        );
+    }
+
+    /// G14: a config-only provider (a `provider_display_configs` row but no
+    /// deployments) reports `model_count == 0` and `configured == true`.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_config_only_provider_reports_zero_models(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        insert_provider_display_config(&pool, "mistral", "Mistral", admin.id).await;
+        // No deployed_models row references "Mistral".
+
+        let headers = add_auth_headers(&admin);
+        let response = app
+            .get("/admin/api/v1/provider-display-configs")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        response.assert_status_ok();
+        let providers: Vec<ProviderDisplayConfigResponse> = response.json();
+        let mistral = providers
+            .iter()
+            .find(|p| p.provider_key == "mistral")
+            .expect("mistral config present");
+        assert_eq!(mistral.model_count, 0, "config-only provider has zero models");
+        assert!(mistral.configured, "config-only provider is configured");
+    }
+
+    /// G13/G15: `GET /admin/api/v1/provider-display-configs/{provider_key}`
+    /// returns the merged entry with the correct `model_count` and `configured`
+    /// flag for both a config+known provider and a known-only provider.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_get_provider_display_config_by_key(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let endpoint = get_test_endpoint_id(&pool).await;
+
+        // config + known: "openai" has a config row and two distinct deployed models.
+        insert_provider_display_config(&pool, "openai", "OpenAI", admin.id).await;
+        create_model_with_metadata(&pool, "gpt-4", "gpt-4", endpoint, admin.id, false, json!({ "provider": "OpenAI" })).await;
+        create_model_with_metadata(
+            &pool,
+            "gpt-4o",
+            "gpt-4o",
+            endpoint,
+            admin.id,
+            false,
+            json!({ "provider": "OpenAI" }),
+        )
+        .await;
+        // known-only: "anthropic" has deployments but no config row.
+        create_model_with_metadata(
+            &pool,
+            "claude-3",
+            "claude-3",
+            endpoint,
+            admin.id,
+            false,
+            json!({ "provider": "Anthropic" }),
+        )
+        .await;
+        create_model_with_metadata(
+            &pool,
+            "claude-3-opus",
+            "claude-3-opus",
+            endpoint,
+            admin.id,
+            false,
+            json!({ "provider": "Anthropic" }),
+        )
+        .await;
+
+        let headers = add_auth_headers(&admin);
+
+        // config + known → configured, model_count == 2 distinct models
+        let response = app
+            .get("/admin/api/v1/provider-display-configs/openai")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        response.assert_status_ok();
+        let openai: ProviderDisplayConfigResponse = response.json();
+        assert_eq!(openai.provider_key, "openai");
+        assert_eq!(openai.model_count, 2);
+        assert!(openai.configured);
+
+        // known-only → not configured, icon null, model_count == 2
+        let response = app
+            .get("/admin/api/v1/provider-display-configs/anthropic")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        response.assert_status_ok();
+        let anthropic: ProviderDisplayConfigResponse = response.json();
+        assert_eq!(anthropic.provider_key, "anthropic");
+        assert_eq!(anthropic.model_count, 2);
+        assert!(!anthropic.configured);
+        assert!(anthropic.icon.is_none());
     }
 }
