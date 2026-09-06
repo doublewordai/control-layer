@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import {
   Dialog,
   DialogContent,
@@ -32,6 +32,16 @@ export function AddFundsModal({
   const addFundsMutation = useAddFunds();
   const { data: currentUser } = useUser("current");
   const [error, setError] = useState<string | null>(null);
+
+  // The parent keeps this modal mounted and only toggles `isOpen`, so React
+  // state persists across close→reopen cycles. Clear any stale error whenever
+  // the modal is (re)opened so a fresh form never re-surfaces the previous
+  // attempt's failure banner.
+  useEffect(() => {
+    if (isOpen) {
+      setError(null);
+    }
+  }, [isOpen]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -67,6 +77,7 @@ export function AddFundsModal({
       onClose();
 
       // Reset form
+      setError(null);
       setAmount("10.00");
       setDescription("");
     } catch (error) {
