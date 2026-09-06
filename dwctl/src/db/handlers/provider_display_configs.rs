@@ -136,7 +136,7 @@ impl<'c> ProviderDisplayConfigs<'c> {
             SELECT
                 LOWER(BTRIM(metadata->>'provider')) AS provider_key,
                 MIN(BTRIM(metadata->>'provider')) AS display_name,
-                COUNT(*)::BIGINT AS model_count
+                COUNT(DISTINCT model_name)::BIGINT AS model_count
             FROM deployed_models
             WHERE
                 deleted = false
