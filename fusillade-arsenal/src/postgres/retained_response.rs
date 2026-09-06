@@ -1182,6 +1182,15 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 /// pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
 
+/// Planner-estimate budget for the `EXPLAIN` fallback. The exact-count arms
+/// are capped because they would hold a connection for a full scan; `EXPLAIN`
+/// is planning-only and can never do that, so it must not inherit `COUNT_BUDGET`.
+/// It still gets a generous bound so a pathological plan cannot stall the
+/// request. Empirically the retained arm's plan takes ~100-130ms in production,
+/// so `COUNT_BUDGET` (100ms) made the fallback itself time out and surface as a
+/// 500 on GET /admin/api/v1/batches/requests.
+const PLAN_BUDGET: &str = "2s";
+
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
@@ -1206,32 +1215,42 @@ async fn count_requests_with_budget<P: PoolProvider>(
             Ok(n) => n,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
                 // The failed statement aborted this transaction; estimate on a
-                // fresh one (EXPLAIN is planning only, so it is cheap).
+                // fresh one. EXPLAIN is planning only, so it is cheap and gets
+                // PLAN_BUDGET rather than the count budget.
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
-                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
+                sqlx::query(&format!("SET LOCAL statement_timeout = '{PLAN_BUDGET}'"))
                     .execute(&mut *tx)
                     .await
                     .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
-                ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                let plan: std::result::Result<serde_json::Value, sqlx::Error> =
+                    sqlx::query_scalar(&format!(
+                        "EXPLAIN (FORMAT JSON) {}",
+                        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+                    ))
+                    .bind(filter.created_by.as_deref())
+                    .bind(filter.status.as_deref())
+                    .bind(filter.models.as_deref())
+                    .bind(filter.created_after)
+                    .bind(filter.created_before)
+                    .bind(filter.service_tiers.as_deref())
+                    .fetch_one(&mut *tx)
+                    .await;
+                match plan {
+                    Ok(plan) => plan
+                        .get(0)
+                        .and_then(|p| p.get("Plan"))
+                        .and_then(|p| p.get("Plan Rows"))
+                        .and_then(|r| r.as_f64())
+                        .map(|r| r.round() as i64)
+                        .unwrap_or(0),
+                    // Even planning can exceed PLAN_BUDGET under pathological
+                    // conditions. The count is a best-effort total for the
+                    // pagination envelope, never worth failing the whole
+                    // read-only listing with a 500.
+                    Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => 0,
+                    Err(e) => return Err(read_database_failure(e)),
+                }
             }
             Err(e) => return Err(read_database_failure(e)),
         };
