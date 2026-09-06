@@ -1182,6 +1182,17 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 /// pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
 
+/// Budget for the planner's row-estimate fallback. This is an
+/// `EXPLAIN (FORMAT JSON)` — planning only, never a scan — so the exact-count
+/// scan budget above is the wrong bound for it: planning the partitioned
+/// retained-response query legitimately takes longer than `COUNT_BUDGET`
+/// (measured ~105ms on production curie vs the 100ms count budget), so
+/// reusing `COUNT_BUDGET` here cancels the fallback too and turns a degraded
+/// estimated count into a hard 500 (`Retained response read failed`). Give
+/// planning a generous bound of its own; the worst case is a slow estimate,
+/// never a long-held scan.
+const ESTIMATE_BUDGET: &str = "5s";
+
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
@@ -1209,10 +1220,12 @@ async fn count_requests_with_budget<P: PoolProvider>(
                 // fresh one (EXPLAIN is planning only, so it is cheap).
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
-                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(read_database_failure)?;
+                sqlx::query(&format!(
+                    "SET LOCAL statement_timeout = '{ESTIMATE_BUDGET}'"
+                ))
+                .execute(&mut *tx)
+                .await
+                .map_err(read_database_failure)?;
                 let plan: serde_json::Value = sqlx::query_scalar(&format!(
                     "EXPLAIN (FORMAT JSON) {}",
                     arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
