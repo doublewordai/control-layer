@@ -1182,8 +1182,32 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 /// pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
 
+/// Planning headroom for the estimate fallback. `EXPLAIN` never executes the
+/// statement, so it cannot scan rows — but producing the plan is not free:
+/// the retained arm resolves its bucket→partition join by deparsing the bound
+/// expression of every daily child (`pg_get_expr`), so planning alone can
+/// exceed `COUNT_BUDGET` at production partition counts. The estimate needs
+/// its own, larger budget; inheriting the execution budget turned the
+/// graceful exact-count fallback into a hard 500 on the responses list.
+const ESTIMATE_BUDGET: &str = "2s";
+
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
+    filter: &ListRequestsFilter,
+) -> Result<i64> {
+    // One transaction per arm: a statement timeout aborts its transaction,
+    // and so does a failed EXPLAIN. Never reuse a dead transaction for the
+    // next arm.
+    let mut total = 0_i64;
+    for arm in [LIVE_REQUEST_COUNT_SQL, RETAINED_REQUEST_COUNT_SQL] {
+        total += count_arm_with_budget(manager, arm, filter).await?;
+    }
+    Ok(total)
+}
+
+async fn count_arm_with_budget<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    arm: &str,
     filter: &ListRequestsFilter,
 ) -> Result<i64> {
     let mut tx = manager.begin_read().await.map_err(read_database_failure)?;
@@ -1191,53 +1215,85 @@ async fn count_requests_with_budget<P: PoolProvider>(
         .execute(&mut *tx)
         .await
         .map_err(read_database_failure)?;
-    let mut total = 0_i64;
-    for arm in [LIVE_REQUEST_COUNT_SQL, RETAINED_REQUEST_COUNT_SQL] {
-        let exact: std::result::Result<i64, sqlx::Error> = sqlx::query_scalar(arm)
-            .bind(filter.created_by.as_deref())
-            .bind(filter.status.as_deref())
-            .bind(filter.models.as_deref())
-            .bind(filter.created_after)
-            .bind(filter.created_before)
-            .bind(filter.service_tiers.as_deref())
-            .fetch_one(&mut *tx)
-            .await;
-        total += match exact {
-            Ok(n) => n,
-            Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
-                // The failed statement aborted this transaction; estimate on a
-                // fresh one (EXPLAIN is planning only, so it is cheap).
-                tx.rollback().await.map_err(read_database_failure)?;
-                tx = manager.begin_read().await.map_err(read_database_failure)?;
-                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
-                ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
-            }
-            Err(e) => return Err(read_database_failure(e)),
-        };
+    let exact: std::result::Result<i64, sqlx::Error> = sqlx::query_scalar(arm)
+        .bind(filter.created_by.as_deref())
+        .bind(filter.status.as_deref())
+        .bind(filter.models.as_deref())
+        .bind(filter.created_after)
+        .bind(filter.created_before)
+        .bind(filter.service_tiers.as_deref())
+        .fetch_one(&mut *tx)
+        .await;
+    match exact {
+        Ok(n) => {
+            tx.commit().await.map_err(read_database_failure)?;
+            Ok(n)
+        }
+        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
+            // The timed-out statement aborted this transaction; estimate on a
+            // fresh one. EXPLAIN is planning only, so it gets its own, larger
+            // budget — see ESTIMATE_BUDGET.
+            tx.rollback().await.map_err(read_database_failure)?;
+            estimate_request_count(manager, arm, filter).await
+        }
+        Err(e) => Err(read_database_failure(e)),
     }
-    tx.commit().await.map_err(read_database_failure)?;
-    Ok(total)
+}
+
+async fn estimate_request_count<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    arm: &str,
+    filter: &ListRequestsFilter,
+) -> Result<i64> {
+    let mut tx = manager.begin_read().await.map_err(read_database_failure)?;
+    sqlx::query(&format!(
+        "SET LOCAL statement_timeout = '{ESTIMATE_BUDGET}'"
+    ))
+    .execute(&mut *tx)
+    .await
+    .map_err(read_database_failure)?;
+    let plan: std::result::Result<serde_json::Value, sqlx::Error> = sqlx::query_scalar(&format!(
+        "EXPLAIN (FORMAT JSON) {}",
+        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+    ))
+    .bind(filter.created_by.as_deref())
+    .bind(filter.status.as_deref())
+    .bind(filter.models.as_deref())
+    .bind(filter.created_after)
+    .bind(filter.created_before)
+    .bind(filter.service_tiers.as_deref())
+    .fetch_one(&mut *tx)
+    .await;
+    match plan {
+        Ok(plan) => {
+            tx.commit().await.map_err(read_database_failure)?;
+            Ok(plan_rows_estimate(plan))
+        }
+        Err(e) => {
+            // total_count only drives pagination display; an understated total
+            // is preferable to failing the whole listing because the count
+            // could not be computed within budget.
+            tx.rollback().await.map_err(read_database_failure)?;
+            tracing::warn!(
+                "failed to estimate request count; degrading arm total to 0: {}",
+                e
+            );
+            Ok(0)
+        }
+    }
+}
+
+/// The planner's row estimate from an `EXPLAIN (FORMAT JSON)` result. The root
+/// node's `Plan Rows` on the `SELECT 1` form estimates the number of rows the
+/// scan would produce — i.e. the count. Missing or malformed estimates degrade
+/// to zero.
+fn plan_rows_estimate(plan: serde_json::Value) -> i64 {
+    plan.get(0)
+        .and_then(|p| p.get("Plan"))
+        .and_then(|p| p.get("Plan Rows"))
+        .and_then(|r| r.as_f64())
+        .map(|r| r.round() as i64)
+        .unwrap_or(0)
 }
 
 fn list_requests_page_sql(active_first: bool) -> String {
@@ -4514,5 +4570,36 @@ mod tests {
             assert!(!display.contains("untrusted-kind"));
             assert!(!display.contains(&request_id().to_string()));
         }
+    }
+
+    #[test]
+    fn plan_rows_estimate_reads_the_root_plan_rows_estimate() {
+        // The count arms run EXPLAIN on `SELECT 1 ...` (no aggregate), so the
+        // root node's Plan Rows is the estimated number of matching rows.
+        let plan = json!([
+            {"Plan": {"Node Type": "Seq Scan", "Plan Rows": 42.0}}
+        ]);
+        assert_eq!(plan_rows_estimate(plan), 42);
+    }
+
+    #[test]
+    fn plan_rows_estimate_rounds_fractional_estimates() {
+        let plan = json!([
+            {"Plan": {"Node Type": "Index Scan", "Plan Rows": 37.9}}
+        ]);
+        assert_eq!(plan_rows_estimate(plan), 38);
+    }
+
+    #[test]
+    fn plan_rows_estimate_degrades_on_missing_or_malformed_plans() {
+        // Regression guard for the degraded-total path: an EXPLAIN that comes
+        // back without a usable estimate must yield 0, never an error.
+        assert_eq!(plan_rows_estimate(json!([])), 0);
+        assert_eq!(plan_rows_estimate(json!([{}])), 0);
+        assert_eq!(plan_rows_estimate(json!([{"Plan": {}}])), 0);
+        assert_eq!(
+            plan_rows_estimate(json!([{"Plan": {"Plan Rows": null}}])),
+            0
+        );
     }
 }
