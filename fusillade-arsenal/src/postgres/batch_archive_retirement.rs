@@ -113,6 +113,33 @@ const BATCH_ARCHIVE_FAMILY: FamilySpec = FamilySpec {
          WHERE archive_bucket >= $1 AND archive_bucket < $2 \
            AND retention_expired_at IS NULL",
     ),
+    // Defense-in-depth re-check run inside `finish()`'s DROP transaction
+    // before `DROP TABLE`: re-verify the same `batch_metadata` invariants
+    // `candidate_sql` gated on at fence time. A writer that un-froze a
+    // fenced-week batch (`location<>''archive''` or `counts_frozen_at IS
+    // NULL`), or a re-freeze that reset a batch's own retention clock
+    // (`counts_frozen_at + retention_days > now`), fails this predicate
+    // and the drop is refused — the partition survives and the journal
+    // retries on a later tick. Mirrors the `candidate_sql` NOT EXISTS
+    // predicate over `[lower, upper)` so any batch that re-gresses the
+    // gate closes the drop.
+    pre_drop_check_sql: Some(
+        r#"
+        SELECT NOT EXISTS (
+            SELECT 1
+            FROM batches b
+            WHERE b.archive_bucket >= $1
+              AND b.archive_bucket < $2
+              AND (
+                  b.location <> 'archive'
+                  OR b.counts_frozen_at IS NULL
+                  OR (b.counts_frozen_at + make_interval(days => $3))
+                        > statement_timestamp()
+              )
+        )
+        "#,
+    ),
+    pre_drop_binds_retention: true,
 };
 
 pub(super) async fn retire_expired_batch_archive_partition<P: PoolProvider>(
