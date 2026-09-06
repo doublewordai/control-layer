@@ -1182,17 +1182,29 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 /// pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
 
+/// Budget for the estimate fallback. EXPLAIN is planning-only - it never
+/// executes the query or scans rows - so it gets a far larger budget than the
+/// count itself. Reusing `COUNT_BUDGET` here is what turned a slow count into
+/// a 500: when a count arm exceeds 100ms (the retained arm's catalog-heavy
+/// plan measured ~120ms+ on production, 2026-09-06), the EXPLAIN it spawned
+/// also exceeded the 100ms budget and was cancelled (57014), and the fallback
+/// treated that as fatal. Planning time is bounded by this budget instead.
+const COUNT_ESTIMATE_BUDGET: &str = "2s";
+
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
 ) -> Result<i64> {
     let mut tx = manager.begin_read().await.map_err(read_database_failure)?;
-    sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-        .execute(&mut *tx)
-        .await
-        .map_err(read_database_failure)?;
     let mut total = 0_i64;
     for arm in [LIVE_REQUEST_COUNT_SQL, RETAINED_REQUEST_COUNT_SQL] {
+        // Bound this arm's exact count. Re-asserted every iteration: the
+        // estimate branch below re-bounds the transaction to a larger budget
+        // for its EXPLAIN and must not leak that into the next arm's count.
+        sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
+            .execute(&mut *tx)
+            .await
+            .map_err(read_database_failure)?;
         let exact: std::result::Result<i64, sqlx::Error> = sqlx::query_scalar(arm)
             .bind(filter.created_by.as_deref())
             .bind(filter.status.as_deref())
@@ -1206,38 +1218,62 @@ async fn count_requests_with_budget<P: PoolProvider>(
             Ok(n) => n,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
                 // The failed statement aborted this transaction; estimate on a
-                // fresh one (EXPLAIN is planning only, so it is cheap).
+                // fresh one. The estimate is best-effort by design: a slow
+                // count must degrade to an estimate, never fail the listing.
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
-                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+                sqlx::query(&format!(
+                    "SET LOCAL statement_timeout = '{COUNT_ESTIMATE_BUDGET}'"
                 ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
+                .execute(&mut *tx)
                 .await
                 .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                estimate_arm_rows(&mut tx, arm, filter).await
             }
             Err(e) => return Err(read_database_failure(e)),
         };
     }
     tx.commit().await.map_err(read_database_failure)?;
     Ok(total)
+}
+
+/// Planner row estimate for an arm whose exact count exceeded its budget.
+///
+/// Best-effort: the estimate only feeds `total_count` on the listing envelope,
+/// and the page query that runs afterwards is the source of truth for the
+/// actual rows. Any failure here - including the EXPLAIN itself being
+/// cancelled against its `statement_timeout` - therefore degrades to a default
+/// estimate of 0 with a warning rather than failing the listing.
+async fn estimate_arm_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    arm: &str,
+    filter: &ListRequestsFilter,
+) -> i64 {
+    let plan: std::result::Result<serde_json::Value, sqlx::Error> = sqlx::query_scalar(&format!(
+        "EXPLAIN (FORMAT JSON) {}",
+        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+    ))
+    .bind(filter.created_by.as_deref())
+    .bind(filter.status.as_deref())
+    .bind(filter.models.as_deref())
+    .bind(filter.created_after)
+    .bind(filter.created_before)
+    .bind(filter.service_tiers.as_deref())
+    .fetch_one(&mut **tx)
+    .await;
+    match plan {
+        Ok(plan) => plan
+            .get(0)
+            .and_then(|p| p.get("Plan"))
+            .and_then(|p| p.get("Plan Rows"))
+            .and_then(|r| r.as_f64())
+            .map(|r| r.round() as i64)
+            .unwrap_or(0),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to estimate retained/list count; defaulting to 0");
+            0
+        }
+    }
 }
 
 fn list_requests_page_sql(active_first: bool) -> String {
