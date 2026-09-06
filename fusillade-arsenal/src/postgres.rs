@@ -6101,9 +6101,14 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         }
 
         // archive_batch locks the same batch row for its whole move
-        // transaction, so retry and the archive sweeper serialize. Recheck
-        // the source reference after locking in case an earlier deletion
-        // changed it before the file lock was acquired.
+        // transaction, so retry and the archive sweeper serialize. The
+        // archive partition *retirement* writer does not touch this row —
+        // it fences by UPDATEing `batch_archive_buckets` and drops the
+        // week's child partition — so the archive-move-back below takes a
+        // `FOR SHARE` on the bucket row and refuses when the week is
+        // `'retiring'` (see the guard inside the `routing != "live"` arm).
+        // Recheck the source reference after locking in case an earlier
+        // deletion changed it before the file lock was acquired.
         let routing = sqlx::query_as::<_, (String, Option<chrono::NaiveDate>, Option<Uuid>)>(
             r#"
             SELECT location, archive_bucket, file_id
@@ -6142,6 +6147,39 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     routing.0
                 )));
             };
+            // Coordinate with archive partition retirement. Retirement fences
+            // a week by UPDATEing `batch_archive_buckets.state` to `'retiring'`
+            // and then drops the weekly `batch_requests_archive` partition. If
+            // this retry moves rows out of a fenced week's partition and un-
+            // freezes the batch (`location='split'`, `counts_frozen_at=NULL`),
+            // the later `DROP TABLE` strands the partition's `completed`
+            // archive rows — the expensive LLM results — irreversibly, and
+            // either wedges or overcounts the batch (see `archive_batch`'s
+            // `FOR SHARE` guard for the symmetric INSERT-side check). Take
+            // `FOR SHARE` on the bucket row so the read synchronizes with a
+            // concurrent fence (the fence's `UPDATE` needs `FOR UPDATE` and
+            // waits), then refuse before touching the archive when the week
+            // is no longer `active`. Only `'retiring'` is refused: once the
+            // retirement has committed `'retired'` the partition is gone, the
+            // archive-move prunes to empty, `count` is `0`, and the
+            // `location`-reset `WHERE` is false, so the batch is never un-
+            // frozen and the retry returns an ordinary `Ok(0)` (a true
+            // "nothing to retry" once retention has erased the rows). Returns
+            // a distinct `Err` so the HTTP layer maps a fenced but genuinely
+            // retriable batch to retry-later `503`, not the `400` reserved for
+            // an empty no-op.
+            let bucket_state: Option<String> = sqlx::query_scalar(
+                "SELECT state FROM batch_archive_buckets WHERE week_start = $1 FOR SHARE",
+            )
+            .bind(bucket)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to lock archive bucket for retry: {}", e))
+            })?;
+            if bucket_state.is_some_and(|state| state == "retiring") {
+                return Err(FusilladeError::RetryBlockedByArchiveFence);
+            }
             let moved = sqlx::query!(
                 r#"
                 INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, not_before,

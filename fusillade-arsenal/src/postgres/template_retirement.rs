@@ -114,6 +114,8 @@ const TEMPLATE_FAMILY: FamilySpec = FamilySpec {
         "#,
     candidate_binds_retention: true,
     completion_sql: None,
+    pre_drop_check_sql: None,
+    pre_drop_binds_retention: false,
 };
 
 pub(super) async fn retire_expired_template_partition<P: PoolProvider>(
