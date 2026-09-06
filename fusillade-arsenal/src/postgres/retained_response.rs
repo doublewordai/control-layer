@@ -929,23 +929,14 @@ fn to_payload<T: Serialize>(
     serde_json::to_value(value).map_err(|_| RetainedResponseSerializationError::EncodeFailure)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetainedResponseReadError {
-    DatabaseFailure,
-}
-
-impl fmt::Display for RetainedResponseReadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Retained response read failed")
-    }
-}
-
-impl std::error::Error for RetainedResponseReadError {}
-
-fn read_database_failure<T>(_: T) -> FusilladeError {
-    FusilladeError::Other(anyhow::Error::new(
-        RetainedResponseReadError::DatabaseFailure,
-    ))
+fn read_database_failure<T>(cause: T) -> FusilladeError
+where
+    T: std::error::Error + Send + Sync + 'static,
+{
+    // Preserve the underlying sqlx error so logs carry the SQLSTATE and
+    // message instead of the opaque static string. The client still sees a
+    // generic 500; only server-side observability gains the cause.
+    FusilladeError::Other(anyhow::Error::new(cause).context("Retained response read failed"))
 }
 
 async fn begin_primary_read<P: PoolProvider>(
@@ -1182,6 +1173,13 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 /// pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
 
+/// Planning budget for the count-estimate fallback (`EXPLAIN`). EXPLAIN is
+/// planning-only, but planning the retained arm across the daily partitions
+/// routinely exceeds `COUNT_BUDGET` (the retained-arm EXPLAIN alone measures
+/// ~106ms against production data), so the fallback runs under its own,
+/// larger budget instead of inheriting the count's tight one.
+const EXPLAIN_BUDGET: &str = "5s";
+
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
@@ -1206,32 +1204,59 @@ async fn count_requests_with_budget<P: PoolProvider>(
             Ok(n) => n,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
                 // The failed statement aborted this transaction; estimate on a
-                // fresh one (EXPLAIN is planning only, so it is cheap).
+                // fresh one. EXPLAIN is planning-only, but planning the retained
+                // arm across daily partitions routinely exceeds COUNT_BUDGET (the
+                // retained-arm EXPLAIN alone measures ~106ms against production
+                // data), so the fallback runs under EXPLAIN_BUDGET rather than
+                // inheriting the count's tight budget.
+                tx.rollback().await.map_err(read_database_failure)?;
+                tx = manager.begin_read().await.map_err(read_database_failure)?;
+                sqlx::query(&format!("SET LOCAL statement_timeout = '{EXPLAIN_BUDGET}'"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(read_database_failure)?;
+                let estimate = {
+                    let plan: std::result::Result<serde_json::Value, sqlx::Error> =
+                        sqlx::query_scalar(&format!(
+                            "EXPLAIN (FORMAT JSON) {}",
+                            arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+                        ))
+                        .bind(filter.created_by.as_deref())
+                        .bind(filter.status.as_deref())
+                        .bind(filter.models.as_deref())
+                        .bind(filter.created_after)
+                        .bind(filter.created_before)
+                        .bind(filter.service_tiers.as_deref())
+                        .fetch_one(&mut *tx)
+                        .await;
+                    match plan {
+                        Ok(plan) => plan
+                            .get(0)
+                            .and_then(|p| p.get("Plan"))
+                            .and_then(|p| p.get("Plan Rows"))
+                            .and_then(|r| r.as_f64())
+                            .map(|r| r.round() as i64)
+                            .unwrap_or(0),
+                        Err(e) => {
+                            // The estimate is best-effort; never fail the whole
+                            // listing just because a planner estimate could not be
+                            // produced. The page query still returns rows; only
+                            // total_count is rough.
+                            tracing::warn!(error = %e, "count estimate failed; reporting 0 for this arm");
+                            0
+                        }
+                    }
+                };
+                // Whether the estimate succeeded or was cancelled, the
+                // transaction may be aborted; restart it and restore the
+                // count budget for the next arm.
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
                 sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
                     .execute(&mut *tx)
                     .await
                     .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
-                ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                estimate
             }
             Err(e) => return Err(read_database_failure(e)),
         };
