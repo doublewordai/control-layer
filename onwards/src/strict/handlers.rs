@@ -2982,6 +2982,71 @@ mod tests {
         );
     }
 
+    /// A 2xx `/responses` success body that omits `output` must be backfilled to
+    /// `output: []` by the normalizer and return 200, not be converted to a
+    /// client-visible 502 by strict deserialization failure (the line-93
+    /// `if !object.contains_key("output") { return; }` guard previously made the
+    /// `ensure_field(object, "output", ...)` backfill unreachable).
+    #[tokio::test]
+    async fn test_strict_sanitize_responses_success_body_missing_output_returns_200() {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4o".to_string(),
+            Target::builder()
+                .url("https://api.openai.com/v1/".parse().unwrap())
+                .onwards_key("sk-test".to_string())
+                .build()
+                .into_pool(),
+        );
+
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+
+        // Provider returns a 2xx success body that omits the (required,
+        // defaultable) `output` field entirely. The normalizer must repair it.
+        let mock_response = r#"{
+            "id": "resp_no_output",
+            "object": "response",
+            "created_at": 1677652288,
+            "status": "completed",
+            "model": "provider-model"
+        }"#;
+
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_response);
+        let state = AppState::with_client(targets, mock_client);
+        let router = crate::strict::build_strict_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/responses")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"model":"gpt-4o","input":"Hello"}"#))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "2xx body missing `output` should be backfilled, not 502'd"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["id"], "resp_no_output");
+        assert_eq!(json["object"], "response");
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["model"], "gpt-4o");
+        assert_eq!(json["output"], serde_json::Value::Array(Vec::new()));
+    }
+
     /// Test that responses API errors are sanitized
     #[tokio::test]
     async fn test_strict_sanitize_responses_error() {
