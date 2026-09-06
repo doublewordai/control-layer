@@ -1182,6 +1182,15 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 /// pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
 
+/// Budget for the planner-estimate fallback. EXPLAIN (FORMAT JSON) without
+/// ANALYZE is planning-only — it never executes the query, so unlike the count
+/// it cannot hold a connection for a full scan and a generous budget costs
+/// nothing in normal operation. The retained arm plans over dozens of daily
+/// partitions and routinely exceeds the count's 100ms budget (observed ~125ms
+/// in production), so sharing `COUNT_BUDGET` used to cancel the EXPLAIN with
+/// the same SQLSTATE 57014 and surface as a hard 500 on the Responses listing.
+const EXPLAIN_BUDGET: &str = "5s";
+
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
@@ -1209,29 +1218,46 @@ async fn count_requests_with_budget<P: PoolProvider>(
                 // fresh one (EXPLAIN is planning only, so it is cheap).
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
-                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
+                // The EXPLAIN gets its own generous budget rather than
+                // inheriting COUNT_BUDGET: it is planning-only, so it can never
+                // hold a connection for the full scan, and the retained arm's
+                // plan routinely takes longer than 100ms in production.
+                sqlx::query(&format!("SET LOCAL statement_timeout = '{EXPLAIN_BUDGET}'"))
                     .execute(&mut *tx)
                     .await
                     .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
-                ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                let plan: std::result::Result<serde_json::Value, sqlx::Error> =
+                    sqlx::query_scalar(&format!(
+                        "EXPLAIN (FORMAT JSON) {}",
+                        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+                    ))
+                    .bind(filter.created_by.as_deref())
+                    .bind(filter.status.as_deref())
+                    .bind(filter.models.as_deref())
+                    .bind(filter.created_after)
+                    .bind(filter.created_before)
+                    .bind(filter.service_tiers.as_deref())
+                    .fetch_one(&mut *tx)
+                    .await;
+                match plan {
+                    Ok(plan) => plan
+                        .get(0)
+                        .and_then(|p| p.get("Plan"))
+                        .and_then(|p| p.get("Plan Rows"))
+                        .and_then(|r| r.as_f64())
+                        .map(|r| r.round() as i64)
+                        .unwrap_or(0),
+                    Err(_) => {
+                        // A cancelled/errored EXPLAIN aborted this transaction;
+                        // start a fresh one so the final commit stays clean. A
+                        // missing planner estimate is a graceful degradation of
+                        // the total-count (pagination just reports a lower
+                        // total), never a reason to fail the whole listing.
+                        tx.rollback().await.map_err(read_database_failure)?;
+                        tx = manager.begin_read().await.map_err(read_database_failure)?;
+                        0
+                    }
+                }
             }
             Err(e) => return Err(read_database_failure(e)),
         };
