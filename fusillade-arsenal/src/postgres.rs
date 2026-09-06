@@ -12900,6 +12900,156 @@ mod tests {
         );
     }
 
+    /// Regression: `complete()`'s `None` (`TaskTerminated`) branch must NOT
+    /// eagerly persist the row to `'failed'`. `TaskTerminated` is retriable, so
+    /// the row must stay `'processing'` for the daemon's automatic retry path
+    /// — `reschedule_for_retry`, which is fenced on `state = 'processing' AND
+    /// daemon_id = $2` — to move it atomically back to `'pending`. This drives
+    /// the genuine `process()` → `complete()` → `reschedule_for_retry` path: a
+    /// panicking `response_fut` drops the result channel, so `complete()`'
+    /// `result_rx.recv()` returns `None` and takes the `TaskTerminated` arm.
+    #[sqlx::test]
+    async fn complete_task_terminated_stays_processing_and_reschedules_for_retry(
+        pool: sqlx::PgPool,
+    ) {
+        use fusillade_core::{CancellationReason, FailureReason, RequestCompletionResult};
+
+        let (manager, claimed) = claim_one_processing(&pool, None).await;
+
+        // A panicking response_fut kills the spawned task, dropping the mpsc
+        // sender so complete()'s result_rx.recv() returns None.
+        let processing = claimed
+            .process(&manager, async { panic!("task_terminated_test") })
+            .await
+            .unwrap();
+
+        let request_id = processing.data.id;
+        let daemon_id = processing.state.daemon_id;
+
+        // Let the spawned task run and panic.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let result = processing
+            .complete(
+                &manager,
+                |_| false,
+                std::future::pending::<CancellationReason>(),
+            )
+            .await
+            .unwrap();
+
+        // (a) complete() returns Failed{TaskTerminated} via the None branch.
+        match &result {
+            RequestCompletionResult::Failed(r) => {
+                assert_eq!(r.state.reason, FailureReason::TaskTerminated);
+                assert_eq!(r.state.retry_attempt, 0);
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // (b) The row stays 'processing' — complete's None branch no longer
+        // persists. (Before the fix it was eagerly written to 'failed', which
+        // defeated reschedule_for_retry's state='processing' fence.)
+        assert_eq!(
+            read_request_row(&pool, request_id).await.0,
+            "processing",
+            "TaskTerminated is retriable: complete() must leave the row in 'processing' \
+             so the daemon's reschedule_for_retry fence can re-pend it"
+        );
+
+        // (c) The daemon's Ok(pending) retry path: reschedule_for_retry now
+        // matches the still-'processing' row and returns Ok(true).
+        let failed = match result {
+            RequestCompletionResult::Failed(r) => r,
+            _ => unreachable!(),
+        };
+        let pending = failed
+            .can_retry(
+                0,
+                fusillade_core::request::transitions::RetryConfig {
+                    max_retries: Some(2),
+                    stop_before_deadline_ms: Some(1_000),
+                    backoff_ms: 1,
+                    backoff_factor: 2,
+                    max_backoff_ms: 10,
+                },
+            )
+            .expect("TaskTerminated with retries remaining is retriable");
+        let rescheduled = manager
+            .reschedule_for_retry(
+                request_id,
+                daemon_id,
+                pending.state.retry_attempt,
+                pending.state.not_before,
+            )
+            .await
+            .unwrap();
+        assert!(
+            rescheduled,
+            "reschedule_for_retry must succeed: the row is still 'processing' and owned \
+             by this daemon, so the automatic retry is no longer silently dropped"
+        );
+
+        // (d) The row is now 'pending' with the retry attempt incremented — the
+        // automatic retry succeeded instead of being abandoned in 'failed'.
+        let (state, retry) = read_request_row(&pool, request_id).await;
+        assert_eq!(state, "pending");
+        assert_eq!(retry, 1);
+    }
+
+    /// No-regression: removing the eager persist from complete()'s `None`
+    /// branch must not break the daemon's terminal-failure persist. When
+    /// `can_retry` declines (retries exhausted or past the SLA deadline), the
+    /// daemon takes its `Err(failed)` arm and calls `storage.persist(&*failed)`
+    /// itself. After the fix the row is still `'processing'` at that point, so
+    /// the single terminal write must succeed (the `state NOT IN
+    /// ('completed','failed')` guard matches) — no double-persist, no stranding.
+    #[sqlx::test]
+    async fn complete_task_terminated_then_terminal_persist_succeeds_from_processing(
+        pool: sqlx::PgPool,
+    ) {
+        use fusillade_core::{CancellationReason, FailureReason, RequestCompletionResult};
+
+        let (manager, claimed) = claim_one_processing(&pool, None).await;
+
+        let processing = claimed
+            .process(&manager, async { panic!("task_terminated_test") })
+            .await
+            .unwrap();
+        let request_id = processing.data.id;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let failed = match processing
+            .complete(
+                &manager,
+                |_| false,
+                std::future::pending::<CancellationReason>(),
+            )
+            .await
+            .unwrap()
+        {
+            RequestCompletionResult::Failed(r) => r,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert_eq!(failed.state.reason, FailureReason::TaskTerminated);
+
+        // The fix leaves the row 'processing' after complete().
+        assert_eq!(read_request_row(&pool, request_id).await.0, "processing");
+
+        // Mirror the daemon's Err(failed) arm: persist the terminal Failed
+        // state. Because the row is still 'processing' (not already 'failed'),
+        // the guard matches and the single terminal write succeeds.
+        manager.persist(&failed).await.unwrap();
+
+        let (state, retry) = read_request_row(&pool, request_id).await;
+        assert_eq!(
+            state, "failed",
+            "terminal persist must move the row to 'failed'"
+        );
+        assert_eq!(retry, 0);
+    }
+
     /// A daemon that no longer owns the row (it was reclaimed and re-claimed
     /// elsewhere) must not be able to reschedule it.
     #[sqlx::test]
