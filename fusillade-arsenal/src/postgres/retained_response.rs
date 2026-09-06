@@ -1180,7 +1180,18 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 /// (SQLSTATE 57014) the arm falls back to the planner's row estimate, which
 /// tracks within a few percent when statistics are fresh. Runs on the read
 /// pool in its own transaction so it never pins the primary.
+///
+/// The estimate runs `EXPLAIN` without `ANALYZE`, so it never scans rows and
+/// can afford a much more generous budget than `COUNT_BUDGET`. Under the count
+/// budget the retained arm's plan timed out in production (it resolves every
+/// active daily partition through the catalog machinery and joins the routes),
+/// which turned a recoverable estimate-the-count fallback into a user-facing
+/// 500 ("Retained response read failed") on `GET /admin/api/v1/batches/requests`.
+/// If even the plan cannot be produced in `EXPLAIN_BUDGET`, the arm contributes
+/// 0 rather than failing the listing: the exact total only drives pagination
+/// metadata.
 const COUNT_BUDGET: &str = "100ms";
+const EXPLAIN_BUDGET: &str = "2s";
 
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
@@ -1206,32 +1217,56 @@ async fn count_requests_with_budget<P: PoolProvider>(
             Ok(n) => n,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
                 // The failed statement aborted this transaction; estimate on a
-                // fresh one (EXPLAIN is planning only, so it is cheap).
+                // fresh one. EXPLAIN is planning only (it never scans rows), so
+                // it runs under EXPLAIN_BUDGET rather than COUNT_BUDGET.
+                tx.rollback().await.map_err(read_database_failure)?;
+                tx = manager.begin_read().await.map_err(read_database_failure)?;
+                sqlx::query(&format!("SET LOCAL statement_timeout = '{EXPLAIN_BUDGET}'"))
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(read_database_failure)?;
+                let estimate: std::result::Result<serde_json::Value, sqlx::Error> =
+                    sqlx::query_scalar(&format!(
+                        "EXPLAIN (FORMAT JSON) {}",
+                        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+                    ))
+                    .bind(filter.created_by.as_deref())
+                    .bind(filter.status.as_deref())
+                    .bind(filter.models.as_deref())
+                    .bind(filter.created_after)
+                    .bind(filter.created_before)
+                    .bind(filter.service_tiers.as_deref())
+                    .fetch_one(&mut *tx)
+                    .await;
+                let plan_rows = estimate.ok().and_then(|plan| {
+                    plan.get(0)
+                        .and_then(|p| p.get("Plan"))
+                        .and_then(|p| p.get("Plan Rows"))
+                        .and_then(|r| r.as_f64())
+                        .map(|r| r.round() as i64)
+                });
+                // A timed-out EXPLAIN aborted this transaction; always reset
+                // to a fresh COUNT_BUDGET transaction before the next arm.
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
                 sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
                     .execute(&mut *tx)
                     .await
                     .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
-                ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                match plan_rows {
+                    Some(n) => n,
+                    None => {
+                        tracing::warn!(
+                            arm = if arm == LIVE_REQUEST_COUNT_SQL {
+                                "live"
+                            } else {
+                                "retained"
+                            },
+                            "count estimate unavailable after count-budget timeout; treating arm as 0",
+                        );
+                        0
+                    }
+                }
             }
             Err(e) => return Err(read_database_failure(e)),
         };
