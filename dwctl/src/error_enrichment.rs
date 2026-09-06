@@ -17,13 +17,20 @@
 //! 0. **403 Forbidden - Non-inference key**: A `platform` (management) key was
 //!    used for inference. Onwards excludes these from its key set, so they 403
 //!    with a generic body; we explain the real reason.
-//! 1. **403 Forbidden - Insufficient Credits**: User's balance < 0 for paid models
-//!    - Shows current balance
-//! 2. **403 Forbidden - Model Access Denied**: User is not a member of a group with access to the requested model
+//! 1. **403 Forbidden - Model Access Denied**: User is not a member of a group with access to the requested model
 //!    - Shows which model was requested
-//! 3. **403 Forbidden - Modality Blocked**: A traffic routing rule denies the API key's
+//! 2. **403 Forbidden - Modality Blocked**: A traffic routing rule denies the API key's
 //!    purpose (realtime/batch/playground) for the requested model
 //!    - Shows which modality and model are blocked
+//! 3. **403 Forbidden - Insufficient Credits**: User's balance ≤ 0 for PAID models.
+//!    Only enforced when the resolved model has an active paid `model_tariffs`
+//!    row, mirroring the onwards key-sync balance gate's free-model arm (which
+//!    admits balance≤0 keys for unmetered models); a 403 on a free model could
+//!    not have originated from the balance gate and is passed through.
+//!    - Shows current balance
+//! 4. **403 Forbidden - Spending Cap**: A cap-exhausted scope for PAID models,
+//!    gated on the same paid-tariff check as #3 (the key-sync cap gate carries
+//!    the matching free-model exemption).
 
 use crate::{
     db::errors::DbError,
@@ -113,13 +120,20 @@ pub async fn error_enrichment_middleware(
         //      the model at all, so report it first.
         //   2. Modality (traffic routing rule) — user has the model but their key
         //      kind (batch/realtime/playground) is denied.
-        //   3. Insufficient balance — onwards excludes keys with balance ≤ 0.
+        //   3. Insufficient balance — onwards excludes keys with balance ≤ 0,
+        //      but only for PAID models: its key-sync predicate has a
+        //      `NOT EXISTS paid tariff` arm that admits balance≤0 keys for
+        //      free (unmetered) models. So this arm rewrites to 402 only when
+        //      the resolved model has a paid tariff — a 403 on a free model
+        //      did not originate from the balance gate and must pass through.
         //      Balance deliberately supersedes the spending cap below: if both
         //      are blown, the account-level condition is the fundamental,
         //      actionable one.
         //   4. Spending cap — onwards excludes every key of a cap scope whose
-        //      window spend reached the limit; only reported when balance is
-        //      healthy.
+        //      window spend reached the limit, but again only for PAID models
+        //      (the cap gate carries a matching `EXISTS paid tariff` arm).
+        //      Gated on the same paid-tariff check as #3; only reported when
+        //      balance is healthy.
 
         // 0. Non-inference key: explain why an otherwise-valid key was rejected,
         //    rather than leaving onwards' generic "forbidden" body.
@@ -167,9 +181,16 @@ pub async fn error_enrichment_middleware(
             .into_response();
         }
 
-        // 3. Insufficient balance.
-        if let Ok(balance) = get_balance_of_api_key(pools.write().into_inner(), &key).await
+        // 3. Insufficient balance — but only for PAID models: onwards admits
+        //    balance≤0 keys for free (unmetered) models via its `NOT EXISTS
+        //    paid tariff` arm, so a 403 on a free model did NOT originate from
+        //    the balance gate and must not be rewritten to a 402 here. The
+        //    tariff probe is gated after the balance read so positive-balance
+        //    callers (the common 403 path) short-circuit before it.
+        if let Some(model) = &model_name
+            && let Ok(balance) = get_balance_of_api_key(pools.write().into_inner(), &key).await
             && balance <= Decimal::ZERO
+            && let Ok(true) = model_has_paid_tariff(pools.write().into_inner(), model).await
         {
             return Error::InsufficientCredits {
                 current_balance: balance,
@@ -178,14 +199,21 @@ pub async fn error_enrichment_middleware(
             .into_response();
         }
 
-        // 4. Spending cap. Read-only against the same checkpoint state and
-        //    window function the sync eligibility predicate uses. The
-        //    window-currency check keeps this arm honest during the small
-        //    post-boundary lag: a key whose window has rolled but which the
-        //    periodic fallback sync hasn't readmitted yet is never reported
-        //    as "cap exceeded".
-        if let Ok(Some(cap)) = get_spend_cap_state(pools.write().into_inner(), &key).await
+        // 4. Spending cap — only for PAID models, mirroring arm #3: the
+        //    key-sync cap gate's `EXISTS paid tariff` arm admits
+        //    cap-exhausted keys for free models, so a 403 on a free model
+        //    could not have originated from the cap gate. Read-only against
+        //    the same checkpoint state and window function the sync
+        //    eligibility predicate uses. The tariff probe is gated after the
+        //    cap-state read so uncapped / under-cap callers (the common 403
+        //    path) short-circuit before it. The window-currency check keeps
+        //    this arm honest during the small post-boundary lag: a key whose
+        //    window has rolled but which the periodic fallback sync hasn't
+        //    readmitted yet is never reported as "cap exceeded".
+        if let Some(model) = &model_name
+            && let Ok(Some(cap)) = get_spend_cap_state(pools.write().into_inner(), &key).await
             && cap.window_spend >= cap.limit
+            && let Ok(true) = model_has_paid_tariff(pools.write().into_inner(), model).await
         {
             if cap.window_current {
                 let resets = match cap.resets_at {
@@ -499,6 +527,47 @@ pub async fn check_user_has_model_access(pool: PgPool, user_id: UserId, model_al
     Ok(result)
 }
 
+/// Whether the resolved model has an active paid tariff — the same
+/// `EXISTS model_tariffs ... price > 0, valid_until IS NULL` condition the
+/// onwards key-sync predicate uses to decide whether its balance and
+/// spending-cap gates apply.
+///
+/// For free (unmetered) models — those with no active positive-price
+/// tariff — onwards admits balance≤0 / cap-exhausted keys via the
+/// `NOT EXISTS paid tariff` (balance) and `EXISTS paid tariff` (cap) arms
+/// of its eligibility query, so a 403 reaching this middleware on such a
+/// key did not originate from either gate. The enrichment arms use this
+/// probe to mirror that exemption: a 402 "InsufficientCredits" /
+/// "spend_cap_exceeded" rewrite is only emitted for paid models; on a
+/// free model the upstream 403 is passed through unchanged.
+///
+/// Resolves the model by its (UNIQUE) alias, so the lookup matches at most
+/// one `deployed_models.id` — the same id the key-sync predicate keys its
+/// tariff arm on. Returns `Ok(false)` (rather than erroring) for an unknown
+/// or deleted alias, so the arms fall through to the passthrough response
+/// rather than mis-rewriting.
+#[instrument(skip_all, name = "dwctl.model_has_paid_tariff")]
+async fn model_has_paid_tariff(pool: PgPool, model_alias: &str) -> Result<bool, DbError> {
+    let mut conn = pool.acquire().await?;
+    let has = sqlx::query_scalar!(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM model_tariffs mt
+            JOIN deployed_models dm ON dm.id = mt.deployed_model_id
+            WHERE dm.alias = $1
+              AND dm.deleted = false
+              AND mt.valid_until IS NULL
+              AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+        ) as "has_paid_tariff!"
+        "#,
+        model_alias
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    Ok(has)
+}
+
 /// Validate that the bearer token's user is allowed to call the specified model.
 ///
 /// Checks both group-based access and modality (traffic routing rule) restrictions.
@@ -691,6 +760,20 @@ mod tests {
         let deployment_id =
             crate::test::utils::create_test_model(&pool, "authorized-model-name", "authorized-model", endpoint_id, user.id).await;
 
+        // `create_test_model` inserts no `model_tariffs` row, so the model is
+        // free/unmetered under the key-sync predicate — the enrichment balance
+        // arm only fires for PAID models (it gates on a paid tariff). Make
+        // this a paid model so the depleted-balance 402 below is the expected
+        // paid-model behaviour.
+        sqlx::query!(
+            "INSERT INTO model_tariffs (deployed_model_id, name, input_price_per_token, output_price_per_token) \
+             VALUES ($1, 'realtime', 0.001, 0.002)",
+            deployment_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
         // Grant access to the group
@@ -728,6 +811,18 @@ mod tests {
         let user = create_test_user(&pool, Role::StandardUser).await;
         let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "cap-endpoint", user.id).await;
         let deployment_id = crate::test::utils::create_test_model(&pool, "cap-model-name", "cap-model", endpoint_id, user.id).await;
+        // `create_test_model` inserts no tariff, so `cap-model` is free under
+        // the key-sync predicate; the cap arm only fires for PAID models.
+        // Make it paid so the 402 `spend_cap_exceeded` expectations below
+        // exercise the paid-model path.
+        sqlx::query!(
+            "INSERT INTO model_tariffs (deployed_model_id, name, input_price_per_token, output_price_per_token) \
+             VALUES ($1, 'realtime', 0.001, 0.002)",
+            deployment_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         let group = create_test_group(&pool).await;
         add_user_to_group(&pool, user.id, group.id).await;
         add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
@@ -1420,5 +1515,298 @@ mod tests {
         // Should pass through original 403 without enrichment
         assert_eq!(response.status_code().as_u16(), 403);
         assert_eq!(response.text(), "No Auth");
+    }
+
+    /// Regression test for the free-model balance-asymmetry bug. A single
+    /// artefact chaining BOTH halves under one `PgPool`:
+    ///   1. Admission half — the REAL `load_targets_from_db` key-sync query
+    ///      admits a depleted-balance key for a no-tariff (free) model
+    ///      (onwards' balance gate has a `NOT EXISTS paid tariff` arm that
+    ///      admits balance≤0 keys for unmetered models), proving the 403
+    ///      reaching the middleware on this caller/model could NOT have
+    ///      originated from the balance gate.
+    ///   2. Middleware half — the REAL `error_enrichment_middleware` passes
+    ///      a stubbed upstream 403 through for the same depleted caller +
+    ///      free model, rather than rewriting it to 402 "add credits".
+    /// A positive-balance caller on the same free model already gets 403
+    /// passthrough; this test pins both ends of the asymmetry on one pool.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_error_enrichment_free_model_balance_asymmetry(pool: PgPool) {
+        use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // A "free" model: `create_test_model` inserts only a
+        // `deployed_models` row (no `model_tariffs`), so the onwards key-sync
+        // free-model arm (`NOT EXISTS paid tariff`) admits it regardless of
+        // balance.
+        let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "free-endpoint", user.id).await;
+        let deployment_id = crate::test::utils::create_test_model(&pool, "free-model-name", "free-model", endpoint_id, user.id).await;
+
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
+
+        let mut api_key_conn = pool.acquire().await.unwrap();
+        let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
+        let api_key = api_keys_repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Free-Model Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+        drop(api_key_conn);
+
+        // Positive balance so arm #3 skips on the first call.
+        let mut credits_conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut credits_conn);
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::new(5000, 2),
+                source_id: uuid::Uuid::new_v4().to_string(),
+                description: Some("Initial credits".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        drop(credits_conn);
+
+        let router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|| async {
+                    axum::response::Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(axum::body::Body::from("Forbidden"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                pool.clone(),
+                crate::error_enrichment::error_enrichment_middleware,
+            ));
+        let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+        let bearer = format!("Bearer {}", api_key.secret);
+        let body = serde_json::json!({
+            "model": "free-model",
+            "messages": [{"role": "user", "content": "Hello"}]
+        });
+
+        // Half A: positive balance — upstream 403 passes through.
+        let response_a = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", &bearer)
+            .json(&body)
+            .await;
+        assert_eq!(
+            response_a.status_code().as_u16(),
+            403,
+            "positive-balance caller on a free model passes the upstream 403 through"
+        );
+
+        // Half B: drain the balance below zero — same free model, same stubbed 403.
+        let mut credits_conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut credits_conn);
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::new(10000, 2),
+                source_id: uuid::Uuid::new_v4().to_string(),
+                description: Some("Usage".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        drop(credits_conn);
+
+        // Admission half — the REAL key-sync query, same `pool`. The
+        // depleted key MUST still be admitted for the no-tariff model.
+        let tiers = crate::config::RateLimitTiersConfig::default();
+        let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false, &tiers)
+            .await
+            .expect("load_targets_from_db must succeed");
+        let admitted = targets
+            .targets
+            .get("free-model")
+            .map(|entry| {
+                let expected = onwards::auth::ConstantTimeString::from(api_key.secret.clone());
+                entry
+                    .value()
+                    .default_pool()
+                    .keys()
+                    .is_some_and(|keys| keys.iter().any(|candidate| candidate == &expected))
+            })
+            .unwrap_or(false);
+        assert!(
+            admitted,
+            "admission half: the depleted key MUST be admitted for the no-tariff model \
+             — onwards' key-sync predicate has a `NOT EXISTS paid tariff` arm that admits \
+             balance≤0 keys for free models"
+        );
+
+        // Middleware half — arm #3 must skip (free model, no paid tariff)
+        // and pass the upstream 403 through.
+        let response_b = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", &bearer)
+            .json(&body)
+            .await;
+        assert_eq!(
+            response_b.status_code().as_u16(),
+            403,
+            "zero-balance caller on a FREE (unmetered) model also passes the upstream 403 \
+             through — balance is irrelevant when the model has no paid tariff"
+        );
+        let body_b = response_b.text();
+        assert!(
+            body_b.contains("Forbidden"),
+            "the real upstream 403 body must surface unchanged, not a 402 add-credits body: {body_b}"
+        );
+    }
+
+    /// Regression test for the free-model spend-cap asymmetry bug. Mirrors
+    /// [`test_error_enrichment_free_model_balance_asymmetry`] for the cap
+    /// dimension (arm #4): a cap-exhausted key with POSITIVE balance (so
+    /// arm #3 cannot fire) is admitted by the REAL key-sync query for a
+    /// no-tariff (free) model (the cap gate's `EXISTS paid tariff` arm admits
+    /// cap-exhausted keys for free models), and the REAL middleware passes
+    /// a stubbed upstream 403 through rather than rewriting it to 402
+    /// `spend_cap_exceeded`.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_error_enrichment_free_model_cap_asymmetry(pool: PgPool) {
+        use crate::test::utils::{add_deployment_to_group, add_user_to_group, create_test_group};
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint_id = crate::test::utils::create_test_endpoint(&pool, "cap-free-endpoint", user.id).await;
+        let deployment_id =
+            crate::test::utils::create_test_model(&pool, "cap-free-model-name", "cap-free-model", endpoint_id, user.id).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        add_deployment_to_group(&pool, deployment_id, group.id, user.id).await;
+
+        let mut api_key_conn = pool.acquire().await.unwrap();
+        let mut api_keys_repo = ApiKeys::new(&mut api_key_conn);
+        let api_key = api_keys_repo
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user.id,
+                name: "Capped Free-Model Key".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: None,
+                burst_size: None,
+                created_by: user.id,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+        drop(api_key_conn);
+
+        // Positive balance holds throughout this test so arm #3 cannot fire;
+        // the failure must be attributable solely to the cap arm (#4).
+        let mut credits_conn = pool.acquire().await.unwrap();
+        let mut credits_repo = Credits::new(&mut credits_conn);
+        credits_repo
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::AdminGrant,
+                amount: Decimal::new(5000, 2),
+                source_id: uuid::Uuid::new_v4().to_string(),
+                description: Some("Initial credits".to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        drop(credits_conn);
+
+        // Cap the key at $10 (one-off) with an exhausted window.
+        sqlx::query("UPDATE api_keys SET spend_limit = 10 WHERE id = $1")
+            .bind(api_key.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend) \
+             VALUES ($1, 10.5, 10.5)",
+        )
+        .bind(api_key.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Admission half — the REAL key-sync query, same `pool`. The
+        // cap-exhausted key MUST still be admitted for the no-tariff model.
+        let tiers = crate::config::RateLimitTiersConfig::default();
+        let targets = crate::sync::onwards_config::load_targets_from_db(&pool, &[], false, &tiers)
+            .await
+            .expect("load_targets_from_db must succeed");
+        let admitted = targets
+            .targets
+            .get("cap-free-model")
+            .map(|entry| {
+                let expected = onwards::auth::ConstantTimeString::from(api_key.secret.clone());
+                entry
+                    .value()
+                    .default_pool()
+                    .keys()
+                    .is_some_and(|keys| keys.iter().any(|candidate| candidate == &expected))
+            })
+            .unwrap_or(false);
+        assert!(
+            admitted,
+            "admission half: the cap-exhausted key MUST be admitted for the no-tariff model \
+             — the cap gate's `EXISTS paid tariff` arm admits cap-exhausted keys for free models"
+        );
+
+        let router = axum::Router::new()
+            .route(
+                "/ai/v1/chat/completions",
+                axum::routing::post(|| async {
+                    axum::response::Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(axum::body::Body::from("Forbidden"))
+                        .unwrap()
+                }),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                pool.clone(),
+                crate::error_enrichment::error_enrichment_middleware,
+            ));
+        let server = axum_test::TestServer::new(router).expect("Failed to create test server");
+        let response = server
+            .post("/ai/v1/chat/completions")
+            .add_header("authorization", &format!("Bearer {}", api_key.secret))
+            .json(&serde_json::json!({
+                "model": "cap-free-model",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+        assert_eq!(
+            response.status_code().as_u16(),
+            403,
+            "cap-exhausted caller on a FREE (unmetered) model passes the upstream 403 through — \
+             the spend cap is irrelevant when the model has no paid tariff"
+        );
+        let body = response.text();
+        assert!(
+            body.contains("Forbidden"),
+            "the real upstream 403 body must surface unchanged, not a 402 spend_cap_exceeded body: {body}"
+        );
     }
 }
