@@ -51,9 +51,20 @@ pub struct CorpusRow {
     /// Present on batch traffic. Carried because a batch corpus needs its `batch_aggregates`
     /// analytics columns delta-folded, and that is not inferable from the numbers alone.
     pub fusillade_batch_id: Option<Uuid>,
-    /// When the batch was created, for batch traffic. Carried because the live path prices
-    /// a batch request as of its batch's creation — tariffs included — not as of processing.
-    pub batch_created_at: Option<DateTime<Utc>>,
+    /// When the customer submitted the work, for anything routed through fusillade — batch,
+    /// async, AND flex. Persisted by migration 134 from the same `x-fusillade-batch-created-at`
+    /// header the live path prices with, so this reproduces the live `pricing_timestamp`
+    /// input verbatim: it equals `batches.created_at` for batch traffic, `requests.created_at`
+    /// for flex traffic, and is NULL for realtime (which is priced at dispatch). Falling back
+    /// to `timestamp` therefore matches the live path for all three row classes, and only
+    /// pre-migration-134 flex rows carry NULL here for a reason other than "realtime" —
+    /// see [`Self::cache_pricing_time_is_unresolved`].
+    pub submitted_at: Option<DateTime<Utc>>,
+    /// The fusillade completion window the live path wrote here ("1h", "24h", ...). Empty for
+    /// realtime. Used only to tell flex (no batch id, non-empty SLA) from realtime when
+    /// `submitted_at` is NULL, so pre-migration-134 flex rows can be detected and excluded
+    /// from cache-multiplier repricing rather than re-priced against the wrong version.
+    pub batch_sla: String,
 
     // What is stored today — the "before" side of every delta.
     pub stored_prompt_tokens: i64,
@@ -83,11 +94,38 @@ impl CorpusRow {
         self.stored_cache_read + self.stored_cache_creation_5m + self.stored_cache_creation_1h + self.stored_cache_creation_24h
     }
 
-    /// The instant tariffs are resolved at — batch creation for batch traffic, else the
-    /// request's own time. Must match the live batcher's `pricing_timestamp` exactly, or a
-    /// recompute across a tariff change would "correct" rows the live path priced right.
+    /// The instant tariffs are resolved at — submission time for deferred work (batch or
+    /// flex), else the request's own dispatch time. Must match the live batcher's
+    /// `pricing_timestamp` exactly, or a recompute across a tariff change would "correct"
+    /// rows the live path priced right.
+    ///
+    /// `submitted_at` is the same value the live path unwraps from the
+    /// `x-fusillade-batch-created-at` header (migration 134 persisted it for exactly this
+    /// purpose): `batches.created_at` for batch, `requests.created_at` for flex, NULL for
+    /// realtime. Falling back to `timestamp` therefore reproduces the live
+    /// `raw.batch_created_at.unwrap_or(raw.timestamp)` for all three row classes. The
+    /// previous derivation read `batch_created_at` from a `LEFT JOIN fusillade.batches`,
+    /// which is NULL for flex (no batch) and fell back to dispatch — mis-resolving the
+    /// cache-tariff version whenever a boundary sat in `(submit_time, dispatch_time]`.
     pub fn pricing_timestamp(&self) -> DateTime<Utc> {
-        self.batch_created_at.unwrap_or(self.timestamp)
+        self.submitted_at.unwrap_or(self.timestamp)
+    }
+
+    /// A deferred row whose submission instant — and therefore the cache-tariff version the
+    /// live path billed with — is unrecoverable, so cache-multiplier repricing cannot be done
+    /// honestly and must be skipped (the caller surfaces a warning instead of a confident
+    /// wrong number).
+    ///
+    /// Migration 134 added `http_analytics.submitted_at` with no backfill: flex rows billed
+    /// before that deploy stay NULL forever (fusillade purges dispatched requests, so the
+    /// value cannot be reconstructed). Only flex rows can hit this — batch rows resolve their
+    /// pricing instant from the batch's own `created_at` (which the JOIN held all along), and
+    /// realtime rows are correctly priced at dispatch (NULL `submitted_at` is their normal
+    /// state, not a gap). The detection therefore keys off a batchless row with a non-empty
+    /// `batch_sla` (the definition of flex), which distinguishes flex from realtime when
+    /// `submitted_at` is NULL.
+    pub fn cache_pricing_time_is_unresolved(&self) -> bool {
+        self.fusillade_batch_id.is_none() && !self.batch_sla.is_empty() && self.submitted_at.is_none()
     }
 }
 
@@ -120,17 +158,26 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
             ha.total_cost,
             ha.input_price_per_token,
             ha.output_price_per_token,
+            -- When the customer submitted the work, for anything routed through fusillade
+            -- (batch, async, flex). NULL for realtime and for rows predating migration 134.
+            -- Drives cache-multiplier version resolution at the same instant the live path
+            -- priced at, so a recompute across a tariff change does not "correct" rows the
+            -- live path priced right. See `CorpusRow::pricing_timestamp`.
+            ha.submitted_at                    AS "submitted_at?",
+            -- The fusillade completion window ("" for realtime, "1h"/"24h"/... for deferred).
+            -- Empty for realtime. Used to tell flex (no batch id, non-empty SLA) from realtime
+            -- when `submitted_at` is NULL, so pre-migration-134 flex rows can be detected and
+            -- excluded from cache-multiplier repricing rather than re-priced at dispatch.
+            ha.batch_sla                       AS "batch_sla!",
             -- `?` overrides sqlx's nullability inference: rt.body is NOT NULL in its own
             -- table, but this is a LEFT JOIN, so it is absent for any row with no fusillade
             -- link. Without the override sqlx types it as String and the None case vanishes.
             rt.body                            AS "request_body?",
             r.response_body                    AS "response_body?",
-            r.response_status                  AS "response_status?",
-            b.created_at                       AS "batch_created_at?"
+            r.response_status                  AS "response_status?"
         FROM http_analytics ha
         LEFT JOIN fusillade.requests r          ON r.id  = ha.fusillade_request_id
         LEFT JOIN fusillade.request_templates_all rt ON rt.id = r.template_id
-        LEFT JOIN fusillade.batches b            ON b.id  = ha.fusillade_batch_id
         -- Ordered so the planner drives off a timestamp index. There is NO index on
         -- http_analytics.user_id, and ordering by `id` instead makes Postgres walk the
         -- primary key filtering as it goes — on a 186M-row table that scans most of it
@@ -183,7 +230,8 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
                 timestamp: r.timestamp,
                 fusillade_request_id: r.fusillade_request_id,
                 fusillade_batch_id: r.fusillade_batch_id,
-                batch_created_at: r.batch_created_at,
+                submitted_at: r.submitted_at,
+                batch_sla: r.batch_sla,
                 stored_prompt_tokens: r.prompt_tokens,
                 stored_completion_tokens: r.completion_tokens,
                 stored_reasoning_tokens: r.reasoning_tokens,
@@ -306,6 +354,105 @@ mod tests {
             cache_creation_5m,
             cost,
             request_id,
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        (user_id, analytics_id)
+    }
+
+    /// Seed one already-billed **flex** (batchless deferred) request, the shape the live
+    /// batcher would have left for a fusillade dispatch with no batch id. Distinct from
+    /// [`seed`] because flex carries two timestamps the realtime seed does not: a
+    /// `submitted_at` (the request's own `created_at`, carried by the
+    /// `x-fusillade-batch-created-at` header on batchless dispatches and persisted by
+    /// migration 134) and a non-empty `batch_sla` (the fusillade completion window — "1h"
+    /// for flex, "" for realtime). The analytics row's `timestamp` is the dispatch instant,
+    /// `submitted_at` is the customer's submission, and a flex row has `submitted_at <
+    /// timestamp`; the gap between them is the queue delay fusillade imposed.
+    ///
+    /// Pass `submitted_at = None` to simulate a flex row that predates migration 134: the
+    /// column was never backfilled, so the live path's pricing instant is unrecoverable.
+    /// The recompute must detect this and surface a warning rather than re-price against the
+    /// wrong cache-tariff version. See
+    /// `flex_row_reprices_at_submission_time_not_dispatch` and
+    /// `pre_migration_134_flex_row_warns_instead_of_phantom_correcting` for the two cases.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_flex_row(
+        pool: &PgPool,
+        uri: &str,
+        response_body: &str,
+        prompt: i64,
+        completion: i64,
+        cache_read: i64,
+        cache_creation_5m: i64,
+        cost: Decimal,
+        submitted_at: Option<DateTime<Utc>>,
+        dispatched: DateTime<Utc>,
+        batch_sla: &str,
+    ) -> (Uuid, i64) {
+        let user_id = Uuid::new_v4();
+        sqlx::query!(
+            "INSERT INTO users (id, username, email, is_admin, auth_source) VALUES ($1,$2,$3,false,'test')",
+            user_id,
+            format!("u_{}", user_id.simple()),
+            format!("{}@example.com", user_id.simple()),
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let template_id = Uuid::new_v4();
+        sqlx::query!(
+            "INSERT INTO fusillade.request_templates (id, endpoint, method, path, model, api_key, body)
+             VALUES ($1,'http://x','POST',$2,'m','k',$3)",
+            template_id,
+            uri,
+            r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let request_id = Uuid::new_v4();
+        sqlx::query!(
+            // created_by, not batch_id: `requests_attribution_xor` requires exactly one. No
+            // batch_id is precisely what makes this row flex rather than batch or async.
+            "INSERT INTO fusillade.requests (id, template_id, state, model, response_status, response_body,
+                                             claimed_at, started_at, completed_at, created_by)
+             VALUES ($1,$2,'completed','m',200,$3,NOW(),NOW(),NOW(),$4)",
+            request_id,
+            template_id,
+            response_body,
+            user_id.to_string(),
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let analytics_id = sqlx::query_scalar!(
+            r#"INSERT INTO http_analytics
+               (instance_id, correlation_id, timestamp, method, uri, model, status_code, user_id,
+                prompt_tokens, completion_tokens, total_tokens, cache_read_input_tokens,
+                cache_creation_5m_input_tokens, cache_creation_input_tokens,
+                total_cost, input_price_per_token, output_price_per_token,
+                fusillade_request_id, fusillade_batch_id, batch_sla, submitted_at)
+            VALUES ($1,1,$2,'POST',$3,'m',200,$4,$5,$6,$7,$8,$9,$9,$10,0.000001,0.000002,$11,NULL,$12,$13)
+            RETURNING id"#,
+            Uuid::new_v4(),
+            dispatched,
+            uri,
+            user_id,
+            prompt,
+            completion,
+            prompt + completion,
+            cache_read,
+            cache_creation_5m,
+            cost,
+            request_id,
+            batch_sla,
+            submitted_at,
         )
         .fetch_one(pool)
         .await
@@ -663,6 +810,297 @@ mod tests {
             report.summary.net_correction,
             Decimal::ZERO,
             "an unchecked row must not move the net correction"
+        );
+    }
+
+    /// Build a `CorpusRow` for unit tests of the pricing-timestamp derivation. Only the
+    /// fields that derivation reads are parameterised; everything else is zeroed out and the
+    /// row is left un-replayable (`exchange: None`), since the unit tests do not exercise the
+    /// recompute corpus — only the derivations and the detection helper.
+    fn row_for_pricing(
+        timestamp: DateTime<Utc>,
+        submitted_at: Option<DateTime<Utc>>,
+        fusillade_batch_id: Option<Uuid>,
+        batch_sla: &str,
+    ) -> CorpusRow {
+        CorpusRow {
+            analytics_id: 0,
+            user_id: None,
+            model: None,
+            timestamp,
+            fusillade_request_id: None,
+            fusillade_batch_id,
+            submitted_at,
+            batch_sla: batch_sla.to_string(),
+            stored_prompt_tokens: 0,
+            stored_completion_tokens: 0,
+            stored_reasoning_tokens: 0,
+            stored_total_tokens: 0,
+            stored_cache_read: 0,
+            stored_cache_creation_5m: 0,
+            stored_cache_creation_1h: 0,
+            stored_cache_creation_24h: 0,
+            stored_total_cost: None,
+            input_price_per_token: None,
+            output_price_per_token: None,
+            exchange: None,
+        }
+    }
+
+    /// `pricing_timestamp` must mirror the live path's
+    /// `raw.batch_created_at.unwrap_or(raw.timestamp)` for every row class: the live
+    /// submission instant for batch and flex (the value `x-fusillade-batch-created-at`
+    /// carried and migration 134 persisted), the dispatch instant for realtime. This is a
+    /// no-DB pin of that derivation; the end-to-end flex case — the one the bug was on — is
+    /// covered by `flex_row_reprices_at_submission_time_not_dispatch` below and exercises the
+    /// resolved cache multipliers, not just the timestamp in isolation.
+    #[test]
+    fn pricing_timestamp_uses_submission_for_deferred_and_dispatch_for_realtime() {
+        let submitted = Utc::now() - chrono::Duration::minutes(90);
+        let dispatched = Utc::now() - chrono::Duration::minutes(30);
+
+        // BATCH: submitted_at equals the batch's created_at — the live path's
+        // batch_created_at for batch. The pricing instant is the batch's creation, not the
+        // dispatcher's processing time.
+        let batch = row_for_pricing(dispatched, Some(submitted), Some(Uuid::new_v4()), "24h");
+        assert_eq!(batch.pricing_timestamp(), submitted);
+
+        // FLEX: submitted_at is the request's own created_at — the live path's source on
+        // batchless dispatches, persisted by migration 134. Priced at submission, not
+        // dispatch. This is the row class the bug was on.
+        let flex = row_for_pricing(dispatched, Some(submitted), None, "1h");
+        assert_eq!(flex.pricing_timestamp(), submitted);
+        assert_ne!(
+            flex.pricing_timestamp(),
+            dispatched,
+            "flex must not price at dispatch — that is precisely the bug"
+        );
+
+        // REALTIME: no submitted_at (NULL by design — migration 134). Priced at dispatch,
+        // which is the live path's `unwrap_or(raw.timestamp)` fallback for realtime.
+        let realtime = row_for_pricing(dispatched, None, None, "");
+        assert_eq!(realtime.pricing_timestamp(), dispatched);
+    }
+
+    /// `cache_pricing_time_is_unresolved` is true ONLY for flex rows predating migration 134
+    /// (no batch id, a deferred SLA, no persisted `submitted_at`). It must NOT fire on:
+    /// - a post-134 flex row (`submitted_at` was persisted, so the instant IS recoverable),
+    /// - a batch row (pre- or post-134): the batch's `created_at` carries the pricing
+    ///   instant via the JOIN, regardless of whether migration 134 also persisted it,
+    /// - an async row (1h SLA + batch id): same as batch — batch-driven,
+    /// - a realtime row: NULL `submitted_at` is the NORMAL state for realtime, not a gap;
+    ///   firing here would exclude every realtime row with cache tokens by mistake.
+    #[test]
+    fn cache_pricing_time_is_unresolved_only_for_pre_migration_134_flex() {
+        let submitted = Some(Utc::now() - chrono::Duration::minutes(90));
+        let dispatched = Utc::now() - chrono::Duration::minutes(30);
+        let batch_id = Some(Uuid::new_v4());
+
+        // The one case that fires: pre-134 flex — batchless, deferred, no recorded submission.
+        let pre134_flex = row_for_pricing(dispatched, None, None, "1h");
+        assert!(
+            pre134_flex.cache_pricing_time_is_unresolved(),
+            "pre-134 flex with no submitted_at is the case this is for"
+        );
+
+        // Post-134 flex: same shape but submitted_at was persisted. Resolution is honest.
+        let post134_flex = row_for_pricing(dispatched, submitted, None, "1h");
+        assert!(
+            !post134_flex.cache_pricing_time_is_unresolved(),
+            "post-134 flex has a real submitted_at — must not warn"
+        );
+
+        // Pre-134 BATCH (no submitted_at, batch id, 24h SLA): the batch's created_at carries
+        // the pricing instant, so the row is resolvable. Must NOT fire — the fix prices batch
+        // rows at their batch's creation, regardless of when migration 134 shipped.
+        let pre134_batch = row_for_pricing(dispatched, None, batch_id, "24h");
+        assert!(
+            !pre134_batch.cache_pricing_time_is_unresolved(),
+            "batch rows are always resolvable via the batch's created_at"
+        );
+
+        // Pre-134 ASYNC (1h SLA + batch id): same — batch-driven.
+        let pre134_async = row_for_pricing(dispatched, None, batch_id, "1h");
+        assert!(
+            !pre134_async.cache_pricing_time_is_unresolved(),
+            "async (1h SLA + batch id) is batch-driven, not flex"
+        );
+
+        // REALTIME: NULL submitted_at is its normal state, not a gap. Must NOT fire — or
+        // every realtime row with cache tokens would be excluded from repricing by mistake.
+        let realtime = row_for_pricing(dispatched, None, None, "");
+        assert!(
+            !realtime.cache_pricing_time_is_unresolved(),
+            "realtime rows are priced at dispatch by design, not by gap"
+        );
+
+        // A batch row with an EMPTY batch_sla (unusual but possible if the SLA header was
+        // missing): still has a batch id, so still resolvable via the batch's created_at.
+        let batch_empty_sla = row_for_pricing(dispatched, None, batch_id, "");
+        assert!(
+            !batch_empty_sla.cache_pricing_time_is_unresolved(),
+            "a batch id always implies a known batches.created_at, even with an empty SLA"
+        );
+    }
+
+    /// THE BUG, END TO END. A flex row submitted before a `model_cache_tariffs` version
+    /// boundary and dispatched after it carries a stored cost the live path computed with
+    /// the OLD multipliers (the version valid at submission). The recompute must price at
+    /// the row's submission instant — not its dispatch instant — so it picks the same OLD
+    /// version the live path billed with and the row recomputes to a zero delta.
+    ///
+    /// Before the fix, the recompute read `batch_created_at` from a `LEFT JOIN
+    /// fusillade.batches` (NULL on flex rows) and fell back to `timestamp` (dispatch), so it
+    /// resolved the NEW multipliers and reported a phantom "correction" on a row whose
+    /// cache pricing was already correct. The same seed under the old code yielded
+    /// `rows_changed == 1` with
+    /// `net_correction == 0.02711340 - 0.01814750 == +0.00896590`.
+    #[sqlx::test]
+    async fn flex_row_reprices_at_submission_time_not_dispatch(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+
+        // The model behind alias 'm', with two cache-tariff versions split by a boundary that
+        // sits in the queue-delay window (between submission and dispatch). Neither matches
+        // the config defaults, so resolving wrongly cannot pass by luck — mirroring
+        // `cached_row_reprices_with_the_tariff_valid_at_its_time` for the flex case.
+        let creator = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let endpoint = crate::test::utils::create_test_endpoint(&pool, "ep-flex-boundary", creator.id).await;
+        let model_id = crate::test::utils::create_test_model(&pool, "m", "m", endpoint, creator.id).await;
+        let now = Utc::now();
+        let submitted = now - chrono::Duration::minutes(90);
+        let boundary = now - chrono::Duration::minutes(60);
+        let dispatched = now - chrono::Duration::minutes(30);
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, read_multiplier, min_prefix_tokens, valid_from, valid_until)
+               VALUES ($1, 2.0, 2.0, 2.5, 0.5, 1024, $2, $3),
+                      ($1, 1.0, 1.0, 1.0, 0.8, 1024, $3, NULL)"#,
+            model_id,
+            submitted - chrono::Duration::hours(1), // OLD: valid before submission
+            boundary,                                // OLD valid_until == NEW valid_from, between submit and dispatch
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The live path's arithmetic at the OLD multipliers (read ×0.5, write_5m ×2.0) for
+        // prompt 31840 (read 30723, creation_5m 251, uncached 866), completion 709, at
+        // 1e-6 / 2e-6:
+        //   866·1e-6 + 30723·1e-6·0.5 + 251·1e-6·2.0 + 709·2e-6
+        //   = 0.000866 + 0.0153615 + 0.000502 + 0.001418 = 0.0181475
+        // round8 → 0.01814750.
+        let (user_id, _) = seed_flex_row(
+            &pool,
+            "/chat/completions",
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":31840,"completion_tokens":709,"total_tokens":32549,"cache_read_input_tokens":30723,"cache_creation_input_tokens":251,"cache_creation":{"ephemeral_5m_input_tokens":251,"ephemeral_1h_input_tokens":0,"ephemeral_24h_input_tokens":0},"prompt_tokens_details":{"cached_tokens":30723}}}"#,
+            31840,
+            709,
+            30723,
+            251,
+            Decimal::from_str_exact("0.01814750").unwrap(),
+            Some(submitted),
+            dispatched,
+            "1h",
+        )
+        .await;
+
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(report.summary.rows_total, 1);
+        assert_eq!(
+            report.summary.rows_changed, 0,
+            "a healthy flex row submitted before the boundary and dispatched after it must \
+             re-price at submission (the live path's pricing instant), not at dispatch"
+        );
+        assert_eq!(report.summary.rows_unchanged, 1);
+        assert_eq!(report.summary.net_correction, Decimal::ZERO);
+        assert!(
+            report.warnings.is_empty(),
+            "post-migration-134 flex rows carry a real submitted_at, so the fix resolves their \
+             cache pricing honestly and nothing should warn: {:?}",
+            report.warnings
+        );
+    }
+
+    /// THE SCOPE LIMITATION, END TO END. A flex row that predates migration 134 carries
+    /// `submitted_at = NULL`: the live path's pricing instant was never recorded and cannot
+    /// be recovered (fusillade purges dispatched requests). Resolving at dispatch instead
+    /// would re-introduce the bug — the wrong cache-tariff version whenever a boundary sits
+    /// in `(submit_time, dispatch_time]`. The fix therefore EXCLUDES such rows from
+    /// cache-multiplier repricing (re-prices at list rate, with a discount of zero) and
+    /// surfaces a warning identifying them, so an operator sees "submission time unknown,
+    /// cache pricing not re-verified" instead of a confident wrong number.
+    #[sqlx::test]
+    async fn pre_migration_134_flex_row_warns_instead_of_phantom_correcting(pool: PgPool) {
+        setup_fusillade_pool(&pool).await;
+
+        let creator = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let endpoint = crate::test::utils::create_test_endpoint(&pool, "ep-flex-pre134", creator.id).await;
+        let model_id = crate::test::utils::create_test_model(&pool, "m", "m", endpoint, creator.id).await;
+        let now = Utc::now();
+        let boundary = now - chrono::Duration::minutes(60);
+        let dispatched = now - chrono::Duration::minutes(30);
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, read_multiplier, min_prefix_tokens, valid_from, valid_until)
+               VALUES ($1, 2.0, 2.0, 2.5, 0.5, 1024, now() - interval '3 hours', $2),
+                      ($1, 1.0, 1.0, 1.0, 0.8, 1024, $2, NULL)"#,
+            model_id,
+            boundary,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A pre-134 flex row: submitted_at was never persisted (NULL), batch_sla "1h",
+        // no batch id, cache tokens > 0 so cache-multiplier repricing IS attempted — which
+        // is exactly the situation the warning has to defuse. The stored cost is the live
+        // discount (same arithmetic as the post-134 seed above): 0.01814750.
+        let (user_id, _) = seed_flex_row(
+            &pool,
+            "/chat/completions",
+            r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"x"},"finish_reason":"stop"}],"usage":{"prompt_tokens":31840,"completion_tokens":709,"total_tokens":32549,"cache_read_input_tokens":30723,"cache_creation_input_tokens":251,"cache_creation":{"ephemeral_5m_input_tokens":251,"ephemeral_1h_input_tokens":0,"ephemeral_24h_input_tokens":0},"prompt_tokens_details":{"cached_tokens":30723}}}"#,
+            31840,
+            709,
+            30723,
+            251,
+            Decimal::from_str_exact("0.01814750").unwrap(),
+            None, // pre-migration-134: no submitted_at, never persisted
+            dispatched,
+            "1h",
+        )
+        .await;
+
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(report.summary.rows_total, 1);
+        // The warning must call out the pre-migration-134 flex flag and must NOT be the
+        // generic `rows_tariff_unresolvable` warning, since the model's tariff history is
+        // intact — only the pricing instant is unrecoverable.
+        assert!(
+            report.warnings.iter().any(|w| w.contains("migration 134") && w.contains("flex")),
+            "expected a pre-migration-134 flex warning, got: {:?}",
+            report.warnings
+        );
+        assert!(
+            !report.warnings.iter().any(|w| w.contains("tariff history deleted")),
+            "the model's tariff history is intact, so the generic tariff-unresolvable warning must not fire: {:?}",
+            report.warnings
+        );
+        // The row re-prices at LIST rate (cache_mults stays None) because the instant is
+        // unrecoverable, so the row appears changed — list = 31840·1e-6 + 709·2e-6 = 0.033258,
+        // vs the discounted stored 0.01814750. The warning defuses the correction.
+        assert_eq!(
+            report.summary.rows_changed, 1,
+            "row re-prices at list rate (no discount) because cache multipliers were deliberately not resolved"
+        );
+        assert!(
+            report.summary.net_correction > Decimal::ZERO,
+            "list rate (no discount) exceeds the discounted stored cost, so the row reads as undercharged until the warning defuses it"
         );
     }
 }
