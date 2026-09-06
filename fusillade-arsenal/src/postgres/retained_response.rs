@@ -929,23 +929,17 @@ fn to_payload<T: Serialize>(
     serde_json::to_value(value).map_err(|_| RetainedResponseSerializationError::EncodeFailure)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetainedResponseReadError {
-    DatabaseFailure,
-}
-
-impl fmt::Display for RetainedResponseReadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Retained response read failed")
-    }
-}
-
-impl std::error::Error for RetainedResponseReadError {}
-
-fn read_database_failure<T>(_: T) -> FusilladeError {
-    FusilladeError::Other(anyhow::Error::new(
-        RetainedResponseReadError::DatabaseFailure,
-    ))
+/// Wrap a database failure during a retained-response read, preserving the
+/// underlying error text. Historically this discarded the actual `sqlx::Error`
+/// and emitted only an opaque "Retained response read failed" marker, which made
+/// 5xx responses on the responses view (`GET /admin/api/v1/batches/requests`)
+/// impossible to diagnose from logs. The original marker text is kept as a
+/// prefix so any existing match on the message keeps working, and the real
+/// cause (timeout, cancellation, connection error, etc.) is appended.
+fn read_database_failure<E: std::fmt::Display>(err: E) -> FusilladeError {
+    FusilladeError::Other(anyhow::Error::msg(format!(
+        "Retained response read failed: {err}"
+    )))
 }
 
 async fn begin_primary_read<P: PoolProvider>(
@@ -1182,6 +1176,16 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 /// pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
 
+/// Budget for the planner-estimate fallback (`EXPLAIN`) after a count times
+/// out. Planning is bounded and cheap relative to executing the count, but in
+/// production the retained arm plans across many daily partitions and has
+/// routinely exceeded `COUNT_BUDGET`; running the estimate under the same
+/// 100ms cap turned a slow total-count into a hard 500 on the whole responses
+/// view (`GET /admin/api/v1/batches/requests`). Give the estimate its own,
+/// more generous budget so it normally succeeds, and degrade to `0` for the
+/// arm if planning still times out (see `count_requests_with_budget`).
+const COUNT_ESTIMATE_BUDGET: &str = "1s";
+
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
@@ -1209,29 +1213,49 @@ async fn count_requests_with_budget<P: PoolProvider>(
                 // fresh one (EXPLAIN is planning only, so it is cheap).
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
+                sqlx::query(&format!(
+                    "SET LOCAL statement_timeout = '{COUNT_ESTIMATE_BUDGET}'"
+                ))
+                .execute(&mut *tx)
+                .await
+                .map_err(read_database_failure)?;
+                let plan: std::result::Result<serde_json::Value, sqlx::Error> =
+                    sqlx::query_scalar(&format!(
+                        "EXPLAIN (FORMAT JSON) {}",
+                        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+                    ))
+                    .bind(filter.created_by.as_deref())
+                    .bind(filter.status.as_deref())
+                    .bind(filter.models.as_deref())
+                    .bind(filter.created_after)
+                    .bind(filter.created_before)
+                    .bind(filter.service_tiers.as_deref())
+                    .fetch_one(&mut *tx)
+                    .await;
+                let estimate = match plan {
+                    Ok(plan) => plan
+                        .get(0)
+                        .and_then(|p| p.get("Plan"))
+                        .and_then(|p| p.get("Plan Rows"))
+                        .and_then(|r| r.as_f64())
+                        .map(|r| r.round() as i64)
+                        .unwrap_or(0),
+                    // The total is a best-effort pagination figure; if planning
+                    // itself exceeds the budget, degrade to 0 for this arm
+                    // instead of failing the whole request.
+                    Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => 0,
+                    Err(e) => return Err(read_database_failure(e)),
+                };
+                // A timed-out EXPLAIN aborted this transaction. Always reset to
+                // a fresh one so the next arm and the final commit run on a
+                // usable transaction regardless of which branch we took.
+                tx.rollback().await.map_err(read_database_failure)?;
+                tx = manager.begin_read().await.map_err(read_database_failure)?;
                 sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
                     .execute(&mut *tx)
                     .await
                     .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
-                ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                estimate
             }
             Err(e) => return Err(read_database_failure(e)),
         };
