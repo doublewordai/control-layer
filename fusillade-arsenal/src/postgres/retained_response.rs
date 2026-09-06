@@ -1182,6 +1182,15 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 /// pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
 
+/// Timeout for the `EXPLAIN` fallback estimate. Unlike the `COUNT(*)` scans
+/// it replaces, `EXPLAIN (FORMAT JSON)` is planning-only — it never walks the
+/// scanned rows — so it can safely run well past `COUNT_BUDGET` to produce a
+/// planner estimate instead of failing the listing. The retained-response
+/// count plans a multi-join catalog query that routinely needs ~100ms+ just to
+/// plan, which is why reusing the 100ms scan budget here turned a slow count
+/// into a hard 500 ("Retained response read failed").
+const EXPLAIN_TIMEOUT: &str = "5s";
+
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
@@ -1209,29 +1218,51 @@ async fn count_requests_with_budget<P: PoolProvider>(
                 // fresh one (EXPLAIN is planning only, so it is cheap).
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
-                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+                // The plan itself needs more room than the COUNT scans (see
+                // EXPLAIN_TIMEOUT), so set that here rather than COUNT_BUDGET.
+                sqlx::query(&format!(
+                    "SET LOCAL statement_timeout = '{EXPLAIN_TIMEOUT}'"
                 ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
+                .execute(&mut *tx)
                 .await
                 .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                let plan: std::result::Result<serde_json::Value, sqlx::Error> =
+                    sqlx::query_scalar(&format!(
+                        "EXPLAIN (FORMAT JSON) {}",
+                        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+                    ))
+                    .bind(filter.created_by.as_deref())
+                    .bind(filter.status.as_deref())
+                    .bind(filter.models.as_deref())
+                    .bind(filter.created_after)
+                    .bind(filter.created_before)
+                    .bind(filter.service_tiers.as_deref())
+                    .fetch_one(&mut *tx)
+                    .await;
+                match plan {
+                    Ok(plan) => plan
+                        .get(0)
+                        .and_then(|p| p.get("Plan"))
+                        .and_then(|p| p.get("Plan Rows"))
+                        .and_then(|r| r.as_f64())
+                        .map(|r| r.round() as i64)
+                        .unwrap_or(0),
+                    // A plan estimate is not worth failing the listing over: on
+                    // the rare path where even planning exceeds the generous
+                    // timeout, degrade to 0 (same as an unparseable plan) and
+                    // repair the aborted transaction for the next arm/commit,
+                    // re-applying the scan budget so later arms stay bounded.
+                    Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
+                        tx.rollback().await.map_err(read_database_failure)?;
+                        tx = manager.begin_read().await.map_err(read_database_failure)?;
+                        sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(read_database_failure)?;
+                        0
+                    }
+                    Err(e) => return Err(read_database_failure(e)),
+                }
             }
             Err(e) => return Err(read_database_failure(e)),
         };
