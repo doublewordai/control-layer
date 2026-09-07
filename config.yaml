@@ -182,6 +182,20 @@ auth:
     # auto_create_users: Automatically create users on first login
     auto_create_users: true
 
+  # Extra email domains to treat as personal, on top of the built-in list.
+  #
+  # A personal domain can't be claimed by a workspace and is never used to route
+  # a signup to one. The built-in list covers the major free-mail providers and
+  # consumer ISPs, but it can only ever be a snapshot: a provider it misses gets
+  # claimed by whoever signs up first, and everyone who signs up at that provider
+  # afterwards is routed into that stranger's workspace. Add a domain here to
+  # close that immediately — it also retires any existing claim, since the claim
+  # is only consulted after this check.
+  #
+  # personal_email_domains:
+  #   - "example-isp.net"
+  personal_email_domains: []
+
   # Default roles assigned to newly created non-admin users
   # Applies to both native user registration and proxy header auto-creation
   # StandardUser role is always guaranteed to be present even if not specified

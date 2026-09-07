@@ -191,7 +191,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
 
                     // Auto-org: join or create organization based on email domain
                     if let Some(domain) = crate::auth::utils::email_domain(&user.email)
-                        && !crate::auth::utils::is_personal_email_domain(&domain)
+                        && !config.auth.is_personal_email_domain(&domain)
                     {
                         use crate::db::handlers::Organizations;
 

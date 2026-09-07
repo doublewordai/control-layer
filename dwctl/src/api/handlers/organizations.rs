@@ -263,7 +263,8 @@ pub async fn create_organization<P: PoolProvider>(
             })?
             .email
     };
-    let claimable_domain = crate::auth::utils::email_domain(&owner_email).filter(|d| !crate::auth::utils::is_personal_email_domain(d));
+    let config = state.current_config();
+    let claimable_domain = crate::auth::utils::email_domain(&owner_email).filter(|d| !config.auth.is_personal_email_domain(d));
 
     // `{domain}~{suffix}`: the domain is what a colleague's signup matches on,
     // and the suffix keeps `users.username` unique so one company can hold
@@ -296,7 +297,6 @@ pub async fn create_organization<P: PoolProvider>(
         created_by: owner_id,
     };
 
-    let config = state.current_config();
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Organizations::new(&mut pool_conn);
 
@@ -1834,7 +1834,7 @@ pub async fn get_onboarding_context<P: PoolProvider>(
     // Personal domains are excluded here exactly as they are at signup: a
     // workspace claiming gmail.com would otherwise match every consumer signup
     // and tell each of them their "company" already has a workspace.
-    let domain = crate::auth::utils::email_domain(&target_email).filter(|d| !crate::auth::utils::is_personal_email_domain(d));
+    let domain = crate::auth::utils::email_domain(&target_email).filter(|d| !state.current_config().auth.is_personal_email_domain(d));
     let mut org_repo = Organizations::new(&mut pool_conn);
     let domain_match = match domain {
         Some(domain) => match org_repo.find_by_domain(&domain).await? {
@@ -1943,7 +1943,7 @@ pub async fn create_user_join_request<P: PoolProvider>(
     })?;
 
     let domain = crate::auth::utils::email_domain(&target.email)
-        .filter(|d| !crate::auth::utils::is_personal_email_domain(d))
+        .filter(|d| !state.current_config().auth.is_personal_email_domain(d))
         .ok_or_else(|| Error::BadRequest {
             message: "No workspace matches this account's email domain".to_string(),
         })?;
