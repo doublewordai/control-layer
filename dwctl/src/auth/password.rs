@@ -58,11 +58,6 @@ pub fn hash_string_with_params(input: &str, params: Option<Argon2Params>) -> Res
     Ok(hash.to_string())
 }
 
-/// Hash a string using Argon2 with default secure parameters.
-pub fn hash_string(input: &str) -> Result<String, Error> {
-    hash_string_with_params(input, None)
-}
-
 /// Verify a string against a hash.
 ///
 /// Note: Verification uses the parameters embedded in the hash itself.
@@ -93,7 +88,7 @@ mod tests {
     #[test]
     fn test_string_hashing() {
         let input = "test_password_123";
-        let hash = hash_string(input).unwrap();
+        let hash = hash_string_with_params(input, None).unwrap();
 
         // Hash should not be empty
         assert!(!hash.is_empty());
@@ -110,8 +105,8 @@ mod tests {
         let input1 = "password1";
         let input2 = "password2";
 
-        let hash1 = hash_string(input1).unwrap();
-        let hash2 = hash_string(input2).unwrap();
+        let hash1 = hash_string_with_params(input1, None).unwrap();
+        let hash2 = hash_string_with_params(input2, None).unwrap();
 
         // Different inputs should produce different hashes
         assert_ne!(hash1, hash2);
@@ -121,8 +116,8 @@ mod tests {
     fn test_same_input_different_hashes() {
         let input = "same_password";
 
-        let hash1 = hash_string(input).unwrap();
-        let hash2 = hash_string(input).unwrap();
+        let hash1 = hash_string_with_params(input, None).unwrap();
+        let hash2 = hash_string_with_params(input, None).unwrap();
 
         // Same input should produce different hashes due to salt
         assert_ne!(hash1, hash2);
