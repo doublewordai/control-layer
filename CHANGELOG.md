@@ -1,5 +1,12 @@
 # Changelog
 
+## [11.4.5](https://github.com/doublewordai/control-layer/compare/v11.4.4...v11.4.5) (2026-09-07)
+
+
+### Bug Fixes
+
+* **fusillade:** bound retained response page scans ([#1699](https://github.com/doublewordai/control-layer/issues/1699)) ([f7c64cf](https://github.com/doublewordai/control-layer/commit/f7c64cffe340e18732e6c7dd58d34a65a381eaff))
+
 ## [11.4.4](https://github.com/doublewordai/control-layer/compare/v11.4.3...v11.4.4) (2026-09-07)
 
 
