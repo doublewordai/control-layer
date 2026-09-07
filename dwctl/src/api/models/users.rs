@@ -240,6 +240,8 @@ pub struct CurrentUser {
 pub struct UserOrganizationContext {
     #[schema(value_type = String, format = "uuid")]
     pub id: UserId,
+    /// Display name where the organization has one, `username` otherwise.
+    /// Never the bare `username` — see `PendingJoinRequestResponse`.
     pub name: String,
     pub role: String,
     /// Effective key-creation capability in this org: owners/admins always

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, username FROM users WHERE id = ANY($1)",
+  "query": "SELECT id, username, display_name FROM users WHERE id = ANY($1)",
   "describe": {
     "columns": [
       {
@@ -12,6 +12,11 @@
         "ordinal": 1,
         "name": "username",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "display_name",
+        "type_info": "Varchar"
       }
     ],
     "parameters": {
@@ -21,8 +26,9 @@
     },
     "nullable": [
       false,
-      false
+      false,
+      true
     ]
   },
-  "hash": "af1a58cfbeb3532052f77dc1c24eb9e14a82229f61f1256d1c840ac18053d6d6"
+  "hash": "aaf9855b0c5e4f92a566b49fcc508455fc127b448a3e79c3380378876a32781f"
 }

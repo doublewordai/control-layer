@@ -1667,7 +1667,7 @@ pub async fn list_user_join_requests<P: PoolProvider>(
                 .map(|o| crate::api::models::organizations::PendingJoinRequestResponse {
                     id: r.id,
                     organization_id: o.id,
-                    organization_name: o.username.clone(),
+                    organization_name: o.display_name.clone().unwrap_or_else(|| o.username.clone()),
                     requested_at: r.created_at,
                 })
         })
@@ -1822,7 +1822,7 @@ pub async fn get_onboarding_context<P: PoolProvider>(
                 .map(|org| PendingJoinRequestResponse {
                     id: request.id,
                     organization_id: org.id,
-                    organization_name: org.username,
+                    organization_name: org.display_name.unwrap_or(org.username),
                     requested_at: request.created_at,
                 })
         }
@@ -2009,7 +2009,7 @@ pub async fn create_user_join_request<P: PoolProvider>(
             DomainJoinOutcome::Requested => Some(PendingJoinRequestResponse {
                 id: row.id,
                 organization_id: org.id,
-                organization_name: org.username,
+                organization_name: org.display_name.unwrap_or(org.username),
                 requested_at: row.created_at,
             }),
             _ => None,
@@ -3036,6 +3036,39 @@ mod tests {
         );
         // Only the attacker (owner) is a member.
         assert_eq!(members.as_array().unwrap().len(), 1, "no victim may be silently enrolled");
+    }
+
+    /// The same plant through `find_by_domain`'s *other* arm. `LIKE $1 || '~%'`
+    /// matches a suffixed username, so an attacker who types
+    /// "acme.test~aaaaaaaa" rather than the bare domain reaches the identical
+    /// hijack. Removing only the bare-equality arm - which the query's own
+    /// comment calls a legacy shape, and which is the tempting minimal fix -
+    /// would leave this open, so the guard has to be that user-supplied text
+    /// never reaches the username at all.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_personal_email_owner_cannot_plant_a_suffixed_domain(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let attacker = create_test_user_on_domain(&pool, Role::StandardUser, "gmail.com").await;
+        let headers = add_auth_headers(&attacker);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "acme.test~aaaaaaaa", "email": "billing@acme.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(
+            crate::db::handlers::Organizations::new(&mut conn)
+                .find_by_domain("acme.test")
+                .await
+                .unwrap()
+                .is_none(),
+            "a suffixed plant must not match the LIKE arm either"
+        );
     }
 
     /// The fix preserves the business-email path: an owner on a non-personal
