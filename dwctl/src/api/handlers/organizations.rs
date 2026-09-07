@@ -266,6 +266,45 @@ pub async fn create_organization<P: PoolProvider>(
     let config = state.current_config();
     let claimable_domain = crate::auth::utils::email_domain(&owner_email).filter(|d| !config.auth.is_personal_email_domain(d));
 
+    // The contact address has to be one the owner already reaches. Otherwise a
+    // workspace can be created naming a stranger's address, and the low-balance
+    // and batch notifications it generates arrive at someone who never agreed
+    // to any of it.
+    //
+    // Changing the address afterwards is unaffected and is how anything else
+    // gets set: that path mails a token to the new address and waits for it to
+    // come back, which proves control directly. This check is the equivalent
+    // for creation, where there is no token to send yet - so it has to lean on
+    // what the owner's own address already proves.
+    //
+    // The two arms are the same rule seen from either side of a domain claim:
+    //
+    //   claimable domain - anything at the domain the owner receives mail at.
+    //     `billing@acme.com` for an owner at `acme.com` is their own company's
+    //     address, and the claim itself is what establishes they are there.
+    //
+    //   personal domain - the owner's exact address, nothing else. "Same
+    //     domain" is meaningless for gmail.com: it would admit every other
+    //     gmail address, which is the whole problem rather than a fix for it.
+    let contact_domain = crate::auth::utils::email_domain(&email).ok_or_else(|| Error::BadRequest {
+        message: "Contact email must include a domain".to_string(),
+    })?;
+    match claimable_domain.as_deref() {
+        Some(domain) if contact_domain != domain => {
+            return Err(Error::BadRequest {
+                message: format!(
+                    "Contact email must be at {domain}, the owner's email domain. Create the workspace with an address there, then change it afterwards - that sends a confirmation link to the new address."
+                ),
+            });
+        }
+        None if !email.eq_ignore_ascii_case(owner_email.trim()) => {
+            return Err(Error::BadRequest {
+                message: "Contact email must be the owner's own address, because their email domain is a personal one that no workspace can claim. Change it afterwards to use a different address - that sends a confirmation link to it.".to_string(),
+            });
+        }
+        _ => {}
+    }
+
     // `{domain}~{suffix}`: the domain is what a colleague's signup matches on,
     // and the suffix keeps `users.username` unique so one company can hold
     // several workspaces - prod and dev being the obvious pair. `~` can't occur
@@ -2827,7 +2866,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&user_headers[0].0, &user_headers[0].1)
             .add_header(&user_headers[1].0, &user_headers[1].1)
-            .json(&json!({ "name": "my-org", "email": "contact@my-org.com" }))
+            .json(&json!({ "name": "my-org", "email": "contact@example.com" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let body = resp.json::<serde_json::Value>();
@@ -2838,6 +2877,63 @@ mod tests {
         let username = body["username"].as_str().unwrap();
         assert!(username.starts_with("example.com~"), "got {username}");
         assert_eq!(body["display_name"].as_str().unwrap(), "my-org");
+    }
+
+    /// A workspace cannot be created naming a contact address its owner does
+    /// not reach - otherwise its notifications land on a stranger.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_contact_email_must_be_at_the_owners_domain(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let headers = add_auth_headers(&owner);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Acme", "email": "victim@unrelated.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        // Any address at the domain they demonstrably receive mail at is fine:
+        // that is their own company, and claiming the domain is what shows they
+        // are in it.
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Acme", "email": "billing@acme.test" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+    }
+
+    /// On a personal domain "same domain" would admit every other customer of
+    /// that provider, so the rule tightens to the owner's exact address.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_personal_email_owner_must_use_their_own_address(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "gmail.com").await;
+        let headers = add_auth_headers(&owner);
+
+        // Same domain, someone else's mailbox: the case a domain-only check
+        // would have waved through.
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Acme", "email": "someone-else@gmail.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({ "name": "Acme", "email": owner.email.to_uppercase() }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
     }
 
     /// Domains are case-insensitive; the things we compare them against are
@@ -2927,7 +3023,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&headers[0].0, &headers[0].1)
             .add_header(&headers[1].0, &headers[1].1)
-            .json(&json!({ "name": "acme.test", "email": "billing@acme.test" }))
+            .json(&json!({ "name": "acme.test", "email": owner.email }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let body = resp.json::<serde_json::Value>();
@@ -2974,7 +3070,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&attacker_headers[0].0, &attacker_headers[0].1)
             .add_header(&attacker_headers[1].0, &attacker_headers[1].1)
-            .json(&json!({ "name": "acme.test", "email": "billing@acme.test" }))
+            .json(&json!({ "name": "acme.test", "email": attacker.email }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let body = resp.json::<serde_json::Value>();
@@ -3056,7 +3152,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&headers[0].0, &headers[0].1)
             .add_header(&headers[1].0, &headers[1].1)
-            .json(&json!({ "name": "acme.test~aaaaaaaa", "email": "billing@acme.test" }))
+            .json(&json!({ "name": "acme.test~aaaaaaaa", "email": attacker.email }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
 
@@ -3200,7 +3296,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&user_headers[0].0, &user_headers[0].1)
             .add_header(&user_headers[1].0, &user_headers[1].1)
-            .json(&json!({ "name": "verify-org", "email": "contact@verify-org.com" }))
+            .json(&json!({ "name": "verify-org", "email": "contact@example.com" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id: uuid::Uuid = resp.json::<serde_json::Value>()["id"].as_str().unwrap().parse().unwrap();
@@ -3258,7 +3354,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&user_headers[0].0, &user_headers[0].1)
             .add_header(&user_headers[1].0, &user_headers[1].1)
-            .json(&json!({ "name": "zdr-org", "email": "contact@zdr-org.com" }))
+            .json(&json!({ "name": "zdr-org", "email": "contact@example.com" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -3307,7 +3403,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&owner_headers[0].0, &owner_headers[0].1)
             .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "owner-zdr-org", "email": "contact@owner-zdr-org.com" }))
+            .json(&json!({ "name": "owner-zdr-org", "email": "contact@example.com" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
@@ -3338,7 +3434,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&other_owner_headers[0].0, &other_owner_headers[0].1)
             .add_header(&other_owner_headers[1].0, &other_owner_headers[1].1)
-            .json(&json!({ "name": "other-owner-org", "email": "contact@other-owner-org.com" }))
+            .json(&json!({ "name": "other-owner-org", "email": "contact@example.com" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
 
@@ -3348,7 +3444,10 @@ mod tests {
             .add_header(&pm_headers[1].0, &pm_headers[1].1)
             .json(&json!({
                 "name": "non-owner-zdr-org",
-                "email": "contact@non-owner-zdr-org.com",
+                // A platform manager creating on someone's behalf is held to
+                // the same rule, keyed on that owner's domain rather than the
+                // manager's.
+                "email": "contact@example.com",
                 "owner_id": owner.id,
             }))
             .await;
@@ -5653,7 +5752,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&owner_headers[0].0, &owner_headers[0].1)
             .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "name": "keyrole-org", "email": "contact@keyrole-org.com" }))
+            .json(&json!({ "name": "keyrole-org", "email": "contact@example.com" }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
