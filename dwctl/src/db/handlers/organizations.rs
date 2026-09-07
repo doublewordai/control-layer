@@ -122,6 +122,9 @@ impl<'c> Organizations<'c> {
     /// Several may match; the oldest surviving one wins. That's the workspace a
     /// colleague signing up is most likely to mean, and it stays stable as
     /// later ones come and go.
+    ///
+    /// A workspace with no live owner or admin is not a candidate at all - see
+    /// the `EXISTS` below.
     pub async fn find_by_domain(&mut self, domain: &str) -> Result<Option<UserDBResponse>> {
         let row = sqlx::query!(
             r#"
@@ -137,6 +140,24 @@ impl<'c> Organizations<'c> {
               -- nobody is left to approve them, so the requester would sit on a
               -- queue no one can see.
               AND is_deleted = false
+              -- Same reasoning one level down: a workspace whose owners and
+              -- admins have all been deleted is still `is_deleted = false`, but
+              -- there is equally nobody home to approve anything. Deleting a
+              -- user scrubs their row and their keys and leaves their
+              -- `user_organizations` rows alone (`Users::delete`), so deleting
+              -- an organization's only owner strands it here: still claiming
+              -- the domain, still offered to every colleague who signs up,
+              -- unadministrable. `users` inside the subquery is the outer row -
+              -- the inner one is aliased.
+              AND EXISTS (
+                  SELECT 1
+                  FROM user_organizations uo
+                  JOIN users admin ON admin.id = uo.user_id
+                  WHERE uo.organization_id = users.id
+                    AND uo.role IN ('owner', 'admin')
+                    AND uo.status = 'active'
+                    AND admin.is_deleted = false
+              )
             ORDER BY created_at ASC
             LIMIT 1
             "#,
@@ -425,6 +446,21 @@ impl<'c> Organizations<'c> {
         .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// The organizations this user actively owns.
+    ///
+    /// Read before deleting the account, because `Users::delete` clears the
+    /// membership rows that identify them: afterwards there is nothing left to
+    /// join on.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn list_owned_organization_ids(&mut self, user_id: UserId) -> Result<Vec<UserId>> {
+        Ok(sqlx::query_scalar!(
+            r#"SELECT organization_id FROM user_organizations WHERE user_id = $1 AND role = 'owner' AND status = 'active'"#,
+            user_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?)
     }
 
     /// Add a member to an organization (active status)
@@ -2049,5 +2085,228 @@ mod tests {
         let org = result.unwrap();
         assert_eq!(org.username, "acme.com");
         assert_eq!(org.user_type, "organization");
+    }
+
+    /// Deleting an owner hands the workspace to the longest-standing admin.
+    #[sqlx::test]
+    async fn test_deleting_owner_promotes_earliest_admin(pool: PgPool) {
+        let owner = create_individual(&pool, "owner", "owner@acme.com").await;
+        let member = create_individual(&pool, "member", "member@acme.com").await;
+        let admin_early = create_individual(&pool, "admin1", "admin1@acme.com").await;
+        let admin_late = create_individual(&pool, "admin2", "admin2@acme.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        let org = orgs
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme.com".to_string(),
+                    email: "contact@acme.com".to_string(),
+                    display_name: Some("Acme Corp".to_string()),
+                    avatar_url: None,
+                    created_by: owner,
+                },
+                TEST_DEFAULT_ROLES,
+            )
+            .await
+            .unwrap();
+        // Joined before either admin, so seniority alone would pick them - the
+        // role ranking has to win.
+        orgs.add_member(org.id, member, "member").await.unwrap();
+        orgs.add_member(org.id, admin_early, "admin").await.unwrap();
+        orgs.add_member(org.id, admin_late, "admin").await.unwrap();
+        drop(conn);
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(Users::new(&mut conn).delete(owner).await.unwrap());
+
+        let mut orgs = Organizations::new(&mut conn);
+        assert_eq!(
+            orgs.get_user_org_role(admin_early, org.id).await.unwrap(),
+            Some("owner".to_string()),
+            "the earliest admin takes over"
+        );
+        assert_eq!(orgs.get_user_org_role(admin_late, org.id).await.unwrap(), Some("admin".to_string()));
+        assert_eq!(orgs.get_user_org_role(member, org.id).await.unwrap(), Some("member".to_string()));
+        assert_eq!(
+            orgs.get_user_org_role(owner, org.id).await.unwrap(),
+            None,
+            "the departed owner keeps no membership"
+        );
+        assert!(
+            orgs.find_by_domain("acme.com").await.unwrap().is_some(),
+            "and the workspace stays routable"
+        );
+    }
+
+    /// With no admins left, the longest-standing ordinary member takes over
+    /// rather than the workspace being closed on people who are still using it.
+    #[sqlx::test]
+    async fn test_deleting_owner_promotes_earliest_member_when_no_admins(pool: PgPool) {
+        let owner = create_individual(&pool, "owner", "owner@acme.com").await;
+        let first = create_individual(&pool, "first", "first@acme.com").await;
+        let second = create_individual(&pool, "second", "second@acme.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        let org = orgs
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme.com".to_string(),
+                    email: "contact@acme.com".to_string(),
+                    display_name: Some("Acme Corp".to_string()),
+                    avatar_url: None,
+                    created_by: owner,
+                },
+                TEST_DEFAULT_ROLES,
+            )
+            .await
+            .unwrap();
+        orgs.add_member(org.id, first, "member").await.unwrap();
+        orgs.add_member(org.id, second, "member").await.unwrap();
+        drop(conn);
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(Users::new(&mut conn).delete(owner).await.unwrap());
+
+        let mut orgs = Organizations::new(&mut conn);
+        assert_eq!(orgs.get_user_org_role(first, org.id).await.unwrap(), Some("owner".to_string()));
+        assert_eq!(orgs.get_user_org_role(second, org.id).await.unwrap(), Some("member".to_string()));
+    }
+
+    /// A co-owner keeps the workspace; nobody is promoted and nothing closes.
+    #[sqlx::test]
+    async fn test_deleting_one_of_two_owners_leaves_the_other(pool: PgPool) {
+        let leaving = create_individual(&pool, "leaving", "leaving@acme.com").await;
+        let staying = create_individual(&pool, "staying", "staying@acme.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        let org = orgs
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme.com".to_string(),
+                    email: "contact@acme.com".to_string(),
+                    display_name: Some("Acme Corp".to_string()),
+                    avatar_url: None,
+                    created_by: leaving,
+                },
+                TEST_DEFAULT_ROLES,
+            )
+            .await
+            .unwrap();
+        orgs.add_member(org.id, staying, "owner").await.unwrap();
+        drop(conn);
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(Users::new(&mut conn).delete(leaving).await.unwrap());
+
+        let mut orgs = Organizations::new(&mut conn);
+        assert_eq!(orgs.get_user_org_role(staying, org.id).await.unwrap(), Some("owner".to_string()));
+        assert!(orgs.find_by_domain("acme.com").await.unwrap().is_some());
+    }
+
+    /// Nobody left to hand it to: the workspace is closed the same way the
+    /// account is - scrubbed, flagged deleted, and stripped of the keys that
+    /// authenticate as it.
+    #[sqlx::test]
+    async fn test_deleting_sole_owner_closes_the_workspace(pool: PgPool) {
+        let owner = create_individual(&pool, "owner", "owner@acme.com").await;
+        let departed = create_individual(&pool, "departed", "departed@acme.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        let org = orgs
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme.com".to_string(),
+                    email: "contact@acme.com".to_string(),
+                    display_name: Some("Acme Corp".to_string()),
+                    avatar_url: None,
+                    created_by: owner,
+                },
+                TEST_DEFAULT_ROLES,
+            )
+            .await
+            .unwrap();
+        // The only other member is already deleted, so there is no live
+        // successor even though a membership row exists.
+        orgs.add_member(org.id, departed, "admin").await.unwrap();
+        drop(conn);
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(Users::new(&mut conn).delete(departed).await.unwrap());
+        sqlx::query!(
+            "INSERT INTO api_keys (user_id, created_by, name, secret, purpose) VALUES ($1, $1, 'org key', 'sk-test-org-key', 'inference')",
+            org.id
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        assert!(Users::new(&mut conn).delete(owner).await.unwrap());
+
+        let closed = sqlx::query!("SELECT username, email, display_name, is_deleted FROM users WHERE id = $1", org.id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert!(closed.is_deleted, "the workspace is closed with its last owner");
+        assert_eq!(
+            closed.username,
+            format!("deleted-{}", org.id),
+            "and scrubbed the same way a user is"
+        );
+        assert_eq!(closed.email, format!("deleted-{}@deleted.local", org.id));
+        assert!(closed.display_name.is_none());
+
+        let keys = sqlx::query_scalar!(r#"SELECT count(*) as "count!" FROM api_keys WHERE user_id = $1"#, org.id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert_eq!(keys, 0, "nothing may keep authenticating as a closed workspace");
+
+        let mut orgs = Organizations::new(&mut conn);
+        assert!(orgs.find_by_domain("acme.com").await.unwrap().is_none());
+    }
+
+    /// Deleting a user scrubs their row and leaves their `user_organizations`
+    /// rows behind, so deleting an organization's only owner leaves the
+    /// workspace live and still claiming its domain with nobody able to
+    /// administer it. Colleagues signing up were offered that workspace and
+    /// could file join requests into it that no one could ever approve - the
+    /// same dead-end the `is_deleted = false` filter exists to prevent, one
+    /// level down. Prod held eight of these.
+    #[sqlx::test]
+    async fn test_find_by_domain_skips_orgs_with_no_live_admin(pool: PgPool) {
+        let owner = create_individual(&pool, "owner", "owner@acme.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        orgs.create(
+            &OrganizationCreateDBRequest {
+                name: "acme.com".to_string(),
+                email: "contact@acme.com".to_string(),
+                display_name: Some("Acme Corp".to_string()),
+                avatar_url: None,
+                created_by: owner,
+            },
+            TEST_DEFAULT_ROLES,
+        )
+        .await
+        .unwrap();
+        assert!(
+            orgs.find_by_domain("acme.com").await.unwrap().is_some(),
+            "routable while the owner is live"
+        );
+        drop(conn);
+
+        // Delete the owner exactly as the users repository does.
+        let mut conn = pool.acquire().await.unwrap();
+        assert!(Users::new(&mut conn).delete(owner).await.unwrap());
+
+        let mut orgs = Organizations::new(&mut conn);
+        assert!(
+            orgs.find_by_domain("acme.com").await.unwrap().is_none(),
+            "an ownerless workspace must not collect join requests nobody can approve"
+        );
     }
 }

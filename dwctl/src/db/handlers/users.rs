@@ -498,6 +498,88 @@ impl<'c> Repository for Users<'c> {
             sqlx::query!(r#"DELETE FROM api_keys WHERE user_id = $1"#, id)
                 .execute(&mut *tx)
                 .await?;
+
+            // Hand on every workspace this user owned, or close it.
+            //
+            // Deleting a user used to scrub the row and walk away from their
+            // `user_organizations` rows, which left the workspace live, still
+            // claiming its email domain, and with nobody able to administer it:
+            // colleagues signing up were pointed at a workspace whose join
+            // requests no one could approve. `remove_member` has a last-owner
+            // guard for exactly this reason; account deletion walked straight
+            // past it.
+            //
+            // Succession order is the longest-standing live member who is
+            // closest to already holding the role: another owner (a no-op
+            // re-assert), then the earliest admin, then the earliest ordinary
+            // member. Only active memberships of live users count - a pending
+            // invitation is not somebody who can take over a workspace.
+            for org_id in sqlx::query_scalar!(
+                r#"SELECT organization_id FROM user_organizations WHERE user_id = $1 AND role = 'owner' AND status = 'active'"#,
+                id
+            )
+            .fetch_all(&mut *tx)
+            .await?
+            {
+                let successor = sqlx::query_scalar!(
+                    r#"
+                    SELECT uo.user_id
+                    FROM user_organizations uo
+                    JOIN users u ON u.id = uo.user_id
+                    WHERE uo.organization_id = $1
+                      AND uo.user_id <> $2
+                      AND uo.status = 'active'
+                      AND u.is_deleted = false
+                    ORDER BY CASE uo.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, uo.created_at ASC, uo.user_id ASC
+                    LIMIT 1
+                    "#,
+                    org_id,
+                    id
+                )
+                .fetch_optional(&mut *tx)
+                .await?;
+
+                match successor {
+                    Some(successor_id) => {
+                        sqlx::query!(
+                            r#"UPDATE user_organizations SET role = 'owner' WHERE organization_id = $1 AND user_id = $2"#,
+                            org_id,
+                            successor_id
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    None => {
+                        // Nobody left to hand it to, so the workspace goes the
+                        // same way the account does: scrubbed, flagged deleted,
+                        // and its keys hard-deleted so nothing keeps
+                        // authenticating as it.
+                        sqlx::query!(
+                            r#"
+                            UPDATE users
+                            SET email = $1, username = $2, display_name = NULL, avatar_url = NULL,
+                                is_deleted = true, updated_at = NOW()
+                            WHERE id = $3 AND user_type = 'organization' AND is_deleted = false
+                            "#,
+                            format!("deleted-{org_id}@deleted.local"),
+                            format!("deleted-{org_id}"),
+                            org_id
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+                        sqlx::query!(r#"DELETE FROM api_keys WHERE user_id = $1"#, org_id)
+                            .execute(&mut *tx)
+                            .await?;
+                    }
+                }
+            }
+
+            // The departing user is not a member of anything any more. Left
+            // behind, these rows are what made the workspaces above look owned
+            // by somebody who no longer exists.
+            sqlx::query!(r#"DELETE FROM user_organizations WHERE user_id = $1"#, id)
+                .execute(&mut *tx)
+                .await?;
         }
 
         tx.commit().await?;
