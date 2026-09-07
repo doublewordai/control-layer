@@ -1206,6 +1206,7 @@ async fn the_route_config_reaches_the_render_call_and_the_leg_body(pool: PgPool)
         crate::continuation::RouteInfo {
             render_kwargs: Some(json!({"thinking_mode": "chat"})),
             strip_leading_bos: true,
+            effort_thinking: None,
         },
     )]));
 
@@ -1233,6 +1234,117 @@ async fn the_route_config_reaches_the_render_call_and_the_leg_body(pool: PgPool)
     let leg = fake.resume_requests();
     assert_eq!(leg.len(), 1);
     assert_eq!(leg[0].body["prompt"], json!([7, 1, 2, 3]));
+}
+
+/// On a translated route, `reasoning_effort` — not the row's `render_kwargs` —
+/// decides the mode a family-reconstructor stream renders AND seeds in:
+/// onwards writes the mode into the body below this layer, so the resume
+/// prefix must be rendered the way leg 1's prompt was actually templated. The
+/// row's chat kwargs (the plain path's content-only render, still correct for
+/// v1 streams) must not leak into a dsv4 stream's render.
+#[sqlx::test]
+async fn a_translated_route_renders_the_efforts_mode_not_the_row_kwargs(pool: PgPool) {
+    for (effort, want_mode, want_text) in [
+        // Thinking effort: thinking render, and the seed splices the think
+        // close the prefix owes ("a thinking turn that does no thinking").
+        ("high", "thinking", "</think>Hello"),
+        // Explicitly disabled reasoning: chat render, no splice.
+        ("none", "chat", "Hello"),
+    ] {
+        let fake = Fake::new(
+            vec![content("chatcmpl-1", "Hello"), Chunk::Reset],
+            vec![vec![leg_text(", world!", Some("stop")), leg_usage(1002, 2), done()]],
+        );
+        let rendered = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = Arc::clone(&rendered);
+        let tokenizer = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/render"))
+            .respond_with(move |req: &wiremock::Request| {
+                sink.lock().unwrap().push(serde_json::from_slice(&req.body).unwrap());
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "token_ids": [4, 5], "total": 1002, "continuation_tokens": 2
+                }))
+            })
+            .mount(&tokenizer)
+            .await;
+
+        let mut st = state(pool.clone(), &fake, tokenizer.uri(), dsv4_config());
+        st.routes = Arc::new(ContinuationRoutes::with_routes([(
+            MODEL.to_string(),
+            crate::continuation::RouteInfo {
+                render_kwargs: Some(json!({"thinking_mode": "chat"})),
+                strip_leading_bos: false,
+                effort_thinking: Some([("none".to_string(), false), ("high".to_string(), true)].into_iter().collect()),
+            },
+        )]));
+
+        let mut body = streaming_body();
+        body["reasoning_effort"] = json!(effort);
+        collect_payloads(app(&fake, st).oneshot(chat_request(body)).await.unwrap()).await;
+
+        let render_requests = rendered.lock().unwrap().clone();
+        assert_eq!(
+            render_requests[0]["chat_template_kwargs"]["thinking_mode"],
+            json!(want_mode),
+            "effort {effort} renders in the translated mode"
+        );
+        assert_eq!(
+            render_requests[0]["continuation_text"],
+            json!(want_text),
+            "effort {effort} seeds the reconstructor in the same mode it renders"
+        );
+    }
+}
+
+/// Canonical reasoning on a route with NO modelled translation: the mode leg 1
+/// ran with is unknowable, so a mapped model falls back to the plain (v1)
+/// accumulator — content-only text, no splice, the row kwargs untouched.
+#[sqlx::test]
+async fn an_unmodelled_effort_falls_back_to_the_plain_accumulator(pool: PgPool) {
+    let fake = Fake::new(
+        vec![content("chatcmpl-1", "Hello"), Chunk::Reset],
+        vec![vec![leg_text(", world!", Some("stop")), leg_usage(1002, 2), done()]],
+    );
+    let rendered = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let sink = Arc::clone(&rendered);
+    let tokenizer = MockServer::start().await;
+    Mock::given(wm_method("POST"))
+        .and(wm_path("/v1/render"))
+        .respond_with(move |req: &wiremock::Request| {
+            sink.lock().unwrap().push(serde_json::from_slice(&req.body).unwrap());
+            ResponseTemplate::new(200).set_body_json(json!({
+                "token_ids": [4, 5], "total": 1002, "continuation_tokens": 2
+            }))
+        })
+        .mount(&tokenizer)
+        .await;
+
+    let mut st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+    st.routes = Arc::new(ContinuationRoutes::with_routes([(
+        MODEL.to_string(),
+        crate::continuation::RouteInfo {
+            render_kwargs: Some(json!({"thinking_mode": "chat"})),
+            strip_leading_bos: false,
+            effort_thinking: None,
+        },
+    )]));
+
+    let mut body = streaming_body();
+    body["reasoning_effort"] = json!("high");
+    let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(body)).await.unwrap()).await;
+    assert_eq!(contents(&parsed(&payloads)), "Hello, world!", "the plain rescue still lands");
+
+    let render_requests = rendered.lock().unwrap().clone();
+    assert_eq!(
+        render_requests[0]["continuation_text"], "Hello",
+        "no family seed: nothing is spliced on a mode we cannot know"
+    );
+    assert_eq!(
+        render_requests[0]["chat_template_kwargs"],
+        json!({"thinking_mode": "chat"}),
+        "the plain path renders exactly as v1 configured it"
+    );
 }
 
 /// The client's own `chat_template_kwargs` describe how leg 1 was actually
@@ -1264,6 +1376,7 @@ async fn request_template_kwargs_override_the_route_defaults_on_a_live_resume(po
         crate::continuation::RouteInfo {
             render_kwargs: Some(json!({"thinking_mode": "chat", "tool_style": "dsml"})),
             strip_leading_bos: false,
+            effort_thinking: None,
         },
     )]));
 

@@ -241,6 +241,7 @@ mod tests {
             response_id: None,
             route: crate::continuation::RouteInfo::default(),
             origin: "realtime",
+            thinking_override: None,
         }
     }
 

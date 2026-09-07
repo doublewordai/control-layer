@@ -149,6 +149,14 @@ pub struct RequestContext {
     /// Metric label for the request origin (realtime / batch / playground),
     /// resolved at arm time from the API key purpose.
     pub origin: &'static str,
+    /// The serving mode the route's reasoning translation determined for this
+    /// stream, when (a) the model has a recognised family reconstructor and
+    /// (b) the resolution is translation-driven. Overrides the render's
+    /// `thinking_mode` so the resume prefix matches the mode onwards wrote
+    /// below this layer. `None` for every plain-path stream — their render is
+    /// byte-identical to v1 (whose route `render_kwargs` describe exactly the
+    /// plain content-only render, see the routes poll).
+    pub thinking_override: Option<bool>,
 }
 
 impl RequestContext {
@@ -164,11 +172,32 @@ impl RequestContext {
         self.body.get("chat_template_kwargs").filter(|v| !v.is_null())
     }
 
+    /// The canonical reasoning effort the client sent, if any — the field a
+    /// translated target's mode is derived from (see [`RouteInfo::resolve_mode`]).
+    pub fn reasoning_effort(&self) -> Option<&str> {
+        self.body.get("reasoning_effort").and_then(Value::as_str)
+    }
+
     /// The `chat_template_kwargs` a render for this stream must use: the route's
     /// serving mode, overlaid with whatever the client asked for (see
-    /// [`RouteInfo::merged_render_kwargs`]).
+    /// [`RouteInfo::merged_render_kwargs`]) — and, for a family-reconstructor
+    /// stream whose mode the reasoning translation determined, the resolved
+    /// `thinking_mode` on top, because that is the mode leg 1's prompt was
+    /// actually templated with downstream.
     pub fn render_kwargs(&self) -> Option<Value> {
-        self.route.merged_render_kwargs(self.chat_template_kwargs())
+        let merged = self.route.merged_render_kwargs(self.chat_template_kwargs());
+        let Some(thinking) = self.thinking_override else {
+            return merged;
+        };
+        let mut kwargs = match merged {
+            Some(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        kwargs.insert(
+            "thinking_mode".to_string(),
+            Value::String(if thinking { "thinking" } else { "chat" }.to_string()),
+        );
+        Some(Value::Object(kwargs))
     }
 
     pub fn max_tokens(&self) -> Option<u32> {
@@ -358,6 +387,18 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
         return next.run(forward(parts, body_bytes)).await;
     }
 
+    // Translation-resolved render mode, armed only for a recognised family
+    // reconstructor: the plain path's render must stay byte-identical to v1.
+    let thinking_override = if accumulate::recognized(&model, &state.cfg) {
+        let effort = body.get("reasoning_effort").and_then(Value::as_str);
+        let kwargs = body.get("chat_template_kwargs").filter(|v| !v.is_null());
+        match route.resolve_mode(kwargs, effort) {
+            super::ModeResolution::Translated(t) => Some(t),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let mut ctx = RequestContext {
         model,
         body,
@@ -365,6 +406,7 @@ pub async fn continuation_middleware(State(state): State<ContinuationState>, req
         response_id,
         route,
         origin: "unknown",
+        thinking_override,
     };
 
     let response = next.run(forward(parts, body_bytes)).await;
@@ -486,8 +528,13 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         // ride along so the reconstructor's thinking/chat mode matches the
         // prompt the resume render will actually build (the request overrides
         // the route key-by-key in both places).
-        let mut acc: Box<dyn StreamAccumulator> =
-            accumulate::for_model(&ctx.model, &state.cfg, &ctx.route, ctx.chat_template_kwargs());
+        let mut acc: Box<dyn StreamAccumulator> = accumulate::for_model(
+            &ctx.model,
+            &state.cfg,
+            &ctx.route,
+            ctx.chat_template_kwargs(),
+            ctx.reasoning_effort(),
+        );
         let mut current: LegStream = Box::pin(SseBufferedStream::new(leg_one));
         // Is `current` a resume leg (text_completion chunks needing reframing)?
         let mut resuming = false;
@@ -1125,6 +1172,7 @@ mod tests {
             response_id: None,
             route: RouteInfo::default(),
             origin: "realtime",
+            thinking_override: None,
         };
         assert_eq!(ctx.messages()[0]["role"], "user");
         assert!(ctx.tools().is_some());
@@ -1139,6 +1187,7 @@ mod tests {
             response_id: None,
             route: RouteInfo::default(),
             origin: "realtime",
+            thinking_override: None,
         };
         assert_eq!(ctx.max_tokens(), Some(42));
         assert!(ctx.tools().is_none());
