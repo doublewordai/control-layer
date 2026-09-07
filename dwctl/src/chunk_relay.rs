@@ -9,9 +9,12 @@
 //! would silently lose those early messages, a stream lets it replay them.
 //!
 //! Publish (`Sink::absorb`) is synchronous and can't `.await`, so it's a
-//! `try_send` into a channel drained by one background task. Subscribe uses
-//! one shared reader doing a single `XREAD` per tick across all
-//! subscribers, instead of one blocking connection per client.
+//! `try_send` into a channel drained by a shard of background publisher
+//! tasks. Subscribe fans out across a fixed number of reader shards, each
+//! doing a single `XREAD` per tick over its own slice of subscribers
+//! (`request_id % reader_workers`). Batched per shard instead of one
+//! blocking connection per client, but not diluted across every subscriber
+//! in the process the way a single shared reader would be under load.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,7 +22,7 @@ use std::time::Duration;
 
 use dashmap::DashMap;
 use deadpool_redis::redis::streams::StreamReadReply;
-use deadpool_redis::redis::{Value, cmd};
+use deadpool_redis::redis::{Value, cmd, pipe};
 use deadpool_redis::{Config as RedisConfig, Pool, Runtime};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -53,6 +56,23 @@ pub struct ChunkRelayConfig {
     pub publish_channel_capacity: usize,
     #[serde(default = "default_reader_poll_interval_ms")]
     pub reader_poll_interval_ms: u64,
+    /// Number of independent publisher shards, each with its own channel,
+    /// Redis connection, and background task. A single sequential publisher
+    /// (one `XADD` round trip at a time) has a hard throughput ceiling no
+    /// buffer size can fix. Once aggregate chunk volume exceeds it, the
+    /// channel backs up and overflows regardless of capacity. Sharding by
+    /// `request_id` lets that many `XADD`s be in flight concurrently.
+    #[serde(default = "default_publish_workers")]
+    pub publish_workers: usize,
+    /// Number of independent reader shards, each doing its own `XREAD` over
+    /// a fixed slice of subscribers (`request_id % reader_workers`), on its
+    /// own Redis connection. A single reader sweeping every subscriber
+    /// dilutes as subscriber count grows, so a request's chunks take longer
+    /// to reach it than the poll-fallback path, which doesn't dilute with
+    /// subscriber count and wins the terminal race instead. Sharding keeps
+    /// each reader's slice a fixed size regardless of total load.
+    #[serde(default = "default_reader_workers")]
+    pub reader_workers: usize,
 }
 
 impl Default for ChunkRelayConfig {
@@ -63,6 +83,8 @@ impl Default for ChunkRelayConfig {
             maxlen: default_maxlen(),
             publish_channel_capacity: default_publish_channel_capacity(),
             reader_poll_interval_ms: default_reader_poll_interval_ms(),
+            publish_workers: default_publish_workers(),
+            reader_workers: default_reader_workers(),
         }
     }
 }
@@ -78,6 +100,12 @@ fn default_publish_channel_capacity() -> usize {
 }
 fn default_reader_poll_interval_ms() -> u64 {
     75
+}
+fn default_publish_workers() -> usize {
+    8
+}
+fn default_reader_workers() -> usize {
+    8
 }
 
 /// How often (in messages) to refresh a stream's TTL.
@@ -122,29 +150,53 @@ fn parse_stream_key(key: &str) -> Option<Uuid> {
 /// tasks spawned once in [`ChunkRelay::from_config`].
 #[derive(Clone)]
 pub struct ChunkRelay {
-    publish_tx: mpsc::Sender<PublishMsg>,
+    /// One independent channel + background publisher per shard, see
+    /// `ChunkRelayConfig::publish_workers`. A request's chunks always hash
+    /// to the same shard, so per-request ordering into Redis is preserved.
+    publish_txs: Arc<[mpsc::Sender<PublishMsg>]>,
     registry: Arc<DashMap<Uuid, ReaderEntry>>,
 }
 
 impl ChunkRelay {
-    /// Spawns the publisher and reader tasks. Construct once at startup and
-    /// clone the handle; do not call per request.
+    /// Spawns the publisher shards and the reader task. Construct once at
+    /// startup and clone the handle; do not call per request.
     pub fn from_config(cfg: &ChunkRelayConfig) -> Result<Self, ChunkRelayError> {
         let pool = RedisConfig::from_url(cfg.redis_url.clone())
             .create_pool(Some(Runtime::Tokio1))
             .map_err(|e| ChunkRelayError::Config(format!("failed to create redis pool: {e}")))?;
 
-        let (publish_tx, publish_rx) = mpsc::channel(cfg.publish_channel_capacity);
+        let workers = cfg.publish_workers.max(1);
+        let publish_txs: Vec<mpsc::Sender<PublishMsg>> = (0..workers)
+            .map(|_| {
+                let (tx, rx) = mpsc::channel(cfg.publish_channel_capacity);
+                tokio::spawn(publisher_loop(pool.clone(), rx, cfg.stream_ttl_secs, cfg.maxlen));
+                tx
+            })
+            .collect();
         let registry: Arc<DashMap<Uuid, ReaderEntry>> = Arc::new(DashMap::new());
 
-        tokio::spawn(publisher_loop(pool.clone(), publish_rx, cfg.stream_ttl_secs, cfg.maxlen));
-        tokio::spawn(reader_loop(
-            pool,
-            registry.clone(),
-            Duration::from_millis(cfg.reader_poll_interval_ms),
-        ));
+        let reader_workers = cfg.reader_workers.max(1);
+        for shard in 0..reader_workers {
+            tokio::spawn(reader_loop(
+                pool.clone(),
+                registry.clone(),
+                Duration::from_millis(cfg.reader_poll_interval_ms),
+                shard,
+                reader_workers,
+            ));
+        }
 
-        Ok(Self { publish_tx, registry })
+        Ok(Self {
+            publish_txs: publish_txs.into(),
+            registry,
+        })
+    }
+
+    /// Every chunk for a given request goes through the same shard, so
+    /// ordering into that request's stream is preserved.
+    fn shard_for(&self, request_id: Uuid) -> &mpsc::Sender<PublishMsg> {
+        let idx = (request_id.as_u128() % self.publish_txs.len() as u128) as usize;
+        &self.publish_txs[idx]
     }
 
     /// Non-blocking — called from `Sink::absorb`, which can't `.await`. A
@@ -156,7 +208,7 @@ impl ChunkRelay {
             data: data.to_string(),
             done: false,
         };
-        if let Err(e) = self.publish_tx.try_send(msg) {
+        if let Err(e) = self.shard_for(request_id).try_send(msg) {
             tracing::debug!(%request_id, seq, error = %e, "chunk relay publish dropped");
         }
     }
@@ -170,15 +222,22 @@ impl ChunkRelay {
             data: String::new(),
             done: true,
         };
-        if let Err(e) = self.publish_tx.try_send(msg) {
+        if let Err(e) = self.shard_for(request_id).try_send(msg) {
             tracing::debug!(%request_id, seq, error = %e, "chunk relay done-sentinel dropped");
         }
     }
 
     /// Reads from the start of the stream, so a late subscriber still sees
     /// earlier chunks.
+    ///
+    /// Capacity must absorb one reader-loop tick's worth of a burst. A
+    /// bursty upstream can hand the daemon hundreds of chunks between ticks,
+    /// and the reader forwards a subscriber's whole backlog in one pass. Too
+    /// small silently drops the subscriber (`try_send` fails once, the
+    /// reader removes the registry entry) and hands the request to the poll
+    /// fallback with no error surfaced. This was 64 and hit in practice.
     pub fn subscribe(&self, request_id: Uuid) -> ChunkStream {
-        let (tx, rx) = mpsc::channel(64);
+        let (tx, rx) = mpsc::channel(4096);
         self.registry.insert(
             request_id,
             ReaderEntry {
@@ -196,44 +255,76 @@ impl ChunkRelay {
     }
 }
 
+/// Max messages pipelined into one Redis round trip. A burst of many
+/// requests finishing at once can queue tens of thousands of messages
+/// behind a single shard, so this bounds each pipeline call instead of
+/// letting it grow without limit.
+const MAX_PUBLISH_BATCH: usize = 256;
+
+/// Drains whatever's already queued (up to `MAX_PUBLISH_BATCH`) into one
+/// pipelined Redis call instead of one round trip per message, and holds
+/// its connection for the task's lifetime instead of re-acquiring it every
+/// message. One round trip per message was the actual bottleneck this was
+/// built to fix. Under a burst of concurrent requests finishing close
+/// together, a shard's queue built up tens of thousands of messages, and
+/// awaiting each round trip serially measured a 20-30s gap between a
+/// request's last chunk being queued and it landing in Redis. That made
+/// the live-relay-vs-poll-fallback race hopeless no matter how the reader
+/// or the race itself was tuned. Pipelining turns it into O(1) round trips
+/// per batch instead of O(n).
 async fn publisher_loop(pool: Pool, mut rx: mpsc::Receiver<PublishMsg>, ttl_secs: u64, maxlen: usize) {
-    while let Some(msg) = rx.recv().await {
-        let mut conn = match pool.get().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(request_id = %msg.request_id, error = %e, "chunk relay: redis unreachable, dropping publish");
-                continue;
+    let mut conn = None;
+
+    loop {
+        let Some(first) = rx.recv().await else { return };
+        let mut batch = vec![first];
+        while batch.len() < MAX_PUBLISH_BATCH {
+            match rx.try_recv() {
+                Ok(msg) => batch.push(msg),
+                Err(_) => break,
             }
-        };
-
-        let key = stream_key(msg.request_id);
-        let result = cmd("XADD")
-            .arg(&key)
-            .arg("MAXLEN")
-            .arg("~")
-            .arg(maxlen)
-            .arg("*")
-            .arg("seq")
-            .arg(msg.seq)
-            .arg("data")
-            .arg(&msg.data)
-            .arg("done")
-            .arg(if msg.done { "1" } else { "0" })
-            .query_async::<String>(&mut conn)
-            .await;
-
-        if let Err(e) = result {
-            tracing::debug!(request_id = %msg.request_id, error = %e, "chunk relay XADD failed");
-            continue;
         }
 
-        // Refresh the TTL periodically rather than on every message — halves
-        // command volume, and the stream only needs to outlive its last write
-        // by roughly stream_ttl_secs, not by an exact amount.
-        if (msg.seq % EXPIRE_REFRESH_EVERY == 0 || msg.done)
-            && let Err(e) = cmd("EXPIRE").arg(&key).arg(ttl_secs).query_async::<i64>(&mut conn).await
-        {
-            tracing::debug!(request_id = %msg.request_id, error = %e, "chunk relay EXPIRE failed");
+        let c = match conn.as_mut() {
+            Some(c) => c,
+            None => match pool.get().await {
+                Ok(c) => conn.insert(c),
+                Err(e) => {
+                    tracing::debug!(error = %e, batch_len = batch.len(), "chunk relay: redis unreachable, dropping publish batch");
+                    continue;
+                }
+            },
+        };
+
+        let keys: Vec<String> = batch.iter().map(|m| stream_key(m.request_id)).collect();
+        let mut pipeline = pipe();
+        for (msg, key) in batch.iter().zip(&keys) {
+            pipeline
+                .cmd("XADD")
+                .arg(key)
+                .arg("MAXLEN")
+                .arg("~")
+                .arg(maxlen)
+                .arg("*")
+                .arg("seq")
+                .arg(msg.seq)
+                .arg("data")
+                .arg(&msg.data)
+                .arg("done")
+                .arg(if msg.done { "1" } else { "0" })
+                .ignore();
+            // Refresh the TTL periodically rather than on every message.
+            // Halves command volume, and the stream only needs to outlive
+            // its last write by roughly stream_ttl_secs, not exactly.
+            if msg.seq % EXPIRE_REFRESH_EVERY == 0 || msg.done {
+                pipeline.cmd("EXPIRE").arg(key).arg(ttl_secs).ignore();
+            }
+        }
+
+        if let Err(e) = pipeline.query_async::<()>(c).await {
+            tracing::debug!(error = %e, batch_len = batch.len(), "chunk relay: pipelined publish batch failed");
+            conn = None; // connection may be bad; get a fresh one next batch
+            continue;
         }
     }
 }
@@ -241,11 +332,15 @@ async fn publisher_loop(pool: Pool, mut rx: mpsc::Receiver<PublishMsg>, ttl_secs
 /// One `XREAD` per tick across every subscribed stream, fanned out to each
 /// subscriber's channel — the fix for the connection-per-reader scaling
 /// limit a naive per-subscriber `XREAD BLOCK` would hit.
-async fn reader_loop(pool: Pool, registry: Arc<DashMap<Uuid, ReaderEntry>>, poll_interval: Duration) {
+async fn reader_loop(pool: Pool, registry: Arc<DashMap<Uuid, ReaderEntry>>, poll_interval: Duration, shard: usize, n_shards: usize) {
     loop {
         tokio::time::sleep(poll_interval).await;
 
-        let ids: Vec<Uuid> = registry.iter().map(|entry| *entry.key()).collect();
+        let ids: Vec<Uuid> = registry
+            .iter()
+            .map(|entry| *entry.key())
+            .filter(|id| (id.as_u128() % n_shards as u128) as usize == shard)
+            .collect();
         if ids.is_empty() {
             continue;
         }
@@ -354,6 +449,8 @@ mod tests {
             maxlen: 2000,
             publish_channel_capacity: 1024,
             reader_poll_interval_ms: 20,
+            publish_workers: 2,
+            reader_workers: 2,
         }
     }
 

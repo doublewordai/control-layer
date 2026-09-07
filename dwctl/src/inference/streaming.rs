@@ -181,6 +181,7 @@ where
         if !terminal.claim() {
             return;
         }
+        tracing::debug!(%request_id, "flex terminal claimed by: poll_fallback");
 
         let frames = match &result {
             Ok(detail) => render(Ok(detail)),
@@ -205,6 +206,21 @@ where
     });
 
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()).into_response()
+}
+
+/// Guarantees the relay's subscriber-registry entry is removed no matter
+/// which of `run_live_relay`'s exit paths fires (including task
+/// cancellation), so a request that never sees a `done` frame doesn't sit
+/// in the registry forever.
+struct UnsubscribeOnDrop<'a> {
+    relay: &'a crate::chunk_relay::ChunkRelay,
+    request_id: uuid::Uuid,
+}
+
+impl Drop for UnsubscribeOnDrop<'_> {
+    fn drop(&mut self) {
+        self.relay.unsubscribe(&self.request_id);
+    }
 }
 
 /// Subscribes to a request's relayed chunks and forwards them live,
@@ -234,6 +250,13 @@ async fn run_live_relay(
     });
 
     let mut stream = relay.subscribe(request_id);
+    // `subscribe`'s own doc note ("dropping the stream also works") only
+    // holds if the reader attempts another delivery to this subscriber.
+    // It won't, once the backend stops producing chunks. Losing the race
+    // below (poll_fallback claims first) then orphans this entry in the
+    // registry forever, diluting every future tick for every shard. Cover
+    // every exit path (not just poll losing) with an explicit unsubscribe.
+    let _unsub_guard = UnsubscribeOnDrop { relay: &relay, request_id };
 
     loop {
         tokio::select! {
@@ -252,6 +275,7 @@ async fn run_live_relay(
                     if !terminal.claim() {
                         return;
                     }
+                    tracing::debug!(%request_id, seq = msg.seq, "flex terminal claimed by: live_relay");
                     match reframe.as_mut() {
                         // Nothing in the raw stream says "response complete" —
                         // only finalize() produces that, so it runs here.
