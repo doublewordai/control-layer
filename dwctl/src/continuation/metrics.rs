@@ -40,9 +40,7 @@ pub fn record_layer_wired(wired: bool) {
 /// | `deadline` | `attempts_exhausted` | `client_disconnect` |
 /// `not_streaming` | `unparseable` | `no_model` | `render_failed` | `no_envelope`
 /// | `parser_overflow` (the forward parser hit a structural bound or
-/// out-of-grammar leg output and the resume was aborted) | `unverified_mode`
-/// (a translation-resolved serving mode, but leg 1 was not served by the
-/// translated member — the death surfaces unresumed) | `logprobs`
+/// out-of-grammar leg output and the resume was aborted) | `logprobs`
 /// | death families from [`super::detect`] (`transport_error`, `truncated`,
 /// `error_envelope`, `error_envelope_4xx`, `cancelled_499`, `stall`) | `ok` for
 /// a clean completion.
