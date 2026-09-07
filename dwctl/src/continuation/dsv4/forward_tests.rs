@@ -429,6 +429,41 @@ fn an_unrecognised_string_flag_poisons() {
         assert!(parser.poisoned(), "flag {flag:?} must poison, not guess");
         assert!(!parser.ends_in_tool_calls(), "a poisoned leg never signals tool_calls");
     }
+    // The WHOLE attribute is matched, not just its last quoted token: a
+    // foreign attribute carrying a well-formed value is still out of grammar.
+    let mut parser = Dsv4Forward::new(ForwardSeed::BetweenToolCalls {
+        next_index: 0,
+        reuse_id: None,
+    });
+    parser.feed(&format!("{INVOKE_OPEN}f\">\n{PARAMETER_OPEN}k\" junk=\"true\">v{PARAMETER_CLOSE}"));
+    assert!(parser.poisoned(), "a non-`string` attribute must not pass as one");
+}
+
+/// A quote inside a completed invoke name (`name="f" junk="x">`) is out of
+/// grammar — emitting it as a function name would not re-serialize to the
+/// leg's bytes, so it poisons like every other out-of-grammar shape.
+#[test]
+fn an_embedded_quote_in_an_invoke_name_poisons() {
+    let mut parser = Dsv4Forward::new(ForwardSeed::BetweenToolCalls {
+        next_index: 0,
+        reuse_id: None,
+    });
+    let deltas = parser.feed(&format!("{INVOKE_OPEN}f\" junk=\"x\">\n"));
+    assert!(parser.poisoned());
+    assert!(
+        !deltas.iter().any(|d| matches!(d, ForwardDelta::ToolCall { name: Some(_), .. })),
+        "the malformed name never reaches the client: {deltas:?}"
+    );
+
+    // Split across feeds: the quote arrives in an earlier fragment, so the
+    // completed name — not just the closing fragment — must be checked.
+    let mut parser = Dsv4Forward::new(ForwardSeed::BetweenToolCalls {
+        next_index: 0,
+        reuse_id: None,
+    });
+    parser.feed(&format!("{INVOKE_OPEN}f\" ju"));
+    parser.feed("nk=\"x\">\n");
+    assert!(parser.poisoned(), "an accumulated name is checked whole, not per fragment");
 }
 
 /// An id the client already received for a call the resume regenerates (leg 1

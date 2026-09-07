@@ -150,10 +150,12 @@ pub fn for_model(
             // The mode leg 1 ran with is unknowable (canonical reasoning with
             // no modelled translation) — a family reconstructor seeded on a
             // guess corrupts seams, so this stream keeps the v1 accumulator.
-            None => {
-                super::metrics::record_unsupported_delta("reasoning_unmapped");
-                Box::new(PlainContent::new(cfg.max_buffer_bytes))
-            }
+            // Deliberately unmetered here: nothing has gone wrong yet, and the
+            // fallback is observable exactly where it bites — a reasoning
+            // delta arriving at PlainContent disarms with the ordinary
+            // `unsupported_delta` accounting, while a content-only stream
+            // rescues fine and owes no signal.
+            None => Box::new(PlainContent::new(cfg.max_buffer_bytes)),
         },
         _ => Box::new(PlainContent::new(cfg.max_buffer_bytes)),
     }

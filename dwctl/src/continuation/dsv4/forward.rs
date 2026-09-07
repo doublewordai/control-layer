@@ -346,6 +346,14 @@ impl Dsv4Forward {
         if let Some(i) = rest.find(TAG_END) {
             self.name.push_str(&rest[..i]);
             let name = std::mem::take(&mut self.name);
+            // A quote inside the completed name means the leg wrote something
+            // like `name="f" junk="x">` — out of grammar, and emitting it as a
+            // function name would not re-serialize to the leg's bytes. Poison,
+            // per the same rule as every other out-of-grammar shape.
+            if name.contains('"') {
+                self.poison();
+                return i + TAG_END.len();
+            }
             self.flush_args(out);
             self.tool_calls_emitted = true;
             // The first call this leg opens may be regenerating one the client
@@ -427,10 +435,11 @@ impl Dsv4Forward {
         // lowercase; a typo'd flag changes the argument's TYPE), so an
         // unrecognised value poisons instead — the resume aborts and the
         // original death surfaces.
-        let flag = rest[..i].rsplit('"').next().unwrap_or("");
-        self.is_string = match flag {
-            "true" => true,
-            "false" => false,
+        // The COMPLETE attribute text is matched, not just its last quoted
+        // token — ` junk="true` must not pass as ` string="true`.
+        self.is_string = match &rest[..i] {
+            " string=\"true" => true,
+            " string=\"false" => false,
             _ => {
                 self.poison();
                 return i + TAG_END.len();

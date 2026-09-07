@@ -723,7 +723,10 @@ impl StreamAccumulator for Dsv4Reconstructor {
                     .filter(|a| !a.is_empty())
                     .unwrap_or_default()
                     .to_string();
-                if !self.fits(name.as_ref().map_or(0, String::len) + args.len()) {
+                let id = call.get("id").and_then(Value::as_str).filter(|i| !i.is_empty()).map(str::to_string);
+                // Every retained byte — id included — counts against the cap;
+                // `len_bytes` must account for whatever this admits.
+                if !self.fits(id.as_ref().map_or(0, String::len) + name.as_ref().map_or(0, String::len) + args.len()) {
                     return self.disarm(AccumulateError::CapExceeded);
                 }
                 // Reconstruction assumes tool calls arrive serially — a sibling
@@ -737,7 +740,6 @@ impl StreamAccumulator for Dsv4Reconstructor {
                     super::metrics::record_unsupported_delta("tool_calls");
                     return self.disarm(AccumulateError::UnsupportedDelta);
                 }
-                let id = call.get("id").and_then(Value::as_str).filter(|i| !i.is_empty()).map(str::to_string);
                 let slot = self.slot(index);
                 if id.is_some() {
                     slot.id = id;
@@ -776,7 +778,7 @@ impl StreamAccumulator for Dsv4Reconstructor {
             + self
                 .tools
                 .iter()
-                .map(|t| t.name.as_ref().map_or(0, String::len) + t.arguments.len())
+                .map(|t| t.id.as_ref().map_or(0, String::len) + t.name.as_ref().map_or(0, String::len) + t.arguments.len())
                 .sum::<usize>()
     }
 

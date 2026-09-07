@@ -1252,7 +1252,7 @@ async fn a_translated_route_renders_the_efforts_mode_not_the_row_kwargs(pool: Pg
         ("none", "chat", "Hello"),
     ] {
         let fake = Fake::new(
-            vec![content("chatcmpl-1", "Hello"), Chunk::Reset],
+            vec![content("dyn-chatcmpl-1", "Hello"), Chunk::Reset],
             vec![vec![leg_text(", world!", Some("stop")), leg_usage(1002, 2), done()]],
         );
         let rendered = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -1295,6 +1295,43 @@ async fn a_translated_route_renders_the_efforts_mode_not_the_row_kwargs(pool: Pg
             "effort {effort} seeds the reconstructor in the same mode it renders"
         );
     }
+}
+
+/// A translation-resolved mode describes the TRANSLATED member's prompt. When
+/// another member served leg 1 (the reserve while dynamo is descheduled — a
+/// routine state, not an incident), its prompt may have run in the other mode,
+/// so the death surfaces unresumed rather than resuming on a seed the real
+/// prompt may disagree with.
+#[sqlx::test]
+async fn a_translated_mode_never_resumes_a_leg_served_elsewhere(pool: PgPool) {
+    let fake = Fake::new(
+        // An OpenRouter-shaped envelope id: not the translated dynamo member.
+        vec![content("gen-openrouter-1", "Hello"), Chunk::Reset],
+        vec![vec![leg_text(", world!", Some("stop")), leg_usage(1002, 2), done()]],
+    );
+    let tokenizer = render_stub(vec![4, 5], 1002, 2).await;
+    let mut st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+    st.routes = Arc::new(ContinuationRoutes::with_routes([(
+        MODEL.to_string(),
+        crate::continuation::RouteInfo {
+            render_kwargs: None,
+            strip_leading_bos: false,
+            effort_thinking: Some([("high".to_string(), true)].into_iter().collect()),
+        },
+    )]));
+
+    let mut body = streaming_body();
+    body["reasoning_effort"] = json!("high");
+    let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(body)).await.unwrap()).await;
+
+    assert!(
+        fake.resume_requests().is_empty(),
+        "no resume leg is dispatched on an unverified mode"
+    );
+    assert!(
+        !payloads.iter().any(|p| p.contains("world")),
+        "the stream ends at the death, exactly like an unarmed one"
+    );
 }
 
 /// Canonical reasoning on a route with NO modelled translation: the mode leg 1

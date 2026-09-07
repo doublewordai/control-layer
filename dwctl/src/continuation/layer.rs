@@ -969,6 +969,25 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     if first_death_reason.is_none() {
                         first_death_reason = Some(reason);
                     }
+                    // A translation-resolved mode describes the TRANSLATED
+                    // member's prompt. The default pool can be served by other
+                    // members (weighted balancing, or the reserve while dynamo
+                    // is descheduled) whose translation — or native handling of
+                    // `reasoning_effort` — may put the prompt in the OTHER
+                    // mode, and a seed that disagrees with the real prompt
+                    // splices or omits a `</think>`. Leg 1's server is known
+                    // from its envelope (dynamo ids are `dyn-*`, the same
+                    // detection the resume legs use); anything else surfaces
+                    // the death exactly as an unarmed stream would.
+                    if ctx.thinking_override.is_some()
+                        && !acc.envelope().is_some_and(|e| e.id.starts_with("dyn-"))
+                    {
+                        if let Some(frame) = first_death.take() {
+                            yield Ok(frame);
+                        }
+                        outcome.record("disarmed", "unverified_mode");
+                        break 'chain;
+                    }
                     // A seam inside reasoning/tool syntax no longer blocks the
                     // resume: the leg's raw output goes through the
                     // accumulator's paired forward parser (seeded at dispatch

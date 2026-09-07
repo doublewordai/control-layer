@@ -202,6 +202,22 @@ fn arguments_before_the_name_disarm() {
     assert_eq!(err, AccumulateError::UnsupportedDelta);
 }
 
+/// Every retained byte counts against the memory cap — the tool-call id
+/// included, or a stream could grow ids past `max_buffer_bytes`.
+#[test]
+fn tool_call_ids_count_against_the_cap() {
+    let mut acc = Dsv4Reconstructor::new(16, true);
+    let err = acc
+        .ingest(&json!({
+            "id": "chatcmpl-1", "model": "dsv4", "created": 1,
+            "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0,
+                "id": "call_far_longer_than_the_cap_allows",
+                "function": {"name": "f", "arguments": ""}}]}, "finish_reason": null}]
+        }))
+        .unwrap_err();
+    assert_eq!(err, AccumulateError::CapExceeded);
+}
+
 /// A call whose name arrived without an id owes the client one; a call whose
 /// id arrived owes nothing.
 #[test]
