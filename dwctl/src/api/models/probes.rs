@@ -126,23 +126,3 @@ pub struct ProbeStatistics {
     #[schema(value_type = Option<String>, format = "date-time")]
     pub last_failure: Option<DateTime<Utc>>,
 }
-
-impl Default for ProbeStatistics {
-    fn default() -> Self {
-        Self {
-            total_executions: 0,
-            successful_executions: 0,
-            failed_executions: 0,
-            success_rate: 0.0,
-            avg_response_time_ms: None,
-            min_response_time_ms: None,
-            max_response_time_ms: None,
-            p50_response_time_ms: None,
-            p95_response_time_ms: None,
-            p99_response_time_ms: None,
-            last_execution: None,
-            last_success: None,
-            last_failure: None,
-        }
-    }
-}
