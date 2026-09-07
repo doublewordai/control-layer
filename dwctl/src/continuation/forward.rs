@@ -139,13 +139,24 @@ pub enum ForwardSeed {
     /// Inside the tool block, between invokes — the next invoke the model opens
     /// is call `next_index`. Carrying the index is what stops the client seeing
     /// a tool-call index restart across the seam.
-    BetweenToolCalls { next_index: u32 },
+    ///
+    /// `reuse_id`: when the client already received an id for `next_index` (an
+    /// id-only opening delta, name never delivered — the prefix renders nothing
+    /// for it and the resume regenerates the call), the regenerated call must
+    /// carry THAT id, not a fresh mint: streaming accumulators key the call on
+    /// its index, and a second id for the same index tears the call apart.
+    BetweenToolCalls { next_index: u32, reuse_id: Option<String> },
     /// Inside call `index`'s invoke, with `args_so_far` being the arguments text
     /// the client has ALREADY received for it. The finer sub-state (mid
     /// parameter name, name closed, mid value) is derived from that text by the
     /// same partial-arguments parse the reconstructor used to render the prefix,
     /// so the two can never disagree about where the raw stopped.
-    InToolCall { index: u32, args_so_far: String },
+    ///
+    /// `id_owed`: the client got this call's name but never an id (id and name
+    /// are independently optional per streaming delta) — the parser mints one
+    /// and attaches it to the first resumed fragment of this call, exactly as
+    /// the dying provider would eventually have done.
+    InToolCall { index: u32, args_so_far: String, id_owed: bool },
 }
 
 /// Today's behaviour, and the default for every model: raw text IS content.

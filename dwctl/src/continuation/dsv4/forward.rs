@@ -122,6 +122,13 @@ pub struct Dsv4Forward {
     /// for such a stream is `tool_calls`, whatever the raw completions leg
     /// reported.
     tool_calls_emitted: bool,
+    /// An id the client already received for the NEXT call this leg opens (an
+    /// id-only opening delta whose call the resume regenerates). Consumed by
+    /// the first `scan_invoke_name` emission instead of minting a fresh one.
+    reuse_id: Option<String>,
+    /// The in-flight seeded call reached the client without an id — mint one
+    /// and attach it to that call's first resumed fragment.
+    id_owed: bool,
 }
 
 impl Dsv4Forward {
@@ -138,19 +145,27 @@ impl Dsv4Forward {
             params: false,
             is_string: false,
             tool_calls_emitted: false,
+            reuse_id: None,
+            id_owed: false,
         };
         match seed {
             ForwardSeed::Reasoning => parser.state = State::Reasoning,
             ForwardSeed::Content => parser.state = State::Content,
-            ForwardSeed::BetweenToolCalls { next_index } => {
+            ForwardSeed::BetweenToolCalls { next_index, reuse_id } => {
                 parser.state = State::Block;
                 parser.next_index = next_index;
                 parser.tool_calls_emitted = true;
+                parser.reuse_id = reuse_id;
             }
-            ForwardSeed::InToolCall { index, args_so_far } => {
+            ForwardSeed::InToolCall {
+                index,
+                args_so_far,
+                id_owed,
+            } => {
                 parser.index = index;
                 parser.next_index = index.saturating_add(1);
                 parser.tool_calls_emitted = true;
+                parser.id_owed = id_owed;
                 // What the client already holds decides what is still owed:
                 // an opening brace, a separator before the next parameter, and
                 // which half of a parameter is in flight.
@@ -172,9 +187,10 @@ impl Dsv4Forward {
     }
 
     /// A tool-call id in the scheme the serving parser uses, taken from the
-    /// fidelity captures: `call_` plus 24 lowercase hex characters. Only ever
-    /// minted for a call that OPENS in the resumed leg — a call leg 1 already
-    /// announced keeps the id the client was given.
+    /// fidelity captures: `call_` plus 24 lowercase hex characters. Minted only
+    /// where the client holds no id yet: a call that OPENS in the resumed leg
+    /// (unless `reuse_id` says leg 1 already named it), or a seeded call whose
+    /// id never arrived (`id_owed`). A call whose id the client holds keeps it.
     fn new_id() -> String {
         let hex = Uuid::new_v4().simple().to_string();
         format!("call_{}", &hex[..24])
@@ -187,14 +203,21 @@ impl Dsv4Forward {
 
     /// Emit whatever arguments text is queued. Called before any other delta and
     /// at the end of every `feed`/`finish`, so ordering across channels is
-    /// preserved.
+    /// preserved. The first fragment of a seeded call whose client never
+    /// received an id carries a freshly minted one (`id_owed`); every other
+    /// fragment sends no metadata — the client already holds it.
     fn flush_args(&mut self, out: &mut Vec<ForwardDelta>) {
         if self.pending.is_empty() {
             return;
         }
+        let id = if std::mem::take(&mut self.id_owed) {
+            Some(Self::new_id())
+        } else {
+            None
+        };
         out.push(ForwardDelta::ToolCall {
             index: self.index,
-            id: None,
+            id,
             name: None,
             arguments: std::mem::take(&mut self.pending),
         });
@@ -313,6 +336,10 @@ impl Dsv4Forward {
         self.next_index = self.index.saturating_add(1);
         self.opened = false;
         self.params = false;
+        // An owed id belongs to the SEEDED call only; it was delivered with
+        // that call's first fragment, and a call ending fragment-less has
+        // nothing for it to ride — never let it leak onto a later call.
+        self.id_owed = false;
     }
 
     fn scan_invoke_name(&mut self, rest: &str, out: &mut Vec<ForwardDelta>) -> usize {
@@ -321,9 +348,14 @@ impl Dsv4Forward {
             let name = std::mem::take(&mut self.name);
             self.flush_args(out);
             self.tool_calls_emitted = true;
+            // The first call this leg opens may be regenerating one the client
+            // already holds an id for (an id-only opening delta on leg 1) —
+            // repeat THAT id; a second id on the same index tears the call
+            // apart in streaming accumulators. Every later call mints.
+            let id = self.reuse_id.take().unwrap_or_else(Self::new_id);
             out.push(ForwardDelta::ToolCall {
                 index: self.index,
-                id: Some(Self::new_id()),
+                id: Some(id),
                 name: Some(name),
                 arguments: String::new(),
             });
@@ -389,10 +421,21 @@ impl Dsv4Forward {
         let Some(i) = rest.find(TAG_END) else {
             return 0;
         };
-        // ` string="true` / ` string="false` — an unrecognised flag is treated
-        // as a string, which keeps the arguments valid JSON either way.
+        // ` string="true` / ` string="false` — the grammar allows exactly
+        // those two. Guessing at anything else silently rewrites the model's
+        // raw bytes on a chained resume (a case-variant `FALSE` re-serializes
+        // lowercase; a typo'd flag changes the argument's TYPE), so an
+        // unrecognised value poisons instead — the resume aborts and the
+        // original death surfaces.
         let flag = rest[..i].rsplit('"').next().unwrap_or("");
-        self.is_string = !flag.eq_ignore_ascii_case("false");
+        self.is_string = match flag {
+            "true" => true,
+            "false" => false,
+            _ => {
+                self.poison();
+                return i + TAG_END.len();
+            }
+        };
         self.push_args(if self.is_string { ": \"" } else { ": " });
         self.state = State::ParamValue;
         i + TAG_END.len()

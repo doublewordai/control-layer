@@ -450,6 +450,11 @@ fn seam_safe(text: String) -> String {
 /// One tool call's accumulated fragments, keyed by the delta's `index`.
 struct ToolSlot {
     index: i64,
+    /// The id the CLIENT received for this call, when one arrived. Id and name
+    /// are independently optional per streaming delta, and the resume must
+    /// repeat an id the client holds (never mint a second for the same index)
+    /// and supply one it never got.
+    id: Option<String>,
     name: Option<String>,
     arguments: String,
 }
@@ -524,6 +529,7 @@ impl Dsv4Reconstructor {
         }
         self.tools.push(ToolSlot {
             index,
+            id: None,
             name: None,
             arguments: String::new(),
         });
@@ -563,26 +569,37 @@ impl Dsv4Reconstructor {
         }
 
         let Some(last) = self.tools.last() else {
-            return ForwardSeed::BetweenToolCalls { next_index: 0 };
+            return ForwardSeed::BetweenToolCalls {
+                next_index: 0,
+                reuse_id: None,
+            };
         };
         let index = u32::try_from(last.index).unwrap_or(0);
         // A slot with no name renders as nothing at all (see `encode_tool_call`),
         // so the prefix stops before this call — but its index is already spent
         // as far as the client is concerned, so the next invoke reuses it rather
-        // than restarting the numbering.
+        // than restarting the numbering, and repeats any id the client already
+        // received for it (an id-only opening delta) instead of minting a second.
         if last.name.is_none() {
-            return ForwardSeed::BetweenToolCalls { next_index: index };
+            return ForwardSeed::BetweenToolCalls {
+                next_index: index,
+                reuse_id: last.id.clone(),
+            };
         }
         let (_, tail) = parse_partial_args(&last.arguments);
         let closed = last.arguments.trim_end().ends_with('}') && tail.is_none();
         if closed || self.finish_reason {
             ForwardSeed::BetweenToolCalls {
                 next_index: index.saturating_add(1),
+                reuse_id: None,
             }
         } else {
             ForwardSeed::InToolCall {
                 index,
                 args_so_far: last.arguments.clone(),
+                // The client got this call's name but never an id: the parser
+                // mints one and rides it on the first resumed fragment.
+                id_owed: last.id.is_none(),
             }
         }
     }
@@ -720,9 +737,22 @@ impl StreamAccumulator for Dsv4Reconstructor {
                     super::metrics::record_unsupported_delta("tool_calls");
                     return self.disarm(AccumulateError::UnsupportedDelta);
                 }
+                let id = call.get("id").and_then(Value::as_str).filter(|i| !i.is_empty()).map(str::to_string);
                 let slot = self.slot(index);
+                if id.is_some() {
+                    slot.id = id;
+                }
                 if name.is_some() {
                     slot.name = name;
+                }
+                // A faithful DSML parser cannot emit arguments before the
+                // invoke name (the name is part of the opening tag). Arguments
+                // reaching a still name-less slot are bytes the client holds
+                // that the regenerated prefix will not contain — unmodelable,
+                // disarm rather than corrupt.
+                if slot.name.is_none() && !args.is_empty() {
+                    super::metrics::record_unsupported_delta("tool_calls");
+                    return self.disarm(AccumulateError::UnsupportedDelta);
                 }
                 slot.arguments.push_str(&args);
             }
@@ -764,15 +794,6 @@ impl StreamAccumulator for Dsv4Reconstructor {
 
     fn disarm_externally(&mut self, cause: AccumulateError) {
         let _ = self.disarm(cause);
-    }
-
-    /// Plain reframing is faithful only when the continuation can produce
-    /// nothing but content: no tool syntax anywhere in the turn, and the
-    /// think block (if the turn has one) already closed — for this family
-    /// content only begins after `</think>`, so non-empty content is that
-    /// proof. Anything else goes through the paired forward parser below.
-    fn plain_resume_ok(&self) -> bool {
-        !self.saw_any_tool_frame && (!self.thinking || !self.content.is_empty())
     }
 
     /// The DSML parser, seeded from this reconstructor's death-point state.

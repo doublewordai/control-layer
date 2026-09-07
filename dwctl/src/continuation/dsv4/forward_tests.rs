@@ -412,6 +412,90 @@ fn a_disproven_tag_prefix_is_released_as_text() {
     assert!(channels.calls.is_empty() && channels.reasoning.is_empty());
 }
 
+/// The grammar allows exactly `string="true"` and `string="false"`. Guessing
+/// at anything else silently rewrites raw bytes on a chained resume (case
+/// variants re-serialize lowercase; typos change the argument's TYPE), so an
+/// unrecognised flag poisons — the resume aborts, the original death surfaces.
+#[test]
+fn an_unrecognised_string_flag_poisons() {
+    for flag in ["FALSE", "flase", "yes", ""] {
+        let mut parser = Dsv4Forward::new(ForwardSeed::BetweenToolCalls {
+            next_index: 0,
+            reuse_id: None,
+        });
+        parser.feed(&format!(
+            "{INVOKE_OPEN}f\">\n{PARAMETER_OPEN}k\" string=\"{flag}\">v{PARAMETER_CLOSE}"
+        ));
+        assert!(parser.poisoned(), "flag {flag:?} must poison, not guess");
+        assert!(!parser.ends_in_tool_calls(), "a poisoned leg never signals tool_calls");
+    }
+}
+
+/// An id the client already received for a call the resume regenerates (leg 1
+/// died after an id-only opening delta) is repeated, never re-minted — a
+/// second id on the same index tears the call apart in streaming accumulators.
+/// Later calls in the same leg mint their own.
+#[test]
+fn a_client_held_id_is_reused_when_the_call_is_regenerated() {
+    let mut parser = Dsv4Forward::new(ForwardSeed::BetweenToolCalls {
+        next_index: 2,
+        reuse_id: Some("call_from_leg_one".to_string()),
+    });
+    let mut deltas = parser.feed(&format!(
+        "{INVOKE_OPEN}first\">\n</｜DSML｜invoke>\n{INVOKE_OPEN}second\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
+    ));
+    deltas.extend(parser.finish());
+
+    let opens: Vec<_> = deltas
+        .iter()
+        .filter_map(|d| match d {
+            ForwardDelta::ToolCall {
+                index,
+                id: Some(id),
+                name: Some(_),
+                ..
+            } => Some((*index, id.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(opens.len(), 2);
+    assert_eq!(
+        opens[0],
+        (2, "call_from_leg_one".to_string()),
+        "the spent index keeps the client's id"
+    );
+    assert_eq!(opens[1].0, 3);
+    assert_ne!(opens[1].1, "call_from_leg_one", "the next call mints its own id");
+}
+
+/// A seeded call whose id never reached the client (name arrived without one)
+/// gets a minted id on its FIRST resumed fragment — and only that one.
+#[test]
+fn an_owed_id_rides_the_first_resumed_fragment_only() {
+    let mut parser = Dsv4Forward::new(ForwardSeed::InToolCall {
+        index: 0,
+        args_so_far: "{\"city\": \"".to_string(),
+        id_owed: true,
+    });
+    let mut deltas = parser.feed(&format!("Paris{PARAMETER_CLOSE}\n"));
+    deltas.extend(parser.feed(&format!("{PARAMETER_OPEN}unit\" string=\"true\">c")));
+    deltas.extend(parser.finish());
+
+    let ids: Vec<_> = deltas
+        .iter()
+        .filter_map(|d| match d {
+            ForwardDelta::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(ids.len() >= 2, "several fragments flow: {deltas:?}");
+    assert!(
+        ids[0].as_deref().is_some_and(|id| id.starts_with("call_")),
+        "the first fragment carries the minted id"
+    );
+    assert!(ids[1..].iter().all(Option::is_none), "no later fragment repeats it");
+}
+
 /// The layer maps/synthesizes `finish_reason: "tool_calls"` from this signal,
 /// so it must stay false while a call's structure is still open — a leg that
 /// ends mid-invoke has handed the client incomplete arguments JSON, and
@@ -482,6 +566,7 @@ fn synthetic_a_tag_split_around_its_multi_byte_characters_holds_back() {
         let mut parser = Dsv4Forward::new(ForwardSeed::InToolCall {
             index: 0,
             args_so_far: "{".to_string(),
+            id_owed: false,
         });
         let deltas = parse_split(&mut parser, &raw, &[split]);
         assert_eq!(
@@ -575,6 +660,7 @@ fn an_in_call_seed_owes_only_what_the_client_has_not_received() {
         let mut parser = Dsv4Forward::new(ForwardSeed::InToolCall {
             index: 3,
             args_so_far: delivered.to_string(),
+            id_owed: false,
         });
         let mut deltas = parser.feed(raw);
         deltas.extend(parser.finish());
@@ -626,7 +712,13 @@ fn tool_call_indexes_continue_leg_ones_numbering() {
         "function": {"name": "get_weather", "arguments": r#"{"city": "Paris"}"#}
     }]}}]}))
     .unwrap();
-    assert_eq!(acc.forward_seed(), ForwardSeed::BetweenToolCalls { next_index: 1 });
+    assert_eq!(
+        acc.forward_seed(),
+        ForwardSeed::BetweenToolCalls {
+            next_index: 1,
+            reuse_id: None
+        }
+    );
 
     let mut parser = acc.forward_parser();
     let raw = format!("{INVOKE_OPEN}get_weather\">\n{PARAMETER_OPEN}city\" string=\"true\">London{PARAMETER_CLOSE}\n{INVOKE_CLOSE}");
@@ -791,7 +883,10 @@ fn synthetic_a_truncated_value_is_flushed_rather_than_dropped() {
 /// DSML into the content channel — the exact bug this parser exists to prevent.
 #[test]
 fn synthetic_a_partial_invoke_open_tag_dies_with_the_leg() {
-    let mut parser = Dsv4Forward::new(ForwardSeed::BetweenToolCalls { next_index: 2 });
+    let mut parser = Dsv4Forward::new(ForwardSeed::BetweenToolCalls {
+        next_index: 2,
+        reuse_id: None,
+    });
     let mut deltas = parser.feed(&format!("{INVOKE_OPEN}get_wea"));
     deltas.extend(parser.finish());
     assert!(deltas.is_empty(), "no half-announced call, and no leaked tag: {deltas:?}");
@@ -880,7 +975,10 @@ fn a_partial_tag_at_finish_is_dropped_not_leaked() {
 /// chained continuation would reorder those bytes.
 #[test]
 fn garbage_inside_a_tool_block_poisons() {
-    let mut p = Dsv4Forward::new(ForwardSeed::BetweenToolCalls { next_index: 1 });
+    let mut p = Dsv4Forward::new(ForwardSeed::BetweenToolCalls {
+        next_index: 1,
+        reuse_id: None,
+    });
     let out = p.feed("\nwhat is this doing here\n<｜DSML｜invoke name=\"f\">");
     assert!(p.poisoned());
     assert!(
@@ -894,7 +992,10 @@ fn garbage_inside_a_tool_block_poisons() {
 /// re-order ahead of the tool block.
 #[test]
 fn trailing_text_after_the_block_poisons() {
-    let mut p = Dsv4Forward::new(ForwardSeed::BetweenToolCalls { next_index: 1 });
+    let mut p = Dsv4Forward::new(ForwardSeed::BetweenToolCalls {
+        next_index: 1,
+        reuse_id: None,
+    });
     let mut out = p.feed("\n</｜DSML｜tool_calls>");
     out.extend(p.feed("\n\nBy the way, here is more prose."));
     out.extend(p.finish());

@@ -89,17 +89,6 @@ pub trait StreamAccumulator: Send {
     /// does for an ingest-time disarm.
     fn disarm_externally(&mut self, cause: AccumulateError);
 
-    /// Whether a resume whose output is reframed as PLAIN `delta.content` is
-    /// faithful from the current state. The default accumulator only ever
-    /// holds content, so always. A structured reconstructor must say no when
-    /// the seam sits inside reasoning or tool syntax: the completions leg
-    /// would emit raw model markup (`</think>`, DSML) that plain reframing
-    /// exposes as answer text. The forward parser lifts this by decoding the
-    /// leg back into chat deltas.
-    fn plain_resume_ok(&self) -> bool {
-        true
-    }
-
     /// The parser for the resume leg this accumulator's prefix will start,
     /// seeded with the structure that was open at the death point.
     ///
