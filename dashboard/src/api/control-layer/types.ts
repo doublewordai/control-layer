@@ -547,7 +547,7 @@ export interface ModelsQuery {
   group?: string; // Filter by group IDs (comma-separated UUIDs)
   include?: ModelsInclude;
   accessible?: boolean; // Filter to only models the current user can access
-  search?: string; // Case-insensitive search across model names and endpoint names
+  search?: string; // Case-insensitive search across alias, model name, display name, and endpoint name
   is_composite?: boolean; // Filter by composite/virtual model status (true = virtual, false = hosted)
   provider?: string; // Filter by provider name (case-insensitive exact match)
   model_type?: ModelType; // Filter by model type (CHAT, EMBEDDINGS, RERANKER)
