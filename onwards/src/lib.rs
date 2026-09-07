@@ -1179,8 +1179,10 @@ mod tests {
             ],
         );
         // dynamo (accepts) first, third party (does not) second: the wave-1 shape.
-        let app_state =
-            AppState::with_client(completions_pool_targets("gpt-4", &[true, false]), mock.clone());
+        let app_state = AppState::with_client(
+            completions_pool_targets("gpt-4", &[true, false]),
+            mock.clone(),
+        );
         let server = TestServer::new(build_router(app_state)).unwrap();
 
         let response = server
@@ -1218,7 +1220,8 @@ mod tests {
     /// feature is needed most.
     #[tokio::test]
     async fn a_non_accepting_primary_never_sees_priority_either() {
-        let mock = MockHttpClient::new_streaming(StatusCode::OK, vec![OK_CONTENT_FRAME.to_string()]);
+        let mock =
+            MockHttpClient::new_streaming(StatusCode::OK, vec![OK_CONTENT_FRAME.to_string()]);
         let app_state =
             AppState::with_client(completions_pool_targets("gpt-4", &[false]), mock.clone());
         let server = TestServer::new(build_router(app_state)).unwrap();
@@ -3154,6 +3157,62 @@ mod tests {
             let requests = mock_client.get_requests();
             assert_eq!(requests.len(), 1);
             assert!(requests[0].uri.contains("api.single.com"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_provider_reasoning_fields_pass_through_only_in_non_strict_mode() {
+        for strict_mode in [false, true] {
+            for stream in [false, true] {
+                for path in ["/v1/chat/completions", "/v1/responses", "/v1/completions"] {
+                    let targets_map = Arc::new(DashMap::new());
+                    targets_map.insert(
+                        "model".to_string(),
+                        pool(
+                            Target::builder()
+                                .url("https://engine.example.com".parse().unwrap())
+                                .build(),
+                        ),
+                    );
+                    let targets = Targets {
+                        targets: targets_map,
+                        key_rate_limiters: Arc::new(DashMap::new()),
+                        key_concurrency_limiters: Arc::new(DashMap::new()),
+                        key_labels: Arc::new(DashMap::new()),
+                        strict_mode,
+                        http_pool_config: None,
+                    };
+                    let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+                    let server = TestServer::new(build_router(AppState::with_client(
+                        targets,
+                        mock_client.clone(),
+                    )))
+                    .unwrap();
+                    // Already translated by the public gateway; some mappings retain
+                    // the canonical effort alongside the provider-native controls.
+                    let mut body = json!({
+                        "model": "model", "messages": [], "input": "hello", "prompt": "hello",
+                        "stream": stream,
+                        "chat_template_kwargs": {"enable_thinking": true},
+                        "thinking_token_budget": 512
+                    });
+                    if path.ends_with("chat/completions") {
+                        body["reasoning_effort"] = json!("high");
+                    }
+                    let response = server.post(path).json(&body).await;
+                    let requests = mock_client.get_requests();
+                    if strict_mode {
+                        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+                        assert!(requests.is_empty());
+                    } else {
+                        assert_eq!(response.status_code(), StatusCode::OK);
+                        assert_eq!(requests.len(), 1);
+                        let forwarded: serde_json::Value =
+                            serde_json::from_slice(&requests[0].body).unwrap();
+                        assert_eq!(forwarded, body);
+                    }
+                }
+            }
         }
     }
 

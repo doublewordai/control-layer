@@ -258,7 +258,6 @@ mod tests {
             database: "clay".into(),
             user: "dwctl".into(),
             password: "pw".into(),
-            request_timeout: Duration::from_secs(5),
         })
         .unwrap()
     }

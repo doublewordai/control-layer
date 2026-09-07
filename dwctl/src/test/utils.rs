@@ -36,7 +36,11 @@ pub async fn create_test_app_state_with_config(pool: PgPool, config: crate::conf
         .await
         .expect("Failed to create fusillade TestDbPools");
 
-    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default()));
+    let request_manager = std::sync::Arc::new(
+        fusillade_arsenal::PostgresRequestManager::new(fusillade_pools, Default::default())
+            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
+            .with_template_generation_writes(config.background_services.batch_daemon.template_generation_writes_enabled),
+    );
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
 
@@ -129,10 +133,11 @@ pub async fn create_test_app_state_with_database_pools(
     let fusillade_test_pools = TestDbPools::new(fusillade_pool)
         .await
         .expect("Failed to create fusillade TestDbPools");
-    let request_manager = std::sync::Arc::new(fusillade_arsenal::PostgresRequestManager::new(
-        fusillade_test_pools,
-        Default::default(),
-    ));
+    let request_manager = std::sync::Arc::new(
+        fusillade_arsenal::PostgresRequestManager::new(fusillade_test_pools, Default::default())
+            .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
+            .with_template_generation_writes(config.background_services.batch_daemon.template_generation_writes_enabled),
+    );
     let limiters = crate::limits::Limiters::new(&config.limits);
     let shared_config = crate::SharedConfig::new(config);
 
@@ -206,6 +211,7 @@ pub fn create_test_config() -> crate::config::Config {
 
     crate::config::Config {
         clickhouse: None,
+        prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
         database_url: None,
         database_replica_url: None,
         database: crate::config::DatabaseConfig::External {
@@ -307,6 +313,10 @@ pub fn create_test_config() -> crate::config::Config {
             probe_scheduler: ProbeSchedulerConfig { enabled: false },
             batch_daemon: DaemonConfig {
                 enabled: DaemonEnabled::Never,
+                retention: fusillade::RetentionPolicy {
+                    max_late_writer_seconds: Some(3_600),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             leader_election: LeaderElectionConfig { enabled: false },
@@ -347,7 +357,6 @@ pub fn create_test_config() -> crate::config::Config {
         onboarding_url: None,
         support_email: "support@test.com".to_string(),
         connections: Default::default(),
-        responses: Default::default(),
         image_normalizer: Default::default(),
         openapi: Default::default(),
         cache: Default::default(),
@@ -506,6 +515,7 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         external_user_id: None,
         groups: None, // Groups not included in test users by default
         credit_balance: None,
+        has_purchased: None,
         has_payment_provider_id: false,
         batch_notifications_enabled: false,
         low_balance_threshold: None,
@@ -697,6 +707,7 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         external_user_id: None,
         groups: None,
         credit_balance: None,
+        has_purchased: None,
         has_payment_provider_id: false,
         batch_notifications_enabled: false,
         low_balance_threshold: None,

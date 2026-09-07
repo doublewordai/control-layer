@@ -2537,6 +2537,58 @@ mod tests {
         resp.assert_status(StatusCode::CREATED);
     }
 
+    /// After the template write cutover a file's templates live in
+    /// `request_templates_g2`. The per-file model counts feed both the
+    /// batch-creation validation and the cached `dw_model` label, so they must
+    /// be read through the generation-transparent view or every cutover batch
+    /// is created with an empty model.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_batch_labels_model_when_templates_are_generation_two(pool: PgPool) {
+        let mut config = create_test_config();
+        config.background_services.batch_daemon.template_generation_writes_enabled = true;
+        let (app, _bg_services) = create_test_app_with_config(pool.clone(), config, false).await;
+
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+        let auth = add_auth_headers(&user);
+
+        let jsonl_content = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-batch.jsonl");
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part("file", file_part)
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload_resp = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        upload_resp.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload_resp.json();
+        let file_id = file["id"].as_str().unwrap();
+
+        let create_req = CreateBatchRequest {
+            input_file_id: file_id.to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            completion_window: "24h".to_string(),
+            metadata: None,
+            api_key_id: None,
+        };
+        let resp = app
+            .post("/ai/v1/batches")
+            .json(&create_req)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(StatusCode::CREATED);
+        let batch: serde_json::Value = resp.json();
+        assert_eq!(batch["model"], "gpt-4", "cutover batch must carry its model label: {batch}");
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_batch_in_org_context(pool: PgPool) {

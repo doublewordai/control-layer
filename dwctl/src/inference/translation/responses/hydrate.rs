@@ -26,7 +26,7 @@ pub enum HydrationError {
 /// in place). A request without a `previous_response_id` is left untouched - call
 /// sites should gate on its presence to skip the typed round-trip on the common
 /// path.
-pub async fn hydrate_previous_response(store: &dyn ResponseStore, request_value: &mut Value) -> Result<(), HydrationError> {
+pub async fn hydrate_previous_response(store: &dyn ResponseStore, owner: &str, request_value: &mut Value) -> Result<(), HydrationError> {
     let mut req: ResponsesRequest =
         serde_json::from_value(request_value.clone()).map_err(|e| HydrationError::Internal(format!("parsing Responses request: {e}")))?;
 
@@ -34,11 +34,18 @@ pub async fn hydrate_previous_response(store: &dyn ResponseStore, request_value:
         return Ok(());
     };
 
-    let context = store
-        .get_context(&prev_id)
+    let mut context = store
+        .get_context(&prev_id, owner)
         .await
         .map_err(|e| HydrationError::Internal(format!("reading previous response {prev_id}: {e}")))?
         .ok_or_else(|| HydrationError::NotFound(prev_id.clone()))?;
+    // The store hands back the compact object it persists (id, status, model,
+    // output, usage...), not the fully-populated wire shape `ResponsesResponse`
+    // deserialises. Backfill the same defaults the retrieval endpoint applies
+    // so a stored single-step response can be extended.
+    if let Value::Object(object) = &mut context {
+        super::types::backfill_responses_response_fields(object, &req.model, &prev_id);
+    }
 
     let prior: ResponsesResponse =
         serde_json::from_value(context).map_err(|e| HydrationError::Internal(format!("deserialising previous response: {e}")))?;

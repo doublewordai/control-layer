@@ -2610,11 +2610,11 @@ mod tests {
             onwards: Default::default(),
             onboarding_url: None,
             connections: Default::default(),
-            responses: Default::default(),
             image_normalizer: Default::default(),
             openapi: Default::default(),
             cache: Default::default(),
             clickhouse: None,
+            prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: Default::default(),
             keystore: None,
         };

@@ -1,5 +1,67 @@
 # Changelog
 
+## [11.4.4](https://github.com/doublewordai/control-layer/compare/v11.4.3...v11.4.4) (2026-09-07)
+
+
+### Bug Fixes
+
+* **fusillade:** give the count-estimate EXPLAIN its own budget ([#1661](https://github.com/doublewordai/control-layer/issues/1661)) ([325ab85](https://github.com/doublewordai/control-layer/commit/325ab8523463485c45699dcc880d507d5d4b731e))
+* **onwards:** pass provider reasoning fields through non-strict gateways ([#1591](https://github.com/doublewordai/control-layer/issues/1591)) ([81e0d38](https://github.com/doublewordai/control-layer/commit/81e0d38b4ff98f1e1d0eb02ed523c19499a94e18))
+
+## [11.4.3](https://github.com/doublewordai/control-layer/compare/v11.4.2...v11.4.3) (2026-09-05)
+
+
+### Bug Fixes
+
+* **onwards:** drain active responses during shutdown ([#1586](https://github.com/doublewordai/control-layer/issues/1586)) ([416ef7f](https://github.com/doublewordai/control-layer/commit/416ef7f1b3cf506a6d4bcec658a3e1ea3d3e7402))
+* prune retained partitions in the trailing-demand query by retent… ([#1587](https://github.com/doublewordai/control-layer/issues/1587)) ([909ec68](https://github.com/doublewordai/control-layer/commit/909ec68d89b5e25d9ea56ce42c15a5166d80a3d3))
+
+## [11.4.2](https://github.com/doublewordai/control-layer/compare/v11.4.1...v11.4.2) (2026-09-04)
+
+
+### Bug Fixes
+
+* **billing:** report first-purchase state so the promo can gate on the ledger ([#1562](https://github.com/doublewordai/control-layer/issues/1562)) ([6a16cdd](https://github.com/doublewordai/control-layer/commit/6a16cddc01ae8c6f515577e61267ca01401bce43))
+* **fusillade:** probe the template per picked row in the claim-time stranded check ([#1580](https://github.com/doublewordai/control-layer/issues/1580)) ([1433908](https://github.com/doublewordai/control-layer/commit/1433908c0fbb17fa3ba7b82c543ef5a40730e54c))
+
+## [11.4.1](https://github.com/doublewordai/control-layer/compare/v11.4.0...v11.4.1) (2026-09-04)
+
+
+### Bug Fixes
+
+* Formalize indices missing from migration and drop unused ones ([#1568](https://github.com/doublewordai/control-layer/issues/1568)) ([0866443](https://github.com/doublewordai/control-layer/commit/0866443427b104e17b562fd6bf809da1bb54d855))
+* **fusillade:** drop the stranded-request purge step that times out  ([#1576](https://github.com/doublewordai/control-layer/issues/1576)) ([b9cae7a](https://github.com/doublewordai/control-layer/commit/b9cae7a23c2bd3cafe5c3a20ceb14c62c03f5a90))
+
+## [11.4.0](https://github.com/doublewordai/control-layer/compare/v11.3.0...v11.4.0) (2026-09-04)
+
+
+### Features
+
+* **fusillade:** move overdue batchless graphs concurrently in the backfill ([#1567](https://github.com/doublewordai/control-layer/issues/1567)) ([b0ed45c](https://github.com/doublewordai/control-layer/commit/b0ed45c09b27d1e87022247ea016b212fa958377))
+
+## [11.3.0](https://github.com/doublewordai/control-layer/compare/v11.2.0...v11.3.0) (2026-09-04)
+
+
+### Features
+
+* **prefix_chain:** content-free prompt-structure capture to ClickHouse ([#1555](https://github.com/doublewordai/control-layer/issues/1555)) ([7bf9c92](https://github.com/doublewordai/control-layer/commit/7bf9c922aa0dc4d3df871330af2593c75028e593))
+
+## [11.2.0](https://github.com/doublewordai/control-layer/compare/v11.1.1...v11.2.0) (2026-09-04)
+
+
+### Features
+
+* **analytics:** record engine cached tokens and content-free request params ([#1553](https://github.com/doublewordai/control-layer/issues/1553)) ([411fabc](https://github.com/doublewordai/control-layer/commit/411fabc6cc30b529a7dc11a22d73d69d6864a8c7))
+* **clickhouse:** shared warehouse connection and a generic best-effort insert sink ([#1554](https://github.com/doublewordai/control-layer/issues/1554)) ([6faf6c0](https://github.com/doublewordai/control-layer/commit/6faf6c01bf160e3c594130ebf6925425083e431f))
+* enforce scheduled content retention by partition drop ([#1481](https://github.com/doublewordai/control-layer/issues/1481)) ([fc5aeae](https://github.com/doublewordai/control-layer/commit/fc5aeaeac79d2f73d5fd2175f28877cc150216db))
+
+
+### Bug Fixes
+
+* **deps:** bump browserslist to 4.28.8 (Dependabot [#175](https://github.com/doublewordai/control-layer/issues/175)/[#176](https://github.com/doublewordai/control-layer/issues/176)) ([#1552](https://github.com/doublewordai/control-layer/issues/1552)) ([9f4d912](https://github.com/doublewordai/control-layer/commit/9f4d912fb4bdd3681c85fbaf14e4dda135a33227))
+* **deps:** finish OpenTelemetry 0.32 migration via outlet 0.10 (CVE-2… ([#1550](https://github.com/doublewordai/control-layer/issues/1550)) ([7c6462f](https://github.com/doublewordai/control-layer/commit/7c6462fecba17688364c208fc0d73c608e483ba1))
+* search customer-visible model fields ([#1560](https://github.com/doublewordai/control-layer/issues/1560)) ([486383d](https://github.com/doublewordai/control-layer/commit/486383d594aae9e0f68f231f9c412fec9f210a8c))
+
 ## [11.1.1](https://github.com/doublewordai/control-layer/compare/v11.1.0...v11.1.1) (2026-09-01)
 
 

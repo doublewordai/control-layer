@@ -281,6 +281,196 @@ or fail retries based on a completion deadline. A zero
 `background_concurrency_limit` disables processing but not submission,
 inspection, or cancellation.
 
+## Automated content retention
+
+Retained-response maintenance is an additive daemon capability configured
+with `RetentionMaintenanceConfig`; it is deliberately outside the serialized
+`DaemonConfig` so existing exhaustive configuration literals remain source
+compatible. The default contains no retention duration and enables no data
+movement or retirement.
+
+Current scheduled lifecycle support is limited to terminal batchless response
+graphs in the `priority`, `flex`, and `background` service tiers. Every
+configured tier needs an explicit positive duration, and batchless policy also
+requires an explicit positive late-writer fence. Scheduled file retention and
+terminal file-backed batch retention are rejected until their complete payload
+lifecycle is supported. Explicit deletion continues through the ordinary
+orphan purge and is independent of scheduled retention.
+
+The effective batch claim owner runs archive maintenance. Weekly archive DDL
+starts asynchronously and never delays claim-loop startup. A separate retained
+gate maintains the continuous daily range from tomorrow through the furthest
+configured retention horizon plus its runway. Request-only daemons perform no
+archive DDL or movement. Steady and backfill movement are independently
+disabled by default and share the existing archive workers' pacing; both use
+positive graph and byte budgets. Each tick resolves one immutable observation,
+dwell, and cancellation-grace boundary for every graph considered in that
+pass. The dwell and grace must each be shorter than every enabled retention
+period.
+
+Before enabling retained-response movement, an operator must build the exact
+payload-free candidate index outside a transaction:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_requests_batchless_retention_due
+  ON requests (
+    service_tier,
+    (CASE state WHEN 'completed' THEN completed_at
+                WHEN 'failed' THEN failed_at
+                WHEN 'canceled' THEN canceled_at END),
+    id
+  )
+  WHERE batch_id IS NULL
+    AND state IN ('completed', 'failed', 'canceled');
+```
+
+Verify its keys, predicate, validity, and readiness through the migration-owned
+guard rather than by name alone:
+
+```sql
+SELECT retained_response_archive_index_ready(current_schema());
+```
+
+The safe enable order is: deploy the archive-aware schema and readers; create
+the index concurrently; verify the readiness query returns `true`; configure
+the retention durations, late-writer fence, and partition runway while movers
+remain disabled; then enable the steady mover and, if needed, backfill. Both
+the exact index and continuous runway are checked fail closed. Missing,
+invalid, or transiently unavailable prerequisites prevent batchless movement,
+and bounded background checks allow movement to recover without a restart
+once both become ready.
+
+Daily partition retirement is independently disabled by default. When
+enabled, the archive-maintenance owner retires at most one expired
+retained-response partition per pass: it journals the exact partition
+identity (schema, schema OID, parent OID, child name and OID, and daily
+bounds), fences the bucket `retiring` in the same transaction so every read
+fails closed, detaches the partition concurrently, drops only the exact
+journaled relation, and records completion durably. PostgreSQL's own UTC
+date decides eligibility; a partition for the current day is retired only
+after the database clock passes its `delete_on`, never early and never from
+the pod clock. Recovery resumes an unfinished journal before selecting new
+work, refuses any renamed, replaced, rebounded, or reparented relation, and
+treats lock or statement timeouts as retryable no-ops.
+
+Retirement DDL requires an explicitly installed single-session maintenance
+pool (`with_partition_maintenance_pool`, max one connection, min zero) whose
+target is attested against the primary at startup; server-side lock and
+statement timeouts are set on that session. Enabling the flag without the
+pool fails startup validation, and an unfinished journal must keep an
+enabled owner until it completes — disabling retirement mid-journal is not a
+rollback. After physical retirement, every retained identifier is moved to a
+durable content-free resurrection fence before its routes are deleted in
+bounded chunks by an independent cleanup phase.
+
+Movement and partition maintenance emit only
+aggregate counts and fixed phase labels, never request identifiers or content.
+
+### Rollout ordering and rollback boundaries
+
+The complete deployment sequence is expand-only and each destructive control
+is enabled separately, in order, only after the previous stage has been
+observed healthy:
+
+1. Build the candidate index with `CREATE INDEX CONCURRENTLY` as a monitored
+   standalone operation; application migrations never build indexes on
+   existing hot tables.
+2. Apply the expand-only migration. It adds new relations and helpers and
+   moves no data. It never scans or rewrites the existing request or
+   template heaps, but two statements take a brief `ACCESS EXCLUSIVE` lock
+   on `requests` (dropping the template foreign key here, and dropping the
+   dead `response_steps` table in the follow-up migration); both run under
+   a short `lock_timeout` so a busy claim path is never queued behind them.
+   Apply in a quiet window and expect one retry if the daemon contends.
+3. Roll out an archive-aware reader fleet everywhere before any movement, so
+   every running process can resolve retained routes.
+4. Verify prerequisites with the read-only preflight
+   (`.github/scripts/check-retained-response-indexes.sql`): exact index
+   readiness, exactly attached daily partitions, no unexplained
+   detach-pending child, and the installed schema generation. Confirm the
+   partition-runway gauge reports the full configured horizon.
+5. Enable steady-state movement with minimal graph and byte budgets, observe
+   write amplification, replication, pool, and latency signals, then ramp.
+6. Enable backfill for non-expired history under the same bounds.
+7. Run the separately gated one-time drain for content that is already past
+   its retention period. This is where `batchless_archive_backfill_concurrency`
+   matters: the backfill worker discovers one wave of distinct candidate
+   graphs per tick and then moves up to that many of them at the same time,
+   each in its own transaction under the per-graph advisory lock and a
+   shared (not exclusive) lock on the target day, so the moves overlap in
+   full. Discovery stays serial (one index probe per candidate), so scaling
+   flattens well past the recommended range. The steady sweep is always
+   sequential. Concurrent
+   passes (several pods, or a pod plus a drain) remain safe because every
+   move takes `FOR UPDATE SKIP LOCKED` and verifies by read-back; they simply
+   do not add throughput, because every pass discovers the same oldest
+   graphs. See the drain-pod recipe below.
+8. Enable daily response-partition retirement after installing the dedicated
+   single-session maintenance connection.
+9. Enable weekly batch-archive retirement with an explicit
+   finalization-anchored retention period. Every batch in a week must be
+   fully archived, frozen, and individually past its period before the week
+   drops; completion stamps batch metadata rows (which are never deleted).
+10. Enable the generation-2 template write cutover, then file-content expiry
+    and weekly template retirement with an explicit creation-anchored period.
+    A template week drops only when no live file still owns rows in it; file
+    rows are tombstoned, never deleted. The frozen legacy template heap is
+    dropped later as one relation, in a separately approved forward
+    migration, once its whole horizon has passed.
+
+Rollback boundaries: before step 5 every change is reversible by disabling
+flags and (only on an empty lifecycle) reverting the expand migration — the
+down migration fails closed while any retained object, route, or unfinished
+retirement exists. After movement has run, roll back only to archive-aware
+reader versions; content already in retained partitions is served through
+routes and must not be abandoned by downgrading readers below step 3. After
+the first partition drop, retirement is irreversible by design; an unfinished
+retirement journal must keep an enabled maintenance owner until it completes.
+
+Abort and hold conditions: stop the ramp if the preflight fails, the runway
+gauge falls behind the horizon, retirement retries persist, mover integrity
+errors appear, or read-parity/latency regressions are observed. All of these
+are content-free signals exported by the daemon; none require inspecting
+customer data.
+
+### One-off drain pod
+
+A historical backlog of terminal batchless graphs is far larger than the
+steady state, so drain it from a dedicated, disposable daemon pod rather than
+by raising the fleet's backfill settings. The pod runs the same image and
+configuration as the batch daemon, with these differences:
+
+- daemon `enabled: always` and leader election off, so the pod moves data
+  regardless of which fleet pod currently owns archive maintenance (the
+  movers coordinate through the database, not through leadership);
+- `batchless_archive_backfill_enabled: true`, sweep left as it is in the
+  fleet;
+- `batchless_archive_backfill_concurrency` high (8 to 16 is a sensible
+  starting range), with `batchless_archive_groups_per_tick` several times
+  the concurrency and `batchless_archive_bytes_per_tick` generous enough that
+  the byte budget is not what ends a tick;
+- its own database pool sizing: the fusillade write pool needs at least the
+  concurrency in spare connections, plus the pod's ordinary daemon use, and
+  the pool must fit under the database's connection ceiling alongside the
+  fleet. Startup refuses a concurrency that is not below the fusillade
+  pool's `max_connections`;
+- `batch_archive_backfill_interval_ms` low, so ticks run back to back.
+
+Watch `fusillade_retained_response_movers_active{worker="backfill"}` (the
+configured fan-out, raised only while a tick is running, so read it as a
+max over a window), `fusillade_retained_response_groups_archived_total` for
+progress, and `fusillade_retained_response_graphs_incomplete_skipped_total`
+for graphs an operator must look at. Stop the pod once
+`fusillade_retained_response_archive_may_have_more{worker="backfill"}` stays
+at zero AND `retained_response_archive_failed` background errors are zero
+over the same window (a failing pass keeps the signal raised, never lowers
+it); from then on the fleet's steady sweep keeps up on its own. Ramp the
+concurrency gradually while watching replication lag, write pool saturation,
+and request latency on the primary, and lower it or stop the pod when any
+abort condition above appears. Throughput scales with concurrency only until
+the primary's write path or the pool is saturated; measure on preview or
+staging before choosing the production value.
+
 Ordinary pending-count queries exclude background demand. To expose it, use an
 explicit `ServiceTierFilter::Include(vec![Some("background".to_string())])`; results use a
 separate `"background"` bucket per model and combine batched and batchless

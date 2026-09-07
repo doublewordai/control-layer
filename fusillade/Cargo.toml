@@ -50,3 +50,4 @@ rand = "0.10"
 axum = "0.8"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"] }
 test-log = "0.2.18"
+tokio = { version = "1", features = ["test-util"] }

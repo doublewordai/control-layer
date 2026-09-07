@@ -517,7 +517,6 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
         };
@@ -632,7 +631,6 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
         };
@@ -749,7 +747,6 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
         };
@@ -934,7 +931,6 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
         };
@@ -1051,7 +1047,6 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
         };

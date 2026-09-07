@@ -8,8 +8,10 @@ use onwards::{
     target::{Targets, WatchedFile},
     telemetry,
 };
-use tokio::{net::TcpListener, task::JoinSet};
-use tracing::{error, info, instrument};
+use tokio::net::TcpListener;
+use tracing::{info, instrument};
+
+mod server;
 #[tokio::main]
 #[instrument]
 pub async fn main() -> anyhow::Result<()> {
@@ -46,21 +48,18 @@ async fn run() -> anyhow::Result<()> {
             .await?;
     }
 
-    let mut serves = JoinSet::new();
+    // Install OS signal handlers before opening either listener.
+    let shutdown_signal = server::shutdown_signal()?;
     // If we are running with metrics enabled, set up the metrics layer and router.
-    let prometheus_layer = if config.metrics {
+    let (prometheus_layer, metrics_router) = if config.metrics {
         let (prometheus_layer, prometheus_handle) =
             build_metrics_layer_and_handle(config.metrics_prefix.clone());
 
         let metrics_router = build_metrics_router(prometheus_handle);
-        let bind_addr = format!("0.0.0.0:{}", config.metrics_port);
-        let listener = TcpListener::bind(&bind_addr).await?;
-        serves.spawn(axum::serve(listener, metrics_router).into_future());
-        info!("Metrics endpoint enabled on {}", bind_addr);
-        Some(prometheus_layer)
+        (Some(prometheus_layer), metrics_router)
     } else {
         info!("Metrics endpoint disabled");
-        None
+        (None, Router::new())
     };
 
     // Register the sanitizer globally - per-target sanitize_response flag controls when it's applied
@@ -84,14 +83,18 @@ async fn run() -> anyhow::Result<()> {
     };
     let bind_addr = format!("0.0.0.0:{}", config.port);
     let listener = TcpListener::bind(&bind_addr).await?;
-    serves.spawn(axum::serve(listener, router).into_future());
+    let metrics_addr = format!("0.0.0.0:{}", config.metrics_port);
+    let metrics_listener = TcpListener::bind(&metrics_addr).await?;
     info!("AI Gateway listening on {}", bind_addr);
+    info!("Metrics and health endpoint listening on {}", metrics_addr);
 
-    // Wait for all servers to complete
-    if let Some(result) = serves.join_next().await {
-        result?.map_err(anyhow::Error::from)
-    } else {
-        error!("No server tasks were spawned");
-        Err(anyhow::anyhow!("No server tasks were spawned"))
-    }
+    server::serve(
+        listener,
+        router,
+        metrics_listener,
+        metrics_router,
+        &config,
+        shutdown_signal,
+    )
+    .await
 }

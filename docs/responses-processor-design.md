@@ -110,6 +110,12 @@ re-claims the row and starts a fresh `ResponseLoopHttpClient::execute`.
 The persisted chain (`fusillade.response_steps`) is read by
 `next_action_for`:
 
+> **Status (2026-09):** the server-side tool loop was removed from the edge
+> in August 2026 and the `response_steps` table was dropped in
+> fusillade-arsenal migration `20260904000000_drop_response_steps`. This
+> section describes the design as it existed; a future loop should rebuild
+> as "continuation as fork" against the retained store's per-object routes.
+
 - **Completed steps survive.** `next_action_for` walks the chain, finds
   the terminal step, returns `Complete(payload)` — the loop assembles
   and returns.

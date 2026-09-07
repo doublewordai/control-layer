@@ -272,58 +272,121 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
                 })
                 .collect();
 
-            let mut last_error = None;
-            for attempt in 0..=self.max_retries {
-                match self.request_manager.persist_completed_realtime_batch(&inputs).await {
-                    Ok(()) => {
-                        if attempt > 0 {
-                            debug!(attempt, batch_size, "Responses batch flush succeeded after retry");
-                            counter!("dwctl_requests_writer_retries_total", "outcome" => "success").increment(1);
-                        }
-                        last_error = None;
-                        break;
-                    }
-                    Err(e) => {
-                        last_error = Some(e);
-                        if attempt < self.max_retries {
-                            let delay = self.retry_base_delay * 2u32.pow(attempt);
-                            warn!(
-                                error = %last_error.as_ref().unwrap(),
-                                attempt = attempt + 1,
-                                max_retries = self.max_retries,
-                                delay_ms = delay.as_millis() as u64,
-                                batch_size,
-                                "Responses batch flush failed, retrying"
-                            );
-                            counter!("dwctl_requests_writer_retries_total", "outcome" => "retry").increment(1);
-                            tokio::time::sleep(delay).await;
+            let mut persisted = 0_usize;
+            let mut unavailable = 0_usize;
+            let mut dropped = 0_usize;
+            match self.persist_with_retries(&inputs).await {
+                Ok(()) => persisted = inputs.len(),
+                Err(error) if retained_write_error(&error) == Some(fusillade::RetainedResponseWriteError::NotFound) && inputs.len() > 1 => {
+                    // The storage transaction rolled the mixed batch back.
+                    // Retry records individually so valid siblings persist;
+                    // unavailable identities are terminal and never retried.
+                    for input in &inputs {
+                        match self.persist_with_retries(std::slice::from_ref(input)).await {
+                            Ok(()) => persisted += 1,
+                            Err(error) if retained_write_error(&error) == Some(fusillade::RetainedResponseWriteError::NotFound) => {
+                                unavailable += 1;
+                            }
+                            Err(error) => {
+                                dropped += 1;
+                                crate::background_error!(
+                                    RESPONSES_WRITER,
+                                    "flush_drop",
+                                    Error,
+                                    error_class = response_write_error_class(&error),
+                                    batch_size = 1,
+                                    attempts = self.max_retries + 1,
+                                    "Failed to flush one response record after retries"
+                                );
+                            }
                         }
                     }
                 }
-            }
-
-            if let Some(e) = last_error {
-                crate::background_error!(
-                    RESPONSES_WRITER, "flush_drop", Error,
-                    error = %e,
-                    batch_size,
-                    attempts = self.max_retries + 1,
-                    "Failed to flush responses batch after all retries, dropping batch"
-                );
-                buffer.clear();
-                return;
+                Err(error) if retained_write_error(&error) == Some(fusillade::RetainedResponseWriteError::NotFound) => {
+                    unavailable = inputs.len();
+                }
+                Err(error) => {
+                    dropped = inputs.len();
+                    crate::background_error!(
+                        RESPONSES_WRITER,
+                        "flush_drop",
+                        Error,
+                        error_class = response_write_error_class(&error),
+                        batch_size,
+                        attempts = self.max_retries + 1,
+                        "Failed to flush responses batch after retries"
+                    );
+                }
             }
 
             let duration = start.elapsed();
             histogram!("dwctl_requests_writer_flush_duration_seconds").record(duration.as_secs_f64());
-            counter!("dwctl_requests_writer_records_total").increment(batch_size as u64);
+            counter!("dwctl_requests_writer_records_total").increment(persisted as u64);
+            counter!("dwctl_requests_writer_terminal_total", "outcome" => "unavailable").increment(unavailable as u64);
 
-            debug!(batch_size, duration_ms = duration.as_millis() as u64, "Flushed responses batch");
+            debug!(
+                batch_size,
+                persisted,
+                unavailable,
+                dropped,
+                duration_ms = duration.as_millis() as u64,
+                "Finished responses batch flush"
+            );
 
             buffer.clear();
         }
         .instrument(span)
         .await;
+    }
+
+    async fn persist_with_retries(&self, inputs: &[PersistCompletedRealtimeInput]) -> Result<(), fusillade::FusilladeError> {
+        let batch_size = inputs.len();
+        for attempt in 0..=self.max_retries {
+            match self.request_manager.persist_completed_realtime_batch(inputs).await {
+                Ok(()) => {
+                    if attempt > 0 {
+                        debug!(attempt, batch_size, "Responses batch flush succeeded after retry");
+                        counter!("dwctl_requests_writer_retries_total", "outcome" => "success").increment(1);
+                    }
+                    return Ok(());
+                }
+                Err(error) if retained_write_error(&error) == Some(fusillade::RetainedResponseWriteError::NotFound) => {
+                    return Err(error);
+                }
+                Err(error) if attempt < self.max_retries => {
+                    let delay = self.retry_base_delay * 2u32.pow(attempt);
+                    warn!(
+                        error_class = response_write_error_class(&error),
+                        attempt = attempt + 1,
+                        max_retries = self.max_retries,
+                        delay_ms = delay.as_millis() as u64,
+                        batch_size,
+                        "Responses batch flush failed, retrying"
+                    );
+                    counter!("dwctl_requests_writer_retries_total", "outcome" => "retry").increment(1);
+                    tokio::time::sleep(delay).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the inclusive retry loop always returns")
+    }
+}
+
+fn retained_write_error(error: &fusillade::FusilladeError) -> Option<fusillade::RetainedResponseWriteError> {
+    fusillade::RetainedResponseWriteError::from_fusillade_error(error)
+}
+
+fn response_write_error_class(error: &fusillade::FusilladeError) -> &'static str {
+    if retained_write_error(error).is_some() {
+        "retained_lifecycle"
+    } else {
+        match error {
+            fusillade::FusilladeError::RequestNotFound(_) => "request_not_found",
+            fusillade::FusilladeError::RequestStateConflict { .. } => "state_conflict",
+            fusillade::FusilladeError::ValidationError(_) => "validation",
+            _ => "storage",
+        }
     }
 }
 
@@ -334,10 +397,33 @@ mod tests {
     use fusillade::ReqwestHttpClient;
     use fusillade_arsenal::PostgresRequestManager;
     use sqlx_pool_router::TestDbPools;
+    use std::io::Write;
     use std::time::Duration;
     use tokio::time::timeout;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+
+    #[derive(Clone)]
+    struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     /// Builds a writer wired to a fresh `#[sqlx::test]` pool with the
     /// fusillade schema installed via `fusillade_arsenal::migrator()` (so we don't
@@ -472,6 +558,131 @@ mod tests {
             .await
             .expect("writer should shut down within 5s")
             .expect("writer task should not panic");
+    }
+
+    #[sqlx::test]
+    async fn test_writer_splits_unavailable_record_without_losing_valid_sibling(pool: sqlx::PgPool) {
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let unavailable_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO retained_response_resurrection_fences \
+             (object_id, reason, expires_at) \
+             VALUES ($1, 'erased', NOW() + INTERVAL '1 hour')",
+        )
+        .bind(unavailable_id)
+        .execute(&fusillade_pool)
+        .await
+        .unwrap();
+        let (writer, _sender, manager) = build_writer(pool).await;
+        let valid_id = Uuid::new_v4();
+        let now = Utc::now();
+        let record = |request_id| RawCompletedRequest {
+            request_id,
+            status_code: 200,
+            response_body: r#"{"output":"done"}"#.to_owned(),
+            request_body: r#"{"input":"safe"}"#.to_owned(),
+            model: "test-model".to_owned(),
+            endpoint: "/v1/responses".to_owned(),
+            api_key: String::new(),
+            created_by: "test-owner".to_owned(),
+            started_at: now,
+            completed_at: now,
+        };
+        let mut records = vec![record(unavailable_id), record(valid_id)];
+
+        writer.flush_batch(&mut records).await;
+
+        assert!(records.is_empty());
+        let valid = manager
+            .get_request_detail(RequestId(valid_id))
+            .await
+            .expect("the valid sibling must persist after batch splitting");
+        assert_eq!(valid.status, "completed");
+        assert!(matches!(
+            manager.get_request_detail(RequestId(unavailable_id)).await,
+            Err(fusillade::FusilladeError::RequestNotFound(_))
+        ));
+    }
+
+    #[sqlx::test]
+    async fn test_writer_failure_logs_are_content_free(pool: sqlx::PgPool) {
+        const REQUEST_SENTINEL: &str = "private-request-payload-b83b1a";
+        const RESPONSE_SENTINEL: &str = "private-response-payload-66f319";
+        const MODEL_SENTINEL: &str = "private-model-c13fa2";
+        const API_KEY_SENTINEL: &str = "private-api-key-220b39";
+        const OWNER_SENTINEL: &str = "private-owner-d34fb4";
+        const DATABASE_SENTINEL: &str = "raw-database-error-566e2d";
+        const POSITIVE_CONTROL: &str = "writer-log-capture-positive-control";
+
+        let (mut writer, _sender, _manager) = build_writer(pool.clone()).await;
+        writer.max_retries = 0;
+
+        sqlx::query(
+            r#"
+            CREATE OR REPLACE FUNCTION fusillade.reject_writer_fixture()
+            RETURNS trigger LANGUAGE plpgsql AS $function$
+            BEGIN
+                RAISE EXCEPTION 'raw-database-error-566e2d';
+            END
+            $function$
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            r#"
+            CREATE TRIGGER reject_writer_fixture
+            BEFORE INSERT ON fusillade.request_templates
+            FOR EACH ROW EXECUTE FUNCTION fusillade.reject_writer_fixture()
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let log_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(CaptureWriter(log_bytes.clone()))
+            .finish();
+        let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+        tracing::info!(POSITIVE_CONTROL);
+
+        let request_id = Uuid::new_v4();
+        let now = Utc::now();
+        let mut records = vec![RawCompletedRequest {
+            request_id,
+            status_code: 200,
+            response_body: RESPONSE_SENTINEL.to_owned(),
+            request_body: REQUEST_SENTINEL.to_owned(),
+            model: MODEL_SENTINEL.to_owned(),
+            endpoint: "/v1/responses".to_owned(),
+            api_key: API_KEY_SENTINEL.to_owned(),
+            created_by: OWNER_SENTINEL.to_owned(),
+            started_at: now,
+            completed_at: now,
+        }];
+        writer.flush_batch(&mut records).await;
+
+        let logs = String::from_utf8(log_bytes.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains(POSITIVE_CONTROL), "the capture subscriber must be active");
+        assert!(logs.contains("Failed to flush responses batch after retries"));
+        for secret in [
+            REQUEST_SENTINEL,
+            RESPONSE_SENTINEL,
+            MODEL_SENTINEL,
+            API_KEY_SENTINEL,
+            OWNER_SENTINEL,
+            DATABASE_SENTINEL,
+        ] {
+            assert!(!logs.contains(secret), "sensitive value leaked into tracing output");
+        }
+        assert!(
+            !logs.contains(&request_id.to_string()),
+            "request identity leaked into tracing output"
+        );
     }
 
     #[sqlx::test]

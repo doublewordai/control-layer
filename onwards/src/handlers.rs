@@ -572,9 +572,11 @@ pub async fn target_message_handler<T: HttpClient>(
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|_| {
             OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
         })?;
-        crate::reasoning::validate_canonical_reasoning(&canonical_request_path, &body).map_err(
-            |error| OnwardsErrorResponse::reasoning(&error),
-        )?
+        crate::reasoning::parse_reasoning_request(
+            &canonical_request_path,
+            &body,
+            state.targets.strict_mode,
+        ).map_err(|error| OnwardsErrorResponse::reasoning(&error))?
     } else {
         None
     };
