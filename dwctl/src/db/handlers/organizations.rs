@@ -2274,7 +2274,7 @@ mod tests {
     /// administer it. Colleagues signing up were offered that workspace and
     /// could file join requests into it that no one could ever approve - the
     /// same dead-end the `is_deleted = false` filter exists to prevent, one
-    /// level down. Prod held eight of these.
+    /// level down.
     #[sqlx::test]
     async fn test_find_by_domain_skips_orgs_with_no_live_admin(pool: PgPool) {
         let owner = create_individual(&pool, "owner", "owner@acme.com").await;

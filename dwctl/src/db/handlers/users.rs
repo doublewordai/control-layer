@@ -499,7 +499,7 @@ impl<'c> Repository for Users<'c> {
                 .execute(&mut *tx)
                 .await?;
 
-            // Hand on every workspace this user owned, or close it.
+            // Hand over every workspace this user owned, or close it.
             //
             // Deleting a user used to scrub the row and walk away from their
             // `user_organizations` rows, which left the workspace live, still
@@ -542,7 +542,7 @@ impl<'c> Repository for Users<'c> {
                 match successor {
                     Some(successor_id) => {
                         sqlx::query!(
-                            r#"UPDATE user_organizations SET role = 'owner' WHERE organization_id = $1 AND user_id = $2"#,
+                            r#"UPDATE user_organizations SET role = 'owner' WHERE organization_id = $1 AND user_id = $2 AND status = 'active'"#,
                             org_id,
                             successor_id
                         )
