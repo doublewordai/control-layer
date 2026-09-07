@@ -9,12 +9,11 @@
 //!   `type == "input_image"` and a bare `image_url` string (not nested
 //!   under a `.url` field).
 //!
-//! Two operating modes:
+//! Operating modes:
 //!
-//! - [`Mode::HttpOnly`] — substitute values starting with `http://` or
-//!   `https://` only. `data:` URIs and other schemes pass through.
-//! - [`Mode::All`] — additionally substitute `data:` URIs (the opt-in
-//!   "image privacy" mode).
+//! - [`Mode::All`] — substitute HTTP(S) URLs and `data:` URIs. The
+//!   system-wide default: every image input gets normalised through
+//!   the content-addressed store.
 //!
 //! Two more modes cover `dw-img://...` opaque tokens (what the flex enqueue
 //! and file-ingest paths store): [`Mode::TokensOnly`] touches only tokens,
@@ -30,11 +29,7 @@ use super::token::ImageToken;
 /// Which inputs the walker should hand to the substitution callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
-    /// Only HTTP(S) URLs. Used by default for users who haven't opted into
-    /// full normalisation.
-    HttpOnly,
-    /// HTTP(S) URLs and `data:` URIs. Used when the calling user has the
-    /// per-account opt-in enabled.
+    /// HTTP(S) URLs and `data:` URIs. The system-wide default mode.
     All,
     /// Only opaque `dw-img://` tokens: swap tokens for fresh signed URLs.
     TokensOnly,
@@ -49,7 +44,6 @@ pub enum Mode {
 impl Mode {
     fn applies_to(self, input: &str) -> bool {
         match self {
-            Mode::HttpOnly => is_http_url(input),
             Mode::All => is_http_url(input) || crate::image_normalizer::data_uri::looks_like_data_uri(input),
             Mode::TokensOnly => ImageToken::looks_like_token(input),
             Mode::AllAndTokens => Mode::All.applies_to(input) || ImageToken::looks_like_token(input),
@@ -273,38 +267,12 @@ mod tests {
         // Mode decides: a token is not an `All` input, but is an `AllAndTokens` one.
         assert!(!has_inputs(&token_only, Mode::All));
         assert!(has_inputs(&token_only, Mode::AllAndTokens));
-        // A data URI is not an `HttpOnly` input.
-        assert!(!has_inputs(&responses, Mode::HttpOnly));
     }
 
     /// Substitution callback that just prefixes the input — easy to assert
     /// against and never errors.
     async fn prefix_with(prefix: &'static str, url: String) -> Result<String, Infallible> {
         Ok(format!("{prefix}:{url}"))
-    }
-
-    #[tokio::test]
-    async fn http_only_substitutes_http_in_chat_completions_shape() {
-        let mut body = json!({
-            "model": "vision",
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        { "type": "text", "text": "describe" },
-                        { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } },
-                        { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
-                    ]
-                }
-            ]
-        });
-
-        let count = substitute_with(&mut body, Mode::HttpOnly, |u| prefix_with("X", u)).await.unwrap();
-
-        assert_eq!(count, 1);
-        let content = &body["messages"][0]["content"];
-        assert_eq!(content[1]["image_url"]["url"], "X:https://example.com/a.png");
-        assert_eq!(content[2]["image_url"]["url"], "data:image/png;base64,AAAA"); // untouched
     }
 
     #[tokio::test]
@@ -342,7 +310,7 @@ mod tests {
             ]
         });
 
-        let count = substitute_with(&mut body, Mode::HttpOnly, |u| prefix_with("R", u)).await.unwrap();
+        let count = substitute_with(&mut body, Mode::All, |u| prefix_with("R", u)).await.unwrap();
 
         assert_eq!(count, 1);
         assert_eq!(body["input"][0]["content"][1]["image_url"], "R:https://example.com/b.png");
@@ -370,7 +338,7 @@ mod tests {
         let mut body = json!({
             "messages": [{ "role": "user", "content": "hello world" }]
         });
-        let count = substitute_with(&mut body, Mode::HttpOnly, |u| prefix_with("Z", u)).await.unwrap();
+        let count = substitute_with(&mut body, Mode::All, |u| prefix_with("Z", u)).await.unwrap();
         assert_eq!(count, 0);
     }
 
@@ -432,7 +400,7 @@ mod tests {
                 ]
             }]
         });
-        let count = substitute_with(&mut body, Mode::HttpOnly, |u| prefix_with("X", u)).await.unwrap();
+        let count = substitute_with(&mut body, Mode::All, |u| prefix_with("X", u)).await.unwrap();
         assert_eq!(count, 1);
     }
 }
