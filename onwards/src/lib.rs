@@ -1609,6 +1609,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_upstream_429_exhaustion_surfaces_429_not_502() {
+        // Every attempt answers 429 — upstream backpressure, not a gateway
+        // failure. When the retry budget exhausts, the caller must see the
+        // upstream's 429 (rate_limit_error), not a 502 that misclassifies
+        // saturation as a proxy 5xx. This is the exhaustion shape that made
+        // production's per-model proxy-5xx alert page on OpenRouter rate
+        // limits.
+        let mock = MockHttpClient::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"Rate limit exceeded","type":"rate_limit_error","code":429}}"#,
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![429]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            429,
+            "exhausted upstream rate limits must surface as 429, not 502"
+        );
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "rate_limit");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "the retry budget must still be spent against the pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_5xx_exhaustion_still_surfaces_502() {
+        // Guard the 429 change's boundary: a genuine upstream 5xx on every
+        // attempt keeps the generic gateway failure (502) on exhaustion.
+        let mock = MockHttpClient::new(StatusCode::BAD_GATEWAY, r#"{"error":{"code":502}}"#);
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 502);
+        assert_eq!(mock.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
     async fn test_streaming_keepalive_then_token_is_forwarded_not_retried() {
         // A valid stream that leads with a keep-alive comment and only *then*
         // emits its first token must be forwarded as-is — the keep-alive is not

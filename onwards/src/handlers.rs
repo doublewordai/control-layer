@@ -1022,6 +1022,16 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
+            // The candidate error becomes the client response when the retry
+            // budget exhausts, so it must carry the upstream class of failure.
+            // A rate-limited upstream is backpressure: if the last attempt
+            // answered 429, surface 429 (as the provider-limiter fallback
+            // below already does) instead of a 502 that misfiles upstream
+            // saturation as a proxy 5xx. Other fallback statuses keep the
+            // generic gateway error.
+            if status == 429 {
+                return LoopAction::Continue(Some(OnwardsErrorResponse::rate_limited()));
+            }
             return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
         }
 
