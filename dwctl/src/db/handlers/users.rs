@@ -586,7 +586,16 @@ impl<'c> Repository for Users<'c> {
             // account leaves it able to keep authenticating into workspaces
             // that outlived it. Same treatment the member-removal and leave
             // paths already apply via `soft_delete_member_org_keys`.
-            sqlx::query!(
+            //
+            // Attribution, not authorship: `created_by` on an org key is the
+            // member it belongs to (`api_keys.rs` sets it from `member_id`),
+            // so this does not touch keys this user issued to other people. It
+            // does take an org-wide key they created without naming a member,
+            // which is attributed to them - the same consequence
+            // `soft_delete_member_org_keys` already has when an org removes
+            // somebody. Logged because, unlike a removal, an account deletion
+            // is invisible to the workspace on the other end of it.
+            let revoked = sqlx::query!(
                 r#"
                 UPDATE api_keys SET is_deleted = true
                 WHERE created_by = $1
@@ -596,7 +605,15 @@ impl<'c> Repository for Users<'c> {
                 id
             )
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected();
+            if revoked > 0 {
+                tracing::info!(
+                    user_id = %abbrev_uuid(&id),
+                    revoked,
+                    "Revoked organization API keys held by a deleted user"
+                );
+            }
 
             // The departing user is not a member of anything any more. Left
             // behind, these rows are what made the workspaces above look owned
