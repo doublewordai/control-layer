@@ -193,6 +193,12 @@ impl RequestContext {
             Some(Value::Object(map)) => map,
             _ => serde_json::Map::new(),
         };
+        // Every recognised mode alias comes OUT before the override goes in —
+        // leaving an `enable_thinking: false` beside `thinking_mode:
+        // "thinking"` hands the template two contradictory answers, and which
+        // one it reads is the template's business, not ours.
+        kwargs.remove("thinking");
+        kwargs.remove("enable_thinking");
         kwargs.insert(
             "thinking_mode".to_string(),
             Value::String(if thinking { "thinking" } else { "chat" }.to_string()),
@@ -512,7 +518,7 @@ fn frame_payload(event: &[u8]) -> Option<&str> {
 }
 
 /// Wrap the response body in the tee + resume loop.
-fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Response {
+fn tee(response: Response, state: ContinuationState, mut ctx: RequestContext) -> Response {
     let (parts, body) = response.into_parts();
     // Normalise the body error to io::Error, then reassemble SSE events so we
     // only ever inspect (and the client only ever receives) complete frames — a
@@ -969,24 +975,15 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
                     if first_death_reason.is_none() {
                         first_death_reason = Some(reason);
                     }
-                    // A translation-resolved mode describes the TRANSLATED
-                    // member's prompt. The default pool can be served by other
-                    // members (weighted balancing, or the reserve while dynamo
-                    // is descheduled) whose translation — or native handling of
-                    // `reasoning_effort` — may put the prompt in the OTHER
-                    // mode, and a seed that disagrees with the real prompt
-                    // splices or omits a `</think>`. Leg 1's server is known
-                    // from its envelope (dynamo ids are `dyn-*`, the same
-                    // detection the resume legs use); anything else surfaces
-                    // the death exactly as an unarmed stream would.
-                    if ctx.thinking_override.is_some()
-                        && !acc.envelope().is_some_and(|e| e.id.starts_with("dyn-"))
-                    {
-                        if let Some(frame) = first_death.take() {
-                            yield Ok(frame);
-                        }
-                        outcome.record("disarmed", "unverified_mode");
-                        break 'chain;
+                    // The render's mode follows the ACCUMULATOR's — evidence
+                    // (observed reasoning proves a think block, whichever
+                    // member served leg 1) over the resolved default. Splice
+                    // and render moving together is the safety invariant: a
+                    // mis-defaulted content-only stream yields a coherent
+                    // prompt of the other mode, never a `</think>` leak —
+                    // the v1 incident was precisely these two DISAGREEING.
+                    if let Some(t) = acc.render_thinking() {
+                        ctx.thinking_override = Some(t);
                     }
                     // A seam inside reasoning/tool syntax no longer blocks the
                     // resume: the leg's raw output goes through the

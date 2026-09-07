@@ -1297,40 +1297,69 @@ async fn a_translated_route_renders_the_efforts_mode_not_the_row_kwargs(pool: Pg
     }
 }
 
-/// A translation-resolved mode describes the TRANSLATED member's prompt. When
-/// another member served leg 1 (the reserve while dynamo is descheduled — a
-/// routine state, not an incident), its prompt may have run in the other mode,
-/// so the death surfaces unresumed rather than resuming on a seed the real
-/// prompt may disagree with.
+/// A reasoning death on a leg the RESERVE served (an OpenRouter-shaped
+/// envelope — routine while dynamo is descheduled, and a major death source)
+/// still resumes: observed reasoning is PROOF of thinking mode whichever
+/// member ran the prompt, so the seed and the render follow the evidence, not
+/// the member's (invisible) translation.
 #[sqlx::test]
-async fn a_translated_mode_never_resumes_a_leg_served_elsewhere(pool: PgPool) {
+async fn a_reserve_served_reasoning_death_resumes_on_stream_evidence(pool: PgPool) {
     let fake = Fake::new(
-        // An OpenRouter-shaped envelope id: not the translated dynamo member.
-        vec![content("gen-openrouter-1", "Hello"), Chunk::Reset],
-        vec![vec![leg_text(", world!", Some("stop")), leg_usage(1002, 2), done()]],
+        vec![
+            reasoning("gen-openrouter-1", "Let me"),
+            reasoning("gen-openrouter-1", " think"),
+            Chunk::Reset,
+        ],
+        vec![vec![
+            leg_text(" carefully.</think>Answer.", Some("stop")),
+            leg_usage(1012, 8),
+            done(),
+        ]],
     );
-    let tokenizer = render_stub(vec![4, 5], 1002, 2).await;
+    let rendered = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let sink = Arc::clone(&rendered);
+    let tokenizer = MockServer::start().await;
+    Mock::given(wm_method("POST"))
+        .and(wm_path("/v1/render"))
+        .respond_with(move |req: &wiremock::Request| {
+            sink.lock().unwrap().push(serde_json::from_slice(&req.body).unwrap());
+            ResponseTemplate::new(200).set_body_json(json!({
+                "token_ids": [4, 5], "total": 1012, "continuation_tokens": 2
+            }))
+        })
+        .mount(&tokenizer)
+        .await;
     let mut st = state(pool, &fake, tokenizer.uri(), dsv4_config());
     st.routes = Arc::new(ContinuationRoutes::with_routes([(
         MODEL.to_string(),
         crate::continuation::RouteInfo {
+            // The route's translation claims CHAT for this effort — but the
+            // stream's own reasoning proves the serving member disagreed.
             render_kwargs: None,
             strip_leading_bos: false,
-            effort_thinking: Some([("high".to_string(), true)].into_iter().collect()),
+            effort_thinking: Some([("high".to_string(), false)].into_iter().collect()),
         },
     )]));
 
     let mut body = streaming_body();
     body["reasoning_effort"] = json!("high");
     let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(body)).await.unwrap()).await;
+    let frames = parsed(&payloads);
 
-    assert!(
-        fake.resume_requests().is_empty(),
-        "no resume leg is dispatched on an unverified mode"
+    assert_eq!(fake.resume_requests().len(), 1, "the reserve-served death IS resumed");
+    let render_requests = rendered.lock().unwrap().clone();
+    assert_eq!(
+        render_requests[0]["continuation_text"], "Let me think",
+        "the prefix is the observed reasoning"
     );
+    assert_eq!(
+        render_requests[0]["chat_template_kwargs"]["thinking_mode"], "thinking",
+        "the render follows the evidence, not the mis-resolved default"
+    );
+    assert_eq!(contents(&frames), "Answer.", "the rescued answer reaches the client as content");
     assert!(
-        !payloads.iter().any(|p| p.contains("world")),
-        "the stream ends at the death, exactly like an unarmed one"
+        !payloads.iter().any(|p| p.contains("</think>")),
+        "the think close is structure, never client text"
     );
 }
 

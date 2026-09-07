@@ -105,6 +105,15 @@ pub trait StreamAccumulator: Send {
         Box::new(PlainForward)
     }
 
+    /// The thinking/chat mode the resume RENDER must use, when this
+    /// accumulator owns the mode question: `Some` from a family reconstructor
+    /// (its evidence-or-default mode, so splice and render always agree —
+    /// the agreement, not the guess, is the safety invariant), `None` from the
+    /// plain path (its render keeps the v1 route-kwargs behaviour untouched).
+    fn render_thinking(&self) -> Option<bool> {
+        None
+    }
+
     /// Whether the layer may inject a message-opening `role` into the first
     /// resumed delta when leg 1 never delivered one. A capability of the
     /// SELECTED accumulator — not of the config key — so an unrecognised

@@ -126,6 +126,16 @@ pub struct Dsv4Forward {
     /// id-only opening delta whose call the resume regenerates). Consumed by
     /// the first `scan_invoke_name` emission instead of minting a fresh one.
     reuse_id: Option<String>,
+    /// Seeded at [`ForwardSeed::InToolCall`]: how many bytes of the `", "`
+    /// separator before the next parameter the client ALREADY holds (its
+    /// arguments ended `,` or `, `). The next parameter emits only the
+    /// remainder — re-emitting delivered punctuation corrupts the JSON.
+    sep_delivered: usize,
+    /// Seeded at [`ForwardSeed::InToolCall`]: how many bytes of the `": "`
+    /// after the in-flight key the client already holds. `Tail::KeyDone`
+    /// covers both "quote closed, no colon yet" and "colon (and space)
+    /// delivered, value not started" — only the raw tail says which.
+    colon_delivered: usize,
     /// The in-flight seeded call reached the client without an id — mint one
     /// and attach it to that call's first resumed fragment.
     id_owed: bool,
@@ -147,6 +157,8 @@ impl Dsv4Forward {
             tool_calls_emitted: false,
             reuse_id: None,
             id_owed: false,
+            sep_delivered: 0,
+            colon_delivered: 0,
         };
         match seed {
             ForwardSeed::Reasoning => parser.state = State::Reasoning,
@@ -172,10 +184,27 @@ impl Dsv4Forward {
                 parser.opened = args_so_far.trim_start().starts_with('{');
                 let (pairs, tail) = parse_partial_args(&args_so_far);
                 parser.params = !pairs.is_empty();
+                // JSON punctuation the client ALREADY holds past the last
+                // complete token is owed by them, not by us — the canonical
+                // separators are `", "` and `": "`, and the raw tail says how
+                // much of one was delivered before the death.
+                let delivered = |full: &str| (1..=full.len()).rev().find(|n| args_so_far.ends_with(&full[..*n])).unwrap_or(0);
                 parser.state = match tail {
-                    None => State::Invoke,
+                    None => {
+                        parser.sep_delivered = delivered(", ");
+                        State::Invoke
+                    }
                     Some(Tail::Key(_)) => State::ParamName,
-                    Some(Tail::KeyDone(_)) => State::ParamAttr,
+                    // `Tail::KeyDone` spans "key quote closed" through "colon
+                    // and space delivered": what the next parameter-attribute
+                    // scan owes depends on the raw tail. (The DSML prefix for
+                    // this state ends after the name-closing quote, so the
+                    // resumed leg starts directly at ` string=` — pinned by
+                    // the in-call-seed owed-bytes test.)
+                    Some(Tail::KeyDone(_)) => {
+                        parser.colon_delivered = delivered(": ");
+                        State::ParamAttr
+                    }
                     Some(Tail::Value { is_string, .. }) => {
                         parser.is_string = is_string;
                         State::ParamValue
@@ -393,8 +422,11 @@ impl Dsv4Forward {
             }
             if tag == PARAMETER_OPEN {
                 if self.params {
-                    frag.push_str(", ");
+                    // Only the part of the separator the client does not
+                    // already hold (a death at `…", ` delivered it all).
+                    frag.push_str(&", "[self.sep_delivered.min(2)..]);
                 }
+                self.sep_delivered = 0;
                 frag.push('"');
                 self.state = State::ParamName;
             } else {
@@ -429,15 +461,14 @@ impl Dsv4Forward {
         let Some(i) = rest.find(TAG_END) else {
             return 0;
         };
+        let attr = &rest[..i];
         // ` string="true` / ` string="false` — the grammar allows exactly
-        // those two. Guessing at anything else silently rewrites the model's
-        // raw bytes on a chained resume (a case-variant `FALSE` re-serializes
-        // lowercase; a typo'd flag changes the argument's TYPE), so an
-        // unrecognised value poisons instead — the resume aborts and the
-        // original death surfaces.
-        // The COMPLETE attribute text is matched, not just its last quoted
-        // token — ` junk="true` must not pass as ` string="true`.
-        self.is_string = match &rest[..i] {
+        // those two, matched as the COMPLETE attribute text (a foreign
+        // attribute carrying `"true` must not pass). Guessing at anything else
+        // silently rewrites the model's raw bytes on a chained resume, so an
+        // unrecognised attribute poisons — the resume aborts and the original
+        // death surfaces.
+        self.is_string = match attr {
             " string=\"true" => true,
             " string=\"false" => false,
             _ => {
@@ -445,7 +476,12 @@ impl Dsv4Forward {
                 return i + TAG_END.len();
             }
         };
-        self.push_args(if self.is_string { ": \"" } else { ": " });
+        // Emit only the punctuation the client does not already hold: a death
+        // at `{"city": ` delivered the colon and space, and re-sending them
+        // yields `{"city": : "…`.
+        let owed = if self.is_string { ": \"" } else { ": " };
+        self.push_args(&owed[self.colon_delivered.min(2)..]);
+        self.colon_delivered = 0;
         self.state = State::ParamValue;
         i + TAG_END.len()
     }

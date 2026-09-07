@@ -678,6 +678,12 @@ fn an_in_call_seed_owes_only_what_the_client_has_not_received() {
         ("{", "<｜DSML｜parameter name=\"city\" string=\"true\">Paris", r#""city": "Paris"#),
         (r#"{"ci"#, "ty\" string=\"true\">Paris", r#"ty": "Paris"#),
         (r#"{"city""#, " string=\"true\">Paris", r#": "Paris"#),
+        // `Tail::KeyDone` also covers "colon (and space) already delivered" —
+        // the owed punctuation shrinks with what the client holds, or the
+        // arguments would read `{"city": : "Paris`.
+        (r#"{"city":"#, " string=\"true\">Paris", r#" "Paris"#),
+        (r#"{"city": "#, " string=\"true\">Paris", r#""Paris"#),
+        (r#"{"n": "#, " string=\"false\">12", "12"),
         (r#"{"city": "Par"#, "is", "is"),
         // A closed value quote in the delivered args means leg 1's parser saw
         // the parameter close tag, so the reconstructed prefix ends AFTER
@@ -690,6 +696,13 @@ fn an_in_call_seed_owes_only_what_the_client_has_not_received() {
             r#", "unit": "c"#,
         ),
         (r#"{"n": 12"#, "5", "5"),
+        // A trailing separator works the same way: the client already holds
+        // `, `, so the next parameter owes only its opening quote.
+        (
+            r#"{"city": "Paris", "#,
+            "<｜DSML｜parameter name=\"unit\" string=\"true\">c",
+            r#""unit": "c"#,
+        ),
     ];
     for (delivered, raw, owed) in cases {
         let mut parser = Dsv4Forward::new(ForwardSeed::InToolCall {
@@ -708,25 +721,33 @@ fn an_in_call_seed_owes_only_what_the_client_has_not_received() {
     }
 }
 
-/// A chat-mode leg has no think tag to close, so its resumed text is content
-/// from the first byte — the seed says so, and nothing infers it from the text.
+/// The mode is stream evidence first, resolved default second: observed
+/// `reasoning_content` PROVES an open think block (a chat prompt cannot
+/// produce one), whichever member served the leg — the OpenRouter reserve's
+/// translation is invisible to us, but its reasoning output is not. A
+/// content-only stream keeps the default, and either default is
+/// self-consistent because the splice and the render always agree.
 #[test]
-fn the_seed_follows_the_legs_serving_mode() {
+fn the_seed_follows_evidence_over_the_resolved_default() {
     let body = json!({"id": "c", "choices": [{"index": 0, "delta": {"reasoning_content": "hmm"}}]});
 
     let mut thinking = Dsv4Reconstructor::new(CAP, true);
     thinking.ingest(&body).unwrap();
     assert_eq!(thinking.forward_seed(), ForwardSeed::Reasoning);
 
+    // A chat-DEFAULTED stream that emits reasoning was really thinking — the
+    // default was wrong (an untranslated member served the leg), and the
+    // evidence corrects both the seed and the render mode.
     let mut chat = Dsv4Reconstructor::new(CAP, false);
     chat.ingest(&body).unwrap();
-    assert_eq!(
-        chat.forward_seed(),
-        ForwardSeed::Content,
-        "a chat-mode prompt already ended with </think>; there is none coming"
-    );
+    assert_eq!(chat.forward_seed(), ForwardSeed::Reasoning);
+    assert_eq!(chat.render_thinking(), Some(true), "the render follows the same evidence");
 
-    // Once the body has started, both are content.
+    // Content-only: the default stands, and the render agrees with it.
+    let chat_only = Dsv4Reconstructor::new(CAP, false);
+    assert_eq!(chat_only.render_thinking(), Some(false));
+
+    // Once the body has started, the seed is content either way.
     thinking
         .ingest(&json!({"choices": [{"index": 0, "delta": {"content": "Answer"}}]}))
         .unwrap();

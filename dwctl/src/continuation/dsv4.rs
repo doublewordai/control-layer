@@ -470,9 +470,10 @@ pub struct Dsv4Reconstructor {
     content: String,
     tools: Vec<ToolSlot>,
     saw_any_tool_frame: bool,
-    /// Generation began inside an open `<think>` — the rendered default for this
-    /// family, and what the resume render reproduces.
-    thinking: bool,
+    /// The RESOLVED default for whether generation began inside an open
+    /// `<think>` (route/translation resolution). Only consulted while the
+    /// stream itself has not proven the mode — see [`Self::thinking`].
+    thinking_default: bool,
     cap: usize,
     envelope: Option<Envelope>,
     finish_reason: bool,
@@ -485,17 +486,18 @@ impl Dsv4Reconstructor {
     /// from the route's `render_kwargs` (see [`super::RouteInfo::thinking`]),
     /// because that is what the prefix is rendered with: tokenizer-svc renders
     /// this family in thinking mode by default, but a route serving it in chat
-    /// mode ends `</think>` already and must not get a second one. The mode
-    /// cannot be inferred from the deltas — a thinking-mode turn that does no
-    /// thinking emits `</think>` first with no `reasoning_content` at all, which
-    /// is exactly the `plat-reasoning` fixture.
+    /// mode ends `</think>` already and must not get a second one. This is the
+    /// DEFAULT: observed `reasoning_content` overrides it (see
+    /// [`Self::thinking`]) — but the converse cannot be inferred, because a
+    /// thinking-mode turn that does no thinking emits `</think>` first with no
+    /// `reasoning_content` at all (exactly the `plat-reasoning` fixture).
     pub fn new(cap: usize, thinking: bool) -> Self {
         Self {
             reasoning: String::new(),
             content: String::new(),
             tools: Vec::new(),
             saw_any_tool_frame: false,
-            thinking,
+            thinking_default: thinking,
             cap,
             envelope: None,
             finish_reason: false,
@@ -521,6 +523,20 @@ impl Dsv4Reconstructor {
     /// Reserve `extra` bytes against the cap, or report the overrun.
     fn fits(&self, extra: usize) -> bool {
         self.len_bytes() + extra <= self.cap
+    }
+
+    /// The mode this stream is KNOWN to run in. Observed `reasoning_content`
+    /// is PROOF of an open think block — a chat-mode prompt cannot produce it —
+    /// and outranks the resolved default, whichever member served the stream.
+    /// This is what keeps the splice and the resume render correct for a leg
+    /// served by a provider whose translation we cannot see (e.g. the
+    /// OpenRouter reserve): the moment reasoning streams, the mode is fact,
+    /// not configuration. Without reasoning the default stands, and either
+    /// default is SELF-CONSISTENT (splice and render always agree — see
+    /// `render_thinking`), so a mis-defaulted content-only stream produces a
+    /// coherent prompt of the other mode, never a leaked `</think>`.
+    fn thinking(&self) -> bool {
+        !self.reasoning.is_empty() || self.thinking_default
     }
 
     fn slot(&mut self, index: i64) -> &mut ToolSlot {
@@ -561,7 +577,7 @@ impl Dsv4Reconstructor {
             // else is still inside the think block — but only a thinking-mode
             // leg HAS one to close; a chat-mode prompt already ended with it.
             let started_body = !self.content.is_empty();
-            return if self.thinking && !started_body {
+            return if self.thinking() && !started_body {
                 ForwardSeed::Reasoning
             } else {
                 ForwardSeed::Content
@@ -612,7 +628,7 @@ impl Dsv4Reconstructor {
         let started_body = !self.content.is_empty() || self.saw_any_tool_frame;
 
         out.push_str(&self.reasoning);
-        if self.thinking && started_body {
+        if self.thinking() && started_body {
             out.push_str(THINK_END);
         }
         out.push_str(&self.content);
@@ -803,6 +819,12 @@ impl StreamAccumulator for Dsv4Reconstructor {
     /// family and nothing else.
     fn forward_parser(&self) -> Box<dyn ForwardParser> {
         Box::new(Dsv4Forward::new(self.forward_seed()))
+    }
+
+    /// The render follows the same evidence-or-default mode as the splice —
+    /// their AGREEMENT is what makes either default self-consistent.
+    fn render_thinking(&self) -> Option<bool> {
+        Some(self.thinking())
     }
 
     /// Role repair rides the family reconstructor, alongside its parser: this
