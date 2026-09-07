@@ -1,0 +1,112 @@
+-- Replace two rank-ordered listing indexes with one archive sort index.
+--
+-- Follows the COR-537 index audit (see 20260904020000_drop_unused_indexes) and
+-- pairs with the Responses page query rewrite in the same change. Net effect on
+-- a production-sized database: +204 MB, -7,101 MB.
+--
+-- ---------------------------------------------------------------------------
+-- Why the two dropped indexes stopped earning their keep
+-- ---------------------------------------------------------------------------
+--
+--   idx_requests_user_active_sort    3983 MB     3,427 scans
+--   idx_requests_active_first_tier   3118 MB       169 scans
+--
+-- Both exist for one reason: to materialize `ORDER BY CASE state WHEN
+-- 'processing' THEN 0 ... ELSE 3 END`, the "active first" ordering of the
+-- Responses page. That is a presentation choice, not a data property, and three
+-- things made it a bad one to encode in an index:
+--
+-- 1. The rank column is unbounded. In (created_by, RANK, created_at DESC, id
+--    DESC) the rank sits between the equality column and the range column, and
+--    nothing ever supplies an equality on it. On PostgreSQL 17 that stops
+--    `created_at` from being a scan boundary (no btree skip scan until 18), so
+--    a date-filtered page walked every entry newer than the requested range
+--    instead of seeking to it -- measured at 1,774,936 index entries walked to
+--    return a 10-row page.
+--
+-- 2. The ordering it provides is almost meaningless now. These indexes were
+--    formalized in 20260630000000, when batchless responses were new. The
+--    batchless population is now overwhelmingly terminal: at the time of
+--    writing exactly one row is non-terminal, so ~7 GB of index existed to
+--    order 20M rows by a column that is constant for all but one of them.
+--
+-- 3. They competed for cache with everything else. `requests` carried ~29 GB of
+--    indexes against a 32 GB compute cache, and these two were half of the
+--    ~14.5 GB spent on listing while serving under 4,000 scans between them --
+--    against 278M for the 401 MB idx_requests_state. On network-attached
+--    storage every evicted page is a round trip, so the reclaim helps queries
+--    that never touch the Responses page at all.
+--
+-- The rewrite removes the need for both. The in-flight rows are read from a
+-- materialized CTE bounded by concurrency rather than history, which
+-- idx_requests_state already serves, and which is small enough to sort by rank
+-- with no index support. Every other arm orders by created_at alone, which
+-- idx_requests_user_created_sort (owner-scoped) and idx_requests_created_tier
+-- (unscoped) already provide.
+--
+-- ---------------------------------------------------------------------------
+-- Why the new index is required
+-- ---------------------------------------------------------------------------
+--
+-- retained_response_objects has owner-leading, state-leading, model-leading and
+-- tier-leading sort indexes but nothing that yields plain newest-first across
+-- all owners. Without it the unscoped (platform manager, no active
+-- organization) archive arm plans as Append + Sort over the whole retained
+-- history and cannot push the LIMIT down; it did not complete inside 240s. With
+-- it the arm becomes a Merge Append of per-partition index scans: 2 ms warm.
+--
+-- Naming the terminal states in the query instead does NOT work -- the planner
+-- then prefers the state-leading index and returns to Append + Sort.
+--
+-- Mechanics: this is a partitioned index, so creating it on the parent cascades
+-- to every attached child. ensure_retained_response_partition builds each daily
+-- partition with `LIKE retained_response_objects INCLUDING ALL` and then
+-- ATTACHes it, so future partitions inherit it with no change to that function.
+--
+-- ---------------------------------------------------------------------------
+-- Production deploy
+-- ---------------------------------------------------------------------------
+--
+-- Run all three out-of-band BEFORE deploying, so the statements below are
+-- no-ops. Both plain forms take an ACCESS EXCLUSIVE lock on tables whose
+-- longest-running statements last tens of seconds under load, with everything
+-- else queuing behind the waiter.
+--
+-- CREATE INDEX CONCURRENTLY cannot target a partitioned parent, so the archive
+-- index needs the per-child build plus attach:
+--
+--   -- 1. one per attached partition
+--   CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_rro_created_d20260908
+--     ON retained_response_objects_d20260908 (created_at DESC, object_id DESC)
+--     WHERE object_kind = 'request';
+--   -- 2. parent, created invalid until every child is attached
+--   CREATE INDEX IF NOT EXISTS idx_retained_response_objects_created
+--     ON ONLY retained_response_objects (created_at DESC, object_id DESC)
+--     WHERE object_kind = 'request';
+--   -- 3. one per partition; the parent flips to valid on the last attach
+--   ALTER INDEX idx_retained_response_objects_created
+--     ATTACH PARTITION idx_rro_created_d20260908;
+--
+--   -- then the drops
+--   DROP INDEX CONCURRENTLY IF EXISTS idx_requests_user_active_sort;
+--   DROP INDEX CONCURRENTLY IF EXISTS idx_requests_active_first_tier;
+--
+-- ANALYZE the retained partitions after step 3 and before deploying. Until the
+-- new index has statistics the planner keeps choosing the owner-leading index
+-- and sorting: the unscoped date-filtered page measured 280s before ANALYZE and
+-- 3 ms after.
+--
+-- Ordering matters for rollback. The drops must not land before the rewrite is
+-- serving: the previous query against the post-drop index set does not complete
+-- inside 300s. Deploy the CONCURRENT creates first, then the release; the drops
+-- are safe from the moment the new binary is live.
+
+CREATE INDEX IF NOT EXISTS idx_retained_response_objects_created
+  ON retained_response_objects (created_at DESC, object_id DESC)
+  WHERE object_kind = 'request';
+
+COMMENT ON INDEX idx_retained_response_objects_created IS
+'Plain newest-first ordering for the Responses archive arm. The owner-, state-, model- and tier-leading sort indexes cannot serve an unscoped page ordered by created_at alone.';
+
+DROP INDEX IF EXISTS idx_requests_user_active_sort;
+DROP INDEX IF EXISTS idx_requests_active_first_tier;

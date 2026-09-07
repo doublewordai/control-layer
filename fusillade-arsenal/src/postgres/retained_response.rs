@@ -1192,6 +1192,15 @@ const COUNT_BUDGET: &str = "100ms";
 /// indefinitely behind a lock queue.
 const ESTIMATE_BUDGET: &str = "5s";
 
+/// Budget for the page query itself. Every measured shape returns in
+/// single-digit milliseconds warm, so this only trips on a pathological filter
+/// combination -- notably a status filter whose value matches nothing, where
+/// the scan has no early exit and walks the whole history. Without a budget
+/// that query ran unbounded on the WRITE pool (`begin_primary_read`), holding a
+/// primary connection for minutes and outliving the request that started it. A
+/// bounded failure is strictly better than an unbounded hang.
+const PAGE_BUDGET: &str = "15s";
+
 /// `SET LOCAL` is transaction-scoped: it is applied once per transaction and
 /// re-applied whenever the fallback replaces the transaction.
 async fn apply_statement_budget(tx: &mut Transaction<'_, Postgres>, budget: &str) -> Result<()> {
@@ -1268,12 +1277,49 @@ async fn count_requests_with_budget<P: PoolProvider>(
     Ok(total)
 }
 
-fn list_requests_page_sql(active_first: bool, owner_scoped: bool) -> String {
-    // Separate SQL shapes let generic prepared plans use the owner-leading
-    // indexes. A nullable-owner OR cannot become an index condition in those
-    // plans. Values remain bound, including the NULL owner for admin listings.
+/// Which optional filters are present, and therefore which SQL shape to emit.
+///
+/// Every optional filter used to be written `($n IS NULL OR col = $n)`. A
+/// disjunction can never become an index boundary condition in a generic
+/// prepared plan, so the owner and the `created_at` range both degraded to
+/// residual filters and the scan walked the whole history. Emitting the
+/// predicate only when the caller supplied it keeps every value bound while
+/// letting the planner use it as a scan bound. Owner already worked this way;
+/// this extends it to the two `created_at` bounds, which is what made date
+/// filtering slow.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct PageShape {
+    pub(crate) active_first: bool,
+    pub(crate) owner_scoped: bool,
+    pub(crate) created_after: bool,
+    pub(crate) created_before: bool,
+}
+
+impl PageShape {
+    fn of(filter: &ListRequestsFilter) -> Self {
+        Self {
+            active_first: filter.active_first,
+            owner_scoped: filter.created_by.is_some(),
+            created_after: filter.created_after.is_some(),
+            created_before: filter.created_before.is_some(),
+        }
+    }
+}
+
+fn list_requests_page_sql(shape: PageShape) -> String {
+    let PageShape {
+        active_first,
+        owner_scoped,
+        created_after,
+        created_before,
+    } = shape;
     let live_owner = if owner_scoped {
         "request.created_by = $1::text"
+    } else {
+        "$1::text IS NULL"
+    };
+    let active_owner = if owner_scoped {
+        "active.created_by = $1::text"
     } else {
         "$1::text IS NULL"
     };
@@ -1282,23 +1328,78 @@ fn list_requests_page_sql(active_first: bool, owner_scoped: bool) -> String {
     } else {
         "$1::text IS NULL"
     };
+    let live_dates = format!(
+        "{}{}",
+        if created_after {
+            "\n              AND request.created_at >= $4"
+        } else {
+            ""
+        },
+        if created_before {
+            "\n              AND request.created_at <= $5"
+        } else {
+            ""
+        },
+    );
+    let active_dates = format!(
+        "{}{}",
+        if created_after {
+            "\n              AND active.created_at >= $4"
+        } else {
+            ""
+        },
+        if created_before {
+            "\n              AND active.created_at <= $5"
+        } else {
+            ""
+        },
+    );
+    // V1 proves created_at < delete_on, so the necessary lower bound also
+    // enables daily partition pruning.
+    let retained_dates = format!(
+        "{}{}",
+        if created_after {
+            "\n              AND object.created_at >= $4\n              AND object.delete_on > ($4 AT TIME ZONE 'UTC')::date"
+        } else {
+            ""
+        },
+        if created_before {
+            "\n              AND object.created_at <= $5"
+        } else {
+            ""
+        },
+    );
+    let rank_of = |column: &str| {
+        format!(
+            "CASE {column} WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END"
+        )
+    };
     let order_clause = if active_first {
-        "CASE sort_state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, sort_created_at DESC, sort_id DESC"
+        format!(
+            "{} ASC, sort_created_at DESC, sort_id DESC",
+            rank_of("sort_state")
+        )
     } else {
-        "sort_created_at DESC, sort_id DESC"
+        "sort_created_at DESC, sort_id DESC".to_string()
     };
-    // Each arm carries its own ORDER BY + LIMIT so the planner can satisfy
-    // the page from ordered indexes (Merge Append over two bounded arms)
-    // instead of sorting the whole union. The live arm's expressions mirror
-    // idx_requests_active_first_tier / idx_requests_created_tier exactly.
-    let live_order = if active_first {
-        "CASE request.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, request.created_at DESC, request.id DESC"
+    // The in-flight arm reads from a materialized CTE of at most a few
+    // thousand rows, so it can afford to sort by the full page ordering --
+    // including the rank -- without any index that encodes that rank. This is
+    // what lets the two ~4 GB rank-ordered indexes go away: nothing sorts a
+    // large set by state any more. Ordering it by created_at alone is a silent
+    // correctness bug once more rows are in flight than fit on one page.
+    let active_order = if active_first {
+        format!(
+            "{} ASC, active.created_at DESC, active.id DESC",
+            rank_of("active.state")
+        )
     } else {
-        "request.created_at DESC, request.id DESC"
+        "active.created_at DESC, active.id DESC".to_string()
     };
-    // RetainedRequestPayloadV1::validate requires a terminal request. Every
-    // retained row therefore has the same active-first rank; omitting that
-    // constant key permits the existing owner/created_at/object_id index scan.
+    // Terminal live rows and retained rows all share one rank, so ordering
+    // them by created_at alone is equivalent to the page ordering -- and it is
+    // an ordering the plain (owner,) created_at DESC indexes already provide.
+    let terminal_order = "request.created_at DESC, request.id DESC";
     let retained_order = "object.created_at DESC, object.object_id DESC";
     format!(
         r#"
@@ -1323,7 +1424,63 @@ fn list_requests_page_sql(active_first: bool, owner_scoped: bool) -> String {
               AND pg_get_expr(child.relpartbound, child.oid) = format(
                   'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
               )
-        ), candidates AS (
+        ),
+        -- The entire in-flight population, materialized up front. Its size is
+        -- bounded by how much work can be simultaneously in flight, not by how
+        -- much history the table holds, so this stays cheap as `requests`
+        -- grows. `idx_requests_state` serves it; no rank-ordered index needed.
+        active AS MATERIALIZED (
+            SELECT id, state, created_at, created_by, model, service_tier, batch_id,
+                   completed_at, failed_at, started_at, response_status
+            FROM requests
+            WHERE created_by IS NOT NULL
+              AND state IN ('processing', 'claimed', 'pending')
+        ),
+        candidates AS (
+            (SELECT
+                active.id AS sort_id,
+                active.state AS sort_state,
+                active.created_at AS sort_created_at,
+                FALSE AS retained,
+                jsonb_build_object(
+                    'id', active.id,
+                    'batch_id', active.batch_id,
+                    'model', active.model,
+                    'status', active.state,
+                    'created_at', active.created_at,
+                    'completed_at', active.completed_at,
+                    'failed_at', active.failed_at,
+                    'duration_ms', (CASE
+                        WHEN active.completed_at IS NOT NULL AND active.started_at IS NOT NULL
+                        THEN EXTRACT(EPOCH FROM (active.completed_at - active.started_at)) * 1000
+                        ELSE NULL END)::float8,
+                    'response_status', active.response_status,
+                    'service_tier', active.service_tier,
+                    'created_by', active.created_by
+                ) AS live_summary,
+                NULL::date AS delete_on,
+                NULL::uuid AS group_id,
+                NULL::text AS object_kind,
+                NULL::uuid AS object_id,
+                NULL::uuid AS request_id,
+                NULL::text AS created_by,
+                NULL::text AS service_tier,
+                NULL::text AS state,
+                NULL::text AS model,
+                NULL::timestamptz AS created_at,
+                NULL::timestamptz AS terminal_at,
+                NULL::smallint AS schema_version,
+                NULL::jsonb AS payload
+            FROM active
+            WHERE {active_owner}
+              AND ($2::text IS NULL OR active.state = $2)
+              AND ($3::text[] IS NULL OR active.model = ANY($3)){active_dates}
+              AND ($6::text[] IS NULL OR active.service_tier = ANY($6))
+            ORDER BY {active_order}
+            LIMIT $7 + $8)
+
+            UNION ALL
+
             (SELECT
                 request.id AS sort_id,
                 request.state AS sort_state,
@@ -1361,12 +1518,13 @@ fn list_requests_page_sql(active_first: bool, owner_scoped: bool) -> String {
             FROM requests request
             WHERE request.created_by IS NOT NULL
               AND {live_owner}
+              -- Complement of the `active` CTE: together the two live arms
+              -- cover every batchless row exactly once.
+              AND request.state NOT IN ('processing', 'claimed', 'pending')
               AND ($2::text IS NULL OR request.state = $2)
-              AND ($3::text[] IS NULL OR request.model = ANY($3))
-              AND ($4::timestamptz IS NULL OR request.created_at >= $4)
-              AND ($5::timestamptz IS NULL OR request.created_at <= $5)
+              AND ($3::text[] IS NULL OR request.model = ANY($3)){live_dates}
               AND ($6::text[] IS NULL OR request.service_tier = ANY($6))
-            ORDER BY {live_order}
+            ORDER BY {terminal_order}
             LIMIT $7 + $8)
 
             UNION ALL
@@ -1412,12 +1570,7 @@ fn list_requests_page_sql(active_first: bool, owner_scoped: bool) -> String {
               AND object.created_by IS NOT NULL
               AND {retained_owner}
               AND ($2::text IS NULL OR object.state = $2)
-              AND ($3::text[] IS NULL OR object.model = ANY($3))
-              AND ($4::timestamptz IS NULL OR object.created_at >= $4)
-              -- V1 proves created_at < delete_on, so this necessary lower
-              -- bound enables daily partition pruning.
-              AND ($4::timestamptz IS NULL OR object.delete_on > ($4 AT TIME ZONE 'UTC')::date)
-              AND ($5::timestamptz IS NULL OR object.created_at <= $5)
+              AND ($3::text[] IS NULL OR object.model = ANY($3)){retained_dates}
               AND ($6::text[] IS NULL OR object.service_tier = ANY($6))
               AND NOT EXISTS (
                   SELECT 1 FROM requests live
@@ -1454,8 +1607,9 @@ pub(crate) async fn list_requests<P: PoolProvider>(
 
     let count = count_requests_with_budget(manager, &filter).await?;
     let mut tx = begin_primary_read(manager).await?;
+    apply_statement_budget(&mut tx, PAGE_BUDGET).await?;
 
-    let query = list_requests_page_sql(filter.active_first, filter.created_by.is_some());
+    let query = list_requests_page_sql(PageShape::of(&filter));
     let rows = sqlx::query(&query)
         .bind(filter.created_by.as_deref())
         .bind(filter.status.as_deref())
@@ -3808,7 +3962,12 @@ mod tests {
         for active_first in [true, false] {
             let sql = format!(
                 "PREPARE owner_page(text, text, text[], timestamptz, timestamptz, text[], bigint, bigint) AS {}",
-                list_requests_page_sql(active_first, true)
+                list_requests_page_sql(PageShape {
+                    active_first,
+                    owner_scoped: true,
+                    created_after: false,
+                    created_before: false
+                })
             );
             sqlx::raw_sql(&sql).execute(&mut *tx).await.unwrap();
             let plan: serde_json::Value = sqlx::query_scalar(
@@ -3889,25 +4048,39 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list_count, 1);
-        let page_rows = sqlx::query(&list_requests_page_sql(false, false))
-            .bind(Option::<&str>::None)
-            .bind(Option::<&str>::None)
-            .bind(Option::<Vec<String>>::None)
-            .bind(Some(timestamp("2026-08-10T00:00:00Z")))
-            .bind(Option::<DateTime<Utc>>::None)
-            .bind(Option::<Vec<String>>::None)
-            .bind(20_i64)
-            .bind(0_i64)
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+        let page_rows = sqlx::query(&list_requests_page_sql(PageShape {
+            active_first: false,
+            owner_scoped: false,
+            created_after: true,
+            created_before: false,
+        }))
+        .bind(Option::<&str>::None)
+        .bind(Option::<&str>::None)
+        .bind(Option::<Vec<String>>::None)
+        .bind(Some(timestamp("2026-08-10T00:00:00Z")))
+        .bind(Option::<DateTime<Utc>>::None)
+        .bind(Option::<Vec<String>>::None)
+        .bind(20_i64)
+        .bind(0_i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(page_rows.len(), 1);
         assert!(page_rows[0].get::<bool, _>("retained"));
         assert_eq!(page_rows[0].get::<Uuid, _>("object_id"), planner_request_id);
 
         for (label, sql, page) in [
             ("count", LIST_REQUESTS_COUNT_SQL.to_owned(), false),
-            ("page", list_requests_page_sql(false, false), true),
+            (
+                "page",
+                list_requests_page_sql(PageShape {
+                    active_first: false,
+                    owner_scoped: false,
+                    created_after: true,
+                    created_before: false,
+                }),
+                true,
+            ),
         ] {
             let plan = explain_bounded_list_query(&pool, &sql, page).await;
             assert!(
@@ -4323,6 +4496,65 @@ mod tests {
             },
             request_payload(),
         )
+    }
+
+    #[test]
+    fn page_sql_emits_date_bounds_directly_or_omits_them() {
+        // A `($n IS NULL OR col >= $n)` bound can never become an index
+        // boundary condition in a generic prepared plan, so the scan walks
+        // every row newer than the requested range instead of seeking to it.
+        // Emitting the predicate only when the caller supplied it is what makes
+        // date-filtered pages fast; the value stays bound either way.
+        let both = list_requests_page_sql(PageShape {
+            active_first: true,
+            owner_scoped: true,
+            created_after: true,
+            created_before: true,
+        });
+        assert!(both.contains("AND request.created_at >= $4"));
+        assert!(both.contains("AND request.created_at <= $5"));
+        assert!(both.contains("AND active.created_at >= $4"));
+        assert!(both.contains("AND object.created_at <= $5"));
+        assert!(!both.contains("$4::timestamptz IS NULL"));
+        assert!(!both.contains("$5::timestamptz IS NULL"));
+
+        // With neither bound the predicates vanish rather than degrading into a
+        // disjunction.
+        let neither = list_requests_page_sql(PageShape {
+            active_first: true,
+            owner_scoped: true,
+            created_after: false,
+            created_before: false,
+        });
+        assert!(!neither.contains("created_at >= $4"));
+        assert!(!neither.contains("created_at <= $5"));
+        assert!(!neither.contains("delete_on > ($4"));
+
+        // The retained lower bound that drives daily partition pruning rides
+        // with created_after, and only with created_after.
+        let after_only = list_requests_page_sql(PageShape {
+            active_first: false,
+            owner_scoped: false,
+            created_after: true,
+            created_before: false,
+        });
+        assert!(after_only.contains("AND object.delete_on > ($4 AT TIME ZONE 'UTC')::date"));
+        assert!(!after_only.contains("created_at <= $5"));
+    }
+
+    #[test]
+    fn live_arms_partition_the_state_space_exactly_once() {
+        // The in-flight CTE and the terminal live arm must be exact
+        // complements: any overlap duplicates rows on the page, any gap drops
+        // them silently.
+        let sql = list_requests_page_sql(PageShape {
+            active_first: true,
+            owner_scoped: true,
+            created_after: false,
+            created_before: false,
+        });
+        assert!(sql.contains("state IN ('processing', 'claimed', 'pending')"));
+        assert!(sql.contains("request.state NOT IN ('processing', 'claimed', 'pending')"));
     }
 
     #[test]
