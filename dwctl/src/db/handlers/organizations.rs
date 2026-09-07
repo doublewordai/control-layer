@@ -126,6 +126,17 @@ impl<'c> Organizations<'c> {
     /// A workspace with no live owner or admin is not a candidate at all - see
     /// the `EXISTS` below.
     pub async fn find_by_domain(&mut self, domain: &str) -> Result<Option<UserDBResponse>> {
+        // Guard the query itself rather than trusting every call site to have
+        // filtered first. `$1` is interpolated into a `LIKE` pattern below, so
+        // a `%` or `_` reaching here matches unrelated workspaces, and a
+        // single-label name matches the opaque `user~{suffix}` given to every
+        // workspace with no domain to claim. Both are reachable wherever a
+        // proxy hands over an unvalidated address. See
+        // [`crate::auth::utils::is_claimable_domain_shape`].
+        if !crate::auth::utils::is_claimable_domain_shape(domain) {
+            return Ok(None);
+        }
+
         let row = sqlx::query!(
             r#"
             SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,
@@ -2174,6 +2185,68 @@ mod tests {
         assert_eq!(orgs.get_user_org_role(second, org.id).await.unwrap(), Some("member".to_string()));
     }
 
+    /// A key issued to a member inside a workspace is owned by the workspace
+    /// and only attributed to them, so account deletion's `WHERE user_id = $1`
+    /// never saw it. API-key auth checks only `api_keys.is_deleted` and not
+    /// whether the creator still exists, so the key kept working after the
+    /// account it belonged to was gone.
+    #[sqlx::test]
+    async fn test_deleting_a_member_revokes_the_org_keys_they_hold(pool: PgPool) {
+        let owner = create_individual(&pool, "owner", "owner@acme.com").await;
+        let member = create_individual(&pool, "member", "member@acme.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        let org = orgs
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme.com".to_string(),
+                    email: "contact@acme.com".to_string(),
+                    display_name: Some("Acme Corp".to_string()),
+                    avatar_url: None,
+                    created_by: owner,
+                },
+                TEST_DEFAULT_ROLES,
+            )
+            .await
+            .unwrap();
+        orgs.add_member(org.id, member, "member").await.unwrap();
+
+        // Issued key: owned by the workspace, attributed to the member.
+        sqlx::query!(
+            "INSERT INTO api_keys (user_id, created_by, name, secret, purpose) VALUES ($1, $2, 'issued', 'sk-issued-key', 'inference')",
+            org.id,
+            member
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        // A key the owner holds in the same workspace must be left alone.
+        sqlx::query!(
+            "INSERT INTO api_keys (user_id, created_by, name, secret, purpose) VALUES ($1, $2, 'owners', 'sk-owner-key', 'inference')",
+            org.id,
+            owner
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+        assert!(Users::new(&mut conn).delete(member).await.unwrap());
+
+        let live: Vec<String> = sqlx::query_scalar!(
+            r#"SELECT name as "name!" FROM api_keys WHERE user_id = $1 AND is_deleted = false ORDER BY name"#,
+            org.id
+        )
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap();
+        assert_eq!(
+            live,
+            vec!["owners".to_string()],
+            "the departed member's issued key must stop authenticating"
+        );
+    }
+
     /// A co-owner keeps the workspace; nobody is promoted and nothing closes.
     #[sqlx::test]
     async fn test_deleting_one_of_two_owners_leaves_the_other(pool: PgPool) {
@@ -2281,32 +2354,112 @@ mod tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let mut orgs = Organizations::new(&mut conn);
-        orgs.create(
-            &OrganizationCreateDBRequest {
-                name: "acme.com".to_string(),
-                email: "contact@acme.com".to_string(),
-                display_name: Some("Acme Corp".to_string()),
-                avatar_url: None,
-                created_by: owner,
-            },
-            TEST_DEFAULT_ROLES,
-        )
-        .await
-        .unwrap();
+        let org = orgs
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme.com".to_string(),
+                    email: "contact@acme.com".to_string(),
+                    display_name: Some("Acme Corp".to_string()),
+                    avatar_url: None,
+                    created_by: owner,
+                },
+                TEST_DEFAULT_ROLES,
+            )
+            .await
+            .unwrap();
         assert!(
             orgs.find_by_domain("acme.com").await.unwrap().is_some(),
             "routable while the owner is live"
         );
         drop(conn);
 
-        // Delete the owner exactly as the users repository does.
+        // Strand the workspace the way the legacy rows were stranded: mark only
+        // the owner deleted, leaving the organization and the membership row
+        // live. Going through `Users::delete` would no longer reproduce it -
+        // that now closes an unhandable workspace outright, so the lookup would
+        // return `None` via the older `is_deleted = false` filter and this test
+        // would pass without ever reaching the predicate it exists to cover.
         let mut conn = pool.acquire().await.unwrap();
-        assert!(Users::new(&mut conn).delete(owner).await.unwrap());
+        sqlx::query!("UPDATE users SET is_deleted = true WHERE id = $1", owner)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
 
+        let still_live = sqlx::query_scalar!(r#"SELECT is_deleted as "is_deleted!" FROM users WHERE id = $1"#, org.id)
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap();
+        assert!(!still_live, "precondition: the workspace itself is not deleted");
         let mut orgs = Organizations::new(&mut conn);
         assert!(
             orgs.find_by_domain("acme.com").await.unwrap().is_none(),
             "an ownerless workspace must not collect join requests nobody can approve"
         );
+    }
+
+    /// `find_by_domain` interpolates its argument into a `LIKE` pattern, so a
+    /// wildcard reaching it matches unrelated workspaces - `%` searches for
+    /// `LIKE '%~%'`, which every suffixed username satisfies. Nothing upstream
+    /// guarantees the domain is a DNS name: proxy-header auth stores whatever
+    /// address it is handed.
+    #[sqlx::test]
+    async fn test_find_by_domain_ignores_sql_wildcards(pool: PgPool) {
+        let creator = create_individual(&pool, "alice", "alice@example.com").await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        orgs.create(
+            &OrganizationCreateDBRequest {
+                name: "acme.com~a1b2c3d4".to_string(),
+                email: "contact@acme.com".to_string(),
+                display_name: Some("Acme Corp".to_string()),
+                avatar_url: None,
+                created_by: creator,
+            },
+            TEST_DEFAULT_ROLES,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            orgs.find_by_domain("acme.com").await.unwrap().is_some(),
+            "control: the real domain resolves"
+        );
+        for wildcard in ["%", "_", "%.com", "acme.co_", "acme%"] {
+            assert!(
+                orgs.find_by_domain(wildcard).await.unwrap().is_none(),
+                "{wildcard} must not be treated as a pattern"
+            );
+        }
+    }
+
+    /// The opaque `user~{suffix}` username is only unroutable because `user`
+    /// cannot be a domain. If a single-label name reached the lookup it would
+    /// match every personal-email workspace at once, which is the
+    /// unauthorised-membership path the opaque username exists to close.
+    #[sqlx::test]
+    async fn test_find_by_domain_ignores_single_label_names(pool: PgPool) {
+        let creator = create_individual(&pool, "alice", "alice@gmail.com").await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        orgs.create(
+            &OrganizationCreateDBRequest {
+                // Exactly what `create_organization` stores for an owner with
+                // no domain to claim.
+                name: "user~a1b2c3d4".to_string(),
+                email: "alice@gmail.com".to_string(),
+                display_name: Some("Alice's workspace".to_string()),
+                avatar_url: None,
+                created_by: creator,
+            },
+            TEST_DEFAULT_ROLES,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            orgs.find_by_domain("user").await.unwrap().is_none(),
+            "a personal-email workspace must not be reachable through its namespace"
+        );
+        assert!(orgs.find_by_domain("localhost").await.unwrap().is_none());
     }
 }

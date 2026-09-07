@@ -574,6 +574,30 @@ impl<'c> Repository for Users<'c> {
                 }
             }
 
+            // Revoke the org-scoped keys this user holds, before the
+            // memberships that identify them are dropped.
+            //
+            // The hard delete above only catches keys the user *owns*
+            // (`user_id = id`). A key issued to them inside a workspace is
+            // owned by the workspace and merely attributed to them
+            // (`user_id = organization_id`, `created_by = id`), so it survives
+            // - and API-key auth checks only `api_keys.is_deleted`, never
+            // whether the creator still exists. Without this, deleting an
+            // account leaves it able to keep authenticating into workspaces
+            // that outlived it. Same treatment the member-removal and leave
+            // paths already apply via `soft_delete_member_org_keys`.
+            sqlx::query!(
+                r#"
+                UPDATE api_keys SET is_deleted = true
+                WHERE created_by = $1
+                  AND is_deleted = false
+                  AND user_id IN (SELECT organization_id FROM user_organizations WHERE user_id = $1)
+                "#,
+                id
+            )
+            .execute(&mut *tx)
+            .await?;
+
             // The departing user is not a member of anything any more. Left
             // behind, these rows are what made the workspaces above look owned
             // by somebody who no longer exists.

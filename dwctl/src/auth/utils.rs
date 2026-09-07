@@ -33,12 +33,50 @@ pub fn default_display_name(email: &str) -> String {
 pub fn email_domain(email: &str) -> Option<String> {
     let (_, domain) = email.rsplit_once('@')?;
     // A trailing dot is the DNS root and makes "acme.com." a different string
-    // to "acme.com", which would claim the same company twice. `None` rather
-    // than an empty string for "bob@": an empty domain matches nothing worth
-    // matching, and letting it reach `find_by_domain` turns its
-    // `$1 || '~%'` arm into a bare `~%` wildcard.
+    // to "acme.com", which would claim the same company twice.
     let domain = domain.trim().trim_end_matches('.').to_ascii_lowercase();
-    if domain.is_empty() { None } else { Some(domain) }
+    is_claimable_domain_shape(&domain).then_some(domain)
+}
+
+/// Whether `domain` is shaped like a DNS name we are willing to route on.
+///
+/// Nothing upstream guarantees this. Proxy-header auth persists whatever
+/// address the proxy hands over, so the domain half is attacker-controlled on
+/// any deployment whose proxy does not validate it, and it flows straight into
+/// `find_by_domain`. Two shapes are actively dangerous there:
+///
+///   SQL wildcards. The lookup's `username LIKE $1 || '~%'` arm treats `%` and
+///     `_` as patterns, so `person@%` searches for `LIKE '%~%'` and matches
+///     essentially every claimed workspace, handing the signup whichever is
+///     oldest.
+///
+///   Single-label names. The opaque `user~{suffix}` given to a workspace with
+///     no domain to claim is only unroutable because `user` cannot be a
+///     domain. Accept `person@user` and that guarantee is gone: the lookup
+///     matches every personal-email workspace at once.
+///
+/// So: at least two labels, each 1-63 characters of ASCII alphanumerics and
+/// inner hyphens. Non-ASCII is rejected rather than punycoded - an IDN address
+/// arriving raw would otherwise let a homograph domain claim sit next to the
+/// company it imitates. The cost of rejecting is only that the address gets no
+/// automatic colleague-matching.
+pub fn is_claimable_domain_shape(domain: &str) -> bool {
+    let mut labels = domain.split('.').peekable();
+    let mut count = 0;
+    while let Some(label) = labels.next() {
+        count += 1;
+        let valid = (1..=63).contains(&label.len())
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            && !label.starts_with('-')
+            && !label.ends_with('-');
+        if !valid {
+            return false;
+        }
+        if labels.peek().is_none() && count < 2 {
+            return false;
+        }
+    }
+    count >= 2
 }
 
 /// Returns `true` if the domain belongs to a personal/free email provider
@@ -383,6 +421,38 @@ mod tests {
     fn personal_check_is_case_insensitive() {
         assert!(is_builtin_personal_email_domain("GMAIL.com"));
         assert!(is_builtin_personal_email_domain("QQ.COM"));
+    }
+
+    /// The domain half of a proxy-header address is not validated anywhere
+    /// upstream, and it is interpolated into a `LIKE` pattern by
+    /// `find_by_domain`.
+    #[test]
+    fn email_domain_rejects_shapes_that_are_not_dns_names() {
+        // SQL wildcards: `%` would search for `LIKE '%~%'`.
+        assert_eq!(email_domain("person@%"), None);
+        assert_eq!(email_domain("person@_"), None);
+        assert_eq!(email_domain("person@%.com"), None);
+        assert_eq!(email_domain("person@acme_.com"), None);
+        // Single labels: `user` would match every `user~{suffix}` workspace.
+        assert_eq!(email_domain("person@user"), None);
+        assert_eq!(email_domain("person@localhost"), None);
+        // Malformed labels.
+        assert_eq!(email_domain("person@acme..com"), None);
+        assert_eq!(email_domain("person@-acme.com"), None);
+        assert_eq!(email_domain("person@acme-.com"), None);
+        assert_eq!(email_domain("person@ac me.com"), None, "an inner space is not a valid label");
+        assert_eq!(
+            email_domain("person@ acme.com "),
+            Some("acme.com".to_string()),
+            "but surrounding whitespace is just trimmed"
+        );
+        // Raw IDN, which would otherwise let a homograph sit beside the real one.
+        assert_eq!(email_domain("person@ácme.com"), None);
+        // Still accepts the ordinary cases, punycode included.
+        assert_eq!(email_domain("person@acme.com"), Some("acme.com".to_string()));
+        assert_eq!(email_domain("person@mail.acme.co.uk"), Some("mail.acme.co.uk".to_string()));
+        assert_eq!(email_domain("person@xn--cme-9na.com"), Some("xn--cme-9na.com".to_string()));
+        assert_eq!(email_domain("person@a-1.acme-corp.io"), Some("a-1.acme-corp.io".to_string()));
     }
 
     #[test]
