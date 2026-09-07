@@ -1425,10 +1425,23 @@ fn list_requests_page_sql(shape: PageShape) -> String {
                   'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
               )
         ),
-        -- The entire in-flight population, materialized up front. Its size is
-        -- bounded by how much work can be simultaneously in flight, not by how
-        -- much history the table holds, so this stays cheap as `requests`
-        -- grows. `idx_requests_state` serves it; no rank-ordered index needed.
+        -- The entire non-terminal batchless population, materialized up front,
+        -- read via `idx_requests_state`. Sorting it by rank costs nothing at
+        -- the sizes seen so far, which is what lets the two ~4 GB rank-ordered
+        -- indexes go away.
+        --
+        -- Sizing caveat: `claimed` and `processing` are bounded by daemon
+        -- concurrency, but `pending` is a QUEUE, so this is bounded by backlog
+        -- depth rather than by concurrency. It is decoupled from history depth
+        -- -- the thing that actually grows without limit -- but it is not
+        -- constant, and there is no LIMIT here, so a sustained drain stall
+        -- makes this CTE proportional to the backlog. Today production holds a
+        -- single non-terminal batchless row. If that ever stops being true, the
+        -- fix is a partial index on
+        -- (created_by, rank, created_at DESC, id DESC) restricted to these
+        -- three states, which lets the arm become a bounded ordered scan; it
+        -- indexes only non-terminal rows, so it is sized by the backlog it
+        -- guards against rather than by the table.
         active AS MATERIALIZED (
             SELECT id, state, created_at, created_by, model, service_tier, batch_id,
                    completed_at, failed_at, started_at, response_status
