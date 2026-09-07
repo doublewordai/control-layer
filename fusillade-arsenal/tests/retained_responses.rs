@@ -3660,6 +3660,126 @@ async fn read_apis_preserve_exact_values_filters_pages_and_counts_after_move(poo
 }
 
 #[sqlx::test]
+async fn retained_pages_validate_routes_before_limit_and_merge_terminal_ties(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = archive_date("2026-08-03");
+    ensure_partition(&pool, delete_on).await;
+    let mut terminal_ids = Vec::new();
+    for (state, label) in [
+        (TerminalState::Completed, "page-completed"),
+        (TerminalState::Failed, "page-failed"),
+        (
+            TerminalState::Canceled { dispatched: false },
+            "page-canceled",
+        ),
+    ] {
+        let graph = singleton(
+            &pool,
+            "flex",
+            state,
+            timestamp("2026-08-01T10:00:00Z"),
+            label,
+        )
+        .await;
+        terminal_ids.push(graph.request_ids[0]);
+    }
+    let invalid = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T11:00:00Z"),
+        "page-invalid-newest",
+    )
+    .await;
+    let request_manager = manager(&pool).await;
+    assert_eq!(
+        archive(&request_manager, &policy(&[("flex", 86_400)]), 4, i64::MAX)
+            .await
+            .unwrap()
+            .groups_archived,
+        4
+    );
+    let pending = singleton(
+        &pool,
+        "priority",
+        TerminalState::Pending,
+        timestamp("2026-07-31T10:00:00Z"),
+        "page-old-pending",
+    )
+    .await;
+    let other = singleton(
+        &pool,
+        "priority",
+        TerminalState::Pending,
+        timestamp("2026-08-02T10:00:00Z"),
+        "page-other-owner",
+    )
+    .await;
+    sqlx::query("UPDATE requests SET created_by = 'other-owner' WHERE id = $1")
+        .bind(other.request_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    terminal_ids.sort_by(|a, b| b.cmp(a));
+
+    // The newest retained candidate is invalid in three distinct ways. It
+    // must never consume a LIMIT slot or hide a valid row on a later page.
+    for invalidation in [
+        "UPDATE retained_response_request_routes SET group_id = gen_random_uuid() WHERE request_id = $1",
+        "DELETE FROM retained_response_request_routes WHERE request_id = $1",
+        "DELETE FROM retained_response_group_routes WHERE group_id = $1",
+    ] {
+        sqlx::query(invalidation)
+            .bind(invalid.request_ids[0])
+            .execute(&pool)
+            .await
+            .unwrap();
+        for owner in [Some(OWNER.to_owned()), None] {
+            for active_first in [true, false] {
+                let mut expected = terminal_ids.clone();
+                if active_first {
+                    expected.insert(0, pending.request_ids[0]);
+                } else {
+                    expected.push(pending.request_ids[0]);
+                }
+                if owner.is_none() {
+                    expected.insert(0, other.request_ids[0]);
+                }
+                for (skip, expected_id) in expected.iter().enumerate() {
+                    let result = request_manager
+                        .list_requests(ListRequestsFilter {
+                            created_by: owner.clone(),
+                            active_first,
+                            limit: 1,
+                            skip: skip as i64,
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        result.data.iter().map(|r| r.id).collect::<Vec<_>>(),
+                        vec![*expected_id]
+                    );
+                }
+                let empty = request_manager
+                    .list_requests(ListRequestsFilter {
+                        created_by: owner.clone(),
+                        active_first,
+                        limit: 1,
+                        skip: expected.len() as i64,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert!(empty.data.is_empty());
+            }
+        }
+        sqlx::query("INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) VALUES ($1, $1, $2) ON CONFLICT (request_id) DO UPDATE SET group_id = EXCLUDED.group_id")
+            .bind(invalid.request_ids[0]).bind(delete_on).execute(&pool).await.unwrap();
+    }
+}
+
+#[sqlx::test]
 async fn anomalous_request_chronology_uses_later_created_at_for_safe_deadline(pool: PgPool) {
     install_candidate_index(&pool).await;
     let expected_delete_on = archive_date("2026-08-07");

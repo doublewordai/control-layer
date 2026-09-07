@@ -1268,7 +1268,20 @@ async fn count_requests_with_budget<P: PoolProvider>(
     Ok(total)
 }
 
-fn list_requests_page_sql(active_first: bool) -> String {
+fn list_requests_page_sql(active_first: bool, owner_scoped: bool) -> String {
+    // Separate SQL shapes let generic prepared plans use the owner-leading
+    // indexes. A nullable-owner OR cannot become an index condition in those
+    // plans. Values remain bound, including the NULL owner for admin listings.
+    let live_owner = if owner_scoped {
+        "request.created_by = $1::text"
+    } else {
+        "$1::text IS NULL"
+    };
+    let retained_owner = if owner_scoped {
+        "object.created_by = $1::text"
+    } else {
+        "$1::text IS NULL"
+    };
     let order_clause = if active_first {
         "CASE sort_state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, sort_created_at DESC, sort_id DESC"
     } else {
@@ -1283,14 +1296,34 @@ fn list_requests_page_sql(active_first: bool) -> String {
     } else {
         "request.created_at DESC, request.id DESC"
     };
-    let retained_order = if active_first {
-        "CASE object.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, object.created_at DESC, object.object_id DESC"
-    } else {
-        "object.created_at DESC, object.object_id DESC"
-    };
+    // RetainedRequestPayloadV1::validate requires a terminal request. Every
+    // retained row therefore has the same active-first rank; omitting that
+    // constant key permits the existing owner/created_at/object_id index scan.
+    let retained_order = "object.created_at DESC, object.object_id DESC";
     format!(
         r#"
-        WITH candidates AS (
+        WITH valid_buckets AS MATERIALIZED (
+            SELECT bucket.delete_on
+            FROM retained_response_buckets bucket
+            JOIN pg_namespace namespace
+              ON namespace.nspname = bucket.partition_schema
+            JOIN pg_class child
+              ON child.relnamespace = namespace.oid
+             AND child.relname = bucket.partition_table
+             AND child.oid = bucket.partition_oid
+            JOIN pg_inherits inheritance
+              ON inheritance.inhrelid = child.oid
+             AND NOT inheritance.inhdetachpending
+            WHERE bucket.state = 'active'
+              AND bucket.partition_schema = current_schema()
+              AND bucket.partition_table =
+                  'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+              AND inheritance.inhparent =
+                  to_regclass(format('%I.retained_response_objects', current_schema()))
+              AND pg_get_expr(child.relpartbound, child.oid) = format(
+                  'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+              )
+        ), candidates AS (
             (SELECT
                 request.id AS sort_id,
                 request.state AS sort_state,
@@ -1327,7 +1360,7 @@ fn list_requests_page_sql(active_first: bool) -> String {
                 NULL::jsonb AS payload
             FROM requests request
             WHERE request.created_by IS NOT NULL
-              AND ($1::text IS NULL OR request.created_by = $1)
+              AND {live_owner}
               AND ($2::text IS NULL OR request.state = $2)
               AND ($3::text[] IS NULL OR request.model = ANY($3))
               AND ($4::timestamptz IS NULL OR request.created_at >= $4)
@@ -1357,37 +1390,27 @@ fn list_requests_page_sql(active_first: bool) -> String {
                 object.terminal_at,
                 object.schema_version,
                 object.payload
-            FROM retained_response_buckets bucket
-            JOIN pg_namespace namespace
-              ON namespace.nspname = bucket.partition_schema
-            JOIN pg_class child
-              ON child.relnamespace = namespace.oid
-             AND child.relname = bucket.partition_table
-             AND child.oid = bucket.partition_oid
-            JOIN pg_inherits inheritance
-              ON inheritance.inhrelid = child.oid
-             AND NOT inheritance.inhdetachpending
-            JOIN retained_response_objects object
-              ON object.delete_on = bucket.delete_on
-             AND object.object_kind = 'request'
-            JOIN retained_response_request_routes route
-              ON route.request_id = object.object_id
-             AND route.group_id = object.group_id
-             AND route.delete_on = object.delete_on
-            JOIN retained_response_group_routes group_route
-              ON group_route.group_id = object.group_id
-             AND group_route.delete_on = object.delete_on
-            WHERE bucket.state = 'active'
-              AND bucket.partition_schema = current_schema()
-              AND bucket.partition_table =
-                  'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
-              AND inheritance.inhparent =
-                  to_regclass(format('%I.retained_response_objects', current_schema()))
-              AND pg_get_expr(child.relpartbound, child.oid) = format(
-                  'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+            FROM retained_response_objects object
+            WHERE object.object_kind = 'request'
+              AND object.delete_on IN (SELECT delete_on FROM valid_buckets)
+              -- Keep validation as per-candidate index probes. OFFSET 0
+              -- prevents pull-up into joins that can scan the route tables
+              -- and sort the entire retained history before applying LIMIT.
+              AND EXISTS (
+                  SELECT 1 FROM retained_response_request_routes route
+                  WHERE route.request_id = object.object_id
+                    AND route.group_id = object.group_id
+                    AND route.delete_on = object.delete_on
+                  OFFSET 0
+              )
+              AND EXISTS (
+                  SELECT 1 FROM retained_response_group_routes group_route
+                  WHERE group_route.group_id = object.group_id
+                    AND group_route.delete_on = object.delete_on
+                  OFFSET 0
               )
               AND object.created_by IS NOT NULL
-              AND ($1::text IS NULL OR object.created_by = $1)
+              AND {retained_owner}
               AND ($2::text IS NULL OR object.state = $2)
               AND ($3::text[] IS NULL OR object.model = ANY($3))
               AND ($4::timestamptz IS NULL OR object.created_at >= $4)
@@ -1399,6 +1422,7 @@ fn list_requests_page_sql(active_first: bool) -> String {
               AND NOT EXISTS (
                   SELECT 1 FROM requests live
                   WHERE live.id = object.object_id AND live.created_by IS NOT NULL
+                  OFFSET 0
               )
             ORDER BY {retained_order}
             LIMIT $7 + $8)
@@ -1431,7 +1455,7 @@ pub(crate) async fn list_requests<P: PoolProvider>(
     let count = count_requests_with_budget(manager, &filter).await?;
     let mut tx = begin_primary_read(manager).await?;
 
-    let query = list_requests_page_sql(filter.active_first);
+    let query = list_requests_page_sql(filter.active_first, filter.created_by.is_some());
     let rows = sqlx::query(&query)
         .bind(filter.created_by.as_deref())
         .bind(filter.status.as_deref())
@@ -3717,6 +3741,93 @@ mod tests {
         .expect("bounded retained-list SQL must be explainable")
     }
 
+    // Count rows visited, including rejected rows, rather than asserting a
+    // particular planner node name or a machine-dependent execution time.
+    fn retained_rows_visited(plan: &serde_json::Value) -> f64 {
+        match plan {
+            serde_json::Value::Array(values) => values.iter().map(retained_rows_visited).sum(),
+            serde_json::Value::Object(fields) => {
+                let visited = if fields.get("Relation Name").and_then(|v| v.as_str())
+                    == Some("retained_response_objects_d20260820")
+                {
+                    [
+                        "Actual Rows",
+                        "Rows Removed by Filter",
+                        "Rows Removed by Index Recheck",
+                    ]
+                    .iter()
+                    .map(|key| fields.get(*key).and_then(|v| v.as_f64()).unwrap_or(0.0))
+                    .sum::<f64>()
+                        * fields
+                            .get("Actual Loops")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                visited + fields.values().map(retained_rows_visited).sum::<f64>()
+            }
+            _ => 0.0,
+        }
+    }
+
+    #[sqlx::test]
+    async fn retained_owner_page_bounds_history_scan_with_generic_plan(pool: PgPool) {
+        sqlx::query("SELECT ensure_retained_response_partition('2026-08-20', NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO retained_response_objects (
+                delete_on, group_id, object_kind, object_id, request_id,
+                created_by, service_tier, state, model, created_at,
+                terminal_at, schema_version, payload
+            ) SELECT '2026-08-20', md5(i::text)::uuid, 'request', md5(i::text)::uuid,
+                md5(i::text)::uuid, CASE WHEN i <= 2000 THEN 'owner' ELSE 'other' END,
+                'flex', 'completed', 'model',
+                '2026-08-11'::timestamptz + i * interval '1 second',
+                '2026-08-12', 1, '{}'::jsonb
+            FROM generate_series(1, 4000) i
+        "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO retained_response_group_routes (group_id, delete_on) SELECT group_id, delete_on FROM retained_response_objects")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) SELECT object_id, group_id, delete_on FROM retained_response_objects")
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql("ANALYZE retained_response_objects; ANALYZE retained_response_objects_d20260820; ANALYZE retained_response_group_routes; ANALYZE retained_response_request_routes;")
+            .execute(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for active_first in [true, false] {
+            let sql = format!(
+                "PREPARE owner_page(text, text, text[], timestamptz, timestamptz, text[], bigint, bigint) AS {}",
+                list_requests_page_sql(active_first, true)
+            );
+            sqlx::raw_sql(&sql).execute(&mut *tx).await.unwrap();
+            let plan: serde_json::Value = sqlx::query_scalar(
+                "EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE owner_page('owner', NULL, NULL, NULL, NULL, ARRAY['flex', 'priority'], 10, 0)"
+            )
+                .fetch_one(&mut *tx).await.unwrap();
+            sqlx::query("DEALLOCATE owner_page")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
+            let visited = retained_rows_visited(&plan);
+            assert!(
+                visited > 0.0 && visited < 100.0,
+                "a ten-row owner page must not visit its entire retained history (visited {visited}): {plan}"
+            );
+        }
+    }
+
     #[sqlx::test]
     async fn retained_list_and_count_plans_prune_children_before_created_after(pool: PgPool) {
         let relevant_delete_on = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
@@ -3778,7 +3889,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list_count, 1);
-        let page_rows = sqlx::query(&list_requests_page_sql(false))
+        let page_rows = sqlx::query(&list_requests_page_sql(false, false))
             .bind(Option::<&str>::None)
             .bind(Option::<&str>::None)
             .bind(Option::<Vec<String>>::None)
@@ -3796,7 +3907,7 @@ mod tests {
 
         for (label, sql, page) in [
             ("count", LIST_REQUESTS_COUNT_SQL.to_owned(), false),
-            ("page", list_requests_page_sql(false), true),
+            ("page", list_requests_page_sql(false, false), true),
         ] {
             let plan = explain_bounded_list_query(&pool, &sql, page).await;
             assert!(
