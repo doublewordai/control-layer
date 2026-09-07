@@ -1182,15 +1182,22 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 /// pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
 
+/// Planning budget for the `EXPLAIN` estimate fallback in
+/// `count_requests_with_budget`.
+///
+/// `EXPLAIN` is planning-only and never scans data, but planning the retained
+/// arm expands every active daily partition plus the partition-catalog joins
+/// and can take ~110ms in production — longer than `COUNT_BUDGET`. The
+/// fallback must not inherit the data-scan budget: when it does, a timed-out
+/// estimate turns a missing `total_count` into a 500 on
+/// `GET /admin/api/v1/batches/requests`.
+const EXPLAIN_BUDGET: &str = "2s";
+
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
 ) -> Result<i64> {
-    let mut tx = manager.begin_read().await.map_err(read_database_failure)?;
-    sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-        .execute(&mut *tx)
-        .await
-        .map_err(read_database_failure)?;
+    let mut tx = begin_budgeted_count_tx(manager, COUNT_BUDGET).await?;
     let mut total = 0_i64;
     for arm in [LIVE_REQUEST_COUNT_SQL, RETAINED_REQUEST_COUNT_SQL] {
         let exact: std::result::Result<i64, sqlx::Error> = sqlx::query_scalar(arm)
@@ -1205,39 +1212,89 @@ async fn count_requests_with_budget<P: PoolProvider>(
         total += match exact {
             Ok(n) => n,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
-                // The failed statement aborted this transaction; estimate on a
-                // fresh one (EXPLAIN is planning only, so it is cheap).
-                tx.rollback().await.map_err(read_database_failure)?;
-                tx = manager.begin_read().await.map_err(read_database_failure)?;
-                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
-                ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                // The failed statement aborted this transaction; estimate the
+                // arm on its own transaction under a planning-only budget.
+                let _ = tx.rollback().await;
+                let estimate = estimate_count_arm(manager, arm, filter).await;
+                // Re-establish a budgeted transaction for the next arm.
+                tx = begin_budgeted_count_tx(manager, COUNT_BUDGET).await?;
+                estimate
             }
             Err(e) => return Err(read_database_failure(e)),
         };
     }
     tx.commit().await.map_err(read_database_failure)?;
     Ok(total)
+}
+
+/// Open a read-only transaction with `statement_timeout` set to `budget`.
+///
+/// The caller owns committing it. After a statement-timeout (SQLSTATE 57014)
+/// the transaction is aborted and must be rolled back and recreated.
+async fn begin_budgeted_count_tx<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    budget: &str,
+) -> Result<Transaction<'static, Postgres>> {
+    let mut tx = manager.begin_read().await.map_err(read_database_failure)?;
+    sqlx::query(&format!("SET LOCAL statement_timeout = '{budget}'"))
+        .execute(&mut *tx)
+        .await
+        .map_err(read_database_failure)?;
+    Ok(tx)
+}
+
+/// Planner row estimate for one count arm, run under [`EXPLAIN_BUDGET`].
+///
+/// The estimate is best-effort: if it cannot be obtained (e.g. it also hit a
+/// statement timeout, or the plan exposes no row estimate), report 0 for the
+/// arm rather than fail the whole listing. A slightly under-reported
+/// `total_count` is far less harmful than a 500 on a user-facing endpoint.
+async fn estimate_count_arm<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    arm: &str,
+    filter: &ListRequestsFilter,
+) -> i64 {
+    let mut tx = match begin_budgeted_count_tx(manager, EXPLAIN_BUDGET).await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "EXPLAIN total_count estimate unavailable for list_requests; reporting 0 for this arm"
+            );
+            return 0;
+        }
+    };
+    match sqlx::query_scalar::<_, serde_json::Value>(&format!(
+        "EXPLAIN (FORMAT JSON) {}",
+        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+    ))
+    .bind(filter.created_by.as_deref())
+    .bind(filter.status.as_deref())
+    .bind(filter.models.as_deref())
+    .bind(filter.created_after)
+    .bind(filter.created_before)
+    .bind(filter.service_tiers.as_deref())
+    .fetch_one(&mut *tx)
+    .await
+    {
+        Ok(plan) => {
+            let _ = tx.commit().await;
+            plan.get(0)
+                .and_then(|p| p.get("Plan"))
+                .and_then(|p| p.get("Plan Rows"))
+                .and_then(|r| r.as_f64())
+                .map(|r| r.round() as i64)
+                .unwrap_or(0)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "EXPLAIN total_count estimate unavailable for list_requests; reporting 0 for this arm"
+            );
+            let _ = tx.rollback().await;
+            0
+        }
+    }
 }
 
 fn list_requests_page_sql(active_first: bool) -> String {
