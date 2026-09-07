@@ -153,13 +153,17 @@ impl<'c> Organizations<'c> {
               AND is_deleted = false
               -- Same reasoning one level down: a workspace whose owners and
               -- admins have all been deleted is still `is_deleted = false`, but
-              -- there is equally nobody home to approve anything. Deleting a
-              -- user scrubs their row and their keys and leaves their
-              -- `user_organizations` rows alone (`Users::delete`), so deleting
-              -- an organization's only owner strands it here: still claiming
-              -- the domain, still offered to every colleague who signs up,
-              -- unadministrable. `users` inside the subquery is the outer row -
-              -- the inner one is aliased.
+              -- there is equally nobody home to approve anything.
+              --
+              -- `Users::delete` no longer creates these - it hands a workspace
+              -- to a successor or closes it - but it used to walk away from the
+              -- departing user's `user_organizations` rows, which stranded any
+              -- workspace whose only owner was deleted: still claiming the
+              -- domain, still offered to every colleague who signed up,
+              -- unadministrable. This covers those legacy rows, and anything
+              -- else that reaches the same state by a route we have not thought
+              -- of. `users` inside the subquery is the outer row - the inner one
+              -- is aliased.
               AND EXISTS (
                   SELECT 1
                   FROM user_organizations uo
@@ -459,15 +463,18 @@ impl<'c> Organizations<'c> {
         Ok(result.rows_affected() > 0)
     }
 
-    /// The organizations this user actively owns.
+    /// The organizations this user is an active member of, whatever their role.
     ///
     /// Read before deleting the account, because `Users::delete` clears the
     /// membership rows that identify them: afterwards there is nothing left to
-    /// join on.
+    /// join on. Deliberately not restricted to the ones they own - a member
+    /// promoted to owner between the read and the delete can still be closed by
+    /// that transaction, and a caller narrowing to owners here would never learn
+    /// it needed cleaning up.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn list_owned_organization_ids(&mut self, user_id: UserId) -> Result<Vec<UserId>> {
+    pub async fn list_member_organization_ids(&mut self, user_id: UserId) -> Result<Vec<UserId>> {
         Ok(sqlx::query_scalar!(
-            r#"SELECT organization_id FROM user_organizations WHERE user_id = $1 AND role = 'owner' AND status = 'active'"#,
+            r#"SELECT organization_id FROM user_organizations WHERE user_id = $1 AND status = 'active'"#,
             user_id
         )
         .fetch_all(&mut *self.db)
@@ -2247,6 +2254,66 @@ mod tests {
         );
     }
 
+    /// Closing a workspace must not fall over on a key something else still
+    /// references. `connections.api_key_id` points at `api_keys(id)` with NO
+    /// ACTION, so hard-deleting the workspace's keys raised a foreign-key
+    /// violation and rolled back the entire account deletion - the account
+    /// could not be deleted at all while the workspace had a connection.
+    #[sqlx::test]
+    async fn test_closing_a_workspace_with_a_connection_still_deletes_the_account(pool: PgPool) {
+        let owner = create_individual(&pool, "owner", "owner@acme.com").await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut orgs = Organizations::new(&mut conn);
+        let org = orgs
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "acme.com".to_string(),
+                    email: "contact@acme.com".to_string(),
+                    display_name: Some("Acme Corp".to_string()),
+                    avatar_url: None,
+                    created_by: owner,
+                },
+                TEST_DEFAULT_ROLES,
+            )
+            .await
+            .unwrap();
+
+        let key_id: uuid::Uuid = sqlx::query_scalar!(
+            "INSERT INTO api_keys (user_id, created_by, name, secret, purpose) VALUES ($1, $1, 'org key', 'sk-conn-key', 'inference') RETURNING id",
+            org.id
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::query!(
+            "INSERT INTO connections (user_id, api_key_id, kind, provider, name, config_encrypted) VALUES ($1, $2, 'source', 'openai', 'conn', '\\x00'::bytea)",
+            org.id,
+            key_id
+        )
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+
+        // The workspace has no successor, so this closes it.
+        assert!(
+            Users::new(&mut conn).delete(owner).await.unwrap(),
+            "the account must delete even though a connection pins the workspace's key"
+        );
+
+        let (org_deleted, key_live) = sqlx::query!(
+            r#"SELECT (SELECT is_deleted FROM users WHERE id = $1) as "org_deleted!",
+                      (SELECT count(*) FROM api_keys WHERE user_id = $1 AND is_deleted = false) as "key_live!""#,
+            org.id
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .map(|r| (r.org_deleted, r.key_live))
+        .unwrap();
+        assert!(org_deleted, "the workspace is still closed");
+        assert_eq!(key_live, 0, "and its keys stop authenticating");
+    }
+
     /// A co-owner keeps the workspace; nobody is promoted and nothing closes.
     #[sqlx::test]
     async fn test_deleting_one_of_two_owners_leaves_the_other(pool: PgPool) {
@@ -2331,10 +2398,17 @@ mod tests {
         assert_eq!(closed.email, format!("deleted-{}@deleted.local", org.id));
         assert!(closed.display_name.is_none());
 
-        let keys = sqlx::query_scalar!(r#"SELECT count(*) as "count!" FROM api_keys WHERE user_id = $1"#, org.id)
-            .fetch_one(&mut *conn)
-            .await
-            .unwrap();
+        // Revoked rather than removed: a hard delete trips
+        // `connections.api_key_id`, which is NO ACTION, and rolls back the whole
+        // account deletion. Authentication checks `is_deleted`, so revoking is
+        // what actually matters here.
+        let keys = sqlx::query_scalar!(
+            r#"SELECT count(*) as "count!" FROM api_keys WHERE user_id = $1 AND is_deleted = false"#,
+            org.id
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap();
         assert_eq!(keys, 0, "nothing may keep authenticating as a closed workspace");
 
         let mut orgs = Organizations::new(&mut conn);

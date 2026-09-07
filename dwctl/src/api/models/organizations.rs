@@ -319,10 +319,13 @@ pub struct PendingJoinRequestResponse {
     /// Display name where the organization has one, `username` otherwise —
     /// the same resolution every other organization-naming response uses.
     ///
-    /// Never the bare `username`: that is the domain-routing key
+    /// The fallback is not cosmetic: `username` is the domain-routing key
     /// (`{domain}~{suffix}`, or an opaque `user~{suffix}` for a workspace with
-    /// no domain to claim), and showing it put "acme.com~a1b2c3d4" on screen
-    /// where the company name belonged.
+    /// no domain to claim), so a row with no display name still surfaces
+    /// "acme.com~a1b2c3d4" here. Every workspace created since #1435 has a
+    /// display name — it defaults to the submitted one — so in practice this
+    /// only affects rows predating that. Clients should render this as given
+    /// rather than trying to parse it.
     pub organization_name: String,
     /// When the request was filed — the moment the user asked, not the moment
     /// they signed up: nothing is filed on their behalf.

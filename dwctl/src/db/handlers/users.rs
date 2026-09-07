@@ -552,8 +552,18 @@ impl<'c> Repository for Users<'c> {
                     None => {
                         // Nobody left to hand it to, so the workspace goes the
                         // same way the account does: scrubbed, flagged deleted,
-                        // and its keys hard-deleted so nothing keeps
-                        // authenticating as it.
+                        // and its keys revoked so nothing keeps authenticating
+                        // as it.
+                        //
+                        // Soft-deleted, not hard-deleted. `connections.api_key_id`
+                        // references `api_keys(id)` with NO ACTION, so removing a
+                        // key a connection still points at raises a foreign-key
+                        // violation and takes the whole account deletion down with
+                        // it. The `api_keys_notify_update` trigger fires the same
+                        // config-change NOTIFY as the delete trigger, so the proxy
+                        // still drops the key from its cache immediately - the
+                        // hard delete was buying nothing here that the soft one
+                        // does not.
                         sqlx::query!(
                             r#"
                             UPDATE users
@@ -567,9 +577,12 @@ impl<'c> Repository for Users<'c> {
                         )
                         .execute(&mut *tx)
                         .await?;
-                        sqlx::query!(r#"DELETE FROM api_keys WHERE user_id = $1"#, org_id)
-                            .execute(&mut *tx)
-                            .await?;
+                        sqlx::query!(
+                            r#"UPDATE api_keys SET is_deleted = true WHERE user_id = $1 AND is_deleted = false"#,
+                            org_id
+                        )
+                        .execute(&mut *tx)
+                        .await?;
                     }
                 }
             }

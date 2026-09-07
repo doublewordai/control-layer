@@ -514,9 +514,15 @@ pub async fn delete_user<P: PoolProvider>(
     // closes it when there is nobody left to hand it to; read the list before
     // the delete, because afterwards the memberships that identify them are
     // gone.
-    let owned_org_ids = {
+    // Every workspace they belong to, not only the ones they own: a member
+    // promoted to owner between this read and the delete would otherwise be
+    // closed by the transaction while sitting outside this list, and its data
+    // would never be purged. Membership is the wider set and costs nothing to
+    // over-collect, because what actually gets cleaned up is decided below by
+    // asking whether each one is now closed.
+    let member_org_ids = {
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
-        Organizations::new(&mut conn).list_owned_organization_ids(user_id).await?
+        Organizations::new(&mut conn).list_member_organization_ids(user_id).await?
     };
 
     // Soft-delete + scrub the user row and hard-delete their API keys
@@ -546,14 +552,26 @@ pub async fn delete_user<P: PoolProvider>(
     // workspaces those are is the transaction's decision, not a guess made
     // before it ran: `get_by_id` filters deleted rows, so a workspace that
     // found a successor still resolves and is left alone.
-    for org_id in owned_org_ids {
+    for org_id in member_org_ids {
         let closed = {
             let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
             Users::new(&mut conn).get_by_id(org_id).await?.is_none()
         };
         if closed {
             let org_id_str = org_id.to_string();
-            cancel_active_batches(&state, &org_id_str).await?;
+            // Cancellation is best-effort and the purge is enqueued regardless.
+            // The account row is already committed by this point, so returning
+            // early on a cancellation failure would strand the workspace's data
+            // permanently: a retried delete finds the user already gone, and the
+            // membership that identified this workspace has been removed, so
+            // nothing can rediscover it.
+            if let Err(e) = cancel_active_batches(&state, &org_id_str).await {
+                tracing::warn!(
+                    org_id = %org_id,
+                    error = %e,
+                    "Failed to cancel batches for a workspace closed with its owner; purging anyway"
+                );
+            }
             enqueue_purge_user_data(&state, org_id_str).await;
         }
     }
