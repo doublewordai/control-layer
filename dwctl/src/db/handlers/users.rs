@@ -463,7 +463,7 @@ impl<'c> Repository for Users<'c> {
         let scrubbed_email = format!("deleted-{}@deleted.local", id);
         let scrubbed_username = format!("deleted-{}", id);
 
-        // Scrub the user row and hard-delete their API keys atomically so a
+        // Scrub the user row and revoke their API keys atomically so a
         // "deleted" account can never keep authenticating.
         let mut tx = self.db.begin().await?;
 
@@ -490,11 +490,17 @@ impl<'c> Repository for Users<'c> {
         .await?;
 
         // Only when we actually transitioned the user to deleted (idempotent on
-        // repeat calls). Hard-delete keys owned by the user (user_id) — these
-        // authenticate as them. Keys they merely created for others (created_by)
-        // belong to those users and are left alone. The api_keys DELETE trigger
-        // emits NOTIFY, so the onwards proxy drops them from its cache at once.
+        // repeat calls). Preserve keys attributed to them in another account
+        // for audit attribution, using the same soft deletion as org departure.
+        // Both UPDATE and DELETE triggers notify the onwards cache to revoke access.
         if result.rows_affected() > 0 {
+            sqlx::query!(
+                "UPDATE api_keys SET is_deleted = true WHERE created_by = $1 AND user_id != $1 AND is_deleted = false",
+                id
+            )
+            .execute(&mut *tx)
+            .await?;
+
             sqlx::query!(r#"DELETE FROM api_keys WHERE user_id = $1"#, id)
                 .execute(&mut *tx)
                 .await?;
@@ -1294,6 +1300,19 @@ mod tests {
     use sqlx::PgPool;
     use std::str::FromStr;
 
+    async fn create_standard_user(conn: &mut PgConnection, username: &str) -> UserDBResponse {
+        Users::new(conn)
+            .create(&UserCreateDBRequest::from(UserCreate {
+                username: username.to_string(),
+                email: format!("{username}@example.com"),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            }))
+            .await
+            .unwrap()
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_user(pool: PgPool) {
@@ -1387,6 +1406,91 @@ mod tests {
             repo.delete(user.id).await.unwrap()
         };
         assert!(!again);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_user_soft_deletes_attributed_keys_preserving_audit_trail(pool: PgPool) {
+        use crate::db::{
+            handlers::organizations::Organizations,
+            models::{api_keys::ApiKeyCreateDBRequest, organizations::OrganizationCreateDBRequest},
+        };
+
+        let mut conn = pool.acquire().await.unwrap();
+        let deleted_user = create_standard_user(&mut conn, "deleted-key-holder").await;
+        let retained_user = create_standard_user(&mut conn, "retained-key-holder").await;
+        let key_owner = Organizations::new(&mut conn)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "shared-key-owner".to_string(),
+                    email: "org@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: retained_user.id,
+                },
+                &[Role::StandardUser],
+            )
+            .await
+            .unwrap();
+
+        let (deleted_user_key, retained_user_key) = {
+            let mut keys = ApiKeys::new(&mut conn);
+            let deleted_user_key = keys
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: key_owner.id,
+                    name: "deleted-user-key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    created_by: deleted_user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
+                })
+                .await
+                .unwrap();
+            let retained_user_key = keys
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: key_owner.id,
+                    name: "retained-user-key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    created_by: retained_user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
+                })
+                .await
+                .unwrap();
+            (deleted_user_key, retained_user_key)
+        };
+
+        assert!(Users::new(&mut conn).delete(deleted_user.id).await.unwrap());
+
+        let audit_record: (UserId, UserId, bool) = sqlx::query_as("SELECT user_id, created_by, is_deleted FROM api_keys WHERE id = $1")
+            .bind(deleted_user_key.id)
+            .fetch_one(&pool)
+            .await
+            .expect("revoked keys must remain available for audit attribution");
+        assert_eq!(audit_record, (key_owner.id, deleted_user.id, true));
+        assert!(
+            ApiKeys::new(&mut conn)
+                .get_user_id_by_secret(&deleted_user_key.secret)
+                .await
+                .unwrap()
+                .is_none(),
+            "the deleted user's attributed key must no longer authenticate"
+        );
+        let retained_key_is_active: bool = sqlx::query_scalar!(
+            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = $1 AND is_deleted = false) as \"exists!\"",
+            retained_user_key.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(retained_key_is_active, "keys attributed to other users must remain active");
     }
 
     #[sqlx::test]
