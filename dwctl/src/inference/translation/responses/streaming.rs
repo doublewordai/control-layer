@@ -184,39 +184,6 @@ impl StreamingState {
         events
     }
 
-    /// Extract tool calls accumulated during the current iteration.
-    ///
-    /// Returns `(call_id, function_name, arguments)` tuples.
-    pub fn extract_tool_calls(&self) -> Vec<(String, String, String)> {
-        self.items
-            .iter()
-            .filter_map(|item| {
-                if let StreamingItemKind::FunctionCall { call_id, name, arguments } = &item.kind {
-                    if !call_id.is_empty() {
-                        Some((call_id.clone(), name.clone(), arguments.clone()))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            })
-            .collect()
-    }
-
-    /// Prepare the state machine for the next tool-loop iteration.
-    ///
-    /// Moves the current iteration's items into `completed_items` so that
-    /// `build_final_response` can include all items across iterations, and
-    /// advances the index offset so new items get unique IDs and output indices.
-    pub fn prepare_next_iteration(&mut self) {
-        self.item_index_offset += self.items.len();
-        self.completed_items.append(&mut self.items);
-        self.msg_item_for_choice.clear();
-        self.fn_call_item_for.clear();
-        self.reasoning_item_for_choice.clear();
-    }
-
     /// Process a single choice from a chunk
     fn process_choice(&mut self, choice: &ChunkChoice) -> Vec<StreamingEvent> {
         let mut events = Vec::new();
@@ -890,19 +857,11 @@ pub enum StreamingEventData {
     },
 }
 
-/// Parse a chat.completion.chunk from SSE data line
-pub fn parse_chat_chunk(data: &str) -> Option<ChatCompletionChunk> {
-    if data.trim() == "[DONE]" {
-        return None;
-    }
-    serde_json::from_str(data).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::types::Input;
     use super::*;
-    use onwards::strict::schemas::chat_completions::{ChunkChoice, ChunkDelta, ChunkFunctionCall, ChunkToolCall};
+    use onwards::strict::schemas::chat_completions::{ChunkChoice, ChunkDelta};
 
     fn test_request(model: &str) -> ResponsesRequest {
         ResponsesRequest {
@@ -1076,23 +1035,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_chat_chunk() {
-        let json = r#"{"id":"chatcmpl-123","object":"chat.completion.chunk","created":1234567890,"model":"gpt-4","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}"#;
-
-        let chunk = parse_chat_chunk(json);
-        assert!(chunk.is_some());
-
-        let chunk = chunk.unwrap();
-        assert_eq!(chunk.id, "chatcmpl-123");
-    }
-
-    #[test]
-    fn test_parse_done_marker() {
-        let chunk = parse_chat_chunk("[DONE]");
-        assert!(chunk.is_none());
-    }
-
-    #[test]
     fn test_sequence_numbers_increase() {
         let mut state = StreamingState::new(&test_request("gpt-4"), None);
 
@@ -1106,192 +1048,6 @@ mod tests {
         let all_events: Vec<_> = events1.into_iter().chain(events2).collect();
         for i in 1..all_events.len() {
             assert!(all_events[i].sequence_number > all_events[i - 1].sequence_number);
-        }
-    }
-
-    /// Helper: create a chunk with tool call deltas
-    fn create_tool_call_chunk(
-        id: &str,
-        role: Option<&str>,
-        tool_call_id: Option<&str>,
-        tool_name: Option<&str>,
-        tool_args: Option<&str>,
-        finish_reason: Option<&str>,
-    ) -> ChatCompletionChunk {
-        let tool_calls = if tool_call_id.is_some() || tool_name.is_some() || tool_args.is_some() {
-            Some(vec![ChunkToolCall {
-                index: 0,
-                id: tool_call_id.map(String::from),
-                call_type: tool_call_id.map(|_| "function".to_string()),
-                function: if tool_name.is_some() || tool_args.is_some() {
-                    Some(ChunkFunctionCall {
-                        name: tool_name.map(String::from),
-                        arguments: tool_args.map(String::from),
-                    })
-                } else {
-                    None
-                },
-            }])
-        } else {
-            None
-        };
-
-        ChatCompletionChunk {
-            id: id.to_string(),
-            object: "chat.completion.chunk".to_string(),
-            created: 1234567890,
-            model: "gpt-4".to_string(),
-            choices: vec![ChunkChoice {
-                index: 0,
-                delta: ChunkDelta {
-                    role: role.map(String::from),
-                    content: None,
-                    tool_calls,
-                    reasoning: None,
-                    reasoning_content: None,
-                    reasoning_details: None,
-                },
-                finish_reason: finish_reason.map(String::from),
-                logprobs: None,
-            }],
-            usage: None,
-            system_fingerprint: None,
-            service_tier: None,
-        }
-    }
-
-    #[test]
-    fn test_extract_tool_calls() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None);
-
-        // Stream a tool call: role, then tool call start, then arguments, then finish
-        state.process_chunk(&create_tool_call_chunk("c1", Some("assistant"), None, None, None, None));
-        state.process_chunk(&create_tool_call_chunk(
-            "c2",
-            None,
-            Some("call_abc"),
-            Some("get_weather"),
-            Some(r#"{"loc"#),
-            None,
-        ));
-        state.process_chunk(&create_tool_call_chunk("c3", None, None, None, Some(r#"ation":"Paris"}"#), None));
-        state.process_chunk(&create_tool_call_chunk("c4", None, None, None, None, Some("tool_calls")));
-
-        let tool_calls = state.extract_tool_calls();
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].0, "call_abc");
-        assert_eq!(tool_calls[0].1, "get_weather");
-        assert_eq!(tool_calls[0].2, r#"{"location":"Paris"}"#);
-    }
-
-    #[test]
-    fn test_extract_tool_calls_empty_when_no_tools() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None);
-
-        // Plain text stream with no tool calls
-        state.process_chunk(&create_test_chunk("c1", Some("Hi"), Some("assistant"), None));
-        state.process_chunk(&create_test_chunk("c2", None, None, Some("stop")));
-
-        let tool_calls = state.extract_tool_calls();
-        assert!(tool_calls.is_empty());
-    }
-
-    #[test]
-    fn test_prepare_next_iteration() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None);
-
-        // First iteration: one item
-        state.process_chunk(&create_test_chunk("c1", Some("Hi"), Some("assistant"), Some("stop")));
-
-        assert_eq!(state.items.len(), 1);
-        assert_eq!(state.completed_items.len(), 0);
-        assert_eq!(state.item_index_offset, 0);
-
-        state.prepare_next_iteration();
-
-        assert_eq!(state.items.len(), 0);
-        assert_eq!(state.completed_items.len(), 1);
-        assert_eq!(state.item_index_offset, 1);
-    }
-
-    #[test]
-    fn test_multi_iteration_item_ids_are_unique() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None);
-
-        // First iteration
-        state.process_chunk(&create_test_chunk("c1", Some("call result"), Some("assistant"), Some("tool_calls")));
-
-        // Collect first iteration item IDs
-        let first_item_ids: Vec<String> = state.items.iter().map(|i| i.id.clone()).collect();
-
-        state.prepare_next_iteration();
-
-        // Second iteration — choice.index is 0 again
-        state.process_chunk(&create_test_chunk("c2", Some("Final answer"), Some("assistant"), Some("stop")));
-
-        let second_item_ids: Vec<String> = state.items.iter().map(|i| i.id.clone()).collect();
-
-        // IDs must not overlap
-        for id in &first_item_ids {
-            assert!(!second_item_ids.contains(id), "ID collision across iterations: {id}");
-        }
-
-        // Specifically: first iteration gets item_0, second gets item_1
-        assert_eq!(first_item_ids, vec!["item_0"]);
-        assert_eq!(second_item_ids, vec!["item_1"]);
-    }
-
-    #[test]
-    fn test_multi_iteration_output_indices() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None);
-
-        // First iteration
-        let events1 = state.process_chunk(&create_test_chunk("c1", Some("Hi"), Some("assistant"), None));
-
-        // Find the output_item.added event and check its index
-        let added_event_1 = events1.iter().find(|e| e.event_type == "response.output_item.added").unwrap();
-        if let StreamingEventData::OutputItemAdded { output_index, .. } = &added_event_1.data {
-            assert_eq!(*output_index, 0);
-        } else {
-            panic!("Expected OutputItemAdded");
-        }
-
-        state.process_chunk(&create_test_chunk("c2", None, None, Some("stop")));
-        state.prepare_next_iteration();
-
-        // Second iteration — should get output_index 1
-        let events2 = state.process_chunk(&create_test_chunk("c3", Some("World"), Some("assistant"), None));
-
-        let added_event_2 = events2.iter().find(|e| e.event_type == "response.output_item.added").unwrap();
-        if let StreamingEventData::OutputItemAdded { output_index, .. } = &added_event_2.data {
-            assert_eq!(*output_index, 1);
-        } else {
-            panic!("Expected OutputItemAdded");
-        }
-    }
-
-    #[test]
-    fn test_multi_iteration_final_response_includes_all_items() {
-        let mut state = StreamingState::new(&test_request("gpt-4"), None);
-
-        // First iteration
-        state.process_chunk(&create_test_chunk("c1", Some("thinking..."), Some("assistant"), Some("tool_calls")));
-        state.prepare_next_iteration();
-
-        // Second iteration
-        state.process_chunk(&create_test_chunk("c2", Some("The answer is 42."), Some("assistant"), Some("stop")));
-
-        let final_events = state.finalize();
-        let completed = final_events
-            .iter()
-            .find(|e| e.event_type == "response.completed")
-            .expect("Should have response.completed event");
-
-        if let StreamingEventData::ResponseCompleted { response } = &completed.data {
-            // Should have items from both iterations
-            assert_eq!(response.output.len(), 2, "Final response should contain items from both iterations");
-        } else {
-            panic!("Expected ResponseCompleted");
         }
     }
 
