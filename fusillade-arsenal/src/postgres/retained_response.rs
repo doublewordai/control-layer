@@ -3357,6 +3357,14 @@ async fn move_graph<P: PoolProvider>(
 // deletion day can still be in the future. This keeps an arbitrary due legacy
 // backlog outside the bounded probe budget while the lock-time checks remain
 // authoritative. A graph is one request, so its group id is its request id.
+//
+// Discovery is paged: one probe returns up to `$5` of the oldest eligible
+// graphs, in global terminal order, instead of a single row. Each tier arm
+// still walks the validated retention-due index in order, so the per-tier
+// `LIMIT $5` is an index-range read, and the outer sort merges the (at most)
+// tier-count small arms. A serial one-row probe per candidate was the whole
+// pass's critical path once moves fanned out: 512 round trips of discovery
+// before the first mover started.
 const CANDIDATE_DISCOVERY_SQL: &str = r#"
         WITH policy(service_tier, archive_after) AS (
             SELECT * FROM UNNEST($1::text[], $2::timestamptz[])
@@ -3394,41 +3402,48 @@ const CANDIDATE_DISCOVERY_SQL: &str = r#"
                              WHEN 'canceled' THEN request.canceled_at
                          END,
                          request.id
-                LIMIT 1
+                LIMIT $5
             ) candidate
             ORDER BY candidate.terminal_at, candidate.id
-            LIMIT 1
+            LIMIT $5
         )
         SELECT candidate.request_id, candidate.group_id
         FROM candidate_seed candidate
+        ORDER BY candidate.terminal_at, candidate.request_id
         "#;
 
-async fn next_candidate<P: PoolProvider>(
+/// One discovery probe: up to `page_size` of the oldest eligible graphs not
+/// already excluded, oldest first. Fewer rows than asked for means the
+/// eligible set is exhausted beyond this page.
+async fn next_candidates<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     tiers: &[String],
     archive_after: &[DateTime<Utc>],
     terminal_before: DateTime<Utc>,
     excluded_request_ids: &[Uuid],
-) -> MovementResult<Option<Candidate>> {
-    let row: Option<(Uuid, Uuid)> = sqlx::query_as(CANDIDATE_DISCOVERY_SQL)
+    page_size: i64,
+) -> MovementResult<Vec<Candidate>> {
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(CANDIDATE_DISCOVERY_SQL)
         .bind(tiers)
         .bind(archive_after)
         .bind(terminal_before)
         .bind(excluded_request_ids)
-        .fetch_optional(manager.read_executor())
+        .bind(page_size)
+        .fetch_all(manager.read_executor())
         .await
         .map_err(database_failure)?;
-    let Some((request_id, group_id)) = row else {
-        return Ok(None);
-    };
-    if group_id != request_id {
-        return Err(incomplete_graph());
-    }
-    Ok(Some(Candidate {
-        request_id,
-        group_id,
-        discovered_topology: graph_topology(request_id),
-    }))
+    rows.into_iter()
+        .map(|(request_id, group_id)| {
+            if group_id != request_id {
+                return Err(incomplete_graph());
+            }
+            Ok(Candidate {
+                request_id,
+                group_id,
+                discovered_topology: graph_topology(request_id),
+            })
+        })
+        .collect()
 }
 
 pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
@@ -3537,32 +3552,41 @@ async fn archive_batchless_responses<P: PoolProvider>(
         });
     }
     let candidate_limit = max_groups.saturating_add(1);
+    // Discovery normally completes in one probe: a page of `candidate_limit`
+    // rows. Further probes only run when a page came back full of graphs
+    // this pass had already seen (deduplicated by group), and even then the
+    // probe count stays bounded so a pathological queue cannot spin here.
     let max_probes = candidate_limit.saturating_mul(2);
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen_groups = std::collections::HashSet::new();
     let mut excluded_request_ids = Vec::new();
     let mut discovery_exhausted = false;
     for _ in 0..max_probes {
-        if candidates.len() as i64 == candidate_limit {
+        let page_size = candidate_limit - candidates.len() as i64;
+        if page_size <= 0 {
             break;
         }
-        let Some(candidate) = next_candidate(
+        let page = next_candidates(
             manager,
             &tiers,
             &archive_after,
             cutoffs.terminal_before(),
             &excluded_request_ids,
+            page_size,
         )
-        .await?
-        else {
-            discovery_exhausted = true;
-            break;
-        };
-        excluded_request_ids.extend(candidate.discovered_topology.request_ids.iter().copied());
+        .await?;
+        let page_exhausted = (page.len() as i64) < page_size;
+        for candidate in page {
+            excluded_request_ids.extend(candidate.discovered_topology.request_ids.iter().copied());
+            if seen_groups.insert(candidate.group_id) {
+                candidates.push(candidate);
+            }
+        }
         excluded_request_ids.sort_unstable();
         excluded_request_ids.dedup();
-        if seen_groups.insert(candidate.group_id) {
-            candidates.push(candidate);
+        if page_exhausted {
+            discovery_exhausted = true;
+            break;
         }
     }
     let mut outcome = RetainedResponseArchiveOutcome {
@@ -4147,6 +4171,7 @@ mod tests {
             .bind(vec![timestamp("2026-08-01T00:00:00Z")])
             .bind(timestamp("2026-08-08T00:00:00Z"))
             .bind(Vec::<Uuid>::new())
+            .bind(513_i64)
             .fetch_one(&mut *tx)
             .await
             .expect("candidate discovery must be explainable");

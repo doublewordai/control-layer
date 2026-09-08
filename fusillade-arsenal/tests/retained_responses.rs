@@ -2839,6 +2839,68 @@ async fn deferred_oldest_group_does_not_consume_the_movement_budget(pool: PgPool
 }
 
 #[sqlx::test]
+async fn one_pass_discovers_a_page_of_the_oldest_graphs_across_tiers(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    // Interleave tiers so oldest-first across the whole queue differs from
+    // oldest-first within any one tier: a paged probe must merge the tier
+    // arms, not drain one tier before looking at the next.
+    let mut graphs = Vec::new();
+    for (index, (tier, hour)) in [
+        ("flex", 8),
+        ("priority", 9),
+        ("flex", 10),
+        ("priority", 11),
+        ("flex", 12),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        graphs.push(
+            singleton(
+                &pool,
+                tier,
+                TerminalState::Completed,
+                timestamp(&format!("2026-08-01T{hour:02}:00:00Z")),
+                &format!("paged-{index}"),
+            )
+            .await,
+        );
+    }
+    let manager = manager(&pool).await;
+    let retention_policy = policy(&[("flex", 86_400), ("priority", 86_400)]);
+
+    let first = archive(&manager, &retention_policy, 3, i64::MAX)
+        .await
+        .expect("a paged pass must archive up to its graph budget");
+
+    assert_eq!(first.groups_archived, 3);
+    assert!(
+        first.may_have_more,
+        "the spare discovered candidate proves more work"
+    );
+    for graph in &graphs[..3] {
+        assert_wholly_retained(&pool, graph).await;
+    }
+    for graph in &graphs[3..] {
+        assert_wholly_live(&pool, graph).await;
+    }
+
+    let second = archive(&manager, &retention_policy, 3, i64::MAX)
+        .await
+        .expect("the remainder must archive on the next pass");
+
+    assert_eq!(second.groups_archived, 2);
+    assert!(
+        !second.may_have_more,
+        "a short page proves the eligible set is exhausted"
+    );
+    for graph in &graphs {
+        assert_wholly_retained(&pool, graph).await;
+    }
+}
+
+#[sqlx::test]
 async fn archives_singleton_request_template_as_one_group(pool: PgPool) {
     install_candidate_index(&pool).await;
     ensure_partition(&pool, archive_date("2026-08-03")).await;
