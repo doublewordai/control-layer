@@ -108,7 +108,8 @@ pub async fn get_probe(
     _: RequiresPermission<resource::Probes, operation::ReadAll>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Probe>, Error> {
-    let probe = ProbeManager::get_probe(&state.db.read(), id).await?;
+    // Clients retrieve probes immediately after creation or an activation change.
+    let probe = ProbeManager::get_probe(&state.db.write(), id).await?;
     Ok(Json(probe))
 }
 
@@ -553,6 +554,44 @@ mod tests {
         let probe: Probe = response.json();
         assert_eq!(probe.id, created.id);
         assert_eq!(probe.name, "Test Probe");
+    }
+
+    #[sqlx::test]
+    async fn test_get_probe_after_create_with_lagging_replica(pool: PgPool) {
+        use sqlx::Executor;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let deployment_id = setup_test_deployment(&pool, user.id).await;
+        let application = crate::Application::new_with_pool(crate::test::utils::create_test_config(), Some(pool.clone()), None)
+            .await
+            .unwrap();
+        // Model a replica that has the schema and auth data, but has not replayed
+        // probe writes. No timing or physical replication is needed.
+        pool.execute("CREATE SCHEMA stale; CREATE TABLE stale.probes (LIKE public.probes INCLUDING ALL)")
+            .await
+            .unwrap();
+        let replica = sqlx::postgres::PgPoolOptions::new()
+            .connect_with(pool.connect_options().as_ref().clone().options([("search_path", "stale,public")]))
+            .await
+            .unwrap();
+        application.app_state.db.replace(pool.clone(), Some(replica.clone()));
+        let (app, _background) = application.into_test_server();
+        let headers = add_auth_headers(&user);
+        let response = app
+            .post("/admin/api/v1/probes")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&serde_json::json!({"name": "New probe", "deployment_id": deployment_id, "interval_seconds": 60}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let created: Probe = response.json();
+        assert!(ProbeManager::get_probe(&replica, created.id).await.is_err());
+        let response = app
+            .get(&format!("/admin/api/v1/probes/{}", created.id))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        response.assert_status_ok();
+        assert_eq!(response.json::<Probe>().name, "New probe");
     }
 
     #[sqlx::test]

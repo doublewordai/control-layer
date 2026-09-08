@@ -1,5 +1,12 @@
 # Changelog
 
+## [11.5.0](https://github.com/doublewordai/control-layer/compare/v11.4.5...v11.5.0) (2026-09-08)
+
+
+### Features
+
+* **fusillade:** add configurable batch leak intervals ([#1712](https://github.com/doublewordai/control-layer/issues/1712)) ([c4bfb3d](https://github.com/doublewordai/control-layer/commit/c4bfb3d8be587602729efcbd2f1390bd034fa005))
+
 ## [11.4.5](https://github.com/doublewordai/control-layer/compare/v11.4.4...v11.4.5) (2026-09-07)
 
 

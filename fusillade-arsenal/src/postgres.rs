@@ -2508,274 +2508,35 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
     ) -> Result<Vec<Request<Claimed>>> {
-        // NOTE: stale-request reclamation deliberately does NOT run here. The
-        // request daemon's `claim_batchless_requests` already runs
-        // `unclaim_stale_requests` every cycle (and reclaims batched rows too);
-        // repeating it here would double the serialized DB round-trips under
-        // the shared claim mutex for no additional coverage.
-
-        let now = Utc::now();
-        let mut model_capacity_pairs: Vec<(String, i64)> = available_capacity
-            .iter()
-            .filter(|(_, cap)| **cap > 0)
-            .map(|(model, cap)| (model.clone(), *cap as i64))
-            .collect();
-        {
-            use rand::seq::SliceRandom;
-            let mut rng = rand::rng();
-            model_capacity_pairs.shuffle(&mut rng);
-        }
-
-        let models_arr: Vec<String> = model_capacity_pairs
-            .iter()
-            .map(|(model, _)| model.clone())
-            .collect();
-        let capacities_arr: Vec<i64> = model_capacity_pairs
-            .iter()
-            .map(|(_, capacity)| *capacity)
-            .collect();
-
-        if models_arr.is_empty() {
-            tracing::debug!("No models with available capacity, skipping batch claim");
-            return Ok(Vec::new());
-        }
-
-        let user_ids_arr: Vec<String> = user_active_counts.keys().cloned().collect();
-        let user_counts_arr: Vec<i64> = user_ids_arr
-            .iter()
-            .map(|u| *user_active_counts.get(u).unwrap_or(&0) as i64)
-            .collect();
-        let batch_limit = batch_limit.max(1) as i64;
-
-        let rows = sqlx::query_as!(
-            ClaimedRequestRow,
-            r#"
-            WITH RECURSIVE all_models AS (
-                SELECT model, capacity
-                FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
-            ),
-            user_priority AS (
-                SELECT * FROM unnest($7::TEXT[], $8::BIGINT[]) AS u(user_id, active_count)
-            ),
-            latest_model_filters AS (
-                -- Scoped to the capacity-eligible models: DISTINCT ON over the
-                -- whole event log would grow with the table for no benefit.
-                SELECT DISTINCT ON (model) model, state
-                FROM model_filters
-                WHERE model = ANY($4::TEXT[])
-                ORDER BY model, created_at DESC, id DESC
-            ),
-            -- Distinct batch_ids that still have pending rows for each
-            -- capacity-eligible model, via an index-only "loose index scan"
-            -- (hop to the next batch_id > the current one) so enumeration costs
-            -- O(pairs · log N) — bounded by batches-with-pending-work per
-            -- model, never by total pending rows (a naive DISTINCT would scan
-            -- every pending index entry) nor by total open batches (the
-            -- previous models × batches join). Relies on idx_requests_pending
-            -- (model, batch_id).
-            batch_groups AS (
-                SELECT m.model, m.capacity,
-                       (SELECT r.batch_id FROM requests r
-                        WHERE r.state = 'pending' AND r.model = m.model
-                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
-                          AND r.service_tier IS DISTINCT FROM 'background'
-                        ORDER BY r.batch_id LIMIT 1) AS batch_id
-                FROM all_models m
-              UNION ALL
-                SELECT g.model, g.capacity,
-                       (SELECT r.batch_id FROM requests r
-                        WHERE r.state = 'pending' AND r.model = g.model
-                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
-                          AND r.service_tier IS DISTINCT FROM 'background'
-                          AND r.batch_id > g.batch_id
-                        ORDER BY r.batch_id LIMIT 1) AS batch_id
-                FROM batch_groups g WHERE g.batch_id IS NOT NULL
-            ),
-            selected_batches AS (
-                SELECT *
-                FROM (
-                    SELECT g.model, g.capacity, b.id AS batch_id,
-                           b.expires_at, b.created_at, b.created_by,
-                           COALESCE(b.completion_window, '24h') AS window_class,
-                           calc.pr,
-                           row_number() OVER (
-                               PARTITION BY g.model
-                               ORDER BY calc.pr ASC, b.expires_at ASC, b.id ASC
-                           ) AS batch_rank
-                    FROM batch_groups g
-                    JOIN batches b
-                      ON b.id = g.batch_id
-                     AND b.cancelling_at IS NULL
-                     AND b.deleted_at IS NULL
-                     AND b.completed_at IS NULL
-                     AND b.failed_at IS NULL
-                     AND b.cancelled_at IS NULL
-                     AND b.service_tier IS DISTINCT FROM 'background'
-                    -- Liveness gate: models whose latest filter event is `live`
-                    -- are always eligible. Models with NO filter event (external /
-                    -- always-on providers that scouter does not manage) are only
-                    -- eligible when `batch_claim_require_live` is false (default),
-                    -- matching the historical NULL-is-live claim behaviour. Models
-                    -- whose latest event is `coming`/`absent` are only eligible
-                    -- via the deadline-ramp escape hatch (see WHERE below).
-                    LEFT JOIN latest_model_filters mf
-                      ON mf.model = g.model
-                    LEFT JOIN user_priority up ON b.created_by = up.user_id
-                    CROSS JOIN LATERAL (
-                        SELECT
-                            (1.0 - $9::DOUBLE PRECISION)
-                                * COALESCE(up.active_count, 0)::DOUBLE PRECISION
-                                / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($8::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
-                            + $9::DOUBLE PRECISION
-                                * LEAST(GREATEST(EXTRACT(EPOCH FROM b.expires_at - $3), 0.0) / 86400.0, 1.0) AS pr
-                    ) calc
-                    WHERE (
-                            mf.state = 'live'
-                            OR (NOT $10::BOOLEAN AND mf.state IS NULL)
-                            -- SLA escape hatch (deadline ramp): regardless of
-                            -- liveness, once a batch is within ramp(W) of its
-                            -- deadline it becomes claimable at full capacity so
-                            -- it can overflow to fallback providers instead of
-                            -- missing SLA waiting for the model. Same formula
-                            -- as the batchless claim: ramp = (W_minutes ^ $11)
-                            -- minutes (~59min for 24h windows, ~10min for 1h).
-                            OR (EXTRACT(EPOCH FROM (b.expires_at - $3))
-                                    <= power(GREATEST(EXTRACT(EPOCH FROM (b.expires_at - b.created_at)), 0.0) / 60.0,
-                                             $11::DOUBLE PRECISION) * 60.0)
-                          )
-                      -- Claimable-NOW probe (per enumerated pair, so bounded):
-                      -- the loose scan proves pending rows exist, but rows all
-                      -- backing off on not_before shouldn't burn a rank slot.
-                      AND EXISTS (
-                        SELECT 1
-                        FROM requests r
-                        WHERE r.state = 'pending'
-                          AND r.model = g.model
-                          AND r.batch_id = g.batch_id
-                          AND r.template_id IS NOT NULL
-                          AND r.service_tier IS DISTINCT FROM 'background'
-                          AND (r.not_before IS NULL OR r.not_before <= $3)
-                    )
-                ) ranked
-                WHERE batch_rank <= $6
-            ),
-            candidate_rows AS (
-                SELECT sb.model, sb.capacity, sb.batch_id, sb.expires_at,
-                       sb.window_class, sb.pr, r.id, r.template_id, r.created_at,
-                       GREATEST(EXTRACT(EPOCH FROM (sb.expires_at - sb.created_at)), 0.0)::DOUBLE PRECISION AS window_secs
-                FROM selected_batches sb
-                CROSS JOIN LATERAL (
-                    SELECT r.id, r.template_id, r.created_at
-                    FROM requests r
-                    WHERE r.state = 'pending'
-                      AND r.model = sb.model
-                      AND r.batch_id = sb.batch_id
-                      AND r.template_id IS NOT NULL
-                      AND r.service_tier IS DISTINCT FROM 'background'
-                      AND (r.not_before IS NULL OR r.not_before <= $3)
-                    ORDER BY r.created_at ASC
-                    LIMIT sb.capacity
-                    FOR UPDATE OF r SKIP LOCKED
-                ) r
-            ),
-            to_claim AS (
-                SELECT id, template_id, batch_id, expires_at AS effective_expires_at,
-                       FALSE AS leaked, window_class, window_secs
-                FROM (
-                    SELECT c.*,
-                           row_number() OVER (
-                               PARTITION BY c.model
-                               ORDER BY c.pr ASC, c.expires_at ASC, c.batch_id ASC, c.created_at ASC
-                           ) AS model_rank
-                    FROM candidate_rows c
-                ) ranked
-                WHERE model_rank <= capacity
-                ORDER BY pr ASC, expires_at ASC, batch_id ASC, created_at ASC
-                LIMIT $2::BIGINT
-            ),
-            -- A pending row whose template is gone (its file soft-deleted, its
-            -- weekly partition retired, or the row purged) can never be claimed.
-            -- Fail it here, bounded to the rows this tick actually picked, so it
-            -- burns a claim slot exactly once instead of on every tick; the
-            -- claim update below skips it via its CROSS JOIN on the template.
-            stranded AS (
-                UPDATE requests r
-                   SET state = 'failed',
-                       error = 'request template no longer exists',
-                       failed_at = $3
-                  FROM to_claim tc
-                  -- Per-row lookup by primary key, like the claim join below:
-                  -- a bare NOT EXISTS on the generation-transparent view gets
-                  -- flattened into an anti-join that hashes the whole legacy
-                  -- template table; LIMIT 1 keeps it a probe per picked row.
-                  LEFT JOIN LATERAL (
-                      SELECT 1 AS present FROM active_request_templates t
-                      WHERE t.id = tc.template_id LIMIT 1
-                  ) t ON true
-                 WHERE r.id = tc.id
-                   AND t.present IS NULL
-                RETURNING r.id
-            )
-            UPDATE requests r
-            SET
-                state = 'claimed',
-                daemon_id = $1,
-                claimed_at = $3
-            FROM to_claim tc
-            CROSS JOIN LATERAL (
-                -- Per-row lookup by primary key. A plain join on the
-                -- generation-transparent view lets the planner hash the whole
-                -- legacy template table against the handful of claimed rows;
-                -- LIMIT 1 keeps this subquery from being flattened into that join.
-                SELECT * FROM active_request_templates t WHERE t.id = tc.template_id LIMIT 1
-            ) t
-            JOIN batches b ON tc.batch_id = b.id
-            WHERE r.id = tc.id
-            RETURNING r.id,
-                      r.batch_id,
-                      r.template_id as "template_id!", r.retry_attempt,
-                      t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
-                      t.body as "body!", t.model as "model!", COALESCE(b.api_key, t.api_key) as "api_key!",
-                      tc.effective_expires_at as "batch_expires_at?",
-                      b.id::TEXT as "batch_id_str!",
-                      COALESCE(b.file_id::TEXT, '') as "batch_file_id!",
-                      b.endpoint as "batch_endpoint!",
-                      b.completion_window as "batch_completion_window?",
-                      b.metadata::TEXT as "batch_metadata",
-                      b.output_file_id::TEXT as "batch_output_file_id",
-                      b.error_file_id::TEXT as "batch_error_file_id",
-                      COALESCE(b.created_by, '') as "batch_created_by!",
-                      to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_created_at!",
-                      to_char(tc.effective_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_expires_at_str",
-                      to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_cancelling_at",
-                      b.errors::TEXT as "batch_errors",
-                      COALESCE(b.total_requests::TEXT, '1') as "batch_total_requests!",
-                      tc.leaked as "leaked!",
-                      tc.window_class as "window_class!",
-                      tc.window_secs as "window_secs!"
-            "#,
-            *daemon_id as Uuid,
-            limit as i64,
-            now,
-            &models_arr,
-            &capacities_arr,
+        self.claim_batch_requests_inner(
+            limit,
             batch_limit,
-            &user_ids_arr,
-            &user_counts_arr,
-            self.config.urgency_weight,
-            self.config.batch_claim_require_live,
-            self.config.claim_ramp_exponent,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+            None,
         )
-        .fetch_all(self.write_executor())
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to claim batch requests: {}", e)))?;
+    }
 
-        let claimed_count = rows.len();
-        if claimed_count > 0 {
-            tracing::debug!(claimed = claimed_count, "Claimed batched requests");
-        }
-
-        Ok(self.claimed_rows_to_requests(rows, daemon_id, now))
+    async fn claim_batch_requests_with_cooldown(
+        &self,
+        limit: usize,
+        batch_limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+        leak_cooldown: &std::collections::HashSet<(String, String, String)>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        self.claim_batch_requests_inner(
+            limit,
+            batch_limit,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+            Some(leak_cooldown),
+        )
+        .await
     }
 
     #[tracing::instrument(
@@ -7136,6 +6897,309 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
 // Helper methods for file streaming and virtual file creation
 impl<P: PoolProvider> PostgresRequestManager<P> {
+    async fn claim_batch_requests_inner(
+        &self,
+        limit: usize,
+        batch_limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+        leak_cooldown: Option<&std::collections::HashSet<(String, String, String)>>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        // NOTE: stale-request reclamation deliberately does NOT run here. The
+        // request daemon's `claim_batchless_requests` already runs
+        // `unclaim_stale_requests` every cycle (and reclaims batched rows too);
+        // repeating it here would double the serialized DB round-trips under
+        // the shared claim mutex for no additional coverage.
+
+        let now = Utc::now();
+        let mut model_capacity_pairs: Vec<(String, i64)> = available_capacity
+            .iter()
+            .filter(|(_, cap)| **cap > 0)
+            .map(|(model, cap)| (model.clone(), *cap as i64))
+            .collect();
+        {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::rng();
+            model_capacity_pairs.shuffle(&mut rng);
+        }
+
+        let models_arr: Vec<String> = model_capacity_pairs
+            .iter()
+            .map(|(model, _)| model.clone())
+            .collect();
+        let capacities_arr: Vec<i64> = model_capacity_pairs
+            .iter()
+            .map(|(_, capacity)| *capacity)
+            .collect();
+
+        if models_arr.is_empty() {
+            tracing::debug!("No models with available capacity, skipping batch claim");
+            return Ok(Vec::new());
+        }
+
+        let user_ids_arr: Vec<String> = user_active_counts.keys().cloned().collect();
+        let user_counts_arr: Vec<i64> = user_ids_arr
+            .iter()
+            .map(|u| *user_active_counts.get(u).unwrap_or(&0) as i64)
+            .collect();
+        let batch_limit = batch_limit.max(1) as i64;
+
+        let leak_enabled = leak_cooldown.is_some();
+        let empty_cooldown = std::collections::HashSet::new();
+        let leak_cooldown = leak_cooldown.unwrap_or(&empty_cooldown);
+
+        // Keep the arrays positionally aligned: HashSet iteration order is not
+        // an API contract across independent passes.
+        let mut cooldown_users = Vec::with_capacity(leak_cooldown.len());
+        let mut cooldown_windows = Vec::with_capacity(leak_cooldown.len());
+        let mut cooldown_models = Vec::with_capacity(leak_cooldown.len());
+        for (user, window, model) in leak_cooldown {
+            cooldown_users.push(user.clone());
+            cooldown_windows.push(window.clone());
+            cooldown_models.push(model.clone());
+        }
+
+        let rows = sqlx::query_as!(
+            ClaimedRequestRow,
+            r#"
+            WITH RECURSIVE all_models AS (
+                SELECT model, capacity
+                FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
+            ),
+            user_priority AS (
+                SELECT * FROM unnest($7::TEXT[], $8::BIGINT[]) AS u(user_id, active_count)
+            ),
+            latest_model_filters AS (
+                -- Scoped to the capacity-eligible models: DISTINCT ON over the
+                -- whole event log would grow with the table for no benefit.
+                SELECT DISTINCT ON (model) model, state
+                FROM model_filters
+                WHERE model = ANY($4::TEXT[])
+                ORDER BY model, created_at DESC, id DESC
+            ),
+            -- Distinct batch_ids that still have pending rows for each
+            -- capacity-eligible model, via an index-only "loose index scan"
+            -- (hop to the next batch_id > the current one) so enumeration costs
+            -- O(pairs · log N) — bounded by batches-with-pending-work per
+            -- model, never by total pending rows (a naive DISTINCT would scan
+            -- every pending index entry) nor by total open batches (the
+            -- previous models × batches join). Relies on idx_requests_pending
+            -- (model, batch_id).
+            batch_groups AS (
+                SELECT m.model, m.capacity,
+                       (SELECT r.batch_id FROM requests r
+                        WHERE r.state = 'pending' AND r.model = m.model
+                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
+                          AND r.service_tier IS DISTINCT FROM 'background'
+                        ORDER BY r.batch_id LIMIT 1) AS batch_id
+                FROM all_models m
+              UNION ALL
+                SELECT g.model, g.capacity,
+                       (SELECT r.batch_id FROM requests r
+                        WHERE r.state = 'pending' AND r.model = g.model
+                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
+                          AND r.service_tier IS DISTINCT FROM 'background'
+                          AND r.batch_id > g.batch_id
+                        ORDER BY r.batch_id LIMIT 1) AS batch_id
+                FROM batch_groups g WHERE g.batch_id IS NOT NULL
+            ),
+            ranked_batches AS (
+                SELECT *
+                FROM (
+                    SELECT g.model, g.capacity, b.id AS batch_id,
+                           b.expires_at, b.created_at, b.created_by,
+                           COALESCE(b.completion_window, '24h') AS window_class,
+                           calc.pr, gate.claim_full,
+                           row_number() OVER (
+                               PARTITION BY g.model, COALESCE(b.created_by, ''),
+                                            COALESCE(b.completion_window, '24h'), gate.claim_full
+                               ORDER BY calc.pr ASC, b.expires_at ASC, b.id ASC
+                           ) AS leak_rank
+                    FROM batch_groups g
+                    JOIN batches b
+                      ON b.id = g.batch_id
+                     AND b.cancelling_at IS NULL
+                     AND b.deleted_at IS NULL
+                     AND b.completed_at IS NULL
+                     AND b.failed_at IS NULL
+                     AND b.cancelled_at IS NULL
+                     AND b.service_tier IS DISTINCT FROM 'background'
+                    -- Live/unmanaged and near-deadline batches claim normally.
+                    -- Other batches share the async one-row-per-bucket trickle.
+                    LEFT JOIN latest_model_filters mf
+                      ON mf.model = g.model
+                    LEFT JOIN user_priority up ON b.created_by = up.user_id
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            (1.0 - $9::DOUBLE PRECISION)
+                                * COALESCE(up.active_count, 0)::DOUBLE PRECISION
+                                / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($8::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
+                            + $9::DOUBLE PRECISION
+                                * LEAST(GREATEST(EXTRACT(EPOCH FROM b.expires_at - $3), 0.0) / 86400.0, 1.0) AS pr
+                    ) calc
+                    CROSS JOIN LATERAL (
+                        SELECT (
+                            COALESCE(mf.state = 'live', NOT $10::BOOLEAN)
+                            OR (EXTRACT(EPOCH FROM (b.expires_at - $3))
+                                <= power(GREATEST(EXTRACT(EPOCH FROM (b.expires_at - b.created_at)), 0.0) / 60.0,
+                                         $11::DOUBLE PRECISION) * 60.0)
+                        ) AS claim_full
+                    ) gate
+                    WHERE (gate.claim_full OR ($15::BOOLEAN AND NOT EXISTS (
+                        SELECT 1 FROM unnest($12::TEXT[], $13::TEXT[], $14::TEXT[]) AS cd(u, w, mdl)
+                        WHERE cd.u = COALESCE(b.created_by, '')
+                          AND cd.w = COALESCE(b.completion_window, '24h')
+                          AND cd.mdl = g.model
+                    )))
+                      -- Claimable-NOW probe (per enumerated pair, so bounded):
+                      -- the loose scan proves pending rows exist, but rows all
+                      -- backing off on not_before shouldn't burn a rank slot.
+                      AND EXISTS (
+                        SELECT 1
+                        FROM requests r
+                        WHERE r.state = 'pending'
+                          AND r.model = g.model
+                          AND r.batch_id = g.batch_id
+                          AND r.template_id IS NOT NULL
+                          AND r.service_tier IS DISTINCT FROM 'background'
+                          AND (r.not_before IS NULL OR r.not_before <= $3)
+                    )
+                ) ranked
+                WHERE claim_full OR leak_rank = 1
+            ),
+            selected_batches AS (
+                SELECT * FROM (
+                    SELECT rb.*, row_number() OVER (
+                        PARTITION BY model ORDER BY claim_full DESC, pr ASC, expires_at ASC, batch_id ASC
+                    ) AS batch_rank
+                    FROM ranked_batches rb
+                ) ranked
+                WHERE batch_rank <= $6
+            ),
+            candidate_rows AS (
+                SELECT sb.model, sb.capacity, sb.batch_id, sb.expires_at,
+                       sb.window_class, sb.pr, NOT sb.claim_full AS leaked, r.id, r.template_id, r.created_at,
+                       GREATEST(EXTRACT(EPOCH FROM (sb.expires_at - sb.created_at)), 0.0)::DOUBLE PRECISION AS window_secs
+                FROM selected_batches sb
+                CROSS JOIN LATERAL (
+                    SELECT r.id, r.template_id, r.created_at
+                    FROM requests r
+                    WHERE r.state = 'pending'
+                      AND r.model = sb.model
+                      AND r.batch_id = sb.batch_id
+                      AND r.template_id IS NOT NULL
+                      AND r.service_tier IS DISTINCT FROM 'background'
+                      AND (r.not_before IS NULL OR r.not_before <= $3)
+                    ORDER BY r.created_at ASC
+                    LIMIT CASE WHEN sb.claim_full THEN sb.capacity ELSE 1 END
+                    FOR UPDATE OF r SKIP LOCKED
+                ) r
+            ),
+            to_claim AS (
+                SELECT id, template_id, batch_id, expires_at AS effective_expires_at,
+                       leaked, window_class, window_secs
+                FROM (
+                    SELECT c.*,
+                           row_number() OVER (
+                               PARTITION BY c.model
+                               ORDER BY c.leaked ASC, c.pr ASC, c.expires_at ASC, c.batch_id ASC, c.created_at ASC
+                           ) AS model_rank
+                    FROM candidate_rows c
+                ) ranked
+                WHERE model_rank <= capacity
+                ORDER BY leaked ASC, pr ASC, expires_at ASC, batch_id ASC, created_at ASC
+                LIMIT $2::BIGINT
+            ),
+            -- A pending row whose template is gone (its file soft-deleted, its
+            -- weekly partition retired, or the row purged) can never be claimed.
+            -- Fail it here, bounded to the rows this tick actually picked, so it
+            -- burns a claim slot exactly once instead of on every tick; the
+            -- claim update below skips it via its CROSS JOIN on the template.
+            stranded AS (
+                UPDATE requests r
+                   SET state = 'failed',
+                       error = 'request template no longer exists',
+                       failed_at = $3
+                  FROM to_claim tc
+                  -- Per-row lookup by primary key, like the claim join below:
+                  -- a bare NOT EXISTS on the generation-transparent view gets
+                  -- flattened into an anti-join that hashes the whole legacy
+                  -- template table; LIMIT 1 keeps it a probe per picked row.
+                  LEFT JOIN LATERAL (
+                      SELECT 1 AS present FROM active_request_templates t
+                      WHERE t.id = tc.template_id LIMIT 1
+                  ) t ON true
+                 WHERE r.id = tc.id
+                   AND t.present IS NULL
+                RETURNING r.id
+            )
+            UPDATE requests r
+            SET
+                state = 'claimed',
+                daemon_id = $1,
+                claimed_at = $3
+            FROM to_claim tc
+            CROSS JOIN LATERAL (
+                -- Per-row lookup by primary key. A plain join on the
+                -- generation-transparent view lets the planner hash the whole
+                -- legacy template table against the handful of claimed rows;
+                -- LIMIT 1 keeps this subquery from being flattened into that join.
+                SELECT * FROM active_request_templates t WHERE t.id = tc.template_id LIMIT 1
+            ) t
+            JOIN batches b ON tc.batch_id = b.id
+            WHERE r.id = tc.id
+            RETURNING r.id,
+                      r.batch_id,
+                      r.template_id as "template_id!", r.retry_attempt,
+                      t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
+                      t.body as "body!", t.model as "model!", COALESCE(b.api_key, t.api_key) as "api_key!",
+                      tc.effective_expires_at as "batch_expires_at?",
+                      b.id::TEXT as "batch_id_str!",
+                      COALESCE(b.file_id::TEXT, '') as "batch_file_id!",
+                      b.endpoint as "batch_endpoint!",
+                      b.completion_window as "batch_completion_window?",
+                      b.metadata::TEXT as "batch_metadata",
+                      b.output_file_id::TEXT as "batch_output_file_id",
+                      b.error_file_id::TEXT as "batch_error_file_id",
+                      COALESCE(b.created_by, '') as "batch_created_by!",
+                      to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_created_at!",
+                      to_char(tc.effective_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_expires_at_str",
+                      to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_cancelling_at",
+                      b.errors::TEXT as "batch_errors",
+                      COALESCE(b.total_requests::TEXT, '1') as "batch_total_requests!",
+                      tc.leaked as "leaked!",
+                      tc.window_class as "window_class!",
+                      tc.window_secs as "window_secs!"
+            "#,
+            *daemon_id as Uuid,
+            limit as i64,
+            now,
+            &models_arr,
+            &capacities_arr,
+            batch_limit,
+            &user_ids_arr,
+            &user_counts_arr,
+            self.config.urgency_weight,
+            self.config.batch_claim_require_live,
+            self.config.claim_ramp_exponent,
+            &cooldown_users,
+            &cooldown_windows,
+            &cooldown_models,
+            leak_enabled,
+        )
+        .fetch_all(self.write_executor())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to claim batch requests: {}", e)))?;
+
+        let claimed_count = rows.len();
+        if claimed_count > 0 {
+            tracing::debug!(claimed = claimed_count, "Claimed batched requests");
+        }
+
+        Ok(self.claimed_rows_to_requests(rows, daemon_id, now))
+    }
+
     /// Internal helper to fetch a batch from a specific executor.
     ///
     /// This is used when we require read-after-write consistency and must query
@@ -11761,7 +11825,227 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_claim_batch_requests_only_uses_live_batches(pool: sqlx::PgPool) {
+    async fn test_claim_batch_requests_leaks_one_per_bucket(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        // Current schemas reject NULL foreground windows. Emulate an older
+        // backend schema to exercise the query's documented 24h normalization.
+        sqlx::query("ALTER TABLE batches DROP CONSTRAINT batches_background_deadline_check")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Two batches in one bucket must not double the allowance. Other users,
+        // models and windows retain their own allowance.
+        for (user, model, window) in [
+            ("alice", "large-a", "24h"),
+            ("alice", "large-a", ""),
+            ("bob", "large-a", "24h"),
+            ("alice", "large-b", "24h"),
+            ("alice", "large-a", "1h"),
+        ] {
+            let file = manager
+                .create_file(
+                    "tiny-batch".into(),
+                    Some(user.into()),
+                    (0..3)
+                        .map(|n| RequestTemplateInput {
+                            custom_id: Some(n.to_string()),
+                            endpoint: "https://api.example.com".into(),
+                            method: "POST".into(),
+                            path: "/test".into(),
+                            body: "{}".into(),
+                            model: model.into(),
+                            api_key: "key".into(),
+                        })
+                        .collect(),
+                )
+                .await
+                .unwrap();
+            manager
+                .create_batch(crate::batch::BatchInput {
+                    file_id: file,
+                    endpoint: "/v1/chat/completions".into(),
+                    completion_window: if window.is_empty() { "24h" } else { window }.into(),
+                    metadata: None,
+                    created_by: Some(user.into()),
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+            if window.is_empty() {
+                sqlx::query("UPDATE batches SET completion_window = NULL WHERE file_id = $1")
+                    .bind(*file)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        for model in ["large-a", "large-b"] {
+            mark_not_live(&manager, model).await;
+        }
+        let capacity = HashMap::from([("large-a".into(), 100), ("large-b".into(), 100)]);
+        let daemon = DaemonId::from(Uuid::new_v4());
+        for _ in 0..2 {
+            let legacy = manager
+                .claim_batch_requests(100, 100, daemon, &capacity, &HashMap::new())
+                .await
+                .unwrap();
+            assert!(
+                legacy.is_empty(),
+                "the legacy method must not leak on any call"
+            );
+        }
+        let first = manager
+            .claim_batch_requests_with_cooldown(
+                100,
+                100,
+                daemon,
+                &capacity,
+                &HashMap::new(),
+                &std::collections::HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.len(),
+            4,
+            "one immediate request per bucket, not per batch"
+        );
+        let cooldown: std::collections::HashSet<_> = first
+            .iter()
+            .map(|r| {
+                let stamp = r
+                    .state
+                    .leak
+                    .as_ref()
+                    .expect("unavailable batches must stamp cooldown");
+                (
+                    r.data.created_by.clone(),
+                    stamp.window_class.clone(),
+                    r.data.model.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(cooldown.len(), 4);
+        let blocked = manager
+            .claim_batch_requests_with_cooldown(
+                100,
+                100,
+                daemon,
+                &capacity,
+                &HashMap::new(),
+                &cooldown,
+            )
+            .await
+            .unwrap();
+        assert!(
+            blocked.is_empty(),
+            "no further claims before the interval elapses"
+        );
+        // The daemon removes refilled buckets; the next cycle then advances each
+        // tiny batch again. No wall-clock sleeps are necessary to test the gate.
+        let next = manager
+            .claim_batch_requests_with_cooldown(
+                100,
+                100,
+                daemon,
+                &capacity,
+                &HashMap::new(),
+                &std::collections::HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.len(), 4);
+        assert!(next.iter().all(|r| r.state.leak.is_some()));
+    }
+
+    #[sqlx::test]
+    async fn test_claim_batch_requests_ramp_precedes_leaks_at_every_limit(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            urgency_weight: 0.5,
+            ..Default::default()
+        });
+        for user in ["busy", "idle-1", "idle-2", "idle-3", "idle-4"] {
+            let file_id = manager
+                .create_file(
+                    user.into(),
+                    Some(user.into()),
+                    (0..3)
+                        .map(|n| RequestTemplateInput {
+                            custom_id: Some(n.to_string()),
+                            endpoint: "https://api.example.com".into(),
+                            method: "POST".into(),
+                            path: "/test".into(),
+                            body: "{}".into(),
+                            model: "large".into(),
+                            api_key: "key".into(),
+                        })
+                        .collect(),
+                )
+                .await
+                .unwrap();
+            manager
+                .create_batch(crate::batch::BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".into(),
+                    completion_window: "24h".into(),
+                    metadata: None,
+                    created_by: Some(user.into()),
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+        }
+        mark_not_live(&manager, "large").await;
+        // Idle users have lower pr (~0.417) than the busy user's ramp batch
+        // (~0.502). Full claims must still win at all three limiting stages.
+        sqlx::query("UPDATE batches SET created_at = NOW() - INTERVAL '4 hours', expires_at = NOW() + INTERVAL '20 hours'")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE batches SET created_at = NOW() - INTERVAL '23 hours', expires_at = NOW() + INTERVAL '5 minutes' WHERE created_by = 'busy'")
+            .execute(&pool).await.unwrap();
+        for (batch_limit, capacity, limit) in [(4, 100, 100), (5, 1, 100), (5, 100, 1)] {
+            let claimed = manager
+                .claim_batch_requests_with_cooldown(
+                    limit,
+                    batch_limit,
+                    DaemonId::from(Uuid::new_v4()),
+                    &HashMap::from([("large".into(), capacity)]),
+                    &HashMap::from([("busy".into(), 100)]),
+                    &HashSet::new(),
+                )
+                .await
+                .unwrap();
+            let rescued: Vec<_> = claimed
+                .iter()
+                .filter(|r| r.data.created_by == "busy")
+                .collect();
+            assert_eq!(
+                rescued.len(),
+                3.min(capacity).min(limit),
+                "ramp claims must survive batch_limit={batch_limit}, capacity={capacity}, limit={limit}"
+            );
+            assert!(rescued.iter().all(|r| r.state.leak.is_none()));
+            sqlx::query(
+                "UPDATE requests SET state = 'pending', daemon_id = NULL, claimed_at = NULL",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_claim_batch_requests_live_and_unmanaged_bypass_cooldown(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -11822,6 +12106,11 @@ mod tests {
             ("unmanaged-model".to_string(), 10),
         ]);
 
+        let cooldown = ["live-model", "coming-model", "unmanaged-model"]
+            .into_iter()
+            .map(|model| (String::new(), "24h".to_string(), model.to_string()))
+            .collect();
+
         // Strict mode (`batch_claim_require_live = true`): only models whose
         // latest filter event is `live` are eligible — the unmanaged
         // (no-event) model is excluded alongside `coming`.
@@ -11834,7 +12123,14 @@ mod tests {
             ..Default::default()
         });
         let claimed = strict_manager
-            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests_with_cooldown(
+                10,
+                1,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &cooldown,
+            )
             .await
             .expect("Failed to claim batch requests");
         assert_eq!(claimed.len(), 1);
@@ -11847,7 +12143,14 @@ mod tests {
         // live-model's only row was claimed above, so this picks up exactly
         // the unmanaged model; `coming` stays excluded in either mode.
         let claimed = manager
-            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests_with_cooldown(
+                10,
+                1,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &cooldown,
+            )
             .await
             .expect("Failed to claim batch requests");
         assert_eq!(claimed.len(), 1);
@@ -11905,10 +12208,23 @@ mod tests {
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("ramp-model".to_string(), 10)]);
 
+        let cooldown = std::collections::HashSet::from([(
+            String::new(),
+            "1h".to_string(),
+            "ramp-model".to_string(),
+        )]);
+
         // Far from the deadline (1h window → ramp opens ~10 minutes out):
-        // a not-live model's batch is NOT claimable.
+        // a not-live model's batch in cooldown is NOT claimable.
         let claimed = manager
-            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests_with_cooldown(
+                10,
+                1,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &cooldown,
+            )
             .await
             .expect("Failed to claim batch requests");
         assert!(
@@ -11931,7 +12247,14 @@ mod tests {
         .unwrap();
 
         let claimed = manager
-            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests_with_cooldown(
+                10,
+                1,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &cooldown,
+            )
             .await
             .expect("Failed to claim batch requests");
         assert_eq!(
@@ -11940,6 +12263,7 @@ mod tests {
             "within-ramp batch must be claimable despite not-live model"
         );
         assert_eq!(claimed[0].data.model, "ramp-model");
+        assert!(claimed[0].state.leak.is_none());
     }
 
     #[sqlx::test]

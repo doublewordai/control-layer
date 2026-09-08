@@ -304,6 +304,16 @@ pub enum ComponentDb {
     Schema {
         /// Schema name (e.g., "fusillade", "outlet")
         name: String,
+        /// Optional transaction-pooled endpoint for this schema in the main
+        /// database. Use a component role whose default current_schema() is
+        /// `name`; a shared public-first search_path breaks retention identity.
+        /// Defaults to the main pooled endpoint when it has the correct schema.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pooled_url: Option<String>,
+        /// Optional replica endpoint for this schema. When pooled, its role must
+        /// also default to `name`. Otherwise inherits the main replica endpoint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replica_url: Option<String>,
         /// Connection pool settings for this component (primary and replica if not specified)
         #[serde(default)]
         pool: PoolSettings,
@@ -313,8 +323,8 @@ pub enum ComponentDb {
         replica_pool: Option<PoolSettings>,
         /// Direct (non-pooled) connections for this schema, used only for
         /// session-scoped work: today its migrations. Only meaningful when the
-        /// main database has a `pooled_url`; otherwise every pool is direct
-        /// and this is unused.
+        /// main database or this component has a `pooled_url`; otherwise every
+        /// pool is direct and this is unused.
         #[serde(default = "default_direct_pool")]
         direct_pool: PoolSettings,
     },
@@ -362,11 +372,10 @@ impl ComponentDb {
         }
     }
 
-    /// Pooled endpoint for a dedicated component database, if configured.
+    /// Explicit pooled endpoint for this component, if configured.
     pub fn pooled_url(&self) -> Option<&str> {
         match self {
-            ComponentDb::Schema { .. } => None,
-            ComponentDb::Dedicated { pooled_url, .. } => pooled_url.as_deref(),
+            ComponentDb::Schema { pooled_url, .. } | ComponentDb::Dedicated { pooled_url, .. } => pooled_url.as_deref(),
         }
     }
 
@@ -383,6 +392,8 @@ impl ComponentDb {
 /// Default fusillade component configuration (schema mode with "fusillade" schema)
 pub fn default_fusillade_component() -> ComponentDb {
     ComponentDb::Schema {
+        pooled_url: None,
+        replica_url: None,
         name: "fusillade".into(),
         pool: PoolSettings {
             max_connections: 20,
@@ -399,6 +410,8 @@ pub fn default_fusillade_component() -> ComponentDb {
 /// Default outlet component configuration (schema mode with "outlet" schema)
 pub fn default_outlet_component() -> ComponentDb {
     ComponentDb::Schema {
+        pooled_url: None,
+        replica_url: None,
         name: "outlet".into(),
         pool: PoolSettings {
             max_connections: 5,
@@ -1980,9 +1993,10 @@ pub struct DaemonConfig {
     pub batch_archive_retention_days: Option<u32>,
 
     /// Explicit direct/session-capable primary endpoint used only for
-    /// retained-response partition DDL. Dedicated Fusillade databases require
-    /// this attestation; schema mode may reuse the application's already-direct
-    /// primary while preserving its search path. Never serialized in config
+    /// retained-response partition DDL. Dedicated databases and pooled schema
+    /// components require an explicit endpoint using the same role as query
+    /// traffic. Unpooled schema mode can reuse its direct pool. Startup attests
+    /// the database, role, schema, and ownership. Never serialized in config
     /// snapshots and redacted from debug output.
     #[serde(default, skip_serializing)]
     pub retained_response_partition_maintenance_url: Option<SensitiveDatabaseUrl>,
@@ -2051,6 +2065,10 @@ pub struct DaemonConfig {
     /// claimable immediately regardless of liveness). Default: 0.56.
     #[serde(default = "default_claim_ramp_exponent", deserialize_with = "deserialize_claim_ramp_exponent")]
     pub claim_ramp_exponent: f64,
+
+    /// Batch-only leaking controls. Async/flex retains its existing window-based rate.
+    #[serde(flatten)]
+    pub leak: fusillade::daemon::LeakConfig,
 
     /// Consecutive claim-cycle failures a claim loop tolerates (retrying with
     /// exponential backoff, capped at 30s) before it gives up and takes the
@@ -2345,6 +2363,7 @@ impl Default for DaemonConfig {
             batch_claim_interval_ms: 0,
             batch_claim_require_live: false,
             claim_ramp_exponent: default_claim_ramp_exponent(),
+            leak: fusillade::daemon::LeakConfig::default(),
             claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
             claim_query_timeout_ms: default_claim_query_timeout_ms(),
             batch_archive_sweep_enabled: false,
@@ -3101,10 +3120,7 @@ impl Config {
             let outlet = config.database.outlet().clone();
             let underway_pool = config.database.underway_pool_settings().clone();
             let direct_pool = config.database.direct_pool_settings().clone();
-            let pooled_url = config
-                .database_pooled_url
-                .take()
-                .or_else(|| config.database.external_pooled_url().map(str::to_string));
+            let pooled_url = config.database.external_pooled_url().map(str::to_string);
 
             // Preserve original replica_pool if it was explicitly configured (not using fallback)
             let original_replica_pool = match &config.database {
@@ -3137,6 +3153,17 @@ impl Config {
                 }
                 DatabaseConfig::Embedded { .. } => {
                     // Can't set replica for embedded database
+                }
+            }
+        }
+
+        // The pooled endpoint override is independent of how the direct URL
+        // was supplied (YAML, nested environment variable, or DATABASE_URL).
+        if let Some(url) = config.database_pooled_url.take() {
+            match &mut config.database {
+                DatabaseConfig::External { pooled_url, .. } => *pooled_url = Some(url),
+                DatabaseConfig::Embedded { .. } => {
+                    return Err(figment::Error::from("a pooled endpoint requires an external database"));
                 }
             }
         }
@@ -3189,12 +3216,16 @@ impl Config {
             });
         }
         if owns_archive_maintenance
-            && (daemon.retained_response_retirement_enabled || daemon.batch_archive_retirement_enabled)
-            && matches!(self.database.fusillade(), ComponentDb::Dedicated { .. })
+            && (daemon.retained_response_retirement_enabled
+                || daemon.batch_archive_retirement_enabled
+                || daemon.template_retirement_enabled)
+            && (matches!(self.database.fusillade(), ComponentDb::Dedicated { .. })
+                || self.database.external_pooled_url().is_some()
+                || self.database.fusillade().pooled_url().is_some())
             && daemon.retained_response_partition_maintenance_url.is_none()
         {
             return Err(Error::Internal {
-                operation: "Config validation: retained-response partition retirement on a dedicated database requires an explicit direct session endpoint".to_string(),
+                operation: "Config validation: partition retirement on a pooled or dedicated database requires an explicit direct session endpoint using the same role as fusillade query traffic".to_string(),
             });
         }
         if owns_archive_maintenance
@@ -3996,6 +4027,57 @@ database:
             assert!(config.database_pooled_url.is_none(), "folded into database.pooled_url");
             Ok(())
         });
+    }
+
+    #[test]
+    fn pooled_schema_retirement_requires_component_session_endpoint() {
+        for component_only in [false, true] {
+            let mut config = Config::default();
+            configure_batchless_retention(&mut config);
+            config.database = serde_json::from_value(serde_json::json!({
+                "type": "external", "url": "postgres://main@localhost/db",
+                "pooled_url": if component_only { None } else { Some("postgres://main@pooler/db") },
+                "fusillade": { "mode": "schema", "name": "fusillade",
+                    "pooled_url": "postgres://component@pooler/db" }
+            }))
+            .unwrap();
+            config.background_services.batch_daemon.retained_response_retirement_enabled = true;
+            let error = config
+                .validate()
+                .expect_err("pooled retirement must require an explicit component session endpoint");
+            assert!(error.to_string().contains("direct session endpoint"));
+            config.background_services.batch_daemon.retained_response_partition_maintenance_url =
+                Some(SensitiveDatabaseUrl("postgres://component@localhost/db".into()));
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn pooled_url_override_without_direct_url_override() {
+        for alias in ["DATABASE_POOLED_URL", "DWCTL_DATABASE_POOLED_URL"] {
+            for nested_direct in [false, true] {
+                Jail::expect_with(|jail| {
+                    jail.clear_env();
+                    jail.create_file("test.yaml", "secret_key: hello\ndatabase:\n  type: external\n  url: postgres://direct/db\n  pooled_url: postgres://old-pool/db\n")?;
+                    if nested_direct {
+                        jail.set_env("DWCTL_DATABASE__URL", "postgres://nested-direct/db");
+                    }
+                    jail.set_env(alias, "postgres://pooled/db");
+                    let config = Config::load_from_path("test.yaml")?;
+                    assert_eq!(
+                        config.database.external_url(),
+                        Some(if nested_direct {
+                            "postgres://nested-direct/db"
+                        } else {
+                            "postgres://direct/db"
+                        })
+                    );
+                    assert_eq!(config.database.external_pooled_url(), Some("postgres://pooled/db"));
+                    assert!(config.database_pooled_url.is_none());
+                    Ok(())
+                });
+            }
+        }
     }
 
     #[test]
@@ -5169,6 +5251,68 @@ background_services:
             err.contains("background_concurrency_limit requires inject_deadline_priority"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_leak_interval_defaults_and_overrides() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: test-secret-key")?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert!(config.background_services.batch_daemon.leak.leak_enabled);
+            assert_eq!(config.background_services.batch_daemon.leak.leak_interval_seconds.get(), 60);
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    leak_enabled: false
+    leak_interval_seconds: 30
+    model_leak_interval_seconds:
+      large/model: 10
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert!(!config.background_services.batch_daemon.leak.leak_enabled);
+            assert_eq!(config.background_services.batch_daemon.leak.leak_interval_seconds.get(), 30);
+            assert_eq!(
+                config.background_services.batch_daemon.leak.model_leak_interval_seconds["large/model"].get(),
+                10
+            );
+            jail.set_env("DWCTL_BACKGROUND_SERVICES__BATCH_DAEMON__LEAK_ENABLED", "true");
+            jail.set_env("DWCTL_BACKGROUND_SERVICES__BATCH_DAEMON__LEAK_INTERVAL_SECONDS", "15");
+            let config = Config::load(&args)?;
+            assert!(config.background_services.batch_daemon.leak.leak_enabled);
+            assert_eq!(config.background_services.batch_daemon.leak.leak_interval_seconds.get(), 15);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_leak_interval_rejects_invalid_values() {
+        Jail::expect_with(|jail| {
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            for value in ["0", "-1", "1.5", ".nan", "4294967296"] {
+                for setting in [
+                    format!("leak_interval_seconds: {value}"),
+                    format!("model_leak_interval_seconds: {{large/model: {value}}}"),
+                ] {
+                    jail.create_file(
+                        "test.yaml",
+                        &format!("secret_key: test-secret-key\nbackground_services:\n  batch_daemon:\n    {setting}\n"),
+                    )?;
+                    assert!(Config::load(&args).is_err(), "accepted {setting}");
+                }
+            }
+            Ok(())
+        });
     }
 
     #[test]
