@@ -1,5 +1,17 @@
 # Changelog
 
+## [11.5.2](https://github.com/doublewordai/control-layer/compare/v11.5.1...v11.5.2) (2026-09-08)
+
+
+### Bug Fixes
+
+* **organizations:** close the domain-claim hijack and the ownerless-workspace gap ([#1698](https://github.com/doublewordai/control-layer/issues/1698)) ([bd84908](https://github.com/doublewordai/control-layer/commit/bd84908fc435bc5ed90d6d09c707a5ba9985ef35))
+
+
+### Continuous Integration
+
+* bump versions for perf, refactor and other commit types ([#1717](https://github.com/doublewordai/control-layer/issues/1717)) ([f3d90bc](https://github.com/doublewordai/control-layer/commit/f3d90bc14fd40bfff433a3de09e2c8954e03746f))
+
 ## [11.5.1](https://github.com/doublewordai/control-layer/compare/v11.5.0...v11.5.1) (2026-09-08)
 
 

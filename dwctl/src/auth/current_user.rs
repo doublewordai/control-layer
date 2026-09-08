@@ -191,7 +191,7 @@ async fn try_proxy_header_auth<P: sqlx_pool_router::PoolProvider + Clone + Send 
 
                     // Auto-org: join or create organization based on email domain
                     if let Some(domain) = crate::auth::utils::email_domain(&user.email)
-                        && !crate::auth::utils::is_personal_email_domain(&domain)
+                        && !config.auth.is_personal_email_domain(&domain)
                     {
                         use crate::db::handlers::Organizations;
 
@@ -556,17 +556,23 @@ async fn populate_org_context(user: &mut CurrentUser, parts: &Parts, db: &PgPool
         }
     }
 
-    // Populate organization names by fetching org user records
+    // Populate organization names by fetching org user records.
+    //
+    // The name shown is the display name - what the owner typed - falling back
+    // to the username only for rows old enough to have neither. `username` is
+    // the domain-routing key (`{domain}~{suffix}`, or an opaque `user~{suffix}`
+    // for a workspace with no domain to claim), not a label: rendering it put
+    // "acme.com~a1b2c3d4" in the organization switcher.
     if !user.organizations.is_empty() {
         let org_ids: Vec<uuid::Uuid> = user.organizations.iter().map(|o| o.id).collect();
-        match sqlx::query!(r#"SELECT id, username FROM users WHERE id = ANY($1)"#, &org_ids)
+        match sqlx::query!(r#"SELECT id, username, display_name FROM users WHERE id = ANY($1)"#, &org_ids)
             .fetch_all(&mut *conn)
             .await
         {
             Ok(rows) => {
                 for org in &mut user.organizations {
                     if let Some(row) = rows.iter().find(|r| r.id == org.id) {
-                        org.name = row.username.clone();
+                        org.name = row.display_name.clone().unwrap_or_else(|| row.username.clone());
                     }
                 }
             }
@@ -1590,6 +1596,59 @@ mod tests {
         assert_eq!(current_user.active_organization, Some(org.id));
         assert!(!current_user.organizations.is_empty());
         assert!(current_user.organizations.iter().any(|o| o.id == org.id));
+    }
+
+    /// The organization switcher reads `organizations[].name`, which must be
+    /// the display name the owner typed - not `users.username`. The username is
+    /// the domain-routing key (`{domain}~{suffix}`, or an opaque `user~{suffix}`
+    /// for a workspace with no domain to claim), so rendering it showed
+    /// "acme.com~a1b2c3d4" where the company name belonged.
+    #[sqlx::test]
+    async fn test_org_context_names_the_org_by_display_name(pool: PgPool) {
+        use crate::db::handlers::Organizations;
+        use crate::db::models::organizations::OrganizationCreateDBRequest;
+
+        let config = create_test_config();
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+
+        let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let external_user_id = test_user.external_user_id.as_ref().unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        let org = Organizations::new(&mut conn)
+            .create(
+                &OrganizationCreateDBRequest {
+                    // The routing key, exactly as `create_organization` writes it.
+                    name: "acme.test~a1b2c3d4".to_string(),
+                    email: "billing@acme.test".to_string(),
+                    display_name: Some("Acme Corporation".to_string()),
+                    avatar_url: None,
+                    created_by: test_user.id,
+                },
+                &[crate::api::models::users::Role::StandardUser],
+            )
+            .await
+            .unwrap();
+        drop(conn);
+
+        let request = axum::http::Request::builder()
+            .uri("http://localhost/test")
+            .header("x-doubleword-user", external_user_id)
+            .header("x-doubleword-email", &test_user.email)
+            .body(())
+            .unwrap();
+        let (mut parts, _body) = request.into_parts();
+
+        let current_user = CurrentUser::from_request_parts(&mut parts, &state).await.unwrap();
+        let listed = current_user
+            .organizations
+            .iter()
+            .find(|o| o.id == org.id)
+            .expect("the owner's organization is listed");
+        assert_eq!(
+            listed.name, "Acme Corporation",
+            "the switcher shows the display name, not the routing key"
+        );
     }
 
     #[sqlx::test]

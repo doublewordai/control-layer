@@ -316,9 +316,16 @@ pub struct PendingJoinRequestResponse {
     pub id: uuid::Uuid,
     #[schema(value_type = String, format = "uuid")]
     pub organization_id: UserId,
-    /// The organization's `username`. Carries the `{domain}~{suffix}` form for
-    /// organizations created since domains became claimable; clients that want
-    /// to show a company name should strip at the separator.
+    /// Display name where the organization has one, `username` otherwise —
+    /// the same resolution every other organization-naming response uses.
+    ///
+    /// The fallback is not cosmetic: `username` is the domain-routing key
+    /// (`{domain}~{suffix}`, or an opaque `user~{suffix}` for a workspace with
+    /// no domain to claim), so a row with no display name still surfaces
+    /// "acme.com~a1b2c3d4" here. Every workspace created since #1435 has a
+    /// display name — it defaults to the submitted one — so in practice this
+    /// only affects rows predating that. Clients should render this as given
+    /// rather than trying to parse it.
     pub organization_name: String,
     /// When the request was filed — the moment the user asked, not the moment
     /// they signed up: nothing is filed on their behalf.
