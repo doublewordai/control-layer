@@ -198,6 +198,21 @@ pub async fn record_image_access(pool: &sqlx::PgPool, attribution: ImageAttribut
     }
 }
 
+/// Whether the caller behind `attribution` may reference the image `token`
+/// in a request — i.e. whether they (or their organization) submitted it.
+/// Same rule as the console's image view, applied at request time so a
+/// `dw-img://` token presented on the wire is only ever signed for the
+/// principal that owns the bytes. Daemon dispatches pass because the hidden
+/// batch key resolves to the same user/org that enqueued the request.
+pub async fn is_token_accessible(
+    pool: &sqlx::PgPool,
+    attribution: &ImageAttribution,
+    token: ImageToken,
+) -> std::result::Result<bool, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    is_authorized_to_view(&mut conn, &token.0, attribution.user_id, attribution.organization_id).await
+}
+
 /// Whether `viewer` — optionally acting in organization `active_org` — is
 /// authorized to view the image identified by `sha256`. True when the viewer
 /// submitted it (`user_id`) OR they are acting in the organization it was

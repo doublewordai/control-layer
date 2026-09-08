@@ -2024,10 +2024,16 @@ pub async fn build_router(
         // Re-use the AppState-bound singleton built once at startup.
         let normalizer = state.image_normalizer.clone();
         let realtime_ttl = cfg.image_normalizer.signing.realtime_ttl();
+        // Tokens only ever arrive on a daemon loopback (flex enqueue / file
+        // ingest store them), so they are signed with the dispatch TTL: long
+        // enough to outlive one full processing attempt.
+        let processing_timeout = std::time::Duration::from_millis(cfg.background_services.batch_daemon.processing_timeout_ms);
+        let token_ttl = cfg.image_normalizer.signing.dispatch_ttl(processing_timeout);
         let image_normalizer_state = crate::inference::image_normalizer_middleware::ImageNormalizerMiddlewareState {
             enabled: cfg.image_normalizer.enabled,
             normalizer,
             realtime_ttl,
+            token_ttl,
             pool: Some(state.db.write().clone()),
         };
         onwards_router.layer(middleware::from_fn_with_state(
@@ -3747,19 +3753,13 @@ impl Application {
         // dispatched without it. Two steps that cannot happen on the loopback:
         //   - ZDR decrypt: the stored body is `dwzdr1:` ciphertext, so it is not
         //     parseable JSON and every edge layer chokes before it could act.
-        //   - JIT image signing: the edge normaliser runs `Mode::All`, which does
-        //     not match the `dw-img://` tokens that file ingest stores.
-        // Derive the signing TTL from the daemon's processing timeout so a signed
-        // URL always outlives one full dispatch attempt.
+        //   (`dw-img://` image tokens are deliberately NOT signed here: the loopback's
+        //   image-normaliser layer signs them below the prompt-cache layer, so the
+        //   cache keys on the stable token rather than a per-attempt signed URL.)
         {
-            let processing_timeout = std::time::Duration::from_millis(config.background_services.batch_daemon.processing_timeout_ms);
-            let dispatch_ttl = config.image_normalizer.signing.dispatch_ttl(processing_timeout);
-            let mut dispatch_processor = crate::inference::engine::dispatch_processor::DispatchProcessor::new()
+            let dispatch_processor = crate::inference::engine::dispatch_processor::DispatchProcessor::new()
                 .with_keystore(keystore.clone())
                 .with_streamable_endpoints(config.background_services.batch_daemon.streamable_endpoints.clone());
-            if config.image_normalizer.enabled {
-                dispatch_processor = dispatch_processor.with_image_normalizer(image_normalizer.clone(), dispatch_ttl);
-            }
             if let Err(e) = postgres_daemon.set_processor(Arc::new(dispatch_processor)) {
                 tracing::warn!(error = e, "Dispatch processor was already set; skipping");
             }

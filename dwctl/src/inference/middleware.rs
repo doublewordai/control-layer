@@ -444,12 +444,14 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     .unwrap();
             }
             // Flex is persisted now and dispatched later by the daemon, so —
-            // unlike realtime — it does NOT pass through the image-normaliser
-            // layer. Normalise image inputs to `dw-img://` tokens here so the
-            // daemon's dispatch-time JIT signing hands the provider a signed
-            // URL rather than the raw image/URL (closing the same exposure the
-            // realtime and `/v1/files` paths already close). No-op when the
-            // feature is disabled.
+            // unlike realtime — this leg does NOT pass through the
+            // image-normaliser layer. Normalise image inputs to `dw-img://`
+            // tokens here; the daemon's dispatch loops back through the edge,
+            // where the normaliser layer signs the tokens (below the
+            // prompt-cache layer, so the cache keys on the stable token) and
+            // hands the provider a signed URL rather than the raw image/URL —
+            // closing the same exposure the realtime and `/v1/files` paths
+            // already close. No-op when the feature is disabled.
             if state.image_normalizer_enabled {
                 // Attribute the image to the acting human + owning org (for org
                 // keys), mirroring how CurrentUser is derived, so the console's

@@ -407,6 +407,11 @@ async fn normalize_template_body_in_place(
                         crate::image_normalizer::NormalizeError::NotFound => {
                             BatchNormalizeError::StoreFailed("image token not found in store".to_string())
                         }
+                        // Ingest never authorises tokens (it only produces them), so this
+                        // variant cannot arise here; map it defensively as bad input.
+                        crate::image_normalizer::NormalizeError::Forbidden => {
+                            BatchNormalizeError::BadInput("image token is not accessible to this caller".to_string())
+                        }
                     };
                     if let Ok(mut g) = err_cell.lock()
                         && g.is_none()
