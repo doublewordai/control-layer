@@ -540,7 +540,7 @@ pub async fn delete_user<P: PoolProvider>(
         }
     }
 
-    // Soft-delete + scrub the user row and hard-delete their API keys
+    // Soft-delete + scrub the user row and revoke their API keys
     // (atomic, in repo.delete). Scoped so the connection borrow is released
     // before we enqueue the background purge below.
     let deleted = {
@@ -557,7 +557,7 @@ pub async fn delete_user<P: PoolProvider>(
     }
 
     // Erase the user's fusillade data (files, batches, requests) in the
-    // background. API keys were already hard-deleted synchronously above so
+    // background. API keys were already revoked synchronously above so
     // they stop authenticating immediately; fusillade data can be unbounded,
     // so it is offloaded to an at-least-once underway job.
     enqueue_purge_user_data(&state, user_id_str).await;
