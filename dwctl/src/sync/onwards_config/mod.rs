@@ -519,17 +519,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
         SELECT
             cm.id as composite_model_id,
             cm.alias,
-            cm.requests_per_second,
-            cm.burst_size,
-            cm.capacity,
-            cm.lb_strategy,
-            cm.fallback_enabled,
-            cm.fallback_on_rate_limit,
-            cm.fallback_on_status,
-            cm.fallback_with_replacement,
-            cm.fallback_max_attempts,
-            cm.sanitize_responses as composite_sanitize_responses,
-            cm.trusted as composite_trusted,
             -- Component info
             dmc.deployed_model_id,
             dmc.weight,
