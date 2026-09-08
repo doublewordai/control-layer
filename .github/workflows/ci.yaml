@@ -401,7 +401,7 @@ jobs:
 
   backend-test:
     if: always() && needs.changes.outputs.run-ci == 'true' && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
-    needs: [changes, backend-crate-test, backend-dwctl-test, backend-lint, frontend-test, build]
+    needs: [changes, backend-crate-test, backend-dwctl-test, backend-lint, frontend-test, build, pooled-e2e]
     runs-on: ubuntu-latest
     name: workspace / rust gate
     env:
@@ -419,6 +419,7 @@ jobs:
           CRATE_TEST_RESULT: ${{ needs.backend-crate-test.result }}
           DWCTL_TEST_RESULT: ${{ needs.backend-dwctl-test.result }}
           LINT_RESULT: ${{ needs.backend-lint.result }}
+          POOLED_RESULT: ${{ needs.pooled-e2e.result }}
         run: |
           if [[ "$CRATE_TEST_RESULT" != "success" ]]; then
             echo "One or more crate test jobs failed: $CRATE_TEST_RESULT" >&2
@@ -430,6 +431,10 @@ jobs:
           fi
           if [[ "$LINT_RESULT" != "success" ]]; then
             echo "Rust workspace lint failed: $LINT_RESULT" >&2
+            exit 1
+          fi
+          if [[ "$POOLED_RESULT" != "success" ]]; then
+            echo "Pooled application E2E failed: $POOLED_RESULT" >&2
             exit 1
           fi
 
@@ -1352,3 +1357,92 @@ jobs:
 
           # Report metrics to Somnial
           curl -X POST "https://charts.somnial.co/doubleword-control-layer/e2e-docker-duration?value=${E2E_DURATION}" || true
+
+  pooled-e2e:
+    if: always() && needs.changes.outputs.run-ci == 'true' && (needs.build.result == 'success' || needs.build.result == 'skipped') && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
+    name: dwctl / pooled database e2e
+    runs-on: depot-ubuntu-24.04
+    timeout-minutes: 30
+    needs: [changes, build]
+    permissions:
+      contents: read
+      packages: read
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install transaction pooler and test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pgbouncer
+          python -m pip install -r scripts/tests/pooled/requirements.txt
+          pgbouncer --version
+
+      - name: Log in to GitHub Container Registry
+        if: needs.build.result == 'success'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Merge queues, fork PRs, and Dependabot do not publish an image. Build
+      # the checked-out application locally without registry write privileges.
+      - name: Install Rust for unpublished builds
+        if: needs.build.result == 'skipped'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache unpublished application build
+        if: needs.build.result == 'skipped'
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pooled-e2e-binary
+
+      - name: Build unpublished application
+        if: needs.build.result == 'skipped'
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo build --locked --profile ci --package dwctl
+
+      - name: Test session isolation and pooled application lifecycle
+        shell: bash
+        env:
+          BUILT_IMAGES: ${{ needs.build.outputs.image-tag }}
+          POOLED_TEST_DATABASE_URL: postgres://postgres:password@127.0.0.1:5432/postgres
+        run: |
+          set -euo pipefail
+          if [[ -n "$BUILT_IMAGES" ]]; then
+            image=$(head -n1 <<< "$BUILT_IMAGES")
+            docker pull "$image"
+            target=(--image "$image")
+          else
+            target=(--binary target/ci/dwctl)
+          fi
+          python scripts/tests/pooled/e2e.py "${target[@]}" --artifacts pooled-e2e-results 2>&1 | tee pooled-e2e.log
+
+      - name: Upload pooled database diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pooled-database-e2e
+          path: |
+            pooled-e2e.log
+            pooled-e2e-results/
+          if-no-files-found: ignore
