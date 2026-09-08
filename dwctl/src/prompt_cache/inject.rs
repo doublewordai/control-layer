@@ -465,19 +465,6 @@ fn sse_data_json(line: &str) -> Option<Value> {
     serde_json::from_str::<Value>(trimmed).ok().filter(Value::is_object)
 }
 
-/// Inject the cache stats into the terminal usage frame of an SSE body. `None` if no usage
-/// frame is found. (Thin wrapper over [`scan_edit_sse`]; the streaming path uses the
-/// scan directly to also collect the commit-gate signals.)
-pub fn inject_into_sse_body(body: &[u8], stats: &CacheStats) -> Option<Bytes> {
-    scan_edit_sse(body, UsageEdit::Inject(stats)).rewritten
-}
-
-/// Scrub provider cache fields from the terminal usage frame of an SSE body. `None` when the
-/// frame was already clean (or no usage frame exists) — the stream passes through untouched.
-pub fn scrub_sse_body(body: &[u8]) -> Option<Bytes> {
-    scan_edit_sse(body, UsageEdit::Scrub).rewritten
-}
-
 /// Inject the cache stats into a **non-streaming** chat-completion JSON response. Buffers the
 /// body, splices the cache fields into `usage`, and returns whether the request succeeded for
 /// billing — a 2xx *with* a usage object — so the caller gates the index write on it. A body that
@@ -901,7 +888,7 @@ mod tests {
         // CRLF-framed stream: the rewritten usage frame must keep its trailing '\r' so the
         // '\r\n\r\n' event boundary stays intact (no lone '\n' amid CRLF).
         let sse = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\r\n\r\ndata: [DONE]\r\n\r\n";
-        let out = inject_into_sse_body(sse.as_bytes(), &stats()).unwrap();
+        let out = scan_edit_sse(sse.as_bytes(), UsageEdit::Inject(&stats())).rewritten.unwrap();
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cache_read_input_tokens\":1024"), "got: {s}");
         // The injected frame is still terminated by CRLF, not a bare LF.
@@ -912,7 +899,7 @@ mod tests {
     #[test]
     fn inject_sse_edits_only_terminal_usage_frame() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata: [DONE]\n\n";
-        let out = inject_into_sse_body(sse.as_bytes(), &stats()).unwrap();
+        let out = scan_edit_sse(sse.as_bytes(), UsageEdit::Inject(&stats())).rewritten.unwrap();
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cached_tokens\":1024"));
         assert!(s.contains("\"cache_read_input_tokens\":1024"));
@@ -925,14 +912,14 @@ mod tests {
     #[test]
     fn inject_sse_none_when_no_usage_frame() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
-        assert!(inject_into_sse_body(sse.as_bytes(), &stats()).is_none());
+        assert!(scan_edit_sse(sse.as_bytes(), UsageEdit::Inject(&stats())).rewritten.is_none());
     }
 
     #[test]
     fn inject_sse_handles_data_prefix_without_space() {
         // `data:{…}` (no space after the colon) is valid SSE and must still be injected.
         let sse = "data:{\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata:[DONE]\n\n";
-        let out = inject_into_sse_body(sse.as_bytes(), &stats()).expect("no-space data: frame is injected");
+        let out = scan_edit_sse(sse.as_bytes(), UsageEdit::Inject(&stats())).rewritten.expect("no-space data: frame is injected");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cache_read_input_tokens\":1024"), "got: {s}");
     }
@@ -943,7 +930,7 @@ mod tests {
         // deltas and `[DONE]` untouched. (The streaming orchestration — deferred classify resolve
         // + the commit gate — is exercised end-to-end in the layer tests.)
         let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata: [DONE]\n\n";
-        let out = inject_into_sse_body(body, &stats()).expect("usage frame present → edited");
+        let out = scan_edit_sse(body, UsageEdit::Inject(&stats())).rewritten.expect("usage frame present → edited");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cached_tokens\":1024"), "got: {s}");
         assert!(s.contains("data: [DONE]"), "DONE preserved");
@@ -953,7 +940,7 @@ mod tests {
     #[test]
     fn inject_into_sse_body_none_without_usage() {
         let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
-        assert!(inject_into_sse_body(body, &stats()).is_none(), "no usage frame → nothing to edit");
+        assert!(scan_edit_sse(body, UsageEdit::Inject(&stats())).rewritten.is_none(), "no usage frame → nothing to edit");
     }
 
     #[tokio::test]
@@ -1045,7 +1032,7 @@ mod tests {
     #[test]
     fn scrub_sse_zeroes_cached_tokens_in_terminal_frame() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":985,\"prompt_tokens_details\":{\"cached_tokens\":687}}}\n\ndata: [DONE]\n\n";
-        let out = scrub_sse_body(sse.as_bytes()).expect("dirty usage frame → rewritten");
+        let out = scan_edit_sse(sse.as_bytes(), UsageEdit::Scrub).rewritten.expect("dirty usage frame → rewritten");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cached_tokens\":0"), "got: {s}");
         assert!(!s.contains("687"), "provider value gone, got: {s}");
@@ -1060,9 +1047,9 @@ mod tests {
     fn scrub_sse_none_when_clean() {
         // A clean terminal frame (or no usage frame at all) → no rewrite, stream passes through.
         let clean = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":100}}\n\ndata: [DONE]\n\n";
-        assert!(scrub_sse_body(clean.as_bytes()).is_none());
+        assert!(scan_edit_sse(clean.as_bytes(), UsageEdit::Scrub).rewritten.is_none());
         let no_usage = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
-        assert!(scrub_sse_body(no_usage.as_bytes()).is_none());
+        assert!(scan_edit_sse(no_usage.as_bytes(), UsageEdit::Scrub).rewritten.is_none());
     }
 
     #[test]
