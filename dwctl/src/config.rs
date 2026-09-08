@@ -1966,6 +1966,10 @@ pub struct DaemonConfig {
     #[serde(default = "default_claim_ramp_exponent", deserialize_with = "deserialize_claim_ramp_exponent")]
     pub claim_ramp_exponent: f64,
 
+    /// Fixed leak interval and per-model overrides, shared by batch and async policy.
+    #[serde(flatten)]
+    pub leak: fusillade::daemon::LeakConfig,
+
     /// Consecutive claim-cycle failures a claim loop tolerates (retrying with
     /// exponential backoff, capped at 30s) before it gives up and takes the
     /// daemon down. Transient DB blips no longer kill the daemon outright.
@@ -2259,6 +2263,7 @@ impl Default for DaemonConfig {
             batch_claim_interval_ms: 0,
             batch_claim_require_live: false,
             claim_ramp_exponent: default_claim_ramp_exponent(),
+            leak: fusillade::daemon::LeakConfig::default(),
             claim_loop_max_consecutive_failures: default_claim_loop_max_consecutive_failures(),
             claim_query_timeout_ms: default_claim_query_timeout_ms(),
             batch_archive_sweep_enabled: false,
@@ -5009,6 +5014,63 @@ background_services:
             err.contains("background_concurrency_limit requires inject_deadline_priority"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn test_leak_interval_defaults_and_overrides() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: test-secret-key")?;
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.leak.leak_interval_seconds.get(), 60);
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: test-secret-key
+background_services:
+  batch_daemon:
+    leak_interval_seconds: 30
+    model_leak_interval_seconds:
+      large/model: 10
+"#,
+            )?;
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.leak.leak_interval_seconds.get(), 30);
+            assert_eq!(
+                config.background_services.batch_daemon.leak.model_leak_interval_seconds["large/model"].get(),
+                10
+            );
+            jail.set_env("DWCTL_BACKGROUND_SERVICES__BATCH_DAEMON__LEAK_INTERVAL_SECONDS", "15");
+            let config = Config::load(&args)?;
+            assert_eq!(config.background_services.batch_daemon.leak.leak_interval_seconds.get(), 15);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_leak_interval_rejects_invalid_values() {
+        Jail::expect_with(|jail| {
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+            for value in ["0", "-1", "1.5", ".nan", "4294967296"] {
+                for setting in [
+                    format!("leak_interval_seconds: {value}"),
+                    format!("model_leak_interval_seconds: {{large/model: {value}}}"),
+                ] {
+                    jail.create_file(
+                        "test.yaml",
+                        &format!("secret_key: test-secret-key\nbackground_services:\n  batch_daemon:\n    {setting}\n"),
+                    )?;
+                    assert!(Config::load(&args).is_err(), "accepted {setting}");
+                }
+            }
+            Ok(())
+        });
     }
 
     #[test]

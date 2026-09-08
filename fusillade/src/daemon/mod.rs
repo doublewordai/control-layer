@@ -31,8 +31,8 @@ use crate::processor::{DefaultRequestProcessor, RequestProcessor};
 use crate::request::{Claimed, DaemonId, FailureReason, Request, RequestCompletionResult};
 
 pub use config::{
-    DaemonConfig, DaemonMode, ModelEscalationConfig, RetentionMaintenanceConfig, ShouldRetryFn,
-    default_should_retry,
+    DaemonConfig, DaemonMode, LeakConfig, ModelEscalationConfig, RetentionMaintenanceConfig,
+    ShouldRetryFn, default_should_retry,
 };
 pub use fusillade_core::daemon_record::{
     AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
@@ -1532,7 +1532,7 @@ fn validate_daemon_intervals(config: &DaemonConfig) -> Result<()> {
 
 /// Daemon responsible for batchless pending requests.
 ///
-/// This loop owns the leaky-bucket/deadline-ramp policy for async/flex rows.
+/// This loop shares the leaky-bucket/deadline-ramp policy with batch claims.
 pub struct RequestDaemon<S, H>
 where
     S: Storage + DaemonStorage,
@@ -1555,10 +1555,10 @@ where
     }
 }
 
-/// Daemon responsible for live-model batch requests.
+/// Daemon responsible for batch requests.
 ///
-/// This loop selects batches first, then claims rows from those batches. It does
-/// not use the request daemon's leaky-bucket fallback.
+/// This loop selects batches first, then claims rows from those batches. It
+/// uses the same leaky-bucket fallback as the request daemon.
 pub struct BatchDaemon<S, H>
 where
     S: Storage + DaemonStorage,
@@ -1645,6 +1645,7 @@ where
     http_client: Arc<H>,
     config: DaemonConfig,
     retention_maintenance: RetentionMaintenanceConfig,
+    leak_config: Option<LeakConfig>,
     /// Per-claim processing hook. Defaults to [`DefaultRequestProcessor`],
     /// which preserves the existing fire-and-store pipeline byte-for-byte.
     /// Override via [`Daemon::with_processor`] to inject custom orchestration
@@ -1669,9 +1670,9 @@ where
     /// Each entry's value is `next_token_at`: the earliest `Instant` the bucket
     /// may leak its next request. Before a claim cycle the daemon derives the
     /// cooldown set (triples with `next_token_at > now`) and passes it to
-    /// `claim_requests`; after a claim it stamps `next_token_at = now + W /
-    /// leaks_per_window` for each leaked row's triple. Stale entries are pruned on
-    /// read to bound the map. See `leaks_per_window`.
+    /// both foreground claim methods; after a claim it stamps the next token
+    /// using the configured interval. Stale entries are pruned on read. State
+    /// remains process-local, as in the original async throttle.
     leak_buckets: Arc<dashmap::DashMap<(String, String, String), std::time::Instant>>,
     /// Per-user throughput counters for periodic OTel emission.
     user_throughput: Arc<dashmap::DashMap<String, UserThroughputStats>>,
@@ -1747,6 +1748,7 @@ where
             http_client,
             config,
             retention_maintenance: RetentionMaintenanceConfig::default(),
+            leak_config: None,
             processor: Arc::new(DefaultRequestProcessor),
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
             adaptive_concurrency,
@@ -1784,6 +1786,13 @@ where
     /// source-compatible serialized daemon configuration.
     pub fn with_retention_maintenance(mut self, config: RetentionMaintenanceConfig) -> Self {
         self.retention_maintenance = config;
+        self
+    }
+
+    /// Use fixed leak intervals for both foreground claim loops. Without this
+    /// override, standalone library users retain `DaemonConfig::leaks_per_window`.
+    pub fn with_leak_config(mut self, config: LeakConfig) -> Self {
+        self.leak_config = Some(config);
         self
     }
 
@@ -1975,8 +1984,9 @@ where
         let mut leaked_count = 0u64;
         for request in claimed {
             if let Some(stamp) = &request.state.leak {
-                let interval = std::time::Duration::from_secs_f64(
-                    (stamp.window_secs / leaks_per_window).max(0.0),
+                let interval = self.leak_config.as_ref().map_or_else(
+                    || Duration::from_secs_f64((stamp.window_secs / leaks_per_window).max(0.0)),
+                    |config| config.interval(&request.data.model),
                 );
                 let key = (
                     request.data.created_by.clone(),
@@ -2212,11 +2222,7 @@ where
             gauge!("fusillade_claim_capacity", "daemon" => loop_name).set(total_capacity as f64);
 
             let user_active_counts = self.user_active_counts();
-            let leak_cooldown = if kind == ClaimLoopKind::Request {
-                self.leak_cooldown()
-            } else {
-                std::collections::HashSet::new()
-            };
+            let leak_cooldown = self.leak_cooldown();
 
             let claim_start = std::time::Instant::now();
             let claim_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
@@ -2239,12 +2245,13 @@ where
                     with_query_timeout(
                         "batch claim query",
                         claim_timeout,
-                        self.storage.claim_batch_requests(
+                        self.storage.claim_batch_requests_with_cooldown(
                             kind.claim_size(&self.config),
                             self.config.batch_claim_batch_size,
                             self.daemon_id,
                             &available_capacity,
                             &user_active_counts,
+                            &leak_cooldown,
                         ),
                     )
                     .await
@@ -2310,9 +2317,7 @@ where
                 "Claimed requests from storage"
             );
 
-            if kind == ClaimLoopKind::Request {
-                self.stamp_leaks(&claimed);
-            }
+            self.stamp_leaks(&claimed);
 
             self.grow_saturated_models(&claimed, &available_capacity);
 
@@ -2869,7 +2874,15 @@ where
                 hostname: get_hostname(),
                 pid: get_pid(),
                 version: get_version(),
-                config_snapshot: daemon_config_snapshot(&self.config, &self.retention_maintenance),
+                config_snapshot: {
+                    let mut snapshot =
+                        daemon_config_snapshot(&self.config, &self.retention_maintenance);
+                    if let Some(config) = &self.leak_config {
+                        snapshot["leak"] =
+                            serde_json::to_value(config).expect("leak config is serializable");
+                    }
+                    snapshot
+                },
             },
             state: Initializing {
                 started_at: chrono::Utc::now(),

@@ -3720,7 +3720,8 @@ impl Application {
         let request_manager = Arc::new(request_manager);
         let postgres_daemon = Arc::new(
             fusillade::PostgresDaemon::from_store(request_manager.clone(), fusillade_daemon_config.clone())
-                .with_retention_maintenance(retention_maintenance_config),
+                .with_retention_maintenance(retention_maintenance_config)
+                .with_leak_config(config.background_services.batch_daemon.leak.clone()),
         );
         // Build the ZDR keystore once and share it across the response store, the
         // daemon processor, and background services (which install the response

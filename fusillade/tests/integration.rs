@@ -44,6 +44,133 @@ async fn mark_models_live_for_test(manager: &PostgresStore<TestDbPools>, models:
     manager.append_model_filter_events(&filters).await.unwrap();
 }
 
+/// Both foreground loops must consume and refill tokens after actual dispatch.
+/// A 24h batch uses the fixed interval, not the legacy 24-minute refill.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn batch_and_async_use_fixed_leak_intervals(pool: sqlx::PgPool) {
+    let config = DaemonConfig {
+        claim_interval_ms: 10,
+        model_concurrency_limits: Arc::new(dashmap::DashMap::from_iter([
+            ("large".to_string(), 10),
+            ("slow".to_string(), 10),
+        ])),
+        ..Default::default()
+    };
+    let store = postgres_store(pool, &config).await;
+    for model in ["large", "slow"] {
+        store
+            .append_model_filter_events(&[ModelFilter {
+                model: model.into(),
+                state: ModelFilterState::Absent,
+                expected_ready_at: None,
+            }])
+            .await
+            .unwrap();
+        let file = store
+            .create_file(
+                "tiny".into(),
+                Some("alice".into()),
+                (0..3)
+                    .map(|n| RequestTemplateInput {
+                        custom_id: Some(n.to_string()),
+                        endpoint: "https://api.example.com".into(),
+                        method: "POST".into(),
+                        path: "/test".into(),
+                        body: "{}".into(),
+                        model: model.into(),
+                        api_key: "key".into(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        store
+            .create_batch(BatchInput {
+                file_id: file,
+                endpoint: "/v1/chat/completions".into(),
+                completion_window: "24h".into(),
+                metadata: None,
+                created_by: Some("alice".into()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+    }
+    for _ in 0..3 {
+        store
+            .create_flex(CreateFlexInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: "{}".into(),
+                model: "large".into(),
+                endpoint: "https://api.example.com".into(),
+                method: "POST".into(),
+                path: "/test".into(),
+                api_key: "key".into(),
+                created_by: "alice".into(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+    }
+    let client = Arc::new(MockHttpClient::new());
+    for _ in 0..7 {
+        client.add_response(
+            "POST /test",
+            Ok(HttpResponse {
+                status: 200,
+                body: "{}".into(),
+            }),
+        );
+    }
+
+    let shutdown = CancellationToken::new();
+    let daemon = Arc::new(
+        PostgresDaemon::new(store, client.clone(), config).with_leak_config(
+            fusillade::daemon::LeakConfig {
+                // The slow model keeps the default, while large refills quickly.
+                model_leak_interval_seconds: std::collections::HashMap::from([(
+                    "large".into(),
+                    std::num::NonZeroU32::new(1).unwrap(),
+                )]),
+                ..Default::default()
+            },
+        ),
+    );
+    let handle = daemon.clone().run(shutdown.clone()).unwrap();
+    let started = std::time::Instant::now();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let calls = client.call_count();
+        if started.elapsed() < Duration::from_secs(1) {
+            assert!(
+                calls <= 3,
+                "one initial call per batch/async bucket, no burst"
+            );
+        }
+        if calls >= 7 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "tiny workloads failed to progress: {calls} calls"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "three rows require two refills"
+    );
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
+    assert_eq!(
+        client.call_count(),
+        7,
+        "slow model must retain its 60-second cooldown"
+    );
+}
+
 fn retry_backoff_ms(config: &DaemonConfig, retry_attempt: u32) -> i64 {
     config
         .backoff_ms
