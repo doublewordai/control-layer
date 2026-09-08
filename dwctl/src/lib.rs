@@ -3520,7 +3520,8 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                 &config.cache.telemetry_blocks.prefixes,
             ),
             crate::prompt_cache::TokenizerClient::new(config.cache.tokenizer_url.clone()),
-            crate::prompt_cache::PrincipalResolver::new(pool.clone()),
+            // Long-lived: hold the live provider (pooled endpoint), never a pinned pool.
+            crate::prompt_cache::PrincipalResolver::new(dyn_pools.clone()),
             sink_handle,
         );
         info!(models = ?config.prefix_chain.models, "Prefix-chain capture enabled");
