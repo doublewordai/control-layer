@@ -490,7 +490,7 @@ request_params:
   # anthropic.claude-v2:0, Ollama llama3.1:8b. Under -dw- all of those are inert — they never
   # match, so such names route exactly as they do with the feature off. Setting this to ":"
   # re-adopts a namespace we don't own and will 400 a harness appending :xhigh to a live alias.
-  # Set via environment: DWCTL_REQUEST_PARAMS__MODEL_SUFFIX_DELIMITER=::
+  # Set via environment: DWCTL_REQUEST_PARAMS__MODEL_SUFFIX_DELIMITER=-dw-
   model_suffix_delimiter: "-dw-"
 
 # Cached-input pricing (the dwctl-owned cache layer)

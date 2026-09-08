@@ -27,7 +27,6 @@
 //! the param passes through to the provider there — harmless (OpenAI-compatible servers ignore
 //! unknown query params), but only `/chat/completions` honours it.
 
-use axum::http::Uri;
 use serde_json::{Value, json};
 
 /// The query parameter name, on `/chat/completions` only.
@@ -91,16 +90,6 @@ pub fn inject_marker(body: &mut Value, marker: Value) -> Inject {
     }
 }
 
-/// Remove every `cacheBreakpoint` pair from the URI's query (other params are preserved in
-/// order; the `?` is dropped entirely if nothing remains). Must run before forwarding: onwards
-/// sends `path_and_query` verbatim upstream. Returns the URI unchanged when the param is absent.
-///
-/// Delegates to the generalised [`crate::inference::params::strip_params`], which strips the
-/// whole family of out-of-band params; the tests below pin this single-param case unchanged.
-pub fn strip_param(uri: &Uri) -> Uri {
-    crate::inference::params::strip_params(uri, &[CACHE_BREAKPOINT_PARAM])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,27 +150,5 @@ mod tests {
         // Non-object bodies have nowhere to inject.
         let mut body = json!(["not", "an", "object"]);
         assert_eq!(inject_marker(&mut body, last_user_message_marker()), Inject::NotAnObject);
-    }
-
-    #[test]
-    fn strip_removes_param_and_preserves_others() {
-        let uri: Uri = "/v1/chat/completions?foo=bar&cacheBreakpoint=lastUserMessage&baz=1"
-            .parse()
-            .unwrap();
-        assert_eq!(strip_param(&uri).to_string(), "/v1/chat/completions?foo=bar&baz=1");
-
-        // Only the param → the whole query goes (no trailing '?').
-        let uri: Uri = "/v1/chat/completions?cacheBreakpoint=lastUserMessage".parse().unwrap();
-        assert_eq!(strip_param(&uri).to_string(), "/v1/chat/completions");
-
-        // Duplicates are all removed.
-        let uri: Uri = "/v1/chat/completions?cacheBreakpoint=a&x=y&cacheBreakpoint=b".parse().unwrap();
-        assert_eq!(strip_param(&uri).to_string(), "/v1/chat/completions?x=y");
-
-        // Absent → unchanged (same instance semantics, incl. no query at all).
-        let uri: Uri = "/v1/chat/completions?foo=bar".parse().unwrap();
-        assert_eq!(strip_param(&uri).to_string(), "/v1/chat/completions?foo=bar");
-        let uri: Uri = "/v1/chat/completions".parse().unwrap();
-        assert_eq!(strip_param(&uri).to_string(), "/v1/chat/completions");
     }
 }

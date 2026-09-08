@@ -112,10 +112,14 @@ async fn cache_breakpoint_is_unrecognised_when_the_cache_layer_is_absent(pool: P
     .await;
     assert_eq!(response.status_code().as_u16(), 200);
 
-    let (_query, body) = only_upstream_request(&mock).await;
+    let (query, body) = only_upstream_request(&mock).await;
     assert!(
         body.get("cache_control").is_none(),
         "no marker should be injected without the cache layer"
+    );
+    assert!(
+        query.contains("cacheBreakpoint=lastUserMessage"),
+        "an unrecognised param must reach the provider untouched, got {query:?}"
     );
 
     cleanup_fixture(fixture).await;

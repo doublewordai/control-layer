@@ -570,8 +570,8 @@ pub fn apply_to_body(params: &RequestParams, body: &mut Value) -> bool {
 /// dropping the `?` entirely if nothing remains.
 ///
 /// Must run before forwarding: onwards sends `path_and_query` verbatim upstream, so a param
-/// we own must not leak to the provider. Generalises the single-param
-/// `crate::prompt_cache::query::strip_param`, which now delegates here.
+/// we own must not leak to the provider. Used both for the full set of params this module
+/// consumes and, from [`crate::prompt_cache::layer`], for the single `cacheBreakpoint` case.
 pub fn strip_params(uri: &Uri, names: &[&str]) -> Uri {
     fn param_key(pair: &str) -> &str {
         pair.split_once('=').map(|(k, _)| k).unwrap_or(pair)

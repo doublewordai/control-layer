@@ -1087,7 +1087,7 @@ pub struct RequestParamsConfig {
     /// Only override this if your aliases already contain `-dw-`, and prefer a delimiter that
     /// is likewise not in anyone else's namespace. Setting it to `:` re-adopts the colon
     /// namespace and will 400 a harness that appends its own `:xhigh` to a live alias.
-    /// Set via environment: `DWCTL_REQUEST_PARAMS__MODEL_SUFFIX_DELIMITER=::`
+    /// Set via environment: `DWCTL_REQUEST_PARAMS__MODEL_SUFFIX_DELIMITER=-dw-`
     pub model_suffix_delimiter: String,
 }
 

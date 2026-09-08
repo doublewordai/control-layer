@@ -179,7 +179,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     match query::breakpoint_marker(parts.uri.query()) {
         Ok(None) => {}
         Ok(Some(marker)) => {
-            parts.uri = query::strip_param(&parts.uri);
+            parts.uri = crate::inference::params::strip_params(&parts.uri, &[query::CACHE_BREAKPOINT_PARAM]);
             let outcome = match parsed_body.as_mut() {
                 Some(body) => match query::inject_marker(body, marker) {
                     Inject::Applied => match serde_json::to_vec(body) {
