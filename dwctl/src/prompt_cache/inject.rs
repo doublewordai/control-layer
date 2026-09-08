@@ -1377,7 +1377,9 @@ mod tests {
     #[test]
     fn scrub_sse_zeroes_cached_tokens_in_terminal_frame() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":985,\"prompt_tokens_details\":{\"cached_tokens\":687}}}\n\ndata: [DONE]\n\n";
-        let out = scan_edit_sse(sse.as_bytes(), UsageEdit::Scrub).rewritten.expect("dirty usage frame → rewritten");
+        let out = scan_edit_sse(sse.as_bytes(), UsageEdit::Scrub)
+            .rewritten
+            .expect("dirty usage frame → rewritten");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cached_tokens\":0"), "got: {s}");
         assert!(!s.contains("687"), "provider value gone, got: {s}");
