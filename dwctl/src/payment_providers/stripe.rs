@@ -338,6 +338,32 @@ impl StripeProvider {
                 PaymentError::InvalidData(format!("Invalid target user ID: {}", e))
             })?;
 
+        // Bail before touching Stripe if this plane does not own the target.
+        //
+        // One Stripe account serves both regional planes and every endpoint
+        // receives every plane's events, so a target this plane has never heard
+        // of is the *expected* shape of a foreign region's setup session, not a
+        // fault. `UnknownReference` matches what the payment-mode path returns
+        // for the same situation, so the webhook acks it with a single warn
+        // naming the reference instead of an ERROR claiming a data integrity
+        // issue — and the front-channel PATCH gets 404 rather than 400, which
+        // is the honest answer for a session whose user does not exist here.
+        //
+        // Checked here rather than further down because everything between this
+        // point and the original check talks to Stripe: on a foreign event the
+        // old ordering issued an UpdateCustomer against the other region's
+        // customer. Harmless in practice — both planes write the same default
+        // payment method — but it is a mutation of shared account state by a
+        // plane with no claim to it, plus an API call against a per-account
+        // rate limit, on every cross-region card verification.
+        if crate::db::handlers::users::Users::new(&mut *conn)
+            .get_by_id(target_id)
+            .await?
+            .is_none()
+        {
+            return Err(PaymentError::UnknownReference(target_id.to_string()));
+        }
+
         let customer_id = match &session.customer {
             Some(stripe_types::Expandable::Id(id)) => Some(id.to_string()),
             Some(stripe_types::Expandable::Object(c)) => Some(c.id.to_string()),
@@ -384,14 +410,7 @@ impl StripeProvider {
         {
             let mut users = crate::db::handlers::users::Users::new(&mut *conn);
 
-            if users.get_by_id(target_id).await?.is_none() {
-                tracing::error!(
-                    "Target user {} not found for setup session {}. This indicates a data integrity issue.",
-                    target_id,
-                    session_id
-                );
-                return Err(PaymentError::InvalidData("Setup session target user not found".to_string()));
-            }
+            // Existence was established above, before any Stripe call.
 
             // Stripe may have created the customer during checkout; persist it so
             // the billing portal and auto top-up can find it later.
@@ -755,18 +774,22 @@ impl PaymentProvider for StripeProvider {
         let signature = headers
             .get("stripe-signature")
             .ok_or_else(|| {
-                tracing::error!("Missing stripe-signature header");
+                // Unauthenticated public endpoint: a malformed or unsigned POST is
+                // something any internet host can send, so it is not an error on our
+                // side. Kept visible because a sudden run of them can mean a
+                // misconfigured endpoint or a rotated secret.
+                tracing::warn!("Missing stripe-signature header");
                 PaymentError::InvalidData("Missing stripe-signature header".to_string())
             })?
             .to_str()
             .map_err(|e| {
-                tracing::error!("Invalid stripe-signature header: {:?}", e);
+                tracing::warn!("Invalid stripe-signature header: {:?}", e);
                 PaymentError::InvalidData("Invalid stripe-signature header".to_string())
             })?;
 
         // Validate the webhook signature and construct the event
         let event = Webhook::construct_event(body, signature, &self.config.webhook_secret).map_err(|e| {
-            tracing::error!("Failed to construct webhook event: {:?}", e);
+            tracing::warn!("Failed to construct webhook event: {:?}", e);
             PaymentError::InvalidData(format!("Webhook validation failed: {}", e))
         })?;
 

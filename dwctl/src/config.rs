@@ -3509,8 +3509,139 @@ impl Config {
     }
 }
 
+/// Field names whose values are credentials. Matched case-insensitively as a
+/// substring of the key, so `api_key`, `webhook_secret` and
+/// `stripe_api_key` are all caught by the same entries.
+///
+/// Substring rather than exact match is deliberate: a new secret is far more
+/// likely to be named `something_token` than to invent a fresh word, so this
+/// fails safe as the config grows. Over-redacting a harmless field costs a
+/// debugging round trip; under-redacting one writes a live credential into the
+/// log pipeline.
+const SENSITIVE_KEY_FRAGMENTS: &[&str] = &[
+    "secret",
+    "password",
+    "api_key",
+    "token",
+    "encryption_key",
+    "wrap_keys",
+    "private_key",
+];
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    SENSITIVE_KEY_FRAGMENTS.iter().any(|fragment| key.contains(fragment))
+}
+
+/// Recursively replace the value of every sensitive-looking key with a marker.
+///
+/// Whole subtrees are redacted when the key itself is sensitive — `wrap_keys`
+/// is a map whose *values* are the key material, so redacting only scalars
+/// would leak it.
+fn redact_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if is_sensitive_key(key) {
+                    *child = serde_json::Value::String("<redacted>".to_string());
+                } else {
+                    redact_value(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(redact_value),
+        _ => {}
+    }
+}
+
+impl Config {
+    /// The configuration rendered for logging, with credentials removed.
+    ///
+    /// Startup used to log `{:#?}` of this struct, which wrote the live Stripe
+    /// API key and webhook signing secret — plus `secret_key`, the connections
+    /// encryption key and the keystore wrap keys — into the log pipeline in
+    /// plaintext on every boot, where they were shipped to log aggregation and
+    /// retained.
+    ///
+    /// Goes through `Serialize` rather than `Debug` so redaction is applied to
+    /// the whole tree by construction. A field added anywhere in the config,
+    /// at any depth, is covered without touching this function, provided it is
+    /// conventionally named.
+    pub fn redacted_for_logging(&self) -> String {
+        match serde_json::to_value(self) {
+            Ok(mut value) => {
+                redact_value(&mut value);
+                serde_json::to_string_pretty(&value).unwrap_or_else(|e| format!("<config could not be rendered: {e}>"))
+            }
+            // Never fall back to `{:#?}` here: that is exactly the leak this
+            // exists to prevent.
+            Err(e) => format!("<config could not be serialised for logging: {e}>"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    /// Startup logs the whole config. It used to do so with `{:#?}`, which put
+    /// the live Stripe API key and webhook signing secret into the log
+    /// pipeline verbatim on every boot. This asserts the rendered form carries
+    /// neither the values nor any other credential in the tree.
+    #[test]
+    fn redacted_config_does_not_contain_credentials() {
+        let mut config = Config::default();
+        config.secret_key = Some("super-secret-signing-key".to_string());
+        config.payment = Some(PaymentConfig::Stripe(StripeConfig {
+            api_key: "rk_live_THIS_MUST_NOT_APPEAR".to_string(),
+            webhook_secret: "whsec_THIS_MUST_NOT_APPEAR".to_string(),
+            price_id: "price_public_identifier".to_string(),
+            enable_invoice_creation: true,
+            auto_topup_terms_of_service_text: None,
+            setup_terms_of_service_text: None,
+            tax_code: None,
+        }));
+
+        let rendered = config.redacted_for_logging();
+
+        for secret in [
+            "rk_live_THIS_MUST_NOT_APPEAR",
+            "whsec_THIS_MUST_NOT_APPEAR",
+            "super-secret-signing-key",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "credential leaked into the startup log: {secret}\n{rendered}"
+            );
+        }
+        assert!(
+            rendered.contains("<redacted>"),
+            "nothing was redacted, so the walk did not run:\n{rendered}"
+        );
+        // Non-sensitive neighbours must survive, or the dump is useless for
+        // the debugging it exists to support.
+        assert!(
+            rendered.contains("price_public_identifier"),
+            "over-redacted: a non-secret field was removed"
+        );
+    }
+
+    #[test]
+    fn sensitive_key_matching_is_case_insensitive_and_substring() {
+        for key in [
+            "api_key",
+            "API_KEY",
+            "stripe_api_key",
+            "webhook_secret",
+            "Password",
+            "encryption_key",
+            "wrap_keys",
+        ] {
+            assert!(is_sensitive_key(key), "{key} should be treated as sensitive");
+        }
+        for key in ["price_id", "url", "enabled", "region", "bucket"] {
+            assert!(!is_sensitive_key(key), "{key} should not be redacted");
+        }
+    }
     use super::*;
     use figment::Jail;
 

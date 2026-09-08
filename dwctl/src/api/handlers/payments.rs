@@ -481,7 +481,12 @@ pub async fn webhook_handler<P: PoolProvider>(
             return StatusCode::NOT_IMPLEMENTED;
         }
         Err(e) => {
-            tracing::error!("Webhook validation failed: {:?}", e);
+            // warn, not error: the endpoint is public and unauthenticated, so
+            // anyone can post junk at it. Genuine causes (a rotated signing
+            // secret, the wrong endpoint registered) show up as a sustained run
+            // rather than a single line, and the 400 is already counted by
+            // dwctl_http_requests_total{status}.
+            tracing::warn!("Webhook validation failed: {:?}", e);
             return StatusCode::BAD_REQUEST;
         }
     };
