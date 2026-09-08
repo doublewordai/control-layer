@@ -393,18 +393,7 @@ observed healthy:
    write amplification, replication, pool, and latency signals, then ramp.
 6. Enable backfill for non-expired history under the same bounds.
 7. Run the separately gated one-time drain for content that is already past
-   its retention period. This is where `batchless_archive_backfill_concurrency`
-   matters: the backfill worker discovers one wave of distinct candidate
-   graphs per tick and then moves up to that many of them at the same time,
-   each in its own transaction under the per-graph advisory lock and a
-   shared (not exclusive) lock on the target day, so the moves overlap in
-   full. Discovery stays serial (one index probe per candidate), so scaling
-   flattens well past the recommended range. The steady sweep is always
-   sequential. Concurrent
-   passes (several pods, or a pod plus a drain) remain safe because every
-   move takes `FOR UPDATE SKIP LOCKED` and verifies by read-back; they simply
-   do not add throughput, because every pass discovers the same oldest
-   graphs. See the drain-pod recipe below.
+   its retention period.
 8. Enable daily response-partition retirement after installing the dedicated
    single-session maintenance connection.
 9. Enable weekly batch-archive retirement with an explicit
@@ -432,44 +421,6 @@ gauge falls behind the horizon, retirement retries persist, mover integrity
 errors appear, or read-parity/latency regressions are observed. All of these
 are content-free signals exported by the daemon; none require inspecting
 customer data.
-
-### One-off drain pod
-
-A historical backlog of terminal batchless graphs is far larger than the
-steady state, so drain it from a dedicated, disposable daemon pod rather than
-by raising the fleet's backfill settings. The pod runs the same image and
-configuration as the batch daemon, with these differences:
-
-- daemon `enabled: always` and leader election off, so the pod moves data
-  regardless of which fleet pod currently owns archive maintenance (the
-  movers coordinate through the database, not through leadership);
-- `batchless_archive_backfill_enabled: true`, sweep left as it is in the
-  fleet;
-- `batchless_archive_backfill_concurrency` high (8 to 16 is a sensible
-  starting range), with `batchless_archive_groups_per_tick` several times
-  the concurrency and `batchless_archive_bytes_per_tick` generous enough that
-  the byte budget is not what ends a tick;
-- its own database pool sizing: the fusillade write pool needs at least the
-  concurrency in spare connections, plus the pod's ordinary daemon use, and
-  the pool must fit under the database's connection ceiling alongside the
-  fleet. Startup refuses a concurrency that is not below the fusillade
-  pool's `max_connections`;
-- `batch_archive_backfill_interval_ms` low, so ticks run back to back.
-
-Watch `fusillade_retained_response_movers_active{worker="backfill"}` (the
-configured fan-out, raised only while a tick is running, so read it as a
-max over a window), `fusillade_retained_response_groups_archived_total` for
-progress, and `fusillade_retained_response_graphs_incomplete_skipped_total`
-for graphs an operator must look at. Stop the pod once
-`fusillade_retained_response_archive_may_have_more{worker="backfill"}` stays
-at zero AND `retained_response_archive_failed` background errors are zero
-over the same window (a failing pass keeps the signal raised, never lowers
-it); from then on the fleet's steady sweep keeps up on its own. Ramp the
-concurrency gradually while watching replication lag, write pool saturation,
-and request latency on the primary, and lower it or stop the pod when any
-abort condition above appears. Throughput scales with concurrency only until
-the primary's write path or the pool is saturated; measure on preview or
-staging before choosing the production value.
 
 Ordinary pending-count queries exclude background demand. To expose it, use an
 explicit `ServiceTierFilter::Include(vec![Some("background".to_string())])`; results use a

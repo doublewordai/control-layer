@@ -1051,6 +1051,66 @@ mod tests {
         assert_eq!(served_by.onwards_model.as_deref(), Some("gpt-4-upstream"));
     }
 
+    /// The error path must attach the same `ServedBy` extension when the
+    /// failure answers for an upstream response. Regression for `ControlLayerProxyErrors`:
+    /// the 5xx the proxy forwards after an upstream answered was recorded with an empty
+    /// `served_by`, so the per-model 5xx could not be attributed to the provider.
+    #[tokio::test]
+    async fn test_served_by_extension_set_on_sanitized_upstream_error() {
+        use tower::ServiceExt;
+
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "gpt-4".to_string(),
+            pool(
+                Target::builder()
+                    .url("https://openrouter.ai/api/v1/".parse().unwrap())
+                    .onwards_model("nvidia/nemotron-3-super-120b-a12b".to_string())
+                    .sanitize_response(true)
+                    .build(),
+            ),
+        );
+        let targets = target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(
+            StatusCode::BAD_GATEWAY,
+            r#"{"error": {"message": "upstream failed"}}"#,
+        );
+        let app_state = AppState::with_client(targets, mock_client);
+        let router = build_router(app_state);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let served_by = response
+            .extensions()
+            .get::<crate::ServedBy>()
+            .expect("sanitized upstream 5xx must carry ServedBy");
+        assert_eq!(served_by.url, "https://openrouter.ai/api/v1/");
+        assert_eq!(
+            served_by.onwards_model.as_deref(),
+            Some("nvidia/nemotron-3-super-120b-a12b")
+        );
+    }
+
     /// Strict-mode `Targets` with one alias backed by a fallback pool of `n`
     /// identical providers (all hit the shared mock client), configured to retry
     /// on the given upstream `on_status` codes.

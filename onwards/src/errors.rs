@@ -25,9 +25,25 @@ pub struct ErrorResponseBody {
 pub struct OnwardsErrorResponse {
     pub body: Option<ErrorResponseBody>,
     pub status: StatusCode,
+    /// The upstream that produced the response this error answers for, when
+    /// one did. Mirrors the `ServedBy` extension the success path attaches:
+    /// error responses that originate from an upstream (sanitized upstream
+    /// bodies, status-fallback exhaustion) carry it so request-logging can
+    /// attribute 5xx to the concrete provider that returned them. `None` when
+    /// no upstream produced a response (auth/validation rejections, gateway
+    /// timeouts, exhausted fallbacks where the last attempt never answered).
+    pub served_by: Option<crate::ServedBy>,
 }
 
 impl OnwardsErrorResponse {
+    /// Attach the upstream that produced the response this error answers for.
+    /// The value lands as a `ServedBy` response extension so downstream
+    /// request-logging can attribute the error to a concrete provider.
+    pub fn with_served_by(mut self, served_by: crate::ServedBy) -> Self {
+        self.served_by = Some(served_by);
+        self
+    }
+
     pub fn reasoning(error: &ReasoningError) -> Self {
         OnwardsErrorResponse {
             body: Some(ErrorResponseBody {
@@ -38,6 +54,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::from_u16(error.status_code())
                 .expect("reasoning errors use valid HTTP status codes"),
+            served_by: None,
         }
     }
 
@@ -52,6 +69,7 @@ impl OnwardsErrorResponse {
                 code: "model_not_found".to_string(),
             }),
             status: StatusCode::NOT_FOUND,
+            served_by: None,
         }
     }
 
@@ -64,6 +82,7 @@ impl OnwardsErrorResponse {
                 code: "rate_limit".to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            served_by: None,
         }
     }
 
@@ -76,6 +95,7 @@ impl OnwardsErrorResponse {
                 code: "concurrency_limit_exceeded".to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            served_by: None,
         }
     }
 
@@ -88,6 +108,7 @@ impl OnwardsErrorResponse {
                 code: "internal_error".to_string(),
             }),
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            served_by: None,
         }
     }
 
@@ -100,6 +121,7 @@ impl OnwardsErrorResponse {
                 code: "internal_error".to_string(),
             }),
             status: StatusCode::BAD_GATEWAY,
+            served_by: None,
         }
     }
 
@@ -112,6 +134,7 @@ impl OnwardsErrorResponse {
                 code: "service_unavailable".to_string(),
             }),
             status: StatusCode::SERVICE_UNAVAILABLE,
+            served_by: None,
         }
     }
 
@@ -125,6 +148,7 @@ impl OnwardsErrorResponse {
                 code: "gateway_timeout".to_string(),
             }),
             status: StatusCode::GATEWAY_TIMEOUT,
+            served_by: None,
         }
     }
 
@@ -139,6 +163,7 @@ impl OnwardsErrorResponse {
                 code: "payload_too_large".to_string(),
             }),
             status: StatusCode::PAYLOAD_TOO_LARGE,
+            served_by: None,
         }
     }
 
@@ -151,6 +176,7 @@ impl OnwardsErrorResponse {
                 code: "unprocessable_request".to_string(),
             }),
             status: StatusCode::UNPROCESSABLE_ENTITY,
+            served_by: None,
         }
     }
 
@@ -167,6 +193,7 @@ impl OnwardsErrorResponse {
                 code: code.to_string(),
             }),
             status: StatusCode::BAD_REQUEST,
+            served_by: None,
         }
     }
 
@@ -179,6 +206,7 @@ impl OnwardsErrorResponse {
                 code: "forbidden".to_string(),
             }),
             status: StatusCode::FORBIDDEN,
+            served_by: None,
         }
     }
 
@@ -192,6 +220,7 @@ impl OnwardsErrorResponse {
                 code: "unauthenticated".to_string(),
             }),
             status: StatusCode::UNAUTHORIZED,
+            served_by: None,
         }
     }
 }
@@ -204,10 +233,17 @@ struct ErrorEnvelope<'a> {
 
 impl IntoResponse for OnwardsErrorResponse {
     fn into_response(self) -> Response {
-        match self.body {
+        let mut response = match self.body {
             Some(ref body) => (self.status, Json(ErrorEnvelope { error: body })).into_response(),
             None => self.status.into_response(), // No body, just status
+        };
+        // Attribute the error to the upstream that produced the response it
+        // answers for, mirroring the success path's `ServedBy` extension so
+        // request-logging / metrics can name the provider behind a 5xx.
+        if let Some(served_by) = self.served_by {
+            response.extensions_mut().insert(served_by);
         }
+        response
     }
 }
 
@@ -267,5 +303,66 @@ mod tests {
 
         assert_eq!(body["error"]["message"], "Forbidden");
         assert_eq!(body["error"]["code"], "forbidden");
+    }
+
+    #[test]
+    fn test_error_response_carries_served_by_extension() {
+        // An error that answers for an upstream response must attach the same
+        // `ServedBy` extension the success path uses, so request-logging can
+        // attribute the 5xx to the concrete provider.
+        let served_by = crate::ServedBy {
+            url: "https://openrouter.ai/api/v1/".to_string(),
+            onwards_model: Some("nvidia/nemotron-3-super-120b-a12b".to_string()),
+        };
+        let error = OnwardsErrorResponse::bad_gateway().with_served_by(served_by);
+        let response = error.into_response();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let extension = response
+            .extensions()
+            .get::<crate::ServedBy>()
+            .expect("error response answering an upstream must carry ServedBy");
+        assert_eq!(extension.url, "https://openrouter.ai/api/v1/");
+        assert_eq!(
+            extension.onwards_model.as_deref(),
+            Some("nvidia/nemotron-3-super-120b-a12b")
+        );
+    }
+
+    #[test]
+    fn test_error_response_without_served_by_has_no_extension() {
+        // Errors that do not answer for any upstream (auth/validation rejections,
+        // gateway-generated errors) must not carry a ServedBy extension.
+        let response = OnwardsErrorResponse::forbidden().into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            response.extensions().get::<crate::ServedBy>().is_none(),
+            "errors that never reached an upstream must not carry ServedBy"
+        );
+    }
+
+    #[test]
+    fn test_builder_served_by_attaches_extension() {
+        let served_by = crate::ServedBy {
+            url: "https://p0.example.com/".to_string(),
+            onwards_model: None,
+        };
+        let error = OnwardsErrorResponse::builder()
+            .body(ErrorResponseBody {
+                message: "An internal error occurred. Please try again later.".to_string(),
+                r#type: "internal_error".to_string(),
+                param: None,
+                code: "internal_error".to_string(),
+            })
+            .status(StatusCode::BAD_GATEWAY)
+            .served_by(served_by)
+            .build();
+        let response = error.into_response();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let extension = response
+            .extensions()
+            .get::<crate::ServedBy>()
+            .expect("builder-set served_by must attach the extension");
+        assert_eq!(extension.url, "https://p0.example.com/");
     }
 }
