@@ -960,6 +960,11 @@ async fn run_batch_archive_phase<S>(
     }
 }
 
+/// Runs one batchless archive pass. Returns `true` when the pass proved more
+/// eligible work remains (`may_have_more`), so the worker can go straight
+/// into its next pass instead of sleeping out the tick interval. A failed or
+/// cancelled pass returns `false`: it keeps the metric raised, but a hot loop
+/// on a failing pass would only amplify the failure.
 async fn run_batchless_archive_phase<S>(
     storage: &S,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -967,7 +972,8 @@ async fn run_batchless_archive_phase<S>(
     retention_policy: &RetentionPolicy,
     cutoffs: &RetainedResponseArchiveCutoffs,
     tick: ArchiveMoverTick,
-) where
+) -> bool
+where
     S: DaemonStorage,
 {
     let started = std::time::Instant::now();
@@ -1054,8 +1060,9 @@ async fn run_batchless_archive_phase<S>(
                     "Retained-response archive phase completed"
                 );
             }
+            outcome.may_have_more
         }
-        Ok(None) => {}
+        Ok(None) => false,
         Err(error) => {
             // A failed pass has not proven the queue empty: keep the
             // "may have more" signal raised so a drain operator never reads a
@@ -1070,10 +1077,13 @@ async fn run_batchless_archive_phase<S>(
                 error = %error,
                 "Failed to archive retained-response graphs"
             );
+            false
         }
     }
 }
 
+/// Runs one mover tick. Returns `true` when the batchless phase reported
+/// more eligible work, which the worker loop treats as "run again now".
 async fn run_archive_mover_tick<S>(
     storage: Arc<S>,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -1081,13 +1091,15 @@ async fn run_archive_mover_tick<S>(
     retention_policy: &RetentionPolicy,
     tick: ArchiveMoverTick,
     retained_runway_ready: &AtomicBool,
-) where
+) -> bool
+where
     S: DaemonStorage + 'static,
 {
     let observed_at = chrono::Utc::now();
     if tick.batch_enabled {
         run_batch_archive_phase(storage.clone(), shutdown, query_timeout, tick).await;
     }
+    let mut more_work = false;
     if tick.batchless_enabled {
         let index_ready = match maintenance_query(
             shutdown,
@@ -1112,7 +1124,7 @@ async fn run_archive_mover_tick<S>(
         };
         if !index_ready || !retained_runway_ready.load(Ordering::Acquire) {
             gauge!("fusillade_retained_response_archive_ready", "worker" => tick.worker).set(0.0);
-            return;
+            return false;
         }
         gauge!("fusillade_retained_response_archive_ready", "worker" => tick.worker).set(1.0);
         let cutoffs = match retained_archive_cutoffs_at(
@@ -1129,10 +1141,10 @@ async fn run_archive_mover_tick<S>(
                     error = %error,
                     "Archive mover could not resolve immutable cutoffs"
                 );
-                return;
+                return false;
             }
         };
-        run_batchless_archive_phase(
+        more_work = run_batchless_archive_phase(
             storage.as_ref(),
             shutdown,
             query_timeout,
@@ -1142,6 +1154,7 @@ async fn run_archive_mover_tick<S>(
         )
         .await;
     }
+    more_work
 }
 
 fn supervise_daemon_handles(
@@ -3489,12 +3502,26 @@ where
                         batchless_enabled,
                         "Archive mover started"
                     );
+                    // The interval paces an idle worker. While a pass keeps
+                    // proving there is more to move, the next pass starts
+                    // straight away: sleeping a full interval between
+                    // back-to-back passes of a multi-day drain is pure idle
+                    // time on the critical path. Errors and empty passes fall
+                    // back to the interval, so a failing pass never hot-loops.
+                    let mut more_work = false;
                     loop {
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {},
-                            _ = shutdown.cancelled() => break,
+                        if more_work {
+                            if shutdown.is_cancelled() {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        } else {
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {},
+                                _ = shutdown.cancelled() => break,
+                            }
                         }
-                        run_archive_mover_tick(
+                        more_work = run_archive_mover_tick(
                             storage.clone(),
                             &shutdown,
                             query_timeout,
@@ -3858,6 +3885,8 @@ mod tests {
         fail_route_cleanup: std::sync::atomic::AtomicBool,
         batchless_cutoffs: std::sync::Mutex<Vec<RetainedResponseArchiveCutoffs>>,
         overdue_concurrency: std::sync::Mutex<Vec<usize>>,
+        batchless_may_have_more: std::sync::atomic::AtomicBool,
+        fail_batchless: std::sync::atomic::AtomicBool,
         fail_weekly: std::sync::atomic::AtomicBool,
         fail_retained: std::sync::atomic::AtomicBool,
         block_retained: std::sync::atomic::AtomicBool,
@@ -3889,6 +3918,8 @@ mod tests {
                 fail_route_cleanup: std::sync::atomic::AtomicBool::new(false),
                 batchless_cutoffs: std::sync::Mutex::new(Vec::new()),
                 overdue_concurrency: std::sync::Mutex::new(Vec::new()),
+                batchless_may_have_more: std::sync::atomic::AtomicBool::new(false),
+                fail_batchless: std::sync::atomic::AtomicBool::new(false),
                 fail_weekly: std::sync::atomic::AtomicBool::new(false),
                 fail_retained: std::sync::atomic::AtomicBool::new(false),
                 block_retained: std::sync::atomic::AtomicBool::new(false),
@@ -3911,6 +3942,18 @@ mod tests {
 
         fn record(&self, event: &'static str) {
             self.events.lock().unwrap().push(event);
+        }
+
+        fn batchless_outcome(&self) -> Result<crate::RetainedResponseArchiveOutcome> {
+            if self.fail_batchless.load(Ordering::SeqCst) {
+                return Err(FusilladeError::Other(anyhow::anyhow!(
+                    "batchless archive failed"
+                )));
+            }
+            Ok(crate::RetainedResponseArchiveOutcome {
+                may_have_more: self.batchless_may_have_more.load(Ordering::SeqCst),
+                ..Default::default()
+            })
         }
     }
 
@@ -3964,7 +4007,7 @@ mod tests {
             self.batchless_calls.fetch_add(1, Ordering::SeqCst);
             self.batchless_cutoffs.lock().unwrap().push(*cutoffs);
             self.record("batchless_move");
-            Ok(crate::RetainedResponseArchiveOutcome::default())
+            self.batchless_outcome()
         }
 
         async fn archive_overdue_batchless_responses(
@@ -3979,7 +4022,7 @@ mod tests {
             self.batchless_cutoffs.lock().unwrap().push(*cutoffs);
             self.overdue_concurrency.lock().unwrap().push(concurrency);
             self.record("batchless_overdue_move");
-            Ok(crate::RetainedResponseArchiveOutcome::default())
+            self.batchless_outcome()
         }
 
         async fn ensure_retained_response_partitions(
@@ -4627,6 +4670,54 @@ mod tests {
         assert_eq!(
             recorder.values("fusillade_retained_response_movers_active"),
             vec![1.0, 0.0]
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_reports_more_work_only_when_the_pass_proved_it() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let policy = configured_batchless_maintenance().policy().clone();
+        let mut tick = mover_tick(false, true);
+        tick.worker = "backfill";
+        tick.include_overdue = true;
+        let ready = std::sync::atomic::AtomicBool::new(true);
+
+        let run = |storage: Arc<FakeMaintenanceStorage>| {
+            run_archive_mover_tick(
+                storage,
+                &shutdown,
+                Duration::from_secs(1),
+                &policy,
+                tick,
+                &ready,
+            )
+        };
+
+        assert!(
+            !run(storage.clone()).await,
+            "an empty pass paces the worker on its interval"
+        );
+
+        storage
+            .batchless_may_have_more
+            .store(true, Ordering::SeqCst);
+        assert!(
+            run(storage.clone()).await,
+            "a pass that proved more work asks for an immediate next pass"
+        );
+
+        storage.fail_batchless.store(true, Ordering::SeqCst);
+        assert!(
+            !run(storage.clone()).await,
+            "a failing pass must never hot-loop, whatever the queue held"
+        );
+
+        storage.fail_batchless.store(false, Ordering::SeqCst);
+        storage.index_ready.store(false, Ordering::SeqCst);
+        assert!(
+            !run(storage.clone()).await,
+            "a pass skipped for a missing index is not more work"
         );
     }
 
