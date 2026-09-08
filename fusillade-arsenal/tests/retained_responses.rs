@@ -3660,6 +3660,126 @@ async fn read_apis_preserve_exact_values_filters_pages_and_counts_after_move(poo
 }
 
 #[sqlx::test]
+async fn retained_pages_validate_routes_before_limit_and_merge_terminal_ties(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = archive_date("2026-08-03");
+    ensure_partition(&pool, delete_on).await;
+    let mut terminal_ids = Vec::new();
+    for (state, label) in [
+        (TerminalState::Completed, "page-completed"),
+        (TerminalState::Failed, "page-failed"),
+        (
+            TerminalState::Canceled { dispatched: false },
+            "page-canceled",
+        ),
+    ] {
+        let graph = singleton(
+            &pool,
+            "flex",
+            state,
+            timestamp("2026-08-01T10:00:00Z"),
+            label,
+        )
+        .await;
+        terminal_ids.push(graph.request_ids[0]);
+    }
+    let invalid = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T11:00:00Z"),
+        "page-invalid-newest",
+    )
+    .await;
+    let request_manager = manager(&pool).await;
+    assert_eq!(
+        archive(&request_manager, &policy(&[("flex", 86_400)]), 4, i64::MAX)
+            .await
+            .unwrap()
+            .groups_archived,
+        4
+    );
+    let pending = singleton(
+        &pool,
+        "priority",
+        TerminalState::Pending,
+        timestamp("2026-07-31T10:00:00Z"),
+        "page-old-pending",
+    )
+    .await;
+    let other = singleton(
+        &pool,
+        "priority",
+        TerminalState::Pending,
+        timestamp("2026-08-02T10:00:00Z"),
+        "page-other-owner",
+    )
+    .await;
+    sqlx::query("UPDATE requests SET created_by = 'other-owner' WHERE id = $1")
+        .bind(other.request_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    terminal_ids.sort_by(|a, b| b.cmp(a));
+
+    // The newest retained candidate is invalid in three distinct ways. It
+    // must never consume a LIMIT slot or hide a valid row on a later page.
+    for invalidation in [
+        "UPDATE retained_response_request_routes SET group_id = gen_random_uuid() WHERE request_id = $1",
+        "DELETE FROM retained_response_request_routes WHERE request_id = $1",
+        "DELETE FROM retained_response_group_routes WHERE group_id = $1",
+    ] {
+        sqlx::query(invalidation)
+            .bind(invalid.request_ids[0])
+            .execute(&pool)
+            .await
+            .unwrap();
+        for owner in [Some(OWNER.to_owned()), None] {
+            for active_first in [true, false] {
+                let mut expected = terminal_ids.clone();
+                if active_first {
+                    expected.insert(0, pending.request_ids[0]);
+                } else {
+                    expected.push(pending.request_ids[0]);
+                }
+                if owner.is_none() {
+                    expected.insert(0, other.request_ids[0]);
+                }
+                for (skip, expected_id) in expected.iter().enumerate() {
+                    let result = request_manager
+                        .list_requests(ListRequestsFilter {
+                            created_by: owner.clone(),
+                            active_first,
+                            limit: 1,
+                            skip: skip as i64,
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        result.data.iter().map(|r| r.id).collect::<Vec<_>>(),
+                        vec![*expected_id]
+                    );
+                }
+                let empty = request_manager
+                    .list_requests(ListRequestsFilter {
+                        created_by: owner.clone(),
+                        active_first,
+                        limit: 1,
+                        skip: expected.len() as i64,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert!(empty.data.is_empty());
+            }
+        }
+        sqlx::query("INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) VALUES ($1, $1, $2) ON CONFLICT (request_id) DO UPDATE SET group_id = EXCLUDED.group_id")
+            .bind(invalid.request_ids[0]).bind(delete_on).execute(&pool).await.unwrap();
+    }
+}
+
+#[sqlx::test]
 async fn anomalous_request_chronology_uses_later_created_at_for_safe_deadline(pool: PgPool) {
     install_candidate_index(&pool).await;
     let expected_delete_on = archive_date("2026-08-07");
@@ -4721,7 +4841,7 @@ async fn overdue_graph_moves_into_the_next_day_instead_of_deferring(pool: PgPool
 
     // … and the gated overdue path is what moves it.
     let outcome = manager
-        .archive_overdue_batchless_responses(&policy, &cutoffs, 1, i64::MAX)
+        .archive_overdue_batchless_responses(&policy, &cutoffs, 1, i64::MAX, 1)
         .await
         .unwrap();
     assert_eq!(
@@ -4739,6 +4859,128 @@ async fn overdue_graph_moves_into_the_next_day_instead_of_deferring(pool: PgPool
     assert_eq!(
         landed_on, next_day,
         "overdue content lands on the day after observation, never a droppable day"
+    );
+}
+
+#[sqlx::test]
+async fn concurrent_overdue_passes_move_every_graph_exactly_once(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    // Twenty already-due singleton graphs with distinct terminal instants, so
+    // every pass discovers the same oldest-first head of the queue.
+    let mut graphs = Vec::new();
+    for index in 0..20 {
+        let terminal_at = timestamp("2026-08-01T08:00:00Z") + TimeDelta::minutes(index);
+        graphs.push(
+            singleton(
+                &pool,
+                "flex",
+                TerminalState::Completed,
+                terminal_at,
+                &format!("concurrent-overdue-{index}"),
+            )
+            .await,
+        );
+    }
+    let next_day = exact_date("2026-09-01");
+    ensure_partition(&pool, next_day).await;
+    let manager = Arc::new(manager(&pool).await);
+
+    let observed = timestamp("2026-08-31T00:00:00Z");
+    let cutoffs = RetainedResponseArchiveCutoffs::new(observed, observed, observed).unwrap();
+    let policy = exact_policy(&[("flex", 1)]);
+
+    // Four passes start together, each fanning out four movers over a wave
+    // of up to eight graphs: intra-pass concurrency over one discovered wave
+    // and inter-pass contention over the same head are both exercised.
+    let barrier = Arc::new(Barrier::new(4));
+    let mut passes = Vec::new();
+    for _ in 0..4 {
+        let manager = manager.clone();
+        let barrier = barrier.clone();
+        let policy = policy.clone();
+        passes.push(tokio::spawn(async move {
+            barrier.wait().await;
+            manager
+                .archive_overdue_batchless_responses(&policy, &cutoffs, 8, i64::MAX, 4)
+                .await
+                .expect("concurrent overdue passes must not fail")
+        }));
+    }
+    let mut outcomes = Vec::new();
+    for pass in passes {
+        outcomes.push(pass.await.expect("overdue pass task must complete"));
+    }
+
+    // Whatever remains after the contended round drains sequentially so the
+    // assertion covers the whole fixture set, not just the contended part.
+    let mut sequential_outcome = RetainedResponseArchiveOutcome::default();
+    let mut drained = false;
+    for _ in 0..20 {
+        let outcome = manager
+            .archive_overdue_batchless_responses(&policy, &cutoffs, 8, i64::MAX, 4)
+            .await
+            .unwrap();
+        sequential_outcome.groups_archived += outcome.groups_archived;
+        sequential_outcome.requests_archived += outcome.requests_archived;
+        if outcome.groups_archived == 0 && !outcome.may_have_more {
+            drained = true;
+            break;
+        }
+    }
+    assert!(
+        drained,
+        "the queue must drain within a bounded number of passes"
+    );
+
+    let contended_groups: u64 = outcomes.iter().map(|outcome| outcome.groups_archived).sum();
+    let contended_requests: u64 = outcomes
+        .iter()
+        .map(|outcome| outcome.requests_archived)
+        .sum();
+    assert!(
+        contended_groups > 0,
+        "the contended round must make progress rather than have every pass skip"
+    );
+    assert_eq!(
+        contended_groups + sequential_outcome.groups_archived,
+        20,
+        "each graph is counted archived exactly once across every pass"
+    );
+    assert_eq!(
+        contended_requests + sequential_outcome.requests_archived,
+        20
+    );
+
+    let request_ids = graphs
+        .iter()
+        .flat_map(|graph| graph.request_ids.iter().copied())
+        .collect::<Vec<_>>();
+    assert_eq!(count_ids(&pool, "requests", &request_ids).await, 0);
+    for graph in &graphs {
+        // One group object, one request object, one delete_on per graph.
+        assert_wholly_retained(&pool, graph).await;
+    }
+    let group_ids = graphs
+        .iter()
+        .map(|graph| graph.group_id)
+        .collect::<Vec<_>>();
+    let (request_routes, group_routes): (i64, i64) = sqlx::query_as(
+        r#"
+        SELECT (SELECT COUNT(*) FROM retained_response_request_routes
+                 WHERE request_id = ANY($1)),
+               (SELECT COUNT(*) FROM retained_response_group_routes
+                 WHERE group_id = ANY($2))
+        "#,
+    )
+    .bind(&request_ids)
+    .bind(&group_ids)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (request_routes, group_routes),
+        (20, 20),
+        "routes map 1:1 onto the moved graphs: nothing lost, nothing moved twice"
     );
 }
 

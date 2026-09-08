@@ -2617,6 +2617,7 @@ mod tests {
             openapi: Default::default(),
             cache: Default::default(),
             clickhouse: None,
+            prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: Default::default(),
             keystore: None,
         };

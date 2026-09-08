@@ -144,6 +144,11 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
     retained_response_fence_seconds: Option<u64>,
+    /// (min, max) batchless retention seconds across configured tiers, from
+    /// [`fusillade_core::RetentionPolicy::batchless_retention_bounds_seconds`].
+    /// Lets the trailing-demand query prune retained partitions that cannot
+    /// contain in-window rows; `None` falls back to the weak necessary bound.
+    retained_response_retention_bounds_seconds: Option<(u64, u64)>,
     template_generation_writes_enabled: bool,
     partition_maintenance_pool: Option<sqlx::PgPool>,
     partition_maintenance_attested: bool,
@@ -377,6 +382,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             pools,
             config,
             retained_response_fence_seconds: None,
+            retained_response_retention_bounds_seconds: None,
             template_generation_writes_enabled: false,
             partition_maintenance_pool: None,
             partition_maintenance_attested: false,
@@ -433,6 +439,19 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// Return the configured content-free resurrection-fence lifetime.
     pub fn retained_response_fence_seconds(&self) -> Option<u64> {
         self.retained_response_fence_seconds
+    }
+
+    /// Configure the (min, max) batchless retention seconds used to prune
+    /// retained partitions in the trailing-demand query. `None` (the
+    /// default, and the state on instances without a batchless policy) keeps
+    /// the weak necessary bound; correctness never depends on this value
+    /// being present, only scan cost does.
+    pub fn with_retained_response_retention_bounds_seconds(
+        mut self,
+        bounds: Option<(u64, u64)>,
+    ) -> Self {
+        self.retained_response_retention_bounds_seconds = bounds;
+        self
     }
 
     /// Route new file-backed template writes into the weekly generation-2
@@ -2057,11 +2076,46 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // Scalar params + force_custom_plan get real histogram selectivity,
         // which keeps the trailing partial indexes in play. Trailing windows
         // are few (typically one), so per-window round trips are cheap.
+        // Retained-partition prune bounds ($7/$8): sweep-landed rows have
+        // delete_on ~ terminal_at + tier retention, so only partitions in
+        // [window_start + min retention, window_end + max retention] can hold
+        // in-window rows. The slack absorbs day rounding at both ends and a
+        // retention-period CHANGE's transition: for up to (window + sweep
+        // dwell) after a config flip, in-window rows landed under the
+        // previous period sit against the bound the change moved — a raise
+        // presses the lower bound, a decrease the upper — and a change
+        // larger than the slack undercounts those rows for that transition
+        // window only. Retention changes are rare, deliberate ops events;
+        // widening the slack to cover arbitrary changes would permanently
+        // scan extra full-day partitions to protect a transient, so the
+        // slack stays small and the exposure is documented instead.
+        // Without configured bounds the SQL falls back to its weak necessary
+        // bound — correct, but it scans every active partition, including the
+        // multi-million-row delete-tomorrow buckets the overdue backfill
+        // lands (the 2026-09-05 scouter timeout).
+        const RETENTION_PRUNE_SLACK_DAYS: i64 = 2;
+        let retention_bounds = self.retained_response_retention_bounds_seconds;
         let now = Utc::now();
         let mut result: Vec<TrailingDemandCount> = Vec::new();
         for (label, start, end) in windows {
             let start_ts = now + chrono::Duration::seconds(*start);
             let end_ts = now + chrono::Duration::seconds(*end);
+            let (prune_lower, prune_upper) = match retention_bounds {
+                Some((min_secs, max_secs)) => {
+                    let min_days = (min_secs / 86_400) as i64;
+                    let max_days = max_secs.div_ceil(86_400) as i64;
+                    // Never weaker than the SQL's fallback bound (> start date).
+                    let lower_offset = (min_days - RETENTION_PRUNE_SLACK_DAYS).max(1);
+                    (
+                        Some(start_ts.date_naive() + chrono::Duration::days(lower_offset)),
+                        Some(
+                            end_ts.date_naive()
+                                + chrono::Duration::days(max_days + RETENTION_PRUNE_SLACK_DAYS),
+                        ),
+                    )
+                }
+                None => (None, None),
+            };
             let rows = sqlx::query(retained_response::TRAILING_DEMAND_SQL)
                 .bind(start_ts)
                 .bind(end_ts)
@@ -2069,6 +2123,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 .bind(&tier_names)
                 .bind(tier_include_null)
                 .bind(tier_mode)
+                .bind(prune_lower)
+                .bind(prune_upper)
                 .fetch_all(&mut *tx)
                 .await
                 .map_err(|e| {
@@ -2340,6 +2396,29 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                     LIMIT m.capacity
                 ) claimed
                 LIMIT $2::BIGINT
+            ),
+            -- A pending row whose template is gone (its file soft-deleted, its
+            -- weekly partition retired, or the row purged) can never be claimed.
+            -- Fail it here, bounded to the rows this tick actually picked, so it
+            -- burns a claim slot exactly once instead of on every tick; the
+            -- claim update below skips it via its CROSS JOIN on the template.
+            stranded AS (
+                UPDATE requests r
+                   SET state = 'failed',
+                       error = 'request template no longer exists',
+                       failed_at = $3
+                  FROM to_claim tc
+                  -- Per-row lookup by primary key, like the claim join below:
+                  -- a bare NOT EXISTS on the generation-transparent view gets
+                  -- flattened into an anti-join that hashes the whole legacy
+                  -- template table; LIMIT 1 keeps it a probe per picked row.
+                  LEFT JOIN LATERAL (
+                      SELECT 1 AS present FROM active_request_templates t
+                      WHERE t.id = tc.template_id LIMIT 1
+                  ) t ON true
+                 WHERE r.id = tc.id
+                   AND t.present IS NULL
+                RETURNING r.id
             )
             UPDATE requests r
             SET
@@ -2613,6 +2692,29 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 WHERE model_rank <= capacity
                 ORDER BY pr ASC, expires_at ASC, batch_id ASC, created_at ASC
                 LIMIT $2::BIGINT
+            ),
+            -- A pending row whose template is gone (its file soft-deleted, its
+            -- weekly partition retired, or the row purged) can never be claimed.
+            -- Fail it here, bounded to the rows this tick actually picked, so it
+            -- burns a claim slot exactly once instead of on every tick; the
+            -- claim update below skips it via its CROSS JOIN on the template.
+            stranded AS (
+                UPDATE requests r
+                   SET state = 'failed',
+                       error = 'request template no longer exists',
+                       failed_at = $3
+                  FROM to_claim tc
+                  -- Per-row lookup by primary key, like the claim join below:
+                  -- a bare NOT EXISTS on the generation-transparent view gets
+                  -- flattened into an anti-join that hashes the whole legacy
+                  -- template table; LIMIT 1 keeps it a probe per picked row.
+                  LEFT JOIN LATERAL (
+                      SELECT 1 AS present FROM active_request_templates t
+                      WHERE t.id = tc.template_id LIMIT 1
+                  ) t ON true
+                 WHERE r.id = tc.id
+                   AND t.present IS NULL
+                RETURNING r.id
             )
             UPDATE requests r
             SET
@@ -2869,6 +2971,29 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 ORDER BY ranked.model_rank, ranked.model_order, ranked.created_at, ranked.id
                 LIMIT $2::BIGINT
                 FOR UPDATE OF lock_row SKIP LOCKED
+            ),
+            -- A pending row whose template is gone (its file soft-deleted, its
+            -- weekly partition retired, or the row purged) can never be claimed.
+            -- Fail it here, bounded to the rows this tick actually picked, so it
+            -- burns a claim slot exactly once instead of on every tick; the
+            -- claim update below skips it via its CROSS JOIN on the template.
+            stranded AS (
+                UPDATE requests r
+                   SET state = 'failed',
+                       error = 'request template no longer exists',
+                       failed_at = $3
+                  FROM locked claimed
+                  -- Per-row lookup by primary key, like the claim join below:
+                  -- a bare NOT EXISTS on the generation-transparent view gets
+                  -- flattened into an anti-join that hashes the whole legacy
+                  -- template table; LIMIT 1 keeps it a probe per picked row.
+                  LEFT JOIN LATERAL (
+                      SELECT 1 AS present FROM active_request_templates t
+                      WHERE t.id = claimed.template_id LIMIT 1
+                  ) t ON true
+                 WHERE r.id = claimed.id
+                   AND t.present IS NULL
+                RETURNING r.id
             )
             UPDATE requests r
             SET state = 'claimed',
@@ -8451,9 +8576,15 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         cutoffs: &RetainedResponseArchiveCutoffs,
         max_groups: i64,
         max_bytes: i64,
+        concurrency: usize,
     ) -> Result<RetainedResponseArchiveOutcome> {
         retained_response::archive_overdue_batchless_responses(
-            self, policy, cutoffs, max_groups, max_bytes,
+            self,
+            policy,
+            cutoffs,
+            max_groups,
+            max_bytes,
+            concurrency,
         )
         .await
     }
@@ -8726,9 +8857,13 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         //
         // Uses LATERAL so Postgres resolves the small set of soft-deleted
         // batch IDs first, then does an index lookup into requests per batch
-        // via idx_requests_batch_id — avoiding a seq scan of the (potentially
-        // huge) requests table. FOR UPDATE SKIP LOCKED enables concurrent
-        // daemons to partition work without blocking.
+        // via idx_requests_batch_state — avoiding a seq scan of the
+        // (potentially huge) requests table. `batch_id` is that index's
+        // leading column, so the equality seek needs no `state` predicate.
+        // (Previously idx_requests_batch_id, dropped in 20260904020000 as a
+        // strict prefix of the smaller, hotter (batch_id, state) index.)
+        // FOR UPDATE SKIP LOCKED enables concurrent daemons to partition work
+        // without blocking.
         let requests_deleted = sqlx::query!(
             r#"
             DELETE FROM requests
@@ -8860,45 +8995,14 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             ))
         })?
         .rows_affected() as i64;
-        // Step 2c: a pending request whose template is gone (purged above, or
-        // its weekly partition retired) can never be claimed, and without the
-        // old ON DELETE SET NULL it would otherwise occupy a claim slot on
-        // every tick. Both existence probes are primary-key lookups.
-        let stranded_failed = sqlx::query(
-            r#"
-            UPDATE requests
-               SET state = 'failed',
-                   error = 'request template no longer exists',
-                   failed_at = NOW()
-             WHERE id IN (
-                   SELECT r.id
-                     FROM requests r
-                    WHERE r.state = 'pending'
-                      AND r.template_id IS NOT NULL
-                      AND NOT EXISTS (SELECT 1 FROM request_templates t WHERE t.id = r.template_id)
-                      AND NOT EXISTS (SELECT 1 FROM request_template_routes rt WHERE rt.template_id = r.template_id)
-                    LIMIT $1
-                    FOR UPDATE SKIP LOCKED
-             )
-            "#,
-        )
-        .bind(batch_size)
-        .execute(self.write_executor())
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to fail stranded requests: {e}")))?
-        .rows_affected() as i64;
-        let total = (requests_deleted
-            + archived_deleted
-            + templates_deleted
-            + g2_templates_deleted
-            + stranded_failed) as u64;
+        let total =
+            (requests_deleted + archived_deleted + templates_deleted + g2_templates_deleted) as u64;
         if total > 0 {
             tracing::info!(
                 requests_deleted,
                 archived_deleted,
                 templates_deleted,
                 g2_templates_deleted,
-                stranded_failed,
                 "Purged orphaned rows"
             );
         }
@@ -11914,6 +12018,56 @@ mod tests {
         );
     }
 
+    /// Without the old ON DELETE SET NULL, a pending request whose template
+    /// is gone would be picked by the claim query on every tick, burn a slot in
+    /// its model's capacity and never be claimed. The claim query fails such a
+    /// row the first time it is picked, so it costs one slot exactly once.
+    #[sqlx::test]
+    async fn test_claim_fails_pending_requests_whose_template_is_gone(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let stranded = setup_freeze_test_batch(&manager, "claim-stranded", 2).await;
+        let healthy = setup_freeze_test_batch(&manager, "claim-healthy", 1).await;
+        sqlx::query!(
+            "DELETE FROM request_templates WHERE id IN (SELECT template_id FROM requests WHERE batch_id = $1)",
+            *stranded as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let capacity = HashMap::from([("freeze-test".to_string(), 10)]);
+        let claimed = manager
+            .claim_batch_requests(10, 5, daemon_id, &capacity, &HashMap::new())
+            .await
+            .unwrap();
+        assert_eq!(claimed.len(), 1, "only the healthy request is claimable");
+        assert_eq!(claimed[0].data.batch_id, Some(healthy));
+
+        let states: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT state, error FROM requests WHERE batch_id = $1 ORDER BY id")
+                .bind(*stranded as Uuid)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(states.len(), 2);
+        assert!(
+            states.iter().all(|(state, error)| state == "failed"
+                && error.as_deref() == Some("request template no longer exists")),
+            "stranded rows must be failed at claim time: {states:?}"
+        );
+
+        // A second tick has nothing left to pick and nothing left to fail.
+        let again = manager
+            .claim_batch_requests(10, 5, daemon_id, &capacity, &HashMap::new())
+            .await
+            .unwrap();
+        assert!(again.is_empty());
+    }
+
     #[sqlx::test]
     async fn test_claim_requests(pool: sqlx::PgPool) {
         let http_client = Arc::new(MockHttpClient::new());
@@ -14242,48 +14396,6 @@ mod tests {
         assert_eq!(
             landed_in_fenced_week, 0,
             "a fenced week must never receive rows"
-        );
-    }
-
-    /// Without the old ON DELETE SET NULL, a pending request whose template
-    /// was purged would sit in the claim window forever. The orphan purge
-    /// fails it instead.
-    #[sqlx::test]
-    async fn test_purge_fails_pending_requests_whose_template_is_gone(pool: sqlx::PgPool) {
-        let manager = PostgresRequestManager::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            Arc::new(MockHttpClient::new()),
-        );
-        let stranded = setup_freeze_test_batch(&manager, "purge-stranded", 2).await;
-        let healthy = setup_freeze_test_batch(&manager, "purge-healthy", 1).await;
-        sqlx::query!(
-            "DELETE FROM request_templates WHERE id IN (SELECT template_id FROM requests WHERE batch_id = $1)",
-            *stranded as Uuid
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
-        let purged = manager.purge_orphaned_rows(100).await.unwrap();
-        assert_eq!(purged, 2, "both stranded requests must be failed");
-        let states: Vec<(String, Option<String>)> =
-            sqlx::query_as("SELECT state, error FROM requests WHERE batch_id = $1 ORDER BY id")
-                .bind(*stranded as Uuid)
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert!(states.iter().all(|(state, error)| state == "failed"
-            && error.as_deref() == Some("request template no longer exists")));
-        let healthy_pending: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM requests WHERE batch_id = $1 AND state = 'pending'",
-        )
-        .bind(*healthy as Uuid)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            healthy_pending, 1,
-            "requests with a live template are untouched"
         );
     }
 

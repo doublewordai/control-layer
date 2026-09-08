@@ -125,6 +125,17 @@ pub struct UserResponse {
     /// User's credit balance (only included if `include=billing` is specified)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credit_balance: Option<f64>,
+    /// Whether this billing target has ever completed a purchase (only included
+    /// if `include=billing` is specified).
+    ///
+    /// This is the ledger truth behind the first-payment-match promotion: the
+    /// match is granted exactly when no earlier `purchase` exists for the
+    /// target. Clients gating on "has this account already had its first
+    /// top-up?" must read this rather than `has_payment_provider_id`, which is
+    /// true for accounts that only verified a card or merely attempted to turn
+    /// on auto top-up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub has_purchased: Option<bool>,
     /// Indicates whether this user has an associated payment provider customer record.
     ///
     /// Note: This field replaces the previous `payment_provider_id` response field to avoid
@@ -260,6 +271,7 @@ impl From<UserDBResponse> for UserResponse {
             last_login: db.last_login,
             groups: None,         // By default, relationships are not included
             credit_balance: None, // By default, credit balances are not included
+            has_purchased: None,  // Ditto: only populated for include=billing
             has_payment_provider_id: db.payment_provider_id.as_ref().is_some_and(|s| !s.is_empty()),
             batch_notifications_enabled: db.batch_notifications_enabled,
             low_balance_threshold: db.low_balance_threshold,
@@ -288,6 +300,12 @@ impl UserResponse {
     /// Create a response with credit balance included
     pub fn with_credit_balance(mut self, balance: f64) -> Self {
         self.credit_balance = Some(balance);
+        self
+    }
+
+    /// Create a response with the first-purchase flag included
+    pub fn with_has_purchased(mut self, has_purchased: bool) -> Self {
+        self.has_purchased = Some(has_purchased);
         self
     }
 

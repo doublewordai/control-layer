@@ -76,6 +76,36 @@ impl RetentionPolicy {
             || !self.batchless_seconds_by_service_tier.is_empty()
     }
 
+    /// The (min, max) batchless retention in seconds across configured
+    /// NON-background tiers, or `None` when none is configured.
+    ///
+    /// Feeds the trailing-demand query's partition-prune bounds: every
+    /// sweep-landed retained row satisfies `delete_on ≈ terminal_at + its
+    /// tier's retention`, so a trailing window over `terminal_at` can only
+    /// match rows in partitions between `window_start + min retention` and
+    /// `window_end + max retention`. Backfill-landed overdue rows (whose
+    /// `delete_on` is clamped to the day after observation) are strictly
+    /// older than any trailing window, and the lower bound prunes their
+    /// partitions without scanning them.
+    ///
+    /// The background tier is excluded because the trailing-demand query
+    /// excludes background rows in every arm (`service_tier IS DISTINCT
+    /// FROM 'background'`); letting an outlier background retention widen
+    /// the bounds would only weaken pruning for rows the query can never
+    /// count.
+    pub fn batchless_retention_bounds_seconds(&self) -> Option<(u64, u64)> {
+        let mut non_background = self
+            .batchless_seconds_by_service_tier
+            .iter()
+            .filter(|(tier, _)| tier.as_str() != "background")
+            .map(|(_, seconds)| *seconds);
+        let first = non_background.next()?;
+        let (min, max) = non_background.fold((first, first), |(min, max), seconds| {
+            (min.min(seconds), max.max(seconds))
+        });
+        Some((min, max))
+    }
+
     /// Reject labels that cannot match a persisted service tier safely.
     pub fn validate(&self) -> std::result::Result<(), String> {
         if self.terminal_batch_seconds == Some(0)
@@ -314,6 +344,31 @@ mod retention_policy_tests {
     use super::*;
 
     #[test]
+    fn retention_bounds_span_non_background_tiers_only() {
+        let mut policy = RetentionPolicy::default();
+        assert_eq!(policy.batchless_retention_bounds_seconds(), None);
+
+        // Background alone configures no bounds: the trailing-demand query
+        // excludes background rows in every arm.
+        policy
+            .batchless_seconds_by_service_tier
+            .insert("background".to_owned(), 86_400);
+        assert_eq!(policy.batchless_retention_bounds_seconds(), None);
+
+        policy
+            .batchless_seconds_by_service_tier
+            .insert("flex".to_owned(), 30 * 86_400);
+        policy
+            .batchless_seconds_by_service_tier
+            .insert("priority".to_owned(), 60 * 86_400);
+        // The background outlier (1 day) must not widen the bounds.
+        assert_eq!(
+            policy.batchless_retention_bounds_seconds(),
+            Some((30 * 86_400, 60 * 86_400))
+        );
+    }
+
+    #[test]
     fn batchless_delete_on_is_the_utc_day_after_exact_expiry() {
         let terminal_at = DateTime::parse_from_rfc3339("2026-08-14T15:30:00Z")
             .unwrap()
@@ -468,7 +523,7 @@ mod retention_policy_tests {
 
         assert_maintenance_is_disabled(
             storage
-                .archive_overdue_batchless_responses(&policy, &cutoffs, 1, 1)
+                .archive_overdue_batchless_responses(&policy, &cutoffs, 1, 1, 1)
                 .await,
         );
         assert_maintenance_is_disabled(
@@ -1112,7 +1167,11 @@ pub trait Storage: Send + Sync {
     /// identified by `service_tier = 'priority' AND batch_id IS NULL` instead,
     /// because the orphan purger may null `template_id` on old realtime rows.
     ///
-    /// Reads the live `requests` table only. Batchless tiers (flex/priority)
+    /// Reads the live `requests` table unioned with the retained-response
+    /// store (batchless rows keep counting after the archiver moves them;
+    /// partition pruning there relies on the configured retention bounds —
+    /// see [`RetentionPolicy::batchless_retention_bounds_seconds`]).
+    /// Batchless tiers (flex/priority)
     /// are exact; batch-tier rows are moved to `batch_requests_archive` once
     /// their parent batch is terminal and frozen, so batch-tier counts cover
     /// only not-yet-archived rows (a lower bound that decays with sweep
@@ -1700,12 +1759,18 @@ pub trait DaemonStorage: Send + Sync {
     /// can still be dropped. Retention is only ever extended here; without
     /// this path such content would stay live, and therefore undeletable,
     /// forever. Storage backends opt in explicitly; the default is disabled.
+    ///
+    /// `concurrency` is how many discovered graphs an implementation may move
+    /// at the same time within this one call. The graph and byte budgets
+    /// bound the whole call, not each concurrent mover; values below 1
+    /// behave as 1.
     async fn archive_overdue_batchless_responses(
         &self,
         _policy: &RetentionPolicy,
         _cutoffs: &RetainedResponseArchiveCutoffs,
         _max_groups: i64,
         _max_bytes: i64,
+        _concurrency: usize,
     ) -> Result<RetainedResponseArchiveOutcome> {
         Err(RetainedResponseMaintenanceError::Disabled.into_fusillade_error())
     }

@@ -1176,21 +1176,68 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 
 /// Total-count budget: an exact count is worth a short wait, but an
 /// unfiltered listing over a 100M-row live table is not allowed to hold a
-/// connection for the full scan. Each arm gets `COUNT_BUDGET`; on timeout
-/// (SQLSTATE 57014) the arm falls back to the planner's row estimate, which
-/// tracks within a few percent when statistics are fresh. Runs on the read
-/// pool in its own transaction so it never pins the primary.
+/// connection for the full scan. Each arm's exact COUNT gets `COUNT_BUDGET`;
+/// on timeout (SQLSTATE 57014) the arm falls back to the planner's row
+/// estimate, which tracks within a few percent when statistics are fresh.
+/// Runs on the read pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
+
+/// Budget for the fallback EXPLAIN, deliberately separate from
+/// `COUNT_BUDGET`. Merely planning the retained arm takes hundreds of
+/// milliseconds once it spans dozens of daily partitions joined to the
+/// catalog tables, so an estimate under the count budget failed in exactly
+/// the cases it exists to rescue (HTTP 500s on the admin request list).
+/// EXPLAIN without ANALYZE reads no rows and takes only planner locks, so it
+/// needs no scan guard; this bound only stops a request handler from waiting
+/// indefinitely behind a lock queue.
+const ESTIMATE_BUDGET: &str = "5s";
+
+/// `SET LOCAL` is transaction-scoped: it is applied once per transaction and
+/// re-applied whenever the fallback replaces the transaction.
+async fn apply_statement_budget(tx: &mut Transaction<'_, Postgres>, budget: &str) -> Result<()> {
+    sqlx::query(&format!("SET LOCAL statement_timeout = '{budget}'"))
+        .execute(&mut **tx)
+        .await
+        .map_err(read_database_failure)?;
+    Ok(())
+}
+
+/// Planner row estimate for one count arm, taken under `ESTIMATE_BUDGET`
+/// rather than `COUNT_BUDGET` (see the latter's docs for why).
+async fn estimate_arm_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    arm: &str,
+    filter: &ListRequestsFilter,
+) -> Result<i64> {
+    apply_statement_budget(tx, ESTIMATE_BUDGET).await?;
+    let plan: serde_json::Value = sqlx::query_scalar(&format!(
+        "EXPLAIN (FORMAT JSON) {}",
+        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+    ))
+    .bind(filter.created_by.as_deref())
+    .bind(filter.status.as_deref())
+    .bind(filter.models.as_deref())
+    .bind(filter.created_after)
+    .bind(filter.created_before)
+    .bind(filter.service_tiers.as_deref())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(read_database_failure)?;
+    Ok(plan
+        .get(0)
+        .and_then(|p| p.get("Plan"))
+        .and_then(|p| p.get("Plan Rows"))
+        .and_then(|r| r.as_f64())
+        .map(|r| r.round() as i64)
+        .unwrap_or(0))
+}
 
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
 ) -> Result<i64> {
     let mut tx = manager.begin_read().await.map_err(read_database_failure)?;
-    sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-        .execute(&mut *tx)
-        .await
-        .map_err(read_database_failure)?;
+    apply_statement_budget(&mut tx, COUNT_BUDGET).await?;
     let mut total = 0_i64;
     for arm in [LIVE_REQUEST_COUNT_SQL, RETAINED_REQUEST_COUNT_SQL] {
         let exact: std::result::Result<i64, sqlx::Error> = sqlx::query_scalar(arm)
@@ -1206,32 +1253,13 @@ async fn count_requests_with_budget<P: PoolProvider>(
             Ok(n) => n,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
                 // The failed statement aborted this transaction; estimate on a
-                // fresh one (EXPLAIN is planning only, so it is cheap).
+                // fresh one, then restore the scan guard for the next arm's
+                // exact count.
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
-                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
-                ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                let estimate = estimate_arm_rows(&mut tx, arm, filter).await?;
+                apply_statement_budget(&mut tx, COUNT_BUDGET).await?;
+                estimate
             }
             Err(e) => return Err(read_database_failure(e)),
         };
@@ -1240,7 +1268,20 @@ async fn count_requests_with_budget<P: PoolProvider>(
     Ok(total)
 }
 
-fn list_requests_page_sql(active_first: bool) -> String {
+fn list_requests_page_sql(active_first: bool, owner_scoped: bool) -> String {
+    // Separate SQL shapes let generic prepared plans use the owner-leading
+    // indexes. A nullable-owner OR cannot become an index condition in those
+    // plans. Values remain bound, including the NULL owner for admin listings.
+    let live_owner = if owner_scoped {
+        "request.created_by = $1::text"
+    } else {
+        "$1::text IS NULL"
+    };
+    let retained_owner = if owner_scoped {
+        "object.created_by = $1::text"
+    } else {
+        "$1::text IS NULL"
+    };
     let order_clause = if active_first {
         "CASE sort_state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, sort_created_at DESC, sort_id DESC"
     } else {
@@ -1255,14 +1296,34 @@ fn list_requests_page_sql(active_first: bool) -> String {
     } else {
         "request.created_at DESC, request.id DESC"
     };
-    let retained_order = if active_first {
-        "CASE object.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, object.created_at DESC, object.object_id DESC"
-    } else {
-        "object.created_at DESC, object.object_id DESC"
-    };
+    // RetainedRequestPayloadV1::validate requires a terminal request. Every
+    // retained row therefore has the same active-first rank; omitting that
+    // constant key permits the existing owner/created_at/object_id index scan.
+    let retained_order = "object.created_at DESC, object.object_id DESC";
     format!(
         r#"
-        WITH candidates AS (
+        WITH valid_buckets AS MATERIALIZED (
+            SELECT bucket.delete_on
+            FROM retained_response_buckets bucket
+            JOIN pg_namespace namespace
+              ON namespace.nspname = bucket.partition_schema
+            JOIN pg_class child
+              ON child.relnamespace = namespace.oid
+             AND child.relname = bucket.partition_table
+             AND child.oid = bucket.partition_oid
+            JOIN pg_inherits inheritance
+              ON inheritance.inhrelid = child.oid
+             AND NOT inheritance.inhdetachpending
+            WHERE bucket.state = 'active'
+              AND bucket.partition_schema = current_schema()
+              AND bucket.partition_table =
+                  'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+              AND inheritance.inhparent =
+                  to_regclass(format('%I.retained_response_objects', current_schema()))
+              AND pg_get_expr(child.relpartbound, child.oid) = format(
+                  'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+              )
+        ), candidates AS (
             (SELECT
                 request.id AS sort_id,
                 request.state AS sort_state,
@@ -1299,7 +1360,7 @@ fn list_requests_page_sql(active_first: bool) -> String {
                 NULL::jsonb AS payload
             FROM requests request
             WHERE request.created_by IS NOT NULL
-              AND ($1::text IS NULL OR request.created_by = $1)
+              AND {live_owner}
               AND ($2::text IS NULL OR request.state = $2)
               AND ($3::text[] IS NULL OR request.model = ANY($3))
               AND ($4::timestamptz IS NULL OR request.created_at >= $4)
@@ -1329,37 +1390,27 @@ fn list_requests_page_sql(active_first: bool) -> String {
                 object.terminal_at,
                 object.schema_version,
                 object.payload
-            FROM retained_response_buckets bucket
-            JOIN pg_namespace namespace
-              ON namespace.nspname = bucket.partition_schema
-            JOIN pg_class child
-              ON child.relnamespace = namespace.oid
-             AND child.relname = bucket.partition_table
-             AND child.oid = bucket.partition_oid
-            JOIN pg_inherits inheritance
-              ON inheritance.inhrelid = child.oid
-             AND NOT inheritance.inhdetachpending
-            JOIN retained_response_objects object
-              ON object.delete_on = bucket.delete_on
-             AND object.object_kind = 'request'
-            JOIN retained_response_request_routes route
-              ON route.request_id = object.object_id
-             AND route.group_id = object.group_id
-             AND route.delete_on = object.delete_on
-            JOIN retained_response_group_routes group_route
-              ON group_route.group_id = object.group_id
-             AND group_route.delete_on = object.delete_on
-            WHERE bucket.state = 'active'
-              AND bucket.partition_schema = current_schema()
-              AND bucket.partition_table =
-                  'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
-              AND inheritance.inhparent =
-                  to_regclass(format('%I.retained_response_objects', current_schema()))
-              AND pg_get_expr(child.relpartbound, child.oid) = format(
-                  'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+            FROM retained_response_objects object
+            WHERE object.object_kind = 'request'
+              AND object.delete_on IN (SELECT delete_on FROM valid_buckets)
+              -- Keep validation as per-candidate index probes. OFFSET 0
+              -- prevents pull-up into joins that can scan the route tables
+              -- and sort the entire retained history before applying LIMIT.
+              AND EXISTS (
+                  SELECT 1 FROM retained_response_request_routes route
+                  WHERE route.request_id = object.object_id
+                    AND route.group_id = object.group_id
+                    AND route.delete_on = object.delete_on
+                  OFFSET 0
+              )
+              AND EXISTS (
+                  SELECT 1 FROM retained_response_group_routes group_route
+                  WHERE group_route.group_id = object.group_id
+                    AND group_route.delete_on = object.delete_on
+                  OFFSET 0
               )
               AND object.created_by IS NOT NULL
-              AND ($1::text IS NULL OR object.created_by = $1)
+              AND {retained_owner}
               AND ($2::text IS NULL OR object.state = $2)
               AND ($3::text[] IS NULL OR object.model = ANY($3))
               AND ($4::timestamptz IS NULL OR object.created_at >= $4)
@@ -1371,6 +1422,7 @@ fn list_requests_page_sql(active_first: bool) -> String {
               AND NOT EXISTS (
                   SELECT 1 FROM requests live
                   WHERE live.id = object.object_id AND live.created_by IS NOT NULL
+                  OFFSET 0
               )
             ORDER BY {retained_order}
             LIMIT $7 + $8)
@@ -1403,7 +1455,7 @@ pub(crate) async fn list_requests<P: PoolProvider>(
     let count = count_requests_with_budget(manager, &filter).await?;
     let mut tx = begin_primary_read(manager).await?;
 
-    let query = list_requests_page_sql(filter.active_first);
+    let query = list_requests_page_sql(filter.active_first, filter.created_by.is_some());
     let rows = sqlx::query(&query)
         .bind(filter.created_by.as_deref())
         .bind(filter.status.as_deref())
@@ -1610,9 +1662,18 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       AND retained.state = 'completed'
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
-      -- V1 proves terminal_at < delete_on, so this necessary lower
-      -- bound enables daily partition pruning for the trailing window.
-      AND retained.delete_on > ($1 AT TIME ZONE 'UTC')::date
+      -- Partition-prune bounds. Sweep-landed rows satisfy
+      -- delete_on ~ terminal_at + tier retention, so a trailing terminal_at
+      -- window can only match partitions between window_start + min
+      -- retention and window_end + max retention ($7/$8, computed with
+      -- day-rounding and retention-raise slack). Backfill-landed overdue
+      -- rows (delete_on clamped to observation + 1) are strictly older
+      -- than any trailing window, so the lower bound prunes their
+      -- partitions outright instead of scanning them row by row. When the
+      -- policy is unknown ($7/$8 NULL) fall back to the weak necessary
+      -- bound: V1 proves terminal_at < delete_on.
+      AND retained.delete_on >= COALESCE($7::date, ($1 AT TIME ZONE 'UTC')::date + 1)
+      AND ($8::date IS NULL OR retained.delete_on <= $8::date)
       AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
       AND retained.service_tier IS DISTINCT FROM 'background'
       AND (
@@ -1671,9 +1732,18 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       AND retained.state = 'failed'
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
-      -- V1 proves terminal_at < delete_on, so this necessary lower
-      -- bound enables daily partition pruning for the trailing window.
-      AND retained.delete_on > ($1 AT TIME ZONE 'UTC')::date
+      -- Partition-prune bounds. Sweep-landed rows satisfy
+      -- delete_on ~ terminal_at + tier retention, so a trailing terminal_at
+      -- window can only match partitions between window_start + min
+      -- retention and window_end + max retention ($7/$8, computed with
+      -- day-rounding and retention-raise slack). Backfill-landed overdue
+      -- rows (delete_on clamped to observation + 1) are strictly older
+      -- than any trailing window, so the lower bound prunes their
+      -- partitions outright instead of scanning them row by row. When the
+      -- policy is unknown ($7/$8 NULL) fall back to the weak necessary
+      -- bound: V1 proves terminal_at < delete_on.
+      AND retained.delete_on >= COALESCE($7::date, ($1 AT TIME ZONE 'UTC')::date + 1)
+      AND ($8::date IS NULL OR retained.delete_on <= $8::date)
       AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
       AND retained.service_tier IS DISTINCT FROM 'background'
       AND (
@@ -1748,6 +1818,49 @@ enum MoveGraphOutcome {
     SkippedLocked,
     Deferred,
     AlreadyGone,
+}
+
+/// The per-call retained-payload byte budget, shared by every graph move in
+/// one archive pass. Reservations are atomic so concurrent movers cannot
+/// jointly exceed the budget: a graph is reserved only while the running
+/// total plus its bytes still fits, or when nothing has been reserved yet
+/// (the one oversized graph a pass may move, exactly as the sequential mover
+/// allowed the first archived graph to exceed the budget). A reservation is
+/// never released: every path after it either commits the move or returns an
+/// error that aborts the whole pass.
+struct ByteBudget {
+    max_bytes: u64,
+    reserved: std::sync::atomic::AtomicU64,
+}
+
+impl ByteBudget {
+    fn new(max_bytes: u64) -> Self {
+        Self {
+            max_bytes,
+            reserved: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// `allow_oversized` is granted only to the first candidate a pass
+    /// dispatches (the oldest), so the one oversized graph a pass may move is
+    /// always the head of the queue rather than whichever mover serialised
+    /// its payload first; a large head can then never be starved by smaller
+    /// siblings that keep winning the race.
+    fn try_reserve(&self, bytes: u64, allow_oversized: bool) -> bool {
+        self.reserved
+            .fetch_update(
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+                |reserved| {
+                    let fits = reserved
+                        .checked_add(bytes)
+                        .is_some_and(|total| total <= self.max_bytes);
+                    (fits || (allow_oversized && reserved == 0))
+                        .then(|| reserved.saturating_add(bytes))
+                },
+            )
+            .is_ok()
+    }
 }
 
 /// The live members of a retained graph. A graph is exactly one request (its
@@ -2743,7 +2856,13 @@ async fn lock_active_partition(
 ) -> MovementResult<bool> {
     sqlx::query(
         r#"
-        SELECT pg_advisory_xact_lock(
+        -- SHARED: movers only need to exclude retirement, which fences a day
+        -- under the exclusive form of this same key (the retirement claim);
+        -- they never need to exclude each other. Concurrent moves into one
+        -- day are safe (distinct graphs, primary keys on every object and
+        -- route), and this is what lets the backfill fan-out overlap the
+        -- write phase instead of queueing on the day.
+        SELECT pg_advisory_xact_lock_shared(
             hashtextextended(
                 'retained_response_objects.partition:' || current_schema() || ':'
                     || to_char($1::date, 'YYYYMMDD'),
@@ -2780,7 +2899,7 @@ async fn lock_active_partition(
           AND pg_get_expr(child.relpartbound, child.oid) = format(
               'FOR VALUES FROM (%L) TO (%L)', $1::date, $1::date + 1
         )
-        FOR UPDATE OF bucket
+        FOR SHARE OF bucket
         "#,
     )
     .bind(delete_on)
@@ -2979,7 +3098,7 @@ async fn move_graph<P: PoolProvider>(
     candidate: Candidate,
     policy: &RetentionPolicy,
     cutoffs: &RetainedResponseArchiveCutoffs,
-    remaining_bytes: u64,
+    budget: &ByteBudget,
     allow_oversized: bool,
 ) -> MovementResult<MoveGraphOutcome> {
     let mut tx = manager.begin_write().await.map_err(database_failure)?;
@@ -3170,7 +3289,7 @@ async fn move_graph<P: PoolProvider>(
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| RetainedResponseMovementError::IntegrityMismatch.into_fusillade_error())
     })?;
-    if payload_bytes > remaining_bytes && !allow_oversized {
+    if !budget.try_reserve(payload_bytes, allow_oversized) {
         return Ok(MoveGraphOutcome::Deferred);
     }
     if !lock_active_partition(&mut tx, delete_on).await? {
@@ -3319,22 +3438,43 @@ pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
     max_groups: i64,
     max_bytes: i64,
 ) -> Result<RetainedResponseArchiveOutcome> {
-    archive_batchless_responses(manager, policy, cutoffs, max_groups, max_bytes, false).await
+    archive_batchless_responses(manager, policy, cutoffs, max_groups, max_bytes, false, 1).await
 }
 
 /// The gated legacy path: no per-tier lower bound, so already-due graphs are
 /// discovered oldest-first; `move_graph` lands them on the day after
-/// observation.
+/// observation. Up to `concurrency` discovered graphs move at the same time.
 pub(crate) async fn archive_overdue_batchless_responses<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     policy: &RetentionPolicy,
     cutoffs: &RetainedResponseArchiveCutoffs,
     max_groups: i64,
     max_bytes: i64,
+    concurrency: usize,
 ) -> Result<RetainedResponseArchiveOutcome> {
-    archive_batchless_responses(manager, policy, cutoffs, max_groups, max_bytes, true).await
+    archive_batchless_responses(
+        manager,
+        policy,
+        cutoffs,
+        max_groups,
+        max_bytes,
+        true,
+        concurrency,
+    )
+    .await
 }
 
+// Concurrency lives here, below discovery, rather than as N whole passes run
+// side by side by the daemon. Discovery is an unlocked oldest-first read, so
+// N simultaneous passes would all discover the same head of the queue and
+// then merely take turns on it through the advisory locks: safe, but no
+// faster than one pass. One serial discovery followed by concurrent moves
+// over a candidate set of distinct graphs (deduplicated by group, with every
+// discovered member excluded from later probes) gives each mover its own
+// graph. Each move is still its own transaction with the per-graph advisory
+// lock, `FOR UPDATE SKIP LOCKED`, and read-back verification, so it stays
+// correct against any other mover — another pass, another pod, or a late
+// writer — exactly as before. The shared byte budget is reserved atomically.
 async fn archive_batchless_responses<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     policy: &RetentionPolicy,
@@ -3342,6 +3482,7 @@ async fn archive_batchless_responses<P: PoolProvider>(
     max_groups: i64,
     max_bytes: i64,
     include_overdue: bool,
+    concurrency: usize,
 ) -> Result<RetainedResponseArchiveOutcome> {
     if max_groups <= 0 || max_bytes <= 0 {
         return Ok(RetainedResponseArchiveOutcome::default());
@@ -3428,18 +3569,37 @@ async fn archive_batchless_responses<P: PoolProvider>(
         may_have_more: candidates.len() as i64 > max_groups || !discovery_exhausted,
         ..Default::default()
     };
-    for candidate in candidates {
-        let remaining_bytes = (max_bytes as u64).saturating_sub(outcome.bytes_archived);
-        let moved = match move_graph(
-            manager,
-            candidate,
-            policy,
-            cutoffs,
-            remaining_bytes,
-            outcome.groups_archived == 0,
-        )
-        .await
+    let budget = ByteBudget::new(max_bytes as u64);
+    let concurrency = concurrency.max(1);
+    let max_groups = max_groups as u64;
+    let mut pending = candidates.into_iter();
+    let mut in_flight = futures::stream::FuturesUnordered::new();
+    let mut dispatched = 0_u64;
+    loop {
+        // Dispatch only while an archived result from every in-flight move
+        // would still fit under the graph budget, so the pass can never
+        // commit more than `max_groups` graphs; the spare discovered
+        // candidate is dispatched only once an earlier move did not archive.
+        while in_flight.len() < concurrency
+            && outcome.groups_archived + in_flight.len() as u64 != max_groups
         {
+            let Some(candidate) = pending.next() else {
+                break;
+            };
+            in_flight.push(move_graph(
+                manager,
+                candidate,
+                policy,
+                cutoffs,
+                &budget,
+                dispatched == 0,
+            ));
+            dispatched += 1;
+        }
+        let Some(result) = futures::StreamExt::next(&mut in_flight).await else {
+            break;
+        };
+        let moved = match result {
             Ok(moved) => moved,
             Err(error)
                 if RetainedResponseMaintenanceError::from_fusillade_error(&error)
@@ -3452,7 +3612,19 @@ async fn archive_batchless_responses<P: PoolProvider>(
                 outcome.may_have_more = true;
                 continue;
             }
-            Err(error) => return Err(error),
+            // Returning drops the other in-flight moves; their uncommitted
+            // transactions roll back when the connections return to the pool.
+            // Graphs this pass already committed stay archived but are not
+            // counted by the caller, so say so (content-free).
+            Err(error) => {
+                if outcome.groups_archived > 0 {
+                    tracing::warn!(
+                        groups_committed_before_failure = outcome.groups_archived,
+                        "Retained-response archive pass aborted after some graphs had committed"
+                    );
+                }
+                return Err(error);
+            }
         };
         match moved {
             MoveGraphOutcome::Archived {
@@ -3464,9 +3636,6 @@ async fn archive_batchless_responses<P: PoolProvider>(
                 outcome.requests_archived += requests;
                 outcome.templates_archived += templates;
                 outcome.bytes_archived += bytes;
-                if outcome.groups_archived == max_groups as u64 {
-                    break;
-                }
             }
             MoveGraphOutcome::SkippedLocked => {
                 outcome.skipped_locked = true;
@@ -3484,6 +3653,7 @@ async fn archive_batchless_responses<P: PoolProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TestDbPools;
     use chrono::{DateTime, NaiveDate, Utc};
     use serde_json::json;
     use sqlx::PgPool;
@@ -3571,6 +3741,93 @@ mod tests {
         .expect("bounded retained-list SQL must be explainable")
     }
 
+    // Count rows visited, including rejected rows, rather than asserting a
+    // particular planner node name or a machine-dependent execution time.
+    fn retained_rows_visited(plan: &serde_json::Value) -> f64 {
+        match plan {
+            serde_json::Value::Array(values) => values.iter().map(retained_rows_visited).sum(),
+            serde_json::Value::Object(fields) => {
+                let visited = if fields.get("Relation Name").and_then(|v| v.as_str())
+                    == Some("retained_response_objects_d20260820")
+                {
+                    [
+                        "Actual Rows",
+                        "Rows Removed by Filter",
+                        "Rows Removed by Index Recheck",
+                    ]
+                    .iter()
+                    .map(|key| fields.get(*key).and_then(|v| v.as_f64()).unwrap_or(0.0))
+                    .sum::<f64>()
+                        * fields
+                            .get("Actual Loops")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                visited + fields.values().map(retained_rows_visited).sum::<f64>()
+            }
+            _ => 0.0,
+        }
+    }
+
+    #[sqlx::test]
+    async fn retained_owner_page_bounds_history_scan_with_generic_plan(pool: PgPool) {
+        sqlx::query("SELECT ensure_retained_response_partition('2026-08-20', NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO retained_response_objects (
+                delete_on, group_id, object_kind, object_id, request_id,
+                created_by, service_tier, state, model, created_at,
+                terminal_at, schema_version, payload
+            ) SELECT '2026-08-20', md5(i::text)::uuid, 'request', md5(i::text)::uuid,
+                md5(i::text)::uuid, CASE WHEN i <= 2000 THEN 'owner' ELSE 'other' END,
+                'flex', 'completed', 'model',
+                '2026-08-11'::timestamptz + i * interval '1 second',
+                '2026-08-12', 1, '{}'::jsonb
+            FROM generate_series(1, 4000) i
+        "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO retained_response_group_routes (group_id, delete_on) SELECT group_id, delete_on FROM retained_response_objects")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) SELECT object_id, group_id, delete_on FROM retained_response_objects")
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql("ANALYZE retained_response_objects; ANALYZE retained_response_objects_d20260820; ANALYZE retained_response_group_routes; ANALYZE retained_response_request_routes;")
+            .execute(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for active_first in [true, false] {
+            let sql = format!(
+                "PREPARE owner_page(text, text, text[], timestamptz, timestamptz, text[], bigint, bigint) AS {}",
+                list_requests_page_sql(active_first, true)
+            );
+            sqlx::raw_sql(&sql).execute(&mut *tx).await.unwrap();
+            let plan: serde_json::Value = sqlx::query_scalar(
+                "EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE owner_page('owner', NULL, NULL, NULL, NULL, ARRAY['flex', 'priority'], 10, 0)"
+            )
+                .fetch_one(&mut *tx).await.unwrap();
+            sqlx::query("DEALLOCATE owner_page")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
+            let visited = retained_rows_visited(&plan);
+            assert!(
+                visited > 0.0 && visited < 100.0,
+                "a ten-row owner page must not visit its entire retained history (visited {visited}): {plan}"
+            );
+        }
+    }
+
     #[sqlx::test]
     async fn retained_list_and_count_plans_prune_children_before_created_after(pool: PgPool) {
         let relevant_delete_on = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
@@ -3632,7 +3889,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list_count, 1);
-        let page_rows = sqlx::query(&list_requests_page_sql(false))
+        let page_rows = sqlx::query(&list_requests_page_sql(false, false))
             .bind(Option::<&str>::None)
             .bind(Option::<&str>::None)
             .bind(Option::<Vec<String>>::None)
@@ -3650,7 +3907,7 @@ mod tests {
 
         for (label, sql, page) in [
             ("count", LIST_REQUESTS_COUNT_SQL.to_owned(), false),
-            ("page", list_requests_page_sql(false), true),
+            ("page", list_requests_page_sql(false, false), true),
         ] {
             let plan = explain_bounded_list_query(&pool, &sql, page).await;
             assert!(
@@ -3704,6 +3961,8 @@ mod tests {
             .bind(vec!["flex".to_owned()])
             .bind(false)
             .bind("include")
+            .bind(Option::<NaiveDate>::None)
+            .bind(Option::<NaiveDate>::None)
             .fetch_all(&pool)
             .await
             .expect("exact trailing-demand SQL must execute");
@@ -3720,6 +3979,8 @@ mod tests {
             .bind(vec!["flex".to_owned()])
             .bind(false)
             .bind("include")
+            .bind(Option::<NaiveDate>::None)
+            .bind(Option::<NaiveDate>::None)
             .fetch_one(&pool)
             .await
             .expect("exact trailing-demand SQL must be explainable");
@@ -3732,6 +3993,128 @@ mod tests {
             0,
             "trailing plan must remove or avoid scanning the irrelevant daily child: {trailing_plan}"
         );
+    }
+
+    #[sqlx::test]
+    async fn trailing_demand_retention_bounds_prune_backfill_partitions(pool: PgPool) {
+        // A sweep-landed row inside the window: delete_on ~ terminal + 5d.
+        let sweep_delete_on = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
+        // A backfill-landed bucket just past the window start: months-old
+        // terminal_at, delete_on clamped to the day after observation. The
+        // weak necessary bound (delete_on > window start) cannot prune it;
+        // the retention-derived lower bound must.
+        let backfill_delete_on = NaiveDate::from_ymd_opt(2026, 8, 11).unwrap();
+        for delete_on in [backfill_delete_on, sweep_delete_on] {
+            sqlx::query("SELECT ensure_retained_response_partition($1, NULL)")
+                .bind(delete_on)
+                .execute(&pool)
+                .await
+                .expect("bounds fixture partition must be available");
+        }
+        for (delete_on, group, request, terminal_at) in [
+            (
+                sweep_delete_on,
+                Uuid::from_u128(0xdddddddddddddddddddddddddddddddd),
+                Uuid::from_u128(0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee),
+                "2026-08-12T10:00:00Z",
+            ),
+            (
+                backfill_delete_on,
+                Uuid::from_u128(0x1dddddddddddddddddddddddddddddd1),
+                Uuid::from_u128(0x1eeeeeeeeeeeeeeeeeeeeeeeeeeeeee1),
+                "2026-05-01T10:00:00Z",
+            ),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO retained_response_objects (
+                    delete_on, group_id, object_kind, object_id, request_id,
+                    created_by, service_tier, state, model,
+                    created_at, terminal_at, schema_version, payload
+                ) VALUES (
+                    $1, $2, 'request', $3, $3,
+                    'bounds-owner', 'flex', 'completed', 'bounds-model',
+                    '2026-05-01T09:00:00Z', $4::timestamptz, 1, '{}'::jsonb
+                )
+                "#,
+            )
+            .bind(delete_on)
+            .bind(group)
+            .bind(request)
+            .bind(terminal_at)
+            .execute(&pool)
+            .await
+            .expect("bounds fixture row must insert");
+            sqlx::query(
+                "INSERT INTO retained_response_group_routes (group_id, delete_on) VALUES ($1, $2)",
+            )
+            .bind(group)
+            .bind(delete_on)
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) VALUES ($1, $2, $3)",
+            )
+            .bind(request)
+            .bind(group)
+            .bind(delete_on)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        // Bounds as the impl computes them for min retention 5d / max 6d over
+        // the window [08-10, 08-15): lower = start + (5 - 2), upper =
+        // end + 6 + 2.
+        let prune_lower = NaiveDate::from_ymd_opt(2026, 8, 13).unwrap();
+        let prune_upper = NaiveDate::from_ymd_opt(2026, 8, 23).unwrap();
+
+        for (label, lower, upper, expect_backfill_scanned) in [
+            ("bounded", Some(prune_lower), Some(prune_upper), false),
+            ("unbounded", None, None, true),
+        ] {
+            let explain = format!("EXPLAIN (ANALYZE, FORMAT JSON) {TRAILING_DEMAND_SQL}");
+            let plan: serde_json::Value = sqlx::query_scalar(&explain)
+                .bind(timestamp("2026-08-10T00:00:00Z"))
+                .bind(timestamp("2026-08-15T00:00:00Z"))
+                .bind(vec!["bounds-model".to_owned()])
+                .bind(vec!["flex".to_owned()])
+                .bind(false)
+                .bind("include")
+                .bind(lower)
+                .bind(upper)
+                .fetch_one(&pool)
+                .await
+                .expect("bounded trailing-demand SQL must be explainable");
+            assert!(
+                relation_actual_loops(&plan, "retained_response_objects_d20260820") > 0,
+                "{label}: plan must execute the sweep-landed child: {plan}"
+            );
+            assert_eq!(
+                relation_actual_loops(&plan, "retained_response_objects_d20260811") > 0,
+                expect_backfill_scanned,
+                "{label}: backfill child scanned={expect_backfill_scanned} expected: {plan}"
+            );
+
+            // Same counts either way: the bounds change what is SCANNED,
+            // never what is counted (the backfill row is out-of-window).
+            let rows = sqlx::query(TRAILING_DEMAND_SQL)
+                .bind(timestamp("2026-08-10T00:00:00Z"))
+                .bind(timestamp("2026-08-15T00:00:00Z"))
+                .bind(vec!["bounds-model".to_owned()])
+                .bind(vec!["flex".to_owned()])
+                .bind(false)
+                .bind("include")
+                .bind(lower)
+                .bind(upper)
+                .fetch_all(&pool)
+                .await
+                .expect("bounded trailing-demand SQL must execute");
+            assert_eq!(rows.len(), 1, "{label}: exactly the in-window row counts");
+            assert_eq!(rows[0].get::<String, _>("model"), "bounds-model");
+            assert_eq!(rows[0].get::<i64, _>("count"), 1);
+        }
     }
 
     #[sqlx::test]
@@ -3771,6 +4154,81 @@ mod tests {
         assert!(
             plan_uses_index(&plan, "idx_requests_batchless_retention_due"),
             "candidate seed must use the validated retention-due index: {plan}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn estimate_runs_under_its_own_budget_not_the_count_budget(pool: PgPool) {
+        let mut tx = pool.begin().await.expect("estimate transaction must begin");
+        apply_statement_budget(&mut tx, COUNT_BUDGET)
+            .await
+            .expect("count budget must apply");
+        let estimate = estimate_arm_rows(&mut tx, RETAINED_REQUEST_COUNT_SQL, &Default::default())
+            .await
+            .expect("estimate must succeed on an empty database");
+        assert!(estimate >= 0);
+        let budget: String = sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("statement_timeout must be readable");
+        assert_eq!(
+            budget, ESTIMATE_BUDGET,
+            "the fallback EXPLAIN must not inherit the exact-count budget"
+        );
+    }
+
+    /// Reproduces the production failure shape: the exact count cannot finish
+    /// inside `COUNT_BUDGET`, and the fallback EXPLAIN is itself slow (here,
+    /// queued behind an exclusive lock rather than a 300 ms plan). The
+    /// estimate must still come back instead of surfacing a read failure.
+    #[sqlx::test]
+    async fn count_falls_back_to_estimate_when_exact_count_and_planning_exceed_count_budget(
+        pool: PgPool,
+    ) {
+        let manager = PostgresRequestManager::new(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Default::default(),
+        );
+        let hold_lock = tokio::time::Duration::from_millis(600);
+        let blocker = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let mut tx = pool.begin().await.expect("blocking transaction must begin");
+                sqlx::query("LOCK TABLE requests IN ACCESS EXCLUSIVE MODE")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("exclusive lock must be taken");
+                tokio::time::sleep(hold_lock).await;
+                tx.rollback()
+                    .await
+                    .expect("blocking transaction must release");
+            })
+        };
+        // Wait until the lock is held before counting.
+        loop {
+            let locked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'requests'::regclass \
+                 AND mode = 'AccessExclusiveLock' AND granted)",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("pg_locks must be readable");
+            if locked {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+
+        let started = tokio::time::Instant::now();
+        let total = count_requests_with_budget(&manager, &Default::default())
+            .await
+            .expect("count must fall back to the planner estimate rather than fail");
+        blocker.await.expect("blocking task must finish");
+
+        assert!(total >= 0);
+        assert!(
+            started.elapsed() >= tokio::time::Duration::from_millis(100),
+            "the exact count should have spent its budget waiting on the lock"
         );
     }
 

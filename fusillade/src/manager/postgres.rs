@@ -94,9 +94,11 @@ where
             ))
         })?;
         let fence_seconds = retention.policy().max_late_writer_seconds;
+        let retention_bounds = retention.policy().batchless_retention_bounds_seconds();
         let storage = Arc::new(
             PostgresStore::new(pools, (&config).into())
-                .with_retained_response_fence_seconds(fence_seconds),
+                .with_retained_response_fence_seconds(fence_seconds)
+                .with_retained_response_retention_bounds_seconds(retention_bounds),
         );
         Ok(Self::from_store(storage, config).with_retention_maintenance(retention))
     }

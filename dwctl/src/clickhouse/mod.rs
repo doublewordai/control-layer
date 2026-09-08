@@ -1,17 +1,12 @@
-//! ClickHouse Cloud: the shared warehouse connection and a generic best-effort sink.
+//! ClickHouse: the shared warehouse connection and a generic best-effort sink.
 //!
-//! The warehouse (`clay`) is fed mostly by the Neon → ClickHouse CDC pipe. A few
-//! high-volume, derived, analytics-only records are written directly from dwctl instead,
-//! because they are variable-length, never read back by dwctl, and would only add WAL
-//! and storage to the billing database on their way through. This module is the one
-//! connection those writers share ([`ClickHouseClient`], built from the top-level
-//! `clickhouse` config section) and the sink they hang off ([`sink::ClickHouseSink`]).
+//! [`ClickHouseClient`] is built from the top-level `clickhouse` config section and is
+//! shared by every feature that writes analytics records directly to the warehouse;
+//! [`sink::ClickHouseSink`] is the batched writer they hang off.
 //!
-//! Best effort by design. Nothing on the request path waits on it. A full queue drops
-//! the newest rows, a failed insert is retried once and then dropped, and every drop is
-//! counted (`dwctl_clickhouse_dropped_rows_total`). There is no spill and no replay: a
-//! warehouse outage loses that window's records, which is the agreed trade for these
-//! records (2026-09-02).
+//! Best effort by design. Nothing on the request path waits on it. A full queue drops the
+//! newest rows, a failed insert is retried once and then dropped, and every drop is
+//! counted (`dwctl_clickhouse_dropped_rows_total`). There is no spill and no replay.
 //!
 //! Rows land in batches: one `INSERT ... FORMAT JSONEachRow` per flush, gzip-compressed.
 //! ClickHouse's cost is per insert statement (each creates a part), not per row, so the
@@ -39,9 +34,8 @@ fn default_database() -> String {
     "clay".to_string()
 }
 
-fn default_request_timeout() -> Duration {
-    Duration::from_secs(30)
-}
+/// Per-insert HTTP timeout. ClickHouse Cloud services can idle and take seconds to wake.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The top-level `clickhouse` config section: connection and credential only.
 ///
@@ -61,10 +55,6 @@ pub struct ClickhouseConfig {
     pub user: String,
     /// Password. `DWCTL_CLICKHOUSE__PASSWORD` in deployments.
     pub password: String,
-    /// Per-insert HTTP timeout. ClickHouse Cloud services can idle and take seconds to
-    /// wake, so keep this generous; the sink is off the request path anyway.
-    #[serde(default = "default_request_timeout", with = "humantime_serde")]
-    pub request_timeout: Duration,
 }
 
 impl fmt::Debug for ClickhouseConfig {
@@ -74,7 +64,6 @@ impl fmt::Debug for ClickhouseConfig {
             .field("database", &self.database)
             .field("user", &self.user)
             .field("password", &"<redacted>")
-            .field("request_timeout", &self.request_timeout)
             .finish()
     }
 }
@@ -96,9 +85,6 @@ impl ClickhouseConfig {
         }
         if self.password.is_empty() {
             return Err("clickhouse.password is empty (set DWCTL_CLICKHOUSE__PASSWORD)".to_string());
-        }
-        if self.request_timeout.is_zero() {
-            return Err("clickhouse.request_timeout must be > 0".to_string());
         }
         if url.password().is_some() || !url.username().is_empty() {
             return Err("clickhouse.endpoint_url must not embed credentials; use clickhouse.user and clickhouse.password".to_string());
@@ -171,7 +157,7 @@ impl ClickHouseClient {
         config.validate().map_err(ClickHouseError::Config)?;
         let endpoint = Url::parse(config.endpoint_url.trim()).map_err(|e| ClickHouseError::Config(e.to_string()))?;
         let http = reqwest::Client::builder()
-            .timeout(config.request_timeout)
+            .timeout(REQUEST_TIMEOUT)
             .build()
             .map_err(ClickHouseError::Transport)?;
         Ok(Self {
@@ -252,7 +238,6 @@ mod tests {
             database: default_database(),
             user: "dwctl".to_string(),
             password: "pw".to_string(),
-            request_timeout: default_request_timeout(),
         }
     }
 
@@ -288,13 +273,6 @@ mod tests {
         assert!(!s.contains("s3cret") && !s.contains("alice"), "{s}");
         assert!(c.validate().unwrap_err().contains("embed credentials"));
         assert_eq!(redact_url("not a url"), "<unparseable url>");
-    }
-
-    #[test]
-    fn zero_timeout_is_rejected() {
-        let mut c = config();
-        c.request_timeout = Duration::ZERO;
-        assert!(c.validate().unwrap_err().contains("request_timeout"));
     }
 
     #[test]

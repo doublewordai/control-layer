@@ -220,6 +220,11 @@ pub struct Config {
     /// on the writing feature's own section. See [`crate::clickhouse::ClickhouseConfig`].
     #[serde(default)]
     pub clickhouse: Option<crate::clickhouse::ClickhouseConfig>,
+    /// Prefix-chain capture for workload profiling: content-free records of prompt
+    /// structure per chat-completions request, written to ClickHouse. Off by default.
+    /// See [`crate::prefix_chain::PrefixChainConfig`].
+    #[serde(default)]
+    pub prefix_chain: crate::prefix_chain::PrefixChainConfig,
     /// Mid-stream continuation (stream resume): the on/off flag, per-origin gates,
     /// and resume-behavior knobs. See [`ContinuationConfig`].
     #[serde(default)]
@@ -1930,6 +1935,15 @@ pub struct DaemonConfig {
     #[serde(default = "default_batchless_archive_bytes_per_tick")]
     pub batchless_archive_bytes_per_tick: i64,
 
+    /// Graphs the backfill worker moves concurrently within one tick. This
+    /// is the drain-throughput lever for the one-off historical drain: each
+    /// graph move is its own short transaction, so a tick's wall-clock time
+    /// is dominated by per-move round trips. The steady sweep is always
+    /// sequential. Must be at least 1 while the backfill is enabled; size the
+    /// fusillade write pool to hold this many extra connections.
+    #[serde(default = "default_batchless_archive_backfill_concurrency")]
+    pub batchless_archive_backfill_concurrency: usize,
+
     /// Daily retained-response partition runway maintained by the archive owner.
     #[serde(default = "default_retained_response_partitions_days_ahead")]
     pub retained_response_partitions_days_ahead: i32,
@@ -2116,6 +2130,10 @@ fn default_batchless_archive_groups_per_tick() -> i64 {
 
 fn default_batchless_archive_bytes_per_tick() -> i64 {
     fusillade::RetentionMaintenanceConfig::default().batchless_archive_bytes_per_tick()
+}
+
+fn default_batchless_archive_backfill_concurrency() -> usize {
+    fusillade::RetentionMaintenanceConfig::default().batchless_archive_backfill_concurrency()
 }
 
 fn default_retained_response_partitions_days_ahead() -> i32 {
@@ -2309,6 +2327,7 @@ impl Default for DaemonConfig {
             batchless_archive_backfill_enabled: false,
             batchless_archive_groups_per_tick: default_batchless_archive_groups_per_tick(),
             batchless_archive_bytes_per_tick: default_batchless_archive_bytes_per_tick(),
+            batchless_archive_backfill_concurrency: default_batchless_archive_backfill_concurrency(),
             retained_response_partitions_days_ahead: default_retained_response_partitions_days_ahead(),
             retained_response_retirement_enabled: false,
             batch_archive_retirement_enabled: false,
@@ -2348,6 +2367,7 @@ impl DaemonConfig {
             .with_batchless_archive_sweep_enabled(self.batchless_archive_sweep_enabled)
             .with_batchless_archive_backfill_enabled(self.batchless_archive_backfill_enabled)
             .with_batchless_archive_limits(self.batchless_archive_groups_per_tick, self.batchless_archive_bytes_per_tick)
+            .with_batchless_archive_backfill_concurrency(self.batchless_archive_backfill_concurrency)
             .with_retained_response_partitions_days_ahead(self.retained_response_partitions_days_ahead)
             .with_retained_response_retirement_enabled(self.retained_response_retirement_enabled)
             .with_batch_archive_retirement_enabled(self.batch_archive_retirement_enabled)
@@ -2925,6 +2945,7 @@ impl Default for Config {
             openapi: OpenApiConfig::default(),
             cache: CacheConfig::default(),
             clickhouse: None,
+            prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: ContinuationConfig::default(),
         }
     }
@@ -3200,6 +3221,28 @@ impl Config {
                 operation: "Config validation: batchless archive group and byte budgets must be positive".to_string(),
             });
         }
+        if owns_archive_maintenance && daemon.batchless_archive_backfill_enabled {
+            let fusillade_pool_max = match self.database.fusillade() {
+                ComponentDb::Schema { pool, .. } | ComponentDb::Dedicated { pool, .. } => pool.max_connections,
+            };
+            // Every concurrent mover holds a write connection for its whole
+            // move; a fan-out at or above the pool ceiling starves the claim
+            // loops and turns into pool timeouts rather than throughput.
+            if daemon.batchless_archive_backfill_concurrency as u64 >= u64::from(fusillade_pool_max) {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: batchless archive backfill concurrency ({}) must be below the fusillade pool max_connections ({})",
+                        daemon.batchless_archive_backfill_concurrency, fusillade_pool_max
+                    ),
+                });
+            }
+        }
+        if owns_archive_maintenance && daemon.batchless_archive_backfill_enabled && daemon.batchless_archive_backfill_concurrency == 0 {
+            return Err(Error::Internal {
+                operation: "Config validation: batchless archive backfill concurrency must be at least 1 when the backfill is enabled"
+                    .to_string(),
+            });
+        }
         if owns_archive_maintenance && batchless_policy_configured && daemon.retained_response_partitions_days_ahead <= 0 {
             return Err(Error::Internal {
                 operation: "Config validation: retained-response partition runway must be positive".to_string(),
@@ -3276,6 +3319,13 @@ impl Config {
             }
         }
 
+        // Prefix-chain capture, when on, needs the warehouse connection, tokenizer-svc and a
+        // usable key — every missing piece is a startup error, never a sink that records nothing.
+        if let Err(e) = self.prefix_chain.validate(self.clickhouse.as_ref(), &self.cache.tokenizer_url) {
+            return Err(Error::Internal {
+                operation: format!("Config validation: {e}"),
+            });
+        }
         // A present `clickhouse` section must be usable: a bad endpoint or a missing
         // password is a startup error, not a sink that fails every insert forever.
         if let Some(ch) = &self.clickhouse
@@ -3299,7 +3349,9 @@ impl Config {
         // Cache TTL tiers: every enabled tier must be a known tier (5m/1h/24h), the set must be
         // non-empty, and the default tier must be one of them — otherwise a no-ttl marker would
         // default straight into a rejected tier. Fail fast at startup with a clear message.
-        if self.cache.enabled {
+        // The cache TTL policy is also consumed by prefix-chain capture, which parses with
+        // the same policies whether or not the cache layer is on.
+        if self.cache.enabled || self.prefix_chain.enabled {
             for ttl in &self.cache.enabled_ttls {
                 if crate::prompt_cache::TtlTier::parse(ttl).is_none() {
                     return Err(Error::Internal {
@@ -3584,6 +3636,7 @@ mod tests {
             "batchless_archive_backfill_enabled",
             "batchless_archive_groups_per_tick",
             "batchless_archive_bytes_per_tick",
+            "batchless_archive_backfill_concurrency",
             "retained_response_partitions_days_ahead",
             "retained_response_retirement_enabled",
             "batch_archive_retirement_enabled",
@@ -3602,6 +3655,7 @@ mod tests {
         assert!(daemon.retained_response_partition_maintenance_url.is_none());
         assert!(daemon.batchless_archive_groups_per_tick > 0);
         assert!(daemon.batchless_archive_bytes_per_tick > 0);
+        assert_eq!(daemon.batchless_archive_backfill_concurrency, 1);
         assert!(daemon.retained_response_partitions_days_ahead > 0);
 
         let mapped = daemon.to_fusillade_retention_maintenance_config();
@@ -3613,6 +3667,10 @@ mod tests {
         );
         assert_eq!(mapped.batchless_archive_groups_per_tick(), daemon.batchless_archive_groups_per_tick);
         assert_eq!(mapped.batchless_archive_bytes_per_tick(), daemon.batchless_archive_bytes_per_tick);
+        assert_eq!(
+            mapped.batchless_archive_backfill_concurrency(),
+            daemon.batchless_archive_backfill_concurrency
+        );
         assert_eq!(
             mapped.retained_response_partitions_days_ahead(),
             daemon.retained_response_partitions_days_ahead
@@ -3680,6 +3738,29 @@ mod tests {
         daemon.batchless_archive_backfill_enabled = true;
         daemon.batchless_archive_groups_per_tick = 0;
         assert!(config.validate().unwrap_err().to_string().contains("group and byte budgets"));
+
+        let mut config = Config::default();
+        configure_batchless_retention(&mut config);
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batchless_archive_backfill_concurrency = 0;
+        assert!(config.validate().is_ok(), "a disabled backfill ignores its concurrency");
+        let daemon = &mut config.background_services.batch_daemon;
+        daemon.batchless_archive_backfill_enabled = true;
+        // Keep the shared cancellation grace inside the 120s fixture retention
+        // so the only remaining objection is the concurrency itself.
+        daemon.batch_archive_cancel_grace_secs = 60.0;
+        assert!(config.validate().unwrap_err().to_string().contains("backfill concurrency"));
+        config.background_services.batch_daemon.batchless_archive_backfill_concurrency = 16;
+        assert!(config.validate().is_ok());
+        // A fan-out at or above the fusillade write pool ceiling would starve
+        // the claim loops rather than add throughput.
+        let pool_max = match config.database.fusillade() {
+            ComponentDb::Schema { pool, .. } | ComponentDb::Dedicated { pool, .. } => pool.max_connections,
+        };
+        config.background_services.batch_daemon.batchless_archive_backfill_concurrency = pool_max as usize;
+        assert!(config.validate().unwrap_err().to_string().contains("below the fusillade pool"));
+        config.background_services.batch_daemon.batchless_archive_backfill_concurrency = pool_max as usize - 1;
+        assert!(config.validate().is_ok());
 
         let mut config = Config::default();
         config.background_services.batch_daemon.retained_response_retirement_enabled = true;

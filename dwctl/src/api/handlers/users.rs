@@ -96,12 +96,19 @@ pub async fn list_users<P: PoolProvider>(
     // Check if user has permission to view billing data (Credits ReadAll)
     let can_view_billing = permissions::has_permission(&current_user, Resource::Credits, Operation::ReadAll);
 
-    // If includes billing AND user has permission, create balances_map
-    let balances_map = if includes.contains(&"billing") && can_view_billing {
+    // If includes billing AND user has permission, create balances_map.
+    //
+    // Both billing facts are fetched together so `include=billing` means the
+    // same thing here as it does on the single-user GET - a caller shouldn't
+    // have to know which endpoint it asked to know which fields it gets. Both
+    // are bulk queries over the page's ids, not per-row lookups.
+    let (balances_map, purchased_ids) = if includes.contains(&"billing") && can_view_billing {
         let mut credits_repo = Credits::new(&mut conn);
-        Some(credits_repo.get_users_balances_bulk(&user_ids).await?)
+        let balances = credits_repo.get_users_balances_bulk(&user_ids).await?;
+        let purchased = credits_repo.has_purchased_bulk(&user_ids).await?;
+        (Some(balances), Some(purchased))
     } else {
-        None
+        (None, None)
     };
 
     // If includes groups, make groups_map and user_groups_map
@@ -145,6 +152,10 @@ pub async fn list_users<P: PoolProvider>(
         if let Some(balances_map) = &balances_map {
             let balance = balances_map.get(&response_user.id).and_then(|b| b.to_f64()).unwrap_or(0.0);
             response_user = response_user.with_credit_balance(balance);
+        }
+        if let Some(purchased_ids) = &purchased_ids {
+            let has_purchased = purchased_ids.contains(&response_user.id);
+            response_user = response_user.with_has_purchased(has_purchased);
         }
 
         response_users.push(response_user);
@@ -264,6 +275,11 @@ pub async fn get_user<P: PoolProvider>(
             0.0
         });
         response = response.with_credit_balance(balance);
+        // Ships with the balance rather than behind its own `include`: every
+        // caller that cares (the first-payment-match banner) is already asking
+        // for billing, and the partial purchases index makes it a lookup.
+        let has_purchased = credits_repo.has_purchased(target_user_id).await?;
+        response = response.with_has_purchased(has_purchased);
     }
 
     // Include organizations if requested
@@ -632,10 +648,13 @@ mod tests {
     use crate::api::models::pagination::MAX_LIMIT;
     use crate::api::models::users::Role;
     use crate::db::handlers::{Credits, Groups, Repository};
-    use crate::db::models::{credits::CreditTransactionCreateDBRequest, groups::GroupCreateDBRequest};
+    use crate::db::models::{
+        credits::{CreditTransactionCreateDBRequest, CreditTransactionType},
+        groups::GroupCreateDBRequest,
+    };
     use crate::test::utils::*;
     use rust_decimal::Decimal;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use sqlx::PgPool;
     use std::collections::HashSet;
     use std::str::FromStr;
@@ -1903,6 +1922,119 @@ mod tests {
         let balance: UserResponse = response.json();
         assert_eq!(balance.id, user.id);
         assert_eq!(balance.credit_balance, Some(150.0));
+    }
+
+    /// `has_purchased` is the ledger answer to "has this billing target already
+    /// had its first top-up?", which is what the first-payment-match promotion
+    /// is actually keyed on. It must not be confused with
+    /// `has_payment_provider_id`: an account that verified a card, or merely
+    /// tried to switch on auto top-up, has a provider record and no purchase,
+    /// and is still owed the match.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_billing_include_reports_first_purchase_state(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        // An admin grant (signup credits) gives them a balance but no purchase.
+        create_initial_credit_transaction(&pool, user.id, "1.0").await;
+
+        let headers = add_auth_headers(&user);
+        let before: UserResponse = app
+            .get("/admin/api/v1/users/current?include=billing")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await
+            .json();
+        assert_eq!(before.credit_balance, Some(1.0));
+        assert_eq!(before.has_purchased, Some(false));
+
+        let mut conn = pool.acquire().await.unwrap();
+        Credits::new(&mut conn)
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: Decimal::from_str("30.0").unwrap(),
+                source_id: "sess-1".to_string(),
+                description: None,
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .expect("insert purchase");
+        drop(conn);
+
+        let after: UserResponse = app
+            .get("/admin/api/v1/users/current?include=billing")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await
+            .json();
+        assert_eq!(after.has_purchased, Some(true));
+    }
+
+    /// `include=billing` has to mean the same thing on the list endpoint as it
+    /// does on the single-user one, or callers can't rely on it at all.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_users_billing_include_reports_first_purchase_state(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_user(&pool, Role::PlatformManager).await;
+        let buyer = create_test_user(&pool, Role::StandardUser).await;
+        let non_buyer = create_test_user(&pool, Role::StandardUser).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        Credits::new(&mut conn)
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id: buyer.id,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: Decimal::from_str("30.0").unwrap(),
+                source_id: "sess-1".to_string(),
+                description: None,
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .expect("insert purchase");
+        drop(conn);
+
+        let headers = add_auth_headers(&admin);
+        let response = app
+            .get("/admin/api/v1/users?include=billing&limit=100")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let rows = body["data"].as_array().expect("data array");
+
+        let purchased_for = |id: UserId| -> Option<bool> {
+            rows.iter()
+                .find(|r| r["id"].as_str() == Some(&id.to_string()))
+                .and_then(|r| r["has_purchased"].as_bool())
+        };
+
+        assert_eq!(purchased_for(buyer.id), Some(true));
+        assert_eq!(purchased_for(non_buyer.id), Some(false));
+    }
+
+    /// Absent without `include=billing`, so a caller can tell "not asked for"
+    /// apart from "asked for, and the answer is no".
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_first_purchase_state_is_omitted_without_the_billing_include(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+
+        let response = app
+            .get("/admin/api/v1/users/current")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+
+        response.assert_status_ok();
+        assert_eq!(response.json::<UserResponse>().has_purchased, None);
     }
 
     // Test: GET /users/current/balance works for standard user with billing info
