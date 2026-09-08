@@ -722,10 +722,12 @@ mod pooled_schema_tests {
         fusillade_arsenal::migrator().run(&*pair.direct.write()).await.unwrap();
         // Each migrator must retain its own ledger.
         migrator().run(&pool).await.unwrap();
-        // This operator-built index is deliberately not installed by migrations.
+        // The migrations build this index; the explicit statement stays so the
+        // readiness check below is exercised against the exact definition even
+        // on a database where the concurrent build was interrupted.
         sqlx::query(
             r#"
-            CREATE INDEX idx_requests_batchless_retention_due ON requests (
+            CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due ON requests (
                 service_tier,
                 (CASE state WHEN 'completed' THEN completed_at
                             WHEN 'failed' THEN failed_at
