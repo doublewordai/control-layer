@@ -1,5 +1,17 @@
 # Changelog
 
+## [11.6.0](https://github.com/doublewordai/control-layer/compare/v11.5.2...v11.6.0) (2026-09-08)
+
+
+### Features
+
+* **dwctl:** pooled and direct connection pools per database ([#1565](https://github.com/doublewordai/control-layer/issues/1565)) ([73a2080](https://github.com/doublewordai/control-layer/commit/73a20807dabf0229ca2d41dda8c8630999fd11e6))
+
+
+### Bug Fixes
+
+* soft-delete organization keys on user deletion ([#1488](https://github.com/doublewordai/control-layer/issues/1488)) ([6fc4078](https://github.com/doublewordai/control-layer/commit/6fc4078756fa8308c910eb189497ee56fe50d356))
+
 ## [11.5.2](https://github.com/doublewordai/control-layer/compare/v11.5.1...v11.5.2) (2026-09-08)
 
 
