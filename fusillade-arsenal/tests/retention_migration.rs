@@ -428,7 +428,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
 
     sqlx::query(
         r#"
-        CREATE INDEX idx_requests_batchless_retention_due
+        CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due
         ON requests (service_tier, created_at, id)
         WHERE batch_id IS NULL
           AND state IN ('completed', 'failed', 'canceled')
@@ -453,7 +453,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
 
     sqlx::query(
         r#"
-        CREATE INDEX idx_requests_batchless_retention_due
+        CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due
         ON requests (
             service_tier,
             (CASE state
@@ -742,7 +742,7 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
 
     sqlx::query(
         r#"
-        CREATE INDEX idx_requests_batchless_retention_due
+        CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due
         ON requests (
             service_tier,
             (CASE state
@@ -896,7 +896,13 @@ async fn adds_retained_response_parent_without_rewriting_live_heaps(pool: sqlx::
 async fn preflight_script_verifies_index_partitions_and_journal_state(pool: sqlx::PgPool) {
     let script = include_str!("../../.github/scripts/check-retained-response-indexes.sql");
 
-    // Without the operator-built candidate index the preflight must fail.
+    // The migrations build the candidate index; model a database where it
+    // is missing (an interrupted concurrent build, or a hand-dropped index)
+    // and require the preflight to fail closed.
+    sqlx::query("DROP INDEX idx_requests_batchless_retention_due")
+        .execute(&pool)
+        .await
+        .expect("the migration-built candidate index must exist to be dropped");
     let error = sqlx::raw_sql(script)
         .execute(&pool)
         .await
@@ -910,7 +916,7 @@ async fn preflight_script_verifies_index_partitions_and_journal_state(pool: sqlx
 
     sqlx::raw_sql(
         r#"
-        CREATE INDEX idx_requests_batchless_retention_due
+        CREATE INDEX IF NOT EXISTS idx_requests_batchless_retention_due
         ON requests (
           service_tier,
           (CASE state WHEN 'completed' THEN completed_at

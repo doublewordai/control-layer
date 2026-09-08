@@ -1,0 +1,1 @@
+DROP INDEX IF EXISTS idx_retained_response_objects_kind_object;
