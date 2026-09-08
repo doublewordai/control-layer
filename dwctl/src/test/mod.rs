@@ -1386,8 +1386,6 @@ async fn test_request_logging_disabled(pool: PgPool) {
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(
@@ -2049,8 +2047,6 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(
@@ -2111,8 +2107,6 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        create_batch_job: std::sync::Arc::new(std::sync::OnceLock::new()),
-        cascade_batch_state_job: std::sync::Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = std::sync::Arc::new(
         crate::tasks::TaskRunner::new(
