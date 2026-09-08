@@ -919,7 +919,9 @@ mod tests {
     fn inject_sse_handles_data_prefix_without_space() {
         // `data:{…}` (no space after the colon) is valid SSE and must still be injected.
         let sse = "data:{\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata:[DONE]\n\n";
-        let out = scan_edit_sse(sse.as_bytes(), UsageEdit::Inject(&stats())).rewritten.expect("no-space data: frame is injected");
+        let out = scan_edit_sse(sse.as_bytes(), UsageEdit::Inject(&stats()))
+            .rewritten
+            .expect("no-space data: frame is injected");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cache_read_input_tokens\":1024"), "got: {s}");
     }
@@ -930,7 +932,9 @@ mod tests {
         // deltas and `[DONE]` untouched. (The streaming orchestration — deferred classify resolve
         // + the commit gate — is exercised end-to-end in the layer tests.)
         let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata: [DONE]\n\n";
-        let out = scan_edit_sse(body, UsageEdit::Inject(&stats())).rewritten.expect("usage frame present → edited");
+        let out = scan_edit_sse(body, UsageEdit::Inject(&stats()))
+            .rewritten
+            .expect("usage frame present → edited");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cached_tokens\":1024"), "got: {s}");
         assert!(s.contains("data: [DONE]"), "DONE preserved");
@@ -940,7 +944,10 @@ mod tests {
     #[test]
     fn inject_into_sse_body_none_without_usage() {
         let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
-        assert!(scan_edit_sse(body, UsageEdit::Inject(&stats())).rewritten.is_none(), "no usage frame → nothing to edit");
+        assert!(
+            scan_edit_sse(body, UsageEdit::Inject(&stats())).rewritten.is_none(),
+            "no usage frame → nothing to edit"
+        );
     }
 
     #[tokio::test]
@@ -1032,7 +1039,9 @@ mod tests {
     #[test]
     fn scrub_sse_zeroes_cached_tokens_in_terminal_frame() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":985,\"prompt_tokens_details\":{\"cached_tokens\":687}}}\n\ndata: [DONE]\n\n";
-        let out = scan_edit_sse(sse.as_bytes(), UsageEdit::Scrub).rewritten.expect("dirty usage frame → rewritten");
+        let out = scan_edit_sse(sse.as_bytes(), UsageEdit::Scrub)
+            .rewritten
+            .expect("dirty usage frame → rewritten");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cached_tokens\":0"), "got: {s}");
         assert!(!s.contains("687"), "provider value gone, got: {s}");
