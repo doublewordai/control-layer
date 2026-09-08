@@ -155,7 +155,7 @@ pub struct LeakStamp {
     /// row's `service_tier` defaulting to `'default'`).
     pub window_class: String,
     /// The request's completion-window length in seconds (`W`), retained for
-    /// library callers using the legacy `leaks_per_window` policy.
+    /// async/flex claims using the `leaks_per_window` policy.
     pub window_secs: f64,
 }
 

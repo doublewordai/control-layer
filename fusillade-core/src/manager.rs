@@ -1353,8 +1353,8 @@ pub trait Storage: Send + Sync {
         leak_cooldown: &std::collections::HashSet<(String, String, String)>,
     ) -> Result<Vec<Request<Claimed>>>;
 
-    /// Claim batch rows with no cooldown supplied. Daemons should use
-    /// [`Storage::claim_batch_requests_with_cooldown`] to enforce leak intervals.
+    /// Claim batch rows using the live-model gate and deadline ramp, without leaking.
+    /// To opt into leaking, use [`Storage::claim_batch_requests_with_cooldown`].
     async fn claim_batch_requests(
         &self,
         limit: usize,
@@ -1384,7 +1384,9 @@ pub trait Storage: Send + Sync {
     /// rows. Unavailable models outside their deadline ramp may leak one row
     /// per bucket absent from `leak_cooldown`. Leaked rows must carry a stamp.
     ///
-    /// The default preserves compatibility with existing storage backends.
+    /// The default delegates to the non-leaking batch claim method and ignores
+    /// cooldowns. Existing backends retain their behavior; implement this method
+    /// to opt into leaking and enforce the supplied cooldowns.
     async fn claim_batch_requests_with_cooldown(
         &self,
         limit: usize,

@@ -645,8 +645,11 @@ background_services:
     # batch_claim_interval_ms: 0     # Batch-claim loop cadence; 0 = inherit claim_interval_ms
     # batch_claim_require_live: false # Require `live` for full-rate batch claims outside the deadline ramp;
     #                                 # false treats no-event models (external providers) as live
-    # Batch and async requests on unavailable models each get one immediate claim,
+    # Batches on unavailable models get one immediate claim,
     # then one per interval, per user/model/window. Positive whole seconds only.
+    # False restores the batch live gate; deadline-ramp claims still proceed.
+    # Async/flex keeps its window-based rate (24min default tier, 60s flex).
+    leak_enabled: true
     leak_interval_seconds: 60
     model_leak_interval_seconds: {} # Exact model aliases; e.g. {"some-large-model": 10}
     # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live work bypasses the leak interval within

@@ -1966,7 +1966,7 @@ pub struct DaemonConfig {
     #[serde(default = "default_claim_ramp_exponent", deserialize_with = "deserialize_claim_ramp_exponent")]
     pub claim_ramp_exponent: f64,
 
-    /// Fixed leak interval and per-model overrides, shared by batch and async policy.
+    /// Batch-only leaking controls. Async/flex retains its existing window-based rate.
     #[serde(flatten)]
     pub leak: fusillade::daemon::LeakConfig,
 
@@ -5025,6 +5025,7 @@ background_services:
                 validate: false,
             };
             let config = Config::load(&args)?;
+            assert!(config.background_services.batch_daemon.leak.leak_enabled);
             assert_eq!(config.background_services.batch_daemon.leak.leak_interval_seconds.get(), 60);
             jail.create_file(
                 "test.yaml",
@@ -5032,19 +5033,23 @@ background_services:
 secret_key: test-secret-key
 background_services:
   batch_daemon:
+    leak_enabled: false
     leak_interval_seconds: 30
     model_leak_interval_seconds:
       large/model: 10
 "#,
             )?;
             let config = Config::load(&args)?;
+            assert!(!config.background_services.batch_daemon.leak.leak_enabled);
             assert_eq!(config.background_services.batch_daemon.leak.leak_interval_seconds.get(), 30);
             assert_eq!(
                 config.background_services.batch_daemon.leak.model_leak_interval_seconds["large/model"].get(),
                 10
             );
+            jail.set_env("DWCTL_BACKGROUND_SERVICES__BATCH_DAEMON__LEAK_ENABLED", "true");
             jail.set_env("DWCTL_BACKGROUND_SERVICES__BATCH_DAEMON__LEAK_INTERVAL_SECONDS", "15");
             let config = Config::load(&args)?;
+            assert!(config.background_services.batch_daemon.leak.leak_enabled);
             assert_eq!(config.background_services.batch_daemon.leak.leak_interval_seconds.get(), 15);
             Ok(())
         });

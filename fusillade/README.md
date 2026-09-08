@@ -490,7 +490,7 @@ The daemon can run two foreground claim loops and two independent background
 claim loops:
 
 - **Request daemon** — claims *batchless* pending rows (flex/async responses).
-  Shares the leaky-bucket and deadline-ramp policy with batch claims: rows for
+  Uses a leaky bucket and deadline ramp: rows for
   models that are not live trickle out at a bounded rate per `(user, window, model)`.
 - **Batch daemon** — claims rows belonging to batches. It first selects the
   top-ranked batches per capacity-eligible model (fairness + deadline
@@ -508,15 +508,20 @@ Batch claiming is gated on model liveness via the `model_filters` event log:
 models whose latest event is `live` are always claimable; models with **no**
 events (external / always-on providers not managed by a controller) are
 claimable at full concurrency unless `batch_claim_require_live` is set (then
-those models also trickle). Models explicitly
+those models require the same opt-in to trickle). With batch leaking enabled, models explicitly
 `coming`/`absent`/`leaving` trickle one row per bucket per leak interval. The
 **deadline ramp** bypasses that interval — within
 `window_minutes ^ claim_ramp_exponent` minutes of the batch deadline, rows are
 claimed at full capacity regardless of liveness so they can overflow to
-fallback providers rather than miss their window.
+fallback providers rather than miss their window. Full claims take priority over
+trickle rows at every batch, model-capacity and total-claim limit.
 
 dwctl sets `background_services.batch_daemon.leak_interval_seconds` to **60**
-by default for both 1h and 24h windows. `model_leak_interval_seconds` maps exact
+by default for both 1h and 24h **batch** windows. Set
+`background_services.batch_daemon.leak_enabled: false` to disable batch leaking
+completely, including the initial claim after restart. The live gate and deadline
+ramp still apply. Async/flex retains `leaks_per_window = 60`: one claim per
+24 minutes for default-tier rows and per minute for flex rows. `model_leak_interval_seconds` maps exact
 model aliases to positive whole-second overrides. The first row is eligible
 immediately; there is no accumulated burst allowance. Live/unmanaged models and
 rows inside the deadline ramp still claim at normal concurrency. Explicit
@@ -525,9 +530,12 @@ rows inside the deadline ramp still claim at normal concurrency. Explicit
 The cooldown is process-local, as before: separate daemon processes have
 separate allowances and restarting a daemon resets its cooldown. This is a
 claim throttle, not a global external-provider spending cap or a guarantee of
-successful completions. Library callers can opt into fixed intervals with
-`with_leak_config(LeakConfig::default())`; otherwise their existing
-`DaemonConfig::leaks_per_window` setting remains in effect.
+successful completions. Library callers opt into batch leaking with
+`with_leak_config(LeakConfig::default())`; otherwise batches retain the non-leaking
+live gate. The existing storage method `claim_batch_requests` also remains
+non-leaking. Custom backends must implement `claim_batch_requests_with_cooldown`
+to support leaking; its default delegates to their existing non-leaking method.
+`fusillade_leaky_bucket_leaks_total` labels each leak with `daemon` and `model`.
 
 Configuration (all optional):
 

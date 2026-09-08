@@ -127,7 +127,7 @@ where
         self
     }
 
-    /// Set fixed leak intervals for batch and async claims.
+    /// Opt into configurable batch leaking; async/flex rates are unchanged.
     pub fn with_leak_config(mut self, config: LeakConfig) -> Self {
         self.leak_config = Some(config);
         self

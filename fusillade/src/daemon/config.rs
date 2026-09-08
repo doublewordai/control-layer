@@ -7,11 +7,14 @@ use std::time::Duration;
 
 use crate::http::HttpResponse;
 
-/// Fixed leak intervals for queued batch and async work on unavailable models.
+/// Optional leaking for queued batches on unavailable models.
+/// Async/flex claims retain `DaemonConfig::leaks_per_window`.
 /// Kept separate from `DaemonConfig` to preserve downstream struct literals.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct LeakConfig {
+    /// Enable batch leaking outside the deadline ramp. False restores the live gate.
+    pub leak_enabled: bool,
     /// Seconds between claims per user/model/window. Must be positive.
     pub leak_interval_seconds: NonZeroU32,
     /// Exact model aliases overriding the default interval.
@@ -21,6 +24,7 @@ pub struct LeakConfig {
 impl Default for LeakConfig {
     fn default() -> Self {
         Self {
+            leak_enabled: true,
             leak_interval_seconds: NonZeroU32::new(60).unwrap(),
             model_leak_interval_seconds: HashMap::new(),
         }
