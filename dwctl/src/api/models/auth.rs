@@ -99,7 +99,7 @@ impl IntoResponse for LoginResponse {
 pub struct LogoutResponse {
     pub auth_response: AuthSuccessResponse,
     pub cookie: String,
-    /// Additional cookies to clear (e.g. dw_active_org)
+    /// Additional cookies to clear (e.g. the org cookie)
     pub extra_cookies: Vec<String>,
 }
 

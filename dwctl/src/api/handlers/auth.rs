@@ -374,8 +374,8 @@ pub async fn logout<P: PoolProvider>(State(state): State<AppState<P>>) -> Result
 
     // Also clear the active organization cookie
     let org_cookie = format!(
-        "dw_active_org=; Path=/; HttpOnly{}{}; SameSite={}; Max-Age=0",
-        secure, domain, session_config.cookie_same_site
+        "{}=; Path=/; HttpOnly{}{}; SameSite={}; Max-Age=0",
+        session_config.org_cookie_name, secure, domain, session_config.cookie_same_site
     );
 
     let auth_response = AuthSuccessResponse {

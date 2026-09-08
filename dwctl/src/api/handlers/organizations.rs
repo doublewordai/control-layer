@@ -2010,7 +2010,8 @@ pub async fn create_user_join_request<P: PoolProvider>(
 
 /// Validate and confirm an active organization context.
 ///
-/// Sets a `dw_active_org` cookie so the browser sends it automatically with all
+/// Sets the org cookie (`auth.native.session.org_cookie_name`, default
+/// `dw_active_org`) so the browser sends it automatically with all
 /// subsequent requests.  CLI tools can still use the `X-Organization-Id` header.
 #[utoipa::path(
     post,
@@ -2049,7 +2050,7 @@ pub async fn set_active_organization<P: PoolProvider>(
         }
     }
 
-    // Build the dw_active_org cookie using the same security settings as the session cookie
+    // Build the org cookie using the same security settings as the session cookie
     let config = state.current_config();
     let session_config = &config.auth.native.session;
     let secure = if session_config.cookie_secure { "; Secure" } else { "" };
@@ -2058,10 +2059,12 @@ pub async fn set_active_organization<P: PoolProvider>(
         .as_ref()
         .map(|d| format!("; Domain={d}"))
         .unwrap_or_default();
+    let org_cookie_name = &session_config.org_cookie_name;
     let cookie = if let Some(org_id) = data.organization_id {
         // Set cookie with long max-age (30 days) — cleared explicitly when switching back
         format!(
-            "dw_active_org={}; Path=/; HttpOnly{}{}; SameSite={}; Max-Age={}",
+            "{}={}; Path=/; HttpOnly{}{}; SameSite={}; Max-Age={}",
+            org_cookie_name,
             org_id,
             secure,
             domain,
@@ -2071,8 +2074,8 @@ pub async fn set_active_organization<P: PoolProvider>(
     } else {
         // Clear cookie
         format!(
-            "dw_active_org=; Path=/; HttpOnly{}{}; SameSite={}; Max-Age=0",
-            secure, domain, session_config.cookie_same_site
+            "{}=; Path=/; HttpOnly{}{}; SameSite={}; Max-Age=0",
+            org_cookie_name, secure, domain, session_config.cookie_same_site
         )
     };
 
