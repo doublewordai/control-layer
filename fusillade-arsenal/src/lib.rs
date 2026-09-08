@@ -15,7 +15,9 @@ pub use fusillade_core::manager::{
     RetainedResponseWriteError, RetentionPolicy, Storage,
 };
 pub use fusillade_core::request::AnyRequest;
-pub use postgres::{BatchInsertStrategy, PoolProvider, PostgresRequestManager, TestDbPools};
+pub use postgres::{
+    BatchInsertStrategy, DynPools, PoolHandle, PoolProvider, PostgresRequestManager, TestDbPools,
+};
 pub use transform::ResponseTransformer;
 
 pub mod batch {

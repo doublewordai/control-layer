@@ -14,7 +14,6 @@
 
 use chrono::{DateTime, Utc};
 use outlet::{RequestData, RequestHandler, ResponseData};
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::writer::{RawCompletedRequest, RequestsWriterSender};
@@ -30,12 +29,16 @@ use crate::inference::store::{ONWARDS_RESPONSE_ID_HEADER, lookup_created_by};
 #[derive(Clone)]
 pub struct FusilladeOutletHandler {
     sender: RequestsWriterSender,
-    dwctl_pool: PgPool,
+    /// Live provider (not a pinned pool): survives runtime pool swaps.
+    dwctl_pool: sqlx_pool_router::DynPools,
 }
 
 impl FusilladeOutletHandler {
-    pub fn new(sender: RequestsWriterSender, dwctl_pool: PgPool) -> Self {
-        Self { sender, dwctl_pool }
+    pub fn new(sender: RequestsWriterSender, dwctl_pool: impl sqlx_pool_router::PoolProvider) -> Self {
+        Self {
+            sender,
+            dwctl_pool: sqlx_pool_router::DynPools::new(dwctl_pool),
+        }
     }
 
     /// Extract the onwards response ID from request headers, if present.
@@ -139,7 +142,7 @@ impl FusilladeOutletHandler {
                 return None;
             }
         };
-        let created_by = lookup_created_by(&self.dwctl_pool, Some(&api_key)).await;
+        let created_by = lookup_created_by(&self.dwctl_pool.write(), Some(&api_key)).await;
         match created_by {
             Some(uid) if !uid.is_empty() => Some((api_key, uid)),
             _ => {

@@ -55,13 +55,13 @@ struct WriteSignalingPools {
 }
 
 impl PoolProvider for WriteSignalingPools {
-    fn read(&self) -> &PgPool {
-        &self.read
+    fn read(&self) -> sqlx_pool_router::PoolHandle {
+        self.read.clone().into()
     }
 
-    fn write(&self) -> &PgPool {
+    fn write(&self) -> sqlx_pool_router::PoolHandle {
         self.write_requested.store(true, Ordering::Release);
-        &self.write
+        self.write.clone().into()
     }
 }
 

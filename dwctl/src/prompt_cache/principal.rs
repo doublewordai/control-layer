@@ -16,7 +16,6 @@
 use std::time::Duration;
 
 use moka::future::Cache;
-use sqlx::PgPool;
 
 use crate::db::handlers::api_keys::ApiKeys;
 use crate::types::UserId;
@@ -28,25 +27,29 @@ use super::metrics as cache_metrics;
 /// over a DB read-through.
 #[derive(Clone)]
 pub struct PrincipalResolver {
-    pool: PgPool,
+    /// Live provider (not a pinned pool): survives runtime pool swaps.
+    pool: sqlx_pool_router::DynPools,
     l1: Cache<String, Option<UserId>>,
 }
 
 impl PrincipalResolver {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: impl sqlx_pool_router::PoolProvider) -> Self {
         // 100k entries ≈ a few MB (String key + Option<Uuid>) — comfortably covers the
         // active-key working set of a busy tenant; cold keys evict + take one DB miss on
         // next use (cheap, indexed point lookup). Bump via `with_capacity` if churn warrants.
         Self::with_capacity(pool, 100_000)
     }
 
-    pub fn with_capacity(pool: PgPool, max_entries: u64) -> Self {
+    pub fn with_capacity(pool: impl sqlx_pool_router::PoolProvider, max_entries: u64) -> Self {
         let l1 = Cache::builder()
             .max_capacity(max_entries)
             // Hygiene only — the mapping is immutable, so correctness doesn't need it.
             .time_to_live(Duration::from_secs(3600))
             .build();
-        Self { pool, l1 }
+        Self {
+            pool: sqlx_pool_router::DynPools::new(pool),
+            l1,
+        }
     }
 
     /// Resolve a validated bearer token to its billing principal. `None` => the token
@@ -66,7 +69,7 @@ impl PrincipalResolver {
             cache_metrics::record_principal_resolve(if cached.is_some() { "hit" } else { "unknown_key" });
             return Ok(cached);
         }
-        let mut conn = self.pool.acquire().await?;
+        let mut conn = self.pool.write().acquire().await?;
         let user_id = ApiKeys::new(&mut conn).get_user_id_by_secret(token).await?;
         cache_metrics::record_principal_resolve(if user_id.is_some() { "miss" } else { "unknown_key" });
         self.l1.insert(token.to_string(), user_id).await;
@@ -81,7 +84,7 @@ mod tests {
     use crate::test::utils::{create_test_api_key_for_user, create_test_user};
 
     #[sqlx::test]
-    async fn resolves_validated_key_to_user(pool: PgPool) {
+    async fn resolves_validated_key_to_user(pool: sqlx::PgPool) {
         let user = create_test_user(&pool, Role::StandardUser).await;
         let key = create_test_api_key_for_user(&pool, user.id).await;
 
@@ -92,7 +95,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn unknown_token_resolves_none(pool: PgPool) {
+    async fn unknown_token_resolves_none(pool: sqlx::PgPool) {
         let resolver = PrincipalResolver::new(pool);
         assert_eq!(resolver.resolve("not-a-real-secret").await.unwrap(), None);
     }

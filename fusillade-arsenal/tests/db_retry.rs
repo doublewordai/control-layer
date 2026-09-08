@@ -19,12 +19,12 @@ use uuid::Uuid;
 struct LazyPools(PgPool);
 
 impl PoolProvider for LazyPools {
-    fn read(&self) -> &PgPool {
-        &self.0
+    fn read(&self) -> sqlx_pool_router::PoolHandle {
+        self.0.clone().into()
     }
 
-    fn write(&self) -> &PgPool {
-        &self.0
+    fn write(&self) -> sqlx_pool_router::PoolHandle {
+        self.0.clone().into()
     }
 }
 

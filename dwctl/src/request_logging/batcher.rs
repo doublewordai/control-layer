@@ -46,7 +46,6 @@ use chrono::{DateTime, Utc};
 use metrics::{counter, histogram};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
@@ -218,7 +217,8 @@ pub struct AnalyticsBatcher<M = crate::metrics::GenAiMetrics>
 where
     M: MetricsRecorder + Clone + Send + Sync + 'static,
 {
-    pool: PgPool,
+    /// Live provider (not a pinned pool): survives runtime pool swaps.
+    pool: sqlx_pool_router::DynPools,
     metrics_recorder: Option<M>,
     receiver: mpsc::Receiver<RawAnalyticsRecord>,
     batch_size: usize,
@@ -246,7 +246,8 @@ where
     ///
     /// A tuple of (batcher, sender) where the sender is used by AnalyticsHandler
     /// to submit records.
-    pub fn new(pool: PgPool, config: Config, metrics_recorder: Option<M>) -> (Self, AnalyticsSender) {
+    pub fn new(pool: impl sqlx_pool_router::PoolProvider, config: Config, metrics_recorder: Option<M>) -> (Self, AnalyticsSender) {
+        let pool = sqlx_pool_router::DynPools::new(pool);
         let (sender, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
         let batch_size = config.analytics.batch_size;
@@ -747,7 +748,7 @@ where
     #[tracing::instrument(skip_all)]
     async fn batch_lookup_cache_tariffs(&self, aliases: &[&str]) -> Result<HashMap<String, Vec<CacheTariffRow>>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
-        let map = crate::pricing::lookup_cache_tariffs(&self.pool, &aliases_vec).await?;
+        let map = crate::pricing::lookup_cache_tariffs(&self.pool.write(), &aliases_vec).await?;
         trace!(count = map.len(), "Batch lookup cache tariffs completed");
         Ok(map)
     }
@@ -755,7 +756,7 @@ where
     /// Write enriched records to the database in a single transaction.
     #[tracing::instrument(skip_all)]
     async fn write_batch_transactional(&self, records: &[EnrichedRecord]) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.write().begin().await?;
 
         // Phase 1: Batch INSERT http_analytics
         let (analytics_ids, newly_inserted) = self.batch_insert_analytics(&mut tx, records).await?;
@@ -1883,10 +1884,9 @@ mod integration_tests {
     use crate::db::models::credits::CreditTransactionType;
     use crate::test::utils::create_test_user;
     use rust_decimal::prelude::FromStr;
-    use sqlx::PgPool;
 
     /// Helper: Create a test model with endpoint
-    async fn create_test_model(pool: &PgPool, model_name: &str) -> crate::types::DeploymentId {
+    async fn create_test_model(pool: &sqlx::PgPool, model_name: &str) -> crate::types::DeploymentId {
         use crate::db::handlers::{Deployments, InferenceEndpoints};
         use crate::db::models::{deployments::DeploymentCreateDBRequest, inference_endpoints::InferenceEndpointCreateDBRequest};
         use std::str::FromStr as _;
@@ -1959,7 +1959,7 @@ mod integration_tests {
     /// Helper: Setup a tariff for a model
     /// Note: Batch tariffs require a completion_window per database constraint
     async fn setup_tariff(
-        pool: &PgPool,
+        pool: &sqlx::PgPool,
         deployed_model_id: crate::types::DeploymentId,
         input_price: Decimal,
         output_price: Decimal,
@@ -1993,7 +1993,7 @@ mod integration_tests {
     }
 
     /// Helper: Create a user with initial balance
-    async fn setup_user_with_balance(pool: &PgPool, balance: Decimal) -> Uuid {
+    async fn setup_user_with_balance(pool: &sqlx::PgPool, balance: Decimal) -> Uuid {
         use crate::db::handlers::credits::Credits;
         use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 
@@ -2020,7 +2020,7 @@ mod integration_tests {
     }
 
     /// Helper: Create an API key for a user
-    async fn create_api_key_for_user(pool: &PgPool, user_id: Uuid, purpose: ApiKeyPurpose) -> String {
+    async fn create_api_key_for_user(pool: &sqlx::PgPool, user_id: Uuid, purpose: ApiKeyPurpose) -> String {
         use crate::db::handlers::api_keys::ApiKeys;
         use crate::db::models::api_keys::ApiKeyCreateDBRequest;
 
@@ -2085,7 +2085,7 @@ mod integration_tests {
     }
 
     /// Run the batcher with given records and wait for completion
-    async fn run_batcher_with_records(pool: &PgPool, records: Vec<RawAnalyticsRecord>) {
+    async fn run_batcher_with_records(pool: &sqlx::PgPool, records: Vec<RawAnalyticsRecord>) {
         let config = crate::test::utils::create_test_config();
         let (batcher, sender) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
 
@@ -2104,7 +2104,7 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_credit_deduction_successful(pool: PgPool) {
+    async fn test_batcher_credit_deduction_successful(pool: sqlx::PgPool) {
         // Setup: Create model with tariff
         let model_id = create_test_model(&pool, "gpt-4-test").await;
         let input_price = Decimal::from_str("0.00001").unwrap();
@@ -2144,7 +2144,7 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_cache_discount_applied(pool: PgPool) {
+    async fn test_batcher_cache_discount_applied(pool: sqlx::PgPool) {
         // Model with a base tariff + a cache tariff (presence = enabled): 1h write ×2.0,
         // read ×0.1. The other tiers are set but unused by this request.
         let model_id = create_test_model(&pool, "cache-bill-test").await;
@@ -2206,7 +2206,7 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_different_tariffs_for_batch_and_realtime(pool: PgPool) {
+    async fn test_batcher_different_tariffs_for_batch_and_realtime(pool: sqlx::PgPool) {
         // Setup: Create model with different tariffs for batch and realtime
         let model_id = create_test_model(&pool, "gpt-4-turbo-test").await;
 
@@ -2277,7 +2277,7 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_folds_batch_analytics_into_aggregates(pool: PgPool) {
+    async fn test_batcher_folds_batch_analytics_into_aggregates(pool: sqlx::PgPool) {
         // Three requests of one batch fold their tokens / latency / list-cost into
         // batch_aggregates (COR-524), so get_batch_analytics can read the row instead of
         // scanning http_analytics. The third is on an UNPRICED model (free): it is not billed
@@ -2360,7 +2360,7 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_denormalizes_fusillade_request_id_onto_credits(pool: PgPool) {
+    async fn test_batcher_denormalizes_fusillade_request_id_onto_credits(pool: sqlx::PgPool) {
         // A batched request's credit row carries its fusillade_request_id (migration 120), so the
         // responses view can read per-request cost off the ledger durably instead of joining
         // http_analytics (COR-524 follow-up / Usage E).
@@ -2399,7 +2399,7 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_fallback_to_realtime_when_batch_tariff_missing(pool: PgPool) {
+    async fn test_batcher_fallback_to_realtime_when_batch_tariff_missing(pool: sqlx::PgPool) {
         // Setup: Create model with ONLY realtime tariff
         let model_id = create_test_model(&pool, "gpt-4-fallback-test").await;
         let realtime_input = Decimal::from_str("0.00015").unwrap();
@@ -2433,7 +2433,7 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_skip_deduction_when_no_pricing(pool: PgPool) {
+    async fn test_batcher_skip_deduction_when_no_pricing(pool: sqlx::PgPool) {
         // Setup: Create model WITHOUT any tariff
         let _model_id = create_test_model(&pool, "gpt-4-no-tariff").await;
 
@@ -2476,7 +2476,7 @@ mod integration_tests {
     /// reads.
     #[sqlx::test]
     #[test_log::test]
-    async fn batcher_persists_the_user_agent_to_http_analytics(pool: PgPool) {
+    async fn batcher_persists_the_user_agent_to_http_analytics(pool: sqlx::PgPool) {
         create_test_model(&pool, "ua-persist-test").await;
 
         let mut record = create_raw_record("ua-persist-test", None, 10, 5);
@@ -2500,7 +2500,7 @@ mod integration_tests {
     /// any duration computed from it then reads as decades of queue delay.
     #[sqlx::test]
     #[test_log::test]
-    async fn batcher_persists_the_submitted_at_to_http_analytics(pool: PgPool) {
+    async fn batcher_persists_the_submitted_at_to_http_analytics(pool: sqlx::PgPool) {
         create_test_model(&pool, "submitted-at-test").await;
 
         let submitted = Utc::now() - chrono::Duration::minutes(90);
@@ -2526,7 +2526,7 @@ mod integration_tests {
     /// "no submitted_at" is how a consumer tells deferred work from immediate.
     #[sqlx::test]
     #[test_log::test]
-    async fn realtime_rows_have_no_submitted_at(pool: PgPool) {
+    async fn realtime_rows_have_no_submitted_at(pool: sqlx::PgPool) {
         create_test_model(&pool, "realtime-no-submit").await;
 
         let record = create_raw_record("realtime-no-submit", None, 10, 5);
@@ -2543,7 +2543,7 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_skip_deduction_for_unauthenticated_requests(pool: PgPool) {
+    async fn test_batcher_skip_deduction_for_unauthenticated_requests(pool: sqlx::PgPool) {
         // Setup: Create model with tariff
         let model_id = create_test_model(&pool, "gpt-4-unauth-test").await;
         setup_tariff(
@@ -2579,7 +2579,7 @@ mod integration_tests {
     /// Test that the batcher sends pg_notify when a user's balance is depleted (crosses zero downward)
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_balance_depleted_notification(pool: PgPool) {
+    async fn test_batcher_balance_depleted_notification(pool: sqlx::PgPool) {
         use sqlx::postgres::PgListener;
         use std::time::Duration;
         use tokio::time::timeout;
@@ -2661,7 +2661,7 @@ mod integration_tests {
     /// (edge-triggered), and further over-cap flushes fold silently.
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_folds_cap_scope_and_notifies_on_crossing(pool: PgPool) {
+    async fn test_batcher_folds_cap_scope_and_notifies_on_crossing(pool: sqlx::PgPool) {
         use crate::db::handlers::api_keys::ApiKeys;
         use sqlx::postgres::PgListener;
         use std::time::Duration;
@@ -2753,7 +2753,7 @@ mod integration_tests {
     /// crossing NOTIFY when the fresh window is under the cap.
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_cap_window_rollover(pool: PgPool) {
+    async fn test_batcher_cap_window_rollover(pool: sqlx::PgPool) {
         use sqlx::postgres::PgListener;
         use std::time::Duration;
         use tokio::time::timeout;
@@ -2827,7 +2827,7 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_flush_emits_single_notification_for_multiple_depletions(pool: PgPool) {
+    async fn test_flush_emits_single_notification_for_multiple_depletions(pool: sqlx::PgPool) {
         use sqlx::postgres::PgListener;
         use std::time::Duration;
         use tokio::time::timeout;
