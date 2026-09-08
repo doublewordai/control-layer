@@ -643,9 +643,16 @@ background_services:
     # batch_claim_size: 0            # Max rows per batch-claim iteration; 0 = inherit claim_batch_size
     # batch_claim_batch_size: 4      # Max batches selected per model per iteration (spill-over pool)
     # batch_claim_interval_ms: 0     # Batch-claim loop cadence; 0 = inherit claim_interval_ms
-    # batch_claim_require_live: false # Require an explicit `live` model_filters event to batch-claim;
+    # batch_claim_require_live: false # Require `live` for full-rate batch claims outside the deadline ramp;
     #                                 # false treats no-event models (external providers) as live
-    # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live batches become claimable within
+    # Batches on unavailable models get one immediate claim,
+    # then one per interval, per user/model/window. Positive whole seconds only.
+    # False restores the batch live gate; deadline-ramp claims still proceed.
+    # Async/flex keeps its window-based rate (24min default tier, 60s flex).
+    leak_enabled: true
+    leak_interval_seconds: 60
+    model_leak_interval_seconds: {} # Exact model aliases; e.g. {"some-large-model": 10}
+    # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live work bypasses the leak interval within
     #                                 # window_minutes^exponent minutes of deadline (~59m/24h, ~10m/1h)
     # background_concurrency_limit: 0 # Per-model foreground in-flight threshold below which
     #                                 # background workers may send; background work does not
