@@ -44,6 +44,174 @@ async fn mark_models_live_for_test(manager: &PostgresStore<TestDbPools>, models:
     manager.append_model_filter_events(&filters).await.unwrap();
 }
 
+async fn seed_leak_work(store: &TestStore) {
+    for model in ["large", "slow"] {
+        store
+            .append_model_filter_events(&[ModelFilter {
+                model: model.into(),
+                state: ModelFilterState::Absent,
+                expected_ready_at: None,
+            }])
+            .await
+            .unwrap();
+        let file = store
+            .create_file(
+                "tiny".into(),
+                Some("alice".into()),
+                (0..3)
+                    .map(|n| RequestTemplateInput {
+                        custom_id: Some(n.to_string()),
+                        endpoint: "https://api.example.com".into(),
+                        method: "POST".into(),
+                        path: "/test".into(),
+                        body: "{}".into(),
+                        model: model.into(),
+                        api_key: "key".into(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        store
+            .create_batch(BatchInput {
+                file_id: file,
+                endpoint: "/v1/chat/completions".into(),
+                completion_window: "24h".into(),
+                metadata: None,
+                created_by: Some("alice".into()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+    }
+    for _ in 0..1 {
+        store
+            .create_flex(CreateFlexInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: "{}".into(),
+                model: "large".into(),
+                endpoint: "https://api.example.com".into(),
+                method: "POST".into(),
+                path: "/test".into(),
+                api_key: "key".into(),
+                created_by: "alice".into(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+    }
+}
+
+/// Batch tokens must refill after actual dispatch while async still progresses.
+/// A 24h batch uses the fixed interval, not the legacy 24-minute refill.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn batch_fixed_leak_interval_eventually_refills(pool: sqlx::PgPool) {
+    let config = DaemonConfig {
+        claim_interval_ms: 10,
+        model_concurrency_limits: Arc::new(dashmap::DashMap::from_iter([
+            ("large".to_string(), 10),
+            ("slow".to_string(), 10),
+        ])),
+        ..Default::default()
+    };
+    let store = postgres_store(pool, &config).await;
+    seed_leak_work(&store).await;
+    let client = Arc::new(MockHttpClient::new());
+    for _ in 0..7 {
+        client.add_response(
+            "POST /test",
+            Ok(HttpResponse {
+                status: 200,
+                body: "{}".into(),
+            }),
+        );
+    }
+
+    let shutdown = CancellationToken::new();
+    let daemon = Arc::new(
+        PostgresDaemon::new(store, client.clone(), config).with_leak_config(
+            fusillade::daemon::LeakConfig {
+                // The slow model keeps the default, while large refills quickly.
+                model_leak_interval_seconds: std::collections::HashMap::from([(
+                    "large".into(),
+                    std::num::NonZeroU32::new(1).unwrap(),
+                )]),
+                ..Default::default()
+            },
+        ),
+    );
+    let handle = daemon.clone().run(shutdown.clone()).unwrap();
+    // SQL tests prove the no-burst and cooldown gates. Here only require
+    // eventual dispatch/refill, without assertions on scheduler timing.
+    let progressed = tokio::time::timeout(Duration::from_secs(30), async {
+        while client.call_count() < 5 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
+    progressed.expect("batch workloads failed to refill and dispatch");
+}
+
+/// Disabling batch leaking (or never opting in) must survive a fresh daemon
+/// while async leaks and live batch claims continue to dispatch.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn batch_leak_disabled_preserves_async_and_live_claims(pool: sqlx::PgPool) {
+    let config = DaemonConfig {
+        claim_interval_ms: 10,
+        model_concurrency_limits: Arc::new(dashmap::DashMap::from_iter([
+            ("large".to_string(), 10),
+            ("slow".to_string(), 10),
+        ])),
+        ..Default::default()
+    };
+    let store = postgres_store(pool.clone(), &config).await;
+    for (iteration, explicit_disable) in [true, false].into_iter().enumerate() {
+        seed_leak_work(&store).await;
+        mark_models_live_for_test(&store, &["slow"]).await;
+        let client = Arc::new(MockHttpClient::new());
+        for _ in 0..10 {
+            client.add_response(
+                "POST /test",
+                Ok(HttpResponse {
+                    status: 200,
+                    body: "{}".into(),
+                }),
+            );
+        }
+        let mut daemon = PostgresDaemon::new(store.clone(), client.clone(), config.clone());
+        if explicit_disable {
+            daemon = daemon.with_leak_config(fusillade::daemon::LeakConfig {
+                leak_enabled: false,
+                ..Default::default()
+            });
+        }
+        let shutdown = CancellationToken::new();
+        let handle = Arc::new(daemon).run(shutdown.clone()).unwrap();
+        // Three live batch rows and one unavailable async row prove both loops ran.
+        let progressed = tokio::time::timeout(Duration::from_secs(30), async {
+            while client.call_count() < 4 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        shutdown.cancel();
+        handle.await.unwrap().unwrap();
+        progressed.expect("live batch and async claims must still dispatch");
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM requests WHERE model = 'large' AND batch_id IS NOT NULL AND state = 'pending'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            pending,
+            3 * (iteration as i64 + 1),
+            "disabled batch leaking must not consume an initial token"
+        );
+    }
+}
+
 fn retry_backoff_ms(config: &DaemonConfig, retry_attempt: u32) -> i64 {
     config
         .backoff_ms
