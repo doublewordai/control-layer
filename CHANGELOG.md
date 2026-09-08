@@ -1,5 +1,13 @@
 # Changelog
 
+## [11.5.1](https://github.com/doublewordai/control-layer/compare/v11.5.0...v11.5.1) (2026-09-08)
+
+
+### Bug Fixes
+
+* **fusillade:** page batchless archive discovery and hot-loop busy movers ([#1715](https://github.com/doublewordai/control-layer/issues/1715)) ([f4d8737](https://github.com/doublewordai/control-layer/commit/f4d8737c72f9a60befa19fdcf5221143d3548169))
+* **onwards:** preserve trusted embedded client error details ([#1714](https://github.com/doublewordai/control-layer/issues/1714)) ([e2bcc8e](https://github.com/doublewordai/control-layer/commit/e2bcc8ee0328994dc52fe4c1bd82488c9e3e077e))
+
 ## [11.5.0](https://github.com/doublewordai/control-layer/compare/v11.4.5...v11.5.0) (2026-09-08)
 
 
