@@ -462,7 +462,7 @@ def flows(app, connection, pool_admin, model_url, roles, admin_dsn):
                 END IF;
             END
             $body$
-        """).format(sql.Literal(roles[1]), sql.Literal(partition))
+        """).format(sql.Literal(roles[0]), sql.Literal(partition))
         observer.execute(function)
         observer.execute("""
             CREATE EVENT TRIGGER pool_test_maintenance ON ddl_command_start
@@ -526,7 +526,7 @@ def run(args):
         "use a local disposable PostgreSQL instance",
     )
     name = "pool_test_" + uuid.uuid4().hex[:12]
-    roles = [name + suffix for suffix in ("_main", "_batch", "_outlet")]
+    roles = [name + suffix for suffix in ("_main", "_outlet")]
     password = uuid.uuid4().hex
     with ExitStack() as stack:
         directory = Path(
@@ -553,13 +553,13 @@ def run(args):
                     sql.Identifier(role), sql.Literal(password)
                 )
             )
-        admin.execute(sql.SQL("GRANT {} TO {}, {}").format(*map(sql.Identifier, roles)))
+        admin.execute(sql.SQL("GRANT {} TO {}").format(*map(sql.Identifier, roles)))
         admin.execute(
             sql.SQL("CREATE DATABASE {} OWNER {}").format(
                 sql.Identifier(name), sql.Identifier(roles[0])
             )
         )
-        for role, schema in zip(roles, ("public", "fusillade", "outlet")):
+        for role, schema in zip(roles, ("public", "outlet")):
             admin.execute(
                 sql.SQL("ALTER ROLE {} IN DATABASE {} SET search_path TO {}").format(
                     sql.Identifier(role), sql.Identifier(name), sql.Identifier(schema)
@@ -659,7 +659,6 @@ ignore_startup_parameters=extra_float_digits
                 "batch_daemon": {
                     "enabled": "always",
                     "retained_response_retirement_enabled": True,
-                    "retained_response_partition_maintenance_url": dsn(roles[1]),
                     "retention": {
                         "batchless_seconds_by_service_tier": {"priority": 604800},
                         "max_late_writer_seconds": 3600,
@@ -667,7 +666,12 @@ ignore_startup_parameters=extra_float_digits
                 },
             },
         }
-        for role, schema in zip(roles[1:], ("fusillade", "outlet")):
+        config["database"]["fusillade"] = {
+            "mode": "schema",
+            "name": "fusillade",
+            "pool": pool,
+        }
+        for role, schema in zip(roles[1:], ("outlet",)):
             config["database"][schema] = {
                 "mode": "schema",
                 "name": schema,
@@ -691,6 +695,23 @@ ignore_startup_parameters=extra_float_digits
             f"http://127.0.0.1:{server.server_port}",
             roles,
             admin_dsn,
+        )
+        with psycopg.connect(dsn(roles[0], True), autocommit=True) as shared:
+            for _ in range(4):
+                schema, can_manage_roles = shared.execute(
+                    "SELECT current_schema(), rolcreaterole FROM pg_roles WHERE rolname = current_user"
+                ).fetchone()
+                check(
+                    schema == "public",
+                    "Fusillade changed the shared role's default schema",
+                )
+                check(
+                    not can_manage_roles,
+                    "application must not require role-management privileges",
+                )
+        print(
+            "PASS: shared application role retains public schema without CREATEROLE",
+            flush=True,
         )
     print("PASS: all pooled application E2E checks", flush=True)
 

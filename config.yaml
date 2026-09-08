@@ -40,17 +40,12 @@ database:
   #   max_connections: 8
   #   min_connections: 0
   #
-  # Schema components behind a transaction pooler need their own pooled role:
-  # ALTER ROLE fusillade_pool IN DATABASE dwctl SET search_path = fusillade;
-  # ALTER ROLE outlet_pool IN DATABASE dwctl SET search_path = outlet;
-  # Provision these roles with the required privileges on the component schema,
-  # tables, sequences, and functions (including future objects). Fusillade also
-  # needs membership of the table-owner role for partition DDL; ordinary DML
-  # grants alone are insufficient. Migrations run as the main direct role.
-  # Keep the main role's default schema unchanged.
-  # Recycle existing pooler backends after changing role defaults. Startup checks
-  # current_schema() on primary and replica; merely including the component in
-  # a shared search_path such as public,fusillade is insufficient for retention.
+  # Fusillade inherits the main pooled endpoint and credentials. It selects its
+  # schema inside each query transaction, leaving the shared role default intact.
+  # Outlet requires its own endpoint with default search_path = outlet because
+  # its client does not select a transaction-local schema. Migrations use the
+  # main direct role; the outlet role must have privileges on migrated objects.
+  # Recycle existing pooler backends after changing outlet role defaults.
 
   # Main database pool settings for primary (and replica if not specified separately)
   # pool:
@@ -85,9 +80,9 @@ database:
   # fusillade:
   #   mode: schema
   #   name: fusillade
-  #   # Required when main uses a pooler with a different default schema:
-  #   # pooled_url: postgres://fusillade_pool:password@pooler:6432/dwctl
-  #   # replica_url: postgres://fusillade_pool:password@replica-pooler:6432/dwctl
+  #   # Optional overrides; otherwise inherits the main pooled credentials:
+  #   # pooled_url: postgres://postgres:password@pooler:6432/dwctl
+  #   # replica_url: postgres://postgres:password@replica-pooler:6432/dwctl
   #   # direct_pool:
   #   #   max_connections: 2
   #   pool:
@@ -777,10 +772,10 @@ background_services:
     # session-capable maintenance endpoint.
     # template_retirement_enabled: false
     # template_retention_days: <positive days>
-    # Required for pooled schema mode and dedicated databases when retirement
-    # or recovery runs. Use the SAME role as the fusillade pooled endpoint on
+    # Schema mode reuses the main direct credentials automatically. Override for
+    # dedicated databases or a different Fusillade query role. Use that role on
     # the DIRECT host; startup attests database, role, schema, and ownership.
-    # retained_response_partition_maintenance_url: postgres://fusillade_pool:password@direct:5432/dwctl
+    # retained_response_partition_maintenance_url: postgres://postgres:password@direct:5432/dwctl
 
     # Batch archive (fusillade phase 3): moves frozen terminal batches' rows
     # from fusillade.requests into the partitioned batch_requests_archive.

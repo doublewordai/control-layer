@@ -976,8 +976,8 @@ async fn load_and_validate_batch_models<P: PoolProvider>(
     file_id: Uuid,
 ) -> Result<(HashMap<String, i64>, BatchModelInfo)> {
     let file_model_counts = {
-        let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
-            operation: format!("get primary Fusillade connection for batch model counts: {e}"),
+        let mut templates_conn = state.request_manager.begin_write().await.map_err(|e| Error::Internal {
+            operation: format!("begin primary Fusillade transaction for batch model counts: {e}"),
         })?;
         BatchTemplates::new(&mut templates_conn)
             .get_model_counts(file_id)
@@ -1001,8 +1001,8 @@ async fn load_and_validate_batch_models<P: PoolProvider>(
         (batch_model_info, reasoning_policies)
     };
 
-    let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
-        operation: format!("get primary Fusillade connection for batch request validation: {e}"),
+    let mut templates_conn = state.request_manager.begin_write().await.map_err(|e| Error::Internal {
+        operation: format!("begin primary Fusillade transaction for batch request validation: {e}"),
     })?;
     let mut templates = BatchTemplates::new(&mut templates_conn);
     let mut stream = templates.stream_reasoning_requests(file_id);

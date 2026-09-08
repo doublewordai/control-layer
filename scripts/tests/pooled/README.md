@@ -28,8 +28,10 @@ The application checks cover:
 Only the external model provider is replaced by a deterministic local HTTP server.
 Primary and replica query pools target the same PostgreSQL instance; this job does
 not simulate replication lag. It does not run browser, external provider, email,
-or webhook delivery tests. Component roles are non-superusers and inherit the
-migration/table-owner role. Diagnostic application and PgBouncer logs are uploaded
+or webhook delivery tests. Fusillade inherits the main pooled endpoint and its
+non-superuser credentials with a `public` default schema; there is no separate
+Fusillade role or maintenance URL. Outlet uses its own schema-default role,
+which inherits the migration/table-owner role. Diagnostic application and PgBouncer logs are uploaded
 on success or failure. Temporary databases, roles, and processes are cleaned up.
 
 ## Run locally

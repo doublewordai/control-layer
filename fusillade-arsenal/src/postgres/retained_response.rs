@@ -2172,12 +2172,13 @@ async fn response_write_graph_ids(
 pub(crate) async fn begin_response_write_transaction(
     pool: &PgPool,
     retry_config: &crate::DbRetryConfig,
+    query_schema: Option<&str>,
     object_ids: &[Uuid],
 ) -> Result<Transaction<'static, Postgres>> {
     const MAX_CANONICAL_LOCK_ATTEMPTS: usize = 8;
 
     for _ in 0..MAX_CANONICAL_LOCK_ATTEMPTS {
-        let mut tx = crate::db::begin_transaction(pool, retry_config)
+        let mut tx = crate::db::begin_transaction_in_schema(pool, retry_config, query_schema)
             .await
             .map_err(database_failure)?;
         let tentative_group_ids = response_write_graph_ids(&mut tx, object_ids).await?;
