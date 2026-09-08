@@ -151,14 +151,6 @@ where
         &self.storage
     }
 
-    pub fn http_client(&self) -> &Arc<H> {
-        &self.http_client
-    }
-
-    pub fn config(&self) -> &DaemonConfig {
-        &self.config
-    }
-
     pub fn processor(&self) -> Option<&Arc<dyn RequestProcessor<PostgresStore<P>, H>>> {
         self.processor.get()
     }
@@ -209,29 +201,6 @@ where
         tracing::info!("PostgreSQL scheduling daemon spawned successfully");
 
         Ok(handle)
-    }
-}
-
-#[async_trait]
-impl<P, H> super::DaemonExecutor<H> for PostgresDaemon<P, H>
-where
-    P: fusillade_arsenal::PoolProvider,
-    H: HttpClient + 'static,
-{
-    fn http_client(&self) -> &Arc<H> {
-        self.http_client()
-    }
-
-    fn config(&self) -> &DaemonConfig {
-        self.config()
-    }
-
-    fn run_with_mode(
-        self: Arc<Self>,
-        shutdown_token: CancellationToken,
-        mode: DaemonMode,
-    ) -> crate::Result<JoinHandle<crate::Result<()>>> {
-        PostgresDaemon::run_with_mode(self, shutdown_token, mode)
     }
 }
 
