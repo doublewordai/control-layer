@@ -1284,6 +1284,116 @@ mod tests {
     // tests exercise the embedded-error detection + retry in target_message_handler.
 
     #[tokio::test]
+    async fn test_embedded_error_preserves_only_trusted_client_details() {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::LoadBalanceStrategy;
+
+        // A per-provider override must win over pool trust in both directions.
+        for (provider_trust, pool_trust, preserve) in [
+            (Some(true), false, true),
+            (Some(false), true, false),
+            (None, true, true),
+            (None, false, false),
+        ] {
+            for streaming in [false, true] {
+                let body = r#"{"error":{"code":400,"message":"image_url.detail must be auto, low or high","type":"invalid_image_error","param":"image_url.detail","metadata":{"private":"not part of the public error"}}}"#;
+                let mock = if streaming {
+                    MockHttpClient::new_streaming(
+                        StatusCode::OK,
+                        vec![": keep-alive\n\n".to_string(), format!("data:{body}\n\n")],
+                    )
+                } else {
+                    MockHttpClient::new(StatusCode::OK, body)
+                };
+                let target = Target::builder()
+                    .url("https://provider.example.com/".parse().unwrap())
+                    .maybe_trusted(provider_trust)
+                    .build();
+                let provider_pool = ProviderPool::with_config(
+                    vec![Provider::new(target, 1)],
+                    None,
+                    None,
+                    None,
+                    None,
+                    LoadBalanceStrategy::Priority,
+                    pool_trust,
+                    Vec::new(),
+                );
+                let targets = embedded_error_targets("gpt-4", 1);
+                targets
+                    .targets
+                    .insert("gpt-4".to_string(), provider_pool.into());
+                let server =
+                    TestServer::new(build_router(AppState::with_client(targets, mock.clone())))
+                        .unwrap();
+                let response = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({
+                        "model":"gpt-4", "stream":streaming,
+                        "messages":[{"role":"user","content":"hello"}]
+                    }))
+                    .await;
+                assert_eq!(response.status_code(), 400);
+                let error = response.json::<serde_json::Value>();
+                if preserve {
+                    assert_eq!(
+                        error["error"]["message"],
+                        "image_url.detail must be auto, low or high"
+                    );
+                    assert_eq!(error["error"]["param"], "image_url.detail");
+                    assert_eq!(error["error"]["code"], "400");
+                    assert_eq!(error["error"]["type"], "invalid_image_error");
+                } else {
+                    assert_eq!(
+                        error["error"]["message"],
+                        "The upstream provider rejected the request."
+                    );
+                    assert!(error["error"]["param"].is_null());
+                    assert_eq!(error["error"]["type"], "invalid_request_error");
+                }
+                assert!(error["error"].get("metadata").is_none());
+                assert_eq!(mock.get_requests().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trusted_embedded_error_keeps_server_and_rate_limit_details_private() {
+        for code in [429, 500, 501, 503] {
+            for streaming in [false, true] {
+                let body =
+                    json!({"error":{"code":code,"message":"private upstream failure"}}).to_string();
+                let mock = if streaming {
+                    MockHttpClient::new_streaming(StatusCode::OK, vec![format!("data: {body}\n\n")])
+                } else {
+                    MockHttpClient::new(StatusCode::OK, &body)
+                };
+                let targets = embedded_error_targets("gpt-4", 1);
+                targets.targets.insert(
+                    "gpt-4".to_string(),
+                    pool(
+                        Target::builder()
+                            .url("https://provider.example.com/".parse().unwrap())
+                            .trusted(true)
+                            .build(),
+                    ),
+                );
+                let server =
+                    TestServer::new(build_router(AppState::with_client(targets, mock))).unwrap();
+                let response = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({
+                        "model":"gpt-4", "stream":streaming,
+                        "messages":[{"role":"user","content":"hello"}]
+                    }))
+                    .await;
+                assert_eq!(response.status_code(), 503);
+                assert!(!response.text().contains("private upstream failure"));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_streaming_embedded_error_retries_then_exhausts_to_503() {
         // 200 stream whose first frame is a `429` error envelope. onwards must
         // retry across providers and, when exhausted, return a sanitized 503 —
