@@ -499,8 +499,6 @@ pub async fn delete_user<P: PoolProvider>(
     Path(user_id): Path<UserId>,
     current_user: RequiresPermission<resource::Users, operation::DeleteAll>,
 ) -> Result<StatusCode> {
-    use fusillade::Storage;
-
     // Prevent self-deletion
     if user_id == current_user.id {
         return Err(Error::BadRequest {
@@ -510,35 +508,22 @@ pub async fn delete_user<P: PoolProvider>(
 
     // Cancel all active batches for this user before deletion
     let user_id_str = user_id.to_string();
-    let batches = state
-        .request_manager
-        .list_batches(fusillade::ListBatchesFilter {
-            created_by: Some(user_id_str.clone()),
-            limit: Some(i64::MAX),
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| {
-            // A listing failure is an internal fault (DB unreachable, etc.), not
-            // a missing resource — don't mislabel it as 404 "Batch not found".
-            tracing::error!(user_id = %user_id, error = %e, "Failed to list batches for user deletion");
-            Error::Internal {
-                operation: "list user batches for deletion".to_string(),
-            }
-        })?;
+    cancel_active_batches(&state, &user_id_str).await?;
 
-    for batch in batches {
-        if batch.completed_at.is_none()
-            && let Err(e) = state.request_manager.cancel_batch(batch.id).await
-        {
-            tracing::warn!(
-                batch_id = %batch.id,
-                user_id = %user_id,
-                error = %e,
-                "Failed to cancel batch during user deletion"
-            );
-        }
-    }
+    // Workspaces this user owns. `Users::delete` hands each to a successor, or
+    // closes it when there is nobody left to hand it to; read the list before
+    // the delete, because afterwards the memberships that identify them are
+    // gone.
+    // Every workspace they belong to, not only the ones they own: a member
+    // promoted to owner between this read and the delete would otherwise be
+    // closed by the transaction while sitting outside this list, and its data
+    // would never be purged. Membership is the wider set and costs nothing to
+    // over-collect, because what actually gets cleaned up is decided below by
+    // asking whether each one is now closed.
+    let member_org_ids = {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+        Organizations::new(&mut conn).list_member_organization_ids(user_id).await?
+    };
 
     // Soft-delete + scrub the user row and hard-delete their API keys
     // (atomic, in repo.delete). Scoped so the connection borrow is released
@@ -562,7 +547,75 @@ pub async fn delete_user<P: PoolProvider>(
     // so it is offloaded to an at-least-once underway job.
     enqueue_purge_user_data(&state, user_id_str).await;
 
+    // A workspace that was closed with the account gets the same treatment, so
+    // its batches and stored payloads do not outlive it. Which of the owned
+    // workspaces those are is the transaction's decision, not a guess made
+    // before it ran: `get_by_id` filters deleted rows, so a workspace that
+    // found a successor still resolves and is left alone.
+    for org_id in member_org_ids {
+        let closed = {
+            let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
+            Users::new(&mut conn).get_by_id(org_id).await?.is_none()
+        };
+        if closed {
+            let org_id_str = org_id.to_string();
+            // Cancellation is best-effort and the purge is enqueued regardless.
+            // The account row is already committed by this point, so returning
+            // early on a cancellation failure would strand the workspace's data
+            // permanently: a retried delete finds the user already gone, and the
+            // membership that identified this workspace has been removed, so
+            // nothing can rediscover it.
+            if let Err(e) = cancel_active_batches(&state, &org_id_str).await {
+                tracing::warn!(
+                    org_id = %org_id,
+                    error = %e,
+                    "Failed to cancel batches for a workspace closed with its owner; purging anyway"
+                );
+            }
+            enqueue_purge_user_data(&state, org_id_str).await;
+        }
+    }
+
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Cancel every batch still running for an owner, so deletion doesn't leave
+/// work executing on behalf of something that no longer exists. Shared by the
+/// account itself and by any workspace closed along with it.
+async fn cancel_active_batches<P: PoolProvider>(state: &AppState<P>, owner_id: &str) -> Result<()> {
+    use fusillade::Storage;
+
+    let batches = state
+        .request_manager
+        .list_batches(fusillade::ListBatchesFilter {
+            created_by: Some(owner_id.to_string()),
+            limit: Some(i64::MAX),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| {
+            // A listing failure is an internal fault (DB unreachable, etc.), not
+            // a missing resource — don't mislabel it as 404 "Batch not found".
+            tracing::error!(owner_id = %owner_id, error = %e, "Failed to list batches for deletion");
+            Error::Internal {
+                operation: "list batches for deletion".to_string(),
+            }
+        })?;
+
+    for batch in batches {
+        if batch.completed_at.is_none()
+            && let Err(e) = state.request_manager.cancel_batch(batch.id).await
+        {
+            tracing::warn!(
+                batch_id = %batch.id,
+                owner_id = %owner_id,
+                error = %e,
+                "Failed to cancel batch during deletion"
+            );
+        }
+    }
+
+    Ok(())
 }
 
 /// Input for the user-data purge background job. Carries the user id as a

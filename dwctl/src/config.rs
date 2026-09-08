@@ -694,6 +694,36 @@ pub struct AuthConfig {
     /// `verified` flag. Only used when the api_key has no explicit per-key
     /// override. Leaving either tier as `None` means "no limit for that tier".
     pub rate_limits: RateLimitTiersConfig,
+    /// Extra email domains to treat as personal, on top of the built-in list
+    /// in `auth::utils`.
+    ///
+    /// A personal domain cannot be claimed by a workspace and is never used to
+    /// route a signup, so this is the lever for a free-mail or ISP provider the
+    /// built-in list has missed. It matters because the built-in list can only
+    /// ever be a snapshot: a provider that is absent gets claimed by whoever
+    /// signs up first, and every later signup at that provider is routed into
+    /// that stranger's workspace. Adding the domain here closes it immediately
+    /// and also retires the existing claim, because the claim is only ever
+    /// consulted after this check.
+    ///
+    /// Matched case-insensitively against the full domain. Entries duplicating
+    /// the built-in list are harmless.
+    pub personal_email_domains: Vec<String>,
+}
+
+impl AuthConfig {
+    /// Whether `domain` belongs to a personal/free email provider, per the
+    /// built-in list plus anything the deployment has added.
+    ///
+    /// Prefer this over [`crate::auth::utils::is_builtin_personal_email_domain`]
+    /// at call sites, so `auth.personal_email_domains` is actually honoured.
+    pub fn is_personal_email_domain(&self, domain: &str) -> bool {
+        crate::auth::utils::is_builtin_personal_email_domain(domain)
+            || self
+                .personal_email_domains
+                .iter()
+                .any(|configured| configured.trim().eq_ignore_ascii_case(domain))
+    }
 }
 
 impl Default for AuthConfig {
@@ -704,6 +734,7 @@ impl Default for AuthConfig {
             security: SecurityConfig::default(),
             default_user_roles: vec![Role::StandardUser, Role::BackgroundInferenceUser],
             rate_limits: RateLimitTiersConfig::default(),
+            personal_email_domains: Vec::new(),
         }
     }
 }
@@ -3516,6 +3547,25 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    /// The built-in list is a snapshot and will always lag some provider.
+    /// `auth.personal_email_domains` is how an operator closes that gap without
+    /// waiting for a release, so it has to actually be consulted.
+    #[test]
+    fn configured_personal_domains_extend_the_builtin_list() {
+        let mut auth = super::AuthConfig::default();
+        assert!(auth.is_personal_email_domain("gmail.com"), "built-in list still applies");
+        assert!(!auth.is_personal_email_domain("example-isp.net"));
+
+        auth.personal_email_domains = vec!["example-isp.net".to_string()];
+        assert!(auth.is_personal_email_domain("example-isp.net"), "configured domain is personal");
+        assert!(
+            auth.is_personal_email_domain("EXAMPLE-ISP.NET"),
+            "and matches case-insensitively, like the built-in check"
+        );
+        assert!(auth.is_personal_email_domain("gmail.com"), "without displacing the built-in list");
+        assert!(!auth.is_personal_email_domain("acme.com"), "and without catching company domains");
+    }
+
     use super::*;
     use figment::Jail;
 
