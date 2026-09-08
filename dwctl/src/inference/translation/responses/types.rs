@@ -30,7 +30,11 @@ fn response_status_for_event_type(event_type: &str) -> &'static str {
     }
 }
 
-fn backfill_responses_response_fields(object: &mut serde_json::Map<String, Value>, fallback_model: &str, fallback_response_id: &str) {
+pub(crate) fn backfill_responses_response_fields(
+    object: &mut serde_json::Map<String, Value>,
+    fallback_model: &str,
+    fallback_response_id: &str,
+) {
     ensure_field(object, "id", || Value::String(fallback_response_id.to_string()));
     ensure_field(object, "object", || Value::String("response".to_string()));
     ensure_field(object, "created_at", || Value::from(0));

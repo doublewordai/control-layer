@@ -7,6 +7,7 @@
 - [Quickstart](quickstart.md)
 - [Configuration](configuration.md)
 - [Command Line Options](cli.md)
+- [Graceful Shutdown](shutdown.md)
 - [API Usage](api-usage.md)
 
 # Features

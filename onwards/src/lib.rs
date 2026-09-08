@@ -59,58 +59,11 @@ pub mod sse;
 pub mod strict;
 pub mod target;
 pub mod telemetry;
-pub mod traits;
 
 use client::{HttpClient, HyperClient};
 pub use handlers::ServedBy;
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
-pub use traits::{
-    NoOpResponseStore, NoOpToolExecutor, RequestContext, ResponseStore, StoreError, ToolError,
-    ToolExecutor, ToolKind, ToolSchema,
-};
-
-/// Type alias for body transformation function
-///
-/// Takes (path, headers, body_bytes) and returns transformed body_bytes or None if no transformation.
-/// This allows you to modify request bodies before they are forwarded to upstream services.
-///
-/// # Arguments
-///
-/// * `&str` - The request path (e.g., "/v1/chat/completions")
-/// * `&HeaderMap` - HTTP headers from the incoming request
-/// * `&[u8]` - The request body as raw bytes
-///
-/// # Returns
-///
-/// * `Some(Bytes)` - Transformed request body to forward
-/// * `None` - Use original request body unchanged
-///
-/// # Examples
-///
-/// ```
-/// use onwards::BodyTransformFn;
-/// use axum::http::HeaderMap;
-/// use std::sync::Arc;
-/// use serde_json::{json, Value};
-///
-/// // Transform function that adds stream_options to OpenAI streaming requests
-/// let transform: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-///     if path == "/v1/chat/completions" {
-///         if let Ok(mut json_body) = serde_json::from_slice::<Value>(body_bytes) {
-///             if json_body.get("stream") == Some(&json!(true)) {
-///                 json_body["stream_options"] = json!({"include_usage": true});
-///                 if let Ok(transformed) = serde_json::to_vec(&json_body) {
-///                     return Some(axum::body::Bytes::from(transformed));
-///                 }
-///             }
-///         }
-///     }
-///     None // No transformation
-/// });
-/// ```
-pub type BodyTransformFn =
-    Arc<dyn Fn(&str, &HeaderMap, &[u8]) -> Option<axum::body::Bytes> + Send + Sync>;
 
 /// Type alias for response transformation function
 ///
@@ -158,7 +111,6 @@ pub type ResponseTransformFn = Arc<
 /// This struct holds all the state needed to run the proxy server. It contains:
 /// - An HTTP client for making upstream requests
 /// - The collection of configured targets (destinations)
-/// - An optional body transformation function
 /// - An optional response transformation function
 ///
 /// # Examples
@@ -175,37 +127,11 @@ pub type ResponseTransformFn = Arc<
 /// # Ok(())
 /// # }
 /// ```
-///
-/// With request transformation:
-/// ```no_run
-/// use onwards::{AppState, BodyTransformFn, config::Config, target::Targets};
-/// use std::sync::Arc;
-/// use clap::Parser;
-///
-/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let config = Config::parse();
-/// let targets = Targets::from_config_file(&config.targets).await?;
-///
-/// let transform: BodyTransformFn = Arc::new(|path, _headers, body| {
-///     // Custom transformation logic
-///     None
-/// });
-///
-/// let app_state = AppState::with_transform(targets, transform);
-/// # Ok(())
-/// # }
-/// ```
 #[derive(Clone)]
 pub struct AppState<T: HttpClient> {
     pub http_client: T,
     pub targets: target::Targets,
-    pub body_transform_fn: Option<BodyTransformFn>,
     pub response_transform_fn: Option<ResponseTransformFn>,
-    /// Header name that signals the request should be treated as streaming.
-    /// When set, the responses adapter checks this header to decide whether to
-    /// use the streaming path before forwarding (since the body transform runs
-    /// too late for that decision). Defaults to `None` (header check disabled).
-    pub streaming_header: Option<String>,
     /// Header name whose value overrides the generated `id` in Responses API
     /// responses. When set, the handler reads this header from the incoming
     /// request and uses its value (prefixed with `resp_` if not already) as the
@@ -213,8 +139,6 @@ pub struct AppState<T: HttpClient> {
     /// correlate responses with pre-created tracking records without needing to
     /// patch the response body after the fact.
     pub response_id_header: Option<String>,
-    pub tool_executor: Arc<dyn ToolExecutor>,
-    pub response_store: Arc<dyn ResponseStore>,
     /// Maximum request body size in bytes, enforced by both routers. Without
     /// this, the strict router's `Json` extractors fall back to Axum's 2 MB
     /// `DefaultBodyLimit`, which rejects large (e.g. long-context or base64
@@ -235,17 +159,10 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
             .field("http_client", &self.http_client)
             .field("targets", &self.targets)
             .field(
-                "body_transform_fn",
-                &self.body_transform_fn.as_ref().map(|_| "<function>"),
-            )
-            .field(
                 "response_transform_fn",
                 &self.response_transform_fn.as_ref().map(|_| "<function>"),
             )
-            .field("streaming_header", &self.streaming_header)
             .field("response_id_header", &self.response_id_header)
-            .field("tool_executor", &"<dyn ToolExecutor>")
-            .field("response_store", &"<dyn ResponseStore>")
             .field("body_limit", &self.body_limit)
             .finish()
     }
@@ -264,34 +181,8 @@ impl AppState<HyperClient> {
         Self {
             http_client,
             targets,
-            body_transform_fn: None,
             response_transform_fn: None,
-            streaming_header: None,
             response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
-            body_limit: DEFAULT_BODY_LIMIT,
-        }
-    }
-
-    /// Create a new AppState with the default Hyper client and a body transformation function
-    pub fn with_transform(targets: target::Targets, body_transform_fn: BodyTransformFn) -> Self {
-        let (max_idle, timeout) = targets
-            .http_pool_config
-            .as_ref()
-            .map(|p| (p.max_idle_per_host, p.idle_timeout_secs))
-            .unwrap_or((100, 90));
-
-        let http_client = client::create_hyper_client(max_idle, timeout);
-        Self {
-            http_client,
-            targets,
-            body_transform_fn: Some(body_transform_fn),
-            response_transform_fn: None,
-            streaming_header: None,
-            response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
         }
     }
@@ -303,40 +194,10 @@ impl<T: HttpClient> AppState<T> {
         Self {
             http_client,
             targets,
-            body_transform_fn: None,
             response_transform_fn: None,
-            streaming_header: None,
             response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
             body_limit: DEFAULT_BODY_LIMIT,
         }
-    }
-
-    /// Create a new AppState with a custom HTTP client and body transformation function
-    pub fn with_client_and_transform(
-        targets: target::Targets,
-        http_client: T,
-        body_transform_fn: BodyTransformFn,
-    ) -> Self {
-        Self {
-            http_client,
-            targets,
-            body_transform_fn: Some(body_transform_fn),
-            response_transform_fn: None,
-            streaming_header: None,
-            response_id_header: None,
-            tool_executor: Arc::new(NoOpToolExecutor),
-            response_store: Arc::new(NoOpResponseStore),
-            body_limit: DEFAULT_BODY_LIMIT,
-        }
-    }
-
-    /// Set the header name that signals a request should use the streaming path.
-    /// Used by the responses adapter to decide streaming vs non-streaming before forwarding.
-    pub fn with_streaming_header(mut self, header: impl Into<String>) -> Self {
-        self.streaming_header = Some(header.into());
-        self
     }
 
     /// Set the header name whose value overrides the Responses API `id` field.
@@ -348,18 +209,6 @@ impl<T: HttpClient> AppState<T> {
     /// Set the response transformation function (builder pattern)
     pub fn with_response_transform(mut self, transform_fn: ResponseTransformFn) -> Self {
         self.response_transform_fn = Some(transform_fn);
-        self
-    }
-
-    /// Set the tool executor for server-side tool handling (builder pattern)
-    pub fn with_tool_executor(mut self, executor: Arc<dyn ToolExecutor>) -> Self {
-        self.tool_executor = executor;
-        self
-    }
-
-    /// Set the response store for stateful conversations (builder pattern)
-    pub fn with_response_store(mut self, store: Arc<dyn ResponseStore>) -> Self {
-        self.response_store = store;
         self
     }
 
@@ -721,6 +570,38 @@ pub mod test_utils {
             }
         }
 
+        pub fn new_delayed_streaming_sequence(
+            status: StatusCode,
+            responses: Vec<(std::time::Duration, Vec<String>)>,
+        ) -> Self {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                custom_headers: Arc::new(Mutex::new(Vec::new())),
+                response_builder: Arc::new(move || {
+                    use axum::body::Body;
+
+                    let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let (delay, chunks) = responses.get(idx).cloned().unwrap_or_default();
+
+                    let stream = async_stream::stream! {
+                        tokio::time::sleep(delay).await;
+                        for chunk in chunks {
+                            yield Ok::<_, std::io::Error>(chunk.into_bytes());
+                        }
+                    };
+
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", "text/event-stream")
+                        .header("cache-control", "no-cache")
+                        .header("connection", "keep-alive")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }),
+            }
+        }
+
         pub fn get_requests(&self) -> Vec<MockRequest> {
             self.requests.lock().unwrap().clone()
         }
@@ -924,7 +805,7 @@ mod tests {
     use test_utils::MockHttpClient;
 
     /// Helper to create a single-provider pool from a target
-    fn pool(target: Target) -> ProviderPool {
+    fn pool(target: Target) -> target::TargetPools {
         target.into_pool()
     }
 
@@ -1202,7 +1083,7 @@ mod tests {
             Vec::new(),
         );
         let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(alias.to_string(), pool);
+        targets_map.insert(alias.to_string(), pool.into());
         target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
@@ -1218,8 +1099,299 @@ mod tests {
         fallback_targets(alias, n, vec![429])
     }
 
+    /// A composite whose COMPLETIONS pool has one member per entry of
+    /// `accepts_priority` (Priority order, embedded-429 retry) alongside a
+    /// single-member default pool. Mirrors the continuation-pool shape; each
+    /// member's `accepts_scheduling_priority` capability is given explicitly.
+    fn completions_pool_targets(alias: &str, accepts_priority: &[bool]) -> target::Targets {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target, TargetPools};
+
+        let make_pool = |members: Vec<(String, bool)>| {
+            let providers = members
+                .into_iter()
+                .map(|(u, accepts)| {
+                    let t = Target::builder()
+                        .url(u.parse().unwrap())
+                        .request_timeout_secs(5)
+                        .accepts_scheduling_priority(accepts)
+                        .build();
+                    Provider::new(t, 1)
+                })
+                .collect();
+            ProviderPool::with_config(
+                providers,
+                None,
+                None,
+                None,
+                Some(FallbackConfig {
+                    enabled: true,
+                    on_status: vec![429],
+                    ..Default::default()
+                }),
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            )
+        };
+        let default_pool = make_pool(vec![("https://chat.example.com/".to_string(), false)]);
+        let completions_pool = make_pool(
+            accepts_priority
+                .iter()
+                .enumerate()
+                .map(|(i, accepts)| (format!("https://c{i}.example.com/"), *accepts))
+                .collect(),
+        );
+        let mut extra = std::collections::HashMap::new();
+        extra.insert("completions".to_string(), completions_pool);
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            alias.to_string(),
+            TargetPools::with_pools(default_pool, extra),
+        );
+        target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        }
+    }
+
+    /// The dynamo scheduler's `priority` field reaches a non-default pool
+    /// member iff that member's serving stack accepts it
+    /// (`accepts_scheduling_priority`), regardless of position. Third-party
+    /// completions targets reject unknown fields outright (Fireworks: "Extra
+    /// inputs are not permitted, field: 'priority'"): keyed on position, the
+    /// cl-1453 canary 400'd on every fallback leg, and later — with the dynamo
+    /// member disabled — on every PRIMARY leg too.
+    #[tokio::test]
+    async fn completions_member_sees_priority_iff_it_accepts_it() {
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                vec![error_frame],                  // primary: embedded 429 → fallback
+                vec![OK_CONTENT_FRAME.to_string()], // fallback member serves
+            ],
+        );
+        // dynamo (accepts) first, third party (does not) second: the wave-1 shape.
+        let app_state = AppState::with_client(
+            completions_pool_targets("gpt-4", &[true, false]),
+            mock.clone(),
+        );
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({
+                "model": "gpt-4", "prompt": [1, 2, 3], "stream": true, "priority": 100,
+                "nvext": {"agent_hints": {"priority": 100}}
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2, "primary fails, fallback serves");
+        let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+        assert_eq!(
+            first["nvext"]["agent_hints"]["priority"], 100,
+            "a member that accepts scheduling fields receives the nvext carrier"
+        );
+        assert_eq!(first["priority"], 100, "and the legacy top-level field");
+        assert!(
+            second.get("priority").is_none() && second.get("nvext").is_none(),
+            "a member that does not accept them must see neither carrier"
+        );
+        assert_eq!(
+            second["prompt"],
+            json!([1, 2, 3]),
+            "the rest of the body is untouched"
+        );
+    }
+
+    /// The incident shape: the dynamo member is disabled/removed and a third
+    /// party sits at index 0. Position must not decide — the field is stripped
+    /// for the first attempt too, or every resume leg 400s exactly when the
+    /// feature is needed most.
+    #[tokio::test]
+    async fn a_non_accepting_primary_never_sees_priority_either() {
+        let mock =
+            MockHttpClient::new_streaming(StatusCode::OK, vec![OK_CONTENT_FRAME.to_string()]);
+        let app_state =
+            AppState::with_client(completions_pool_targets("gpt-4", &[false]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/completions")
+            .json(&json!({
+                "model": "gpt-4", "prompt": [1, 2, 3], "stream": true,
+                "nvext": {"agent_hints": {"priority": 100}}
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(
+            body.get("nvext").is_none(),
+            "index 0 is not 'dynamo'; a non-accepting primary is stripped too"
+        );
+        assert_eq!(body["prompt"], json!([1, 2, 3]));
+    }
+
+    /// Control: default-pool fallbacks keep `priority` on every attempt —
+    /// batch/flex deadline priorities must keep reaching dynamo exactly as
+    /// today, whichever member serves.
+    #[tokio::test]
+    async fn default_pool_fallback_keeps_priority_on_every_attempt() {
+        let error_frame =
+            "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
+                .to_string();
+        let mock = MockHttpClient::new_streaming_sequence(
+            StatusCode::OK,
+            vec![vec![error_frame], vec![OK_CONTENT_FRAME.to_string()]],
+        );
+        let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true, "priority": -1754812800,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2);
+        for (i, req) in requests.iter().enumerate() {
+            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
+            assert_eq!(
+                body["priority"], -1754812800i64,
+                "attempt {i}: default-pool members all receive the deadline priority"
+            );
+        }
+    }
+
     // Some upstreams return HTTP 200 and put the real error in the body. These
     // tests exercise the embedded-error detection + retry in target_message_handler.
+
+    #[tokio::test]
+    async fn test_embedded_error_preserves_only_trusted_client_details() {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::LoadBalanceStrategy;
+
+        // A per-provider override must win over pool trust in both directions.
+        for (provider_trust, pool_trust, preserve) in [
+            (Some(true), false, true),
+            (Some(false), true, false),
+            (None, true, true),
+            (None, false, false),
+        ] {
+            for streaming in [false, true] {
+                let body = r#"{"error":{"code":400,"message":"image_url.detail must be auto, low or high","type":"invalid_image_error","param":"image_url.detail","metadata":{"private":"not part of the public error"}}}"#;
+                let mock = if streaming {
+                    MockHttpClient::new_streaming(
+                        StatusCode::OK,
+                        vec![": keep-alive\n\n".to_string(), format!("data:{body}\n\n")],
+                    )
+                } else {
+                    MockHttpClient::new(StatusCode::OK, body)
+                };
+                let target = Target::builder()
+                    .url("https://provider.example.com/".parse().unwrap())
+                    .maybe_trusted(provider_trust)
+                    .build();
+                let provider_pool = ProviderPool::with_config(
+                    vec![Provider::new(target, 1)],
+                    None,
+                    None,
+                    None,
+                    None,
+                    LoadBalanceStrategy::Priority,
+                    pool_trust,
+                    Vec::new(),
+                );
+                let targets = embedded_error_targets("gpt-4", 1);
+                targets
+                    .targets
+                    .insert("gpt-4".to_string(), provider_pool.into());
+                let server =
+                    TestServer::new(build_router(AppState::with_client(targets, mock.clone())))
+                        .unwrap();
+                let response = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({
+                        "model":"gpt-4", "stream":streaming,
+                        "messages":[{"role":"user","content":"hello"}]
+                    }))
+                    .await;
+                assert_eq!(response.status_code(), 400);
+                let error = response.json::<serde_json::Value>();
+                if preserve {
+                    assert_eq!(
+                        error["error"]["message"],
+                        "image_url.detail must be auto, low or high"
+                    );
+                    assert_eq!(error["error"]["param"], "image_url.detail");
+                    assert_eq!(error["error"]["code"], "400");
+                    assert_eq!(error["error"]["type"], "invalid_image_error");
+                } else {
+                    assert_eq!(
+                        error["error"]["message"],
+                        "The upstream provider rejected the request."
+                    );
+                    assert!(error["error"]["param"].is_null());
+                    assert_eq!(error["error"]["type"], "invalid_request_error");
+                }
+                assert!(error["error"].get("metadata").is_none());
+                assert_eq!(mock.get_requests().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trusted_embedded_error_keeps_server_and_rate_limit_details_private() {
+        for code in [429, 500, 501, 503] {
+            for streaming in [false, true] {
+                let body =
+                    json!({"error":{"code":code,"message":"private upstream failure"}}).to_string();
+                let mock = if streaming {
+                    MockHttpClient::new_streaming(StatusCode::OK, vec![format!("data: {body}\n\n")])
+                } else {
+                    MockHttpClient::new(StatusCode::OK, &body)
+                };
+                let targets = embedded_error_targets("gpt-4", 1);
+                targets.targets.insert(
+                    "gpt-4".to_string(),
+                    pool(
+                        Target::builder()
+                            .url("https://provider.example.com/".parse().unwrap())
+                            .trusted(true)
+                            .build(),
+                    ),
+                );
+                let server =
+                    TestServer::new(build_router(AppState::with_client(targets, mock))).unwrap();
+                let response = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({
+                        "model":"gpt-4", "stream":streaming,
+                        "messages":[{"role":"user","content":"hello"}]
+                    }))
+                    .await;
+                assert_eq!(response.status_code(), 503);
+                assert!(!response.text().contains("private upstream failure"));
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_streaming_embedded_error_retries_then_exhausts_to_503() {
@@ -1382,6 +1554,117 @@ mod tests {
             mock.get_requests().len(),
             2,
             "empty stream must trigger a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slow_streaming_empty_body_retries_then_succeeds() {
+        // Regression for a stream that stays idle past the SSE peek budget, then
+        // closes without any frames. It is still a terminal empty response and
+        // must not be forwarded as a bodyless 200.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                (std::time::Duration::from_millis(20), vec![]),
+                (
+                    std::time::Duration::ZERO,
+                    vec![OK_CONTENT_FRAME.to_string()],
+                ),
+            ],
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200, "the retry's success is served");
+        assert!(
+            response.text().contains("hi"),
+            "client receives the healthy provider's content"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "slow empty stream must trigger a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_slow_streaming_content_is_not_retried() {
+        // A valid stream may be slow to first token. Once it produces data, the
+        // original stream must be forwarded intact without duplicate work.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![(
+                std::time::Duration::from_millis(20),
+                vec![OK_CONTENT_FRAME.to_string()],
+            )],
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            response.text().contains("hi"),
+            "client receives the slow provider's content"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "slow content must not trigger a retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_idle_stream_after_decisive_wait_is_forwarded_not_retried() {
+        // If an upstream opens an SSE response and then stays idle past both the
+        // initial peek and bounded decisive wait, the handler must not withhold
+        // response headers indefinitely. The still-open stream is forwarded and
+        // any later content is delivered from the original provider.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![(
+                std::time::Duration::from_millis(75),
+                vec![OK_CONTENT_FRAME.to_string()],
+            )],
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4", "stream": true,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            response.text().contains("hi"),
+            "client receives the original provider's delayed content"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "idle-but-open stream must not retry before a terminal empty is observed"
         );
     }
 
@@ -2108,7 +2391,7 @@ mod tests {
             .build();
         targets_map.insert(
             "limited-model".to_string(),
-            ProviderPool::new(vec![Provider::with_concurrency_limit(target, 1, 5)]),
+            ProviderPool::new(vec![Provider::with_concurrency_limit(target, 1, 5)]).into(),
         );
 
         let targets = Targets {
@@ -2161,7 +2444,8 @@ mod tests {
                 target::LoadBalanceStrategy::default(),
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
 
         let targets = Targets {
@@ -2313,7 +2597,7 @@ mod tests {
         #[fixture]
         #[once]
         fn get_shared_metrics_servers(
-            #[default(Arc::new(DashMap::new()))] targets: Arc<DashMap<String, ProviderPool>>,
+            #[default(Arc::new(DashMap::new()))] targets: Arc<DashMap<String, target::TargetPools>>,
         ) -> (TestServer, TestServer) {
             let targets = Targets {
                 targets,
@@ -2509,398 +2793,6 @@ mod tests {
                 "an unknown model must NOT create a per-model series:\n{metrics_text}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_body_transformation_applied() {
-        use serde_json::json;
-
-        // Create a simple target
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "test-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create a body transformation function that adds a "transformed": true field
-        let transform_fn: BodyTransformFn = Arc::new(|_path, _headers, body_bytes| {
-            if let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-                && let Some(obj) = json_body.as_object_mut()
-            {
-                obj.insert("transformed".to_string(), json!(true));
-                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                    return Some(axum::body::Bytes::from(transformed_bytes));
-                }
-            }
-            None
-        });
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Make a request
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "Hello"}]
-            }))
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        // Check that the request was transformed before forwarding
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body["transformed"], true);
-        assert_eq!(forwarded_body["model"], "test-model");
-        assert_eq!(forwarded_body["messages"][0]["content"], "Hello");
-    }
-
-    #[tokio::test]
-    async fn test_body_transformation_not_applied_when_none() {
-        use serde_json::json;
-
-        // Create a simple target
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "test-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state = AppState::with_client(targets, mock_client.clone()); // No transform function
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Make a request
-        let original_body = json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hello"}]
-        });
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&original_body)
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        // Check that the request was NOT transformed
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(forwarded_body.get("transformed").is_none());
-        assert_eq!(forwarded_body["model"], "test-model");
-        assert_eq!(forwarded_body["messages"][0]["content"], "Hello");
-    }
-
-    #[tokio::test]
-    async fn test_body_transformation_returns_none() {
-        use serde_json::json;
-
-        // Create a simple target
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "test-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create a transformation function that always returns None (no transformation)
-        let transform_fn: BodyTransformFn = Arc::new(|_path, _headers, _body_bytes| None);
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Make a request
-        let original_body = json!({
-            "model": "test-model",
-            "messages": [{"role": "user", "content": "Hello"}]
-        });
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&original_body)
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        // Check that the request was NOT transformed since function returned None
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body, original_body);
-    }
-
-    #[tokio::test]
-    async fn test_openai_streaming_include_usage_transformation() {
-        use serde_json::json;
-
-        // Create a target for OpenAI
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "gpt-4".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.openai.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create a transformation function that forces include_usage for streaming requests
-        let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            // Only transform requests to OpenAI chat completions endpoint
-            if path == "/v1/chat/completions"
-                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-                && let Some(obj) = json_body.as_object_mut()
-            {
-                // Check if this is a streaming request
-                if let Some(stream) = obj.get("stream")
-                    && stream.as_bool() == Some(true)
-                {
-                    // Force include_usage to true for streaming requests
-                    obj.insert(
-                        "stream_options".to_string(),
-                        json!({
-                            "include_usage": true
-                        }),
-                    );
-
-                    if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                        return Some(axum::body::Bytes::from(transformed_bytes));
-                    }
-                }
-            }
-            None
-        });
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Test streaming request - should add include_usage
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&json!({
-                "model": "gpt-4",
-                "messages": [{"role": "user", "content": "Hello"}],
-                "stream": true
-            }))
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body["model"], "gpt-4");
-        assert_eq!(forwarded_body["stream"], true);
-        assert_eq!(forwarded_body["stream_options"]["include_usage"], true);
-    }
-
-    #[tokio::test]
-    async fn test_openai_non_streaming_not_transformed() {
-        use serde_json::json;
-
-        // Create a target for OpenAI
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "gpt-4".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.openai.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create the same transformation function
-        let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            if path == "/v1/chat/completions"
-                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-                && let Some(obj) = json_body.as_object_mut()
-                && let Some(stream) = obj.get("stream")
-                && stream.as_bool() == Some(true)
-            {
-                obj.insert(
-                    "stream_options".to_string(),
-                    json!({
-                        "include_usage": true
-                    }),
-                );
-
-                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                    return Some(axum::body::Bytes::from(transformed_bytes));
-                }
-            }
-            None
-        });
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Test non-streaming request - should NOT be transformed
-        let original_body = json!({
-            "model": "gpt-4",
-            "messages": [{"role": "user", "content": "Hello"}],
-            "stream": false
-        });
-
-        let response = server
-            .post("/v1/chat/completions")
-            .json(&original_body)
-            .await;
-
-        assert_eq!(response.status_code(), 200);
-
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 1);
-
-        let forwarded_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body, original_body);
-        assert!(forwarded_body.get("stream_options").is_none());
-    }
-
-    #[tokio::test]
-    async fn test_transformation_path_filtering() {
-        use serde_json::json;
-
-        // Create a target
-        let targets_map = Arc::new(DashMap::new());
-        targets_map.insert(
-            "test-model".to_string(),
-            pool(
-                Target::builder()
-                    .url("https://api.example.com".parse().unwrap())
-                    .build(),
-            ),
-        );
-
-        let targets = target::Targets {
-            targets: targets_map,
-            key_rate_limiters: Arc::new(DashMap::new()),
-            key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
-            strict_mode: false,
-            http_pool_config: None,
-        };
-
-        // Create a transformation function that only transforms specific paths
-        let transform_fn: BodyTransformFn = Arc::new(|path, _headers, body_bytes| {
-            if path == "/v1/chat/completions"
-                && let Ok(mut json_body) = serde_json::from_slice::<serde_json::Value>(body_bytes)
-                && let Some(obj) = json_body.as_object_mut()
-            {
-                obj.insert("path_transformed".to_string(), json!(path));
-                if let Ok(transformed_bytes) = serde_json::to_vec(&json_body) {
-                    return Some(axum::body::Bytes::from(transformed_bytes));
-                }
-            }
-            None
-        });
-
-        let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
-        let app_state =
-            AppState::with_client_and_transform(targets, mock_client.clone(), transform_fn);
-        let router = build_router(app_state);
-        let server = TestServer::new(router).unwrap();
-
-        // Test matching path - should be transformed
-        let response1 = server
-            .post("/v1/chat/completions")
-            .json(&json!({"model": "test-model", "test": "data"}))
-            .await;
-        assert_eq!(response1.status_code(), 200);
-
-        // Test non-matching path - should NOT be transformed
-        let response2 = server
-            .post("/v1/embeddings")
-            .json(&json!({"model": "test-model", "test": "data"}))
-            .await;
-        assert_eq!(response2.status_code(), 200);
-
-        let requests = mock_client.get_requests();
-        assert_eq!(requests.len(), 2);
-
-        // First request should be transformed
-        let forwarded_body1: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(forwarded_body1["path_transformed"], "/v1/chat/completions");
-
-        // Second request should NOT be transformed
-        let forwarded_body2: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
-        assert!(forwarded_body2.get("path_transformed").is_none());
     }
 
     mod response_headers_pricing {
@@ -3224,7 +3116,7 @@ mod tests {
             let pool = ProviderPool::new(providers);
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("test-model".to_string(), pool);
+            targets_map.insert("test-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
@@ -3280,7 +3172,7 @@ mod tests {
             let pool = ProviderPool::new(providers);
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("weighted-model".to_string(), pool);
+            targets_map.insert("weighted-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
@@ -3346,7 +3238,7 @@ mod tests {
             );
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("single-model".to_string(), pool);
+            targets_map.insert("single-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
@@ -3375,6 +3267,62 @@ mod tests {
             let requests = mock_client.get_requests();
             assert_eq!(requests.len(), 1);
             assert!(requests[0].uri.contains("api.single.com"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_provider_reasoning_fields_pass_through_only_in_non_strict_mode() {
+        for strict_mode in [false, true] {
+            for stream in [false, true] {
+                for path in ["/v1/chat/completions", "/v1/responses", "/v1/completions"] {
+                    let targets_map = Arc::new(DashMap::new());
+                    targets_map.insert(
+                        "model".to_string(),
+                        pool(
+                            Target::builder()
+                                .url("https://engine.example.com".parse().unwrap())
+                                .build(),
+                        ),
+                    );
+                    let targets = Targets {
+                        targets: targets_map,
+                        key_rate_limiters: Arc::new(DashMap::new()),
+                        key_concurrency_limiters: Arc::new(DashMap::new()),
+                        key_labels: Arc::new(DashMap::new()),
+                        strict_mode,
+                        http_pool_config: None,
+                    };
+                    let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+                    let server = TestServer::new(build_router(AppState::with_client(
+                        targets,
+                        mock_client.clone(),
+                    )))
+                    .unwrap();
+                    // Already translated by the public gateway; some mappings retain
+                    // the canonical effort alongside the provider-native controls.
+                    let mut body = json!({
+                        "model": "model", "messages": [], "input": "hello", "prompt": "hello",
+                        "stream": stream,
+                        "chat_template_kwargs": {"enable_thinking": true},
+                        "thinking_token_budget": 512
+                    });
+                    if path.ends_with("chat/completions") {
+                        body["reasoning_effort"] = json!("high");
+                    }
+                    let response = server.post(path).json(&body).await;
+                    let requests = mock_client.get_requests();
+                    if strict_mode {
+                        assert_eq!(response.status_code(), StatusCode::BAD_REQUEST);
+                        assert!(requests.is_empty());
+                    } else {
+                        assert_eq!(response.status_code(), StatusCode::OK);
+                        assert_eq!(requests.len(), 1);
+                        let forwarded: serde_json::Value =
+                            serde_json::from_slice(&requests[0].body).unwrap();
+                        assert_eq!(forwarded, body);
+                    }
+                }
+            }
         }
     }
 
@@ -3538,7 +3486,8 @@ mod tests {
                 target::LoadBalanceStrategy::Priority,
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
         let targets = Targets {
             targets: targets_map,
@@ -3705,7 +3654,8 @@ mod tests {
                 target::LoadBalanceStrategy::Priority,
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
         let targets = Targets {
             targets: targets_map,
@@ -3789,7 +3739,8 @@ mod tests {
                 target::LoadBalanceStrategy::Priority,
                 false,
                 Vec::new(),
-            ),
+            )
+            .into(),
         );
         let targets = Targets {
             targets: targets_map,
@@ -4227,7 +4178,7 @@ mod tests {
             ]);
 
             let targets_map = Arc::new(DashMap::new());
-            targets_map.insert("test-model".to_string(), pool);
+            targets_map.insert("test-model".to_string(), pool.into());
 
             let targets = Targets {
                 targets: targets_map,
@@ -4435,6 +4386,193 @@ mod tests {
             // When sanitization is disabled, upstream error body should pass through
             let body: serde_json::Value = response.json();
             assert_eq!(body["error"]["message"], "provider-specific detail");
+        }
+    }
+
+    /// Per-request-class pools, end to end through the router.
+    ///
+    /// A composite with a `completions` pool must send `/v1/completions` into
+    /// that pool and everything else into `default`. Asserted on the URL the
+    /// upstream client actually received, under both routers.
+    mod completions_pool {
+        use super::*;
+        use crate::target::{COMPLETIONS_POOL, LoadBalanceStrategy, TargetPools};
+        use std::collections::HashMap;
+
+        fn priority_pool(urls: &[&str]) -> ProviderPool {
+            ProviderPool::with_config(
+                urls.iter()
+                    .map(|url| {
+                        Provider::new(Target::builder().url(url.parse().unwrap()).build(), 1)
+                    })
+                    .collect(),
+                None,
+                None,
+                None,
+                None,
+                LoadBalanceStrategy::Priority,
+                false,
+                Vec::new(),
+            )
+        }
+
+        /// dynamo sits at position 0 of BOTH pools — the same hosted model is a
+        /// member of each, with independent ordering behind it.
+        fn flash_pools() -> TargetPools {
+            TargetPools::with_pools(
+                priority_pool(&[
+                    "https://dynamo.example.com",
+                    "https://openrouter.example.com",
+                ]),
+                HashMap::from([(
+                    COMPLETIONS_POOL.to_string(),
+                    priority_pool(&[
+                        "https://dynamo.example.com",
+                        "https://fireworks.example.com",
+                    ]),
+                )]),
+            )
+        }
+
+        fn server_with(strict_mode: bool, pools: TargetPools) -> (TestServer, MockHttpClient) {
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("dsv4-flash".to_string(), pools);
+            let targets = Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+                key_labels: Arc::new(DashMap::new()),
+                strict_mode,
+                http_pool_config: None,
+            };
+            let mock_client = MockHttpClient::new(
+                StatusCode::OK,
+                r#"{"id":"cmpl-1","object":"text_completion","created":0,"model":"dsv4-flash","choices":[]}"#,
+            );
+            let app_state = AppState::with_client(targets, mock_client.clone());
+            let server = TestServer::new(build_router(app_state)).unwrap();
+            (server, mock_client)
+        }
+
+        /// The completions pool's first member answers — the on-prem one, which
+        /// is free for us; the validated third-party target is its failover.
+        #[tokio::test]
+        async fn completions_requests_are_served_by_the_completions_pool() {
+            for strict_mode in [false, true] {
+                let (server, client) = server_with(strict_mode, flash_pools());
+                let response = server
+                    .post("/v1/completions")
+                    .json(&json!({"model": "dsv4-flash", "prompt": [1, 2, 3]}))
+                    .await;
+                assert_eq!(
+                    response.status_code(),
+                    StatusCode::OK,
+                    "strict={strict_mode}"
+                );
+
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1, "strict={strict_mode}");
+                assert!(
+                    requests[0].uri.starts_with("https://dynamo.example.com/"),
+                    "strict={strict_mode}: got {}",
+                    requests[0].uri
+                );
+            }
+        }
+
+        /// "Never serves chat" is structural: the validated completions target
+        /// is not a member of the default pool, so chat traffic cannot reach it
+        /// even when the default pool fails over.
+        #[tokio::test]
+        async fn chat_requests_never_reach_the_completions_pool() {
+            for strict_mode in [false, true] {
+                let (server, client) = server_with(strict_mode, flash_pools());
+                let response = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({
+                        "model": "dsv4-flash",
+                        "messages": [{"role": "user", "content": "hi"}]
+                    }))
+                    .await;
+                assert!(
+                    response.status_code().is_success(),
+                    "strict={strict_mode}: {}",
+                    response.status_code()
+                );
+
+                let requests = client.requests.lock().unwrap();
+                assert!(
+                    requests.iter().all(|r| !r.uri.contains("fireworks")),
+                    "strict={strict_mode}: {:?}",
+                    requests.iter().map(|r| r.uri.clone()).collect::<Vec<_>>()
+                );
+            }
+        }
+
+        /// Rule 3: a composite with no completions pool serves completions from
+        /// its default pool, exactly as before named pools existed.
+        #[tokio::test]
+        async fn a_composite_without_a_completions_pool_serves_completions_from_default() {
+            for strict_mode in [false, true] {
+                let (server, client) = server_with(
+                    strict_mode,
+                    priority_pool(&["https://dynamo.example.com"]).into(),
+                );
+                let response = server
+                    .post("/v1/completions")
+                    .json(&json!({"model": "dsv4-flash", "prompt": "hi"}))
+                    .await;
+                assert_eq!(
+                    response.status_code(),
+                    StatusCode::OK,
+                    "strict={strict_mode}"
+                );
+
+                let requests = client.requests.lock().unwrap();
+                assert_eq!(requests.len(), 1, "strict={strict_mode}");
+                assert!(
+                    requests[0].uri.starts_with("https://dynamo.example.com/"),
+                    "strict={strict_mode}: got {}",
+                    requests[0].uri
+                );
+            }
+        }
+
+        /// An EMPTY completions pool is treated as an absent one: the default
+        /// pool serves the class, exactly as it did before the pool existed.
+        ///
+        /// A pool whose members were all removed or disabled must not start
+        /// 503-ing traffic the default pool handled the day before. Resume legs
+        /// are kept off unvalidated members upstream of here — dwctl only calls
+        /// a model resumable while its completions pool has a member.
+        #[tokio::test]
+        async fn an_empty_completions_pool_falls_back_to_the_default() {
+            let pools = TargetPools::with_pools(
+                priority_pool(&["https://openrouter.example.com"]),
+                HashMap::from([(COMPLETIONS_POOL.to_string(), ProviderPool::new(vec![]))]),
+            );
+            assert!(
+                pools
+                    .resolved_name(crate::target::RequestClass::Completions)
+                    .is_none(),
+                "an empty pool is not a picked pool"
+            );
+            let (server, client) = server_with(false, pools);
+
+            let response = server
+                .post("/v1/completions")
+                .json(&json!({"model": "dsv4-flash", "prompt": "hi"}))
+                .await;
+            assert_eq!(response.status_code(), StatusCode::OK);
+            let requests = client.requests.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(
+                requests[0]
+                    .uri
+                    .starts_with("https://openrouter.example.com/"),
+                "got {}",
+                requests[0].uri
+            );
         }
     }
 }

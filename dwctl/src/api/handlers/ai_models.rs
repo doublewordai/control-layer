@@ -126,6 +126,11 @@ fn parse_optional_bool(param: &'static str, value: Option<&str>) -> Result<Optio
 /// This intentionally does not filter by credit balance. Credit balance controls
 /// dispatch eligibility in the onwards key sync; model discovery should reflect
 /// access grants so users can still see what would be available after top-up.
+// An axum handler's error type is the response it will send, so the `Err`
+// variant is a whole `Response` by construction. Boxing it to satisfy the lint
+// would add an allocation on every error path and make this handler's signature
+// differ from every other one for no benefit.
+#[allow(clippy::result_large_err)]
 pub async fn list_ai_models<P: PoolProvider>(
     State(state): State<AppState<P>>,
     Query(query): Query<ModelsListQuery>,
@@ -163,7 +168,7 @@ pub async fn list_ai_models<P: PoolProvider>(
         WHERE ak.secret = $1
           AND ak.is_deleted = FALSE
           AND u.is_deleted = FALSE
-          AND ak.purpose IN ('realtime', 'batch', 'playground')
+          AND ak.purpose IN ('realtime', 'batch', 'playground', 'continuation')
         LIMIT 1
         "#,
     )
@@ -173,9 +178,11 @@ pub async fn list_ai_models<P: PoolProvider>(
     .map_err(|e| database_error("lookup_api_key", e))?;
 
     let Some(user_id) = user_id else {
+        // See INVALID_API_KEY_MESSAGE: a wrong-region key looks identical to an
+        // invalid one, so the copy nudges users to check their regional endpoint.
         return Err(openai_error(
             StatusCode::UNAUTHORIZED,
-            "Invalid API key",
+            crate::errors::INVALID_API_KEY_MESSAGE,
             "authentication_error",
             "invalid_api_key",
         ));

@@ -131,7 +131,13 @@ async fn translate_response_back(
             Ok(new_body) => json_response(status, new_body),
             Err(e) => {
                 warn!(error = %e, translator = translator.name(), "edge translation: response translate failed");
-                error_response(translator, StatusCode::BAD_GATEWAY, "response translation failed")
+                // Deliberately NOT a 5xx: the upstream succeeded, and the same
+                // body will fail translation identically on every attempt, so
+                // this must map to a status fusillade classifies as
+                // non-retriable (it retries >=500, 429, 408 and 404) or a
+                // daemon-dispatched request retry-loops on it forever
+                // (COR-630).
+                error_response(translator, StatusCode::UNPROCESSABLE_ENTITY, "response translation failed")
             }
         }
     } else {
@@ -332,7 +338,9 @@ mod tests {
     }
 
     /// A 2xx downstream body that cannot be translated becomes an Anthropic error
-    /// envelope, not a plain-text 502.
+    /// envelope, with a status the batch daemon will not retry: the upstream
+    /// succeeded, so the same body fails translation identically on every
+    /// attempt.
     #[tokio::test]
     async fn untranslatable_success_body_becomes_anthropic_error() {
         async fn bad_handler(_req: Request) -> Response {
@@ -349,7 +357,7 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(response.status_code().as_u16(), 502);
+        assert_eq!(response.status_code().as_u16(), 422);
         let body: serde_json::Value = response.json();
         assert_eq!(body["type"], "error");
     }

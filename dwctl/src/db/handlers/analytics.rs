@@ -1773,7 +1773,7 @@ mod tests {
     // repeated calls for a batch accumulate.
     async fn insert_test_analytics_with_batch_id(pool: &PgPool, data: TestBatchAnalyticsData<'_>) {
         use crate::api::models::users::Role;
-        use crate::request_logging::batcher::list_price;
+        use crate::pricing::list_price;
         use crate::test::utils::create_test_user;
         use rust_decimal::Decimal;
         use uuid::Uuid;

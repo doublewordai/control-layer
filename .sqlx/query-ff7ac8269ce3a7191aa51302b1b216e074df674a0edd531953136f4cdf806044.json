@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH ranked AS (\n                SELECT id, ROW_NUMBER() OVER (ORDER BY sort_order ASC, weight DESC, created_at ASC) - 1 AS new_order\n                FROM deployed_model_components\n                WHERE composite_model_id = $1 AND pool = $2\n            )\n            UPDATE deployed_model_components dmc\n            SET sort_order = ranked.new_order\n            FROM ranked\n            WHERE dmc.id = ranked.id\n              AND dmc.sort_order IS DISTINCT FROM ranked.new_order\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ff7ac8269ce3a7191aa51302b1b216e074df674a0edd531953136f4cdf806044"
+}

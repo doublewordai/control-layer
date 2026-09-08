@@ -82,7 +82,6 @@ export interface ComponentModelSummary {
   model_type?: ModelType;
   endpoint?: ComponentEndpointSummary;
   trusted?: boolean;
-  open_responses_adapter?: boolean;
 }
 
 export interface ModelComponent {
@@ -90,6 +89,12 @@ export interface ModelComponent {
   enabled: boolean;
   sort_order: number; // Lower = higher priority for priority-based routing
   created_at: string;
+  // Which routing pool this membership belongs to. "default" serves chat;
+  // "completions" holds validated continuation targets for /v1/completions.
+  // The same hosted model can be a member of both, with independent ordering,
+  // and component PATCH/DELETE endpoints address one membership at a time
+  // (server default: ?pool=default).
+  pool: "default" | "completions";
   model: ComponentModelSummary;
 }
 
@@ -327,7 +332,6 @@ export interface Model {
   components?: ModelComponent[]; // only present when include=components
   sanitize_responses?: boolean | null; // only present for virtual models
   trusted?: boolean; // Mark provider as trusted in strict mode (bypasses error sanitization)
-  open_responses_adapter?: boolean; // Enable adapter that converts /v1/responses to /v1/chat/completions
   reasoning_translation_overrides?: ReasoningTranslationOverrides | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
@@ -350,7 +354,6 @@ export interface StandardModelCreate {
   batch_capacity?: number;
   throughput?: number;
   trusted?: boolean;
-  open_responses_adapter?: boolean;
   reasoning_translation_overrides?: ReasoningTranslationOverrides;
   traffic_routing_rules?: TrafficRoutingRule[];
   allowed_batch_completion_windows?: string[];
@@ -544,7 +547,7 @@ export interface ModelsQuery {
   group?: string; // Filter by group IDs (comma-separated UUIDs)
   include?: ModelsInclude;
   accessible?: boolean; // Filter to only models the current user can access
-  search?: string; // Search query to filter models by alias or model_name
+  search?: string; // Case-insensitive search across alias, model name, display name, and endpoint name
   is_composite?: boolean; // Filter by composite/virtual model status (true = virtual, false = hosted)
   provider?: string; // Filter by provider name (case-insensitive exact match)
   model_type?: ModelType; // Filter by model type (CHAT, EMBEDDINGS, RERANKER)
@@ -666,7 +669,6 @@ export interface ModelUpdateRequest {
   backoff_max_total_ms?: number | null;
   sanitize_responses?: boolean | null;
   trusted?: boolean | null;
-  open_responses_adapter?: boolean | null;
   reasoning_translation_overrides?: ReasoningTranslationOverrides | null;
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
@@ -1347,6 +1349,12 @@ export interface Batch {
   cancelled_at?: number | null;
   request_counts: BatchRequestCounts;
   metadata?: Record<string, string>;
+  /**
+   * Model alias used by the batch's requests, or "mixed" when the input
+   * file spans multiple models. Absent on batches created before the
+   * backend started stamping it.
+   */
+  model?: string | null;
   usage?: BatchUsage;
   /** Included when requesting with include=analytics */
   analytics?: BatchAnalytics;
@@ -1714,9 +1722,27 @@ export interface OrganizationSummary {
   can_manage_keys: boolean;
 }
 
+/**
+ * An organization contact-email change that is still awaiting verification.
+ * The backend never applies an email change directly: both the current and
+ * the new mailbox must click a confirmation link before `email` updates.
+ */
+export interface PendingEmailChange {
+  /** The address `email` will become once both sides confirm. */
+  new_email: string;
+  /** When the confirmation links expire (ISO 8601). */
+  expires_at: string;
+  /** When the new mailbox confirmed; null/absent while still outstanding. */
+  new_email_confirmed_at?: string | null;
+  /** When the current mailbox confirmed; null/absent while still outstanding. */
+  old_email_confirmed_at?: string | null;
+}
+
 /** Organization response — flattened User with org-specific fields */
 export interface Organization extends User {
   member_count?: number;
+  /** Present while an email change is waiting on confirmation. */
+  pending_email_change?: PendingEmailChange;
 }
 
 export interface OrganizationMember {

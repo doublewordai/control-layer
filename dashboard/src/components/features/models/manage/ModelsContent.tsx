@@ -65,6 +65,13 @@ import { Markdown } from "../../../ui/markdown";
 import { isBatchDenied, isPlaygroundDenied, isRealtimeDenied } from "../../../../utils/modelAccess";
 import { copyToClipboard } from "../../../../utils/clipboard";
 
+// Hosted-model counts show CHAT-serving members only: the completions pool is
+// the continuation mechanism's separate failover list (same deployment may sit
+// in both), and counting it here double-counts and confuses operators.
+const defaultPoolCount = (components?: { pool?: string }[]) =>
+  (components ?? []).filter((c) => (c.pool ?? "default") === "default").length;
+
+
 const COMPLETION_WINDOWS: Record<
   string,
   { label: string; icon: typeof Clock; sort: number }
@@ -425,10 +432,10 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                                       .
                                     </p>
                                     {model.components &&
-                                      model.components.length > 0 && (
+                                      defaultPoolCount(model.components) > 0 && (
                                         <p className="text-xs text-muted-foreground">
-                                          {model.components.length} hosted model
-                                          {model.components.length !== 1
+                                          {defaultPoolCount(model.components)} hosted model
+                                          {defaultPoolCount(model.components) !== 1
                                             ? "s"
                                             : ""}{" "}
                                           configured
@@ -660,8 +667,8 @@ export const ModelsContent: React.FC<ModelsContentProps> = ({
                             <span className="text-gray-500 text-sm">
                               {canManageGroups && model.is_composite ? (
                                 <span className="font-medium text-gray-600">
-                                  {model.components?.length || 0} hosted model
-                                  {(model.components?.length || 0) !== 1 ? "s" : ""}
+                                  {defaultPoolCount(model.components)} hosted model
+                                  {defaultPoolCount(model.components) !== 1 ? "s" : ""}
                                 </span>
                               ) : (
                                 <>

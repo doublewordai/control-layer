@@ -37,7 +37,6 @@ fn client(stall: Duration) -> ReqwestHttpClient {
         Duration::from_secs(10),
         Duration::from_secs(10),
         Duration::from_secs(10),
-        vec![],
     )
     .with_upload_stall_timeout(stall)
 }

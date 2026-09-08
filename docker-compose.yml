@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:15
+    image: postgres:17
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-control_layer}
       POSTGRES_USER: ${POSTGRES_USER:-control_layer}
@@ -20,7 +20,7 @@ services:
     ports:
       - "3001:3001"
     environment:
-      - RUST_LOG={RUST_LOG:-info}
+      - RUST_LOG=${RUST_LOG:-info}
       - DATABASE_URL=postgres://control_layer:control_layer_password@postgres:5432/control_layer
       - DWCTL_SECRET_KEY=mysupersecretkey
 

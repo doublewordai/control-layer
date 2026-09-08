@@ -158,6 +158,64 @@ pub struct UsageMetrics {
     /// place per-request routing attribution is knowable. `None` when the
     /// request never reached an upstream (or predates the extension).
     pub served_by: Option<String>,
+    /// Cached-prompt count as reported by the UPSTREAM in
+    /// `usage.prompt_tokens_details.cached_tokens` (SGLang/vLLM through the dynamo
+    /// frontend, OpenAI-compatible providers). Observational only: distinct from
+    /// `cache_read_input_tokens`, which is dwctl's own cache layer and drives billing.
+    /// `None` when the upstream reported nothing. See `extract_engine_cached_tokens`.
+    pub engine_cached_tokens: Option<i64>,
+    /// Content-free request parameters read off the parsed request body.
+    pub request_params: RequestParams,
+}
+
+/// Content-free request parameters, read off the parsed request body.
+///
+/// All `None` when the body did not parse as a typed chat/completions request
+/// (embeddings, the Responses API, opaque bodies). `stream` is `Some(false)` when a typed
+/// request omitted the field, because "not streaming" is the meaningful value there.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RequestParams {
+    pub stream: Option<bool>,
+    /// `max_completion_tokens` when present, else `max_tokens`.
+    pub max_tokens: Option<i64>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub n: Option<i32>,
+    /// Number of tool definitions on the request (`tools`). Chat completions only.
+    pub tool_count: Option<i32>,
+    /// Number of entries in `messages`. Chat completions only.
+    pub message_count: Option<i32>,
+}
+
+impl RequestParams {
+    /// Read the parameters off a parsed request. Never fails: unsupported shapes yield the
+    /// all-`None` default.
+    pub fn from_parsed(parsed: &ParsedAIRequest) -> Self {
+        if parsed.responses_request.is_some() {
+            return Self::default();
+        }
+        match &parsed.request {
+            AiRequest::ChatCompletions(req) => Self {
+                stream: Some(req.stream.unwrap_or(false)),
+                max_tokens: req.max_completion_tokens.or(req.max_tokens).map(i64::from),
+                temperature: req.temperature,
+                top_p: req.top_p,
+                n: req.n.map(|n| i32::try_from(n).unwrap_or(i32::MAX)),
+                tool_count: Some(req.tools.as_ref().map(|t| t.len()).unwrap_or(0) as i32),
+                message_count: Some(req.messages.len() as i32),
+            },
+            AiRequest::Completions(req) => Self {
+                stream: Some(req.stream.unwrap_or(false)),
+                max_tokens: req.max_tokens.map(i64::from),
+                temperature: req.temperature,
+                top_p: req.top_p,
+                n: req.n.map(|n| i32::try_from(n).unwrap_or(i32::MAX)),
+                tool_count: None,
+                message_count: None,
+            },
+            AiRequest::Embeddings(_) | AiRequest::Other(_) => Self::default(),
+        }
+    }
 }
 
 /// Parses HTTP request body data into structured AI request types.
@@ -228,12 +286,41 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
         };
     }
 
-    match serde_json::from_str(&body_str) {
-        Ok(request) => Ok(ParsedAIRequest {
-            headers,
-            request,
-            responses_request: None,
-        }),
+    // On a known endpoint the path is authoritative and the body is not. Untagged
+    // classification disambiguates on each variant's required fields, and the
+    // completions shape requires only `model`, so a chat body that fails its own
+    // parse (malformed `messages`, say) would otherwise fall through and be recorded
+    // as a completions request rather than as unrecognised. Same reasoning that
+    // already drives the /responses branch above.
+    //
+    // An unknown path keeps the untagged parse, so callers that do not carry a real
+    // endpoint path behave exactly as before.
+    let path = request_data.uri.path();
+    let known_endpoint = |value: Value| -> Option<AiRequest> {
+        if path.ends_with("/chat/completions") {
+            Some(serde_json::from_value(value.clone()).map_or(AiRequest::Other(value), AiRequest::ChatCompletions))
+        } else if path.ends_with("/embeddings") {
+            Some(serde_json::from_value(value.clone()).map_or(AiRequest::Other(value), AiRequest::Embeddings))
+        } else if path.ends_with("/completions") {
+            Some(serde_json::from_value(value.clone()).map_or(AiRequest::Other(value), AiRequest::Completions))
+        } else {
+            None
+        }
+    };
+
+    match serde_json::from_str::<Value>(&body_str) {
+        Ok(value) => {
+            let request = match known_endpoint(value.clone()) {
+                Some(request) => request,
+                // Unknown path: untagged, as before.
+                None => serde_json::from_value(value.clone()).unwrap_or(AiRequest::Other(value)),
+            };
+            Ok(ParsedAIRequest {
+                headers,
+                request,
+                responses_request: None,
+            })
+        }
         Err(e) => {
             // Always base64 encode unparseable content to avoid PostgreSQL issues
             let base64_encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes);
@@ -243,6 +330,23 @@ pub fn parse_ai_request(request_data: &RequestData) -> Result<ParsedAIRequest, S
             })
         }
     }
+}
+
+/// Whether a captured response body is an SSE stream rather than a single JSON body.
+///
+/// The dispatch used to announce this with a request header, because the layer that
+/// reassembled the stream sat above this one and so this one saw the raw frames while
+/// the captured request body still said `stream: false`. Reassembly now happens below
+/// this layer, so a stream reaching here is either a genuine client-facing one or a
+/// stored body from before that change, and in both cases the body says so itself.
+///
+/// SSE is a sequence of `field: value` lines, and the first non-blank line of anything
+/// this captures is a `data:` or `event:` field. A JSON body starts with `{` or `[`, so
+/// the two cannot be confused.
+fn looks_like_sse(body: &str) -> bool {
+    body.lines()
+        .find(|line| !line.trim().is_empty())
+        .is_some_and(|line| line.starts_with("data:") || line.starts_with("event:"))
 }
 
 /// Parses HTTP response body data into structured AI response types.
@@ -278,20 +382,16 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
         return Ok(AiResponse::Other(Value::Null));
     }
 
-    // Onwards injects stream:true into the forwarded body when it sees this header,
-    // but outlet captures the original request body (without stream:true). Check the
-    // header so we know to use the streaming parser for the response.
-    let fusillade_stream = request_data
-        .headers
-        .get("x-fusillade-stream")
-        .and_then(|values| values.first())
-        .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        == Some("true");
+    // Batch traffic is dispatched as a stream so the provider reports usage, but the
+    // captured request body is the caller's and still says `stream: false`. The
+    // response is self-describing, so take it from that rather than from a header the
+    // dispatch had to add for this layer's benefit.
+    let sse_body = looks_like_sse(&body_str);
 
     // /v1/messages (Anthropic) has its own SSE event lifecycle and a distinct
     // blocking shape, both produced by dwctl's edge translator. Detect it by path
     // (like /responses) - stream is signalled by the request body's `stream` flag
-    // or the fusillade header.
+    // or by the response arriving as SSE.
     let result = if request_data.uri.path().ends_with("/messages") {
         let anthropic_stream = request_data
             .body
@@ -299,7 +399,7 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
             .and_then(|b| serde_json::from_slice::<Value>(b).ok())
             .and_then(|v| v.get("stream").and_then(Value::as_bool))
             .unwrap_or(false)
-            || fusillade_stream;
+            || sse_body;
         if anthropic_stream {
             utils::parse_anthropic_streaming_response(&body_str)
         } else {
@@ -314,7 +414,7 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
             Ok(parsed_request) => {
                 // /v1/responses has its own SSE event format distinct from chat completions.
                 if let Some(responses_req) = &parsed_request.responses_request {
-                    if responses_req.stream.unwrap_or(false) || fusillade_stream {
+                    if responses_req.stream.unwrap_or(false) || sse_body {
                         utils::parse_responses_streaming_response(&body_str)
                     } else {
                         // Try the typed Response parser first. Fall back to the generic untagged
@@ -331,7 +431,7 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
                     // used to lose it there, send a streamed body to the non-streaming
                     // parser, and bill the request ZERO tokens. `Other` carries the raw
                     // `Value`, so take the flag from that instead of re-parsing the body.
-                    let is_streaming = fusillade_stream
+                    let is_streaming = sse_body
                         || match &parsed_request.request {
                             AiRequest::ChatCompletions(req) => req.stream.unwrap_or(false),
                             AiRequest::Completions(req) => req.stream.unwrap_or(false),
@@ -388,11 +488,13 @@ impl UsageMetrics {
     ) -> Self {
         // Extract model from request.
         // First try typed deserialization (ChatCompletions, Completions, Embeddings).
-        // If that fails (e.g. request uses content types async_openai doesn't know about,
+        // If that fails (e.g. request uses content types the strict schemas don't model,
         // like Responses API's input_text/input_image), fall back to extracting the
         // "model" field from raw JSON.
-        let request_model = match parse_ai_request(request_data) {
-            Ok(parsed_request) => {
+        let parsed_request = parse_ai_request(request_data).ok();
+        let request_params = parsed_request.as_ref().map(RequestParams::from_parsed).unwrap_or_default();
+        let request_model = match parsed_request {
+            Some(parsed_request) => {
                 if let Some(responses_req) = parsed_request.responses_request {
                     responses_req.model
                 } else {
@@ -414,17 +516,47 @@ impl UsageMetrics {
                     }
                 }
             }
-            _ => None,
+            None => None,
         };
 
         // Token metrics come from the single parse of the response into `AiResponse`
         // (the same value request logging stores), normalised to one currency here.
-        let metrics = TokenMetrics::from(parsed_response);
+        let mut metrics = TokenMetrics::from(parsed_response);
+
+        // Raw-usage fallback: some upstreams answer 200 with real usage in a shape the typed
+        // parse cannot represent — OpenRouter emits `finish_reason: "error"` (not a variant
+        // of the enum), Dynamo omits the message `role` — and the untagged parse falls
+        // through to `Other`, reading zero. Billing zero for a request the provider counted
+        // (and charges us for) is a silent revenue leak, and it writes the impossible
+        // `prompt < read + creation` signature because the cache split below is read from
+        // the raw body and survives. When the typed parse produced no counts but the body
+        // plainly carries a usage object, read the counts from the raw JSON. Measured before
+        // this existed: 149 such rows for one user in 10 days, 3.75M prompt tokens billed
+        // at nothing (~$7.09).
+        if metrics.prompt_tokens == 0
+            && metrics.completion_tokens == 0
+            && metrics.total_tokens == 0
+            && let Some(raw) = extract_from_last_usage(response_data, raw_usage_tokens)
+        {
+            metrics.prompt_tokens = raw.prompt;
+            metrics.completion_tokens = raw.completion;
+            metrics.reasoning_tokens = raw.reasoning;
+            metrics.total_tokens = raw.total;
+        }
 
         // The cache split lives in extension fields the typed parse drops, so read it from
         // the raw `usage` object. It only exists on a successful response that carried a
         // usage frame, so an errored/partial stream naturally extracts zero (no cache bill).
         let cache_tokens = extract_cache_tokens(response_data);
+        // The cache layer (inside outlet) rewrites `prompt_tokens_details.cached_tokens`
+        // before this body is read, so prefer the value it stashed on the way through.
+        // The body is only the truth when no cache layer touched the response.
+        let engine_cached_tokens = response_data
+            .extensions
+            .get::<crate::prompt_cache::UpstreamCachedTokens>()
+            .and_then(|c| c.get())
+            .map(|v| i64::try_from(v).unwrap_or(i64::MAX))
+            .or_else(|| extract_engine_cached_tokens(response_data));
 
         // Streams that started with HTTP 200 but ended with an embedded provider error frame
         // get reclassified to 500 so success-rate / availability metrics, the credits-eligibility
@@ -462,6 +594,8 @@ impl UsageMetrics {
             server_address: config.host.clone(),
             server_port: config.port,
             served_by: response_data.extensions.get::<onwards::ServedBy>().map(|s| s.url.clone()),
+            engine_cached_tokens,
+            request_params,
         }
     }
 }
@@ -480,12 +614,16 @@ fn ai_response_stream_errored(response: &AiResponse) -> bool {
 }
 
 /// The cache token split read from a response `usage` object.
+///
+/// Visible to the crate because [`crate::recompute`] replays a stored response through this
+/// same extractor rather than re-implementing it — a recompute that read the split
+/// differently from the live path would "correct" healthy requests.
 #[derive(Debug, Clone, Copy, Default)]
-struct CacheTokens {
-    read: i64,
-    creation_5m: i64,
-    creation_1h: i64,
-    creation_24h: i64,
+pub(crate) struct CacheTokens {
+    pub read: i64,
+    pub creation_5m: i64,
+    pub creation_1h: i64,
+    pub creation_24h: i64,
 }
 
 /// Pull the cache split out of a single `usage` JSON object. Reads come **only** from
@@ -529,9 +667,83 @@ fn cache_tokens_from_usage(usage: &Value) -> CacheTokens {
 /// terminal `data:` frame (take the last one seen). Returns all-zero when there is no
 /// usage object (non-cache request, error body, or a stream that died before its usage
 /// frame) — which is exactly the no-cache-billing case.
-fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
+pub(crate) fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
+    extract_from_last_usage(response_data, cache_tokens_from_usage)
+}
+
+/// The upstream's own cached-prompt count: `usage.prompt_tokens_details.cached_tokens`
+/// (the OpenAI-compatible shape SGLang, vLLM and the dynamo frontend emit). This is the
+/// engine's prefix-cache hit for the request, recorded for workload profiling. It is NOT
+/// a dwctl cache read — `cache_tokens_from_usage` keeps ignoring it on purpose — and is
+/// never priced. `None` when the field is absent.
+fn engine_cached_tokens_from_usage(usage: &Value) -> Option<i64> {
+    usage
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_i64)
+        .map(|v| v.max(0))
+}
+
+/// See [`engine_cached_tokens_from_usage`]; reads the last `usage` block like the other
+/// usage extractors (terminal SSE frame for streams).
+pub(crate) fn extract_engine_cached_tokens(response_data: &ResponseData) -> Option<i64> {
+    extract_from_last_usage(response_data, engine_cached_tokens_from_usage)
+}
+
+/// Token counts read straight from a raw `usage` JSON object, for bodies the typed parse
+/// cannot represent. Field semantics mirror [`TokenMetrics`]'s arms exactly: an OpenAI
+/// `prompt_tokens` is already the total input; an Anthropic `input_tokens` excludes the
+/// cache buckets, which are added back — reading it verbatim is the August incident.
+///
+/// Shared by the live path's raw-usage fallback and [`crate::recompute`]'s replay of stored
+/// fusillade bodies, so the two can never read the same unrepresentable body differently.
+pub(crate) struct RawUsageTokens {
+    pub prompt: i64,
+    pub completion: i64,
+    pub reasoning: i64,
+    pub total: i64,
+}
+
+/// Read [`RawUsageTokens`] out of one `usage` object, or `None` when it carries neither an
+/// OpenAI-shaped nor an Anthropic-shaped input count (nothing recognisable to bill on).
+pub(crate) fn raw_usage_tokens(usage: &Value) -> Option<RawUsageTokens> {
+    let get = |k: &str| usage.get(k).and_then(Value::as_i64);
+    let prompt = match get("prompt_tokens") {
+        Some(p) => p,
+        None => {
+            get("input_tokens")?
+                + get("cache_read_input_tokens").unwrap_or(0).max(0)
+                + get("cache_creation_input_tokens").unwrap_or(0).max(0)
+        }
+    };
+    let completion = get("completion_tokens").or_else(|| get("output_tokens")).unwrap_or(0);
+    let reasoning = usage
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    // Floor everything at 0 (malformed bodies must not reach the cost maths), and derive the
+    // total where the shape reports none, as the Anthropic arm does.
+    let prompt = prompt.max(0);
+    let completion = completion.max(0);
+    let total = get("total_tokens").unwrap_or(prompt + completion).max(0);
+    Some(RawUsageTokens {
+        prompt,
+        completion,
+        reasoning: reasoning.max(0),
+        total,
+    })
+}
+
+/// Locate the response's final `usage` object and map it with `from_usage`.
+///
+/// Factored out of [`extract_cache_tokens`] so that a caller reading a *raw upstream* body
+/// can apply different field semantics without duplicating the body handling — the
+/// decompress fallback and the SSE last-frame-wins scan are fiddly and must not diverge.
+/// The live path keeps [`cache_tokens_from_usage`]; [`crate::recompute`] passes a variant
+/// that also understands the provider's flat `cache_creation_input_tokens`, which appears
+/// in stored fusillade bodies but never in a body dwctl itself annotated.
+pub(crate) fn extract_from_last_usage<T: Default>(response_data: &ResponseData, from_usage: impl Fn(&Value) -> T) -> T {
     let Some(body) = &response_data.body else {
-        return CacheTokens::default();
+        return T::default();
     };
     // On a decompress failure (e.g. a mis-set Content-Encoding on an actually-plain body),
     // fall back to the raw bytes rather than silently returning zero cache tokens — zeroing
@@ -550,12 +762,12 @@ fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
     if let Ok(value) = serde_json::from_str::<Value>(body_str.trim())
         && let Some(usage) = value.get("usage").filter(|u| u.is_object())
     {
-        return cache_tokens_from_usage(usage);
+        return from_usage(usage);
     }
 
     // Streaming: scan SSE frames, keeping the last one that carries a usage object.
     // SSE allows `data:<value>` and `data: <value>` — strip the colon then an optional space.
-    let mut last = CacheTokens::default();
+    let mut last = T::default();
     for line in body_str.lines() {
         if let Some(data) = line.strip_prefix("data:") {
             let data = data.strip_prefix(' ').unwrap_or(data);
@@ -564,7 +776,7 @@ fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
                 && let Ok(value) = serde_json::from_str::<Value>(trimmed)
                 && let Some(usage) = value.get("usage").filter(|u| u.is_object())
             {
-                last = cache_tokens_from_usage(usage);
+                last = from_usage(usage);
             }
         }
     }
@@ -604,8 +816,6 @@ impl Auth {
 /// loop. The client executes the tool itself and sends a fresh request, so the follow-up
 /// arrives with its own `fusillade_request_id` and is otherwise indistinguishable from an
 /// ordinary multi-turn message. Without this the whole class of usage is invisible.
-/// (Server-side tool loops are a different thing entirely, counted by `tool_iterations`
-/// and detailed in `tool_call_analytics`.)
 ///
 /// Deliberately a free function over the already-deserialised `AiResponse` rather than a
 /// field on `TokenMetrics`: nothing new is parsed, and none of the nine `TokenMetrics`
@@ -631,12 +841,12 @@ fn extract_finish_reason(response: &AiResponse) -> Option<String> {
     match response {
         AiResponse::ChatCompletions(r) => r.choices.first()?.finish_reason.as_ref().and_then(as_wire),
         AiResponse::ChatCompletionsStream(chunks) => chunks.iter().rev().find_map(|c| match c {
-            ChatCompletionChunk::Normal(n) => n.choices.first()?.finish_reason.as_ref().and_then(as_wire),
+            ChatCompletionChunk::Chunk(n) => n.choices.first()?.finish_reason.as_ref().and_then(as_wire),
             _ => None,
         }),
         AiResponse::Completions(r) => r.choices.first()?.finish_reason.as_ref().and_then(as_wire),
         AiResponse::CompletionsStream(chunks) => chunks.iter().rev().find_map(|c| match c {
-            CompletionChunk::Normal(n) => n.choices.first()?.finish_reason.as_ref().and_then(as_wire),
+            CompletionChunk::Chunk(n) => n.choices.first()?.finish_reason.as_ref().and_then(as_wire),
             _ => None,
         }),
         // Neither the Responses API nor Anthropic Messages has an OpenAI-style finish_reason.
@@ -645,27 +855,35 @@ fn extract_finish_reason(response: &AiResponse) -> Option<String> {
         // guessed at here, so a NULL means "not extracted yet" rather than "no tool call".
         AiResponse::Responses(_) | AiResponse::ResponsesStream(_) => None,
         AiResponse::Anthropic(_) | AiResponse::AnthropicStream(_) => None,
-        AiResponse::Embeddings(_) | AiResponse::Base64Embeddings(_) | AiResponse::Other(_) => None,
+        AiResponse::Embeddings(_) | AiResponse::Other(_) => None,
     }
 }
 
-/// Helper struct for extracting token metrics from responses
+/// Helper struct for extracting token metrics from responses.
+///
+/// Visible to the crate because [`crate::recompute`] replays a stored response through
+/// `From<&AiResponse>` rather than re-deriving counts of its own. That is what makes a
+/// recompute of healthy traffic a guaranteed no-op: it is the same code that produced the
+/// original row, so any delta it reports is a real change in what this code believes — not
+/// a second opinion.
 #[derive(Debug, Clone)]
-struct TokenMetrics {
-    prompt_tokens: i64,
-    completion_tokens: i64,
-    reasoning_tokens: i64,
-    total_tokens: i64,
-    response_type: String,
-    response_model: Option<String>,
+pub(crate) struct TokenMetrics {
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub reasoning_tokens: i64,
+    pub total_tokens: i64,
+    pub response_type: String,
+    pub response_model: Option<String>,
 }
 
-fn extract_completion_reasoning_tokens(usage: &async_openai::types::chat::CompletionUsage) -> i64 {
+fn extract_completion_reasoning_tokens(usage: &onwards::strict::schemas::chat_completions::Usage) -> i64 {
+    // onwards models `completion_tokens_details` as a permissive `Value` rather than
+    // a typed struct, so providers can add fields without the parse collapsing.
     usage
         .completion_tokens_details
         .as_ref()
-        .and_then(|d| d.reasoning_tokens)
-        .map(|t| t as i64)
+        .and_then(|d| d.get("reasoning_tokens"))
+        .and_then(serde_json::Value::as_i64)
         .unwrap_or(0)
 }
 
@@ -733,12 +951,12 @@ impl From<&AiResponse> for TokenMetrics {
                 // For streaming responses, token usage and model are in the last Normal chunk (not Done marker)
                 // Find the last Normal chunk, prioritizing those with usage data
                 let last_normal_with_usage = chunks.iter().rev().find_map(|chunk| match chunk {
-                    ChatCompletionChunk::Normal(normal_chunk) if normal_chunk.usage.is_some() => Some(normal_chunk),
+                    ChatCompletionChunk::Chunk(normal_chunk) if normal_chunk.usage.is_some() => Some(normal_chunk),
                     _ => None,
                 });
 
                 let model = chunks.iter().find_map(|chunk| match chunk {
-                    ChatCompletionChunk::Normal(c) => Some(c.model.clone()),
+                    ChatCompletionChunk::Chunk(c) => Some(c.model.clone()),
                     _ => None,
                 });
 
@@ -776,12 +994,12 @@ impl From<&AiResponse> for TokenMetrics {
             }
             AiResponse::CompletionsStream(chunks) => {
                 let last_normal_with_usage = chunks.iter().rev().find_map(|chunk| match chunk {
-                    CompletionChunk::Normal(normal_chunk) if normal_chunk.usage.is_some() => Some(normal_chunk),
+                    CompletionChunk::Chunk(normal_chunk) if normal_chunk.usage.is_some() => Some(normal_chunk),
                     _ => None,
                 });
 
                 let model = chunks.iter().find_map(|chunk| match chunk {
-                    CompletionChunk::Normal(c) => Some(c.model.clone()),
+                    CompletionChunk::Chunk(c) => Some(c.model.clone()),
                     _ => None,
                 });
 
@@ -839,23 +1057,18 @@ impl From<&AiResponse> for TokenMetrics {
             }
             AiResponse::Embeddings(response) => {
                 let usage = &response.usage;
+                // One variant now covers both encodings, so the analytics label is
+                // read back off the payload rather than off the variant.
+                let base64 = response
+                    .data
+                    .first()
+                    .is_some_and(|d| matches!(d.embedding, onwards::strict::schemas::embeddings::Embedding::Base64(_)));
                 Self {
                     prompt_tokens: usage.prompt_tokens as i64,
                     completion_tokens: 0, // Embeddings don't have completion tokens
                     reasoning_tokens: 0,
                     total_tokens: usage.total_tokens as i64,
-                    response_type: "embeddings".to_string(),
-                    response_model: Some(response.model.clone()),
-                }
-            }
-            AiResponse::Base64Embeddings(response) => {
-                let usage = &response.usage;
-                Self {
-                    prompt_tokens: usage.prompt_tokens as i64,
-                    completion_tokens: 0, // Embeddings don't have completion tokens
-                    reasoning_tokens: 0,
-                    total_tokens: usage.total_tokens as i64,
-                    response_type: "base64_embeddings".to_string(),
+                    response_type: if base64 { "base64_embeddings" } else { "embeddings" }.to_string(),
                     response_model: Some(response.model.clone()),
                 }
             }
@@ -962,13 +1175,16 @@ impl From<&AiResponse> for TokenMetrics {
 
 #[cfg(test)]
 mod tests {
-    use super::{UsageMetrics, extract_cache_tokens, extract_finish_reason, parse_ai_request, parse_ai_response};
+    use super::{
+        RequestParams, UsageMetrics, extract_cache_tokens, extract_engine_cached_tokens, extract_finish_reason, parse_ai_request,
+        parse_ai_response,
+    };
     use crate::request_logging::models::{AiRequest, AiResponse};
-    use async_openai::types::chat::{CreateChatCompletionResponse, CreateChatCompletionStreamResponse};
-    use async_openai::types::completions::CreateCompletionResponse;
-    use async_openai::types::embeddings::{CreateBase64EmbeddingResponse, CreateEmbeddingResponse, EmbeddingUsage};
     use axum::http::{Method, StatusCode, Uri};
     use bytes::Bytes;
+    use onwards::strict::schemas::chat_completions::{ChatCompletionChunk as ChatChunk, ChatCompletionResponse, Usage as ChatUsage};
+    use onwards::strict::schemas::completions::CompletionResponse;
+    use onwards::strict::schemas::embeddings::{Embedding, EmbeddingData, EmbeddingsResponse, EmbeddingsUsage};
     use outlet::{RequestData, ResponseData};
     use std::{
         collections::HashMap,
@@ -1259,13 +1475,12 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_ai_response_fusillade_stream_header() {
-        // Request body has stream: false, but x-fusillade-stream header is set.
-        // Outlet captures the original body before onwards injects stream:true,
-        // so the header is the only signal that the response is SSE.
+    fn test_parse_ai_response_detects_stream_from_the_body() {
+        // Request body has stream: false, but the captured response is SSE: the
+        // captured request is what the caller sent, before the stream was forced
+        // downstream, so the response body is the only thing that says so.
         let request_json = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "hello"}], "stream": false}"#;
-        let mut headers = HashMap::new();
-        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let headers = HashMap::new();
         let request_data = RequestData {
             correlation_id: 123,
             timestamp: SystemTime::now(),
@@ -1311,14 +1526,108 @@ mod tests {
         }
     }
 
+    /// The OpenRouter `finish_reason: "error"` shape, from a real prod row (analytics_id
+    /// 184786706): HTTP 200, a full usage object the provider counted (and charges us for),
+    /// but a finish_reason value the typed enum doesn't have — so the untagged parse falls
+    /// to `Other` and billing read zero. The raw-usage fallback must recover the counts;
+    /// the cache split is read from the raw body either way. Before the fallback existed
+    /// this billed 149 rows (3.75M prompt tokens, ~$7) at nothing for one user in 10 days,
+    /// and wrote the impossible `prompt < read + creation` signature.
     #[test]
-    fn test_fusillade_stream_with_embedded_error_frame_reclassifies_to_500() {
+    fn unrepresentable_finish_reason_still_bills_from_the_raw_usage() {
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)),
+            trace_id: None,
+            span_id: None,
+        };
+        let body = r#"{"id":"resp_1","object":"chat.completion","created":1786498035,"model":"m","choices":[{"finish_reason":"error","index":0,"message":{"role":"assistant","refusal":null,"reasoning_details":[{"text":"...","type":"reasoning.text","index":0,"format":"unknown"}]}}],"usage":{"prompt_tokens":29366,"completion_tokens":97,"total_tokens":29463,"completion_tokens_details":{"reasoning_tokens":97},"cache_read_input_tokens":25351,"cache_creation_input_tokens":4015,"cache_creation":{"ephemeral_5m_input_tokens":4015,"ephemeral_1h_input_tokens":0,"ephemeral_24h_input_tokens":0}}}"#;
+        let response_data = ResponseData {
+            extensions: Default::default(),
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(body)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        // onwards types `finish_reason` as a plain string, so the shape that used to
+        // defeat the typed parse now goes through it. The counts below are the point
+        // either way: they must come out right whichever path produced them.
+        assert!(
+            matches!(parsed, AiResponse::ChatCompletions(_)),
+            "onwards represents an unrepresentable-by-enum finish_reason"
+        );
+
+        let metrics = UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::config::Config::default(),
+        );
+        assert_eq!(metrics.prompt_tokens, 29_366, "recovered from the raw usage object");
+        assert_eq!(metrics.completion_tokens, 97);
+        assert_eq!(metrics.reasoning_tokens, 97);
+        assert_eq!(metrics.total_tokens, 29_463);
+        assert_eq!(metrics.cache_read_input_tokens, 25_351, "split read from the raw body as before");
+        assert_eq!(metrics.cache_creation_5m_input_tokens, 4_015);
+    }
+
+    /// The July shape on the live path: `usage` is null, so there is genuinely nothing to
+    /// read and the fallback must not invent counts — the row records zero, exactly as
+    /// before the fallback existed.
+    #[test]
+    fn null_usage_still_records_zero_on_the_live_path() {
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)),
+            trace_id: None,
+            span_id: None,
+        };
+        let body = r#"{"id":"c","object":"chat.completion","created":1,"model":"m","choices":[{"finish_reason":"tool_calls","index":0,"message":{"role":"assistant","content":null}}],"usage":null}"#;
+        let response_data = ResponseData {
+            extensions: Default::default(),
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::OK,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(body)),
+            duration: Duration::from_millis(100),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        let metrics = UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::config::Config::default(),
+        );
+        assert_eq!(metrics.prompt_tokens, 0, "no usage anywhere → nothing invented");
+        assert_eq!(metrics.completion_tokens, 0);
+        assert_eq!(metrics.total_tokens, 0);
+    }
+
+    #[test]
+    fn test_streamed_body_with_embedded_error_frame_reclassifies_to_500() {
         // Reproduces trace 91ea8848dc08735f183449277b8b8846: Dynamo started a 200 OK
         // SSE stream, generated some delta chunks, then crashed mid-generation and
         // emitted an error frame in place of the terminal usage chunk + [DONE].
         let request_json = r#"{"model": "moonshotai/Kimi-K2.6", "messages": [{"role": "user", "content": "hi"}], "stream": false}"#;
-        let mut headers = HashMap::new();
-        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let headers = HashMap::new();
         let request_data = RequestData {
             correlation_id: 999,
             timestamp: SystemTime::now(),
@@ -1431,12 +1740,11 @@ mod tests {
     }
 
     #[test]
-    fn test_fusillade_stream_with_real_error_status_is_preserved() {
+    fn test_streamed_body_with_real_error_status_is_preserved() {
         // If upstream returns a real non-2xx status (no SSE body to scan), we must NOT
         // override it to 500. The real status code is more informative.
         let request_json = r#"{"model": "gpt-4", "messages": [{"role": "user", "content": "hi"}], "stream": false}"#;
-        let mut headers = HashMap::new();
-        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let headers = HashMap::new();
         let request_data = RequestData {
             correlation_id: 7,
             timestamp: SystemTime::now(),
@@ -1473,8 +1781,7 @@ mod tests {
     #[test]
     fn test_parse_ai_response_fusillade_completions_stream() {
         let request_json = r#"{"model": "gpt-3.5-turbo-instruct", "prompt": "Hello", "stream": false}"#;
-        let mut headers = HashMap::new();
-        headers.insert("x-fusillade-stream".to_string(), vec![Bytes::from("true")]);
+        let headers = HashMap::new();
         let request_data = RequestData {
             correlation_id: 123,
             timestamp: SystemTime::now(),
@@ -1673,13 +1980,13 @@ mod tests {
 
         // Response with usage data
         #[allow(deprecated)]
-        let chat_response = CreateChatCompletionResponse {
+        let chat_response = ChatCompletionResponse {
             id: "chatcmpl-123".to_string(),
             object: "chat.completion".to_string(),
             created: 1677652288,
             model: "gpt-5".to_string(),
             choices: vec![],
-            usage: Some(async_openai::types::chat::CompletionUsage {
+            usage: Some(ChatUsage {
                 prompt_tokens: 15,
                 completion_tokens: 25,
                 total_tokens: 40,
@@ -1743,13 +2050,13 @@ mod tests {
 
         // Streaming response with usage in the last chunk
         #[allow(deprecated)]
-        let stream_chunk = CreateChatCompletionStreamResponse {
+        let stream_chunk = ChatChunk {
             id: "chatcmpl-123".to_string(),
             object: "chat.completion.chunk".to_string(),
             created: 1677652288,
             model: "gpt-4".to_string(),
             choices: vec![],
-            usage: Some(async_openai::types::chat::CompletionUsage {
+            usage: Some(ChatUsage {
                 prompt_tokens: 8,
                 completion_tokens: 12,
                 total_tokens: 20,
@@ -1761,7 +2068,7 @@ mod tests {
         };
 
         let parsed_response =
-            AiResponse::ChatCompletionsStream(vec![crate::request_logging::models::ChatCompletionChunk::Normal(stream_chunk)]);
+            AiResponse::ChatCompletionsStream(vec![crate::request_logging::models::ChatCompletionChunk::Chunk(stream_chunk)]);
 
         let metrics = UsageMetrics::extract(
             instance_id,
@@ -1804,7 +2111,7 @@ mod tests {
             duration_to_first_byte: Duration::from_millis(50),
         };
 
-        let chat_response: CreateChatCompletionResponse = serde_json::from_value(serde_json::json!({
+        let chat_response: ChatCompletionResponse = serde_json::from_value(serde_json::json!({
             "id": "chatcmpl-123",
             "object": "chat.completion",
             "created": 1677652288,
@@ -1861,11 +2168,11 @@ mod tests {
             duration_to_first_byte: Duration::from_millis(50),
         };
 
-        let embeddings_response = CreateEmbeddingResponse {
+        let embeddings_response = EmbeddingsResponse {
             object: "list".to_string(),
             data: vec![],
             model: "text-embedding-ada-002".to_string(),
-            usage: EmbeddingUsage {
+            usage: EmbeddingsUsage {
                 prompt_tokens: 6,
                 total_tokens: 6,
             },
@@ -1914,13 +2221,13 @@ mod tests {
         };
 
         #[allow(deprecated)]
-        let completions_response = CreateCompletionResponse {
+        let completions_response = CompletionResponse {
             id: "cmpl-123".to_string(),
             object: "text_completion".to_string(),
             created: 1677652288,
             model: "gpt-3.5-turbo-instruct".to_string(),
             choices: vec![],
-            usage: Some(async_openai::types::chat::CompletionUsage {
+            usage: Some(ChatUsage {
                 prompt_tokens: 10,
                 completion_tokens: 15,
                 total_tokens: 25,
@@ -1972,17 +2279,24 @@ mod tests {
             duration_to_first_byte: Duration::from_millis(50),
         };
 
-        let base64_embeddings_response = CreateBase64EmbeddingResponse {
+        // A base64 payload now rides the single Embeddings variant; the analytics
+        // label is read back off the untagged `Embedding` rather than the variant,
+        // so the data has to carry one entry for the label to be derivable.
+        let base64_embeddings_response = EmbeddingsResponse {
             object: "list".to_string(),
-            data: vec![],
+            data: vec![EmbeddingData {
+                object: "embedding".to_string(),
+                embedding: Embedding::Base64("ZmFrZQ==".to_string()),
+                index: 0,
+            }],
             model: "text-embedding-3-large".to_string(),
-            usage: EmbeddingUsage {
+            usage: EmbeddingsUsage {
                 prompt_tokens: 4,
                 total_tokens: 4,
             },
         };
 
-        let parsed_response = AiResponse::Base64Embeddings(base64_embeddings_response);
+        let parsed_response = AiResponse::Embeddings(base64_embeddings_response);
 
         let metrics = UsageMetrics::extract(
             instance_id,
@@ -2557,6 +2871,163 @@ mod tests {
         assert_eq!(c.creation_1h, 0);
     }
 
+    /// `prompt_tokens_details.cached_tokens` is the ENGINE's prefix-cache hit (SGLang/vLLM
+    /// via the dynamo frontend). It is recorded on its own column and must keep being
+    /// ignored by the billing split — the two readers look at the same usage object and
+    /// must disagree on purpose.
+    #[test]
+    fn engine_cached_tokens_read_from_prompt_tokens_details_and_not_billed() {
+        let body = serde_json::json!({
+            "usage": {"prompt_tokens": 3607, "completion_tokens": 607,
+                      "prompt_tokens_details": {"cached_tokens": 3456}}
+        })
+        .to_string();
+        let r = response_with_body(body);
+        assert_eq!(extract_engine_cached_tokens(&r), Some(3456));
+        assert_eq!(extract_cache_tokens(&r).read, 0, "engine hits are not dwctl cache reads");
+    }
+
+    #[test]
+    fn engine_cached_tokens_streaming_terminal_frame() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000,\"completion_tokens\":5,\"prompt_tokens_details\":{\"cached_tokens\":1984}}}\n\n\
+                   data: [DONE]\n\n";
+        assert_eq!(extract_engine_cached_tokens(&response_with_body(sse)), Some(1984));
+    }
+
+    #[test]
+    fn engine_cached_tokens_absent_is_none_and_negative_is_clamped() {
+        let none = serde_json::json!({"usage": {"prompt_tokens": 10, "completion_tokens": 1}}).to_string();
+        assert_eq!(extract_engine_cached_tokens(&response_with_body(none)), None);
+        let neg = serde_json::json!({"usage": {"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": -5}}}).to_string();
+        assert_eq!(extract_engine_cached_tokens(&response_with_body(neg)), Some(0));
+        assert_eq!(extract_engine_cached_tokens(&response_with_body("")), None);
+    }
+
+    /// With the cache layer in front, the body's `cached_tokens` is already zeroed when
+    /// analytics reads it; the value the layer stashed on the response wins.
+    #[test]
+    fn engine_cached_tokens_prefers_the_cache_layers_stashed_value() {
+        let scrubbed = serde_json::json!({
+            "usage": {"prompt_tokens": 985, "completion_tokens": 2, "prompt_tokens_details": {"cached_tokens": 0}}
+        })
+        .to_string();
+        let mut r = response_with_body(scrubbed);
+        let cell = crate::prompt_cache::UpstreamCachedTokens::default();
+        cell.set(687);
+        r.extensions.insert(cell);
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: "/chat/completions".parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#)),
+            trace_id: None,
+            span_id: None,
+        };
+        let parsed = parse_ai_response(&request_data, &r).unwrap();
+        let m = UsageMetrics::extract(uuid::Uuid::nil(), &request_data, &r, &parsed, &crate::config::Config::default());
+        assert_eq!(m.engine_cached_tokens, Some(687));
+
+        // An inserted-but-never-filled cell (no usage frame seen) falls back to the body.
+        let mut r = response_with_body(
+            serde_json::json!({"usage": {"prompt_tokens": 1, "prompt_tokens_details": {"cached_tokens": 3}}}).to_string(),
+        );
+        r.extensions.insert(crate::prompt_cache::UpstreamCachedTokens::default());
+        let parsed = parse_ai_response(&request_data, &r).unwrap();
+        let m = UsageMetrics::extract(uuid::Uuid::nil(), &request_data, &r, &parsed, &crate::config::Config::default());
+        assert_eq!(m.engine_cached_tokens, Some(3));
+    }
+
+    fn params_for(uri: &str, request_body: &str) -> RequestParams {
+        let request_data = RequestData {
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            method: axum::http::Method::POST,
+            uri: uri.parse::<Uri>().unwrap(),
+            headers: HashMap::new(),
+            body: Some(Bytes::from(request_body.to_owned())),
+            trace_id: None,
+            span_id: None,
+        };
+        let response_data = response_with_body(
+            r#"{"id":"r","object":"chat.completion","created":1,"model":"m","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}"#,
+        );
+        let parsed = parse_ai_response(&request_data, &response_data).unwrap();
+        UsageMetrics::extract(
+            uuid::Uuid::nil(),
+            &request_data,
+            &response_data,
+            &parsed,
+            &crate::config::Config::default(),
+        )
+        .request_params
+    }
+
+    /// The content-free request parameters come off the typed chat request.
+    /// `max_completion_tokens` wins over `max_tokens`; `tools` and `messages` are counted.
+    #[test]
+    fn request_params_read_from_a_chat_request() {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "s"},
+                {"role": "user", "content": "u"},
+                {"role": "assistant", "content": "a"}
+            ],
+            "tools": [{"type": "function", "function": {"name": "get_weather", "description": "d",
+                       "parameters": {"type": "object", "properties": {}}}}],
+            "stream": true,
+            "max_tokens": 100,
+            "max_completion_tokens": 512,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "n": 1
+        })
+        .to_string();
+        let p = params_for("/chat/completions", &body);
+        assert_eq!(
+            p,
+            RequestParams {
+                stream: Some(true),
+                max_tokens: Some(512),
+                temperature: Some(0.7),
+                top_p: Some(0.9),
+                n: Some(1),
+                tool_count: Some(1),
+                message_count: Some(3),
+            }
+        );
+    }
+
+    /// A chat request that omits `stream` is a non-streaming request, not an unknown one;
+    /// a body that is not a typed chat/completions request yields all-`None`.
+    #[test]
+    fn request_params_stream_defaults_false_and_untyped_bodies_yield_none() {
+        let p = params_for("/chat/completions", r#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#);
+        assert_eq!(p.stream, Some(false));
+        assert_eq!(p.max_tokens, None);
+        assert_eq!(p.tool_count, Some(0));
+        assert_eq!(p.message_count, Some(1));
+
+        let e = params_for("/embeddings", r#"{"model":"m","input":"hello"}"#);
+        assert_eq!(e, RequestParams::default());
+    }
+
+    #[test]
+    fn request_params_read_from_a_completions_request() {
+        let p = params_for(
+            "/completions",
+            r#"{"model":"m","prompt":"hi","max_tokens":64,"temperature":0.2,"stream":false}"#,
+        );
+        assert_eq!(p.stream, Some(false));
+        assert_eq!(p.max_tokens, Some(64));
+        assert_eq!(p.temperature, Some(0.2));
+        assert_eq!(p.tool_count, None, "completions have no tools");
+        assert_eq!(p.message_count, None, "completions have no messages");
+    }
+
     #[test]
     fn extract_cache_tokens_ignores_provider_native_cached_tokens() {
         // Only the provider's own `prompt_tokens_details.cached_tokens` is present (e.g. an
@@ -2592,7 +3063,7 @@ mod tests {
     /// Build a POST /v1/chat/completions request + response pair from a raw body.
     ///
     /// `stream` has to be declared on the REQUEST: parse_ai_response picks the SSE parser
-    /// from the request's `stream: true` (or the x-fusillade-stream header), not by sniffing
+    /// from the shape of the captured body, not by sniffing
     /// the response. Getting this wrong makes an SSE body fail to parse rather than
     /// producing a wrong finish_reason, which is how the first draft of these tests failed.
     fn chat_pair(body: &'static str, stream: bool) -> (RequestData, ResponseData) {

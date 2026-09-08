@@ -113,6 +113,13 @@ pub struct PendingEmailChangeResponse {
     pub new_email: String,
     /// When the verification token expires.
     pub expires_at: DateTime<Utc>,
+    /// When the *new* mailbox clicked its verification link, if it has.
+    /// `null` means that side is still outstanding — together with
+    /// `old_email_confirmed_at` this lets the dashboard say exactly which
+    /// address the change is waiting on.
+    pub new_email_confirmed_at: Option<DateTime<Utc>>,
+    /// When the *current* mailbox clicked its verification link, if it has.
+    pub old_email_confirmed_at: Option<DateTime<Utc>>,
 }
 
 impl From<crate::db::models::organizations::PendingOrgEmailChangeDBResponse> for PendingEmailChangeResponse {
@@ -120,6 +127,8 @@ impl From<crate::db::models::organizations::PendingOrgEmailChangeDBResponse> for
         Self {
             new_email: p.new_email,
             expires_at: p.expires_at,
+            new_email_confirmed_at: p.new_email_confirmed_at,
+            old_email_confirmed_at: p.old_email_confirmed_at,
         }
     }
 }

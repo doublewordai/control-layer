@@ -8,8 +8,8 @@ use crate::{
     api::models::{
         cache_pricing::CachePricingResponse,
         deployments::{
-            ComponentEndpointSummary, ComponentModelSummary, DeployedModelResponse, ModelComponentResponse, ModelMetrics, ModelProbeStatus,
-            ModelType,
+            ComponentEndpointSummary, ComponentModelSummary, ComponentPool, DeployedModelResponse, ModelComponentResponse, ModelMetrics,
+            ModelProbeStatus, ModelType,
         },
         inference_endpoints::InferenceEndpointResponse,
     },
@@ -425,6 +425,7 @@ impl<'a> DeployedModelEnricher<'a> {
         ModelComponentResponse {
             weight: c.weight,
             enabled: c.enabled,
+            pool: ComponentPool::from_db(&c.pool),
             sort_order: c.sort_order,
             created_at: c.created_at,
             model: ComponentModelSummary {
@@ -443,7 +444,6 @@ impl<'a> DeployedModelEnricher<'a> {
                     name: c.endpoint_name.unwrap_or_default(),
                 }),
                 trusted: c.model_trusted,
-                open_responses_adapter: c.model_open_responses_adapter,
             },
         }
     }
@@ -492,7 +492,6 @@ mod tests {
             components: None,
             sanitize_responses: None,
             trusted: None,
-            open_responses_adapter: None,
             reasoning_translation_overrides: None,
             supported_reasoning_efforts: None,
             traffic_routing_rules: None,
@@ -650,14 +649,12 @@ mod tests {
         let mut model = create_test_model();
         model.sanitize_responses = Some(true);
         model.trusted = Some(false);
-        model.open_responses_adapter = Some(true);
 
         let masked = model.mask_response_config();
 
         // Response config fields should be masked
         assert_eq!(masked.sanitize_responses, None);
         assert_eq!(masked.trusted, None);
-        assert_eq!(masked.open_responses_adapter, None);
     }
 
     #[test]
@@ -678,6 +675,7 @@ mod tests {
                 auth_header_name: "Authorization".to_string(),
                 auth_header_prefix: "Bearer ".to_string(),
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: Uuid::new_v4(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),

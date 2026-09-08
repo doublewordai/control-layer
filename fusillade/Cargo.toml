@@ -22,8 +22,8 @@ fusillade-arsenal = { path = "../fusillade-arsenal", optional = true }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-util = "0.7"
 tracing = "0.1"
-tracing-opentelemetry = "0.32.1"
-opentelemetry = "0.31.0"
+tracing-opentelemetry = "0.33.0"
+opentelemetry = "0.32.0"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -37,7 +37,7 @@ thiserror = "2"
 async-trait = "0.1"
 futures = "0.3"
 eventsource-stream = "0.2"
-openai-reassembler = "0.3.0"
+openai-reassembler = "0.4.0"
 parking_lot = "0.12"
 scopeguard = "1"
 humantime = "2"
@@ -50,3 +50,4 @@ rand = "0.10"
 axum = "0.8"
 sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "json", "tls-rustls"] }
 test-log = "0.2.18"
+tokio = { version = "1", features = ["test-util"] }

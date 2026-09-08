@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import BatchInfo from "./BatchInfo";
@@ -139,5 +139,63 @@ describe("BatchInfo", () => {
 
     expect(screen.getByText("Reasoning")).toBeInTheDocument();
     expect(screen.getByText("42")).toBeInTheDocument();
+  });
+
+  describe("model row in the Metrics card", () => {
+    const analyticsWithRequests = {
+      data: {
+        total_requests: 250,
+        total_prompt_tokens: 1000,
+        total_completion_tokens: 500,
+        total_tokens: 1500,
+      },
+      isLoading: false,
+    } as never;
+
+    // The Model label's row: the value sits beside the label in the same flex row.
+    const modelRow = (container: HTMLElement) =>
+      within(container).getByText("Model").parentElement!;
+
+    it("shows the batch's model above the token metrics", () => {
+      vi.mocked(hooks.useBatch).mockReturnValue({
+        data: { ...mockBatch, model: "deepseek-v4-pro" },
+        isLoading: false,
+        error: null,
+      } as never);
+      vi.mocked(hooks.useBatchAnalytics).mockReturnValue(analyticsWithRequests);
+
+      const { container } = renderBatchInfo();
+
+      const row = modelRow(container);
+      expect(row).toHaveTextContent("deepseek-v4-pro");
+      // Model is the first row of the card, above Prompt.
+      const prompt = within(container).getByText("Prompt").parentElement!;
+      expect(row.compareDocumentPosition(prompt)).toBe(
+        Node.DOCUMENT_POSITION_FOLLOWING,
+      );
+    });
+
+    it("falls back to metadata.model for batches without the typed field", () => {
+      vi.mocked(hooks.useBatch).mockReturnValue({
+        data: { ...mockBatch, metadata: { model: "qwen3-235b" } },
+        isLoading: false,
+        error: null,
+      } as never);
+      vi.mocked(hooks.useBatchAnalytics).mockReturnValue(analyticsWithRequests);
+
+      const { container } = renderBatchInfo();
+
+      expect(modelRow(container)).toHaveTextContent("qwen3-235b");
+    });
+
+    it("shows a dash when the batch has no model label", () => {
+      vi.mocked(hooks.useBatchAnalytics).mockReturnValue(analyticsWithRequests);
+
+      const { container } = renderBatchInfo();
+
+      const row = modelRow(container);
+      expect(row).toHaveTextContent("Model-");
+      expect(row.querySelector("[title]")).toBeNull();
+    });
   });
 });

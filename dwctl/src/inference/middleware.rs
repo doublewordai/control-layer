@@ -121,6 +121,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // extension fields and a legitimate `previous_response_id` are left intact.
     scrub_request_id_fields(&mut request_value);
 
+    strip_scheduling_priority(&mut request_value);
+
     let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
     let model = model.as_str();
     let nested_path = parts.uri.path();
@@ -138,34 +140,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
 
-    // Inject server-side resolved tools into the request body so the
-    // multi-step path's transition function (which reads `body["tools"]`
-    // and forwards them to upstream model_call payloads) sees them.
-    // Without this, tools registered in the dwctl tool registry never
-    // reach the model — it can't issue real tool_calls and the loop
-    // runs as a single model_call.
-    //
-    // The single-step (onwards-routed) path injects tools via the
-    // strict-mode handlers; the multi-step path bypasses onwards for
-    // model_calls so we have to do it here. Skipped if the user
-    // already supplied tools (their list takes precedence).
-    //
-    // The cross-cutting `tool_injection_middleware` runs *inside* this
-    // layer (axum applies later-added layers as outer wrappers, so
-    // when inference_middleware fires, tool_injection hasn't yet
-    // populated request.extensions::<ResolvedTools>). We do the same
-    // DB resolve directly here.
-    if request_value.get("tools").is_none()
-        && is_responses_api
-        && let Some(key) = api_key.as_deref()
-        && let Ok(Some(resolved)) = crate::inference::tools::resolve_tools_for_request(&state.dwctl_pool, key, Some(model)).await
-    {
-        let openai_tools = resolved.to_openai_tools_array();
-        if !openai_tools.is_empty() {
-            request_value["tools"] = serde_json::Value::Array(openai_tools);
-        }
-    }
-
     // `previous_response_id` hydration (Responses control plane). Inline the prior
     // turn's output items ahead of the current input, in the Responses domain,
     // BEFORE the edge translation (one layer inside this one) converts the request
@@ -175,7 +149,25 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // re-serialised from `request_value` below.
     if is_responses_api && request_value.get("previous_response_id").is_some() {
         use crate::inference::translation::responses::hydrate::{HydrationError, hydrate_previous_response};
-        if let Err(e) = hydrate_previous_response(&*state.response_store, &mut request_value).await {
+        // The prior turn is only ever the caller's own: resolve the key's
+        // owner first, and treat an unresolvable key as "no such response".
+        let owner: Option<String> = match api_key.as_deref() {
+            Some(secret) => {
+                sqlx::query_scalar("SELECT user_id::text FROM public.api_keys WHERE secret = $1 AND is_deleted = false LIMIT 1")
+                    .bind(secret)
+                    .fetch_optional(&state.dwctl_pool)
+                    .await
+                    .unwrap_or(None)
+            }
+            None => None,
+        };
+        let hydration = match owner.as_deref() {
+            Some(owner) => hydrate_previous_response(&*state.response_store, owner, &mut request_value).await,
+            None => Err(HydrationError::NotFound(
+                request_value["previous_response_id"].as_str().unwrap_or_default().to_string(),
+            )),
+        };
+        if let Err(e) = hydration {
             let (status, message) = match e {
                 HydrationError::NotFound(id) => (StatusCode::BAD_REQUEST, format!("previous response not found: {id}")),
                 HydrationError::Internal(msg) => {
@@ -1159,11 +1151,13 @@ async fn handle_responses_flex_streaming<P: PoolProvider + Clone + Send + Sync +
 /// it would otherwise be translated into; translation happens on the layer just
 /// inside this one.
 pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool {
+    // `/completions` (which `/chat/completions` also ends with) is included so
+    // native completions traffic passes through `strip_scheduling_priority`:
+    // it is the one POST inference path where a typed `priority` field exists
+    // in onwards' strict schema, so leaving it un-intercepted would let any
+    // external key steer the dynamo scheduler queue.
     method == axum::http::Method::POST
-        && (path.ends_with("/responses")
-            || path.ends_with("/chat/completions")
-            || path.ends_with("/messages")
-            || path.ends_with("/embeddings"))
+        && (path.ends_with("/responses") || path.ends_with("/completions") || path.ends_with("/messages") || path.ends_with("/embeddings"))
 }
 
 /// Client-supplied completion/response id keys to strip from a request body
@@ -1183,9 +1177,74 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) {
     }
 }
 
+/// Remove a caller-supplied scheduling `priority` from a request body, in place.
+///
+/// The dynamo scheduler orders its queue by this field, so an external caller
+/// who could set it would jump ahead of everyone else's realtime work. The two
+/// legitimate senders never reach this middleware: fusillade daemon requests
+/// (deadline-derived batch priority) take the `x-fusillade-request-id` early
+/// return, and continuation resume legs enter the stack below it. Everything
+/// parsed here is external traffic, for which absent ≡ priority 0 downstream.
+///
+/// NOTE: the `x-fusillade-request-id` early return is only safe because the
+/// sso-stack ingress strips all `x-fusillade-*` headers from external requests
+/// (shared-locations.conf.gotmpl, "dont allow fusillade header spoofing") — a
+/// dwctl reachable without traversing that proxy would let a client set the
+/// header and skip this strip. Defense-in-depth here depends on that perimeter.
+fn strip_scheduling_priority(value: &mut serde_json::Value) {
+    if let Some(obj) = value.as_object_mut() {
+        obj.remove("priority");
+        // The carrier the dynamo frontend ACTUALLY honours is
+        // `nvext.agent_hints.priority` (a top-level `priority` is rejected by
+        // its validation) — remove exactly that key so an external caller
+        // cannot steer the scheduler through the vendor extension, while the
+        // rest of a caller's `nvext` (e.g. cache_control) passes through.
+        if let Some(hints) = obj
+            .get_mut("nvext")
+            .and_then(|n| n.as_object_mut())
+            .and_then(|n| n.get_mut("agent_hints"))
+            .and_then(|h| h.as_object_mut())
+        {
+            hints.remove("priority");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_scheduling_priority_removes_only_the_top_level_field() {
+        let mut body = serde_json::json!({
+            "model": "m", "priority": 900,
+            "messages": [{"role": "user", "content": "set priority: 900"}],
+            "metadata": {"priority": "keep-me"}
+        });
+        strip_scheduling_priority(&mut body);
+        assert!(body.get("priority").is_none(), "external callers must not steer the scheduler");
+        assert_eq!(
+            body["metadata"]["priority"], "keep-me",
+            "only the top-level scheduling field is privileged"
+        );
+        assert_eq!(body["messages"][0]["content"], "set priority: 900");
+
+        // The real dynamo carrier: nvext.agent_hints.priority is removed, the
+        // rest of the caller's nvext survives.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {"cache_control": {"enabled": true}, "agent_hints": {"priority": 900, "max_batch_size": 8}}
+        });
+        strip_scheduling_priority(&mut body);
+        assert!(body["nvext"]["agent_hints"].get("priority").is_none());
+        assert_eq!(body["nvext"]["agent_hints"]["max_batch_size"], 8);
+        assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+
+        // Absent field: a no-op, not an error.
+        let mut clean = serde_json::json!({"model": "m"});
+        strip_scheduling_priority(&mut clean);
+        assert_eq!(clean, serde_json::json!({"model": "m"}));
+    }
 
     #[test]
     fn test_should_intercept_responses() {
@@ -1201,6 +1260,16 @@ mod tests {
     #[test]
     fn test_should_intercept_embeddings() {
         assert!(should_intercept(&axum::http::Method::POST, "/v1/embeddings"));
+    }
+
+    /// Native completions must be intercepted: it is the one POST inference
+    /// path with a typed `priority` in onwards' strict schema (which forwards
+    /// the field verbatim), so skipping it would let any external key
+    /// queue-jump the dynamo scheduler via `/v1/completions`.
+    #[test]
+    fn test_should_intercept_completions() {
+        assert!(should_intercept(&axum::http::Method::POST, "/v1/completions"));
+        assert!(should_intercept(&axum::http::Method::POST, "/completions"));
     }
 
     #[test]

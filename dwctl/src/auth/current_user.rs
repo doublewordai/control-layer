@@ -396,7 +396,7 @@ async fn try_api_key_auth(parts: &axum::http::request::Parts, db: &PgPool) -> Op
         Some(data) => data,
         None => {
             return Some(Err(Error::Unauthenticated {
-                message: Some("Invalid API key".to_string()),
+                message: Some(crate::errors::INVALID_API_KEY_MESSAGE.to_string()),
             }));
         }
     };
@@ -719,7 +719,15 @@ impl<P: sqlx_pool_router::PoolProvider + Clone + Send + Sync> FromRequestParts<c
         } else {
             debug!("Authentication failed: invalid credentials");
             trace!("All authentication attempts failed ({}): {:?}", auth_errors.len(), auth_errors);
-            Err(Error::Unauthenticated { message: None })
+            // Surface the API-key failure copy (the region-aware invalid-key
+            // message) rather than the generic "Authentication required"
+            // fallback. Scoped to the API-key method so the other auth
+            // methods' responses stay byte-identical.
+            let message = auth_errors.iter().find_map(|(method, e)| match e {
+                Error::Unauthenticated { message } if *method == "API key" => message.clone(),
+                _ => None,
+            });
+            Err(Error::Unauthenticated { message })
         }
     }
 }
@@ -795,23 +803,15 @@ mod tests {
         assert_eq!(current_user.email, new_email);
         assert_eq!(current_user.username, new_external_id); // Username is set to external_user_id for uniqueness
         assert!(current_user.roles.contains(&Role::StandardUser));
-        assert!(current_user.display_name.is_some(), "Display name should be auto-generated");
+        // Display name defaults to the email prefix (the part before @)
+        assert_eq!(current_user.display_name.as_deref(), Some("newuser"));
 
         // Verify user was actually created in database with display name
         let created_user = users_repo.get_user_by_email(new_email).await.unwrap();
         assert!(created_user.is_some());
         let db_user = created_user.unwrap();
         assert_eq!(db_user.auth_source, "proxy-header");
-        assert!(db_user.display_name.is_some(), "Database user should have display name");
-
-        // Verify display name format (should match pattern: "{adjective} {noun} {4-digit number}")
-        let display_name = db_user.display_name.unwrap();
-        let parts: Vec<&str> = display_name.split_whitespace().collect();
-        assert_eq!(parts.len(), 3, "Display name should have 3 parts");
-        assert!(
-            parts[2].len() == 4 && parts[2].parse::<u32>().is_ok(),
-            "Third part should be a 4-digit number"
-        );
+        assert_eq!(db_user.display_name.as_deref(), Some("newuser"));
     }
 
     #[sqlx::test]

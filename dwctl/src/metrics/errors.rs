@@ -26,10 +26,13 @@ pub mod component {
     pub const ONWARDS_HEARTBEAT: &str = "onwards_heartbeat";
     pub const ANALYTICS: &str = "analytics";
     pub const ANALYTICS_BATCHER: &str = "analytics_batcher";
+    pub const CLICKHOUSE_SINK: &str = "clickhouse_sink";
+    pub const PREFIX_CHAIN: &str = "prefix_chain";
     pub const RESPONSES_WRITER: &str = "responses_writer";
     pub const BATCH_POPULATE: &str = "batch_populate";
     pub const PAYMENTS: &str = "payments";
     pub const USAGE_REFRESH: &str = "usage_refresh";
+    pub const CONTINUATION: &str = "continuation";
 }
 
 /// Increment `dwctl_background_errors_total`. `component`/`reason`/`severity` are `&'static str`

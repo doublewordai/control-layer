@@ -1,54 +1,24 @@
 //! Authentication utility functions.
 
-use rand::prelude::RngExt;
-use rand::rng;
-
-/// Generate a random inference-themed display name
-/// Format: "{adjective} {noun} {4-digit number}"
-/// Example: "Swift Inference 4729"
-pub fn generate_random_display_name() -> String {
-    const ADJECTIVES: &[&str] = &[
-        "Swift",
-        "Neural",
-        "Deep",
-        "Smart",
-        "Quantum",
-        "Adaptive",
-        "Dynamic",
-        "Logical",
-        "Efficient",
-        "Precise",
-        "Optimized",
-        "Parallel",
-        "Recursive",
-        "Semantic",
-        "Synthetic",
-    ];
-
-    const NOUNS: &[&str] = &[
-        "Inference",
-        "Network",
-        "Model",
-        "Agent",
-        "Processor",
-        "Analyzer",
-        "Engine",
-        "System",
-        "Predictor",
-        "Learner",
-        "Classifier",
-        "Transformer",
-        "Encoder",
-        "Decoder",
-        "Reasoning",
-    ];
-
-    let mut rng = rng();
-    let adjective = ADJECTIVES[rng.random_range(0..ADJECTIVES.len())];
-    let noun = NOUNS[rng.random_range(0..NOUNS.len())];
-    let number = rng.random_range(1000..10000);
-
-    format!("{} {} {}", adjective, noun, number)
+/// Derive a default display name from an email address.
+///
+/// Uses the local part (the text before `@`). If there's no `@`, returns the
+/// input string unchanged. Falls back to `"user"` when the local part is empty.
+/// This replaces the previous randomly-generated "{adjective} {noun} {number}"
+/// placeholder so a new user's name is recognisable — derived from their email, not invented.
+///
+/// Examples:
+///   `seb@doubleword.ai`      → `seb`
+///   `user.name@domain.co.uk` → `user.name`
+///   `@domain.com`            → `user`
+///   `no-at-sign`             → `no-at-sign`
+pub fn default_display_name(email: &str) -> String {
+    let prefix = email.rsplit_once('@').map_or(email, |(local, _)| local);
+    if prefix.is_empty() {
+        "user".to_string()
+    } else {
+        prefix.to_string()
+    }
 }
 
 /// Extract the domain part from an email address.

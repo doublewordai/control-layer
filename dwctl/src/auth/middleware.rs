@@ -150,6 +150,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -206,6 +207,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -374,6 +376,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -443,6 +446,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -513,7 +517,6 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
         };
@@ -556,6 +559,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: jwt_user.id,
             })
             .await
@@ -627,7 +631,6 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
         };
@@ -673,6 +676,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -743,7 +747,6 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
         };
@@ -788,6 +791,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: Uuid::nil(), // Use nil for system creation
             })
             .await
@@ -872,6 +876,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -926,7 +931,6 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
         };
@@ -972,6 +976,7 @@ mod tests {
                 auth_header_name: None,
                 auth_header_prefix: None,
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
                 created_by: user.id,
             })
             .await
@@ -1042,7 +1047,6 @@ mod tests {
             limiters: state.limiters,
             connections_encryption_key: None,
             response_store: state.response_store,
-            response_step_manager: state.response_step_manager,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
         };

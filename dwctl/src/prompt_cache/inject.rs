@@ -24,10 +24,50 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use serde_json::Value;
+use std::sync::{Arc, OnceLock};
 use tracing::error;
 
 use super::parse::{TELEMETRY_ROLE, TelemetryPolicy};
 use super::stats::CacheStats;
+
+/// The upstream's `prompt_tokens_details.cached_tokens` exactly as it arrived, captured
+/// BEFORE this layer zeroes it (inactive model) or overwrites it with dwctl's own read
+/// (active model). It is the engine's prefix-cache hit for the request, which workload
+/// profiling records as `http_analytics.engine_cached_tokens`.
+///
+/// Why an extension and not the body: outlet (which feeds analytics) sits OUTSIDE this
+/// layer, so by the time it reads the body the value is gone. Outlet clones response
+/// extensions when the response head arrives, so the cell is inserted then and filled
+/// later — for a stream, at the terminal usage frame — through the shared `Arc`. Analytics
+/// runs after the body completes and reads the filled cell.
+#[derive(Clone, Debug, Default)]
+pub struct UpstreamCachedTokens(Arc<OnceLock<u64>>);
+
+impl UpstreamCachedTokens {
+    /// `None` until a usage object has been seen. First write wins.
+    pub fn get(&self) -> Option<u64> {
+        self.0.get().copied()
+    }
+
+    pub(crate) fn set(&self, value: u64) {
+        let _ = self.0.set(value);
+    }
+}
+
+/// The upstream's own cached-prompt count from a `usage` object, read before any rewrite.
+fn upstream_cached_tokens(usage: &serde_json::Map<String, Value>) -> Option<u64> {
+    usage
+        .get("prompt_tokens_details")
+        .and_then(Value::as_object)
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+}
+
+/// [`upstream_cached_tokens`] for a non-streaming JSON body.
+pub(crate) fn read_upstream_cached_tokens_json(body: &[u8]) -> Option<u64> {
+    let json: Value = serde_json::from_slice(body).ok()?;
+    upstream_cached_tokens(json.get("usage")?.as_object()?)
+}
 
 /// Remove `cache_control` markers from the request body at exactly the locations the parser
 /// reads them — each `messages[i].content[j]` block and each `tools[i]` object — and NOWHERE
@@ -283,6 +323,8 @@ pub(crate) struct SseScan {
     pub saw_error: bool,
     /// A `data:` frame carrying a `usage` object (the terminal usage frame).
     pub saw_usage: bool,
+    /// The upstream's `cached_tokens` from that usage frame, read before any edit.
+    pub upstream_cached_tokens: Option<u64>,
 }
 
 /// How [`scan_edit_sse`] treats the (single) usage frame it finds.
@@ -317,6 +359,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
             rewritten: None,
             saw_error: false,
             saw_usage: false,
+            upstream_cached_tokens: None,
         };
     };
 
@@ -326,16 +369,21 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
     if matches!(edit, UsageEdit::Probe) {
         let mut saw_error = false;
         let mut saw_usage = false;
+        let mut upstream = None;
         for line in body_str.split('\n') {
             if let Some(chunk) = sse_data_json(line) {
                 saw_error |= chunk.get("error").is_some();
-                saw_usage |= chunk.get("usage").is_some_and(Value::is_object);
+                if let Some(usage) = chunk.get("usage").and_then(Value::as_object) {
+                    saw_usage = true;
+                    upstream = upstream.or_else(|| upstream_cached_tokens(usage));
+                }
             }
         }
         return SseScan {
             rewritten: None,
             saw_error,
             saw_usage,
+            upstream_cached_tokens: upstream,
         };
     }
 
@@ -343,6 +391,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
     let mut edited = false;
     let mut saw_error = false;
     let mut saw_usage = false;
+    let mut upstream = None;
 
     let mut first = true;
     for line in body_str.split('\n') {
@@ -362,6 +411,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
                 && let Some(usage_obj) = usage.as_object_mut()
             {
                 saw_usage = true;
+                upstream = upstream.or_else(|| upstream_cached_tokens(usage_obj));
                 if !edited {
                     // Preserve the line's terminator style: on a CRLF stream this `line`
                     // (split on '\n') ends with '\r', which the reserialized JSON drops —
@@ -396,6 +446,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
         rewritten: if edited { Some(Bytes::from(out)) } else { None },
         saw_error,
         saw_usage,
+        upstream_cached_tokens: upstream,
     }
 }
 
@@ -433,7 +484,7 @@ pub fn scrub_sse_body(body: &[u8]) -> Option<Bytes> {
 /// can't be buffered becomes a structured 5xx with a `false` gate. Streaming responses are handled
 /// separately by the cache layer, which defers the classify-await into the SSE stream so it never
 /// holds the first token.
-pub async fn inject_into_response_nonstreaming(response: Response, stats: &CacheStats) -> (Response, bool) {
+pub async fn inject_into_response_nonstreaming(response: Response, stats: &CacheStats, capture: &UpstreamCachedTokens) -> (Response, bool) {
     let status_ok = response.status().is_success();
 
     // Only JSON can carry a chat-completion `usage`; don't buffer explicitly non-JSON bodies
@@ -474,6 +525,9 @@ pub async fn inject_into_response_nonstreaming(response: Response, stats: &Cache
 
     // A present `usage` object is billing's success signal for a non-streamed call (it's where
     // token counts come from); combined with a 2xx status, it gates the write.
+    if let Some(v) = read_upstream_cached_tokens_json(&body_bytes) {
+        capture.set(v);
+    }
     match inject_into_usage_json(&body_bytes, stats) {
         Some(rewritten) => {
             let len = rewritten.len();
@@ -503,7 +557,7 @@ pub async fn inject_into_response_nonstreaming(response: Response, stats: &Cache
 /// request never commits an index write. Non-2xx responses return unbuffered (onwards error
 /// envelopes carry no usage); non-completion JSON passes through (no `usage` object → nothing
 /// to scrub).
-pub async fn scrub_response_nonstreaming(response: Response) -> Response {
+pub async fn scrub_response_nonstreaming(response: Response, capture: &UpstreamCachedTokens) -> Response {
     // Non-2xx bodies are onwards-shaped error envelopes (third-party error bodies are replaced
     // before they reach this layer) — no usage to scrub, so skip the buffering entirely rather
     // than risk masking an upstream failure with the body-read 500 below.
@@ -540,6 +594,9 @@ pub async fn scrub_response_nonstreaming(response: Response) -> Response {
         }
     };
 
+    if let Some(v) = read_upstream_cached_tokens_json(&body_bytes) {
+        capture.set(v);
+    }
     let rewritten = scrub_usage_json(&body_bytes);
     if rewritten.is_some() {
         // We emit plain JSON (parse succeeded), so drop any stale Content-Encoding.
@@ -556,6 +613,39 @@ pub async fn scrub_response_nonstreaming(response: Response) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The upstream's `cached_tokens` is read off the usage frame BEFORE the scrub zeroes
+    /// it, on both the probe and the edit pass, and off a non-streaming body.
+    #[test]
+    fn upstream_cached_tokens_are_read_before_the_rewrite() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
+                   data: {\"choices\":[],\"usage\":{\"prompt_tokens\":985,\"prompt_tokens_details\":{\"cached_tokens\":687}}}\n\n\
+                   data: [DONE]\n\n";
+        let probe = scan_edit_sse(sse.as_bytes(), UsageEdit::Probe);
+        assert!(probe.saw_usage);
+        assert_eq!(probe.upstream_cached_tokens, Some(687));
+        let scrub = scan_edit_sse(sse.as_bytes(), UsageEdit::Scrub);
+        assert_eq!(scrub.upstream_cached_tokens, Some(687), "read before zeroing");
+        let out = String::from_utf8(scrub.rewritten.expect("rewritten").to_vec()).unwrap();
+        assert!(out.contains("\"cached_tokens\":0"), "customer-visible value still zeroed: {out}");
+        let no_usage = scan_edit_sse(b"data: {\"choices\":[]}\n\n", UsageEdit::Probe);
+        assert_eq!(no_usage.upstream_cached_tokens, None);
+
+        let body = br#"{"usage":{"prompt_tokens":10,"prompt_tokens_details":{"cached_tokens":4}}}"#;
+        assert_eq!(read_upstream_cached_tokens_json(body), Some(4));
+        assert_eq!(read_upstream_cached_tokens_json(br#"{"usage":{"prompt_tokens":10}}"#), None);
+        assert_eq!(read_upstream_cached_tokens_json(b"nope"), None);
+    }
+
+    #[test]
+    fn upstream_cached_tokens_cell_is_first_write_wins() {
+        let cell = UpstreamCachedTokens::default();
+        assert_eq!(cell.get(), None);
+        cell.set(5);
+        cell.set(9);
+        assert_eq!(cell.get(), Some(5));
+        assert_eq!(cell.clone().get(), Some(5), "clones share the cell");
+    }
 
     fn stats() -> CacheStats {
         CacheStats {
@@ -875,7 +965,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(serde_json::json!({"error":{"message":"bad request"}}).to_string()))
             .unwrap();
-        let (_out, billing_ok) = inject_into_response_nonstreaming(resp, &stats()).await;
+        let (_out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default()).await;
         assert!(!billing_ok, "error body → no commit");
     }
 
@@ -887,7 +977,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(serde_json::json!({"usage":{"prompt_tokens":2000}}).to_string()))
             .unwrap();
-        let (out, billing_ok) = inject_into_response_nonstreaming(resp, &stats()).await;
+        let (out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default()).await;
         assert!(billing_ok, "2xx with usage → commit allowed");
         let collected = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
         let s = std::str::from_utf8(&collected).unwrap();
@@ -997,7 +1087,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(body.clone()))
             .unwrap();
-        let out = scrub_response_nonstreaming(resp).await;
+        let out = scrub_response_nonstreaming(resp, &UpstreamCachedTokens::default()).await;
         assert_eq!(out.status(), 502, "status preserved");
         let collected = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
         assert_eq!(collected, body.as_bytes(), "error body untouched");
@@ -1018,7 +1108,7 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        let out = scrub_response_nonstreaming(resp).await;
+        let out = scrub_response_nonstreaming(resp, &UpstreamCachedTokens::default()).await;
         assert_eq!(out.status(), 200);
         let collected = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&collected).unwrap();

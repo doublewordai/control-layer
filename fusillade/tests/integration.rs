@@ -1,6 +1,8 @@
 use fusillade::PostgresDaemon;
 use fusillade::batch::{BackgroundBatchInput, BatchInput, RequestTemplateInput};
-use fusillade::daemon::{DaemonConfig, ModelEscalationConfig, default_should_retry};
+use fusillade::daemon::{
+    DaemonConfig, ModelEscalationConfig, RetentionMaintenanceConfig, default_should_retry,
+};
 use fusillade::http::{HttpResponse, MockHttpClient};
 use fusillade::manager::{ModelFilter, ModelFilterState, Storage};
 use fusillade::request::{
@@ -40,6 +42,174 @@ async fn mark_models_live_for_test(manager: &PostgresStore<TestDbPools>, models:
         .collect();
 
     manager.append_model_filter_events(&filters).await.unwrap();
+}
+
+async fn seed_leak_work(store: &TestStore) {
+    for model in ["large", "slow"] {
+        store
+            .append_model_filter_events(&[ModelFilter {
+                model: model.into(),
+                state: ModelFilterState::Absent,
+                expected_ready_at: None,
+            }])
+            .await
+            .unwrap();
+        let file = store
+            .create_file(
+                "tiny".into(),
+                Some("alice".into()),
+                (0..3)
+                    .map(|n| RequestTemplateInput {
+                        custom_id: Some(n.to_string()),
+                        endpoint: "https://api.example.com".into(),
+                        method: "POST".into(),
+                        path: "/test".into(),
+                        body: "{}".into(),
+                        model: model.into(),
+                        api_key: "key".into(),
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        store
+            .create_batch(BatchInput {
+                file_id: file,
+                endpoint: "/v1/chat/completions".into(),
+                completion_window: "24h".into(),
+                metadata: None,
+                created_by: Some("alice".into()),
+                api_key_id: None,
+                api_key: None,
+                total_requests: None,
+            })
+            .await
+            .unwrap();
+    }
+    for _ in 0..1 {
+        store
+            .create_flex(CreateFlexInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: "{}".into(),
+                model: "large".into(),
+                endpoint: "https://api.example.com".into(),
+                method: "POST".into(),
+                path: "/test".into(),
+                api_key: "key".into(),
+                created_by: "alice".into(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+    }
+}
+
+/// Batch tokens must refill after actual dispatch while async still progresses.
+/// A 24h batch uses the fixed interval, not the legacy 24-minute refill.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn batch_fixed_leak_interval_eventually_refills(pool: sqlx::PgPool) {
+    let config = DaemonConfig {
+        claim_interval_ms: 10,
+        model_concurrency_limits: Arc::new(dashmap::DashMap::from_iter([
+            ("large".to_string(), 10),
+            ("slow".to_string(), 10),
+        ])),
+        ..Default::default()
+    };
+    let store = postgres_store(pool, &config).await;
+    seed_leak_work(&store).await;
+    let client = Arc::new(MockHttpClient::new());
+    for _ in 0..7 {
+        client.add_response(
+            "POST /test",
+            Ok(HttpResponse {
+                status: 200,
+                body: "{}".into(),
+            }),
+        );
+    }
+
+    let shutdown = CancellationToken::new();
+    let daemon = Arc::new(
+        PostgresDaemon::new(store, client.clone(), config).with_leak_config(
+            fusillade::daemon::LeakConfig {
+                // The slow model keeps the default, while large refills quickly.
+                model_leak_interval_seconds: std::collections::HashMap::from([(
+                    "large".into(),
+                    std::num::NonZeroU32::new(1).unwrap(),
+                )]),
+                ..Default::default()
+            },
+        ),
+    );
+    let handle = daemon.clone().run(shutdown.clone()).unwrap();
+    // SQL tests prove the no-burst and cooldown gates. Here only require
+    // eventual dispatch/refill, without assertions on scheduler timing.
+    let progressed = tokio::time::timeout(Duration::from_secs(30), async {
+        while client.call_count() < 5 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    shutdown.cancel();
+    handle.await.unwrap().unwrap();
+    progressed.expect("batch workloads failed to refill and dispatch");
+}
+
+/// Disabling batch leaking (or never opting in) must survive a fresh daemon
+/// while async leaks and live batch claims continue to dispatch.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn batch_leak_disabled_preserves_async_and_live_claims(pool: sqlx::PgPool) {
+    let config = DaemonConfig {
+        claim_interval_ms: 10,
+        model_concurrency_limits: Arc::new(dashmap::DashMap::from_iter([
+            ("large".to_string(), 10),
+            ("slow".to_string(), 10),
+        ])),
+        ..Default::default()
+    };
+    let store = postgres_store(pool.clone(), &config).await;
+    for (iteration, explicit_disable) in [true, false].into_iter().enumerate() {
+        seed_leak_work(&store).await;
+        mark_models_live_for_test(&store, &["slow"]).await;
+        let client = Arc::new(MockHttpClient::new());
+        for _ in 0..10 {
+            client.add_response(
+                "POST /test",
+                Ok(HttpResponse {
+                    status: 200,
+                    body: "{}".into(),
+                }),
+            );
+        }
+        let mut daemon = PostgresDaemon::new(store.clone(), client.clone(), config.clone());
+        if explicit_disable {
+            daemon = daemon.with_leak_config(fusillade::daemon::LeakConfig {
+                leak_enabled: false,
+                ..Default::default()
+            });
+        }
+        let shutdown = CancellationToken::new();
+        let handle = Arc::new(daemon).run(shutdown.clone()).unwrap();
+        // Three live batch rows and one unavailable async row prove both loops ran.
+        let progressed = tokio::time::timeout(Duration::from_secs(30), async {
+            while client.call_count() < 4 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        shutdown.cancel();
+        handle.await.unwrap().unwrap();
+        progressed.expect("live batch and async claims must still dispatch");
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM requests WHERE model = 'large' AND batch_id IS NOT NULL AND state = 'pending'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            pending,
+            3 * (iteration as i64 + 1),
+            "disabled batch leaking must not consume an initial token"
+        );
+    }
 }
 
 fn retry_backoff_ms(config: &DaemonConfig, retry_attempt: u32) -> i64 {
@@ -94,6 +264,124 @@ fn call_priority(call: &fusillade::http::MockCall) -> i64 {
         ["priority"]
         .as_i64()
         .expect("daemon must inject an integer priority")
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn postgres_convenience_builder_installs_retained_response_fence(pool: sqlx::PgPool) {
+    let retention = RetentionMaintenanceConfig::new(fusillade::RetentionPolicy {
+        batchless_seconds_by_service_tier: std::collections::HashMap::from([(
+            "flex".to_string(),
+            86_400,
+        )]),
+        max_late_writer_seconds: Some(7_200),
+        ..Default::default()
+    });
+    let daemon = PostgresDaemon::try_from_pools_with_retention(
+        TestDbPools::new(pool).await.unwrap(),
+        DaemonConfig::default(),
+        retention,
+    )
+    .expect("valid retention configuration must construct");
+    assert_eq!(
+        daemon.storage().retained_response_fence_seconds(),
+        Some(7_200)
+    );
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn postgres_run_rejects_invalid_structure_and_fence_before_spawning(pool: sqlx::PgPool) {
+    let config = DaemonConfig {
+        batch_archive_sweep_enabled: true,
+        batch_archive_sweep_interval_ms: 0,
+        ..Default::default()
+    };
+    let store = postgres_store(pool.clone(), &config).await;
+    let error = postgres_daemon(store, Arc::new(MockHttpClient::new()), config)
+        .run(CancellationToken::new())
+        .expect_err("invalid structural config must fail synchronously");
+    assert!(error.to_string().contains("sweep"));
+
+    let retention = RetentionMaintenanceConfig::new(fusillade::RetentionPolicy {
+        batchless_seconds_by_service_tier: std::collections::HashMap::from([(
+            "flex".to_string(),
+            86_400,
+        )]),
+        max_late_writer_seconds: Some(7_200),
+        ..Default::default()
+    })
+    .with_batchless_archive_sweep_enabled(true);
+    let config = DaemonConfig::default();
+    let store = postgres_store(pool, &config).await;
+    let error = Arc::new(
+        PostgresDaemon::new(store, Arc::new(MockHttpClient::new()), config)
+            .with_retention_maintenance(retention),
+    )
+    .run(CancellationToken::new())
+    .expect_err("a mismatched store fence must fail synchronously");
+    assert!(error.to_string().contains("late-writer fence"));
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn default_claims_start_while_weekly_partition_ddl_is_blocked(pool: sqlx::PgPool) {
+    let mut blocker = pool.begin().await.expect("blocker transaction must start");
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtext('ensure_archive_partitions')::bigint)")
+        .execute(&mut *blocker)
+        .await
+        .expect("weekly partition lock must be held");
+
+    let http_client = Arc::new(MockHttpClient::new());
+    http_client.add_response(
+        "POST /v1/ddl-independent",
+        Ok(HttpResponse {
+            status: 200,
+            body: r#"{"result":"claimed"}"#.to_string(),
+        }),
+    );
+    let limits = Arc::new(dashmap::DashMap::new());
+    limits.insert("ddl-independent-model".to_string(), 1);
+    let config = DaemonConfig {
+        claim_interval_ms: 10,
+        claim_batch_size: 1,
+        model_concurrency_limits: limits,
+        status_log_interval_ms: None,
+        throughput_log_interval_ms: None,
+        heartbeat_interval_ms: 10_000,
+        cancellation_poll_interval_ms: 100,
+        claim_query_timeout_ms: 5_000,
+        ..Default::default()
+    };
+    let manager = postgres_store(pool, &config).await;
+    manager
+        .create_flex(CreateFlexInput {
+            request_id: uuid::Uuid::new_v4(),
+            body: r#"{"prompt":"claim while DDL waits"}"#.to_string(),
+            model: "ddl-independent-model".to_string(),
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/ddl-independent".to_string(),
+            api_key: "test-key".to_string(),
+            created_by: "ddl-independent-owner".to_string(),
+            metadata: None,
+        })
+        .await
+        .expect("request must seed");
+    mark_models_live_for_test(manager.as_ref(), &["ddl-independent-model"]).await;
+
+    let shutdown = CancellationToken::new();
+    let handle = postgres_daemon(manager, http_client.clone(), config)
+        .run(shutdown.clone())
+        .expect("default daemon structure must start");
+    tokio::time::timeout(Duration::from_secs(2), wait_for_mock_calls(&http_client, 1))
+        .await
+        .expect("claim loop must not await the blocked weekly DDL");
+
+    blocker.rollback().await.expect("blocker must release");
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("daemon must stop")
+        .expect("daemon task must not panic")
+        .expect("daemon must stop cleanly");
 }
 
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
@@ -681,6 +969,446 @@ async fn test_daemon_respects_per_model_concurrency_limits(pool: sqlx::PgPool) {
 
     // Verify all 5 HTTP calls were made
     assert_eq!(http_client.call_count(), 5);
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn test_daemon_cuts_claim_capacity_after_escalated_model_529(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    let first_wave = [
+        http_client.add_response_with_trigger(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 529,
+                body: r#"{"error":"model overloaded"}"#.to_string(),
+            }),
+        ),
+        http_client.add_response_with_trigger(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success"}"#.to_string(),
+            }),
+        ),
+        http_client.add_response_with_trigger(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success"}"#.to_string(),
+            }),
+        ),
+        http_client.add_response_with_trigger(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success"}"#.to_string(),
+            }),
+        ),
+    ];
+    let remaining_triggers: Vec<_> = (0..5)
+        .map(|_| {
+            http_client.add_response_with_trigger(
+                "POST /v1/test",
+                Ok(HttpResponse {
+                    status: 200,
+                    body: r#"{"result":"success"}"#.to_string(),
+                }),
+            )
+        })
+        .collect();
+
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("source-model".to_string(), 4);
+    model_concurrency_limits.insert("overloaded-model".to_string(), 4);
+    let model_escalations = Arc::new(dashmap::DashMap::new());
+    model_escalations.insert(
+        "source-model".to_string(),
+        ModelEscalationConfig {
+            escalation_model: "overloaded-model".to_string(),
+            escalation_threshold_seconds: 7_200,
+        },
+    );
+    let config = DaemonConfig {
+        claim_batch_size: 20,
+        claim_interval_ms: 10,
+        model_concurrency_limits,
+        model_escalations,
+        adaptive_concurrency: true,
+        // The controller is refused without a gate, since the configured limit
+        // becomes a starting point and nothing else would bound growth. There is
+        // no cgroup limit under test, so the gate permits the controller and then
+        // never engages.
+        memory_gate_high_fraction: 0.75,
+        // Larger than anything this test dispatches, so the limit only moves
+        // downward and the assertion is about the cut alone.
+        max_retries: Some(3),
+        stop_before_deadline_ms: None,
+        backoff_ms: 10,
+        backoff_factor: 1,
+        max_backoff_ms: 10,
+        status_log_interval_ms: None,
+        heartbeat_interval_ms: 10_000,
+        cancellation_poll_interval_ms: 100,
+        ..Default::default()
+    };
+    let manager = postgres_store(pool, &config).await;
+    let templates = (0..8)
+        .map(|index| fusillade::RequestTemplateInput {
+            custom_id: Some(format!("request-{index}")),
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/test".to_string(),
+            body: format!(r#"{{"prompt":"test-{index}"}}"#),
+            model: "source-model".to_string(),
+            api_key: "test-key".to_string(),
+        })
+        .collect();
+    let file_id = manager
+        .create_file("adaptive-concurrency".to_string(), None, templates)
+        .await
+        .unwrap();
+    let batch = manager
+        .create_batch(fusillade::batch::BatchInput {
+            file_id,
+            endpoint: "/v1/test".to_string(),
+            completion_window: "1h".to_string(),
+            metadata: None,
+            created_by: None,
+            api_key_id: None,
+            api_key: None,
+            total_requests: None,
+        })
+        .await
+        .unwrap();
+    mark_models_live_for_test(manager.as_ref(), &["source-model"]).await;
+
+    let shutdown_token = CancellationToken::new();
+    let daemon_handle = postgres_daemon(manager.clone(), http_client.clone(), config)
+        .run(shutdown_token.clone())
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while http_client.in_flight_count() != 4 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the configured initial concurrency should saturate");
+
+    let [
+        overload_trigger,
+        success_trigger_1,
+        success_trigger_2,
+        success_trigger_3,
+    ] = first_wave;
+    overload_trigger.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while http_client.in_flight_count() != 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the 529 response should finish before the successful requests");
+
+    for trigger in [success_trigger_1, success_trigger_2, success_trigger_3] {
+        trigger.send(()).unwrap();
+    }
+
+    // The 529 came back from the escalation target, but the slot it consumed was
+    // claimed against `source-model` - so that is the model whose limit must be
+    // cut. If the escalation target were charged instead, `source-model` would
+    // keep claiming four at a time and this would never be observed.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while http_client.in_flight_count() != 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the 529 should cut source-model's limit from four to three");
+
+    for trigger in remaining_triggers {
+        trigger.send(()).unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status = manager.get_batch_status(batch.id).await.unwrap();
+            if status.completed_requests == 8 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all requests should complete after the throttled waves drain");
+    shutdown_token.cancel();
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("daemon should stop")
+        .expect("daemon task should not panic")
+        .expect("daemon should stop cleanly");
+}
+
+/// A clean, capacity-bound model is allowed past its configured limit.
+///
+/// That is the half of the problem a controller which only ratchets down cannot
+/// fix: a static limit sized for one model replica is far too low once the fleet
+/// scales up, and nothing downstream tells fusillade that more capacity exists.
+/// So a model that keeps filling every slot it is offered, without ever being
+/// rejected, has to be allowed past its configured value.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn adaptive_concurrency_grows_past_the_configured_limit(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    let triggers: Vec<_> = (0..12)
+        .map(|_| {
+            http_client.add_response_with_trigger(
+                "POST /v1/grow",
+                Ok(HttpResponse {
+                    status: 200,
+                    body: r#"{"result":"success"}"#.to_string(),
+                }),
+            )
+        })
+        .collect();
+
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("growing-model".to_string(), 2);
+    let config = DaemonConfig {
+        claim_batch_size: 20,
+        claim_interval_ms: 10,
+        model_concurrency_limits,
+        adaptive_concurrency: true,
+        // The controller is refused without a gate, since the configured limit
+        // becomes a starting point and nothing else would bound growth. There is
+        // no cgroup limit under test, so the gate permits the controller and then
+        // never engages.
+        memory_gate_high_fraction: 0.75,
+        max_retries: Some(3),
+        stop_before_deadline_ms: None,
+        status_log_interval_ms: None,
+        throughput_log_interval_ms: None,
+        heartbeat_interval_ms: 10_000,
+        cancellation_poll_interval_ms: 100,
+        purge_interval_ms: 0,
+        ..Default::default()
+    };
+    let manager = postgres_store(pool, &config).await;
+    for index in 0..12 {
+        manager
+            .create_flex(CreateFlexInput {
+                request_id: uuid::Uuid::new_v4(),
+                body: format!(r#"{{"kind":"grow-{index}"}}"#),
+                model: "growing-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/grow".to_string(),
+                api_key: "key".to_string(),
+                created_by: format!("owner-{index}"),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+    }
+    mark_models_live_for_test(manager.as_ref(), &["growing-model"]).await;
+
+    let shutdown_token = CancellationToken::new();
+    let daemon_handle = postgres_daemon(manager.clone(), http_client.clone(), config)
+        .run(shutdown_token.clone())
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while http_client.in_flight_count() != 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the configured limit should bound the first wave");
+
+    // Those two filled every slot offered and came back clean, which is the
+    // condition that raises the limit. Later waves should exceed the configured
+    // 2.
+    let mut triggers = triggers.into_iter();
+    triggers.next().unwrap().send(()).unwrap();
+    triggers.next().unwrap().send(()).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while http_client.in_flight_count() <= 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("a clean, capacity-bound model should be allowed past its configured limit");
+
+    shutdown_token.cancel();
+    for trigger in triggers {
+        let _ = trigger.send(());
+    }
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("daemon should stop")
+        .expect("daemon task should not panic")
+        .expect("daemon should stop cleanly");
+}
+
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn background_529_does_not_throttle_foreground_claims(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    let overload_trigger = http_client.add_response_with_trigger(
+        "POST /v1/adaptive-shared",
+        Ok(HttpResponse {
+            status: 529,
+            body: r#"{"error":"model overloaded"}"#.to_string(),
+        }),
+    );
+    let success_triggers: Vec<_> = (0..4)
+        .map(|_| {
+            http_client.add_response_with_trigger(
+                "POST /v1/adaptive-shared",
+                Ok(HttpResponse {
+                    status: 200,
+                    body: r#"{"result":"success"}"#.to_string(),
+                }),
+            )
+        })
+        .collect();
+
+    let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+    model_concurrency_limits.insert("shared-model".to_string(), 4);
+    let config = DaemonConfig {
+        mode: fusillade::DaemonMode::Both,
+        claim_batch_size: 10,
+        batch_claim_size: 10,
+        batch_claim_batch_size: 10,
+        claim_interval_ms: 10,
+        batch_claim_interval_ms: 10,
+        model_concurrency_limits,
+        background_concurrency_limit: 4,
+        inject_deadline_priority: true,
+        adaptive_concurrency: true,
+        // The controller is refused without a gate, since the configured limit
+        // becomes a starting point and nothing else would bound growth. There is
+        // no cgroup limit under test, so the gate permits the controller and then
+        // never engages.
+        memory_gate_high_fraction: 0.75,
+        max_retries: Some(3),
+        stop_before_deadline_ms: None,
+        backoff_ms: 60_000,
+        backoff_factor: 1,
+        max_backoff_ms: 60_000,
+        status_log_interval_ms: None,
+        throughput_log_interval_ms: None,
+        heartbeat_interval_ms: 10_000,
+        cancellation_poll_interval_ms: 100,
+        purge_interval_ms: 0,
+        ..Default::default()
+    };
+    let manager = postgres_store(pool, &config).await;
+    let background_request_id = uuid::Uuid::new_v4();
+    manager
+        .create_background(CreateBackgroundInput {
+            request_id: background_request_id,
+            body: r#"{"kind":"background-overload"}"#.to_string(),
+            model: "shared-model".to_string(),
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/adaptive-shared".to_string(),
+            api_key: "key".to_string(),
+            created_by: "background-owner".to_string(),
+            metadata: None,
+        })
+        .await
+        .unwrap();
+    mark_models_live_for_test(manager.as_ref(), &["shared-model"]).await;
+
+    let shutdown_token = CancellationToken::new();
+    let daemon_handle = postgres_daemon(manager.clone(), http_client.clone(), config)
+        .run(shutdown_token.clone())
+        .unwrap();
+
+    wait_for_mock_calls(&http_client, 1).await;
+    overload_trigger.send(()).unwrap();
+    let overload_recorded_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let background = manager
+            .get_request_detail(fusillade::RequestId(background_request_id))
+            .await
+            .unwrap();
+        if background.status == "pending" {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < overload_recorded_deadline,
+            "background 529 was not rescheduled before timeout"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    let foreground_ids: Vec<_> = (0..4).map(|_| uuid::Uuid::new_v4()).collect();
+    for (index, request_id) in foreground_ids.iter().copied().enumerate() {
+        manager
+            .create_flex(CreateFlexInput {
+                request_id,
+                body: format!(r#"{{"kind":"foreground-{index}"}}"#),
+                model: "shared-model".to_string(),
+                endpoint: "https://api.example.com".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/adaptive-shared".to_string(),
+                api_key: "key".to_string(),
+                created_by: format!("foreground-owner-{index}"),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    // Background work is opportunistic: it runs on top of the foreground limit
+    // rather than inside it, and it is admitted only while foreground is quiet.
+    // Its rejections therefore say that background overflowed, not that the
+    // foreground ceiling is too high - cutting foreground here would shrink the
+    // SLA-bearing traffic because spare-capacity traffic bounced. So the
+    // foreground limit must be untouched: all four claim at once.
+    wait_for_mock_calls(&http_client, 5).await;
+    assert_eq!(http_client.in_flight_count(), 4);
+    let stability_deadline = tokio::time::Instant::now() + Duration::from_millis(150);
+    while tokio::time::Instant::now() < stability_deadline {
+        assert_eq!(
+            http_client.call_count(),
+            5,
+            "a background 529 must not reduce foreground capacity"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let mut success_triggers = success_triggers.into_iter();
+    success_triggers.next().unwrap().send(()).unwrap();
+    success_triggers.next().unwrap().send(()).unwrap();
+    success_triggers.next().unwrap().send(()).unwrap();
+    success_triggers.next().unwrap().send(()).unwrap();
+
+    let completion_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut all_completed = true;
+        for request_id in &foreground_ids {
+            let request = manager
+                .get_request_detail(fusillade::RequestId(*request_id))
+                .await
+                .unwrap();
+            all_completed &= request.status == "completed";
+        }
+        if all_completed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < completion_deadline,
+            "foreground requests did not complete before timeout"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    shutdown_token.cancel();
+    tokio::time::timeout(Duration::from_secs(5), daemon_handle)
+        .await
+        .expect("daemon should stop")
+        .expect("daemon task should not panic")
+        .expect("daemon should stop cleanly");
 }
 
 #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]

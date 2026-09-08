@@ -354,7 +354,9 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
     // API key counts — from the Targets DashMap (no SQL needed)
     for entry in targets.targets.iter() {
         let model = entry.key().clone();
-        let count = entry.value().keys().map(|k| k.len()).unwrap_or(0);
+        // Access control is a property of the alias; a non-default pool
+        // inherits the default's keys unless it states its own.
+        let count = entry.value().default_pool().keys().map(|k| k.len()).unwrap_or(0);
         gauge!("dwctl_model_api_key_count", "model" => model).set(count as f64);
     }
 
@@ -403,6 +405,7 @@ mod tests {
                 auth_header_name: Some("Authorization".to_string()),
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
             })
             .await
             .unwrap();
@@ -442,7 +445,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: true,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -558,6 +560,7 @@ mod tests {
                 auth_header_name: Some("Authorization".to_string()),
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
             })
             .await
             .unwrap();
@@ -597,7 +600,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: true,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -641,7 +643,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: true,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -710,6 +711,7 @@ mod tests {
                 auth_header_name: Some("Authorization".to_string()),
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
             })
             .await
             .unwrap();
@@ -748,7 +750,6 @@ mod tests {
             backoff_max_total_ms: None,
             sanitize_responses: false,
             trusted: false,
-            open_responses_adapter: true,
             reasoning_translation_overrides: None,
             allowed_batch_completion_windows: None,
             metadata: None,
@@ -811,6 +812,7 @@ mod tests {
                 auth_header_name: Some("Authorization".to_string()),
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
             })
             .await
             .unwrap();
@@ -850,7 +852,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: false,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -962,6 +963,7 @@ mod tests {
                 auth_header_name: Some("Authorization".to_string()),
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
             })
             .await
             .unwrap();
@@ -1001,7 +1003,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: false,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -1045,7 +1046,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: false,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -1146,6 +1146,7 @@ mod tests {
                 auth_header_name: Some("Authorization".to_string()),
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
             })
             .await
             .unwrap();
@@ -1185,7 +1186,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: false,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,
@@ -1279,6 +1279,7 @@ mod tests {
                 auth_header_name: Some("Authorization".to_string()),
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
+                accepts_scheduling_priority: false,
             })
             .await
             .unwrap();
@@ -1318,7 +1319,6 @@ mod tests {
                 backoff_max_total_ms: None,
                 sanitize_responses: false,
                 trusted: false,
-                open_responses_adapter: true,
                 reasoning_translation_overrides: None,
 
                 allowed_batch_completion_windows: None,

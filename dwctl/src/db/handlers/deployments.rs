@@ -6,9 +6,9 @@ use crate::db::{
     errors::{DbError, Result},
     handlers::repository::Repository,
     models::deployments::{
-        DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse, DeploymentCreateDBRequest, DeploymentDBResponse,
-        DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus, ModelType, ProviderPricing, ProviderPricingFields,
-        TrafficRuleAction, TrafficRuleDBRow,
+        DEFAULT_COMPONENT_POOL, DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse, DeploymentCreateDBRequest,
+        DeploymentDBResponse, DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus, ModelType, ProviderPricing,
+        ProviderPricingFields, TrafficRuleAction, TrafficRuleDBRow,
     },
 };
 use crate::reasoning::{ModelReasoningPolicy, resolve_reasoning_translation};
@@ -40,7 +40,7 @@ pub struct DeploymentFilter {
     pub accessible_to: Option<UserId>, // None = show all deployments, Some(user_id) = show only deployments accessible to that user
     pub group_ids: Option<Vec<crate::types::GroupId>>, // None = show all, Some(group_ids) = show only models in any of these groups
     pub aliases: Option<Vec<String>>,
-    pub search: Option<String>,                // Case-insensitive substring search on alias and model_name
+    pub search: Option<String>,                // Case-insensitive substring search
     pub is_composite: Option<bool>,            // None = show all, Some(true) = composite only, Some(false) = non-composite only
     pub provider: Option<String>,              // Filter by metadata provider (case-insensitive exact match)
     pub model_type: Option<ModelType>,         // Filter by model type column
@@ -192,7 +192,6 @@ struct DeployedModel {
     pub backoff_max_total_ms: Option<i32>,
     pub sanitize_responses: bool,
     pub trusted: bool,
-    pub open_responses_adapter: Option<bool>,
     pub reasoning_translation_overrides: Option<serde_json::Value>,
     // Traffic routing
     pub allowed_batch_completion_windows: Option<Vec<String>>,
@@ -258,7 +257,6 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             backoff_max_total_ms: m.backoff_max_total_ms,
             sanitize_responses: m.sanitize_responses,
             trusted: m.trusted,
-            open_responses_adapter: m.open_responses_adapter.unwrap_or(true),
             reasoning_translation_overrides: m.reasoning_translation_overrides.and_then(|value| {
                 serde_json::from_value(value)
                     .inspect_err(|error| tracing::warn!(%error, "failed to deserialize reasoning translation overrides"))
@@ -320,12 +318,12 @@ impl<'c> Repository for Deployments<'c> {
                 downstream_hourly_rate, downstream_input_token_cost_ratio,
                 is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status,
                 fallback_with_replacement, fallback_max_attempts,
-                sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows,
+                sanitize_responses, trusted, allowed_batch_completion_windows,
                 metadata,
                 backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
                 reasoning_translation_overrides
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38)
             RETURNING *
             "#,
             request.model_name.trim(),
@@ -357,16 +355,15 @@ impl<'c> Repository for Deployments<'c> {
             request.fallback_max_attempts,
             request.sanitize_responses,
             request.trusted,
-            Some(request.open_responses_adapter),
             request.allowed_batch_completion_windows.as_ref().map(|w| w.as_slice()),
             request.metadata.as_ref().map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({}))).unwrap_or_else(|| serde_json::json!({})) as serde_json::Value,
-            request.backoff_enabled,                  // $33
-            request.backoff_initial_ms,               // $34
-            request.backoff_max_ms,                   // $35
-            request.backoff_factor,                   // $36
-            request.backoff_jitter.as_str(),          // $37
-            request.backoff_max_total_ms,             // $38
-            reasoning_translation_overrides,          // $39
+            request.backoff_enabled,                  // $32
+            request.backoff_initial_ms,               // $33
+            request.backoff_max_ms,                   // $34
+            request.backoff_factor,                   // $35
+            request.backoff_jitter.as_str(),          // $36
+            request.backoff_max_total_ms,             // $37
+            reasoning_translation_overrides,          // $38
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -385,7 +382,7 @@ impl<'c> Repository for Deployments<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = $1",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -410,7 +407,7 @@ impl<'c> Repository for Deployments<'c> {
 
         let deployments = sqlx::query_as!(
             DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, open_responses_adapter, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = ANY($1)",
             ids.as_slice()
         )
             .fetch_all(&mut *self.db)
@@ -578,35 +575,34 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE fallback_max_attempts
             END,
             trusted = COALESCE($42, trusted),
-            open_responses_adapter = COALESCE($43, open_responses_adapter),
 
             -- Batch completion windows
             allowed_batch_completion_windows = CASE
-                WHEN $44 THEN $45
+                WHEN $43 THEN $44
                 ELSE allowed_batch_completion_windows
             END,
 
             -- Catalog metadata
             metadata = CASE
-                WHEN $46 THEN $47
+                WHEN $45 THEN $46
                 ELSE metadata
             END,
 
-            display_name = COALESCE($48, display_name),
+            display_name = COALESCE($47, display_name),
 
             -- Inter-attempt backoff
-            backoff_enabled = COALESCE($49, backoff_enabled),
-            backoff_initial_ms = COALESCE($50, backoff_initial_ms),
-            backoff_max_ms = COALESCE($51, backoff_max_ms),
-            backoff_factor = COALESCE($52, backoff_factor),
-            backoff_jitter = COALESCE($53, backoff_jitter),
+            backoff_enabled = COALESCE($48, backoff_enabled),
+            backoff_initial_ms = COALESCE($49, backoff_initial_ms),
+            backoff_max_ms = COALESCE($50, backoff_max_ms),
+            backoff_factor = COALESCE($51, backoff_factor),
+            backoff_jitter = COALESCE($52, backoff_jitter),
             backoff_max_total_ms = CASE
-                WHEN $54 THEN $55
+                WHEN $53 THEN $54
                 ELSE backoff_max_total_ms
             END,
 
             reasoning_translation_overrides = CASE
-                WHEN $56 THEN $57
+                WHEN $55 THEN $56
                 ELSE reasoning_translation_overrides
             END,
 
@@ -664,28 +660,27 @@ impl<'c> Repository for Deployments<'c> {
             request.fallback_max_attempts.is_some() as bool,                         // $40
             request.fallback_max_attempts.as_ref().and_then(|inner| inner.as_ref()), // $41
             request.trusted,                                                         // $42
-            request.open_responses_adapter,                                          // $43
             // Batch completion windows
-            request.allowed_batch_completion_windows.is_some() as bool, // $44
-            request.allowed_batch_completion_windows.as_ref().and_then(|inner| inner.as_deref()) as Option<&[String]>, // $45
+            request.allowed_batch_completion_windows.is_some() as bool, // $43
+            request.allowed_batch_completion_windows.as_ref().and_then(|inner| inner.as_deref()) as Option<&[String]>, // $44
             // Catalog metadata
-            request.metadata.is_some() as bool, // $46
+            request.metadata.is_some() as bool, // $45
             request
                 .metadata
                 .as_ref()
                 .map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({})))
-                .unwrap_or_else(|| serde_json::json!({})) as serde_json::Value, // $47
-            request.display_name.as_deref(),    // $48
+                .unwrap_or_else(|| serde_json::json!({})) as serde_json::Value, // $46
+            request.display_name.as_deref(),    // $47
             // Inter-attempt backoff
-            request.backoff_enabled,                                                // $49
-            request.backoff_initial_ms,                                             // $50
-            request.backoff_max_ms,                                                 // $51
-            request.backoff_factor,                                                 // $52
-            request.backoff_jitter.as_deref(),                                      // $53
-            request.backoff_max_total_ms.is_some() as bool,                         // $54
-            request.backoff_max_total_ms.as_ref().and_then(|inner| inner.as_ref()), // $55
-            request.reasoning_translation_overrides.is_some(),                      // $56
-            reasoning_translation_overrides,                                        // $57
+            request.backoff_enabled,                                                // $48
+            request.backoff_initial_ms,                                             // $49
+            request.backoff_max_ms,                                                 // $50
+            request.backoff_factor,                                                 // $51
+            request.backoff_jitter.as_deref(),                                      // $52
+            request.backoff_max_total_ms.is_some() as bool,                         // $53
+            request.backoff_max_total_ms.as_ref().and_then(|inner| inner.as_ref()), // $54
+            request.reasoning_translation_overrides.is_some(),                      // $55
+            reasoning_translation_overrides,                                        // $56
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -814,6 +809,8 @@ impl<'c> Deployments<'c> {
             query.push(" AND (LOWER(dm.alias) LIKE ");
             query.push_bind(search_pattern.clone());
             query.push(" OR LOWER(dm.model_name) LIKE ");
+            query.push_bind(search_pattern.clone());
+            query.push(" OR LOWER(dm.display_name) LIKE ");
             query.push_bind(search_pattern.clone());
             query.push(" OR LOWER(ie.name) LIKE ");
             query.push_bind(search_pattern);
@@ -964,9 +961,9 @@ impl<'c> Deployments<'c> {
         let result = sqlx::query!(
             r#"
             WITH inserted AS (
-                INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order)
-                VALUES ($1, $2, $3, $4, $5)
-                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, created_at
+                INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, pool)
+                VALUES ($1, $2, $3, $4, $5, $6)
+                RETURNING id, composite_model_id, deployed_model_id, weight, enabled, sort_order, pool, created_at
             )
             SELECT
                 inserted.id,
@@ -975,13 +972,13 @@ impl<'c> Deployments<'c> {
                 inserted.weight,
                 inserted.enabled,
                 inserted.sort_order,
+                inserted.pool,
                 inserted.created_at,
                 dm.alias as model_alias,
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
                 dm.trusted as model_trusted,
-                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM inserted
@@ -992,7 +989,8 @@ impl<'c> Deployments<'c> {
             request.deployed_model_id,
             request.weight,
             request.enabled,
-            request.sort_order
+            request.sort_order,
+            request.pool
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -1004,6 +1002,7 @@ impl<'c> Deployments<'c> {
             weight: result.weight,
             enabled: result.enabled,
             sort_order: result.sort_order,
+            pool: result.pool,
             created_at: result.created_at,
             model_alias: result.model_alias,
             model_name: result.model_name,
@@ -1012,17 +1011,23 @@ impl<'c> Deployments<'c> {
             endpoint_id: result.endpoint_id,
             endpoint_name: result.endpoint_name,
             model_trusted: result.model_trusted,
-            model_open_responses_adapter: result.model_open_responses_adapter.unwrap_or(true),
         })
     }
 
     /// Remove a component from a composite model
     #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), deployed_id = %abbrev_uuid(&deployed_model_id)), err)]
-    pub async fn remove_component(&mut self, composite_model_id: DeploymentId, deployed_model_id: DeploymentId) -> Result<bool> {
+    pub async fn remove_component(
+        &mut self,
+        composite_model_id: DeploymentId,
+        deployed_model_id: DeploymentId,
+        pool: &str,
+    ) -> Result<bool> {
         let result = sqlx::query!(
-            "DELETE FROM deployed_model_components WHERE composite_model_id = $1 AND deployed_model_id = $2",
+            "DELETE FROM deployed_model_components
+             WHERE composite_model_id = $1 AND deployed_model_id = $2 AND pool = $3",
             composite_model_id,
-            deployed_model_id
+            deployed_model_id,
+            pool
         )
         .execute(&mut *self.db)
         .await?;
@@ -1042,13 +1047,13 @@ impl<'c> Deployments<'c> {
                 dmc.weight,
                 dmc.enabled,
                 dmc.sort_order,
+                dmc.pool,
                 dmc.created_at,
                 dm.alias as model_alias,
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
                 dm.trusted as model_trusted,
-                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
@@ -1071,6 +1076,7 @@ impl<'c> Deployments<'c> {
                 weight: r.weight,
                 enabled: r.enabled,
                 sort_order: r.sort_order,
+                pool: r.pool,
                 created_at: r.created_at,
                 model_alias: r.model_alias,
                 model_name: r.model_name,
@@ -1079,7 +1085,6 @@ impl<'c> Deployments<'c> {
                 endpoint_id: r.endpoint_id,
                 endpoint_name: r.endpoint_name,
                 model_trusted: r.model_trusted,
-                model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
             })
             .collect())
     }
@@ -1103,13 +1108,13 @@ impl<'c> Deployments<'c> {
                 dmc.weight,
                 dmc.enabled,
                 dmc.sort_order,
+                dmc.pool,
                 dmc.created_at,
                 dm.alias as model_alias,
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
                 dm.trusted as model_trusted,
-                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
@@ -1133,6 +1138,7 @@ impl<'c> Deployments<'c> {
                 weight: r.weight,
                 enabled: r.enabled,
                 sort_order: r.sort_order,
+                pool: r.pool,
                 created_at: r.created_at,
                 model_alias: r.model_alias,
                 model_name: r.model_name,
@@ -1141,7 +1147,6 @@ impl<'c> Deployments<'c> {
                 endpoint_id: r.endpoint_id,
                 endpoint_name: r.endpoint_name,
                 model_trusted: r.model_trusted,
-                model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
             });
         }
 
@@ -1156,9 +1161,13 @@ impl<'c> Deployments<'c> {
         composite_model_id: DeploymentId,
         components: Vec<(DeploymentId, i32, bool, i32)>,
     ) -> Result<Vec<DeploymentComponentDBResponse>> {
-        // Delete existing components
+        // Replace the DEFAULT pool only. Bulk replacement predates pools and has
+        // no way to name one; wiping a composite's completions pool as a side
+        // effect of editing its member list would silently disable continuation
+        // for that model. Non-default pools are edited through the components
+        // API, which names the pool.
         sqlx::query!(
-            "DELETE FROM deployed_model_components WHERE composite_model_id = $1",
+            "DELETE FROM deployed_model_components WHERE composite_model_id = $1 AND pool = 'default'",
             composite_model_id
         )
         .execute(&mut *self.db)
@@ -1173,6 +1182,7 @@ impl<'c> Deployments<'c> {
                 weight,
                 enabled,
                 sort_order,
+                pool: DEFAULT_COMPONENT_POOL.to_string(),
             };
             results.push(self.add_component(&request).await?);
         }
@@ -1198,17 +1208,20 @@ impl<'c> Deployments<'c> {
         Ok(locked.is_some())
     }
 
-    /// Renumber a composite's components to a dense 0..n-1 sequence in their
+    /// Renumber one pool's components to a dense 0..n-1 sequence in their
     /// current priority order (sort_order, then weight DESC, then created_at).
     /// Used after a removal so deletions don't leave gaps. Idempotent.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
-    pub async fn compact_component_sort_order(&mut self, composite_model_id: DeploymentId) -> Result<()> {
+    ///
+    /// Ordering is per pool: each pool is its own failover list, so position 0
+    /// means "tried first in this pool", not "tried first in the composite".
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), pool), err)]
+    pub async fn compact_component_sort_order(&mut self, composite_model_id: DeploymentId, pool: &str) -> Result<()> {
         sqlx::query!(
             r#"
             WITH ranked AS (
                 SELECT id, ROW_NUMBER() OVER (ORDER BY sort_order ASC, weight DESC, created_at ASC) - 1 AS new_order
                 FROM deployed_model_components
-                WHERE composite_model_id = $1
+                WHERE composite_model_id = $1 AND pool = $2
             )
             UPDATE deployed_model_components dmc
             SET sort_order = ranked.new_order
@@ -1216,7 +1229,8 @@ impl<'c> Deployments<'c> {
             WHERE dmc.id = ranked.id
               AND dmc.sort_order IS DISTINCT FROM ranked.new_order
             "#,
-            composite_model_id
+            composite_model_id,
+            pool
         )
         .execute(&mut *self.db)
         .await?;
@@ -1225,16 +1239,19 @@ impl<'c> Deployments<'c> {
     }
 
     /// The sort_order to use when appending a new component: one past the
-    /// current maximum within the composite, or 0 if it has no components yet.
+    /// current maximum within the composite's `pool`, or 0 if that pool is
+    /// empty.
     /// Callers serialize via [`Self::lock_composite`] so concurrent appends can't
     /// observe the same maximum. With removals compacting the sequence
     /// ([`Self::compact_component_sort_order`]) there are no gaps, so this is also
     /// the next dense index.
-    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
-    pub async fn next_component_sort_order(&mut self, composite_model_id: DeploymentId) -> Result<i32> {
+    #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id), pool), err)]
+    pub async fn next_component_sort_order(&mut self, composite_model_id: DeploymentId, pool: &str) -> Result<i32> {
         let next = sqlx::query_scalar!(
-            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM deployed_model_components WHERE composite_model_id = $1",
-            composite_model_id
+            "SELECT COALESCE(MAX(sort_order) + 1, 0) FROM deployed_model_components
+             WHERE composite_model_id = $1 AND pool = $2",
+            composite_model_id,
+            pool
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -1242,9 +1259,9 @@ impl<'c> Deployments<'c> {
         Ok(next.unwrap_or(0))
     }
 
-    /// Reassign sort_order across a composite's components by descending weight
-    /// (ties broken by insertion order), producing a dense, unique 0..n-1
-    /// sequence. Used when a composite switches to the `priority` strategy so the
+    /// Reassign sort_order within each of a composite's pools by descending
+    /// weight (ties broken by insertion order), producing a dense, unique
+    /// 0..n-1 sequence per pool. Used when a composite switches to the `priority` strategy so the
     /// previous weighting determines the failover order instead of leaving every
     /// component at the default sort_order = 0.
     #[instrument(skip(self), fields(composite_id = %abbrev_uuid(&composite_model_id)), err)]
@@ -1252,7 +1269,8 @@ impl<'c> Deployments<'c> {
         sqlx::query!(
             r#"
             WITH ranked AS (
-                SELECT id, ROW_NUMBER() OVER (ORDER BY weight DESC, created_at ASC) - 1 AS new_order
+                SELECT id,
+                       ROW_NUMBER() OVER (PARTITION BY pool ORDER BY weight DESC, created_at ASC) - 1 AS new_order
                 FROM deployed_model_components
                 WHERE composite_model_id = $1
             )
@@ -1280,14 +1298,16 @@ impl<'c> Deployments<'c> {
         &mut self,
         composite_model_id: DeploymentId,
         deployed_model_id: DeploymentId,
+        pool: &str,
         target_position: i32,
     ) -> Result<()> {
-        // Current order (same key the read paths use), as component ids.
+        // Current order within this pool (same key the read paths use).
         let mut ordered: Vec<DeploymentId> = sqlx::query_scalar!(
             "SELECT deployed_model_id FROM deployed_model_components
-             WHERE composite_model_id = $1
+             WHERE composite_model_id = $1 AND pool = $2
              ORDER BY sort_order ASC, weight DESC, created_at ASC",
-            composite_model_id
+            composite_model_id,
+            pool
         )
         .fetch_all(&mut *self.db)
         .await?;
@@ -1302,11 +1322,12 @@ impl<'c> Deployments<'c> {
         // Write back sort_order = index for the whole composite.
         for (idx, id) in ordered.iter().enumerate() {
             sqlx::query!(
-                "UPDATE deployed_model_components SET sort_order = $3
-                 WHERE composite_model_id = $1 AND deployed_model_id = $2
-                   AND sort_order IS DISTINCT FROM $3",
+                "UPDATE deployed_model_components SET sort_order = $4
+                 WHERE composite_model_id = $1 AND deployed_model_id = $2 AND pool = $3
+                   AND sort_order IS DISTINCT FROM $4",
                 composite_model_id,
                 id,
+                pool,
                 idx as i32
             )
             .execute(&mut *self.db)
@@ -1322,6 +1343,7 @@ impl<'c> Deployments<'c> {
         &mut self,
         composite_model_id: DeploymentId,
         deployed_model_id: DeploymentId,
+        pool: &str,
     ) -> Result<Option<DeploymentComponentDBResponse>> {
         let result = sqlx::query!(
             r#"
@@ -1332,22 +1354,23 @@ impl<'c> Deployments<'c> {
                 dmc.weight,
                 dmc.enabled,
                 dmc.sort_order,
+                dmc.pool,
                 dmc.created_at,
                 dm.alias as model_alias,
                 dm.model_name,
                 dm.description as model_description,
                 dm.type as model_type,
                 dm.trusted as model_trusted,
-                dm.open_responses_adapter as "model_open_responses_adapter?",
                 dm.hosted_on as endpoint_id,
                 e.name as "endpoint_name?"
             FROM deployed_model_components dmc
             JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
             LEFT JOIN inference_endpoints e ON e.id = dm.hosted_on
-            WHERE dmc.composite_model_id = $1 AND dmc.deployed_model_id = $2
+            WHERE dmc.composite_model_id = $1 AND dmc.deployed_model_id = $2 AND dmc.pool = $3
             "#,
             composite_model_id,
-            deployed_model_id
+            deployed_model_id,
+            pool
         )
         .fetch_optional(&mut *self.db)
         .await?;
@@ -1359,6 +1382,7 @@ impl<'c> Deployments<'c> {
             weight: r.weight,
             enabled: r.enabled,
             sort_order: r.sort_order,
+            pool: r.pool,
             created_at: r.created_at,
             model_alias: r.model_alias,
             model_name: r.model_name,
@@ -1367,7 +1391,6 @@ impl<'c> Deployments<'c> {
             endpoint_id: r.endpoint_id,
             endpoint_name: r.endpoint_name,
             model_trusted: r.model_trusted,
-            model_open_responses_adapter: r.model_open_responses_adapter.unwrap_or(true),
         }))
     }
 
@@ -1385,6 +1408,7 @@ impl<'c> Deployments<'c> {
         &mut self,
         composite_model_id: DeploymentId,
         deployed_model_id: DeploymentId,
+        pool: &str,
         weight: Option<i32>,
         enabled: Option<bool>,
         sort_order: Option<i32>,
@@ -1392,12 +1416,13 @@ impl<'c> Deployments<'c> {
         // Apply weight/enabled first; this also tells us whether the component exists.
         let exists = sqlx::query_scalar!(
             "UPDATE deployed_model_components
-             SET weight = COALESCE($3, weight),
-                 enabled = COALESCE($4, enabled)
-             WHERE composite_model_id = $1 AND deployed_model_id = $2
+             SET weight = COALESCE($4, weight),
+                 enabled = COALESCE($5, enabled)
+             WHERE composite_model_id = $1 AND deployed_model_id = $2 AND pool = $3
              RETURNING id",
             composite_model_id,
             deployed_model_id,
+            pool,
             weight,
             enabled
         )
@@ -1408,13 +1433,13 @@ impl<'c> Deployments<'c> {
             return Ok(None);
         }
 
-        // A supplied sort_order is a move-to-position request; reindex the composite.
+        // A supplied sort_order is a move-to-position request; reindex this pool.
         if let Some(target_position) = sort_order {
-            self.move_component_to_position(composite_model_id, deployed_model_id, target_position)
+            self.move_component_to_position(composite_model_id, deployed_model_id, pool, target_position)
                 .await?;
         }
 
-        self.get_component(composite_model_id, deployed_model_id).await
+        self.get_component(composite_model_id, deployed_model_id, pool).await
     }
 
     /// Get throughput values for the given model aliases
@@ -1692,6 +1717,51 @@ mod tests {
             roles: vec![Role::StandardUser],
         });
         user_repo.create(&user_create).await.unwrap().into()
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn searches_customer_visible_model_fields(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        crate::seed_database(
+            &[crate::config::ModelSource {
+                name: "test".to_string(),
+                url: base_url,
+                api_key: None,
+                sync_interval: std::time::Duration::from_secs(3600),
+                default_models: None,
+            }],
+            &pool,
+        )
+        .await
+        .unwrap();
+
+        let user = create_test_user(&pool).await;
+        let endpoint_id = get_test_endpoint_id(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = Deployments::new(&mut conn);
+        let created = repo
+            .create(
+                &DeploymentCreateDBRequest::builder()
+                    .created_by(user.id)
+                    .model_name("Qwen/Qwen3.8-27B-FP8".to_string())
+                    .alias("Qwen/Qwen3.8-27B-FP8".to_string())
+                    .display_name("Qwen3.8 27B".to_string())
+                    .description("Optimized for multilingual retrieval".to_string())
+                    .hosted_on(endpoint_id)
+                    .build(),
+            )
+            .await
+            .unwrap();
+
+        for search in ["qwen3.8 27b", "qwen3.8-27b"] {
+            let results = repo
+                .list(&DeploymentFilter::new(0, 10).with_search(search.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id, created.id);
+        }
     }
 
     fn reasoning_translation_overrides() -> ReasoningTranslationOverrides {
@@ -3224,6 +3294,7 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
             created_by: user.id,
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
@@ -3271,6 +3342,7 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
             created_by: user.id,
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
@@ -4701,13 +4773,14 @@ mod tests {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
             for component_id in &components {
                 // Mirror the handler: the server assigns the next position on add.
-                let sort_order = repo.next_component_sort_order(composite).await.unwrap();
+                let sort_order = repo.next_component_sort_order(composite, DEFAULT_COMPONENT_POOL).await.unwrap();
                 repo.add_component(&DeploymentComponentCreateDBRequest {
                     composite_model_id: composite,
                     deployed_model_id: *component_id,
                     weight: 50,
                     enabled: true,
                     sort_order,
+                    pool: DEFAULT_COMPONENT_POOL.to_string(),
                 })
                 .await
                 .unwrap();
@@ -4739,6 +4812,7 @@ mod tests {
                     weight,
                     enabled: true,
                     sort_order: 0,
+                    pool: DEFAULT_COMPONENT_POOL.to_string(),
                 })
                 .await
                 .unwrap();
@@ -4774,6 +4848,7 @@ mod tests {
                     weight: 50,
                     enabled: true,
                     sort_order: i as i32,
+                    pool: DEFAULT_COMPONENT_POOL.to_string(),
                 })
                 .await
                 .unwrap();
@@ -4786,7 +4861,7 @@ mod tests {
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
             let moved = repo
-                .update_component(composite, components[2], None, None, Some(0))
+                .update_component(composite, components[2], DEFAULT_COMPONENT_POOL, None, None, Some(0))
                 .await
                 .unwrap()
                 .expect("component exists");
@@ -4805,7 +4880,7 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
-            repo.update_component(composite, components[2], None, None, Some(999))
+            repo.update_component(composite, components[2], DEFAULT_COMPONENT_POOL, None, None, Some(999))
                 .await
                 .unwrap()
                 .expect("component exists");
@@ -4821,7 +4896,7 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
-            repo.update_component(composite, components[0], Some(99), None, None)
+            repo.update_component(composite, components[0], DEFAULT_COMPONENT_POOL, Some(99), None, None)
                 .await
                 .unwrap()
                 .expect("component exists");
@@ -4847,6 +4922,7 @@ mod tests {
                     weight: 50,
                     enabled: true,
                     sort_order: i as i32,
+                    pool: DEFAULT_COMPONENT_POOL.to_string(),
                 })
                 .await
                 .unwrap();
@@ -4858,8 +4934,12 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
-            assert!(repo.remove_component(composite, components[1]).await.unwrap());
-            repo.compact_component_sort_order(composite).await.unwrap();
+            assert!(
+                repo.remove_component(composite, components[1], DEFAULT_COMPONENT_POOL)
+                    .await
+                    .unwrap()
+            );
+            repo.compact_component_sort_order(composite, DEFAULT_COMPONENT_POOL).await.unwrap();
         }
         tx.commit().await.unwrap();
 
@@ -4874,7 +4954,7 @@ mod tests {
         let mut tx = pool.begin().await.unwrap();
         let next = {
             let mut repo = Deployments::new(tx.acquire().await.unwrap());
-            repo.next_component_sort_order(composite).await.unwrap()
+            repo.next_component_sort_order(composite, DEFAULT_COMPONENT_POOL).await.unwrap()
         };
         tx.commit().await.unwrap();
         assert_eq!(next, 2);

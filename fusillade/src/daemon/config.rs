@@ -1,19 +1,116 @@
 //! Shared daemon configuration.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::http::HttpResponse;
+
+/// Optional leaking for queued batches on unavailable models.
+/// Async/flex claims retain `DaemonConfig::leaks_per_window`.
+/// Kept separate from `DaemonConfig` to preserve downstream struct literals.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LeakConfig {
+    /// Enable batch leaking outside the deadline ramp. False restores the live gate.
+    pub leak_enabled: bool,
+    /// Seconds between claims per user/model/window. Must be positive.
+    pub leak_interval_seconds: NonZeroU32,
+    /// Exact model aliases overriding the default interval.
+    pub model_leak_interval_seconds: HashMap<String, NonZeroU32>,
+}
+
+impl Default for LeakConfig {
+    fn default() -> Self {
+        Self {
+            leak_enabled: true,
+            leak_interval_seconds: NonZeroU32::new(60).unwrap(),
+            model_leak_interval_seconds: HashMap::new(),
+        }
+    }
+}
+
+impl LeakConfig {
+    pub(crate) fn interval(&self, model: &str) -> Duration {
+        let seconds = self
+            .model_leak_interval_seconds
+            .get(model)
+            .unwrap_or(&self.leak_interval_seconds);
+        Duration::from_secs(u64::from(seconds.get()))
+    }
+}
 
 /// Predicate function to determine if a response should be retried.
 pub type ShouldRetryFn = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
 
-/// Default retry predicate: retry on server errors, rate limits, timeouts, and not found.
+/// Default retry predicate: retry on server errors, rate limits, timeouts, and not
+/// found, plus successful chat completions that carry reasoning but no final answer.
 pub fn default_should_retry(response: &HttpResponse) -> bool {
-    response.status >= 500
+    if response.status >= 500
         || response.status == 429
         || response.status == 408
         || response.status == 404
+    {
+        return true;
+    }
+    (200..300).contains(&response.status) && is_reasoning_without_answer(&response.body)
+}
+
+/// A completed chat response whose message holds chain-of-thought but no answer:
+/// the engine emitted an end-of-sequence token mid-reasoning, so the whole output
+/// was filed as reasoning and `content` never arrived. The response looks
+/// successful (2xx, `finish_reason: "stop"`) but is useless to the caller, so it
+/// is classified as a failure and retried.
+///
+/// Detection must read the body, not usage counts: some engine builds omit the
+/// reasoning split from the usage frame (`reasoning_tokens: 0` despite real
+/// reasoning), so token-based predicates miss them.
+///
+/// `finish_reason: "length"` is deliberately excluded — hitting a token cap is a
+/// valid outcome under caller-controlled parameters, and retrying it can re-arm
+/// arbitrarily large generations.
+fn is_reasoning_without_answer(body: &str) -> bool {
+    // Non-reasoning responses can never match; skip parsing their bodies.
+    if !body.contains("\"reasoning") {
+        return false;
+    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
+        return false;
+    };
+    let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else {
+        return false;
+    };
+    choices.iter().any(|choice| {
+        if choice.get("finish_reason").and_then(|f| f.as_str()) != Some("stop") {
+            return false;
+        }
+        let Some(message) = choice.get("message") else {
+            return false;
+        };
+        // A tool invocation is a complete answer with legitimately empty content.
+        let has_tool_calls = message
+            .get("tool_calls")
+            .and_then(|t| t.as_array())
+            .is_some_and(|t| !t.is_empty())
+            || message.get("function_call").is_some_and(|f| !f.is_null());
+        if has_tool_calls {
+            return false;
+        }
+        let has_reasoning = ["reasoning_content", "reasoning"].iter().any(|key| {
+            message
+                .get(key)
+                .and_then(|r| r.as_str())
+                .is_some_and(|r| !r.is_empty())
+        });
+        let no_answer = match message.get("content") {
+            None | Some(serde_json::Value::Null) => true,
+            Some(serde_json::Value::String(s)) => s.is_empty(),
+            // Structured content parts are an answer even when unusual.
+            Some(_) => false,
+        };
+        has_reasoning && no_answer
+    })
 }
 
 fn default_should_retry_fn() -> ShouldRetryFn {
@@ -101,18 +198,255 @@ impl DaemonMode {
     }
 }
 
+/// Additive controls for retained-response maintenance.
+///
+/// This configuration is installed with [`super::Daemon::with_retention_maintenance`]
+/// so existing exhaustive [`DaemonConfig`] literals remain source compatible.
+/// The policy carries no implicit retention duration and every destructive
+/// action is disabled by default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionMaintenanceConfig {
+    policy: crate::RetentionPolicy,
+    batchless_archive_sweep_enabled: bool,
+    batchless_archive_backfill_enabled: bool,
+    batchless_archive_groups_per_tick: i64,
+    batchless_archive_bytes_per_tick: i64,
+    batchless_archive_backfill_concurrency: usize,
+    retained_response_partitions_days_ahead: i32,
+    retained_response_retirement_enabled: bool,
+    batch_archive_retirement_enabled: bool,
+    batch_archive_retention_days: Option<u32>,
+    template_retirement_enabled: bool,
+    template_retention_days: Option<u32>,
+}
+
+impl Default for RetentionMaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            policy: crate::RetentionPolicy::default(),
+            batchless_archive_sweep_enabled: false,
+            batchless_archive_backfill_enabled: false,
+            batchless_archive_groups_per_tick: 4,
+            batchless_archive_bytes_per_tick: 64 * 1_024 * 1_024,
+            batchless_archive_backfill_concurrency: 1,
+            retained_response_partitions_days_ahead: 7,
+            retained_response_retirement_enabled: false,
+            batch_archive_retirement_enabled: false,
+            batch_archive_retention_days: None,
+            template_retirement_enabled: false,
+            template_retention_days: None,
+        }
+    }
+}
+
+impl RetentionMaintenanceConfig {
+    /// Create disabled maintenance controls for an explicit retention policy.
+    pub fn new(policy: crate::RetentionPolicy) -> Self {
+        Self {
+            policy,
+            ..Self::default()
+        }
+    }
+
+    /// Enable or disable steady movement of newly terminal batchless graphs.
+    pub fn with_batchless_archive_sweep_enabled(mut self, enabled: bool) -> Self {
+        self.batchless_archive_sweep_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable historical batchless archive movement.
+    pub fn with_batchless_archive_backfill_enabled(mut self, enabled: bool) -> Self {
+        self.batchless_archive_backfill_enabled = enabled;
+        self
+    }
+
+    /// Set the complete-graph and retained-payload byte bounds per mover tick.
+    pub fn with_batchless_archive_limits(mut self, max_groups: i64, max_bytes: i64) -> Self {
+        self.batchless_archive_groups_per_tick = max_groups;
+        self.batchless_archive_bytes_per_tick = max_bytes;
+        self
+    }
+
+    /// Set how many graphs the backfill worker moves concurrently within one
+    /// tick. The steady sweep always moves sequentially. Values below 1 fail
+    /// startup validation while the backfill is enabled.
+    pub fn with_batchless_archive_backfill_concurrency(mut self, concurrency: usize) -> Self {
+        self.batchless_archive_backfill_concurrency = concurrency;
+        self
+    }
+
+    /// Set the daily retained-response partition runway.
+    pub fn with_retained_response_partitions_days_ahead(mut self, days_ahead: i32) -> Self {
+        self.retained_response_partitions_days_ahead = days_ahead;
+        self
+    }
+
+    /// Enable or disable selection of newly eligible daily response buckets.
+    /// Durable unfinished retirements remain recoverable while this is false.
+    pub fn with_retained_response_retirement_enabled(mut self, enabled: bool) -> Self {
+        self.retained_response_retirement_enabled = enabled;
+        self
+    }
+
+    /// Enable or disable selection of newly eligible weekly batch-archive
+    /// buckets. Durable unfinished retirements remain recoverable while this
+    /// is false.
+    pub fn with_batch_archive_retirement_enabled(mut self, enabled: bool) -> Self {
+        self.batch_archive_retirement_enabled = enabled;
+        self
+    }
+
+    /// Set the finalization-anchored batch content retention period. There is
+    /// deliberately no default; enabling batch-archive retirement without an
+    /// explicit period fails validation.
+    pub fn with_batch_archive_retention_days(mut self, days: Option<u32>) -> Self {
+        self.batch_archive_retention_days = days;
+        self
+    }
+
+    /// Return the operator-supplied retention policy.
+    pub fn policy(&self) -> &crate::RetentionPolicy {
+        &self.policy
+    }
+
+    /// Whether steady batchless archive movement is enabled.
+    pub fn batchless_archive_sweep_enabled(&self) -> bool {
+        self.batchless_archive_sweep_enabled
+    }
+
+    /// Whether historical batchless archive movement is enabled.
+    pub fn batchless_archive_backfill_enabled(&self) -> bool {
+        self.batchless_archive_backfill_enabled
+    }
+
+    /// Maximum complete response graphs moved per tick.
+    pub fn batchless_archive_groups_per_tick(&self) -> i64 {
+        self.batchless_archive_groups_per_tick
+    }
+
+    /// Maximum retained payload bytes moved per tick.
+    pub fn batchless_archive_bytes_per_tick(&self) -> i64 {
+        self.batchless_archive_bytes_per_tick
+    }
+
+    /// Graphs the backfill worker moves concurrently within one tick.
+    pub fn batchless_archive_backfill_concurrency(&self) -> usize {
+        self.batchless_archive_backfill_concurrency
+    }
+
+    /// Number of future daily retained-response partitions to ensure.
+    pub fn retained_response_partitions_days_ahead(&self) -> i32 {
+        self.retained_response_partitions_days_ahead
+    }
+
+    /// Whether selection of newly eligible retained-response buckets is enabled.
+    pub fn retained_response_retirement_enabled(&self) -> bool {
+        self.retained_response_retirement_enabled
+    }
+
+    /// Whether selection of newly eligible batch-archive buckets is enabled.
+    pub fn batch_archive_retirement_enabled(&self) -> bool {
+        self.batch_archive_retirement_enabled
+    }
+
+    /// The finalization-anchored batch content retention period, when set.
+    pub fn batch_archive_retention_days(&self) -> Option<u32> {
+        self.batch_archive_retention_days
+    }
+
+    /// Enable or disable file-content expiry and selection of newly eligible
+    /// weekly template buckets. Durable unfinished retirements remain
+    /// recoverable while this is false.
+    pub fn with_template_retirement_enabled(mut self, enabled: bool) -> Self {
+        self.template_retirement_enabled = enabled;
+        self
+    }
+
+    /// Set the creation-anchored input-content retention period. There is
+    /// deliberately no default; enabling template retirement without an
+    /// explicit period fails validation.
+    pub fn with_template_retention_days(mut self, days: Option<u32>) -> Self {
+        self.template_retention_days = days;
+        self
+    }
+
+    /// Whether file-content expiry and template bucket selection are enabled.
+    pub fn template_retirement_enabled(&self) -> bool {
+        self.template_retirement_enabled
+    }
+
+    /// The creation-anchored input-content retention period, when set.
+    pub fn template_retention_days(&self) -> Option<u32> {
+        self.template_retention_days
+    }
+}
+
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct DaemonConfig {
     /// Claim-loop mode for this daemon process.
     #[serde(default)]
     pub mode: DaemonMode,
     pub claim_batch_size: usize,
+    /// Per-model concurrency.
+    ///
+    /// With `adaptive_concurrency` off these are the limits, unchanged. With it
+    /// on they are where each model starts, and the controller owns the number
+    /// from there - bounded by the memory gate, not per model.
     #[serde(
         default = "default_model_concurrency_limits",
         serialize_with = "serialize_model_concurrency_limits",
         deserialize_with = "deserialize_model_concurrency_limits"
     )]
     pub model_concurrency_limits: Arc<dashmap::DashMap<String, usize>>,
+    /// Discover each model's concurrency from downstream backpressure instead of
+    /// running flat out at its configured value.
+    ///
+    /// Off by default, and turning it off returns every model to its configured
+    /// value exactly as before, so the flag is safe to flip either way. While it
+    /// is on a model's limit can go above its configured value, so the daemon
+    /// refuses to enable it unless `memory_gate_high_fraction` is set - there
+    /// would otherwise be nothing bounding growth.
+    #[serde(default)]
+    pub adaptive_concurrency: bool,
+    /// What to multiply a model's limit by each time it goes up.
+    ///
+    /// Clamped to `1.01..=10.0`. Higher recovers faster from a cut but overshoots
+    /// the model's real capacity further before a 529 says so, and every request
+    /// past that point is a retry and a database write.
+    #[serde(default = "default_adaptive_growth_factor")]
+    pub adaptive_growth_factor: f64,
+    /// What to multiply a model's limit by when it returns a 529.
+    ///
+    /// Clamped to `0.05..=0.99`. Closer to 1 gives up less throughput per
+    /// rejection but takes more steps to get down when capacity really has
+    /// dropped.
+    #[serde(default = "default_adaptive_cut_factor")]
+    pub adaptive_cut_factor: f64,
+    /// Fraction of this process's own memory limit at or above which claiming
+    /// stops. Zero disables the gate.
+    ///
+    /// A count of in-flight requests cannot express this: per-request bytes
+    /// vary by more than an order of magnitude between workloads, so no count is
+    /// safe across all of them. This bounds the thing that actually kills the
+    /// process, by measuring it rather than predicting it: above the mark the
+    /// daemon claims nothing and in-flight drains as requests finish. Nothing
+    /// upstream signals local memory pressure, so with `adaptive_concurrency` on
+    /// this is the only control that corresponds to running out of memory.
+    ///
+    /// Claiming resumes on either of two conditions: usage falling below
+    /// `memory_gate_low_fraction`, or in-flight falling to
+    /// `memory_gate_release_in_flight_fraction` of what it was when the gate
+    /// engaged. The second exists because the first is not always reachable -
+    /// see that field for why.
+    #[serde(default)]
+    pub memory_gate_high_fraction: f64,
+    /// Fraction of the memory limit below which claiming resumes. Must be above
+    /// zero and below `memory_gate_high_fraction`, or the gate stays off.
+    ///
+    /// Separate from the high mark so the gate does not flip on and off every
+    /// claim cycle while usage sits on the boundary.
+    #[serde(default = "default_memory_gate_low_fraction")]
+    pub memory_gate_low_fraction: f64,
     #[serde(skip, default = "default_model_escalations")]
     pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
     #[serde(default)]
@@ -181,19 +515,21 @@ pub struct DaemonConfig {
     /// Maximum time to the first streaming response event, in milliseconds.
     ///
     /// This includes connection setup, request upload, response headers, and
-    /// the first event. For non-streaming requests it contributes to the
-    /// combined overall request timeout with `body_timeout_ms`.
+    /// the first event. The daemon itself no longer reads streams, so it applies
+    /// `first_chunk_timeout_ms + body_timeout_ms` as one overall request timeout
+    /// and the layer that does read them enforces this budget on its own.
     pub first_chunk_timeout_ms: u64,
     /// Maximum idle time between subsequent SSE events, in milliseconds.
     ///
-    /// This only applies to endpoints listed in `streamable_endpoints` and
-    /// starts after the first event has arrived.
+    /// Starts after the first event has arrived. This is the budget that catches
+    /// a stream which opens and then stalls, and it has no equivalent in an
+    /// overall request timeout, so it is enforced only where the stream is read.
+    /// A stream that trips it comes back to the daemon as a timeout error.
     pub chunk_timeout_ms: u64,
     /// Maximum total response-body collection time, in milliseconds.
     ///
-    /// For streaming requests this runs across the complete SSE collection
-    /// phase, alongside the per-event `chunk_timeout_ms`. For non-streaming
-    /// requests it contributes to the combined overall request timeout with
+    /// Enforced across the whole read where the stream is read, and contributing
+    /// to the daemon's combined overall request timeout with
     /// `first_chunk_timeout_ms`.
     pub body_timeout_ms: u64,
     pub status_log_interval_ms: Option<u64>,
@@ -282,8 +618,6 @@ pub struct DaemonConfig {
     pub batch_finalizer_cancelled_per_tick: i64,
     pub throughput_log_interval_ms: Option<u64>,
     #[serde(default)]
-    pub streamable_endpoints: Vec<String>,
-    #[serde(default)]
     pub urgency_weight: f64,
     #[serde(default = "default_service_tier_completion_windows_ms")]
     pub service_tier_completion_windows_ms: HashMap<String, u64>,
@@ -356,6 +690,25 @@ fn default_upload_stall_poll_ms() -> u64 {
     crate::http::DEFAULT_UPLOAD_STALL_POLL.as_millis() as u64
 }
 
+/// Ten points under a 0.75 high mark: wide enough that the gate does not flap,
+/// narrow enough that a pod does not sit idle far below its ceiling.
+fn default_memory_gate_low_fraction() -> f64 {
+    0.65
+}
+
+/// Half the work in flight at engagement. Low enough that a genuinely loaded pod
+/// holds for a meaningful stretch rather than flapping, high enough that it
+/// always recovers well before a full drain. If memory is still over the high
+/// mark when it resumes, the next cycle re-engages, so the cost of releasing too
+/// early is one claim batch.
+fn default_adaptive_growth_factor() -> f64 {
+    1.5
+}
+
+fn default_adaptive_cut_factor() -> f64 {
+    0.8
+}
+
 fn default_archive_sweep_interval_ms() -> u64 {
     5_000
 }
@@ -418,6 +771,11 @@ impl Default for DaemonConfig {
             mode: DaemonMode::default(),
             claim_batch_size: 100,
             model_concurrency_limits: Arc::new(dashmap::DashMap::new()),
+            adaptive_concurrency: false,
+            adaptive_growth_factor: default_adaptive_growth_factor(),
+            adaptive_cut_factor: default_adaptive_cut_factor(),
+            memory_gate_high_fraction: 0.0,
+            memory_gate_low_fraction: default_memory_gate_low_fraction(),
             model_escalations: default_model_escalations(),
             inject_deadline_priority: false,
             background_concurrency_limit: 0,
@@ -469,7 +827,6 @@ impl Default for DaemonConfig {
             purge_batch_size: 1000,
             purge_throttle_ms: 100,
             throughput_log_interval_ms: Some(60_000),
-            streamable_endpoints: Vec::new(),
             urgency_weight: 0.0,
             service_tier_completion_windows_ms: default_service_tier_completion_windows_ms(),
             default_completion_window_ms: default_completion_window_ms(),
@@ -521,6 +878,43 @@ mod tests {
     }
 
     #[test]
+    fn fixed_leak_intervals_resolve_exact_model_overrides() {
+        let config: LeakConfig = serde_json::from_value(serde_json::json!({
+            "model_leak_interval_seconds": {"large/model": 10}
+        }))
+        .unwrap();
+        assert_eq!(config.interval("large/model").as_secs(), 10);
+        assert_eq!(config.interval("other/model").as_secs(), 60);
+        assert_eq!(config.interval("large/model-suffix").as_secs(), 60);
+        assert!(
+            serde_json::from_value::<LeakConfig>(serde_json::json!({
+                "leak_interval_seconds": 0
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<LeakConfig>(serde_json::json!({
+                "model_leak_interval_seconds": {"large/model": 0}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn retention_maintenance_defaults_are_safe_and_bounded() {
+        let config = RetentionMaintenanceConfig::default();
+
+        assert!(!config.policy.is_enabled());
+        assert!(!config.batchless_archive_sweep_enabled);
+        assert!(!config.batchless_archive_backfill_enabled);
+        assert!(!config.retained_response_retirement_enabled);
+        assert!(config.batchless_archive_groups_per_tick > 0);
+        assert!(config.batchless_archive_bytes_per_tick > 0);
+        assert_eq!(config.batchless_archive_backfill_concurrency, 1);
+        assert!(config.retained_response_partitions_days_ahead > 0);
+    }
+
+    #[test]
     fn daemon_mode_metric_labels_match_serde_encoding() {
         // The `mode` label on daemon metrics (fusillade_daemon_up) must read
         // identically to the config value that produced it, or dashboards
@@ -533,6 +927,52 @@ mod tests {
             let serde_encoding = serde_json::to_value(mode).unwrap();
             assert_eq!(serde_encoding.as_str().unwrap(), mode.metric_label());
         }
+    }
+
+    #[test]
+    fn adaptive_concurrency_ships_dark() {
+        // Turning it on lets a model's limit grow past its configured value, so
+        // the failure mode for defaulting it on is an OOM rather than a slow
+        // queue. It has to be a deliberate flip.
+        let config = DaemonConfig::default();
+        assert!(!config.adaptive_concurrency);
+        assert_eq!(config.memory_gate_high_fraction, 0.0);
+    }
+
+    #[test]
+    fn adaptive_concurrency_knobs_default_and_round_trip() {
+        let default_config = DaemonConfig::default();
+        assert_eq!(default_config.adaptive_growth_factor, 1.5);
+        assert_eq!(default_config.adaptive_cut_factor, 0.8);
+
+        // Configs serialized before these keys existed must keep deserializing.
+        let mut serialized = serde_json::to_value(&default_config).unwrap();
+        {
+            let serialized = serialized.as_object_mut().unwrap();
+            serialized.remove("adaptive_concurrency");
+            serialized.remove("adaptive_growth_factor");
+            serialized.remove("adaptive_cut_factor");
+            serialized.remove("memory_gate_high_fraction");
+        }
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        assert!(!decoded.adaptive_concurrency);
+        assert_eq!(decoded.adaptive_growth_factor, 1.5);
+        assert_eq!(decoded.adaptive_cut_factor, 0.8);
+        assert_eq!(decoded.memory_gate_high_fraction, 0.0);
+
+        let configured = DaemonConfig {
+            adaptive_concurrency: true,
+            adaptive_growth_factor: 2.0,
+            adaptive_cut_factor: 0.5,
+            memory_gate_high_fraction: 0.75,
+            ..DaemonConfig::default()
+        };
+        let decoded: DaemonConfig =
+            serde_json::from_value(serde_json::to_value(configured).unwrap()).unwrap();
+        assert!(decoded.adaptive_concurrency);
+        assert_eq!(decoded.adaptive_growth_factor, 2.0);
+        assert_eq!(decoded.adaptive_cut_factor, 0.5);
+        assert_eq!(decoded.memory_gate_high_fraction, 0.75);
     }
 
     #[test]
@@ -580,6 +1020,91 @@ mod tests {
 
         for status in [200, 400, 401, 403, 422, 498, 499] {
             assert!(!default_should_retry(&response(status, "")));
+        }
+    }
+
+    /// Builds a 2xx chat-completion body with the given message fields spliced in.
+    fn chat_completion(finish_reason: &str, message_fields: &str) -> String {
+        format!(
+            r#"{{"id":"cmpl-1","object":"chat.completion","choices":[{{"index":0,"finish_reason":"{finish_reason}","message":{{"role":"assistant"{message_fields}}}}}],"usage":{{"prompt_tokens":10,"completion_tokens":5}}}}"#
+        )
+    }
+
+    #[test]
+    fn reasoning_without_answer_is_retriable() {
+        // The premature end-of-sequence shape: reasoning present, content never
+        // arrived (absent, null, or empty) — regardless of which reasoning field
+        // the serving stack uses.
+        for message in [
+            r#","reasoning_content":"We need to assess the headnotes...""#,
+            r#","reasoning_content":"We need to assess...","content":null"#,
+            r#","reasoning_content":"We need to assess...","content":"""#,
+            r#","reasoning":"We need to assess...""#,
+        ] {
+            let body = chat_completion("stop", message);
+            assert!(
+                default_should_retry(&response(200, &body)),
+                "expected retry for {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_with_answer_is_not_retriable() {
+        let body = chat_completion(
+            "stop",
+            r#","reasoning_content":"We need to assess...","content":"Headnote 1: ...""#,
+        );
+        assert!(!default_should_retry(&response(200, &body)));
+    }
+
+    #[test]
+    fn tool_calls_with_empty_content_are_not_retriable() {
+        // Tool invocations legitimately return no content alongside reasoning.
+        for message in [
+            r#","reasoning_content":"I should call the tool...","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]"#,
+            r#","reasoning_content":"I should call the tool...","function_call":{"name":"f","arguments":"{}"}"#,
+        ] {
+            let body = chat_completion("stop", message);
+            assert!(
+                !default_should_retry(&response(200, &body)),
+                "expected no retry for {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn length_capped_reasoning_is_not_retriable() {
+        // Exhausting the caller's token budget mid-reasoning is the caller's
+        // signal to handle (finish_reason "length"), not a retriable fault.
+        let body = chat_completion("length", r#","reasoning_content":"We need to assess...""#);
+        assert!(!default_should_retry(&response(200, &body)));
+    }
+
+    #[test]
+    fn empty_content_without_reasoning_is_not_retriable() {
+        let body = chat_completion("stop", r#","content":"""#);
+        assert!(!default_should_retry(&response(200, &body)));
+    }
+
+    #[test]
+    fn structured_content_counts_as_an_answer() {
+        let body = chat_completion(
+            "stop",
+            r#","reasoning_content":"We need to assess...","content":[{"type":"text","text":"answer"}]"#,
+        );
+        assert!(!default_should_retry(&response(200, &body)));
+    }
+
+    #[test]
+    fn unparseable_or_non_chat_bodies_are_not_retriable() {
+        for body in [
+            "not json at all",
+            r#"{"reasoning_content":"orphaned"}"#,
+            r#"{"object":"list","data":[],"note":"reasoning"}"#,
+            r#"data: {"choices":[{"delta":{"reasoning_content":"sse frame"}}]}"#,
+        ] {
+            assert!(!default_should_retry(&response(200, body)));
         }
     }
 

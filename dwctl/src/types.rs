@@ -118,7 +118,6 @@ pub enum Resource {
     Webhooks,
     System,
     Organizations,
-    ToolSources,
     Connections,
 }
 

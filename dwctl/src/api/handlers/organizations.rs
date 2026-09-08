@@ -4737,6 +4737,10 @@ mod tests {
         );
         assert_eq!(body["pending_email_change"]["new_email"].as_str().unwrap(), "attacker@example.com");
         assert!(body["pending_email_change"]["expires_at"].is_string());
+        // Neither side has clicked yet — both confirmation timestamps are
+        // surfaced as explicit nulls so the dashboard can say "waiting on both".
+        assert!(body["pending_email_change"]["new_email_confirmed_at"].is_null());
+        assert!(body["pending_email_change"]["old_email_confirmed_at"].is_null());
 
         // Re-fetch to make sure the field really wasn't written.
         let resp = server

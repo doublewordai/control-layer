@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM batch_requests_archive\n            WHERE (id, archive_bucket) IN (\n                SELECT a.id, a.archive_bucket\n                FROM (SELECT id, archive_bucket FROM batches\n                      WHERE deleted_at IS NOT NULL\n                        AND retention_expired_at IS NULL\n                        AND archive_bucket IS NOT NULL) b,\n                LATERAL (\n                    SELECT id, archive_bucket FROM batch_requests_archive\n                    WHERE archive_bucket = b.archive_bucket AND batch_id = b.id\n                    LIMIT $1\n                    FOR UPDATE SKIP LOCKED\n                ) a\n                LIMIT $1\n            )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aa821d673e92d20f27f9e35f8826cb6f65d28a713edc622c73f8dd1a081d11f5"
+}

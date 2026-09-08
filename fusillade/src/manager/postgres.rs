@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::daemon::{Daemon, DaemonConfig, DaemonMode};
+use crate::daemon::{Daemon, DaemonConfig, DaemonMode, LeakConfig, RetentionMaintenanceConfig};
 use crate::http::{HttpClient, ReqwestHttpClient};
 use crate::processor::RequestProcessor;
 
@@ -24,6 +24,8 @@ where
     storage: Arc<PostgresStore<P>>,
     http_client: Arc<H>,
     config: DaemonConfig,
+    retention_maintenance: RetentionMaintenanceConfig,
+    leak_config: Option<LeakConfig>,
     processor: OnceLock<Arc<dyn RequestProcessor<PostgresStore<P>, H>>>,
 }
 
@@ -62,7 +64,6 @@ where
                 Duration::from_millis(config.first_chunk_timeout_ms),
                 Duration::from_millis(config.chunk_timeout_ms),
                 Duration::from_millis(config.body_timeout_ms),
-                config.streamable_endpoints.clone(),
             )
             .with_upload_stall_timeout(Duration::from_millis(config.upload_stall_timeout_ms))
             .with_upload_chunk_bytes(config.upload_chunk_bytes)
@@ -79,6 +80,29 @@ where
         let storage = Arc::new(PostgresStore::new(pools, (&config).into()));
         Self::from_store(storage, config)
     }
+
+    /// Build a PostgreSQL daemon and install one retention policy on both the
+    /// scheduling runtime and every store-side late-writer fence path.
+    /// Existing constructors remain unchanged for source compatibility.
+    pub fn try_from_pools_with_retention(
+        pools: P,
+        config: DaemonConfig,
+        retention: RetentionMaintenanceConfig,
+    ) -> crate::Result<Self> {
+        retention.policy().validate().map_err(|error| {
+            crate::FusilladeError::ValidationError(format!(
+                "invalid retention configuration: {error}"
+            ))
+        })?;
+        let fence_seconds = retention.policy().max_late_writer_seconds;
+        let retention_bounds = retention.policy().batchless_retention_bounds_seconds();
+        let storage = Arc::new(
+            PostgresStore::new(pools, (&config).into())
+                .with_retained_response_fence_seconds(fence_seconds)
+                .with_retained_response_retention_bounds_seconds(retention_bounds),
+        );
+        Ok(Self::from_store(storage, config).with_retention_maintenance(retention))
+    }
 }
 
 impl<P, H> PostgresDaemon<P, H>
@@ -91,8 +115,22 @@ where
             storage,
             http_client,
             config,
+            retention_maintenance: RetentionMaintenanceConfig::default(),
+            leak_config: None,
             processor: OnceLock::new(),
         }
+    }
+
+    /// Install retained-response maintenance controls on the daemon runtime.
+    pub fn with_retention_maintenance(mut self, config: RetentionMaintenanceConfig) -> Self {
+        self.retention_maintenance = config;
+        self
+    }
+
+    /// Opt into configurable batch leaking; async/flex rates are unchanged.
+    pub fn with_leak_config(mut self, config: LeakConfig) -> Self {
+        self.leak_config = Some(config);
+        self
     }
 
     pub fn with_processor(self, processor: Arc<dyn RequestProcessor<PostgresStore<P>, H>>) -> Self {
@@ -153,11 +191,29 @@ where
             self.http_client.clone(),
             self.config.clone(),
             shutdown_token,
-        );
+        )
+        .with_retention_maintenance(self.retention_maintenance.clone());
+        if let Some(config) = &self.leak_config {
+            daemon = daemon.with_leak_config(config.clone());
+        }
         if let Some(processor) = self.processor.get().cloned() {
             daemon = daemon.with_processor(processor);
         }
+        if mode != DaemonMode::RequestOnly
+            && !self
+                .retention_maintenance
+                .policy()
+                .batchless_seconds_by_service_tier
+                .is_empty()
+            && self.storage.retained_response_fence_seconds()
+                != self.retention_maintenance.policy().max_late_writer_seconds
+        {
+            return Err(crate::FusilladeError::ValidationError(
+                "PostgreSQL late-writer fence does not match retained-response policy".to_string(),
+            ));
+        }
         let daemon = Arc::new(daemon);
+        daemon.validate_startup(mode)?;
 
         let handle = tokio::spawn(async move { daemon.run_with_mode(mode).await });
 

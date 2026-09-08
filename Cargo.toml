@@ -5,7 +5,6 @@ members = [
   "fusillade-arsenal",
   "fusillade-core",
   "onwards",
-  "onwards-fusillade",
 ]
 default-members = ["dwctl"]
 resolver = "2"

@@ -9,16 +9,18 @@ COPY fusillade/ fusillade/
 COPY fusillade-core/ fusillade-core/
 COPY fusillade-arsenal/ fusillade-arsenal/
 COPY onwards/ onwards/
-COPY onwards-fusillade/ onwards-fusillade/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Backend build stage
 FROM chef AS builder
 
-# Install build dependencies including Node.js
+# Install build dependencies including Node.js.
+# `make` is required by tikv-jemalloc-sys, which builds jemalloc from its C
+# sources via autotools rather than shipping a prebuilt library.
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    make \
     curl \
     && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y nodejs \
@@ -45,7 +47,6 @@ COPY fusillade/ fusillade/
 COPY fusillade-core/ fusillade-core/
 COPY fusillade-arsenal/ fusillade-arsenal/
 COPY onwards/ onwards/
-COPY onwards-fusillade/ onwards-fusillade/
 RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
 ENV SQLX_OFFLINE=true
 RUN cargo build --release -p dwctl

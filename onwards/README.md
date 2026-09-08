@@ -54,6 +54,7 @@ curl -X POST http://localhost:3000/v1/chat/completions \
 - Strict mode for request validation and error standardization
 - Response sanitization for OpenAI schema compliance
 - Prometheus metrics
+- Graceful standalone gateway shutdown, with readiness withdrawal and streaming response drain
 - Custom response headers
 
 ## Performance Tuning

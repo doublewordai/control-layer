@@ -176,6 +176,41 @@ describe("MyOrganization", () => {
     expect(container.textContent).not.toMatch(/zero data retention/i);
   });
 
+  it("flags a pending email change on the org header", async () => {
+    server.use(userWithOrg("owner"));
+    server.use(
+      http.get("/admin/api/v1/organizations/:id", () =>
+        HttpResponse.json({
+          id: ORG_ID,
+          username: "acme-corp",
+          display_name: ORG_NAME,
+          email: "contact@acme.com",
+          created_at: "2025-01-15T10:00:00Z",
+          member_count: 3,
+          zero_data_retention: false,
+          pending_email_change: {
+            new_email: "new-contact@acme.com",
+            expires_at: "2025-06-02T12:00:00Z",
+          },
+        }),
+      ),
+    );
+    const { container } = render(<MyOrganization />, {
+      wrapper: createWrapper(),
+    });
+
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("heading", { name: ORG_NAME }),
+      ).toBeInTheDocument();
+    });
+
+    expect(container.textContent).toMatch(/contact@acme.com/);
+    expect(container.textContent).toMatch(
+      /pending change to new-contact@acme.com · waiting on both contact@acme.com and new-contact@acme.com/i,
+    );
+  });
+
   const CURRENT_USER_ID = "550e8400-e29b-41d4-a716-446655440001";
 
   const sarahUser = {

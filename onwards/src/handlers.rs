@@ -9,7 +9,7 @@ use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::models::ListModelResponse;
 use crate::sse::SseBufferedStream;
-use crate::target::{ConcurrencyGuard, RoutingAction, Target};
+use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
 use axum::{
     Json,
     extract::Request,
@@ -81,7 +81,7 @@ fn embedded_error_status(body: &serde_json::Value) -> Option<u16> {
 enum SseEventKind {
     /// A `data:` frame carrying an embedded provider error — the contained
     /// `error.code`, per [`embedded_error_status`].
-    Error(u16),
+    Error(u16, serde_json::Value),
     /// A `data:` frame carrying normal content (or the `[DONE]` sentinel).
     Data,
     /// No `data:` field: an SSE comment / keep-alive (e.g. `: keep-alive`), which
@@ -120,13 +120,12 @@ fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
     if data.trim() == "[DONE]" {
         return SseEventKind::Data;
     }
-    match serde_json::from_str::<serde_json::Value>(data.trim())
-        .ok()
-        .as_ref()
-        .and_then(embedded_error_status)
+    if let Ok(body) = serde_json::from_str::<serde_json::Value>(data.trim())
+        && let Some(status) = embedded_error_status(&body)
     {
-        Some(status) => SseEventKind::Error(status),
-        None => SseEventKind::Data,
+        SseEventKind::Error(status, body["error"].clone())
+    } else {
+        SseEventKind::Data
     }
 }
 
@@ -390,7 +389,7 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Extract the request body. TODO(fergus): make this step conditional: its not necessary if we
     // extract the model from the header.
-    let mut body_bytes =
+    let body_bytes =
         match axum::body::to_bytes(std::mem::take(req.body_mut()), state.body_limit).await {
             Ok(bytes) => bytes,
             // to_bytes only fails when the body exceeds the limit (or the
@@ -398,15 +397,6 @@ pub async fn target_message_handler<T: HttpClient>(
             // than an opaque 500.
             Err(_) => return Err(OnwardsErrorResponse::payload_too_large(state.body_limit)),
         };
-
-    // Apply body transformation if provided
-    if let Some(ref transform_fn) = state.body_transform_fn {
-        let path = req.uri().path();
-        if let Some(transformed_body) = transform_fn(path, req.headers(), &body_bytes) {
-            debug!("Applied body transformation for path: {}", path);
-            body_bytes = transformed_body;
-        }
-    }
 
     // Log incoming request metadata for debugging.
     // ZDR: never log the request body or headers — bodies carry prompt content
@@ -448,8 +438,18 @@ pub async fn target_message_handler<T: HttpClient>(
             .collect::<Vec<_>>()
     );
 
-    let mut pool = match state.targets.targets.get(&model_name) {
-        Some(pool) => {
+    let canonical_request_path = req.uri().path().to_string();
+
+    // Resolve which of the composite's pools serves this request, once, from
+    // the path alone — before auth, limits or provider selection, all of which
+    // then run on the chosen pool exactly as they ran on the single pool
+    // before. A composite with no pool for this class resolves to its default,
+    // which is byte-identically today's behaviour. Resolution happens INSIDE
+    // the map guard so only the chosen pool is cloned: KeySets are owned, so a
+    // whole-TargetPools clone would deep-copy every pool's keys per request.
+    let request_class = RequestClass::from_path(&canonical_request_path);
+    let (mut resolved_pool_name, mut pool) = match state.targets.targets.get(&model_name) {
+        Some(pools) => {
             // Now that the model is known to be a configured target, tag the
             // in-flight guard so `onwards_model_inflight{model=…}` tracks this
             // request for its whole lifetime (the guard moves into GuardedStream on
@@ -459,7 +459,7 @@ pub async fn target_message_handler<T: HttpClient>(
             if let Some(guard) = inflight_guard.as_mut() {
                 guard.set_model(&model_name);
             }
-            pool.clone()
+            (pools.resolved_name(request_class), pools.resolve(request_class).clone())
         }
         None => {
             debug!("No target found for model: {}", model_name);
@@ -467,8 +467,6 @@ pub async fn target_message_handler<T: HttpClient>(
             return Err(OnwardsErrorResponse::model_not_found(model_name.as_str()));
         }
     };
-
-    let canonical_request_path = req.uri().path().to_string();
 
     // Extract bearer token for authentication and rate limiting
     let bearer_token = req
@@ -537,7 +535,16 @@ pub async fn target_message_handler<T: HttpClient>(
                             model_name, redirect_alias, labels
                         );
                         pool = match state.targets.targets.get(redirect_alias) {
-                            Some(p) => p.clone(),
+                            // The redirect names an alias, so its pools are
+                            // resolved for this request's class just as the
+                            // original alias's were — and `resolved_pool_name`
+                            // is recomputed with it: the capability strip and
+                            // the span field must describe the pool that
+                            // actually serves, not the source alias's.
+                            Some(p) => {
+                                resolved_pool_name = p.resolved_name(request_class);
+                                p.resolve(request_class).clone()
+                            }
                             None => {
                                 debug!("Redirect target '{}' not found", redirect_alias);
                                 return Err(OnwardsErrorResponse::bad_gateway());
@@ -564,9 +571,11 @@ pub async fn target_message_handler<T: HttpClient>(
         let body: serde_json::Value = serde_json::from_slice(&body_bytes).map_err(|_| {
             OnwardsErrorResponse::bad_request("Request body must be valid JSON.", None)
         })?;
-        crate::reasoning::validate_canonical_reasoning(&canonical_request_path, &body).map_err(
-            |error| OnwardsErrorResponse::reasoning(&error),
-        )?
+        crate::reasoning::parse_reasoning_request(
+            &canonical_request_path,
+            &body,
+            state.targets.strict_mode,
+        ).map_err(|error| OnwardsErrorResponse::reasoning(&error))?
     } else {
         None
     };
@@ -585,6 +594,17 @@ pub async fn target_message_handler<T: HttpClient>(
     // This runs after routing rules so that redirects get a chance to replace the pool.
     if pool.is_empty() {
         debug!("Pool for model '{}' has no providers", model_name);
+        // Counted, not just logged: this is a debug line on a hot path, so under
+        // load it is exactly the signal a log pipeline sheds, and the 503 it
+        // produces is indistinguishable downstream from every other 503.
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "no_providers",
+            "status" => "503",
+            "model" => model_name.to_string(),
+        )
+        .increment(1);
+        record_response_status(503);
         return Err(OnwardsErrorResponse::service_unavailable());
     }
 
@@ -661,6 +681,12 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Track last error for fallback scenarios
     let mut last_error: Option<OnwardsErrorResponse> = None;
+    // The status the UPSTREAM returned on the most recent attempt, before any
+    // sanitization. `last_error` cannot serve this purpose: by the time an
+    // attempt is recorded there it has already been mapped onto a gateway
+    // response, so an upstream 529 and an upstream 500 are both 503 and the
+    // distinction that matters for backpressure is gone.
+    let mut last_upstream_status: Option<u16> = None;
 
     // Iterate through providers (with fallback support).
     // select_iter() uses weighted least connections: picks the provider with the
@@ -670,7 +696,7 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
     let pool_max_attempts = pool.fallback_max_attempts();
-    for (_idx, target, connection_guard) in pool.select_iter() {
+    for (_member_idx, target, connection_guard) in pool.select_iter() {
         any_attempted = true;
         attempt_number += 1;
 
@@ -683,7 +709,13 @@ pub async fn target_message_handler<T: HttpClient>(
             provider.timeout_secs = target.request_timeout_secs,
             http.response.status_code = tracing::field::Empty,
             onwards.fallback = tracing::field::Empty,
+            onwards.pool = tracing::field::Empty,
         );
+        // Recorded only when a non-default pool served the request, so the
+        // field's presence answers "did per-class routing engage here?".
+        if let Some(pool_name) = resolved_pool_name {
+            attempt_span.record("onwards.pool", pool_name);
+        }
 
         // The loop body is wrapped in an instrumented async block so that
         // attempt_span is the "current" span for all logging / field recording,
@@ -727,6 +759,35 @@ pub async fn target_message_handler<T: HttpClient>(
 
         // Prepare body for this attempt (may need model rewrite)
         let mut attempt_body = body_bytes.clone();
+
+        // Within a non-default pool, scheduling fields are only meaningful to
+        // a member whose serving stack understands them
+        // (`accepts_scheduling_priority` — the dynamo frontend); third-party
+        // members reject unknown fields outright (Fireworks: "Extra inputs are
+        // not permitted"). Strip them from every attempt whose provider lacks
+        // the capability, REGARDLESS of position: keying on member index broke
+        // the moment the dynamo member was disabled during an incident and a
+        // third party became index 0 (every resume 400'd). Two carriers:
+        // `nvext` (the self-hosted stack's vendor extension — the WHOLE object
+        // goes, since no third party understands any of it and Fireworks 400s
+        // on its presence) and a legacy top-level `priority`. Default-pool
+        // traffic is untouched: batch/flex deadline priorities must keep
+        // reaching dynamo exactly as today.
+        if resolved_pool_name.is_some()
+            && !target.accepts_scheduling_priority
+            && (attempt_body.windows(10).any(|w| w == b"\"priority\"")
+                || attempt_body.windows(7).any(|w| w == b"\"nvext\""))
+            && let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
+            && let Some(obj) = parsed.as_object_mut()
+        {
+            let removed = [obj.remove("priority"), obj.remove("nvext")];
+            if removed.iter().any(Option::is_some)
+                && let Ok(stripped) = serde_json::to_vec(&parsed)
+            {
+                debug!("Stripped scheduling fields for a pool member that does not accept them");
+                attempt_body = stripped.into();
+            }
+        }
 
         // Rewrite model field if configured
         if let Some(ref rewrite) = target.onwards_model
@@ -949,6 +1010,7 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         let status = response.status().as_u16();
+        last_upstream_status = Some(status);
         upstream_span.record("http.response.status_code", status);
         tracing::Span::current().record("http.response.status_code", status);
 
@@ -1044,7 +1106,7 @@ pub async fn target_message_handler<T: HttpClient>(
             Clean,
             /// Provider embedded an error status in the 2xx body
             /// (`{"error":{"code":N}}`).
-            Embedded(u16),
+            Embedded(u16, serde_json::Value),
             /// 2xx whose body *terminated* empty before any content frame — e.g.
             /// an upstream `200 OK` with an empty body. Treated as a retryable
             /// 502. Keyed on stream termination, never a time budget, so a
@@ -1062,11 +1124,23 @@ pub async fn target_message_handler<T: HttpClient>(
                 // one. Holding the `200` headers until the first frame costs
                 // nothing in time-to-first-*token* (onwards must receive it to
                 // forward it anyway). The whole peek is bounded by a short fixed
-                // budget — NOT the request timeout, which governs header receipt —
-                // so a `200`-then-idle stream isn't withheld from the client; on
-                // timeout we forward whatever we have, unmodified (no retry).
+                // budget — NOT the request timeout, which governs header receipt.
+                // If that budget expires, keep control for a bounded second window
+                // until the next decisive event: terminal empty is retryable, while
+                // the first real content frame is reattached and forwarded without
+                // retry. If the upstream remains idle beyond that, forward the
+                // still-open stream instead of withholding headers indefinitely.
                 use futures_util::StreamExt;
+                #[cfg(not(test))]
                 const SSE_PEEK_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+                #[cfg(test)]
+                const SSE_PEEK_BUDGET: std::time::Duration = std::time::Duration::from_millis(10);
+                #[cfg(not(test))]
+                const SSE_DECISIVE_WAIT_BUDGET: std::time::Duration =
+                    std::time::Duration::from_secs(30);
+                #[cfg(test)]
+                const SSE_DECISIVE_WAIT_BUDGET: std::time::Duration =
+                    std::time::Duration::from_millis(50);
                 const SSE_PEEK_MAX_EVENTS: usize = 4;
 
                 let (parts, body) = response.into_parts();
@@ -1084,8 +1158,8 @@ pub async fn target_message_handler<T: HttpClient>(
                     for _ in 0..SSE_PEEK_MAX_EVENTS {
                         match events.next().await {
                             Some(Ok(chunk)) => match classify_sse_event(&chunk) {
-                                SseEventKind::Error(status) => {
-                                    embedded = Some(status);
+                                SseEventKind::Error(status, error) => {
+                                    embedded = Some((status, error));
                                     peeked.push(Ok(chunk));
                                     break;
                                 }
@@ -1110,22 +1184,57 @@ pub async fn target_message_handler<T: HttpClient>(
                         }
                     }
                 };
-                let timed_out = tokio::time::timeout(SSE_PEEK_BUDGET, peek).await.is_err();
-                if timed_out {
-                    debug!("Timed out peeking SSE lead frames; forwarding stream unmodified");
+                if tokio::time::timeout(SSE_PEEK_BUDGET, peek).await.is_err() {
+                    debug!("Timed out peeking SSE lead frames; waiting for first terminal frame");
+                    let decisive_wait = async {
+                        for _ in 0..SSE_PEEK_MAX_EVENTS {
+                            match events.next().await {
+                                Some(Ok(chunk)) => match classify_sse_event(&chunk) {
+                                    SseEventKind::Error(status, error) => {
+                                        embedded = Some((status, error));
+                                        peeked.push(Ok(chunk));
+                                        break;
+                                    }
+                                    SseEventKind::Data => {
+                                        saw_data = true;
+                                        peeked.push(Ok(chunk));
+                                        break;
+                                    }
+                                    SseEventKind::Comment => peeked.push(Ok(chunk)),
+                                },
+                                Some(Err(e)) => {
+                                    stream_ended = true;
+                                    peeked.push(Err(e));
+                                    break;
+                                }
+                                None => {
+                                    stream_ended = true;
+                                    break;
+                                }
+                            }
+                        };
+                    };
+                    if tokio::time::timeout(SSE_DECISIVE_WAIT_BUDGET, decisive_wait)
+                        .await
+                        .is_err()
+                    {
+                        debug!(
+                            "Timed out waiting for decisive SSE frame; forwarding stream unmodified"
+                        );
+                    }
                 }
                 // Forward the consumed frames followed by the remainder, so a clean
                 // (or slow) stream is intact; on a retry path below this `response`
                 // is dropped when we return.
                 let rest = futures_util::stream::iter(peeked).chain(events);
                 response = Response::from_parts(parts, axum::body::Body::from_stream(rest));
-                if let Some(status) = embedded {
-                    Scan2xx::Embedded(status)
-                } else if !timed_out && stream_ended && !saw_data {
+                if let Some((status, error)) = embedded {
+                    Scan2xx::Embedded(status, error)
+                } else if stream_ended && !saw_data {
                     // Stream closed/errored before any content frame: nothing was
-                    // forwarded, so retrying is safe. A *timeout* (stream still open,
-                    // just slow to first token) deliberately falls through to `Clean`
-                    // — that's the valid-but-slow case we must never retry.
+                    // forwarded, so retrying is safe. A valid-but-slow stream that
+                    // eventually produces content falls through to `Clean` with the
+                    // consumed frames reattached below.
                     Scan2xx::EmptyBody
                 } else {
                     Scan2xx::Clean
@@ -1153,8 +1262,10 @@ pub async fn target_message_handler<T: HttpClient>(
                     let embedded = if buffered.windows(ERROR_KEY.len()).any(|w| w == ERROR_KEY) {
                         serde_json::from_slice::<serde_json::Value>(&buffered)
                             .ok()
-                            .as_ref()
-                            .and_then(embedded_error_status)
+                            .and_then(|body| {
+                                embedded_error_status(&body)
+                                    .map(|status| (status, body["error"].clone()))
+                            })
                     } else {
                         None
                     };
@@ -1166,7 +1277,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         .headers_mut()
                         .insert(CONTENT_LENGTH, HeaderValue::from(len));
                     match embedded {
-                        Some(status) => Scan2xx::Embedded(status),
+                        Some((status, error)) => Scan2xx::Embedded(status, error),
                         None => Scan2xx::Clean,
                     }
                 }
@@ -1176,7 +1287,7 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         match scan {
-            Scan2xx::Embedded(embedded) => {
+            Scan2xx::Embedded(embedded, provider_error) => {
                 warn!(
                     http_status = status,
                     embedded_status = embedded,
@@ -1185,6 +1296,9 @@ pub async fn target_message_handler<T: HttpClient>(
                 );
                 upstream_span.record("http.response.status_code", embedded);
                 tracing::Span::current().record("http.response.status_code", embedded);
+                // A 200 carrying an embedded error IS that error for our
+                // purposes, so it overrides the 200 recorded above.
+                last_upstream_status = Some(embedded);
 
                 let retryable = pool.should_fallback_on_status(embedded)
                     || (embedded == 429 && pool.should_fallback_on_rate_limit());
@@ -1201,17 +1315,34 @@ pub async fn target_message_handler<T: HttpClient>(
                 // non-retryable ones like 501/505 — collapses to a generic 503. This is
                 // deliberately more opaque than the non-embedded error path: a
                 // 200-with-error body is already anomalous, so we hide the specifics.
-                // Genuine client errors (other 4xx) are surfaced, sanitized, so the
-                // caller can fix the request.
+                // For trusted providers, retain the standard client-error fields
+                // so the caller can fix the request. Never log the body: even
+                // validation errors can echo request content.
+                let trusted = target.trusted.unwrap_or_else(|| pool.is_trusted());
                 let err = if embedded == 429 || embedded >= 500 {
                     OnwardsErrorResponse::service_unavailable()
                 } else {
                     OnwardsErrorResponse::builder()
                         .body(ErrorResponseBody {
-                            message: "The upstream provider rejected the request.".to_string(),
-                            r#type: "invalid_request_error".to_string(),
-                            param: None,
-                            code: "upstream_error".to_string(),
+                            message: trusted
+                                .then(|| provider_error["message"].as_str())
+                                .flatten()
+                                .unwrap_or("The upstream provider rejected the request.")
+                                .to_string(),
+                            r#type: trusted
+                                .then(|| provider_error["type"].as_str())
+                                .flatten()
+                                .unwrap_or("invalid_request_error")
+                                .to_string(),
+                            param: trusted
+                                .then(|| provider_error["param"].as_str())
+                                .flatten()
+                                .map(str::to_string),
+                            code: if trusted {
+                                embedded.to_string()
+                            } else {
+                                "upstream_error".to_string()
+                            },
                         })
                         .status(StatusCode::from_u16(embedded).unwrap_or(StatusCode::BAD_REQUEST))
                         .build()
@@ -1493,16 +1624,48 @@ pub async fn target_message_handler<T: HttpClient>(
         // We tried at least one provider but all failed
         let final_error = last_error
             .unwrap_or_else(|| OnwardsErrorResponse::model_not_found(model_name.as_str()));
-        record_response_status(final_error.status.as_u16());
+        // `status` carries the PRE-sanitization status of the last attempt, which
+        // the response itself discards: a 529 and a 500 both leave here as 503,
+        // so without this the caller cannot tell saturation from failure. This is
+        // the single exit where a candidate error actually becomes the response,
+        // so counting here counts outcomes rather than attempts.
+        let status = final_error.status.as_u16();
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "retries_exhausted",
+            // The upstream's own status on the final attempt, NOT the gateway
+            // response above: both a 529 and a 500 sanitize to 503, and only
+            // the former is backpressure. Falls back to the response status
+            // when no attempt got far enough to see one.
+            "status" => last_upstream_status.unwrap_or(status).to_string(),
+            "model" => model_name.to_string(),
+        )
+        .increment(1);
+        record_response_status(status);
         Err(final_error)
     } else if !pool.is_empty() {
         // Pool has providers but select_iter() yielded nothing — all at capacity
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "all_at_capacity",
+            "status" => "429",
+            "model" => model_name.to_string(),
+        )
+        .increment(1);
         record_response_status(429);
         Err(OnwardsErrorResponse::concurrency_limited())
     } else {
         // Empty pool (shouldn't normally happen, targets resolved earlier)
         let err = OnwardsErrorResponse::model_not_found(model_name.as_str());
-        record_response_status(err.status.as_u16());
+        let status = err.status.as_u16();
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "empty_pool_late",
+            "status" => status.to_string(),
+            "model" => model_name.to_string(),
+        )
+        .increment(1);
+        record_response_status(status);
         Err(err)
     }
     }
@@ -1528,7 +1691,10 @@ pub async fn models<T: HttpClient>(
         .targets
         .iter()
         .filter(|entry| {
-            let pool = entry.value();
+            // Model listing is about the alias, not about a request class, and
+            // a non-default pool inherits the default's keys unless it states
+            // its own — so the default pool's keys are the alias's visibility.
+            let pool = entry.value().default_pool();
 
             // If pool has no keys configured, it's publicly accessible
             let Some(keys) = pool.keys() else {
@@ -1614,24 +1780,24 @@ mod tests {
         // A provider's first-frame error on a 200 stream.
         assert_eq!(
             classify_sse_event(b"data: {\"error\":{\"code\":429,\"message\":\"x\"}}\n\n"),
-            Error(429)
+            Error(429, serde_json::json!({"code":429,"message":"x"}))
         );
         // Error alongside otherwise-valid chunk fields (provider shape).
         assert_eq!(
             classify_sse_event(b"data: {\"id\":\"g\",\"choices\":[],\"error\":{\"code\":502}}\n\n"),
-            Error(502)
+            Error(502, serde_json::json!({"code":502}))
         );
         // Tolerant of `data:` with no space after the colon.
         assert_eq!(
             classify_sse_event(b"data:{\"error\":{\"code\":503}}\n\n"),
-            Error(503)
+            Error(503, serde_json::json!({"code":503}))
         );
         // Multi-line `data:` fields are concatenated with `\n` before parsing
         // (SSE spec): the two `data:` lines here join to the valid JSON
         // `{"error":{"code":429}}` (the embedded `\n` is JSON whitespace).
         assert_eq!(
             classify_sse_event(b"data: {\"error\":\ndata: {\"code\":429}}\n\n"),
-            Error(429)
+            Error(429, serde_json::json!({"code":429}))
         );
 
         // Normal content and the [DONE] sentinel are data frames, not errors.
@@ -2390,12 +2556,8 @@ mod tests {
                 http_pool_config: None,
             },
             http_client: mock_client,
-            body_transform_fn: None,
             response_transform_fn: None,
-            streaming_header: None,
             response_id_header: None,
-            tool_executor: std::sync::Arc::new(crate::NoOpToolExecutor),
-            response_store: std::sync::Arc::new(crate::NoOpResponseStore),
             body_limit: crate::DEFAULT_BODY_LIMIT,
         };
 
@@ -2408,7 +2570,7 @@ mod tests {
             .unwrap();
 
         // Test the timeout logic directly (not the full handler)
-        let target = pool.first_target().unwrap();
+        let target = pool.default_pool().first_target().unwrap();
         let timeout_secs = target.request_timeout_secs.unwrap();
         let timeout_duration = std::time::Duration::from_secs(timeout_secs);
 
@@ -2475,11 +2637,11 @@ mod tests {
             upstream_auth_header_prefix: None,
             response_headers: None,
             sanitize_response: false,
-            open_responses: None,
             request_timeout_secs: None,
             trusted,
             propagate_trace_context,
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
         }
     }
 

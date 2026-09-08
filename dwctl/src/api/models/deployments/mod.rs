@@ -238,9 +238,6 @@ pub struct StandardModelCreate {
     /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
     #[serde(default)]
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
-    #[serde(default)]
-    pub open_responses_adapter: Option<bool>,
     /// Per-surface overrides for the endpoint's provider reasoning translations.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
@@ -347,9 +344,6 @@ pub struct CompositeModelCreate {
     /// Whether to mark provider as trusted in strict mode (defaults to false, used when strict_mode=true)
     #[serde(default)]
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter that converts /v1/responses to /v1/chat/completions (defaults to true)
-    #[serde(default)]
-    pub open_responses_adapter: Option<bool>,
     /// Traffic routing rules evaluated against API key labels.
     /// Each rule matches on key labels (e.g., purpose) and either denies or redirects traffic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -457,9 +451,6 @@ pub struct DeployedModelUpdate {
     /// Whether to mark provider as trusted in strict mode (null = no change, used when strict_mode=true)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted: Option<bool>,
-    /// Whether to enable the open_responses adapter (null = no change)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub open_responses_adapter: Option<bool>,
     /// Reasoning translation overrides (omitted = unchanged, null = inherit both endpoint defaults).
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub reasoning_translation_overrides: Option<Option<ReasoningTranslationOverrides>>,
@@ -575,9 +566,6 @@ pub struct DeployedModelResponse {
     /// Whether to mark provider as trusted in strict mode (used when strict_mode=true)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trusted: Option<bool>,
-    /// Whether the open_responses adapter is enabled (converts /v1/responses to /v1/chat/completions)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub open_responses_adapter: Option<bool>,
     /// Provider reasoning translation overrides. Omitted for composite models.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_translation_overrides: Option<ReasoningTranslationOverrides>,
@@ -650,7 +638,6 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             components: None, // By default, components are not included
             sanitize_responses: Some(db.sanitize_responses),
             trusted: Some(db.trusted),
-            open_responses_adapter: Some(db.open_responses_adapter),
             reasoning_translation_overrides: if db.is_composite {
                 None
             } else {
@@ -738,7 +725,6 @@ impl DeployedModelResponse {
     pub fn mask_response_config(mut self) -> Self {
         self.sanitize_responses = None;
         self.trusted = None;
-        self.open_responses_adapter = None;
         self.reasoning_translation_overrides = None;
         self
     }
@@ -838,6 +824,57 @@ impl DeployedModelResponse {
 
 // ===== Composite Model Component Types =====
 
+/// Which of a composite's named pools a membership belongs to.
+///
+/// A composite is a set of named pools, and onwards resolves `request class ->
+/// pool` before it selects a provider. `Default` is the pool that serves every
+/// class without a pool of its own — exactly the single member list that
+/// existed before pools — so an unqualified component is unchanged.
+///
+/// The same hosted model may be a member of more than one pool (dynamo at
+/// position 0 of both), with independent ordering in each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ComponentPool {
+    /// Serves every request class that has no pool of its own. The default, so
+    /// adding a component never silently creates a continuation target.
+    #[default]
+    Default,
+    /// Serves `/v1/completions` — token-id continuation resume legs and
+    /// ordinary completions traffic alike. Members here are validated
+    /// continuation targets; "never serves chat" is structural, because they
+    /// are simply not members of the default pool.
+    Completions,
+}
+
+impl ComponentPool {
+    /// The stored/wire value, bounded by the column's CHECK constraint.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ComponentPool::Default => "default",
+            ComponentPool::Completions => "completions",
+        }
+    }
+
+    /// Parse a stored value, falling back to the column default for anything
+    /// unrecognised (a row can only hold what the CHECK constraint allows).
+    pub fn from_db(value: &str) -> Self {
+        match value {
+            "completions" => ComponentPool::Completions,
+            _ => ComponentPool::Default,
+        }
+    }
+}
+
+/// Which pool a component request addresses. Omitted ⇒ `default`, so every
+/// existing caller keeps addressing the pool it always did.
+#[derive(Debug, Clone, Copy, Default, Deserialize, IntoParams)]
+pub struct ComponentPoolQuery {
+    /// The pool this component belongs to. Defaults to `default`.
+    #[serde(default)]
+    pub pool: ComponentPool,
+}
+
 /// Request to add a component to a composite model
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelComponentCreate {
@@ -852,6 +889,10 @@ pub struct ModelComponentCreate {
     /// PATCH endpoint's `sort_order` to reorder. Retained for API compatibility.
     #[serde(default)]
     pub sort_order: i32,
+    /// Which of the composite's pools to add this member to. Defaults to
+    /// `default`.
+    #[serde(default)]
+    pub pool: ComponentPool,
 }
 
 fn default_weight() -> i32 {
@@ -874,6 +915,9 @@ pub struct ModelComponentUpdate {
     /// dense, unique 0..n-1 sequence — two components can never share a position.
     /// Out-of-range values are clamped. Omit to leave the order unchanged.
     pub sort_order: Option<i32>,
+    // A component's pool is not updatable: it is part of which membership this
+    // is (the request addresses it with `?pool=`), not a property of one. Move
+    // a member between pools by removing it from one and adding it to the other.
 }
 
 /// Summary of a model used as a component in a composite model
@@ -894,8 +938,6 @@ pub struct ComponentModelSummary {
     pub endpoint: Option<ComponentEndpointSummary>,
     /// Whether to mark provider as trusted in strict mode
     pub trusted: bool,
-    /// Whether the open_responses adapter is enabled
-    pub open_responses_adapter: bool,
 }
 
 /// Summary of an endpoint hosting a component model
@@ -915,6 +957,8 @@ pub struct ModelComponentResponse {
     pub weight: i32,
     /// Whether this component is enabled
     pub enabled: bool,
+    /// Which of the composite's pools this membership belongs to
+    pub pool: ComponentPool,
     /// Sort order for priority-based routing (lower = higher priority)
     pub sort_order: i32,
     /// When this component was added

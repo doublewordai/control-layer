@@ -492,6 +492,87 @@ cache:
   #   default_read_multiplier: 0.1
   #   default_min_prefix_tokens: 1024
 
+# Mid-stream continuation (the resume layer): when a streaming generation dies
+# mid-output, rebuild the prompt + partial output as token-ids (tokenizer-svc
+# /v1/render) and resume it as a /v1/completions request through the model's
+# completions pool, splicing the result into the client's still-open stream with
+# merged billing. Per-model activation is DATA, not config: a model rescues only
+# when its composite carries a completions pool with an enabled member.
+# ClickHouse warehouse connection (unused in local dev). Required by prefix_chain.
+# clickhouse:
+#   endpoint_url: "https://<service>.<region>.aws.clickhouse.cloud:8443"
+#   database: "clay"
+#   user: "dwctl"
+#   password: ""
+
+# Prefix-chain capture: per chat-completions request, keyed hashes of the prompt's
+# content blocks plus per-block token counts, written to ClickHouse. No content.
+prefix_chain:
+  enabled: false
+  models: null # null: every model; a non-empty list: exactly those aliases
+  hmac_key: "" # 32 bytes, hex; from a secret as DWCTL_PREFIX_CHAIN__HMAC_KEY
+
+continuation:
+  # Global kill switch. When false (default), the layer is not added to the
+  # stack and the request path is byte-identical to a build without it.
+  # Set via environment: DWCTL_CONTINUATION__ENABLED=true
+  enabled: false
+  # Base URL of the tokenizer-svc used to render resume prefixes. Unset
+  # (default) falls back to cache.tokenizer_url — the same service serves both
+  # layers; set only to split them.
+  # Set via environment: DWCTL_CONTINUATION__TOKENIZER_URL=http://tokenizer-svc:8088
+  # tokenizer_url: http://localhost:8088
+  # Per-origin eligibility gates (derived from the API key's purpose, the same
+  # signal analytics uses for request_origin). Permanent config, not rollout
+  # scaffolding: resume economics differ per origin (paying a provider again vs
+  # a plain retry behind fusillade's masking).
+  origins:
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__REALTIME=true
+    realtime: true
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__BATCH=true
+    batch: false
+    # Set via environment: DWCTL_CONTINUATION__ORIGINS__PLAYGROUND=true
+    playground: false
+  # Maximum resume legs for one logical stream (a leg that itself dies re-enters
+  # the chain). Exhausted -> the ORIGINAL death surfaces, exactly as unresumed.
+  # Set via environment: DWCTL_CONTINUATION__MAX_ATTEMPTS=2
+  max_attempts: 2
+  # Seconds per resume attempt (render + continuation-target time-to-first-byte).
+  # Crossed -> that leg is abandoned; attempts exhausted -> the original death
+  # surfaces. Cold provider prefill dominates on long prompts.
+  # Set via environment: DWCTL_CONTINUATION__RESUME_DEADLINE_SECS=20
+  resume_deadline_secs: 20
+  # Inter-frame silence after which an armed stream is declared stalled and
+  # rescued. Rescue CANCELS the original leg, so this must never undercut the
+  # platform's own liveness judgment (fusillade allows 600s between SSE events
+  # in prod): a preempted-but-progressing stream must be left alone. 540 sits
+  # just inside fusillade's 600s so batch-origin stalls remain rescuable before
+  # the daemon aborts. Arms only after the first generated text.
+  # Set via environment: DWCTL_CONTINUATION__STALL_TIMEOUT_SECS=540
+  stall_timeout_secs: 540
+  # Cap applied separately to each retained allocation per armed stream (the
+  # request body, and the accumulated generation) - worst case ~2x this value.
+  # Exceeded -> the stream is marked non-resumable (outcome cap_exceeded) and
+  # the buffer dropped; the stream itself is unaffected.
+  # Set via environment: DWCTL_CONTINUATION__MAX_BUFFER_BYTES=2097152
+  max_buffer_bytes: 2097152
+  # Dynamo scheduler priority on resume legs. Realtime runs 0, batch negative —
+  # positive puts resumes ahead of new work, deliberately: a resume finishes a
+  # stream already accepted, on a seam budget. Onwards strips the field for
+  # pool members that would reject it (third-party providers).
+  # Set via environment: DWCTL_CONTINUATION__PRIORITY=100
+  priority: 100
+  # Per-model cap on concurrently in-flight resume legs — bounds the stampede a
+  # flapping model can send at its continuation provider during an incident.
+  # Set via environment: DWCTL_CONTINUATION__MAX_INFLIGHT_PER_MODEL=8
+  max_inflight_per_model: 8
+  # Reconstructor per model alias, for models whose reasoning/tool-call streams
+  # have a byte-exactness verdict from the fidelity harness ("dsv4" = the
+  # DeepSeek-V4/DSML family). Absent from the map -> plain-content only;
+  # reasoning/tool streams disarm safely instead of resuming.
+  # Set via environment: DWCTL_CONTINUATION__MODEL_RECONSTRUCTORS='{"deepseek-ai/DeepSeek-V4-Flash":"dsv4"}'
+  model_reconstructors: {}
+
 # Background services configuration
 # Controls which background services run on this instance
 background_services:
@@ -542,14 +623,36 @@ background_services:
     default_model_concurrency: 10 # Default concurrent requests per model
     claim_interval_ms: 1000 # Milliseconds to sleep between claim iterations
 
+    # Adaptive per-model concurrency. Discovers the sustainable in-flight count
+    # from downstream 529s instead of running flat out at a static number.
+    #
+    # default_model_concurrency and per-model batch_capacity become the value
+    # each model STARTS at; the controller owns the number from there and can go
+    # above it. Turning this off puts every model back on its configured value,
+    # so the flag is safe to flip either way. Set max_total_in_flight first - it
+    # is what bounds this instance's memory once per-model values stop capping.
+    #
+    # adaptive_concurrency: false
+    # adaptive_growth_factor: 1.5    # Multiplier applied each time a limit goes up
+    # adaptive_cut_factor: 0.8       # Multiplier applied on downstream 529
+    # max_total_in_flight: 0         # Hard cap on this instance's total in-flight
+    #                                # requests across all models; 0 disables
+
     # Split claim daemons (fusillade >= 20): batched and batchless (flex) rows
     # are claimed by independent loops. All optional:
     # batch_claim_size: 0            # Max rows per batch-claim iteration; 0 = inherit claim_batch_size
     # batch_claim_batch_size: 4      # Max batches selected per model per iteration (spill-over pool)
     # batch_claim_interval_ms: 0     # Batch-claim loop cadence; 0 = inherit claim_interval_ms
-    # batch_claim_require_live: false # Require an explicit `live` model_filters event to batch-claim;
+    # batch_claim_require_live: false # Require `live` for full-rate batch claims outside the deadline ramp;
     #                                 # false treats no-event models (external providers) as live
-    # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live batches become claimable within
+    # Batches on unavailable models get one immediate claim,
+    # then one per interval, per user/model/window. Positive whole seconds only.
+    # False restores the batch live gate; deadline-ramp claims still proceed.
+    # Async/flex keeps its window-based rate (24min default tier, 60s flex).
+    leak_enabled: true
+    leak_interval_seconds: 60
+    model_leak_interval_seconds: {} # Exact model aliases; e.g. {"some-large-model": 10}
+    # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live work bypasses the leak interval within
     #                                 # window_minutes^exponent minutes of deadline (~59m/24h, ~10m/1h)
     # background_concurrency_limit: 0 # Per-model foreground in-flight threshold below which
     #                                 # background workers may send; background work does not
@@ -581,6 +684,52 @@ background_services:
     claim_timeout_ms: 60000 # Max time in "claimed" state before auto-unclaim (1 minute)
     processing_timeout_ms: 600000 # Max time in "processing" state before auto-unclaim (10 minutes)
     pending_request_counts_timeout_ms: 60000 # Statement timeout for pending request count queries (1 minute)
+
+    # Retained-response lifecycle. No retention period is implied by the
+    # application defaults, and movement and retirement remain off unless
+    # explicitly enabled. Only terminal batchless response tiers are accepted
+    # for scheduled lifecycle management in this release; file and file-backed
+    # batch policies fail startup validation. Every configured tier also needs
+    # an explicit positive max_late_writer_seconds fence.
+    # retention:
+    #   batchless_seconds_by_service_tier:
+    #     flex: <seconds>
+    #   max_late_writer_seconds: <seconds>
+    # batchless_archive_sweep_enabled: false
+    # batchless_archive_backfill_enabled: false
+    # batchless_archive_groups_per_tick: <positive bound>
+    # batchless_archive_bytes_per_tick: <positive bound>
+    # batchless_archive_backfill_concurrency: 1  # Graphs the backfill moves at once per tick; the
+    #                                            # one-off drain lever (sweep stays sequential). Needs
+    #                                            # this many spare fusillade write connections.
+    # retained_response_partitions_days_ahead: <positive runway>
+    # Daily partition retirement irreversibly drops whole expired
+    # retained-response partitions. It is independently disabled and needs a
+    # session-capable direct primary connection: in schema mode the primary
+    # connection is reused, while a dedicated fusillade database requires the
+    # explicit direct (non-pooled) endpoint below. Keep the endpoint
+    # configured until every journaled retirement has completed, even if the
+    # enable flag is turned back off.
+    # retained_response_retirement_enabled: false
+    # Weekly batch-archive retirement irreversibly drops whole expired
+    # archive partitions once every batch in the week is past the
+    # finalization-anchored retention period below. Batch metadata rows are
+    # stamped retention-expired, never deleted. Requires the same
+    # session-capable maintenance endpoint as response retirement.
+    # batch_archive_retirement_enabled: false
+    # batch_archive_retention_days: <positive days>
+    # Route NEW file-backed request templates into weekly generation-2
+    # partitions (reads stay generation-transparent). Prerequisite for the
+    # template retention lifecycle; the legacy heap freezes once enabled.
+    # template_generation_writes_enabled: false
+    # File-content expiry + weekly template partition retirement. Tombstones
+    # aged input-file metadata (rows survive) once every referencing batch's
+    # content is expired, then drops whole template weeks that no live file
+    # references. Requires the generation-2 write cutover above and the same
+    # session-capable maintenance endpoint.
+    # template_retirement_enabled: false
+    # template_retention_days: <positive days>
+    # retained_response_partition_maintenance_url: <direct session-capable postgres endpoint>
 
     # Batch archive (fusillade phase 3): moves frozen terminal batches' rows
     # from fusillade.requests into the partitioned batch_requests_archive.
@@ -619,9 +768,10 @@ background_services:
     #     escalation_threshold_seconds: 900  # Default: 900 (15 minutes before expiry)
 
     # Endpoints that should use SSE streaming for usage tracking.
-    # Batch requests to these paths are sent with X-Fusillade-Stream: true,
-    # causing the upstream proxy to inject stream: true and stream_options.include_usage.
-    # The streamed response is reassembled into non-streaming JSON before storage.
+    # Batch requests to these paths have stream: true and stream_options.include_usage
+    # injected on the way out, and the streamed response is reassembled into
+    # non-streaming JSON before it is stored or returned. Only batch traffic is
+    # affected; a client request to the same path is left as the client sent it.
     streamable_endpoints:
       - /v1/chat/completions
       - /v1/completions

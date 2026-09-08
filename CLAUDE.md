@@ -45,6 +45,9 @@ Handlers (API) → Repositories (db::handlers) → Models (db::models) → Postg
 ```
 
 - Migrations run automatically on startup from `dwctl/migrations/`
+- The `underway` crate (background task queue) ships its own SQLx migrations
+  that create the `underway` schema; `just db-setup` applies these too, but
+  they are also applied at runtime via `underway::run_migrations`
 - Schema uses PostgreSQL LISTEN/NOTIFY for real-time config updates
 - Advisory locks for leader election - leader election is used to choose who
 runs the probe service, and (configurably) the batch daemon
@@ -55,8 +58,11 @@ runs the probe service, and (configurably) the batch daemon
 ### Initial Setup
 
 ```bash
-# Install prerequisites (macOS)
-brew install just hurl postgresql
+# Install prerequisites (macOS). `just check` verifies all of these:
+#   docker + compose plugin, hurl, psql, createdb, cargo, pnpm
+brew install just hurl postgresql pnpm
+brew install --cask docker   # any Docker runtime works (Docker Desktop, OrbStack, colima)
+# cargo comes from rustup, not Homebrew: https://rustup.rs
 
 # Check all dependencies installed
 just check
@@ -75,10 +81,20 @@ just db-setup
 
 ```bash
 # Start backend (from project root)
-cargo run
+just dev-native
 
 # Start frontend dev server (from dashboard/)
 pnpm run dev
+```
+
+`just dev-native` is `cargo run` plus two things you need locally: it checks
+whether Postgres is up before starting a build that would fail
+without it, and it relaxes the session cookie for plain HTTP.
+
+```bash
+DWCTL_AUTH__NATIVE__SESSION__COOKIE_SECURE=false \
+DWCTL_AUTH__NATIVE__SESSION__COOKIE_SAME_SITE=lax \
+cargo run
 ```
 
 ### Testing

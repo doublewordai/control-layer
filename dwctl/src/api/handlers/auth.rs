@@ -125,9 +125,9 @@ pub async fn register<P: PoolProvider>(
         .map_err(|e| Error::Internal {
             operation: format!("spawn password hashing task: {e}"),
         })??;
-    // Generate a random display name if not provided
+    // Default the display name to the email prefix when not provided
     let display_name = if request.display_name.is_none() {
-        Some(crate::auth::utils::generate_random_display_name())
+        Some(crate::auth::utils::default_display_name(&request.email))
     } else {
         request.display_name
     };
@@ -1136,18 +1136,8 @@ mod tests {
         let body: AuthResponse = response.json();
         assert_eq!(body.user.email, "autogen@example.com");
 
-        // Verify display name was auto-generated
-        assert!(body.user.display_name.is_some(), "Display name should be auto-generated");
-        let display_name = body.user.display_name.unwrap();
-
-        // Verify format: "{adjective} {noun} {4-digit number}"
-        let parts: Vec<&str> = display_name.split_whitespace().collect();
-        assert_eq!(parts.len(), 3, "Display name should have 3 parts, got: {}", display_name);
-        assert!(
-            parts[2].len() == 4 && parts[2].parse::<u32>().is_ok(),
-            "Third part should be a 4-digit number, got: {}",
-            parts[2]
-        );
+        // Verify display name defaulted to the email prefix
+        assert_eq!(body.user.display_name.as_deref(), Some("autogen"));
     }
 
     #[sqlx::test]

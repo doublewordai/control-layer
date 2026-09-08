@@ -32,6 +32,7 @@ impl<'c> Tariffs<'c> {
             crate::db::models::api_keys::ApiKeyPurpose::Batch => "batch",
             crate::db::models::api_keys::ApiKeyPurpose::Playground => "playground",
             crate::db::models::api_keys::ApiKeyPurpose::Platform => "platform",
+            crate::db::models::api_keys::ApiKeyPurpose::Continuation => "continuation",
         });
 
         let tariff = sqlx::query_as!(
@@ -179,6 +180,7 @@ impl<'c> Tariffs<'c> {
             crate::db::models::api_keys::ApiKeyPurpose::Batch => "batch",
             crate::db::models::api_keys::ApiKeyPurpose::Playground => "playground",
             crate::db::models::api_keys::ApiKeyPurpose::Platform => "platform",
+            crate::db::models::api_keys::ApiKeyPurpose::Continuation => "continuation",
         };
 
         // Step 1: Check current (active) tariff - this is the fast path for recent requests

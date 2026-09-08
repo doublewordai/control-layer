@@ -866,6 +866,66 @@ async fn process_auto_topups(
             }
         }
 
+        // Invoice-billed accounts branch off before any card is involved.
+        //
+        // They accrue the top-up onto their next invoice and get the credits
+        // now: this is post-pay, so the balance has to be restored immediately
+        // or an invoice-billed account would sit at zero until month end with
+        // auto top-up unable to do anything about it. Stripe raises, emails and
+        // chases one invoice per period covering everything accrued in it.
+        //
+        // Deliberately skips `get_default_payment_method`: these accounts may
+        // have no card at all, and the card-decline machinery below (soft/hard
+        // decline backoff, "auto top-up disabled" emails) describes a failure
+        // mode that cannot happen here. Non-payment of an invoice is a
+        // collections problem, on Stripe's dunning schedule, not a decline.
+        if user.invoicing_enabled {
+            match provider
+                .accrue_invoice_item(amount_cents, &user.payment_provider_id, description, &source_id)
+                .await
+            {
+                Ok(invoice_item_id) => {
+                    tracing::info!(
+                        user_id = %user.id,
+                        %invoice_item_id,
+                        amount_cents,
+                        "Accrued auto top-up onto the account's next invoice"
+                    );
+                }
+                Err(e) => {
+                    crate::background_error!(
+                        AUTO_TOPUP, "invoice_accrual", Error,
+                        user_id = %user.id,
+                        error = %e,
+                        "Failed to accrue auto top-up onto the next invoice"
+                    );
+                    continue;
+                }
+            }
+
+            let request = CreditTransactionCreateDBRequest {
+                user_id: user.id,
+                transaction_type: CreditTransactionType::Purchase,
+                amount: charge_amount,
+                source_id,
+                description: Some(description.to_string()),
+                fusillade_batch_id: None,
+                api_key_id: None,
+            };
+            if let Err(e) = Credits::new(&mut *conn).create_transaction(&request).await {
+                // The accrual landed at the provider, so the customer will be
+                // invoiced for credits they never received. Needs manual repair,
+                // hence Critical rather than a quiet warning.
+                crate::background_error!(
+                    AUTO_TOPUP, "invoice_credit_grant", Critical,
+                    user_id = %user.id,
+                    error = %e,
+                    "Accrued an invoice item but failed to grant the credits"
+                );
+            }
+            continue;
+        }
+
         // Fetch the customer's default payment method from the provider
         let payment_method_id = match provider.get_default_payment_method(&user.payment_provider_id).await {
             Ok(Some(pm_id)) => pm_id,
@@ -1202,6 +1262,68 @@ mod tests {
         }))
     }
 
+    /// The whole point of the flag: an invoice-billed account gets its credits
+    /// immediately (post-pay) without any card being involved. `cus_test_soft_decline`
+    /// is the dummy provider's "this card always declines" customer, so if the
+    /// branch leaked into the card path this would decline instead of crediting.
+    #[sqlx::test]
+    async fn test_process_auto_topups_invoices_instead_of_charging(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
+        sqlx::query!("UPDATE users SET invoicing_enabled = true WHERE id = $1", user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        let credited = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'auto_topup_%'",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(credited, 1, "credits are granted at accrual, not on payment");
+
+        // None of the card-decline machinery may have run: there is no card.
+        let state = sqlx::query!(
+            "SELECT auto_topup_amount, auto_topup_soft_failure_count, auto_topup_retry_after FROM users WHERE id = $1",
+            user.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state.auto_topup_amount, Some(25.0), "auto top-up must stay enabled");
+        assert_eq!(state.auto_topup_soft_failure_count, 0);
+        assert!(state.auto_topup_retry_after.is_none(), "must not be paused for a decline");
+    }
+
+    /// The flag defaults false, so every existing account keeps the card path.
+    #[sqlx::test]
+    async fn test_process_auto_topups_defaults_to_charging_a_card(pool: PgPool) {
+        let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
+
+        let invoicing = sqlx::query_scalar!("SELECT invoicing_enabled FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!invoicing, "new accounts are not invoice-billed");
+
+        let mut conn = pool.acquire().await.unwrap();
+        process_auto_topups(dummy_payment_provider().as_ref(), &mut conn, None, &CreditsConfig::default()).await;
+
+        // Took the card path and hit the decline, rather than silently invoicing.
+        let state = sqlx::query_scalar!("SELECT auto_topup_soft_failure_count FROM users WHERE id = $1", user.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, 1, "unchanged behaviour for card-billed accounts");
+    }
+
     #[sqlx::test]
     async fn test_process_auto_topups_first_soft_decline_pauses_without_charging(pool: PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
@@ -1444,6 +1566,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl PaymentProvider for AlreadyChargingProvider {
+        async fn accrue_invoice_item(&self, _: i64, _: &str, _: &str, _: &str) -> crate::payment_providers::Result<String> {
+            unimplemented!("not called by process_auto_topups")
+        }
         async fn charge_auto_topup(&self, _: i64, _: &str, _: &str, _: &str) -> crate::payment_providers::Result<String> {
             Err(PaymentError::AlreadyProcessed)
         }

@@ -1747,4 +1747,188 @@ mod tests {
         // turn2's own breakpoint has moved forward to its last block.
         assert_eq!(turn2.breakpoints[0].block_index, 3);
     }
+
+    #[test]
+    fn automatic_marker_lands_on_trailing_tool_call() {
+        // A request ending in an assistant tool-call turn: the LAST tool_call is the last block,
+        // so that's where automatic caching marks — the whole request (text + both calls) is the
+        // cached prefix.
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": [{"type": "text", "text": "calling"}], "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}},
+                    {"id": "c2", "type": "function", "function": {"name": "g", "arguments": "{}"}}
+                ]}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 4, "user + assistant text + 2 tool_calls");
+        assert_eq!(p.breakpoints.len(), 1);
+        assert_eq!(p.breakpoints[0].block_index, 3, "the LAST tool_call");
+        assert_eq!(
+            p.breakpoints[0].prefix,
+            PrefixSpec {
+                tools_kept: 0,
+                full_messages: 2,
+                partial: None
+            },
+            "the prefix is both messages whole"
+        );
+    }
+
+    #[test]
+    fn automatic_marker_lands_on_trailing_tool_result() {
+        // A request ending with a tool result (the shape mid tool-loop, where the "last user
+        // message" naming is loosest): automatic marks the tool block — a larger prefix than the
+        // literal last user message, which is the right cache boundary.
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "tool output"}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 3, "user + tool_call + tool result");
+        assert_eq!(p.blocks[2].role, "tool");
+        assert_eq!(p.breakpoints[0].block_index, 2);
+        assert_eq!(p.breakpoints[0].prefix.full_messages, 3);
+    }
+
+    #[test]
+    fn automatic_marker_on_trailing_image_block() {
+        // Image last: the image block is a real block (it participates in the prefix hash via its
+        // URL/base64 bytes) with empty write-side text — the marker lands on it, keeping the cache
+        // chain alive across image turns. Image tokens themselves are never discounted (they fall
+        // into the uncached tail; "image-token caching is deferred" at the top of this module).
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 2);
+        assert_eq!(p.blocks[1].text, "", "image blocks carry no write-side text");
+        assert_eq!(p.breakpoints[0].block_index, 1, "marker on the image block");
+        // Same image, different encoding bytes → different prefix (the URL string is the content).
+        let other = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}}
+                ]}
+            ]
+        }));
+        assert_ne!(p.cumulative_hashes[1], other.cumulative_hashes[1]);
+    }
+
+    #[test]
+    fn automatic_with_trailing_blockless_message_marks_last_real_block() {
+        // KNOWN SKEW, pinned: a trailing message that contributes no blocks (null/absent content,
+        // no tool_calls) leaves the automatic marker on the LAST REAL block — but the breakpoint's
+        // prefix still counts ALL messages, so exact counting includes the phantom message's
+        // template scaffolding (a few tokens) in the stored prefix count while the hash boundary
+        // sits earlier. Bounded: at worst a few tokens shift between the creation/uncached buckets
+        // this turn and inflate the read by the same next turn; the billing caps floor it at zero.
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": null}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 1, "the null-content assistant adds no block");
+        assert_eq!(p.breakpoints[0].block_index, 0, "marker on the last REAL block");
+        assert_eq!(p.breakpoints[0].prefix.full_messages, 2, "prefix spec counts the phantom message");
+
+        // Same for a trailing empty content array.
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": []}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 1);
+        assert_eq!(p.breakpoints[0].block_index, 0);
+
+        // An empty-STRING content is a real (empty text) block, not the blockless shape.
+        let p = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": ""}
+            ]
+        }));
+        assert_eq!(p.blocks.len(), 2, "empty-string prefill is a block");
+        assert_eq!(p.breakpoints[0].block_index, 1);
+    }
+
+    #[test]
+    fn automatic_with_telemetry_last_block_marks_prior_block() {
+        // Strip mode with a trailing telemetry-only system message: the telemetry block is
+        // excluded from the cache view, so automatic marks the last REAL block — same prefix-spec
+        // family as the blockless case above (full_messages counts the telemetry-only message; in
+        // strip mode the forwarded body loses the block, so the render view matches what's sent).
+        let p = parse_with(
+            serde_json::json!({
+                "cache_control": {"type": "ephemeral"},
+                "messages": [
+                    {"role": "user", "content": "q"},
+                    {"role": "system", "content": [
+                        {"type": "text", "text": "x-anthropic-billing-header: cch=zzz"}
+                    ]}
+                ]
+            }),
+            &telemetry(),
+        );
+        assert_eq!(p.blocks.len(), 1, "telemetry block excluded from the cache view");
+        assert_eq!(p.breakpoints[0].block_index, 0);
+    }
+
+    #[test]
+    fn automatic_tool_loop_growth_reads_prior_turn() {
+        // The growing-conversation property through a TOOL loop (not just plain turns): turn 2
+        // appends the assistant tool-call, the tool result, and a new user message; its cumulative
+        // hash at turn 1's breakpoint block is unchanged, so turn 2 reads what turn 1 wrote.
+        let turn1 = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "q"}
+            ]
+        }));
+        let turn2 = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "q"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "result"},
+                {"role": "user", "content": "next"}
+            ]
+        }));
+        assert_eq!(turn1.breakpoints[0].block_index, 1);
+        assert_eq!(
+            turn1.cumulative_hashes[1], turn2.cumulative_hashes[1],
+            "turn 2 reads turn 1's write"
+        );
+        assert_eq!(turn2.blocks.len(), 5, "sys + user + tool_call + tool + user");
+        assert_eq!(turn2.breakpoints[0].block_index, 4, "marker moved to the new frontier");
+        // Well within the 20-block walk-back window: 3 new blocks per tool-loop turn.
+        let candidates = turn2.read_candidates(&turn2.breakpoints[0]);
+        assert!(
+            candidates.contains(&turn1.cumulative_hashes[1]),
+            "prior write reachable by walk-back"
+        );
+    }
 }

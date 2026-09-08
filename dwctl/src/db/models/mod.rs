@@ -71,6 +71,5 @@ pub mod password_reset_tokens;
 pub mod probes;
 pub mod provider_display_configs;
 pub mod tariffs;
-pub mod tool_sources;
 pub mod users;
 pub mod webhooks;

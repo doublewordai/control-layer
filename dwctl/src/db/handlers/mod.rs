@@ -72,7 +72,6 @@ pub mod password_reset_tokens;
 pub mod provider_display_configs;
 pub mod repository;
 pub mod tariffs;
-pub mod tool_sources;
 pub mod users;
 pub mod webhooks;
 
@@ -89,6 +88,5 @@ pub use password_reset_tokens::PasswordResetTokens;
 pub use provider_display_configs::ProviderDisplayConfigs;
 pub use repository::Repository;
 pub use tariffs::Tariffs;
-pub use tool_sources::ToolSources;
 pub use users::Users;
 pub use webhooks::Webhooks;

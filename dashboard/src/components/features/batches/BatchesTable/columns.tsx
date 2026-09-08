@@ -23,6 +23,7 @@ import {
   copyToClipboard,
 } from "../../../../utils";
 import type { Batch, BatchStatus } from "../types";
+import { batchModelName } from "../model";
 import { getCompletionWindowLabel } from "../../../../utils/serviceTier";
 
 interface ColumnActions {
@@ -59,6 +60,25 @@ const getStatusColor = (status: BatchStatus) => {
     default:
       return "bg-gray-100 text-gray-800";
   }
+};
+
+const modelColumn: ColumnDef<Batch> = {
+  id: "model",
+  header: "Model",
+  cell: ({ row }) => {
+    const modelName = batchModelName(row.original as Batch);
+    if (!modelName) {
+      return <span className="text-gray-400">-</span>;
+    }
+    return (
+      <span
+        className="font-mono text-xs text-doubleword-neutral-700 truncate max-w-[160px] block cursor-default"
+        title={modelName}
+      >
+        {modelName}
+      </span>
+    );
+  },
 };
 
 const userColumn: ColumnDef<Batch> = {
@@ -114,6 +134,7 @@ export const createBatchColumns = (
       );
     },
   },
+  modelColumn,
   ...(actions.showUserColumn ? [userColumn] : []),
   ...(actions.showTypeColumn !== false
     ? [

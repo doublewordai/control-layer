@@ -1,6 +1,6 @@
 [package]
 name = "onwards"
-version = "0.38.1"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88.0"
 description = "A flexible LLM proxy library"
@@ -18,7 +18,6 @@ async-trait = "0.1.88"
 brotli = "8"
 bytes = "1.10"
 eventsource-stream = "0.2"
-openai-reassembler = "0.3"
 axum = "0.8.4"
 flate2 = "1"
 clap = { version = "4.5.40", features = ["derive", "env"] }
@@ -44,14 +43,15 @@ tokio = { version = "1.45.1", features = [
   "fs",
   "sync",
   "time",
+  "signal",
 ] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tracing = "0.1.41"
-tracing-opentelemetry = "0.32.1"
+tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "registry"] }
-opentelemetry = "0.31.0"
-opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
+opentelemetry = "0.32.0"
+opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "http-json", "reqwest-blocking-client", "reqwest-rustls"] }
 url = { version = "2.5", features = ["serde"] }
 bon = "3.6.5"
 subtle = "2.6.1"
@@ -66,3 +66,5 @@ futures-util = "0.3"
 rstest = "0.26.1"
 tower = "0.5"
 wiremock = "0.6"
+reqwest = { version = "0.13", features = ["json", "stream"] }
+tokio = { version = "1.45.1", features = ["process", "io-util"] }

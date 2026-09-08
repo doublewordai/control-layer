@@ -80,7 +80,11 @@ fn normalize_chat_chunk_choice_value(value: &mut Value, fallback_index: usize) {
 /// Backfill omitted non-critical chat completion response fields during strict
 /// sanitization. This is intentionally kept out of serde defaults so we only
 /// relax third-party provider payloads, not every deserialize path.
-pub(crate) fn normalize_chat_completion_response_value(value: &mut Value, fallback_model: &str) {
+///
+/// Public because dwctl's edge translators parse provider payloads through the
+/// strict schemas too, and must apply the same relaxations first (backends
+/// omit `role` on reassembled/streamed replies, among others).
+pub fn normalize_chat_completion_response_value(value: &mut Value, fallback_model: &str) {
     let Some(object) = value.as_object_mut() else {
         return;
     };
@@ -113,7 +117,9 @@ pub(crate) fn normalize_chat_completion_response_value(value: &mut Value, fallba
 
 /// Backfill omitted non-critical chat completion chunk fields during strict
 /// sanitization. This keeps partial-but-usable streamed chunks from failing.
-pub(crate) fn normalize_chat_completion_chunk_value(
+///
+/// Public for the same reason as [`normalize_chat_completion_response_value`].
+pub fn normalize_chat_completion_chunk_value(
     value: &mut Value,
     fallback_model: &str,
     fallback_id: &str,

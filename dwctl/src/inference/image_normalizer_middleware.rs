@@ -3,9 +3,7 @@
 //! [`ImageNormalizer`] for fetch + store, and substitutes the URL in the
 //! body with a fresh short-lived signed URL before forwarding to onwards.
 //!
-//! Modelled directly on the existing
-//! [`tool_injection_middleware`](crate::inference::tools::tool_injection_middleware)
-//! pattern: read the body once via `axum::body::to_bytes`, mutate the JSON
+//! Pattern: read the body once via `axum::body::to_bytes`, mutate the JSON
 //! in place, restore the body via `Body::from(...)`.
 //!
 //! The middleware is a no-op for:
@@ -84,9 +82,7 @@ fn extract_bearer_token(request: &Request<Body>) -> Option<String> {
     }
 }
 
-/// Axum middleware function. Applies to the onwards router, runs in front
-/// of `tool_injection_middleware` (i.e. configured as an outer Tower layer
-/// so the request reaches it first).
+/// Axum middleware function. Applies to the onwards router.
 pub async fn image_normalizer_middleware(
     State(state): State<ImageNormalizerMiddlewareState>,
     mut request: Request<Body>,

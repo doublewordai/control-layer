@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tracing::{instrument, trace};
 use uuid::Uuid;
 
@@ -201,6 +201,68 @@ impl<'c> Credits<'c> {
             // Freshly created transaction; the tier isn't needed on this return path.
             service_tier: None,
         })
+    }
+
+    /// Has this billing target ever completed a purchase?
+    ///
+    /// The read-side counterpart of [`Self::grant_first_payment_match`]: that
+    /// method decides eligibility from the absence of a prior `purchase` row,
+    /// and this answers the same question for callers that need to know
+    /// *before* any money moves - notably the dashboard's first-deposit-match
+    /// banner, which must not advertise a promotion the ledger will refuse.
+    ///
+    /// Deliberately not `has_payment_provider_id`: a payment-provider customer
+    /// record is created by setup-mode card verification and by
+    /// `POST /auto-topup/enable` (even on the `needs_billing_portal` bail-out),
+    /// so it goes true for accounts that have never bought anything and would
+    /// hide the promotion from people still entitled to it.
+    ///
+    /// Served by the partial `idx_credits_transactions_user_purchases` index
+    /// (migration 100), so it stays a direct lookup no matter how many `usage`
+    /// rows the target has accumulated.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn has_purchased(&mut self, user_id: UserId) -> Result<bool> {
+        let purchased = sqlx::query_scalar!(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM credits_transactions
+                WHERE user_id = $1 AND transaction_type = 'purchase'
+            ) AS "purchased!"
+            "#,
+            user_id
+        )
+        .fetch_one(&mut *self.db)
+        .await?;
+
+        Ok(purchased)
+    }
+
+    /// Which of `user_ids` have ever completed a purchase?
+    ///
+    /// Bulk form of [`Self::has_purchased`], for the list endpoints - one
+    /// query for the page rather than one per row. Returns only the ids that
+    /// have purchased; absent means no purchase, so callers test membership.
+    ///
+    /// `DISTINCT` rather than a count: we only need the boolean, and stopping
+    /// at existence keeps this on the partial purchases index.
+    #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
+    pub async fn has_purchased_bulk(&mut self, user_ids: &[UserId]) -> Result<HashSet<UserId>> {
+        if user_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let rows = sqlx::query_scalar!(
+            r#"
+            SELECT DISTINCT user_id AS "user_id!"
+            FROM credits_transactions
+            WHERE user_id = ANY($1::uuid[]) AND transaction_type = 'purchase'
+            "#,
+            user_ids
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(rows.into_iter().collect())
     }
 
     /// Grant a first-payment match bonus to `payee` if eligible.
@@ -955,6 +1017,103 @@ mod tests {
         // Verify balance via get_user_balance (balance_after is no longer stored for new transactions)
         let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
         assert_eq!(balance, Decimal::from_str("100.50").unwrap());
+    }
+
+    /// A usage transaction carrying a `fusillade_batch_id` is NOT listed individually —
+    /// the grouped query's non-batch arm filters `WHERE fusillade_batch_id IS NULL`, and
+    /// batched spend reaches the customer only through `batch_aggregates`.
+    ///
+    /// This is a trap for anyone amending billing by hand. A compensating correction for a
+    /// batched request, written with the batch id set and without also folding
+    /// `batch_aggregates.total_amount`, is charged to the customer and appears **nowhere**
+    /// in their transaction history. The internal usage-repair runbook therefore writes
+    /// batch corrections with a NULL batch id so they surface as their own line; this test
+    /// pins the behaviour that advice depends on.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn batched_transaction_is_invisible_without_an_aggregate_row(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let batch_id = Uuid::new_v4();
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+
+        // A usage row tagged with a batch, but no batch_aggregates row to surface it.
+        sqlx::query!(
+            r#"INSERT INTO credits_transactions
+               (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, service_tier)
+               VALUES ($1, 'usage', $2, $3, 'batched usage', $4, 'batch')"#,
+            user_id,
+            Decimal::from_str("1.25").unwrap(),
+            format!("test-batched-{}", Uuid::new_v4()),
+            batch_id,
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("insert batched usage");
+
+        let mut credits = Credits::new(&mut conn);
+        let listed = credits
+            .list_transactions_with_batches(user_id, 0, 50, &TransactionFilters::default())
+            .await
+            .expect("list transactions");
+
+        assert!(
+            listed.is_empty(),
+            "a batched transaction with no aggregate row must not appear; got {listed:?}"
+        );
+
+        // The ledger row is real - the money is recorded, it simply cannot be seen.
+        let ledger: Decimal = sqlx::query_scalar!(
+            r#"SELECT COALESCE(SUM(CASE WHEN transaction_type IN ('admin_grant','purchase')
+                                        THEN amount ELSE -amount END), 0) AS "total!"
+               FROM credits_transactions WHERE user_id = $1"#,
+            user_id
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .expect("sum ledger");
+        assert_eq!(ledger, Decimal::from_str("-1.25").unwrap(), "the charge is in the ledger");
+
+        // ...and the balance read model has NOT moved, because a raw INSERT never folds it.
+        // That is the second half of the same trap, and why the repair runbook must run the
+        // balance heal after any manual ledger surgery.
+        let mut credits = Credits::new(&mut conn);
+        let balance = credits.get_user_balance(user_id).await.expect("Failed to get balance");
+        assert_eq!(
+            balance,
+            Decimal::ZERO,
+            "a hand-written ledger row does not fold the checkpoint - heal is required"
+        );
+    }
+
+    /// The same correction written WITHOUT a batch id does surface, which is why the
+    /// runbook writes them that way.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn unbatched_correction_surfaces_as_its_own_line(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+
+        sqlx::query!(
+            r#"INSERT INTO credits_transactions
+               (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, service_tier)
+               VALUES ($1, 'usage', $2, $3, 'usage correction', NULL, 'batch')"#,
+            user_id,
+            Decimal::from_str("1.25").unwrap(),
+            format!("test-correction-{}", Uuid::new_v4()),
+        )
+        .execute(&mut *conn)
+        .await
+        .expect("insert correction");
+
+        let mut credits = Credits::new(&mut conn);
+        let listed = credits
+            .list_transactions_with_batches(user_id, 0, 50, &TransactionFilters::default())
+            .await
+            .expect("list transactions");
+
+        assert_eq!(listed.len(), 1, "the correction must be visible to the customer");
+        assert_eq!(listed[0].transaction.description.as_deref(), Some("usage correction"));
+        assert_eq!(listed[0].batch_id, None);
     }
 
     #[sqlx::test]
@@ -2105,6 +2264,65 @@ mod tests {
         .fetch_optional(pool)
         .await
         .expect("query bonus")
+    }
+
+    #[sqlx::test]
+    async fn test_has_purchased_is_false_before_any_purchase(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        assert!(!credits.has_purchased(user).await.unwrap());
+
+        insert_purchase(&mut credits, user, "30.0", "sess-1").await;
+
+        assert!(credits.has_purchased(user).await.unwrap());
+    }
+
+    #[sqlx::test]
+    async fn test_has_purchased_ignores_grants_and_usage(pool: PgPool) {
+        // The regression this guards: signup credits and a verified card both
+        // give an account a balance and a payment-provider record without a
+        // purchase, and the first-payment match is still owed to them.
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        for (transaction_type, source_id) in [
+            (CreditTransactionType::AdminGrant, "signup-credits"),
+            (CreditTransactionType::Usage, "some-request"),
+            (CreditTransactionType::AdminRemoval, "clawback"),
+        ] {
+            credits
+                .create_transaction(&CreditTransactionCreateDBRequest {
+                    user_id: user,
+                    transaction_type,
+                    amount: Decimal::from_str("1.0").unwrap(),
+                    source_id: source_id.to_string(),
+                    description: None,
+                    fusillade_batch_id: None,
+                    api_key_id: None,
+                })
+                .await
+                .unwrap();
+        }
+
+        assert!(!credits.has_purchased(user).await.unwrap());
+    }
+
+    #[sqlx::test]
+    async fn test_has_purchased_is_scoped_to_the_billing_target(pool: PgPool) {
+        // An org admin paying for their org must not lose their own personal
+        // eligibility, and vice versa - the two are separate billing targets.
+        let payer = create_test_user(&pool).await;
+        let other = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        insert_purchase(&mut credits, payer, "30.0", "sess-1").await;
+
+        assert!(credits.has_purchased(payer).await.unwrap());
+        assert!(!credits.has_purchased(other).await.unwrap());
     }
 
     #[sqlx::test]

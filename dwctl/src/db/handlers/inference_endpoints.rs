@@ -36,6 +36,7 @@ struct InferenceEndpoint {
     pub auth_header_name: String,
     pub auth_header_prefix: String,
     pub reasoning_translation: Option<serde_json::Value>,
+    pub accepts_scheduling_priority: bool,
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -55,6 +56,7 @@ impl TryFrom<InferenceEndpoint> for InferenceEndpointDBResponse {
             auth_header_name: src.auth_header_name,
             auth_header_prefix: src.auth_header_prefix,
             reasoning_translation: src.reasoning_translation.map(serde_json::from_value).transpose()?,
+            accepts_scheduling_priority: src.accepts_scheduling_priority,
             created_by: src.created_by,
             created_at: src.created_at,
             updated_at: src.updated_at,
@@ -86,8 +88,8 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         let endpoint = sqlx::query_as!(
             InferenceEndpoint,
             r#"
-            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by, reasoning_translation)
-            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8, $9)
+            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by, reasoning_translation, accepts_scheduling_priority)
+            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8, $9, $10)
             RETURNING *
             "#,
             request.name,
@@ -98,7 +100,8 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             request.auth_header_name,
             request.auth_header_prefix,
             request.created_by,
-            reasoning_translation
+            reasoning_translation,
+            request.accepts_scheduling_priority
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -140,6 +143,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
                 auth_header_name: row.auth_header_name,
                 auth_header_prefix: row.auth_header_prefix,
                 reasoning_translation: row.reasoning_translation,
+                accepts_scheduling_priority: row.accepts_scheduling_priority,
                 created_by: row.created_by,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
@@ -197,6 +201,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
                     WHEN $9 THEN $10
                     ELSE reasoning_translation
                 END,
+                accepts_scheduling_priority = COALESCE($11, accepts_scheduling_priority),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -210,7 +215,8 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             request.auth_header_name,
             request.auth_header_prefix,
             request.reasoning_translation.is_some(),
-            reasoning_translation
+            reasoning_translation,
+            request.accepts_scheduling_priority
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -287,6 +293,7 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
             created_by,
         }
     }
@@ -354,6 +361,7 @@ mod tests {
                     auth_header_name: None,
                     auth_header_prefix: None,
                     reasoning_translation: Some(None),
+                    accepts_scheduling_priority: None,
                 },
             )
             .await
@@ -508,6 +516,7 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: None,
         };
 
         // Apply update
@@ -553,6 +562,7 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: None,
         };
 
         // Apply update
@@ -621,6 +631,7 @@ mod tests {
             auth_header_name: "Authorization".to_string(),
             auth_header_prefix: "Bearer ".to_string(),
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
             created_by: uuid::Uuid::new_v4(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -636,6 +647,7 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: None,
         };
 
         let updated_response = mock_coalesce_update(update_request, original_response.clone());
@@ -672,6 +684,7 @@ mod tests {
             auth_header_name: "Authorization".to_string(),
             auth_header_prefix: "Bearer ".to_string(),
             reasoning_translation: None,
+            accepts_scheduling_priority: false,
             created_by: uuid::Uuid::new_v4(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now() - chrono::Duration::seconds(1),
@@ -687,6 +700,7 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: None,
         };
 
         let updated_response = mock_coalesce_update(update_request, original_response.clone());
@@ -721,6 +735,7 @@ mod tests {
             auth_header_name: None,
             auth_header_prefix: None,
             reasoning_translation: None,
+            accepts_scheduling_priority: None,
         };
 
         let result = repo.update(fake_id, &update_request).await;

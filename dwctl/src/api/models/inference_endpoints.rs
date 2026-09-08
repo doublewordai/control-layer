@@ -135,6 +135,12 @@ pub struct InferenceEndpointCreate {
     /// Default provider mapping for canonical reasoning controls.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
+    /// This endpoint's serving stack understands the scheduling `priority`
+    /// request field (the dynamo frontend does; third-party APIs reject
+    /// unknown fields). Onwards strips the field from named-pool attempts to
+    /// members of endpoints without it. Defaults to false.
+    #[serde(default)]
+    pub accepts_scheduling_priority: bool,
 }
 
 fn default_sync() -> bool {
@@ -157,6 +163,9 @@ pub struct InferenceEndpointUpdate {
     /// Endpoint reasoning default (omitted = unchanged, null = clear).
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub reasoning_translation: Option<Option<ReasoningTranslationConfig>>,
+    /// See `InferenceEndpointCreate::accepts_scheduling_priority` (omitted = unchanged).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepts_scheduling_priority: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -197,6 +206,7 @@ pub struct InferenceEndpointResponse {
     pub auth_header_prefix: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_translation: Option<ReasoningTranslationConfig>,
+    pub accepts_scheduling_priority: bool,
     #[schema(value_type = String, format = "uuid")]
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
@@ -215,6 +225,7 @@ impl From<InferenceEndpointDBResponse> for InferenceEndpointResponse {
             auth_header_name: db.auth_header_name,
             auth_header_prefix: db.auth_header_prefix,
             reasoning_translation: db.reasoning_translation,
+            accepts_scheduling_priority: db.accepts_scheduling_priority,
             created_by: db.created_by,
             created_at: db.created_at,
             updated_at: db.updated_at,

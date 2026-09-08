@@ -20,6 +20,12 @@ pub enum ApiKeyPurpose {
     Batch,
     /// Playground inference access (/ai/*) - hidden keys for dashboard playground
     Playground,
+    /// Mid-stream continuation access (/ai/*) - hidden keys the resume middleware
+    /// uses to replay a failed stream's exact token-id prefix via a completions
+    /// route. The purpose is what `model_traffic_rules` keys on to steer resume
+    /// legs to a model's continuation deployment; one hidden key per user, like
+    /// batch/playground.
+    Continuation,
 }
 
 /// Whether an API key `purpose` (raw DB string) is permitted on the inference
@@ -32,7 +38,7 @@ pub enum ApiKeyPurpose {
 /// queries in `sync::onwards_config` mirror this list as a SQL
 /// `ak.purpose IN (...)` filter (SQL cannot call this) - keep them in sync.
 pub fn is_inference_purpose(purpose: &str) -> bool {
-    matches!(purpose, "realtime" | "batch" | "playground")
+    matches!(purpose, "realtime" | "batch" | "playground" | "continuation")
 }
 
 #[cfg(test)]
@@ -44,6 +50,7 @@ mod purpose_tests {
         assert!(is_inference_purpose("realtime"));
         assert!(is_inference_purpose("batch"));
         assert!(is_inference_purpose("playground"));
+        assert!(is_inference_purpose("continuation"));
         assert!(!is_inference_purpose("platform"));
         assert!(!is_inference_purpose("unknown"));
     }

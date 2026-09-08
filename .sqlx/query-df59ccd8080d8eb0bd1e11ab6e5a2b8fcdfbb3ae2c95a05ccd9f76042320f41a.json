@@ -145,6 +145,11 @@
       },
       {
         "ordinal": 28,
+        "name": "invoicing_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 29,
         "name": "auto_join_enabled",
         "type_info": "Bool"
       }
@@ -191,6 +196,7 @@
       false,
       false,
       true,
+      false,
       false
     ]
   },

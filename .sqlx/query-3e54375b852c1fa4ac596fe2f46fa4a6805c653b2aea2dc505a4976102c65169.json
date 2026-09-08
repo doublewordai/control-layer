@@ -62,6 +62,11 @@
         "ordinal": 11,
         "name": "reasoning_translation",
         "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 12,
+        "name": "accepts_scheduling_priority",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -81,7 +86,8 @@
       false,
       false,
       false,
-      true
+      true,
+      false
     ]
   },
   "hash": "3e54375b852c1fa4ac596fe2f46fa4a6805c653b2aea2dc505a4976102c65169"

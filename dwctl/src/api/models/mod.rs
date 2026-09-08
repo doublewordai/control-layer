@@ -20,7 +20,6 @@ pub mod probes;
 pub mod provider_display_configs;
 pub mod requests;
 pub mod tariffs;
-pub mod tool_sources;
 pub mod transactions;
 pub mod users;
 pub mod webhooks;

@@ -20,7 +20,9 @@ use axum::http::{HeaderMap, StatusCode, Uri, header, request::Parts};
 use bytes::Bytes;
 use serde_json::Value;
 
-use onwards::strict::schemas::chat_completions::{ChatCompletionChunk, ChatCompletionResponse};
+use onwards::strict::schemas::chat_completions::{
+    ChatCompletionChunk, ChatCompletionResponse, normalize_chat_completion_chunk_value, normalize_chat_completion_response_value,
+};
 
 use self::types::ResponsesRequest;
 
@@ -79,7 +81,14 @@ impl ProtocolTranslator for OpenResponses {
         // request-only fields (model, tools, instructions, previous_response_id).
         let req: ResponsesRequest =
             serde_json::from_slice(request).map_err(|e| TranslationError::Internal(format!("re-parsing Responses request: {e}")))?;
-        let chat: ChatCompletionResponse = serde_json::from_slice(&body)
+        // Backends differ on which optional-per-spec fields they omit (Dynamo
+        // omits `role` on streamed deltas, which the reassembled batch/flex body
+        // inherits), so relax the payload with onwards' sanitizer before the
+        // strict parse — the same order onwards' own strict handlers use.
+        let mut raw: Value = serde_json::from_slice(&body)
+            .map_err(|e| TranslationError::Internal(format!("upstream response was not Chat Completions: {e}")))?;
+        normalize_chat_completion_response_value(&mut raw, &req.model);
+        let chat: ChatCompletionResponse = serde_json::from_value(raw)
             .map_err(|e| TranslationError::Internal(format!("upstream response was not Chat Completions: {e}")))?;
 
         // Stamp the platform tracking id so `GET /v1/responses/{id}` resolves; fall
@@ -148,15 +157,27 @@ struct ResponsesStreamReframer {
     /// `None` only if the (already validated) request failed to re-parse; we then
     /// emit a single terminal error rather than a stream.
     state: Option<streaming::StreamingState>,
+    /// Requested model, used to backfill chunks from backends that omit it.
+    model: String,
+    /// Chunk id to backfill when the backend omits one.
+    fallback_id: String,
     errored: bool,
 }
 
 impl ResponsesStreamReframer {
     fn new(request: &Bytes, response_id: Option<&str>) -> Self {
-        let state = serde_json::from_slice::<ResponsesRequest>(request)
-            .ok()
-            .map(|req| streaming::StreamingState::new(&req, response_id));
-        Self { state, errored: false }
+        let req = serde_json::from_slice::<ResponsesRequest>(request).ok();
+        let model = req.as_ref().map(|r| r.model.clone()).unwrap_or_default();
+        let state = req.map(|req| streaming::StreamingState::new(&req, response_id));
+        let fallback_id = response_id
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("chatcmpl-{}", uuid::Uuid::new_v4()));
+        Self {
+            state,
+            model,
+            fallback_id,
+            errored: false,
+        }
     }
 
     fn emit_error(&mut self, message: &str) -> Vec<u8> {
@@ -173,9 +194,13 @@ impl StreamReframer for ResponsesStreamReframer {
         if self.state.is_none() {
             return self.emit_error("could not initialise Responses stream");
         }
-        // Skip a chunk we can't parse, mirroring the middleware's own tolerance
-        // of unparseable SSE data lines.
-        let Ok(parsed) = serde_json::from_value::<ChatCompletionChunk>(chunk.clone()) else {
+        // Backfill fields backends legally omit on chunks before the strict
+        // parse (same relaxation as the blocking path); then skip a chunk we
+        // still can't parse, mirroring the middleware's own tolerance of
+        // unparseable SSE data lines.
+        let mut raw = chunk.clone();
+        normalize_chat_completion_chunk_value(&mut raw, &self.model, &self.fallback_id);
+        let Ok(parsed) = serde_json::from_value::<ChatCompletionChunk>(raw) else {
             return Vec::new();
         };
         let state = self.state.as_mut().expect("state is Some");
@@ -336,5 +361,89 @@ mod tests {
             text.contains(r#""delta":"Hi""#) || text.contains("Hi"),
             "missing text delta in:\n{text}"
         );
+    }
+
+    /// A blocking reply whose message omits `role` (and other optional-per-spec
+    /// top-level fields) must still translate. This is the shape a reassembled
+    /// single-chunk stream takes when the backend never sends `role` on its
+    /// deltas; `finish_reason: "length"` mimics a `max_output_tokens: 1` reply,
+    /// which is single-chunk and therefore hits it deterministically.
+    #[test]
+    fn blocking_reply_missing_optional_fields_is_tolerated() {
+        let request = Bytes::from(r#"{"model":"m","input":"hi","max_output_tokens":1}"#);
+        let body = Bytes::from(r#"{"choices":[{"message":{"content":"Hello"},"finish_reason":"length"}]}"#);
+
+        let out = OpenResponses::new()
+            .translate_response(&request, None, body)
+            .expect("must translate");
+
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["object"], "response");
+        assert_eq!(v["status"], "incomplete", "length-capped replies surface as incomplete");
+        assert_eq!(v["model"], "m", "model backfilled from the request");
+        assert_eq!(v["output"][0]["role"], "assistant", "missing role defaults to assistant");
+        assert_eq!(v["output"][0]["content"][0]["text"], "Hello");
+    }
+
+    /// Streamed chunks whose deltas omit `role` (and whose envelopes omit
+    /// `created`/`model`) must still reframe into Responses events rather than
+    /// being silently dropped.
+    #[tokio::test]
+    async fn streamed_chunks_missing_optional_fields_are_reframed() {
+        async fn fake_chat_sse(_req: Request) -> Response {
+            let sse = concat!(
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let mut r = Response::new(Body::from(sse));
+            r.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+            r
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(fake_chat_sse))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({ "model": "gpt-4o", "input": "hi", "stream": true, "max_output_tokens": 1 }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 200);
+        let text = response.text();
+        assert!(text.contains("event: response.output_text.delta"), "chunk was dropped:\n{text}");
+        assert!(text.contains("Hi"), "missing text delta in:\n{text}");
+    }
+
+    /// A 2xx body the translator genuinely cannot translate must surface as a
+    /// status the batch daemon will NOT retry (it retries >=500, 429, 408 and
+    /// 404): the upstream succeeded, so every retry fails identically.
+    #[tokio::test]
+    async fn untranslatable_success_body_is_a_non_retriable_status() {
+        async fn bad_handler(_req: Request) -> Response {
+            let mut r = Response::new(Body::from("not json at all"));
+            r.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("application/json"));
+            r
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(bad_handler))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({ "model": "gpt-4o", "input": "hi" }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 422);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["message"], "response translation failed");
     }
 }

@@ -35,16 +35,13 @@ struct StreamingFixture {
     group_id: Uuid,
 }
 
-async fn setup_streaming_fixture(
-    pool: &PgPool,
-    mock_endpoint_url: String,
-    model_name: &str,
-    alias: &str,
-    open_responses_adapter: Option<bool>,
-) -> StreamingFixture {
+async fn setup_streaming_fixture(pool: &PgPool, mock_endpoint_url: String, model_name: &str, alias: &str) -> StreamingFixture {
     let mut config = crate::test::utils::create_test_config();
     config.background_services.onwards_sync.enabled = true;
     config.enable_request_logging = true;
+    // Batch traffic to these paths is forced to stream and reassembled on the way
+    // back, which is what these fixtures exercise.
+    config.background_services.batch_daemon.streamable_endpoints = vec!["/v1/chat/completions".to_string(), "/v1/completions".to_string()];
 
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
         .await
@@ -113,7 +110,6 @@ async fn setup_streaming_fixture(
             "alias": alias,
             "description": "Test model deployment",
             "hosted_on": endpoint.id,
-            "open_responses_adapter": open_responses_adapter,
             "tariffs": [{
                 "name": "batch",
                 "input_price_per_token": "0.001",
@@ -553,6 +549,39 @@ async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
     assert_eq!(invalid_capabilities_response.status_code(), 400);
 }
 
+#[sqlx::test]
+async fn ai_models_unknown_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
+    let config = crate::test::utils::create_test_config();
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, _bg_services) = app.into_test_server();
+
+    let response = server
+        .get("/ai/v1/models")
+        .add_header("authorization", "Bearer not-a-real-key")
+        .await;
+    assert_eq!(response.status_code(), 401);
+
+    let body: serde_json::Value = response.json();
+    assert_eq!(body["error"]["type"], "authentication_error");
+    assert_eq!(body["error"]["code"], "invalid_api_key");
+    assert_eq!(body["error"]["message"], crate::errors::INVALID_API_KEY_MESSAGE);
+
+    // The copy stays generic: it must point at the regional-endpoints docs page
+    // without enumerating regional API base URLs in the error body.
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(message.contains("https://docs.doubleword.ai/inference-api/regional-endpoints"));
+    assert!(
+        !message.contains("api.doubleword.ai"),
+        "401 copy must not enumerate regional base URLs"
+    );
+    assert!(
+        !message.contains("api.us.doubleword.ai"),
+        "401 copy must not enumerate regional base URLs"
+    );
+}
+
 async fn assert_usage_recorded(fixture: &StreamingFixture, expected_uri: &str, prompt_tokens: i64, completion_tokens: i64) {
     let mut tries = 0;
     // The batcher flush folds the balance in the same transaction that
@@ -625,6 +654,61 @@ async fn cleanup_fixture(fixture: StreamingFixture) {
     fixture.bg_services.shutdown().await;
 }
 
+/// A client asking for a stream must receive one, through the whole app.
+///
+/// This is the regression that shipped: the edge decided to reassemble from a
+/// header it stamps on every inbound request, so a client's `stream: true` came
+/// back as one `chat.completion` object. Nothing at this level covered it - both
+/// streaming fixtures sent the daemon's headers, so both took the daemon's path.
+#[sqlx::test]
+#[test_log::test]
+async fn test_e2e_ai_proxy_client_stream_is_not_reassembled(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    let sse_response = "data: {\"id\":\"chatcmpl-123\",\"object\":\"chat.completion.chunk\",\"created\":1677652288,\"model\":\"gpt-3.5-turbo\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello!\"}}],\"usage\":null}\n\ndata: [DONE]\n\n";
+
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({ "stream": true })))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_raw(sse_response, "text/event-stream"),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
+
+    // No daemon headers at all: this is a client, and the client asked to stream.
+    let inference_response = fixture
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", format!("Bearer {}", fixture.api_key))
+        .json(&serde_json::json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "Hello from E2E test"}],
+            "stream": true
+        }))
+        .await;
+
+    assert_eq!(inference_response.status_code().as_u16(), 200);
+    let content_type = inference_response
+        .headers()
+        .get("content-type")
+        .map_or("", |v| v.to_str().unwrap_or_default())
+        .to_string();
+    assert!(
+        content_type.starts_with("text/event-stream"),
+        "a client that asked to stream must not be handed an assembled body, got {content_type:?}"
+    );
+    assert!(
+        inference_response.text().starts_with("data:"),
+        "the frames themselves must reach the client"
+    );
+
+    cleanup_fixture(fixture).await;
+}
+
 #[sqlx::test]
 #[test_log::test]
 async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool: PgPool) {
@@ -646,13 +730,17 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         .mount(&mock_server)
         .await;
 
-    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model", None).await;
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo", "test-model").await;
 
     let inference_response = fixture
         .server
         .post("/ai/v1/chat/completions")
         .add_header("authorization", format!("Bearer {}", fixture.api_key))
-        .add_header("x-fusillade-stream", "true")
+        // Both headers, because a real daemon dispatch carries both: the mark it
+        // sets for itself, and the correlation id the edge takes an early return
+        // on so a dispatch does not create a second row.
+        .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
+        .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "messages": [{"role": "user", "content": "Hello from E2E test"}]
@@ -660,7 +748,9 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
         .await;
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
-    assert_eq!(inference_response.text(), sse_response);
+    let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(assembled["choices"][0]["message"]["content"], "Hello! How can I help you today?");
+    assert_eq!(assembled["usage"]["total_tokens"], 21);
     assert_usage_recorded(&fixture, "http://localhost/chat/completions", 9, 12).await;
     cleanup_fixture(fixture).await;
 }
@@ -686,20 +776,17 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         .mount(&mock_server)
         .await;
 
-    let fixture = setup_streaming_fixture(
-        &pool,
-        format!("{}/v1", mock_server.uri()),
-        "gpt-3.5-turbo-instruct",
-        "test-model",
-        None,
-    )
-    .await;
+    let fixture = setup_streaming_fixture(&pool, format!("{}/v1", mock_server.uri()), "gpt-3.5-turbo-instruct", "test-model").await;
 
     let inference_response = fixture
         .server
         .post("/ai/v1/completions")
         .add_header("authorization", format!("Bearer {}", fixture.api_key))
-        .add_header("x-fusillade-stream", "true")
+        // Both headers, because a real daemon dispatch carries both: the mark it
+        // sets for itself, and the correlation id the edge takes an early return
+        // on so a dispatch does not create a second row.
+        .add_header(crate::inference::outbound_request::STREAM_MARKER_HEADER, "1")
+        .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
         .json(&serde_json::json!({
             "model": "test-model",
             "prompt": "Hello from E2E test"
@@ -707,7 +794,8 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
         .await;
 
     assert_eq!(inference_response.status_code().as_u16(), 200);
-    assert_eq!(inference_response.text(), sse_response);
+    let assembled: serde_json::Value = inference_response.json();
+    assert_eq!(assembled["usage"]["total_tokens"], 20);
     assert_usage_recorded(&fixture, "http://localhost/completions", 8, 12).await;
     cleanup_fixture(fixture).await;
 }
@@ -717,13 +805,12 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
 // The original test proxied a streaming `/v1/responses` request to a
 // wiremock that returned an SSE response and asserted the proxied
 // stream made it through unchanged. Since commit `6a7c24d7`,
-// `/v1/responses` doesn't proxy — it engages the multi-step warm
-// path which builds chat-completions payloads itself and fires per-
-// step model_calls over an HTTP loopback (unreachable from the
-// axum_test in-memory transport). Streaming coverage of the warm
-// path's SSE event sink lives in `responses::streaming`'s unit tests
-// and the `multi_step_executor` integration test; an e2e proxy test
-// for `/v1/responses` would need a real loopback listener.
+// `/v1/responses` doesn't proxy — the edge translates it to a
+// chat-completions call itself (the multi-step tool loop that once
+// lived here was removed in 2026-08, along with `response_steps`).
+// Streaming coverage lives in `responses::streaming`'s unit tests;
+// an e2e proxy test for `/v1/responses` would need a real loopback
+// listener.
 
 /// End-to-end test: Traffic routing rules are enforced by onwards after sync.
 /// Covers three scenarios: baseline allow, deny by purpose, and redirect by purpose.
@@ -1328,7 +1415,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
             as std::sync::Arc<dyn crate::image_normalizer::ImageNormalizer>)
         .build();
     let onwards_router = axum::Router::new(); // Empty onwards router for testing
-    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
+    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None, None)
         .await
         .expect("Failed to build router");
 
@@ -1859,6 +1946,56 @@ mod openapi_access_control {
     }
 
     #[sqlx::test]
+    async fn unknown_bearer_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool, true).await;
+
+        // The CurrentUser extractor rejects unknown bearer keys for every
+        // dwctl-authenticated surface; the copy must nudge users to check
+        // their regional endpoint without enumerating base URLs.
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header("authorization", "Bearer not-a-real-key")
+            .await;
+        assert_eq!(response.status_code().as_u16(), 401);
+
+        let text = response.text();
+        assert!(
+            text.contains(crate::errors::INVALID_API_KEY_MESSAGE),
+            "unknown-key 401 should carry the regional-endpoints copy, got: {text}"
+        );
+        assert!(
+            !text.contains("api.doubleword.ai"),
+            "401 copy must not enumerate regional base URLs"
+        );
+        assert!(
+            !text.contains("api.us.doubleword.ai"),
+            "401 copy must not enumerate regional base URLs"
+        );
+    }
+
+    #[sqlx::test]
+    async fn ai_spec_error_example_matches_live_copy(pool: PgPool) {
+        let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let headers = add_auth_headers(&user);
+
+        let response = server
+            .get("/ai/openapi.json")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+
+        // The documented error example in the AI spec description is a separate
+        // string literal; keep it from drifting away from the live 401 copy.
+        let text = response.text();
+        assert!(
+            text.contains(crate::errors::INVALID_API_KEY_MESSAGE),
+            "AI OpenAPI description should embed the live invalid-API-key copy"
+        );
+    }
+
+    #[sqlx::test]
     async fn ai_spec_allows_any_authenticated_identity(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
 
@@ -1942,7 +2079,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
         .build();
 
     let onwards_router = axum::Router::new();
-    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
+    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None, None)
         .await
         .expect("Failed to build router");
     let server = axum_test::TestServer::new(router).expect("Failed to create test server");
@@ -2004,7 +2141,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
         .build();
 
     let onwards_router = axum::Router::new();
-    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None)
+    let router = super::build_router(&mut app_state, onwards_router, None, None, None, false, None, None)
         .await
         .expect("Failed to build router");
     let server = axum_test::TestServer::new(router).expect("Failed to create test server");
@@ -2523,4 +2660,138 @@ async fn test_read_pool_enforces_readonly(pool: PgPool) {
         .await;
 
     assert!(result.is_ok(), "Write operation on write pool should succeed");
+}
+
+/// The components API round-trips a member's pool, and lets the SAME hosted
+/// model be a member of two pools with independent per-pool ordering — which is
+/// how the canary is wired (dynamo position 0 in both).
+#[sqlx::test]
+#[test_log::test]
+async fn test_component_pool_round_trips_and_allows_dual_membership(pool: PgPool) {
+    let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
+    let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let headers = add_auth_headers(&admin);
+
+    let endpoint: serde_json::Value = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"name": "Test Endpoint", "url": "https://api.example.com/v1"}))
+        .await
+        .json();
+
+    let mut members = Vec::new();
+    for name in ["dynamo-flash", "fireworks-flash", "novita-flash"] {
+        let model: serde_json::Value = server
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&serde_json::json!({"type": "standard", "model_name": name, "hosted_on": endpoint["id"]}))
+            .await
+            .json();
+        members.push(model["id"].as_str().unwrap().to_string());
+    }
+
+    let composite: serde_json::Value = server
+        .post("/admin/api/v1/models")
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"type": "composite", "model_name": "dsv4-flash"}))
+        .await
+        .json();
+    let composite_id = composite["id"].as_str().unwrap().to_string();
+
+    let add = async |member: &str, body: serde_json::Value| {
+        server
+            .post(&format!("/admin/api/v1/models/{composite_id}/components/{member}"))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&body)
+            .await
+    };
+
+    // An add that names no pool keeps today's behaviour: the default pool.
+    let plain = add(&members[2], serde_json::json!({"weight": 50})).await;
+    assert_eq!(plain.status_code(), 200);
+    assert_eq!(plain.json::<serde_json::Value>()["pool"], "default");
+
+    let on_prem = add(&members[0], serde_json::json!({"weight": 50})).await;
+    assert_eq!(on_prem.status_code(), 200);
+    assert_eq!(on_prem.json::<serde_json::Value>()["pool"], "default");
+
+    // The same hosted model joins the completions pool too — position 0 there,
+    // independent of its position in the default pool.
+    let on_prem_completions = add(&members[0], serde_json::json!({"weight": 50, "pool": "completions"})).await;
+    assert_eq!(on_prem_completions.status_code(), 200, "a member may belong to more than one pool");
+    let on_prem_completions: serde_json::Value = on_prem_completions.json();
+    assert_eq!(on_prem_completions["pool"], "completions");
+    assert_eq!(on_prem_completions["sort_order"], 0, "ordering is per pool");
+
+    // The validated target sits behind it, in the completions pool only.
+    let validated = add(&members[1], serde_json::json!({"weight": 50, "pool": "completions"})).await;
+    assert_eq!(validated.status_code(), 200);
+    let validated_body: serde_json::Value = validated.json();
+    assert_eq!(validated_body["pool"], "completions");
+    assert_eq!(validated_body["sort_order"], 1);
+
+    // A pool name outside the CHECK constraint is refused at the schema.
+    let bogus = add(&members[1], serde_json::json!({"weight": 50, "pool": "chat"})).await;
+    assert!(
+        bogus.status_code().is_client_error(),
+        "unknown pool names must not reach the database: {}",
+        bogus.status_code()
+    );
+
+    // A PATCH addresses one membership, named by `?pool=`; the other is untouched.
+    let moved = server
+        .patch(&format!(
+            "/admin/api/v1/models/{composite_id}/components/{}?pool=completions",
+            members[1]
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .json(&serde_json::json!({"sort_order": 0}))
+        .await;
+    assert_eq!(moved.status_code(), 200);
+    assert_eq!(moved.json::<serde_json::Value>()["sort_order"], 0);
+
+    let listed: serde_json::Value = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    let pools: Vec<&str> = listed.as_array().unwrap().iter().map(|c| c["pool"].as_str().unwrap()).collect();
+    assert_eq!(pools.iter().filter(|p| **p == "completions").count(), 2);
+    assert_eq!(pools.iter().filter(|p| **p == "default").count(), 2);
+
+    // Removing a completions membership leaves the default one alone: the same
+    // model is still serving chat.
+    let removed = server
+        .delete(&format!(
+            "/admin/api/v1/models/{composite_id}/components/{}?pool=completions",
+            members[0]
+        ))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await;
+    assert_eq!(removed.status_code(), 200);
+
+    let listed: serde_json::Value = server
+        .get(&format!("/admin/api/v1/models/{composite_id}/components"))
+        .add_header(&headers[0].0, &headers[0].1)
+        .add_header(&headers[1].0, &headers[1].1)
+        .await
+        .json();
+    let remaining: Vec<(&str, &str)> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| (c["model"]["id"].as_str().unwrap(), c["pool"].as_str().unwrap()))
+        .collect();
+    assert!(
+        remaining.contains(&(members[0].as_str(), "default")),
+        "the default-pool membership survives: {remaining:?}"
+    );
+    assert!(!remaining.contains(&(members[0].as_str(), "completions")));
 }
