@@ -3023,7 +3023,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&headers[0].0, &headers[0].1)
             .add_header(&headers[1].0, &headers[1].1)
-            .json(&json!({ "name": "acme.test", "email": "billing@acme.test" }))
+            .json(&json!({ "name": "acme.test", "email": owner.email }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let body = resp.json::<serde_json::Value>();
@@ -3070,7 +3070,7 @@ mod tests {
             .post("/admin/api/v1/organizations")
             .add_header(&attacker_headers[0].0, &attacker_headers[0].1)
             .add_header(&attacker_headers[1].0, &attacker_headers[1].1)
-            .json(&json!({ "name": "acme.test", "email": "billing@acme.test" }))
+            .json(&json!({ "name": "acme.test", "email": attacker.email }))
             .await;
         resp.assert_status(axum::http::StatusCode::CREATED);
         let body = resp.json::<serde_json::Value>();
@@ -3166,7 +3166,6 @@ mod tests {
             "a suffixed plant must not match the LIKE arm either"
         );
     }
-
 
     /// The fix preserves the business-email path: an owner on a non-personal
     /// domain still claims that domain as `{domain}~{suffix}` and remains
