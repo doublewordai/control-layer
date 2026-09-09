@@ -1,5 +1,13 @@
 # Changelog
 
+## [11.8.0](https://github.com/doublewordai/control-layer/compare/v11.7.0...v11.8.0) (2026-09-09)
+
+
+### Features
+
+* **dashboard:** filter responses by account on the console ([#1733](https://github.com/doublewordai/control-layer/issues/1733)) ([6d2f4ba](https://github.com/doublewordai/control-layer/commit/6d2f4bac6eceba5648515459ca71d1f542e4ba46))
+* **responses:** surface the API key holder, not just the billing owner ([#1732](https://github.com/doublewordai/control-layer/issues/1732)) ([f9cc7f3](https://github.com/doublewordai/control-layer/commit/f9cc7f30ea2175819f977a10a53f3d35eb7239fc))
+
 ## [11.7.0](https://github.com/doublewordai/control-layer/compare/v11.6.3...v11.7.0) (2026-09-09)
 
 
