@@ -742,24 +742,60 @@ impl<'c> Organizations<'c> {
     ///
     /// Scoped to `org_id` as well as the request id so a caller who can manage
     /// one organization can't approve a request belonging to another. Returns
-    /// false if the request no longer exists or was already decided, which
+    /// `None` if the request no longer exists or was already decided, which
     /// makes concurrent approvals a no-op rather than a double-add.
+    ///
+    /// The approved user's id comes back so the caller can tell them — only
+    /// the winner of a concurrent approval gets a `Some`, so the requester is
+    /// mailed once rather than once per racing admin.
     #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), request_id = %abbrev_uuid(&request_id)), err)]
-    pub async fn approve_join_request(&mut self, org_id: UserId, request_id: Uuid, role: &str) -> Result<bool> {
-        let result = sqlx::query!(
+    pub async fn approve_join_request(&mut self, org_id: UserId, request_id: Uuid, role: &str) -> Result<Option<UserId>> {
+        let approved = sqlx::query_scalar!(
             r#"
             UPDATE user_organizations
             SET status = 'active', role = $3
             WHERE id = $1 AND organization_id = $2 AND status = 'requested'
+            RETURNING user_id
             "#,
             request_id,
             org_id,
             role,
         )
-        .execute(&mut *self.db)
+        .fetch_optional(&mut *self.db)
         .await?;
 
-        Ok(result.rows_affected() > 0)
+        // `user_id` is nullable on the table (an invite by address has no
+        // account behind it yet), but a `requested` row is always filed by a
+        // signed-in user, so the inner `None` is unreachable in practice.
+        Ok(approved.flatten())
+    }
+
+    /// Email addresses of everyone who can act on a join request: the active
+    /// owners and admins.
+    ///
+    /// Deleted accounts are filtered out here rather than at the send site —
+    /// a soft-deleted user keeps their row in `users`, and mailing them a
+    /// workspace's join requests would be a live notification to a closed
+    /// account.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
+    pub async fn list_admin_emails(&mut self, org_id: UserId) -> Result<Vec<String>> {
+        let emails = sqlx::query_scalar!(
+            r#"
+            SELECT u.email
+            FROM user_organizations uo
+            JOIN users u ON u.id = uo.user_id
+            WHERE uo.organization_id = $1
+              AND uo.status = 'active'
+              AND uo.role IN ('owner', 'admin')
+              AND u.is_deleted = false
+            ORDER BY u.email
+            "#,
+            org_id,
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(emails)
     }
 
     /// Decline a join request, removing the row.

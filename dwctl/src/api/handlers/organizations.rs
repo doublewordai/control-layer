@@ -34,6 +34,33 @@ use axum::{
 /// Maximum number of organizations a user can belong to simultaneously.
 const MAX_ORGS_PER_USER: i64 = 3;
 
+/// How an organization should be named in an email.
+///
+/// `username` carries the claimed domain plus a `~suffix` for the workspaces
+/// that share one (`acme.com~a1b2c3d4`). That suffix is an internal
+/// uniqueness device and means nothing to a reader, so it is stripped when
+/// the username has to stand in for a missing display name.
+fn org_email_name(display_name: Option<&str>, username: &str) -> String {
+    display_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| username.split('~').next().unwrap_or(username).to_string())
+}
+
+/// How a person should be named in an email.
+///
+/// Falls back to the address rather than `username`, which for an individual
+/// is the identity provider's subject (`google-oauth2|1104...`) and is not
+/// something to show anyone.
+fn person_email_name(display_name: Option<&str>, email: &str) -> String {
+    display_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| email.to_string())
+}
+
 /// Hash a token with SHA-256 for deterministic DB lookup.
 /// Since invite tokens are 256 bits of cryptographic randomness,
 /// a fast hash is secure enough (no brute-force risk).
@@ -1142,12 +1169,56 @@ pub async fn approve_join_request<P: PoolProvider>(
     check_role_assignment_privilege(&current_user, id, &role, can_all, &mut pool_conn).await?;
 
     let mut repo = Organizations::new(&mut pool_conn);
-    let approved = repo.approve_join_request(id, request_id, &role).await?;
-    if !approved {
+    let Some(approved_user_id) = repo.approve_join_request(id, request_id, &role).await? else {
         return Err(Error::NotFound {
             resource: "Join request".to_string(),
             id: format!("{request_id} in organization {id}"),
         });
+    };
+
+    // Close the loop the intercept screen promised ("we'll let you know when
+    // you're approved"). Nothing else tells them: approval is a status flip
+    // with no channel back to a browser they closed days ago.
+    //
+    // Best-effort throughout. The membership is live whether or not the mail
+    // lands, and surfacing an error here would invite an admin to retry an
+    // approval that already succeeded.
+    let mut users_repo = Users::new(&mut pool_conn);
+    // Swallowing the error would leave the warning below saying only that the
+    // parties could not be loaded, with no hint that the database was the
+    // reason — the difference between "this user vanished" and "the pool is
+    // failing" is the whole diagnosis.
+    let mut load = async |who: &str, user_id: UserId| match users_repo.get_by_id(user_id).await {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(org_id = %id, "Failed to load the {who} for a join-approval notification: {e}");
+            None
+        }
+    };
+    let org_user = load("organization", id).await;
+    let approved_user = load("approved user", approved_user_id).await;
+
+    match (org_user, approved_user) {
+        (Some(org_user), Some(approved_user)) => {
+            let config = state.current_config();
+            let dashboard_link = config.dashboard_url.trim_end_matches('/').to_string();
+            let org_name = org_email_name(org_user.display_name.as_deref(), &org_user.username);
+
+            match EmailService::new(&config) {
+                Ok(email_service) => {
+                    if let Err(e) = email_service
+                        .send_org_join_approved_email(&approved_user.email, &org_name, &role, &dashboard_link)
+                        .await
+                    {
+                        tracing::warn!(org_id = %id, "Failed to send a join-approval notification: {e}");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(org_id = %id, "Email service unavailable, join-approval notification not sent: {e}");
+                }
+            }
+        }
+        _ => tracing::warn!(org_id = %id, "Approved a join request but could not load the parties to notify"),
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -2045,6 +2116,55 @@ pub async fn create_user_join_request<P: PoolProvider>(
         "pending" => DomainJoinOutcome::Invited,
         _ => DomainJoinOutcome::AlreadyMember,
     };
+
+    // Tell the people who can act on it. Best-effort, and deliberately after
+    // the write: the row is already committed, so failing the call over a mail
+    // error would report "nothing happened" to a user whose request is in fact
+    // filed and waiting. Only a fresh `requested` row is worth a mail — the
+    // other two outcomes mean nobody has a decision to make.
+    if outcome == DomainJoinOutcome::Requested {
+        let recipients = match org_repo.list_admin_emails(org.id).await {
+            Ok(emails) => emails,
+            Err(e) => {
+                tracing::warn!(org_id = %org.id, "Failed to list admins to notify of a join request: {e}");
+                Vec::new()
+            }
+        };
+
+        if recipients.is_empty() {
+            // `find_by_domain` only matches workspaces that still have a live
+            // owner or admin, so an empty list is the last one leaving between
+            // that read and this one — not an ordinary state. Worth saying out
+            // loud, because the requester has been told someone was notified.
+            tracing::warn!(
+                org_id = %org.id,
+                "Join request filed against a workspace with no active owner or admin to notify"
+            );
+        } else {
+            let config = state.current_config();
+            let requests_link = format!("{}/organization", config.dashboard_url.trim_end_matches('/'));
+            let org_name = org_email_name(org.display_name.as_deref(), &org.username);
+            let requester_name = person_email_name(target.display_name.as_deref(), &target.email);
+
+            match EmailService::new(&config) {
+                Ok(email_service) => {
+                    for recipient in &recipients {
+                        // Addresses stay out of the log line; the org id is
+                        // enough to find the workspace whose mail failed.
+                        if let Err(e) = email_service
+                            .send_org_join_request_email(recipient, &org_name, &requester_name, &target.email, &requests_link)
+                            .await
+                        {
+                            tracing::warn!(org_id = %org.id, "Failed to send a join-request notification: {e}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(org_id = %org.id, "Email service unavailable, join-request notification not sent: {e}");
+                }
+            }
+        }
+    }
 
     Ok(Json(DomainJoinResponse {
         outcome,
@@ -4203,6 +4323,81 @@ mod tests {
             .await;
         resp.assert_status_ok();
         assert_eq!(resp.json::<serde_json::Value>().as_array().unwrap().len(), 1);
+    }
+
+    /// Who gets told about a join request. Owners and admins can act on one;
+    /// plain members cannot, and a pending or requested row is not a person
+    /// with authority to approve anything.
+    #[sqlx::test]
+    async fn test_list_admin_emails_covers_only_those_who_can_decide(pool: PgPool) {
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let admin = create_test_user(&pool, Role::StandardUser).await;
+        let member = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, _request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+        repo.add_member(org_id, admin.id, "admin").await.unwrap();
+        repo.add_member(org_id, member.id, "member").await.unwrap();
+
+        let emails = repo.list_admin_emails(org_id).await.unwrap();
+
+        assert!(emails.contains(&owner.email), "the owner decides");
+        assert!(emails.contains(&admin.email), "admins decide");
+        assert!(!emails.contains(&member.email), "a plain member cannot approve");
+        assert!(
+            !emails.contains(&joiner.email),
+            "the requester is not notified of their own request"
+        );
+        assert_eq!(emails.len(), 2);
+    }
+
+    /// A soft-deleted owner keeps their `users` row and their membership, so
+    /// without the filter the workspace would keep mailing a closed account.
+    #[sqlx::test]
+    async fn test_list_admin_emails_skips_deleted_accounts(pool: PgPool) {
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let admin = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, _request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        crate::db::handlers::Organizations::new(&mut conn)
+            .add_member(org_id, admin.id, "admin")
+            .await
+            .unwrap();
+        // `delete` is the soft-delete on the `Repository` trait; the tests
+        // module doesn't `use super::*`, so bring it into scope here.
+        use crate::db::handlers::Repository as _;
+        crate::db::handlers::Users::new(&mut conn).delete(admin.id).await.unwrap();
+
+        let emails = crate::db::handlers::Organizations::new(&mut conn)
+            .list_admin_emails(org_id)
+            .await
+            .unwrap();
+
+        assert_eq!(emails, vec![owner.email], "only the live owner is left to tell");
+    }
+
+    /// The approval hands back who was approved, so exactly one caller can
+    /// mail them. A second, racing approval finds nothing to update and gets
+    /// `None` — otherwise every admin who pressed the button would send a
+    /// duplicate "you're in" email.
+    #[sqlx::test]
+    async fn test_approve_join_request_returns_the_approved_user_once(pool: PgPool) {
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let (org_id, request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+
+        let approved = repo.approve_join_request(org_id, request_id, "member").await.unwrap();
+        assert_eq!(approved, Some(joiner.id), "the caller learns who to tell");
+
+        let again = repo.approve_join_request(org_id, request_id, "member").await.unwrap();
+        assert_eq!(again, None, "a second approval has nobody new to notify");
     }
 
     #[sqlx::test]
