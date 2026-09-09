@@ -1,36 +1,64 @@
 -- Index terminal_at on the retained-response store.
 --
--- The trailing terminal-demand query (TRAILING_DEMAND_SQL, served to scouter
--- via /monitoring/demand) filters retained request objects by a trailing
--- terminal_at window. Partition pruning on delete_on limits WHICH daily
--- partitions are read, but inside an admitted partition no existing index
--- leads on terminal_at (they lead on created_at), so every row is filtered
--- one by one. While the admitted partitions were empty that was invisible; once
--- the retention mover landed a full day of terminals (~1.8M rows) into a
--- partition the window admits, the statement ran to its 60 s timeout on every
--- poll and scouter stopped scheduling (2026-09-08 22:42 UTC). In steady state
--- the current day's landing partition is always inside the window, so this is
--- structural, not a backfill transient.
+-- Trailing demand filters retained requests by state and terminal_at.
+-- Partition pruning on delete_on limits the daily partitions read, while
+-- (state, terminal_at) limits each admitted partition to the matching window.
+-- Existing indexes lead on created_at and cannot provide that range scan.
 --
--- (state, terminal_at) turns the filter into an index range: the query
--- constrains state to a single value ('completed' / 'failed') and terminal_at
--- to the window, so the scan visits only in-window rows.
---
--- PRODUCTION: the child indexes were built out of band with CREATE INDEX
--- CONCURRENTLY on 2026-09-09 and attached to a parent index of this exact name
--- and definition, so the statement below is a no-op there (IF NOT EXISTS). Do
--- not let this migration build the index against a live production parent:
--- CREATE INDEX on a partitioned table holds SHARE on the parent for the whole
--- build, which blocks the movers' inserts on every partition until it commits.
--- On fresh, development and forked databases the partitions are small and the
--- build is immediate. Partitions created later by
--- ensure_retained_response_partition() inherit it (LIKE ... INCLUDING ALL, then
--- ATTACH PARTITION).
+-- Populated installations must first run scripts/prepare_retained_terminal_index.sql
+-- to build concurrent child indexes and attach them. Startup validates that
+-- preparation is complete instead of silently accepting a same-name index or
+-- building every populated partition while blocking writes. Fresh empty
+-- databases can build immediately. Future partitions inherit the parent index.
 SET LOCAL lock_timeout = '5s';
 
-CREATE INDEX IF NOT EXISTS idx_retained_response_objects_state_terminal
-    ON retained_response_objects (state, terminal_at)
-    WHERE object_kind = 'request';
+DO $$
+DECLARE
+    parent_table regclass := to_regclass(format('%I.retained_response_objects', current_schema()));
+    parent_index regclass := to_regclass(format('%I.idx_retained_response_objects_state_terminal', current_schema()));
+    populated boolean;
+BEGIN
+    IF parent_index IS NULL THEN
+        EXECUTE format('LOCK TABLE %s IN SHARE MODE', parent_table);
+        -- Conservatively require preparation even for emptied heaps with dead
+        -- pages. Never scan old partitions while holding the SHARE lock.
+        SELECT EXISTS (
+            SELECT 1 FROM pg_partition_tree(parent_table) tree
+            WHERE tree.isleaf AND pg_relation_size(tree.relid) > 0
+        ) INTO populated;
+        IF populated THEN
+            RAISE EXCEPTION 'Prepare the retained terminal index with scripts/prepare_retained_terminal_index.sql before upgrading a populated database';
+        END IF;
+        EXECUTE format('CREATE INDEX idx_retained_response_objects_state_terminal ON %s (state, terminal_at) WHERE object_kind = ''request''', parent_table);
+        parent_index := to_regclass(format('%I.idx_retained_response_objects_state_terminal', current_schema()));
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_am am ON am.oid = c.relam
+        WHERE i.indexrelid = parent_index AND i.indrelid = parent_table
+          AND c.relkind = 'I' AND am.amname = 'btree'
+          AND i.indisvalid AND i.indisready AND NOT i.indisunique
+          AND i.indnkeyatts = 2 AND i.indnatts = 2
+          AND pg_get_indexdef(i.indexrelid, 1, true) = 'state'
+          AND pg_get_indexdef(i.indexrelid, 2, true) = 'terminal_at'
+          AND pg_get_expr(i.indpred, i.indrelid) = '(object_kind = ''request''::text)'
+    ) OR EXISTS (
+        SELECT 1 FROM pg_inherits heap
+        WHERE heap.inhparent = parent_table
+          AND NOT EXISTS (
+              SELECT 1 FROM pg_inherits attachment
+              JOIN pg_index child ON child.indexrelid = attachment.inhrelid
+              WHERE attachment.inhparent = parent_index
+                AND child.indrelid = heap.inhrelid
+                AND child.indisvalid AND child.indisready
+          )
+    ) THEN
+        RAISE EXCEPTION 'Retained terminal index is invalid, incomplete, or has the wrong definition; run scripts/prepare_retained_terminal_index.sql before upgrading';
+    END IF;
+END
+$$;
 
 COMMENT ON INDEX idx_retained_response_objects_state_terminal IS
 'Trailing terminal-demand window scans: (state, terminal_at) on retained request objects. Existing indexes lead on created_at; without this the demand query filters every row of each admitted daily partition.';

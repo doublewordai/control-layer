@@ -1,8 +1,145 @@
 use std::borrow::Cow;
 
 use fusillade_arsenal::MIGRATOR;
+use percent_encoding::percent_decode_str;
+use sqlx::ConnectOptions;
 
 const RETENTION_MIGRATION: i64 = 20260818000000;
+
+const TERMINAL_INDEX_MIGRATION: &str =
+    include_str!("../migrations/20260909000000_add_retained_response_terminal_index.up.sql");
+
+async fn terminal_index_fixture(pool: &sqlx::PgPool) {
+    sqlx::raw_sql(
+        "CREATE SCHEMA terminal_test;
+         SET search_path = terminal_test;
+         CREATE TABLE retained_response_objects (
+             delete_on date NOT NULL, object_kind text, state text, terminal_at timestamptz
+         ) PARTITION BY RANGE (delete_on);
+         CREATE TABLE existing_child PARTITION OF retained_response_objects
+             FOR VALUES FROM ('2026-09-09') TO ('2026-09-10');
+         INSERT INTO retained_response_objects VALUES ('2026-09-09', 'request', 'completed', now());",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn run_terminal_migration(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+    let mut transaction = pool.begin().await?;
+    sqlx::query("SET LOCAL search_path = terminal_test")
+        .execute(&mut *transaction)
+        .await?;
+    sqlx::raw_sql(TERMINAL_INDEX_MIGRATION)
+        .execute(&mut *transaction)
+        .await?;
+    transaction.commit().await
+}
+
+#[sqlx::test(migrations = false)]
+async fn terminal_index_startup_rejects_unprepared_populated_and_incomplete_parent(
+    pool: sqlx::PgPool,
+) {
+    terminal_index_fixture(&pool).await;
+    let error = run_terminal_migration(&pool).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("before upgrading a populated database")
+    );
+    sqlx::query("CREATE INDEX idx_retained_response_objects_state_terminal ON ONLY terminal_test.retained_response_objects (state, terminal_at) WHERE object_kind = 'request'")
+        .execute(&pool).await.unwrap();
+    let error = run_terminal_migration(&pool).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("invalid, incomplete, or has the wrong definition")
+    );
+}
+
+#[sqlx::test(migrations = false)]
+async fn terminal_index_preparation_adopts_children_and_is_rerunnable(pool: sqlx::PgPool) {
+    terminal_index_fixture(&pool).await;
+    sqlx::query("CREATE INDEX CONCURRENTLY previously_built ON terminal_test.existing_child (state, terminal_at) WHERE object_kind = 'request'")
+        .execute(&pool).await.unwrap();
+    let old_oid: i64 =
+        sqlx::query_scalar("SELECT 'terminal_test.previously_built'::regclass::oid::bigint")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    // A second child must be built concurrently by the preparation itself.
+    sqlx::query("CREATE TABLE terminal_test.unindexed_child PARTITION OF terminal_test.retained_response_objects FOR VALUES FROM ('2026-09-10') TO ('2026-09-11')")
+        .execute(&pool).await.unwrap();
+    for _ in 0..2 {
+        let mut database_url = pool.connect_options().to_url_lossy();
+        let password = percent_decode_str(database_url.password().unwrap_or_default())
+            .decode_utf8()
+            .expect("SQLx passwords are UTF-8")
+            .into_owned();
+        database_url.set_password(None).unwrap();
+        // SQLx adds its own tuning parameters, which libpq does not accept.
+        let libpq_options: Vec<(String, String)> = database_url
+            .query_pairs()
+            .filter(|(key, _)| {
+                matches!(
+                    key.as_ref(),
+                    "sslmode"
+                        | "sslrootcert"
+                        | "sslcert"
+                        | "sslkey"
+                        | "options"
+                        | "application_name"
+                )
+            })
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect();
+        database_url.set_query(None);
+        database_url.query_pairs_mut().extend_pairs(libpq_options);
+        let output = tokio::process::Command::new("psql")
+            .env("PGPASSWORD", password)
+            .args(["--dbname", database_url.as_str()])
+            .args(["-X", "-v", "schema=terminal_test", "-f"])
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../scripts/prepare_retained_terminal_index.sql"
+            ))
+            .output()
+            .await
+            .expect("psql must be installed for migration preparation tests");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    run_terminal_migration(&pool).await.unwrap();
+    let adopted: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_inherits WHERE inhrelid = $1::bigint::oid AND inhparent = 'terminal_test.idx_retained_response_objects_state_terminal'::regclass)")
+        .bind(old_oid).fetch_one(&pool).await.unwrap();
+    assert!(
+        adopted,
+        "pre-existing child must be attached without rebuilding"
+    );
+    sqlx::query("CREATE TABLE terminal_test.future_child PARTITION OF terminal_test.retained_response_objects FOR VALUES FROM ('2026-09-11') TO ('2026-09-12')")
+        .execute(&pool).await.unwrap();
+    run_terminal_migration(&pool).await.unwrap();
+    let attached: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_inherits WHERE inhparent = 'terminal_test.idx_retained_response_objects_state_terminal'::regclass")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(attached, 3);
+}
+
+#[sqlx::test(migrations = false)]
+async fn terminal_index_startup_rejects_wrong_definition(pool: sqlx::PgPool) {
+    terminal_index_fixture(&pool).await;
+    sqlx::query("CREATE INDEX idx_retained_response_objects_state_terminal ON terminal_test.retained_response_objects (terminal_at, state) WHERE object_kind = 'request'")
+        .execute(&pool).await.unwrap();
+    assert!(
+        run_terminal_migration(&pool)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("wrong definition")
+    );
+}
 
 /// The trailing-demand query filters retained request objects by a
 /// terminal_at window; the (state, terminal_at) index must exist on the

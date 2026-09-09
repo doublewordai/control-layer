@@ -1563,6 +1563,9 @@ pub(crate) async fn count_owner_flex_requests_since<P: PoolProvider>(
 }
 
 pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
+    WITH live_request_ids AS MATERIALIZED (
+        SELECT id FROM requests WHERE created_by IS NOT NULL
+    )
     SELECT model, service_tier, outcome, SUM(count)::BIGINT AS count
     FROM (
     SELECT
@@ -1633,6 +1636,9 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
     FROM retained_response_objects retained
     WHERE retained.object_kind = 'request'
       AND retained.state = 'completed'
+      -- Both identity columns are NOT NULL; NOT IN permits a hashed subplan
+      -- even when stale statistics underestimate the live identity count.
+      AND retained.object_id NOT IN (SELECT id FROM live_request_ids)
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
       -- Partition-prune bounds. Sweep-landed rows satisfy
@@ -1651,13 +1657,9 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       -- the same catalog identity checks every retained read applies:
       -- retiring/retired buckets and any partition that no longer matches
       -- its registered identity contribute nothing. This is a count, so the
-      -- per-row route joins and the live anti-join the point/list readers
-      -- carry are deliberately absent: a move deletes the live row and
-      -- inserts the retained object in one transaction, so a request is
-      -- never visible on both sides, and route rows exist for every object
-      -- of an active bucket. With the mover keeping up, a trailing hour is
-      -- ~150k retained rows; three index probes per row put the previous
-      -- shape past the 60s statement timeout (2026-09-09).
+      -- route rows are unnecessary. Live identities are materialized once
+      -- above to preserve live-preferred reads even during repair overlaps,
+      -- without probing the broad user index for each retained object.
       AND retained.delete_on IN (
           SELECT bucket.delete_on
           FROM retained_response_buckets bucket
@@ -1705,6 +1707,7 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
     FROM retained_response_objects retained
     WHERE retained.object_kind = 'request'
       AND retained.state = 'failed'
+      AND retained.object_id NOT IN (SELECT id FROM live_request_ids)
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
       -- Partition-prune bounds. Sweep-landed rows satisfy
@@ -1723,13 +1726,9 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       -- the same catalog identity checks every retained read applies:
       -- retiring/retired buckets and any partition that no longer matches
       -- its registered identity contribute nothing. This is a count, so the
-      -- per-row route joins and the live anti-join the point/list readers
-      -- carry are deliberately absent: a move deletes the live row and
-      -- inserts the retained object in one transaction, so a request is
-      -- never visible on both sides, and route rows exist for every object
-      -- of an active bucket. With the mover keeping up, a trailing hour is
-      -- ~150k retained rows; three index probes per row put the previous
-      -- shape past the 60s statement timeout (2026-09-09).
+      -- route rows are unnecessary. Live identities are materialized once
+      -- above to preserve live-preferred reads even during repair overlaps,
+      -- without probing the broad user index for each retained object.
       AND retained.delete_on IN (
           SELECT bucket.delete_on
           FROM retained_response_buckets bucket
