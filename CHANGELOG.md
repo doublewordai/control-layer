@@ -1,5 +1,19 @@
 # Changelog
 
+## [11.6.2](https://github.com/doublewordai/control-layer/compare/v11.6.1...v11.6.2) (2026-09-09)
+
+
+### Bug Fixes
+
+* add index for finalizer sweep ([#1728](https://github.com/doublewordai/control-layer/issues/1728)) ([a983682](https://github.com/doublewordai/control-layer/commit/a98368203a929e647199a6a94385116247214050))
+
+## [11.6.1](https://github.com/doublewordai/control-layer/compare/v11.6.0...v11.6.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* keep the trailing-demand retained arms under the statement timeout ([#1723](https://github.com/doublewordai/control-layer/issues/1723)) ([c4390d3](https://github.com/doublewordai/control-layer/commit/c4390d3d5fd226b912bc374037f3bc953123436c))
+
 ## [11.6.0](https://github.com/doublewordai/control-layer/compare/v11.5.2...v11.6.0) (2026-09-08)
 
 
