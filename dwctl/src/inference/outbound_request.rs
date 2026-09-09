@@ -77,6 +77,18 @@ pub const STREAM_MARKER_KEY: &str = "stream";
 /// The header [`STREAM_MARKER_KEY`] arrives as.
 pub const STREAM_MARKER_HEADER: &str = "x-fusillade-batch-stream";
 
+/// `batch_metadata` key the daemon's dispatch sets on EVERY dispatch, so the
+/// edge can tell a daemon loopback from a client's own request where that
+/// matters (today: whether a `dw-img://` image token in the body may be
+/// signed — tokens are an internal representation that only enqueue / file
+/// ingest place in a body, never a client). Same trust argument as
+/// [`STREAM_MARKER_KEY`]: the ingress strips every `x-fusillade-*` header from
+/// external requests.
+pub const DISPATCH_MARKER_KEY: &str = "dispatch";
+
+/// The header [`DISPATCH_MARKER_KEY`] arrives as.
+pub const DISPATCH_MARKER_HEADER: &str = "x-fusillade-batch-dispatch";
+
 impl StreamTimeouts {
     /// Read the budgets from the daemon's configuration.
     ///

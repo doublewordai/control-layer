@@ -55,13 +55,13 @@ struct WriteSignalingPools {
 }
 
 impl PoolProvider for WriteSignalingPools {
-    fn read(&self) -> &PgPool {
-        &self.read
+    fn read(&self) -> sqlx_pool_router::PoolHandle {
+        self.read.clone().into()
     }
 
-    fn write(&self) -> &PgPool {
+    fn write(&self) -> sqlx_pool_router::PoolHandle {
         self.write_requested.store(true, Ordering::Release);
-        &self.write
+        self.write.clone().into()
     }
 }
 
@@ -4694,6 +4694,70 @@ async fn read_mixed_live_and_retained_rows_do_not_double_count_or_split_demand(p
     assert_eq!(after_list.data.len(), 2);
     assert_eq!(after_flex, 2);
     assert_eq!(after_trailing, before_trailing);
+}
+
+#[sqlx::test]
+async fn trailing_live_identity_suppresses_retained_even_outside_filters(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let request_manager = manager(&pool).await;
+    for state in [TerminalState::Completed, TerminalState::Failed] {
+        let graph = singleton(
+            &pool,
+            "flex",
+            state,
+            timestamp("2026-08-01T10:00:00Z"),
+            "overlap-filter",
+        )
+        .await;
+        archive(&request_manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+            .await
+            .unwrap();
+        let windows = [("retained".to_owned(), -31_536_000, 0)];
+        let models = [MODEL.to_owned()];
+        let filter = ServiceTierFilter::Include(vec![Some("flex".to_owned())]);
+        let before = request_manager
+            .get_completed_request_counts_by_model_and_window(&windows, &models, &filter)
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].count, 1);
+        // A pending live row with a different model and tier still owns this
+        // identity. Filtering the live-ID set by demand would leak its archive.
+        sqlx::query("INSERT INTO requests (id, model, service_tier, created_by) VALUES ($1, 'other-model', 'background', $2)")
+            .bind(graph.request_ids[0]).bind(OWNER).execute(&pool).await.unwrap();
+        let suppressed = request_manager
+            .get_completed_request_counts_by_model_and_window(&windows, &models, &filter)
+            .await
+            .unwrap();
+        assert!(suppressed.is_empty());
+
+        // An unattributed batched live identity does not suppress the retained
+        // owner-visible identity: preserve the existing created_by boundary.
+        let batch_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO batches (expires_at) VALUES (now() + interval '1 day') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE requests SET created_by = NULL, batch_id = $2 WHERE id = $1")
+            .bind(graph.request_ids[0])
+            .bind(batch_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let unattributed = request_manager
+            .get_completed_request_counts_by_model_and_window(&windows, &models, &filter)
+            .await
+            .unwrap();
+        assert_eq!(unattributed, before);
+        // Fence this iteration's archive so the next outcome is independent.
+        sqlx::query("DELETE FROM retained_response_objects WHERE group_id = $1")
+            .bind(graph.group_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 }
 
 async fn assert_graph_reads_not_found(

@@ -9,8 +9,9 @@
 //! prompt-cache layer — is deliberate: the cache hashes the stable
 //! content-addressed token, not the per-attempt signed URL, so a
 //! byte-identical image keeps a prefix chain intact across calls. A token
-//! is only signed for a caller whose user or organization submitted the
-//! image (`image_access`); anyone else gets a 403.
+//! is only signed on a marked daemon dispatch, and only for a caller whose
+//! user or organization submitted the image (`image_access`); a client
+//! presenting a token directly, or anyone else's token, gets a 403.
 //!
 //! Pattern: read the body once via `axum::body::to_bytes`, mutate the JSON
 //! in place, restore the body via `Body::from(...)`.
@@ -84,7 +85,7 @@ pub struct ImageNormalizerMiddlewareState {
     /// bearer-token API key for `image_access` bookkeeping, and (b) by the
     /// per-user-mode lookup once the opt-in flag is wired through.
     /// `None` disables both (useful in tests).
-    pub pool: Option<PgPool>,
+    pub pool: Option<sqlx_pool_router::DynPools>,
 }
 
 /// Extract the Bearer token from `Authorization`, case-insensitive.
@@ -158,9 +159,21 @@ pub async fn image_normalizer_middleware(
     // the request. For `dw-img://` tokens it is the authorisation: a token is
     // signed only for the user/org that submitted the image.
     let attribution_for_access = match (state.pool.as_ref(), extract_bearer_token(&request)) {
-        (Some(pool), Some(bearer)) => crate::api::handlers::images::resolve_image_attribution(pool, &bearer).await,
+        (Some(pool), Some(bearer)) => crate::api::handlers::images::resolve_image_attribution(&pool.write(), &bearer).await,
         _ => None,
     };
+
+    // Tokens are an internal representation (what flex enqueue / file ingest
+    // store), so they are only ever legitimate on a daemon dispatch loopback,
+    // which the daemon marks. A client presenting a token directly is refused —
+    // even its own — rather than opening an unreviewed token-reuse surface.
+    // The marker is trustworthy for the same reason the stream marker is: the
+    // ingress strips every `x-fusillade-*` header from external requests.
+    let is_daemon_dispatch = request
+        .headers()
+        .get(crate::inference::outbound_request::DISPATCH_MARKER_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some("1");
 
     let normalizer = state.normalizer.clone();
     let realtime_ttl = state.realtime_ttl;
@@ -172,17 +185,22 @@ pub async fn image_normalizer_middleware(
         let is_data_uri = url.starts_with("data:");
         async move {
             // `dw-img://` token: sign it (no ingest — the bytes are already in
-            // the store) for the principal that owns the image. Unattributable
-            // callers (no pool, unknown key) are refused rather than trusted:
+            // the store), but only on a daemon dispatch AND only for the
+            // principal that owns the image (`image_access`: the submitting
+            // user, or anyone acting in the organization it was submitted
+            // under). Unattributable callers are refused rather than trusted:
             // a token names bytes, and signing it hands out a URL to them.
             if ImageToken::looks_like_token(&url) {
+                if !is_daemon_dispatch {
+                    return Err(NormalizeError::Forbidden);
+                }
                 let token: ImageToken = url
                     .parse()
                     .map_err(|e: TokenParseError| NormalizeError::BadInput(format!("invalid dw-img token: {e}")))?;
                 let (Some(pool), Some(attribution)) = (pool_for_access.as_ref(), attribution_for_access) else {
                     return Err(NormalizeError::Forbidden);
                 };
-                match crate::api::handlers::images::is_token_accessible(pool, &attribution, token).await {
+                match crate::api::handlers::images::is_token_accessible(&pool.write(), &attribution, token).await {
                     Ok(true) => {}
                     Ok(false) => return Err(NormalizeError::Forbidden),
                     Err(e) => return Err(NormalizeError::Transient(format!("image access lookup failed: {e}"))),
@@ -214,7 +232,7 @@ pub async fn image_normalizer_middleware(
                 let bytes_len = ingested.bytes_len;
                 let token = ingested.token;
                 tokio::spawn(async move {
-                    crate::api::handlers::images::record_image_access(&pool, attribution, token, &mime, bytes_len).await;
+                    crate::api::handlers::images::record_image_access(&pool.write(), attribution, token, &mime, bytes_len).await;
                 });
             }
             Ok::<String, NormalizeError>(signed.url)
@@ -584,13 +602,19 @@ mod tests {
 
     // ---- `dw-img://` token signing (the daemon loopback path) ----
 
-    async fn post_json_as(router: Router, bearer: Option<&str>, body: Value) -> (StatusCode, Value) {
+    /// Post as a caller, optionally carrying the daemon's dispatch marker
+    /// (what a flex/batch loopback carries; the ingress strips it from
+    /// external requests).
+    async fn post_json_as(router: Router, bearer: Option<&str>, daemon_dispatch: bool, body: Value) -> (StatusCode, Value) {
         let mut req = Request::builder()
             .method(Method::POST)
             .uri("/chat/completions")
             .header("content-type", "application/json");
         if let Some(b) = bearer {
             req = req.header("authorization", format!("Bearer {b}"));
+        }
+        if daemon_dispatch {
+            req = req.header(crate::inference::outbound_request::DISPATCH_MARKER_HEADER, "1");
         }
         let resp = router
             .oneshot(req.body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap())
@@ -609,6 +633,40 @@ mod tests {
                 { "type": "image_url", "image_url": { "url": token.to_dw_img_uri() } }
             ]}]
         })
+    }
+
+    fn state_with_pool(pool: &sqlx::PgPool) -> ImageNormalizerMiddlewareState {
+        let mut state = state_for_tests();
+        state.pool = Some(sqlx_pool_router::DynPools::new(pool.clone()));
+        state
+    }
+
+    /// An org-scoped API key: `user_id` = the org (the billing principal),
+    /// `created_by` = the acting member — the same shape as the hidden batch
+    /// key the daemon dispatches with.
+    async fn create_org_key_for_member(pool: &sqlx::PgPool, org: crate::types::UserId, member: crate::types::UserId) -> String {
+        use crate::api::models::api_keys::ApiKeyCreate;
+        use crate::db::handlers::api_keys::ApiKeys;
+        use crate::db::handlers::repository::Repository;
+        use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose};
+
+        let mut conn = pool.acquire().await.expect("acquire");
+        let mut repo = ApiKeys::new(&mut conn);
+        let request = ApiKeyCreateDBRequest::new(
+            org,
+            member,
+            ApiKeyCreate {
+                name: format!("org key {}", uuid::Uuid::new_v4().simple()),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: None,
+                burst_size: None,
+                member_id: None,
+                spend_limit: None,
+                spend_limit_interval: None,
+            },
+        );
+        repo.create(&request).await.expect("create org key").secret
     }
 
     /// Ingest an image the way flex enqueue does (bytes into the store, an
@@ -630,21 +688,20 @@ mod tests {
         ingested.token
     }
 
-    /// The fix for flex prompt caching with images: a loopback body carrying
+    /// The fix for flex prompt caching with images: a daemon loopback carrying
     /// the token that enqueue stored gets a signed URL from THIS layer (below
     /// the prompt cache), for the principal that submitted the image.
     #[sqlx::test]
-    async fn signs_a_token_for_the_principal_that_submitted_the_image(pool: sqlx::PgPool) {
+    async fn signs_a_token_on_a_dispatch_for_the_principal_that_submitted_the_image(pool: sqlx::PgPool) {
         use crate::api::models::users::Role;
         use crate::test::utils::{create_test_api_key_for_user, create_test_user};
 
         let user = create_test_user(&pool, Role::StandardUser).await;
         let key = create_test_api_key_for_user(&pool, user.id).await;
-        let mut state = state_for_tests();
-        state.pool = Some(pool.clone());
+        let state = state_with_pool(&pool);
         let token = ingest_for_key(&pool, &state, &key.secret).await;
 
-        let (status, echoed) = post_json_as(build_router(state), Some(&key.secret), body_with_token(token)).await;
+        let (status, echoed) = post_json_as(build_router(state), Some(&key.secret), true, body_with_token(token)).await;
 
         assert_eq!(status, StatusCode::OK, "{echoed}");
         let url = echoed["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap();
@@ -654,6 +711,31 @@ mod tests {
         );
         // The text block is untouched: only image inputs are rewritten.
         assert_eq!(echoed["messages"][0]["content"][0]["text"], "what is this?");
+    }
+
+    /// Ownership is by principal, not by human: an image submitted under an
+    /// organization key by one member is accessible to a dispatch under any
+    /// key of that organization — which is exactly the hidden batch key's
+    /// shape (`user_id` = org, `created_by` = whichever member created it).
+    #[sqlx::test]
+    async fn signs_a_token_for_another_member_of_the_submitting_organization(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::{add_org_member, create_test_org, create_test_user};
+
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, alice.id).await;
+        add_org_member(&pool, org.id, bob.id, "member").await;
+        let alice_org_key = create_org_key_for_member(&pool, org.id, alice.id).await;
+        let bob_org_key = create_org_key_for_member(&pool, org.id, bob.id).await;
+        let state = state_with_pool(&pool);
+        let token = ingest_for_key(&pool, &state, &alice_org_key).await;
+
+        let (status, echoed) = post_json_as(build_router(state), Some(&bob_org_key), true, body_with_token(token)).await;
+
+        assert_eq!(status, StatusCode::OK, "{echoed}");
+        let url = echoed["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap();
+        assert!(url.contains(&token.to_hex()), "{url}");
     }
 
     /// A token names bytes; signing it hands out a URL to them. A different
@@ -667,11 +749,28 @@ mod tests {
         let owner_key = create_test_api_key_for_user(&pool, owner.id).await;
         let other = create_test_user(&pool, Role::StandardUser).await;
         let other_key = create_test_api_key_for_user(&pool, other.id).await;
-        let mut state = state_for_tests();
-        state.pool = Some(pool.clone());
+        let state = state_with_pool(&pool);
         let token = ingest_for_key(&pool, &state, &owner_key.secret).await;
 
-        let (status, body) = post_json_as(build_router(state), Some(&other_key.secret), body_with_token(token)).await;
+        let (status, body) = post_json_as(build_router(state), Some(&other_key.secret), true, body_with_token(token)).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"]["code"], "image_token_forbidden");
+    }
+
+    /// Tokens are internal: a client presenting one directly — even its own —
+    /// is refused. Only a marked daemon dispatch may have tokens signed.
+    #[sqlx::test]
+    async fn refuses_a_token_outside_a_daemon_dispatch(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::{create_test_api_key_for_user, create_test_user};
+
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_key = create_test_api_key_for_user(&pool, owner.id).await;
+        let state = state_with_pool(&pool);
+        let token = ingest_for_key(&pool, &state, &owner_key.secret).await;
+
+        let (status, body) = post_json_as(build_router(state), Some(&owner_key.secret), false, body_with_token(token)).await;
 
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(body["error"]["code"], "image_token_forbidden");
@@ -686,11 +785,10 @@ mod tests {
 
         let owner = create_test_user(&pool, Role::StandardUser).await;
         let owner_key = create_test_api_key_for_user(&pool, owner.id).await;
-        let mut state = state_for_tests();
-        state.pool = Some(pool.clone());
+        let state = state_with_pool(&pool);
         let token = ingest_for_key(&pool, &state, &owner_key.secret).await;
 
-        let (status, body) = post_json_as(build_router(state), None, body_with_token(token)).await;
+        let (status, body) = post_json_as(build_router(state), None, true, body_with_token(token)).await;
 
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     }

@@ -234,6 +234,15 @@ where
                 .insert(crate::inference::outbound_request::STREAM_MARKER_KEY.to_string(), "1".to_string());
         }
 
+        // Mark every dispatch as such. The edge image-normaliser layer signs
+        // `dw-img://` tokens only on a marked dispatch (and only for the owning
+        // principal): tokens are what enqueue / file ingest store, so a client
+        // presenting one directly is refused rather than served.
+        request
+            .data
+            .batch_metadata
+            .insert(crate::inference::outbound_request::DISPATCH_MARKER_KEY.to_string(), "1".to_string());
+
         // Everything dispatches through the default processor: the loopback
         // re-enters the full dwctl edge, which owns translation, id-scrub and the
         // streaming usage flags. No path-based branching here - the multi-step

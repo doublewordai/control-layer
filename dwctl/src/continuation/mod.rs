@@ -314,13 +314,13 @@ impl ContinuationRoutes {
     /// Spawn the refresh poller. A failed refresh keeps the previous set (a DB
     /// blip must not silently disable resume) and is reported through
     /// `background_error!` so it lands on the unified error metric.
-    pub fn spawn_poller(self: Arc<Self>, pool: PgPool) {
+    pub fn spawn_poller(self: Arc<Self>, pools: sqlx_pool_router::DynPools) {
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(ROUTE_REFRESH_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
-                if let Err(e) = self.refresh(&pool).await {
+                if let Err(e) = self.refresh(&pools.write()).await {
                     crate::background_error!(
                         component::CONTINUATION,
                         "route_refresh",
@@ -402,14 +402,15 @@ impl Drop for InflightGuard {
 /// bounds the cost of key probing.
 #[derive(Clone)]
 pub struct PurposeResolver {
-    pool: PgPool,
+    /// Live provider (not a pinned pool): survives runtime pool swaps.
+    pools: sqlx_pool_router::DynPools,
     l1: Cache<String, Option<ApiKeyPurpose>>,
 }
 
 impl PurposeResolver {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pools: impl sqlx_pool_router::PoolProvider) -> Self {
         Self {
-            pool,
+            pools: sqlx_pool_router::DynPools::new(pools),
             l1: Cache::builder()
                 .max_capacity(100_000)
                 .time_to_live(Duration::from_secs(3600))
@@ -426,7 +427,7 @@ impl PurposeResolver {
         // sail past a disabled batch gate for an hour. The failed request
         // still resolves to None (one-off misclassification, fail-open on the
         // origin gate only); the next request retries the lookup.
-        let Ok(mut conn) = self.pool.acquire().await else {
+        let Ok(mut conn) = self.pools.write().acquire().await else {
             return None;
         };
         let looked_up = ApiKeys::new(&mut conn).get_user_info_by_secret(token).await;

@@ -1,5 +1,36 @@
 # Changelog
 
+## [11.6.1](https://github.com/doublewordai/control-layer/compare/v11.6.0...v11.6.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* keep the trailing-demand retained arms under the statement timeout ([#1723](https://github.com/doublewordai/control-layer/issues/1723)) ([c4390d3](https://github.com/doublewordai/control-layer/commit/c4390d3d5fd226b912bc374037f3bc953123436c))
+
+## [11.6.0](https://github.com/doublewordai/control-layer/compare/v11.5.2...v11.6.0) (2026-09-08)
+
+
+### Features
+
+* **dwctl:** pooled and direct connection pools per database ([#1565](https://github.com/doublewordai/control-layer/issues/1565)) ([73a2080](https://github.com/doublewordai/control-layer/commit/73a20807dabf0229ca2d41dda8c8630999fd11e6))
+
+
+### Bug Fixes
+
+* soft-delete organization keys on user deletion ([#1488](https://github.com/doublewordai/control-layer/issues/1488)) ([6fc4078](https://github.com/doublewordai/control-layer/commit/6fc4078756fa8308c910eb189497ee56fe50d356))
+
+## [11.5.2](https://github.com/doublewordai/control-layer/compare/v11.5.1...v11.5.2) (2026-09-08)
+
+
+### Bug Fixes
+
+* **organizations:** close the domain-claim hijack and the ownerless-workspace gap ([#1698](https://github.com/doublewordai/control-layer/issues/1698)) ([bd84908](https://github.com/doublewordai/control-layer/commit/bd84908fc435bc5ed90d6d09c707a5ba9985ef35))
+
+
+### Continuous Integration
+
+* bump versions for perf, refactor and other commit types ([#1717](https://github.com/doublewordai/control-layer/issues/1717)) ([f3d90bc](https://github.com/doublewordai/control-layer/commit/f3d90bc14fd40bfff433a3de09e2c8954e03746f))
+
 ## [11.5.1](https://github.com/doublewordai/control-layer/compare/v11.5.0...v11.5.1) (2026-09-08)
 
 

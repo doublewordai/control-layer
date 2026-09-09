@@ -6,7 +6,6 @@
 use std::time::Duration;
 
 use metrics::gauge;
-use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
@@ -28,7 +27,9 @@ impl Default for PoolMetricsConfig {
 /// A named pool for metrics labeling
 pub struct LabeledPool {
     pub name: &'static str,
-    pub pool: PgPool,
+    /// Live provider: the sampler reads the *current* pool each tick, so a
+    /// runtime pool swap (connection-budget re-division) is reflected.
+    pub pool: sqlx_pool_router::DynPools,
 }
 
 /// Start the pool metrics sampler background task.
@@ -51,12 +52,6 @@ pub async fn run_pool_metrics_sampler(
         config.sample_interval
     );
 
-    // Record max connections once at startup (it doesn't change)
-    for labeled in &pools {
-        let max = labeled.pool.options().get_max_connections();
-        gauge!("dwctl_db_pool_connections_max", "pool" => labeled.name.to_string()).set(max as f64);
-    }
-
     let mut interval = tokio::time::interval(config.sample_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -68,9 +63,16 @@ pub async fn run_pool_metrics_sampler(
             }
             _ = interval.tick() => {
                 for labeled in &pools {
-                    let size = labeled.pool.size();
-                    let idle = labeled.pool.num_idle();
+                    // Re-read the pool each tick: the governor may have swapped
+                    // it for one with a different max since the last sample.
+                    let current = labeled.pool.write();
+                    let max = current.options().get_max_connections();
+                    let size = current.size();
+                    let idle = current.num_idle();
                     let in_use = size as usize - idle;
+
+                    gauge!("dwctl_db_pool_connections_max", "pool" => labeled.name.to_string())
+                        .set(max as f64);
 
                     gauge!("dwctl_db_pool_connections_total", "pool" => labeled.name.to_string())
                         .set(size as f64);
@@ -100,13 +102,13 @@ mod tests {
     use std::time::Duration;
 
     #[sqlx::test]
-    async fn test_pool_metrics_sampler_runs_and_shuts_down(pool: PgPool) {
+    async fn test_pool_metrics_sampler_runs_and_shuts_down(pool: sqlx::PgPool) {
         let shutdown = CancellationToken::new();
         let shutdown_clone = shutdown.clone();
 
         let pools = vec![LabeledPool {
             name: "test",
-            pool: pool.clone(),
+            pool: sqlx_pool_router::DynPools::new(pool.clone()),
         }];
 
         let config = PoolMetricsConfig {
