@@ -1270,13 +1270,17 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
             .collect();
 
         if !error_indices.is_empty() {
-            let fusillade_pool = state.request_manager.pool();
+            let mut transaction = state
+                .request_manager
+                .begin_write()
+                .await
+                .map_err(|e| ActivateError::Retryable(format!("begin invalid-request update: {e}")))?;
 
             let template_ids: Vec<Uuid> =
                 sqlx::query_scalar("SELECT id FROM fusillade.request_templates_all WHERE file_id = $1 AND line_number = ANY($2)")
                     .bind(input.file_id)
                     .bind(&error_indices)
-                    .fetch_all(&fusillade_pool)
+                    .fetch_all(&mut *transaction)
                     .await
                     .map_err(|e| ActivateError::Retryable(format!("query templates: {e}")))?;
 
@@ -1287,7 +1291,7 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
                 .bind("Request failed validation during ingestion — check sync entry for details")
                 .bind(batch_id)
                 .bind(&template_ids)
-                .execute(&fusillade_pool)
+                .execute(&mut *transaction)
                 .await
                 .map_err(|e| ActivateError::Retryable(format!("fail invalid requests: {e}")))?;
 
@@ -1297,6 +1301,10 @@ pub(crate) async fn run_activate_batch<P: PoolProvider + Clone + Send + Sync + '
                     "Failed invalid requests from tier 2 validation errors"
                 );
             }
+            transaction
+                .commit()
+                .await
+                .map_err(|e| ActivateError::Retryable(format!("commit invalid-request update: {e}")))?;
         }
     }
 
