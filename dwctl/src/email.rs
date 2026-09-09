@@ -10,6 +10,19 @@ use lettre::{
 use minijinja::{Environment, context, value::Value};
 use std::path::Path;
 
+/// The name every template is registered under.
+///
+/// The `.html` matters: minijinja picks its auto-escape mode from the
+/// template name's extension, and a bare `"email"` gets `AutoEscape::None` —
+/// every interpolated value lands raw. These bodies carry display names,
+/// organization names, batch filenames and email addresses, all of them free
+/// text somebody chose, so they must be escaped.
+///
+/// Server-generated URLs are the exception and are passed with
+/// `Value::from_safe_string`: escaping renders `/` as `&#x2f;`, which the
+/// anchor survives but the plain-text fallback line beneath it does not.
+const TEMPLATE_NAME: &str = "email.html";
+
 struct EmailTemplates {
     password_reset: String,
     batch_complete: String,
@@ -256,7 +269,7 @@ impl EmailService {
             &self.templates.batch_complete
         };
         let mut env = Environment::new();
-        env.add_template("email", template_src)?;
+        env.add_template(TEMPLATE_NAME, template_src)?;
 
         let (outcome_label, outcome_icon, header_color, outcome_message) = match info.outcome {
             BatchOutcome::Completed => ("Completed", "✓", "#16a34a", "Your batch has finished processing successfully."),
@@ -289,7 +302,7 @@ impl EmailService {
         let profile_link = format!("{base}/profile");
         let priority = if info.completion_window == "1h" { "Priority" } else { "Standard" };
 
-        env.get_template("email")?.render(context! {
+        env.get_template(TEMPLATE_NAME)?.render(context! {
             to_name,
             batch_id => &info.batch_id,
             model => &info.model,
@@ -304,8 +317,8 @@ impl EmailService {
             completed_requests => info.completed_requests,
             failed_requests => info.failed_requests,
             total_requests => info.total_requests,
-            dashboard_link,
-            profile_link,
+            dashboard_link => Value::from_safe_string(dashboard_link.to_string()),
+            profile_link => Value::from_safe_string(profile_link.to_string()),
             priority,
             completion_window => &info.completion_window,
             filename => info.filename.as_deref().unwrap_or(""),
@@ -317,11 +330,11 @@ impl EmailService {
 
     fn render_password_reset_body(&self, to_name: &str, reset_link: &str) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
-        env.add_template("email", &self.templates.password_reset)?;
+        env.add_template(TEMPLATE_NAME, &self.templates.password_reset)?;
 
-        env.get_template("email")?.render(context! {
+        env.get_template(TEMPLATE_NAME)?.render(context! {
             to_name,
-            reset_link,
+            reset_link => Value::from_safe_string(reset_link.to_string()),
         })
     }
 
@@ -341,17 +354,17 @@ impl EmailService {
 
     fn render_low_balance_body(&self, to_name: &str, balance: &rust_decimal::Decimal) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
-        env.add_template("email", &self.templates.low_balance)?;
+        env.add_template(TEMPLATE_NAME, &self.templates.low_balance)?;
 
         let base = self.base_url.trim_end_matches('/');
         let dashboard_link = format!("{base}/cost-management");
         let profile_link = format!("{base}/profile");
 
-        env.get_template("email")?.render(context! {
+        env.get_template(TEMPLATE_NAME)?.render(context! {
             to_name,
             balance => format!("{:.2}", balance),
-            dashboard_link,
-            profile_link,
+            dashboard_link => Value::from_safe_string(dashboard_link.to_string()),
+            profile_link => Value::from_safe_string(profile_link.to_string()),
             from_name => &self.from_name,
             reply_to => self.reply_to.as_deref().unwrap_or(&self.from_email),
         })
@@ -437,7 +450,7 @@ impl EmailService {
         let name = to_name.unwrap_or("User");
 
         let mut env = Environment::new();
-        env.add_template("email", &self.templates.auto_topup_limit_reached)
+        env.add_template(TEMPLATE_NAME, &self.templates.auto_topup_limit_reached)
             .map_err(|e| Error::Internal {
                 operation: format!("add email template: {e}"),
             })?;
@@ -447,7 +460,7 @@ impl EmailService {
         let profile_link = format!("{base}/profile");
 
         let body = env
-            .get_template("email")
+            .get_template(TEMPLATE_NAME)
             .map_err(|e| Error::Internal {
                 operation: format!("get email template: {e}"),
             })?
@@ -455,8 +468,8 @@ impl EmailService {
                 to_name => name,
                 monthly_limit => format!("{:.2}", monthly_limit),
                 balance => format!("{:.2}", balance),
-                dashboard_link,
-                profile_link,
+                dashboard_link => Value::from_safe_string(dashboard_link.to_string()),
+                profile_link => Value::from_safe_string(profile_link.to_string()),
             })
             .map_err(|e| Error::Internal {
                 operation: format!("render email template: {e}"),
@@ -474,19 +487,19 @@ impl EmailService {
         new_balance: Option<&rust_decimal::Decimal>,
     ) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
-        env.add_template("email", template)?;
+        env.add_template(TEMPLATE_NAME, template)?;
 
         let base = self.base_url.trim_end_matches('/');
         let dashboard_link = format!("{base}/cost-management");
         let profile_link = format!("{base}/profile");
 
-        env.get_template("email")?.render(context! {
+        env.get_template(TEMPLATE_NAME)?.render(context! {
             to_name,
             amount => format!("{:.2}", amount),
             threshold => format!("{:.2}", threshold),
             new_balance => new_balance.map(|b| format!("{:.2}", b)).unwrap_or_default(),
-            dashboard_link,
-            profile_link,
+            dashboard_link => Value::from_safe_string(dashboard_link.to_string()),
+            profile_link => Value::from_safe_string(profile_link.to_string()),
         })
     }
 
@@ -560,13 +573,13 @@ impl EmailService {
         invite_link: &str,
     ) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
-        env.add_template("email", &self.templates.org_invite)?;
+        env.add_template(TEMPLATE_NAME, &self.templates.org_invite)?;
 
-        env.get_template("email")?.render(context! {
+        env.get_template(TEMPLATE_NAME)?.render(context! {
             org_name,
             inviter_name,
             role,
-            invite_link,
+            invite_link => Value::from_safe_string(invite_link.to_string()),
         })
     }
 
@@ -647,14 +660,9 @@ impl EmailService {
         requests_link: &str,
     ) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
-        // Registered under an `.html` name on purpose: minijinja picks its
-        // auto-escape mode from the template name's extension, and a bare
-        // "email" gets `AutoEscape::None`. These bodies interpolate a
-        // display name and address chosen by someone who is not yet a member
-        // of the workspace, so they must be escaped.
-        env.add_template("email.html", &self.templates.org_join_request)?;
+        env.add_template(TEMPLATE_NAME, &self.templates.org_join_request)?;
 
-        env.get_template("email.html")?.render(context! {
+        env.get_template(TEMPLATE_NAME)?.render(context! {
             org_name,
             requester_name,
             requester_email,
@@ -668,14 +676,9 @@ impl EmailService {
 
     fn render_org_join_approved_body(&self, org_name: &str, role: &str, dashboard_link: &str) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
-        // Registered under an `.html` name on purpose: minijinja picks its
-        // auto-escape mode from the template name's extension, and a bare
-        // "email" gets `AutoEscape::None`. These bodies interpolate a
-        // display name and address chosen by someone who is not yet a member
-        // of the workspace, so they must be escaped.
-        env.add_template("email.html", &self.templates.org_join_approved)?;
+        env.add_template(TEMPLATE_NAME, &self.templates.org_join_approved)?;
 
-        env.get_template("email.html")?.render(context! {
+        env.get_template(TEMPLATE_NAME)?.render(context! {
             org_name,
             role,
             // Config-derived, not user input — see `render_org_join_request_body`.
@@ -720,11 +723,11 @@ impl EmailService {
 
     fn render_org_email_change_verify_new_body(&self, org_name: &str, confirm_link: &str) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
-        env.add_template("email", &self.templates.org_email_change_verify_new)?;
+        env.add_template(TEMPLATE_NAME, &self.templates.org_email_change_verify_new)?;
 
-        env.get_template("email")?.render(context! {
+        env.get_template(TEMPLATE_NAME)?.render(context! {
             org_name,
-            confirm_link,
+            confirm_link => Value::from_safe_string(confirm_link.to_string()),
         })
     }
 
@@ -736,12 +739,12 @@ impl EmailService {
         support_email: Option<&str>,
     ) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
-        env.add_template("email", &self.templates.org_email_change_verify_old)?;
+        env.add_template(TEMPLATE_NAME, &self.templates.org_email_change_verify_old)?;
 
-        env.get_template("email")?.render(context! {
+        env.get_template(TEMPLATE_NAME)?.render(context! {
             org_name,
             new_email,
-            confirm_link,
+            confirm_link => Value::from_safe_string(confirm_link.to_string()),
             support_email,
         })
     }
@@ -751,6 +754,21 @@ impl EmailService {
 mod tests {
     use super::*;
     use crate::test::utils::create_test_config;
+
+    /// What an email client shows, from what we put on the wire.
+    ///
+    /// Bodies are HTML-escaped, so a value like `/v1/chat/completions` ships
+    /// as `&#x2f;v1&#x2f;chat&#x2f;completions` and renders back to the
+    /// original. Assertions about what the reader sees go through here;
+    /// assertions about escaping deliberately do not.
+    fn as_rendered(body: &str) -> String {
+        body.replace("&#x2f;", "/")
+            .replace("&quot;", "\"")
+            .replace("&#x27;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&")
+    }
 
     fn test_info(
         outcome: BatchOutcome,
@@ -843,7 +861,7 @@ mod tests {
             Some("Weekly report generation"),
         );
 
-        let body = email_service.render_batch_completion_body("Alice".into(), &info, false).unwrap();
+        let body = as_rendered(&email_service.render_batch_completion_body("Alice".into(), &info, false).unwrap());
 
         assert!(body.contains("Hi Alice,"));
         assert!(body.contains("Completed"));
@@ -1082,6 +1100,31 @@ mod tests {
         assert!(body.contains("Acme"));
         assert!(body.contains("member"));
         assert!(body.contains("http://localhost:3001"));
+    }
+
+    /// The invite email is the sharpest edge of this class: `invite_member`
+    /// sends to an arbitrary address, and both the organization name and the
+    /// inviter name are free text the sender chose. Unescaped, that is a way
+    /// to have Doubleword deliver attacker-authored markup, from its own
+    /// sending domain, to somebody who never signed up.
+    #[tokio::test]
+    async fn test_org_invite_body_escapes_the_sender_controlled_names() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let body = email_service
+            .render_org_invite_body(
+                "<b>Acme</b>",
+                "<script>alert(1)</script>",
+                "member",
+                "http://localhost:3001/org-invite?token=abc",
+            )
+            .unwrap();
+
+        assert!(!body.contains("<script>"), "inviter name must not inject markup: {body}");
+        assert!(!body.contains("<b>Acme</b>"), "org name must not inject markup: {body}");
+        // The link still has to survive intact for the fallback line.
+        assert!(body.contains("http://localhost:3001/org-invite?token=abc"), "link mangled: {body}");
     }
 
     /// A join request is filed by someone who is NOT yet a member — an
