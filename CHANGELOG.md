@@ -1,5 +1,12 @@
 # Changelog
 
+## [11.6.3](https://github.com/doublewordai/control-layer/compare/v11.6.2...v11.6.3) (2026-09-09)
+
+
+### Bug Fixes
+
+* support scoped owners for pooled component connections ([#1721](https://github.com/doublewordai/control-layer/issues/1721)) ([1bd4127](https://github.com/doublewordai/control-layer/commit/1bd41270c6aac86f7af1deebd96139da8a2383d6))
+
 ## [11.6.2](https://github.com/doublewordai/control-layer/compare/v11.6.1...v11.6.2) (2026-09-09)
 
 
