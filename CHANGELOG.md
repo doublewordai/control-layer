@@ -1,5 +1,12 @@
 # Changelog
 
+## [11.6.1](https://github.com/doublewordai/control-layer/compare/v11.6.0...v11.6.1) (2026-09-09)
+
+
+### Bug Fixes
+
+* keep the trailing-demand retained arms under the statement timeout ([#1723](https://github.com/doublewordai/control-layer/issues/1723)) ([c4390d3](https://github.com/doublewordai/control-layer/commit/c4390d3d5fd226b912bc374037f3bc953123436c))
+
 ## [11.6.0](https://github.com/doublewordai/control-layer/compare/v11.5.2...v11.6.0) (2026-09-08)
 
 
