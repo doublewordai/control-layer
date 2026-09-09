@@ -743,7 +743,7 @@ mod tests {
         handle
     }
 
-    async fn create_active_probe(pool: &PgPool, name: &str) -> crate::db::models::probes::Probe {
+    async fn create_active_probe(pool: &sqlx::PgPool, name: &str) -> crate::db::models::probes::Probe {
         let deployment_id = setup_test_deployment(pool).await;
         ProbeManager::create_probe(
             pool,
@@ -766,7 +766,7 @@ mod tests {
     /// again. Without the prune, the stale handle keeps the probe in both the
     /// "active" and "running" sets, so neither set-difference acts on it.
     #[sqlx::test]
-    async fn test_sync_restarts_probe_with_finished_scheduler(pool: PgPool) {
+    async fn test_sync_restarts_probe_with_finished_scheduler(pool: sqlx::PgPool) {
         let probe = create_active_probe(&pool, "Finished-handle probe").await;
 
         let config = create_test_config();
@@ -799,7 +799,7 @@ mod tests {
     /// on a (re)activation notification instead of skipping it due to a stale
     /// handle.
     #[sqlx::test]
-    async fn test_is_scheduler_running_prunes_finished_scheduler(pool: PgPool) {
+    async fn test_is_scheduler_running_prunes_finished_scheduler(pool: sqlx::PgPool) {
         let probe = create_active_probe(&pool, "Finished-handle probe").await;
 
         let config = create_test_config();
@@ -824,7 +824,7 @@ mod tests {
     /// for a probe whose previous scheduler died, rather than skipping it
     /// because a stale finished handle is still keyed in the map.
     #[sqlx::test]
-    async fn test_handle_probe_change_restarts_finished_scheduler(pool: PgPool) {
+    async fn test_handle_probe_change_restarts_finished_scheduler(pool: sqlx::PgPool) {
         let probe = create_active_probe(&pool, "Finished-handle probe").await;
 
         let config = create_test_config();
@@ -852,7 +852,7 @@ mod tests {
     /// When a probe is active and its scheduler is running, `sync_with_database`
     /// should leave it untouched (not pruned, not replaced).
     #[sqlx::test]
-    async fn test_sync_keeps_running_scheduler(pool: PgPool) {
+    async fn test_sync_keeps_running_scheduler(pool: sqlx::PgPool) {
         let _probe = create_active_probe(&pool, "Live probe").await;
 
         let config = create_test_config();
@@ -879,7 +879,7 @@ mod tests {
     /// The finished handle is pruned; since the probe is absent from active IDs,
     /// no restart occurs and the map ends empty.
     #[sqlx::test]
-    async fn test_sync_prunes_finished_and_does_not_restart_deleted(pool: PgPool) {
+    async fn test_sync_prunes_finished_and_does_not_restart_deleted(pool: sqlx::PgPool) {
         let probe = create_active_probe(&pool, "Deleted probe").await;
 
         let config = create_test_config();
