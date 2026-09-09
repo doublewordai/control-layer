@@ -67,6 +67,15 @@ fn content(id: &str, text: &str) -> Chunk {
     }))
 }
 
+/// The message-opening preamble MOST providers send first — but not all: the
+/// plat capture serves content first and attaches the role to a later frame.
+fn role_preamble(id: &str) -> Chunk {
+    frame(json!({
+        "id": id, "object": "chat.completion.chunk", "created": 1_700_000_000, "model": MODEL,
+        "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]
+    }))
+}
+
 fn leg_text(text: &str, finish: Option<&str>) -> Chunk {
     frame(json!({
         "id": "cmpl-leg", "object": "text_completion", "created": 1_800_000_000, "model": "continuation-composite",
@@ -327,6 +336,102 @@ async fn a_cut_stream_is_resumed_into_one_seamless_response(pool: PgPool) {
         usage.get("prompt_tokens_details").is_none(),
         "the leg's own cache accounting describes the re-prefill, not the customer's request"
     );
+}
+
+/// Not every provider opens the stream with a `role` preamble (the plat capture
+/// attaches it to a later frame), so a death in that gap would leave the
+/// assembled message roleless — the resumed frames replace whichever later
+/// frame would have carried it. The FIRST resumed delta must supply it, once.
+#[sqlx::test]
+async fn a_resume_supplies_the_role_leg_one_never_delivered(pool: PgPool) {
+    let fake = Fake::new(
+        // Leg 1 dies having sent only roleless content frames.
+        vec![content("chatcmpl-1", "Hello"), content("chatcmpl-1", ", wor")],
+        vec![vec![leg_text("ld!", Some("stop")), leg_usage(1012, 8), done()]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    let payloads = collect_payloads(response).await;
+    let frames = parsed(&payloads);
+
+    let roles: Vec<&Value> = frames.iter().filter(|f| f["choices"][0]["delta"].get("role").is_some()).collect();
+    assert_eq!(roles.len(), 1, "exactly one role delta on the merged stream");
+    assert_eq!(roles[0]["choices"][0]["delta"]["role"], "assistant");
+    assert_eq!(
+        roles[0]["choices"][0]["delta"]["content"], "ld!",
+        "the role rides the FIRST resumed delta, opening the message where leg 1 never did"
+    );
+}
+
+/// The deployment-posture invariant: role repair rides the per-model
+/// reconstructor flip. An UNMAPPED model's resumed frames stay byte-identical
+/// to the pre-v2 layer — shipping this image changes nothing for any model
+/// until it is flipped in `model_reconstructors`.
+#[sqlx::test]
+async fn an_unmapped_model_never_gains_an_injected_role(pool: PgPool) {
+    let fake = Fake::new(
+        vec![content("chatcmpl-1", "Hello"), content("chatcmpl-1", ", wor")],
+        vec![vec![leg_text("ld!", Some("stop")), leg_usage(1012, 8), done()]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), test_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    let payloads = collect_payloads(response).await;
+    let frames = parsed(&payloads);
+
+    assert!(
+        frames.iter().all(|f| f["choices"][0]["delta"].get("role").is_none()),
+        "no role is ever injected for a model outside the reconstructor map"
+    );
+    assert_eq!(contents(&frames), "Hello, world!", "the plain rescue is otherwise identical");
+}
+
+/// A resume can complete without producing a single client delta (its usage
+/// frame stands in for the terminal chunk). An owed role must still be
+/// delivered, and BEFORE the terminal usage frame.
+#[sqlx::test]
+async fn an_owed_role_is_delivered_even_when_the_resume_emits_no_delta(pool: PgPool) {
+    let fake = Fake::new(vec![content("chatcmpl-1", "Hello")], vec![vec![leg_usage(1012, 0), done()]]);
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    let payloads = collect_payloads(response).await;
+    let frames = parsed(&payloads);
+
+    let role_at = frames
+        .iter()
+        .position(|f| f["choices"][0]["delta"]["role"] == "assistant")
+        .expect("the owed role is delivered even with no resumed delta");
+    let usage_at = frames.iter().position(|f| f.get("usage").is_some()).expect("merged usage frame");
+    assert!(role_at < usage_at, "the role must precede the terminal usage frame");
+    assert_eq!(contents(&frames), "Hello", "nothing else is fabricated");
+}
+
+/// The mirror invariant: a role leg 1 already delivered is never re-sent —
+/// strict clients open a second message on a repeated role.
+#[sqlx::test]
+async fn a_role_already_delivered_is_never_resent(pool: PgPool) {
+    let fake = Fake::new(
+        vec![role_preamble("chatcmpl-1"), content("chatcmpl-1", "Hello, wor")],
+        vec![vec![leg_text("ld!", Some("stop")), leg_usage(1012, 8), done()]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    let payloads = collect_payloads(response).await;
+    let frames = parsed(&payloads);
+
+    assert_eq!(
+        frames.iter().filter(|f| f["choices"][0]["delta"].get("role").is_some()).count(),
+        1,
+        "only leg 1's own preamble carries the role"
+    );
+    assert_eq!(contents(&frames), "Hello, world!", "the rescue itself is unaffected");
 }
 
 /// Batch loopback: fusillade marks stream-intent with `x-fusillade-stream`
@@ -1101,6 +1206,7 @@ async fn the_route_config_reaches_the_render_call_and_the_leg_body(pool: PgPool)
         crate::continuation::RouteInfo {
             render_kwargs: Some(json!({"thinking_mode": "chat"})),
             strip_leading_bos: true,
+            effort_thinking: None,
         },
     )]));
 
@@ -1128,6 +1234,183 @@ async fn the_route_config_reaches_the_render_call_and_the_leg_body(pool: PgPool)
     let leg = fake.resume_requests();
     assert_eq!(leg.len(), 1);
     assert_eq!(leg[0].body["prompt"], json!([7, 1, 2, 3]));
+}
+
+/// On a translated route, `reasoning_effort` — not the row's `render_kwargs` —
+/// decides the mode a family-reconstructor stream renders AND seeds in:
+/// onwards writes the mode into the body below this layer, so the resume
+/// prefix must be rendered the way leg 1's prompt was actually templated. The
+/// row's chat kwargs (the plain path's content-only render, still correct for
+/// v1 streams) must not leak into a dsv4 stream's render.
+#[sqlx::test]
+async fn a_translated_route_renders_the_efforts_mode_not_the_row_kwargs(pool: PgPool) {
+    for (effort, want_mode, want_text) in [
+        // Thinking effort: thinking render, and the seed splices the think
+        // close the prefix owes ("a thinking turn that does no thinking").
+        ("high", "thinking", "</think>Hello"),
+        // Explicitly disabled reasoning: chat render, no splice.
+        ("none", "chat", "Hello"),
+    ] {
+        let fake = Fake::new(
+            vec![content("dyn-chatcmpl-1", "Hello"), Chunk::Reset],
+            vec![vec![leg_text(", world!", Some("stop")), leg_usage(1002, 2), done()]],
+        );
+        let rendered = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let sink = Arc::clone(&rendered);
+        let tokenizer = MockServer::start().await;
+        Mock::given(wm_method("POST"))
+            .and(wm_path("/v1/render"))
+            .respond_with(move |req: &wiremock::Request| {
+                sink.lock().unwrap().push(serde_json::from_slice(&req.body).unwrap());
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "token_ids": [4, 5], "total": 1002, "continuation_tokens": 2
+                }))
+            })
+            .mount(&tokenizer)
+            .await;
+
+        let mut st = state(pool.clone(), &fake, tokenizer.uri(), dsv4_config());
+        st.routes = Arc::new(ContinuationRoutes::with_routes([(
+            MODEL.to_string(),
+            crate::continuation::RouteInfo {
+                render_kwargs: Some(json!({"thinking_mode": "chat"})),
+                strip_leading_bos: false,
+                effort_thinking: Some([("none".to_string(), false), ("high".to_string(), true)].into_iter().collect()),
+            },
+        )]));
+
+        let mut body = streaming_body();
+        body["reasoning_effort"] = json!(effort);
+        collect_payloads(app(&fake, st).oneshot(chat_request(body)).await.unwrap()).await;
+
+        let render_requests = rendered.lock().unwrap().clone();
+        assert_eq!(
+            render_requests[0]["chat_template_kwargs"]["thinking_mode"],
+            json!(want_mode),
+            "effort {effort} renders in the translated mode"
+        );
+        assert_eq!(
+            render_requests[0]["continuation_text"],
+            json!(want_text),
+            "effort {effort} seeds the reconstructor in the same mode it renders"
+        );
+    }
+}
+
+/// A reasoning death on a leg the RESERVE served (an OpenRouter-shaped
+/// envelope — routine while dynamo is descheduled, and a major death source)
+/// still resumes: observed reasoning is PROOF of thinking mode whichever
+/// member ran the prompt, so the seed and the render follow the evidence, not
+/// the member's (invisible) translation.
+#[sqlx::test]
+async fn a_reserve_served_reasoning_death_resumes_on_stream_evidence(pool: PgPool) {
+    let fake = Fake::new(
+        vec![
+            reasoning("gen-openrouter-1", "Let me"),
+            reasoning("gen-openrouter-1", " think"),
+            Chunk::Reset,
+        ],
+        vec![vec![
+            leg_text(" carefully.</think>Answer.", Some("stop")),
+            leg_usage(1012, 8),
+            done(),
+        ]],
+    );
+    let rendered = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let sink = Arc::clone(&rendered);
+    let tokenizer = MockServer::start().await;
+    Mock::given(wm_method("POST"))
+        .and(wm_path("/v1/render"))
+        .respond_with(move |req: &wiremock::Request| {
+            sink.lock().unwrap().push(serde_json::from_slice(&req.body).unwrap());
+            ResponseTemplate::new(200).set_body_json(json!({
+                "token_ids": [4, 5], "total": 1012, "continuation_tokens": 2
+            }))
+        })
+        .mount(&tokenizer)
+        .await;
+    let mut st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+    st.routes = Arc::new(ContinuationRoutes::with_routes([(
+        MODEL.to_string(),
+        crate::continuation::RouteInfo {
+            // The route's translation claims CHAT for this effort — but the
+            // stream's own reasoning proves the serving member disagreed.
+            render_kwargs: None,
+            strip_leading_bos: false,
+            effort_thinking: Some([("high".to_string(), false)].into_iter().collect()),
+        },
+    )]));
+
+    let mut body = streaming_body();
+    body["reasoning_effort"] = json!("high");
+    let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(body)).await.unwrap()).await;
+    let frames = parsed(&payloads);
+
+    assert_eq!(fake.resume_requests().len(), 1, "the reserve-served death IS resumed");
+    let render_requests = rendered.lock().unwrap().clone();
+    assert_eq!(
+        render_requests[0]["continuation_text"], "Let me think",
+        "the prefix is the observed reasoning"
+    );
+    assert_eq!(
+        render_requests[0]["chat_template_kwargs"]["thinking_mode"], "thinking",
+        "the render follows the evidence, not the mis-resolved default"
+    );
+    assert_eq!(contents(&frames), "Answer.", "the rescued answer reaches the client as content");
+    assert!(
+        !payloads.iter().any(|p| p.contains("</think>")),
+        "the think close is structure, never client text"
+    );
+}
+
+/// Canonical reasoning on a route with NO modelled translation: the mode leg 1
+/// ran with is unknowable, so a mapped model falls back to the plain (v1)
+/// accumulator — content-only text, no splice, the row kwargs untouched.
+#[sqlx::test]
+async fn an_unmodelled_effort_falls_back_to_the_plain_accumulator(pool: PgPool) {
+    let fake = Fake::new(
+        vec![content("chatcmpl-1", "Hello"), Chunk::Reset],
+        vec![vec![leg_text(", world!", Some("stop")), leg_usage(1002, 2), done()]],
+    );
+    let rendered = Arc::new(Mutex::new(Vec::<Value>::new()));
+    let sink = Arc::clone(&rendered);
+    let tokenizer = MockServer::start().await;
+    Mock::given(wm_method("POST"))
+        .and(wm_path("/v1/render"))
+        .respond_with(move |req: &wiremock::Request| {
+            sink.lock().unwrap().push(serde_json::from_slice(&req.body).unwrap());
+            ResponseTemplate::new(200).set_body_json(json!({
+                "token_ids": [4, 5], "total": 1002, "continuation_tokens": 2
+            }))
+        })
+        .mount(&tokenizer)
+        .await;
+
+    let mut st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+    st.routes = Arc::new(ContinuationRoutes::with_routes([(
+        MODEL.to_string(),
+        crate::continuation::RouteInfo {
+            render_kwargs: Some(json!({"thinking_mode": "chat"})),
+            strip_leading_bos: false,
+            effort_thinking: None,
+        },
+    )]));
+
+    let mut body = streaming_body();
+    body["reasoning_effort"] = json!("high");
+    let payloads = collect_payloads(app(&fake, st).oneshot(chat_request(body)).await.unwrap()).await;
+    assert_eq!(contents(&parsed(&payloads)), "Hello, world!", "the plain rescue still lands");
+
+    let render_requests = rendered.lock().unwrap().clone();
+    assert_eq!(
+        render_requests[0]["continuation_text"], "Hello",
+        "no family seed: nothing is spliced on a mode we cannot know"
+    );
+    assert_eq!(
+        render_requests[0]["chat_template_kwargs"],
+        json!({"thinking_mode": "chat"}),
+        "the plain path renders exactly as v1 configured it"
+    );
 }
 
 /// The client's own `chat_template_kwargs` describe how leg 1 was actually
@@ -1159,6 +1442,7 @@ async fn request_template_kwargs_override_the_route_defaults_on_a_live_resume(po
         crate::continuation::RouteInfo {
             render_kwargs: Some(json!({"thinking_mode": "chat", "tool_style": "dsml"})),
             strip_leading_bos: false,
+            effort_thinking: None,
         },
     )]));
 
@@ -1174,4 +1458,206 @@ async fn request_template_kwargs_override_the_route_defaults_on_a_live_resume(po
     );
     // Nothing stripped: the full rendered prefix goes to the provider.
     assert_eq!(fake.resume_requests()[0].body["prompt"], json!([4, 5]));
+}
+
+// ── the forward parser, end to end ───────────────────────────────────────────
+
+/// A model whose reconstructor is configured, so its resume legs are parsed
+/// rather than passed through.
+fn dsv4_config() -> ContinuationConfig {
+    ContinuationConfig {
+        model_reconstructors: [(MODEL.to_string(), "dsv4".to_string())].into_iter().collect(),
+        ..test_config()
+    }
+}
+
+fn reasoning(id: &str, text: &str) -> Chunk {
+    frame(json!({
+        "id": id, "object": "chat.completion.chunk", "created": 1_700_000_000, "model": MODEL,
+        "choices": [{"index": 0, "delta": {"reasoning_content": text}, "finish_reason": null}]
+    }))
+}
+
+fn channel(frames: &[Value], key: &str) -> String {
+    frames.iter().filter_map(|f| f["choices"][0]["delta"][key].as_str()).collect()
+}
+
+/// **The point of the parser.** A leg that dies mid-reasoning resumes into raw
+/// model text — `</think>`, then DSML — and the client must receive that as
+/// `reasoning_content`, `content` and structured `tool_calls`, never as raw
+/// text in `delta.content`. The raw arrives split across chunks, including one
+/// that ends in the middle of `</think>`, because that is what an SSE boundary
+/// does to a tag.
+#[sqlx::test]
+async fn a_resumed_dsml_leg_reaches_the_client_as_parsed_channels(pool: PgPool) {
+    let fake = Fake::new(
+        vec![reasoning("chatcmpl-1", "Let me"), reasoning("chatcmpl-1", " check")],
+        vec![vec![
+            leg_text(" the weather.</thi", None),
+            leg_text("nk>Checking now.\n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n", None),
+            leg_text("<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n", None),
+            leg_text("<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Par", None),
+            leg_text(
+                "is</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
+                // The RAW completions termination; the layer maps it to the
+                // chat-shaped "tool_calls" because the stream carried
+                // tool-call deltas.
+                Some("stop"),
+            ),
+            leg_usage(1030, 40),
+            done(),
+        ]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payloads = collect_payloads(response).await;
+    let frames = parsed(&payloads);
+
+    // No structure reaches any client-visible channel — a real `</think>` in a
+    // content stream is the production bug this replaces.
+    for tag in ["</think>", "<\u{ff5c}DSML\u{ff5c}", "\u{ff5c}DSML\u{ff5c}parameter"] {
+        assert!(
+            !contents(&frames).contains(tag),
+            "{tag} leaked into delta.content: {:?}",
+            contents(&frames)
+        );
+        assert!(!channel(&frames, "reasoning_content").contains(tag), "{tag} leaked into reasoning");
+    }
+
+    assert_eq!(
+        channel(&frames, "reasoning_content"),
+        "Let me check the weather.",
+        "leg 1's reasoning and the resumed reasoning are one continuous channel"
+    );
+    assert_eq!(contents(&frames), "Checking now.\n\n", "the body, separator included");
+
+    // The tool call is structured, opened once, and its arguments are JSON.
+    let calls: Vec<&Value> = frames
+        .iter()
+        .filter_map(|f| f["choices"][0]["delta"]["tool_calls"].as_array())
+        .flatten()
+        .collect();
+    assert!(!calls.is_empty(), "the DSML block became tool-call deltas");
+    assert!(calls.iter().all(|c| c["index"] == 0), "one call, one index");
+    let opened: Vec<&Value> = calls.iter().filter(|c| c.get("id").is_some()).copied().collect();
+    assert_eq!(opened.len(), 1, "a call is announced exactly once");
+    assert_eq!(opened[0]["function"]["name"], "get_weather");
+    assert!(
+        opened[0]["id"].as_str().is_some_and(|id| id.starts_with("call_")),
+        "ids follow the serving parser's scheme"
+    );
+    let arguments: String = calls.iter().filter_map(|c| c["function"]["arguments"].as_str()).collect();
+    assert_eq!(arguments, r#"{"city": "Paris"}"#);
+
+    // And the stream is still one logical response.
+    assert_eq!(
+        frames.iter().filter(|f| f["choices"][0]["finish_reason"] == "tool_calls").count(),
+        1,
+        "exactly one finish_reason, on the last delta of the terminal chunk"
+    );
+    assert_eq!(usage_frames(&frames).len(), 1, "still exactly one usage frame");
+    assert_eq!(payloads.last().unwrap(), "[DONE]");
+    for f in &frames {
+        assert_eq!(f["id"], "chatcmpl-1", "every delta is on the client's own envelope");
+        assert_eq!(f["model"], MODEL);
+    }
+}
+
+/// The same script on an UNMAPPED model: no reconstructor, so the leg is passed
+/// through byte for byte and the raw text lands in `delta.content` exactly as it
+/// did before the parser existed. This is the regression guard for every model
+/// that is not deliberately enabled.
+#[sqlx::test]
+async fn an_unmapped_model_still_passes_the_leg_through_verbatim(pool: PgPool) {
+    let raw = "ld!</think> and <\u{ff5c}DSML\u{ff5c}tool_calls> stay text";
+    let fake = Fake::new(
+        vec![content("chatcmpl-1", "Hello"), content("chatcmpl-1", ", wor")],
+        vec![vec![leg_text(raw, Some("stop")), leg_usage(1012, 8), done()]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), test_config());
+
+    let frames = parsed(&collect_payloads(app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap()).await);
+    assert_eq!(
+        contents(&frames),
+        format!("Hello, wor{raw}"),
+        "an unmapped model's raw text is content, unparsed"
+    );
+    assert!(
+        frames.iter().all(|f| f["choices"][0]["delta"].get("tool_calls").is_none()),
+        "nothing is interpreted"
+    );
+    assert_eq!(usage_frames(&frames).len(), 1);
+}
+
+/// **A poisoned leg must not end as a silently truncated success.** A leg that
+/// streams an unterminated DSML invoke name past the structural bound poisons
+/// the forward parser; the continuation must ABORT — no usage frame, no
+/// `[DONE]`, `failed` outcome — instead of closing the stream as if the
+/// truncated output were the whole generation.
+#[sqlx::test]
+async fn a_poisoned_leg_aborts_instead_of_closing_as_success(pool: PgPool) {
+    let mut leg = vec![leg_text(
+        "</think>Checking now.\n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"",
+        None,
+    )];
+    for _ in 0..8 {
+        leg.push(leg_text(&"q".repeat(1024), None));
+    }
+    leg.push(leg_text("", Some("stop")));
+    leg.push(leg_usage(1030, 40));
+    leg.push(done());
+    let fake = Fake::new(
+        vec![reasoning("chatcmpl-1", "Let me"), reasoning("chatcmpl-1", " check")],
+        vec![leg],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payloads = collect_payloads(response).await;
+
+    let joined = payloads.join("\n");
+    assert!(!joined.contains("[DONE]"), "a poisoned resume must not close as a success");
+    assert!(!joined.contains("\"usage\""), "no usage frame for an aborted resume");
+    assert!(!joined.contains('q'), "poisoned bytes must never reach the client: {joined:?}");
+    assert!(!joined.contains("\u{ff5c}DSML\u{ff5c}"), "no DSML leak");
+}
+
+/// A resumed TOOL stream whose leg ends without a terminal completion chunk
+/// (usage stands in for it) must still deliver `finish_reason: "tool_calls"` —
+/// the only tool-loop signal clients key on — and BEFORE the usage frame,
+/// which clients treat as terminal.
+#[sqlx::test]
+async fn a_tool_leg_without_a_finish_chunk_still_signals_tool_calls(pool: PgPool) {
+    let fake = Fake::new(
+        vec![reasoning("chatcmpl-1", "Let me"), reasoning("chatcmpl-1", " check")],
+        vec![vec![
+            leg_text(
+                " the weather.</think>Now.\n\n<\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}invoke name=\"get_weather\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"city\" string=\"true\">Paris</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>\n</\u{ff5c}DSML\u{ff5c}tool_calls>",
+                None,
+            ),
+            // No terminal completion chunk: usage stands in, then [DONE].
+            leg_usage(1030, 40),
+            done(),
+        ]],
+    );
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let st = state(pool, &fake, tokenizer.uri(), dsv4_config());
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let payloads = collect_payloads(response).await;
+
+    let finish_at = payloads
+        .iter()
+        .position(|p| p.contains("\"finish_reason\":\"tool_calls\""))
+        .expect("a tool stream must carry finish_reason tool_calls");
+    let usage_at = payloads.iter().position(|p| p.contains("\"usage\"")).expect("merged usage frame");
+    assert!(finish_at < usage_at, "finish_reason must precede the terminal usage frame");
+    assert!(payloads.iter().any(|p| p.contains("[DONE]")), "stream closes normally");
 }

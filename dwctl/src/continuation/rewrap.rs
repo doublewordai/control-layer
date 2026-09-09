@@ -120,34 +120,65 @@ pub fn usage_of(chunk: &Value) -> Option<(u64, u64)> {
     Some((prompt, completion))
 }
 
-/// Reframe one `text_completion` streaming chunk as a `chat.completion.chunk` on
-/// the original envelope. Returns `None` when there is nothing for the client in
-/// it (no choices, or an empty text with no `finish_reason`) — e.g. the leg's
-/// terminal usage-only chunk, which the caller replaces with [`usage_frame`].
-pub fn reframe_chunk(chunk: &Value, env: &Envelope) -> Option<Value> {
+/// The generated text and `finish_reason` of one `text_completion` streaming
+/// chunk. `None` when the chunk carries no choice at all — the leg's terminal
+/// usage-only chunk, which the caller replaces with [`usage_frame`].
+///
+/// This is the raw material the leg's [`ForwardParser`] consumes: on a model
+/// with a reconstructor the text is the model's RAW sequence and becomes 0..n
+/// chat deltas, and on every other model it is the content itself.
+///
+/// [`ForwardParser`]: super::forward::ForwardParser
+pub fn completion_parts(chunk: &Value) -> Option<(&str, Value)> {
     let choice = chunk.get("choices")?.as_array()?.first()?;
     let text = choice.get("text").and_then(Value::as_str).unwrap_or("");
     let finish_reason = choice.get("finish_reason").cloned().unwrap_or(Value::Null);
-    if text.is_empty() && finish_reason.is_null() {
-        return None;
-    }
-    // `delta.content` only — leg 1 already sent the `role` delta, and re-sending
-    // one makes strict clients open a second message.
-    let mut delta = serde_json::Map::new();
-    if !text.is_empty() {
-        delta.insert("content".to_string(), Value::String(text.to_string()));
-    }
-    Some(json!({
+    Some((text, finish_reason))
+}
+
+/// One chat chunk on the original stream's envelope, carrying an already-built
+/// `delta` object.
+///
+/// No `role` delta is added HERE: most streams have already opened the message
+/// on leg 1, and re-sending one makes strict clients open a second. But not
+/// every provider opens with a role preamble (the plat captures attach it to a
+/// later frame), so the layer tracks whether a role has actually been delivered
+/// and injects one into the first resumed delta only when it is still owed
+/// (`ensure_role` in the layer).
+pub fn delta_chunk(env: &Envelope, delta: Value, finish_reason: Value) -> Value {
+    json!({
         "id": env.id,
         "object": "chat.completion.chunk",
         "created": env.created,
         "model": env.model,
         "choices": [{
             "index": 0,
-            "delta": Value::Object(delta),
+            "delta": delta,
             "finish_reason": finish_reason,
         }],
-    }))
+    })
+}
+
+/// Reframe one `text_completion` streaming chunk as a `chat.completion.chunk` on
+/// the original envelope, treating its text as plain content. Returns `None`
+/// when there is nothing for the client in it (no choices, or an empty text with
+/// no `finish_reason`).
+///
+/// **The reference implementation of the passthrough path.** The live path runs
+/// the text through the leg's forward parser instead; for an unmapped model that
+/// parser is `PlainForward`, and the frames it produces are byte-identical to
+/// this function's — pinned by a test here, so the parser rewiring cannot
+/// silently change what a plain model's client receives.
+pub fn reframe_chunk(chunk: &Value, env: &Envelope) -> Option<Value> {
+    let (text, finish_reason) = completion_parts(chunk)?;
+    if text.is_empty() && finish_reason.is_null() {
+        return None;
+    }
+    let mut delta = serde_json::Map::new();
+    if !text.is_empty() {
+        delta.insert("content".to_string(), Value::String(text.to_string()));
+    }
+    Some(delta_chunk(env, Value::Object(delta), finish_reason))
 }
 
 /// A bare `finish_reason: "length"` chunk. Emitted when the client's own

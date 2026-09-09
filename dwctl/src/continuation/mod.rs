@@ -39,6 +39,7 @@
 pub mod accumulate;
 pub mod detect;
 pub mod dsv4;
+pub mod forward;
 pub mod layer;
 pub mod metrics;
 pub mod render;
@@ -105,12 +106,15 @@ pub async fn provision_global_key(pool: &PgPool) -> anyhow::Result<String> {
 /// two places.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct RouteInfo {
-    /// `chat_template_kwargs` for tokenizer-svc `/v1/render`. Also the source of
-    /// truth for the serving mode the reconstructor must match: a route serving
-    /// DeepSeek in chat mode (`{"thinking_mode": "chat"}`) must not have a
-    /// `</think>` spliced into its resume prefix, while tokenizer-svc renders
-    /// that family in thinking mode by default. `None` = the model's template
-    /// default.
+    /// `chat_template_kwargs` for tokenizer-svc `/v1/render`, and the serving
+    /// mode for streams with no canonical reasoning in play (see
+    /// [`Self::resolve_mode`]): a route serving DeepSeek in chat mode
+    /// (`{"thinking_mode": "chat"}`) must not have a `</think>` spliced into
+    /// its resume prefix, while tokenizer-svc renders that family in thinking
+    /// mode by default. On a TRANSLATED target this row describes the PLAIN
+    /// path's content-only render (v1 semantics — load-bearing, do not "fix"
+    /// it to the serving default); a family reconstructor's mode comes from
+    /// the resolution instead. `None` = the model's template default.
     pub render_kwargs: Option<serde_json::Value>,
     /// This provider prepends its own BOS (Fireworks does on most models), so
     /// our leading BOS has to come off or the exact prefix shifts by one token.
@@ -125,6 +129,44 @@ pub struct RouteInfo {
     /// (Fireworks / DeepSeek-V4-Flash) is `strip_leading_bos = false`, so
     /// nothing is lost by carrying the value and acting on it later.
     pub strip_leading_bos: bool,
+    /// How the model's CHAT-serving member translates the canonical
+    /// `reasoning_effort` into a thinking/chat mode, when it does: effort →
+    /// thinking?, derived from the member's `reasoning_translation` writes
+    /// that target a `chat_template_kwargs` thinking key.
+    ///
+    /// Why this exists: onwards REJECTS client `chat_template_kwargs` on a
+    /// translated target and writes the mode into the body BELOW this layer,
+    /// so the request as captured here never shows the mode leg 1 actually
+    /// ran with — only the translation does. `None` = the route has no
+    /// mode-writing translation (the kwargs logic stands).
+    pub effort_thinking: Option<std::collections::BTreeMap<String, bool>>,
+}
+
+/// How the serving mode of a stream's leg 1 was determined — the mode the
+/// resume render AND a family reconstructor's seeding must match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeResolution {
+    /// No canonical reasoning in play: route + request kwargs decide, exactly
+    /// as before translations were modelled.
+    Kwargs(bool),
+    /// The route's reasoning translation decided (or, with no effort sent on a
+    /// translated route, the template default applied — the same default
+    /// tokenizer-svc renders with).
+    Translated(bool),
+    /// Canonical reasoning was sent but nothing tells us what mode it produced
+    /// downstream — a family reconstructor must fall back to the plain (v1)
+    /// accumulator rather than guess a seam mode.
+    Unknowable,
+}
+
+impl ModeResolution {
+    /// The thinking mode, when one could be determined.
+    pub fn thinking(self) -> Option<bool> {
+        match self {
+            ModeResolution::Kwargs(t) | ModeResolution::Translated(t) => Some(t),
+            ModeResolution::Unknowable => None,
+        }
+    }
 }
 
 impl RouteInfo {
@@ -135,13 +177,60 @@ impl RouteInfo {
     /// `"chat"`) or a boolean `thinking`. Absent ⇒ true, matching
     /// tokenizer-svc's own default for the families that have one.
     pub fn thinking(&self) -> bool {
-        let Some(kwargs) = self.render_kwargs.as_ref() else {
+        Self::thinking_from(self.render_kwargs.as_ref())
+    }
+
+    /// Whether THIS stream's leg generates in thinking mode: the route's serving
+    /// mode overlaid with the request's own `chat_template_kwargs` — the same
+    /// merge [`Self::merged_render_kwargs`] feeds to the resume render, so the
+    /// reconstructor's mode can never diverge from the prompt it splices for. A
+    /// request that overrides `thinking_mode` on a chat-default route must be
+    /// seeded as a thinking stream, and vice versa.
+    pub fn thinking_for(&self, request_kwargs: Option<&serde_json::Value>) -> bool {
+        Self::thinking_from(self.merged_render_kwargs(request_kwargs).as_ref())
+    }
+
+    fn thinking_from(kwargs: Option<&serde_json::Value>) -> bool {
+        let Some(kwargs) = kwargs else {
             return true;
         };
         if let Some(mode) = kwargs.get("thinking_mode").and_then(|v| v.as_str()) {
             return !mode.eq_ignore_ascii_case("chat");
         }
-        kwargs.get("thinking").and_then(|v| v.as_bool()).unwrap_or(true)
+        for key in ["thinking", "enable_thinking"] {
+            if let Some(t) = kwargs.get(key).and_then(|v| v.as_bool()) {
+                return t;
+            }
+        }
+        true
+    }
+
+    /// Resolve the serving mode of a stream's leg 1, accounting for the
+    /// route's reasoning translation. The four arms:
+    ///
+    /// - effort sent, translated route → the translation decides (an effort
+    ///   the map does not cover is [`ModeResolution::Unknowable`] — such a
+    ///   request would have been rejected by onwards anyway);
+    /// - effort sent, untranslated route → the provider interprets it
+    ///   natively; the mode is unknowable from here;
+    /// - no effort, translated route → nothing is written downstream and the
+    ///   template default applies (thinking — the same default
+    ///   [`Self::thinking_from`] encodes for an absent kwargs object). The
+    ///   route row's `render_kwargs` deliberately does NOT apply here: on a
+    ///   translated target it describes how the PLAIN accumulator's
+    ///   content-only prefix must render (see the poll's selection comment),
+    ///   not the serving default;
+    /// - neither → route + request kwargs, exactly as before.
+    pub fn resolve_mode(&self, request_kwargs: Option<&serde_json::Value>, reasoning_effort: Option<&str>) -> ModeResolution {
+        match (reasoning_effort, self.effort_thinking.as_ref()) {
+            (Some(effort), Some(map)) => map
+                .get(effort)
+                .map(|t| ModeResolution::Translated(*t))
+                .unwrap_or(ModeResolution::Unknowable),
+            (Some(_), None) => ModeResolution::Unknowable,
+            (None, Some(_)) => ModeResolution::Translated(Self::thinking_from(None)),
+            (None, None) => ModeResolution::Kwargs(self.thinking_for(request_kwargs)),
+        }
     }
 
     /// Merge this route's render kwargs with the ones the client sent.
@@ -166,6 +255,36 @@ impl RouteInfo {
             (Some(route), Some(request)) => Some(if request.is_null() { route.clone() } else { request.clone() }),
         }
     }
+}
+
+/// Derive the effort → thinking map from a chat-surface reasoning translation:
+/// the first write targeting a `chat_template_kwargs` thinking key, its values
+/// read as bools (or DeepSeek's `thinking_mode` strings). A translation with
+/// no such write returns `None` — it does not steer the mode, so the route is
+/// treated as untranslated and canonical-reasoning requests resolve
+/// [`ModeResolution::Unknowable`] (safe fallback), never a guess.
+fn effort_thinking_map(config: &crate::reasoning::ReasoningTranslationConfig) -> Option<std::collections::BTreeMap<String, bool>> {
+    const MODE_PATHS: [&str; 3] = [
+        "/chat_template_kwargs/enable_thinking",
+        "/chat_template_kwargs/thinking",
+        "/chat_template_kwargs/thinking_mode",
+    ];
+    let translation = config.chat_completions.as_ref()?;
+    let write = translation.writes.iter().find(|w| MODE_PATHS.contains(&w.target_path.as_str()))?;
+    let map: std::collections::BTreeMap<String, bool> = write
+        .values
+        .iter()
+        .filter_map(|(effort, value)| {
+            let thinking = match value {
+                serde_json::Value::Bool(b) => *b,
+                serde_json::Value::String(s) => !s.eq_ignore_ascii_case("chat"),
+                _ => return None,
+            };
+            let effort = serde_json::to_value(effort).ok()?.as_str()?.to_string();
+            Some((effort, thinking))
+        })
+        .collect();
+    (!map.is_empty()).then_some(map)
 }
 
 /// The models that have a continuation route attached, with that route's
@@ -295,14 +414,47 @@ impl ContinuationRoutes {
         )
         .fetch_all(pool)
         .await?;
+        // The CHAT-serving member's reasoning translation, per composite: the
+        // default pool's first enabled member (the one leg 1 traffic reaches
+        // first) with the same endpoint-base + per-model-override resolution
+        // the onwards config sync applies — so this layer models exactly the
+        // mode writes onwards will make below it.
+        let translations = sqlx::query!(
+            r#"
+            SELECT DISTINCT ON (cm.alias)
+                cm.alias,
+                ie.reasoning_translation AS endpoint_translation,
+                dm.reasoning_translation_overrides AS model_overrides
+            FROM deployed_model_components dmc
+            JOIN deployed_models cm ON cm.id = dmc.composite_model_id
+            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
+            JOIN inference_endpoints ie ON dm.hosted_on = ie.id
+            WHERE dmc.pool = 'default'
+              AND dmc.enabled = true
+              AND cm.deleted = false
+              AND dm.deleted = false
+            ORDER BY cm.alias, dmc.sort_order ASC
+            "#
+        )
+        .fetch_all(pool)
+        .await?;
+        let mut effort_maps: HashMap<String, std::collections::BTreeMap<String, bool>> = translations
+            .into_iter()
+            .filter_map(|row| {
+                let config = crate::reasoning::resolve_reasoning_translation(row.endpoint_translation, row.model_overrides, &row.alias)?;
+                Some((row.alias, effort_thinking_map(&config)?))
+            })
+            .collect();
         self.store(
             rows.into_iter()
                 .map(|row| {
+                    let effort_thinking = effort_maps.remove(&row.alias);
                     (
                         row.alias,
                         RouteInfo {
                             render_kwargs: row.render_kwargs,
                             strip_leading_bos: row.strip_leading_bos,
+                            effort_thinking,
                         },
                     )
                 })
@@ -555,6 +707,103 @@ mod tests {
         assert!(routes.is_empty());
     }
 
+    #[test]
+    fn resolve_mode_covers_all_four_arms() {
+        let translated = RouteInfo {
+            // The v1 plain-render row — deliberately NOT the serving default.
+            render_kwargs: Some(serde_json::json!({"thinking_mode": "chat"})),
+            strip_leading_bos: false,
+            effort_thinking: Some([("none".to_string(), false), ("high".to_string(), true)].into_iter().collect()),
+        };
+        // The translation decides; the row kwargs do not.
+        assert_eq!(translated.resolve_mode(None, Some("high")), ModeResolution::Translated(true));
+        assert_eq!(translated.resolve_mode(None, Some("none")), ModeResolution::Translated(false));
+        // An effort the map does not cover (onwards would reject it anyway).
+        assert_eq!(translated.resolve_mode(None, Some("bogus")), ModeResolution::Unknowable);
+        // No effort on a translated route: the template default, NOT the row.
+        assert_eq!(translated.resolve_mode(None, None), ModeResolution::Translated(true));
+
+        let untranslated = RouteInfo {
+            render_kwargs: Some(serde_json::json!({"thinking_mode": "chat"})),
+            ..RouteInfo::default()
+        };
+        // Canonical reasoning the provider interprets natively: unknowable.
+        assert_eq!(untranslated.resolve_mode(None, Some("high")), ModeResolution::Unknowable);
+        // Nothing canonical: kwargs logic, exactly as before.
+        assert_eq!(untranslated.resolve_mode(None, None), ModeResolution::Kwargs(false));
+    }
+
+    #[test]
+    fn the_effort_map_derives_from_a_mode_writing_translation() {
+        // The prod 0731 shape, verbatim.
+        let config: crate::reasoning::ReasoningTranslationConfig = serde_json::from_value(serde_json::json!({
+            "chat_completions": {"unsupported_efforts": [], "writes": [{
+                "target_path": "/chat_template_kwargs/enable_thinking",
+                "values": {"none": false, "minimal": true, "low": true, "medium": true,
+                           "high": true, "xhigh": true, "max": true}
+            }]}
+        }))
+        .unwrap();
+        let map = effort_thinking_map(&config).expect("a mode-writing translation derives a map");
+        assert_eq!(map.get("none"), Some(&false));
+        assert_eq!(map.get("max"), Some(&true));
+        assert_eq!(map.len(), 7);
+
+        // A translation that never touches a thinking key does not steer the
+        // mode — the route counts as untranslated (safe fallback), no guess.
+        let budget_only: crate::reasoning::ReasoningTranslationConfig = serde_json::from_value(serde_json::json!({
+            "chat_completions": {"unsupported_efforts": [], "writes": [{
+                "target_path": "/thinking_token_budget",
+                "values": {"none": 0, "minimal": 1, "low": 10, "medium": 100,
+                           "high": 1000, "xhigh": 2000, "max": 4000}
+            }]}
+        }))
+        .unwrap();
+        assert!(effort_thinking_map(&budget_only).is_none());
+    }
+
+    /// The chat-serving (default-pool, first enabled) member's reasoning
+    /// translation reaches the route, resolved endpoint-base + model-overrides
+    /// exactly as the onwards config sync resolves it.
+    #[sqlx::test]
+    async fn the_default_pool_members_translation_reaches_the_route(pool: PgPool) {
+        let user = create_test_user(&pool, Role::PlatformManager).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let composite = create_composite(&pool, "dsv4-flash", user.id).await;
+        let dynamo = create_test_model(&pool, "m-dyn", "dynamo", endpoint, user.id).await;
+        let fireworks = create_test_model(&pool, "m-fw", "fireworks", endpoint, user.id).await;
+        add_component(&pool, composite, dynamo, "default").await;
+        add_component_at(&pool, composite, dynamo, "completions", 0).await;
+        add_component_at(&pool, composite, fireworks, "completions", 1).await;
+
+        let routes = ContinuationRoutes::new();
+        routes.refresh(&pool).await.unwrap();
+        assert_eq!(
+            routes.get("dsv4-flash").unwrap().effort_thinking,
+            None,
+            "no translation configured, no map"
+        );
+
+        sqlx::query!(
+            r#"UPDATE inference_endpoints
+               SET reasoning_translation = '{"chat_completions": {"unsupported_efforts": [], "writes": [{
+                   "target_path": "/chat_template_kwargs/enable_thinking",
+                   "values": {"none": false, "minimal": true, "low": true, "medium": true,
+                              "high": true, "xhigh": true, "max": true}}]}}'::jsonb
+               WHERE id = $1"#,
+            endpoint
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        routes.refresh(&pool).await.unwrap();
+
+        let route = routes.get("dsv4-flash").unwrap();
+        let map = route.effort_thinking.as_ref().expect("the translation reached the route");
+        assert_eq!(map.get("none"), Some(&false));
+        assert_eq!(map.get("high"), Some(&true));
+    }
+
     #[sqlx::test]
     async fn per_route_config_reaches_the_cache(pool: PgPool) {
         let user = create_test_user(&pool, Role::PlatformManager).await;
@@ -665,6 +914,7 @@ mod tests {
         let route = |kwargs: Option<serde_json::Value>| RouteInfo {
             render_kwargs: kwargs,
             strip_leading_bos: false,
+            effort_thinking: None,
         };
         // tokenizer-svc renders the reasoning families in thinking mode by
         // default, so an unconfigured route is a thinking route.
@@ -683,6 +933,7 @@ mod tests {
         let route = RouteInfo {
             render_kwargs: Some(serde_json::json!({"thinking_mode": "chat", "tool_style": "dsml"})),
             strip_leading_bos: false,
+            effort_thinking: None,
         };
         // Nothing from the client: the route's own kwargs.
         assert_eq!(route.merged_render_kwargs(None), route.render_kwargs);

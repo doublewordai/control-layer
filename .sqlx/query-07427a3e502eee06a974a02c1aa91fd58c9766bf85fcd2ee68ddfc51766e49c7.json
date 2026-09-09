@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT DISTINCT ON (cm.alias)\n                cm.alias,\n                ie.reasoning_translation AS endpoint_translation,\n                dm.reasoning_translation_overrides AS model_overrides\n            FROM deployed_model_components dmc\n            JOIN deployed_models cm ON cm.id = dmc.composite_model_id\n            JOIN deployed_models dm ON dm.id = dmc.deployed_model_id\n            JOIN inference_endpoints ie ON dm.hosted_on = ie.id\n            WHERE dmc.pool = 'default'\n              AND dmc.enabled = true\n              AND cm.deleted = false\n              AND dm.deleted = false\n            ORDER BY cm.alias, dmc.sort_order ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "endpoint_translation",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 2,
+        "name": "model_overrides",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "07427a3e502eee06a974a02c1aa91fd58c9766bf85fcd2ee68ddfc51766e49c7"
+}

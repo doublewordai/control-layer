@@ -165,6 +165,83 @@ fn reconstruction_is_monotonic_across_every_fixture_stream() {
     }
 }
 
+/// Id and name are independently optional per streaming delta. An id-only
+/// opening delta spends the index and hands the client an id; the death seed
+/// must carry that id so the regenerated call repeats it instead of minting a
+/// second one for the same index.
+#[test]
+fn an_id_only_opening_delta_seeds_the_reuse_id() {
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
+    acc.ingest(&json!({
+        "id": "chatcmpl-1", "model": "dsv4", "created": 1,
+        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_abc"}]}, "finish_reason": null}]
+    }))
+    .unwrap();
+    assert_eq!(
+        acc.forward_seed(),
+        ForwardSeed::BetweenToolCalls {
+            next_index: 0,
+            reuse_id: Some("call_abc".to_string())
+        }
+    );
+}
+
+/// Arguments cannot precede the invoke name in faithful DSML (the name is part
+/// of the opening tag). A name-less slot receiving arguments means the client
+/// holds bytes the regenerated prefix will not contain — disarm, never guess.
+#[test]
+fn arguments_before_the_name_disarm() {
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
+    let err = acc
+        .ingest(&json!({
+            "id": "chatcmpl-1", "model": "dsv4", "created": 1,
+            "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_abc",
+                "function": {"arguments": "{\"x\": 1"}}]}, "finish_reason": null}]
+        }))
+        .unwrap_err();
+    assert_eq!(err, AccumulateError::UnsupportedDelta);
+}
+
+/// Every retained byte counts against the memory cap — the tool-call id
+/// included, or a stream could grow ids past `max_buffer_bytes`.
+#[test]
+fn tool_call_ids_count_against_the_cap() {
+    let mut acc = Dsv4Reconstructor::new(16, true);
+    let err = acc
+        .ingest(&json!({
+            "id": "chatcmpl-1", "model": "dsv4", "created": 1,
+            "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0,
+                "id": "call_far_longer_than_the_cap_allows",
+                "function": {"name": "f", "arguments": ""}}]}, "finish_reason": null}]
+        }))
+        .unwrap_err();
+    assert_eq!(err, AccumulateError::CapExceeded);
+}
+
+/// A call whose name arrived without an id owes the client one; a call whose
+/// id arrived owes nothing.
+#[test]
+fn the_seed_tracks_whether_the_client_still_needs_an_id() {
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
+    acc.ingest(&tool_frame(0, Some("get_weather"), "{\"city\": \"Par", false)).unwrap();
+    assert!(
+        matches!(acc.forward_seed(), ForwardSeed::InToolCall { id_owed: true, .. }),
+        "no id ever reached the client for this call"
+    );
+
+    let mut acc = Dsv4Reconstructor::new(CAP, true);
+    acc.ingest(&json!({
+        "id": "chatcmpl-1", "model": "dsv4", "created": 1,
+        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_abc",
+            "function": {"name": "get_weather", "arguments": "{\"city\": \"Par"}}]}, "finish_reason": null}]
+    }))
+    .unwrap();
+    assert!(
+        matches!(acc.forward_seed(), ForwardSeed::InToolCall { id_owed: false, .. }),
+        "the client already holds this call's id"
+    );
+}
+
 fn tool_frame(index: i64, name: Option<&str>, arguments: &str, finish: bool) -> Value {
     let mut function = serde_json::Map::new();
     if let Some(name) = name {
@@ -520,35 +597,4 @@ fn disarm_is_sticky_and_keeps_the_first_cause() {
         AccumulateError::UnsupportedDelta
     );
     assert_eq!(acc.disarmed(), Some(AccumulateError::UnsupportedDelta));
-}
-
-/// Plain (`delta.content`-only) reframing is faithful only when the
-/// continuation can produce nothing but content — the v1 guard that keeps raw
-/// DSML/`</think>` out of answer text until the forward parser pairs in v2.
-#[test]
-fn plain_resume_ok_tracks_the_seam_phase() {
-    let chunk = |delta: serde_json::Value| {
-        serde_json::json!({"id": "c", "object": "chat.completion.chunk",
-            "choices": [{"index": 0, "delta": delta, "finish_reason": null}]})
-    };
-
-    // Thinking-mode turn, seam inside the open think block: not plain-safe.
-    let mut acc = Dsv4Reconstructor::new(CAP, true);
-    acc.ingest(&chunk(serde_json::json!({"reasoning_content": "let me think"})))
-        .unwrap();
-    assert!(!acc.plain_resume_ok(), "mid-reasoning seam would leak raw </think> into content");
-
-    // Content began (think closed for this family): plain-safe.
-    acc.ingest(&chunk(serde_json::json!({"content": "Answer: "}))).unwrap();
-    assert!(acc.plain_resume_ok());
-
-    // A tool block anywhere in the turn: never plain-safe.
-    acc.ingest(&chunk(serde_json::json!({"tool_calls": [{"index": 0,
-        "function": {"name": "f", "arguments": "{"}}]})))
-        .unwrap();
-    assert!(!acc.plain_resume_ok(), "the continuation may emit DSML tool markup");
-
-    // Chat-mode turn (no think block rendered): plain-safe from the start.
-    let acc = Dsv4Reconstructor::new(CAP, false);
-    assert!(acc.plain_resume_ok());
 }
