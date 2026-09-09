@@ -1606,7 +1606,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
         let server = axum_test::TestServer::new(router).expect("Failed to create test server");
@@ -1797,7 +1797,7 @@ mod tests {
                 }),
             )
             .layer(axum::middleware::from_fn_with_state(
-                pool.clone(),
+                sqlx_pool_router::DynPools::new(pool.clone()),
                 crate::error_enrichment::error_enrichment_middleware,
             ));
         let server = axum_test::TestServer::new(router).expect("Failed to create test server");
