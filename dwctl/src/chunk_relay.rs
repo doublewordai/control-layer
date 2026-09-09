@@ -333,6 +333,13 @@ async fn publisher_loop(pool: Pool, mut rx: mpsc::Receiver<PublishMsg>, ttl_secs
 /// subscriber's channel — the fix for the connection-per-reader scaling
 /// limit a naive per-subscriber `XREAD BLOCK` would hit.
 async fn reader_loop(pool: Pool, registry: Arc<DashMap<Uuid, ReaderEntry>>, poll_interval: Duration, shard: usize, n_shards: usize) {
+    // Held across ticks instead of `pool.get()` per tick, same reasoning as
+    // `publisher_loop`: re-acquiring every tick adds avoidable overhead, and
+    // under real load (many subscribers, larger `XREAD` replies) ticks can
+    // start overlapping enough that the pool grows well past its intended
+    // per-shard size instead of reusing one connection.
+    let mut conn = None;
+
     loop {
         tokio::time::sleep(poll_interval).await;
 
@@ -345,12 +352,15 @@ async fn reader_loop(pool: Pool, registry: Arc<DashMap<Uuid, ReaderEntry>>, poll
             continue;
         }
 
-        let mut conn = match pool.get().await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::debug!(error = %e, "chunk relay: redis unreachable, reader retrying next tick");
-                continue;
-            }
+        let c = match conn.as_mut() {
+            Some(c) => c,
+            None => match pool.get().await {
+                Ok(c) => conn.insert(c),
+                Err(e) => {
+                    tracing::debug!(error = %e, "chunk relay: redis unreachable, reader retrying next tick");
+                    continue;
+                }
+            },
         };
 
         let mut command = cmd("XREAD");
@@ -363,11 +373,12 @@ async fn reader_loop(pool: Pool, registry: Arc<DashMap<Uuid, ReaderEntry>>, poll
             command.arg(last_id);
         }
 
-        let reply = match command.query_async::<Option<StreamReadReply>>(&mut conn).await {
+        let reply = match command.query_async::<Option<StreamReadReply>>(c).await {
             Ok(Some(reply)) => reply,
             Ok(None) => continue,
             Err(e) => {
                 tracing::debug!(error = %e, "chunk relay XREAD failed");
+                conn = None; // connection may be bad; get a fresh one next tick
                 continue;
             }
         };
