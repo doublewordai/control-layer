@@ -21,6 +21,8 @@ struct EmailTemplates {
     auto_topup_disabled: String,
     auto_topup_limit_reached: String,
     org_invite: String,
+    org_join_request: String,
+    org_join_approved: String,
     org_email_change_verify_new: String,
     org_email_change_verify_old: String,
 }
@@ -38,6 +40,8 @@ impl EmailTemplates {
             auto_topup_disabled: include_str!("../default_templates/auto_topup_disabled.html").to_string(),
             auto_topup_limit_reached: include_str!("../default_templates/auto_topup_limit_reached.html").to_string(),
             org_invite: include_str!("../default_templates/org_invite.html").to_string(),
+            org_join_request: include_str!("../default_templates/org_join_request.html").to_string(),
+            org_join_approved: include_str!("../default_templates/org_join_approved.html").to_string(),
             org_email_change_verify_new: include_str!("../default_templates/org_email_change_verify_new.html").to_string(),
             org_email_change_verify_old: include_str!("../default_templates/org_email_change_verify_old.html").to_string(),
         }
@@ -68,6 +72,8 @@ impl EmailTemplates {
             auto_topup_disabled: load("auto_topup_disabled.html", embedded.auto_topup_disabled),
             auto_topup_limit_reached: load("auto_topup_limit_reached.html", embedded.auto_topup_limit_reached),
             org_invite: load("org_invite.html", embedded.org_invite),
+            org_join_request: load("org_join_request.html", embedded.org_join_request),
+            org_join_approved: load("org_join_approved.html", embedded.org_join_approved),
             org_email_change_verify_new: load("org_email_change_verify_new.html", embedded.org_email_change_verify_new),
             org_email_change_verify_old: load("org_email_change_verify_old.html", embedded.org_email_change_verify_old),
         }
@@ -564,6 +570,89 @@ impl EmailService {
         })
     }
 
+    /// Tell an owner or admin that somebody has asked to join their workspace.
+    ///
+    /// Deliberately its own template rather than a re-worded `org_invite`:
+    /// that one is overridable per-deployment via `templates_dir`, so sharing
+    /// it would send an operator's customised *invite* copy here, and every
+    /// string in it points the wrong way — this mail goes to the workspace's
+    /// owner, about a third party, and carries no token and no expiry.
+    ///
+    /// One call per recipient; the caller owns the fan-out.
+    pub async fn send_org_join_request_email(
+        &self,
+        to_email: &str,
+        org_name: &str,
+        requester_name: &str,
+        requester_email: &str,
+        requests_link: &str,
+    ) -> Result<(), Error> {
+        let subject = format!("{requester_name} has asked to join {org_name}");
+        let body = self
+            .render_org_join_request_body(org_name, requester_name, requester_email, requests_link)
+            .map_err(|e| Error::Internal {
+                operation: format!("render email template: {e}"),
+            })?;
+
+        self.send_email(to_email, None, &subject, &body).await
+    }
+
+    /// Tell a requester their join request was approved.
+    ///
+    /// Nothing else closes this loop: approval is a bare status flip with no
+    /// response to the requester's browser, so without this mail the user is
+    /// told "we'll let you know when you're approved" and then never is.
+    pub async fn send_org_join_approved_email(
+        &self,
+        to_email: &str,
+        org_name: &str,
+        role: &str,
+        dashboard_link: &str,
+    ) -> Result<(), Error> {
+        let subject = format!("You've been approved to join {org_name}");
+        let body = self
+            .render_org_join_approved_body(org_name, role, dashboard_link)
+            .map_err(|e| Error::Internal {
+                operation: format!("render email template: {e}"),
+            })?;
+
+        self.send_email(to_email, None, &subject, &body).await
+    }
+
+    fn render_org_join_request_body(
+        &self,
+        org_name: &str,
+        requester_name: &str,
+        requester_email: &str,
+        requests_link: &str,
+    ) -> Result<String, minijinja::Error> {
+        let mut env = Environment::new();
+        env.add_template("email", &self.templates.org_join_request)?;
+
+        env.get_template("email")?.render(context! {
+            org_name,
+            requester_name,
+            requester_email,
+            requests_link,
+        })
+    }
+
+    fn render_org_join_approved_body(
+        &self,
+        org_name: &str,
+        role: &str,
+        dashboard_link: &str,
+    ) -> Result<String, minijinja::Error> {
+        let mut env = Environment::new();
+        env.add_template("email", &self.templates.org_join_approved)?;
+
+        env.get_template("email")?.render(context! {
+            org_name,
+            role,
+            dashboard_link,
+        })
+    }
+
     /// Send the verification link to the *new* contact address. The
     /// recipient must click to prove possession of the mailbox; the change
     /// only applies once the old-side has also confirmed.
@@ -917,5 +1006,63 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_org_join_request_body_names_the_requester() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let body = email_service
+            .render_org_join_request_body("Acme", "Dana", "dana@acme.test", "http://localhost:3001/organization")
+            .unwrap();
+
+        assert!(body.contains("Dana"));
+        assert!(body.contains("dana@acme.test"));
+        assert!(body.contains("http://localhost:3001/organization"));
+        assert!(body.contains("Acme"));
+    }
+
+    /// The whole reason this isn't a re-worded `org_invite`: the two emails
+    /// point in opposite directions, and invite copy in an admin's inbox
+    /// would read as though *they* had been invited somewhere.
+    #[tokio::test]
+    async fn test_org_join_request_body_carries_no_invite_copy() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let body = email_service
+            .render_org_join_request_body("Acme", "Dana", "dana@acme.test", "http://localhost:3001/organization")
+            .unwrap();
+
+        assert!(!body.contains("invited"), "this mail is not an invitation");
+        assert!(!body.contains("Accept invite"));
+        assert!(!body.contains("expires"), "join requests have no expiry");
+    }
+
+    #[tokio::test]
+    async fn test_org_join_approved_body_states_the_role() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let body = email_service
+            .render_org_join_approved_body("Acme", "member", "http://localhost:3001")
+            .unwrap();
+
+        assert!(body.contains("Acme"));
+        assert!(body.contains("member"));
+        assert!(body.contains("http://localhost:3001"));
+    }
+
+    /// Every email has an operator override in `templates_dir`. A join-request
+    /// mail falling back to the invite template would be silent and wrong, so
+    /// pin that the three are distinct documents.
+    #[tokio::test]
+    async fn test_join_templates_are_distinct_from_the_invite_template() {
+        let templates = EmailTemplates::embedded();
+
+        assert_ne!(templates.org_join_request, templates.org_invite);
+        assert_ne!(templates.org_join_approved, templates.org_invite);
+        assert_ne!(templates.org_join_request, templates.org_join_approved);
     }
 }
