@@ -673,13 +673,20 @@ fn connect_options(url: &str, slow_threshold: std::time::Duration) -> anyhow::Re
 /// statement to run, rather than at the first bare-table query.
 async fn verify_schema_on_default_search_path(component_name: &str, schema: &str, pooled: &DbPools) -> anyhow::Result<()> {
     for pool in [pooled.write(), pooled.read()] {
+        let mut transaction = pool.begin().await?;
         let (current_schema, search_path): (Option<String>, String) =
             sqlx::query_as("SELECT current_schema(), current_setting('search_path')")
-                .fetch_one(&*pool)
+                .fetch_one(&mut *transaction)
                 .await?;
+        // A leftover session SET must not make a shared login appear correctly
+        // configured. DEFAULT uses the backend's startup default; LOCAL and
+        // rollback preserve its state and are safe through transaction poolers.
+        sqlx::query("SET LOCAL search_path TO DEFAULT").execute(&mut *transaction).await?;
+        let default_schema: Option<String> = sqlx::query_scalar("SELECT current_schema()").fetch_one(&mut *transaction).await?;
+        transaction.rollback().await?;
         anyhow::ensure!(
-            current_schema.as_deref() == Some(schema),
-            "{component_name}: pooled endpoint current_schema() is {current_schema:?}, expected `{schema}` \
+            current_schema.as_deref() == Some(schema) && default_schema.as_deref() == Some(schema),
+            "{component_name}: pooled endpoint current_schema() is {current_schema:?}, default schema is {default_schema:?}, expected `{schema}` \
              (search_path: {search_path}). Configure database.{component_name}.pooled_url and, if needed, \
              replica_url using a component role with ALTER ROLE <component_role> IN DATABASE <db> \
              SET search_path TO \"{schema}\". Recycle existing pooler backends after changing role defaults."
@@ -688,26 +695,243 @@ async fn verify_schema_on_default_search_path(component_name: &str, schema: &str
     Ok(())
 }
 
+/// Prove that an explicit schema endpoint reaches the same live database before
+/// creating schemas or migrating. Names, catalog OIDs and system identifiers can
+/// survive cloning; contention on a fresh database-scoped lock cannot. Both locks
+/// are transaction scoped so errors and cancellation cannot leak session locks.
+async fn verify_same_live_database(component_name: &str, main: &PgPool, component: &PgPool) -> anyhow::Result<()> {
+    let challenge = Uuid::new_v4().as_u128() as i64;
+    let mut main_transaction = main.begin().await?;
+    let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(challenge)
+        .fetch_one(&mut *main_transaction)
+        .await?;
+    anyhow::ensure!(held, "{component_name}: could not acquire live database identity challenge");
+    let mut component_transaction = component.begin().await?;
+    let acquired: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
+        .bind(challenge)
+        .fetch_one(&mut *component_transaction)
+        .await?;
+    component_transaction.rollback().await?;
+    main_transaction.rollback().await?;
+    anyhow::ensure!(
+        !acquired,
+        "{component_name}: schema url must connect to the same live database as main"
+    );
+    Ok(())
+}
+
+/// Validate schema access without changing a pooled backend's session defaults.
+async fn verify_schema_in_transaction(schema: &str, pooled: &DbPools) -> anyhow::Result<()> {
+    for pool in [pooled.write(), pooled.read()] {
+        let mut transaction = pool.begin().await?;
+        sqlx::query(&format!("SET LOCAL search_path TO \"{}\"", schema.replace('"', "\"\"")))
+            .execute(&mut *transaction)
+            .await?;
+        let current: Option<String> = sqlx::query_scalar("SELECT current_schema()").fetch_one(&mut *transaction).await?;
+        anyhow::ensure!(
+            current.as_deref() == Some(schema),
+            "pooled endpoint cannot access schema `{schema}`"
+        );
+        transaction.rollback().await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod pooled_schema_tests {
+    use std::io::{Result as IoResult, Write};
+    use std::sync::Mutex;
+
     use super::*;
+
+    #[tokio::test]
+    async fn startup_does_not_log_schema_credentials() {
+        #[derive(Clone)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> IoResult<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> IoResult<()> {
+                Ok(())
+            }
+        }
+        let captured = Capture(Default::default());
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let config = Config {
+            database: serde_json::from_value(serde_json::json!({
+                "type": "external", "url": "invalid", "fusillade": {
+                    "mode": "schema", "name": "fusillade",
+                    "url": "postgres://fusillade:scoped_password_sentinel@localhost/db"
+                }
+            }))
+            .unwrap(),
+            ..Config::default()
+        };
+        assert!(Application::new_with_pool_and_config_path(config, None, None, None).await.is_err());
+        let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("Starting control layer"), "startup logging must be captured");
+        assert!(
+            !logs.contains("scoped_password_sentinel"),
+            "startup must not log schema credentials"
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn pooled_fusillade_defaults_to_role_schema_validation(pool: PgPool) {
+        let mut endpoint = pool.connect_options().to_url_lossy();
+        endpoint.set_query(None);
+        let component = serde_json::from_value(serde_json::json!({
+            "mode": "schema", "name": "fusillade", "pooled_url": endpoint.as_str(),
+            "pool": {"max_connections": 2, "min_connections": 0}
+        }))
+        .unwrap();
+        let main = db::PoolPair::unsplit(DbPools::new(pool));
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        assert!(
+            result.is_err(),
+            "role_default must reject a shared login whose default schema is public"
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn scoped_schema_rejects_inherited_pooled_identity(pool: PgPool) {
+        let component = serde_json::from_value(serde_json::json!({
+            "mode": "schema", "name": "fusillade", "url": pool.connect_options().to_url_lossy().as_str(),
+            "pooled_schema_mode": "transaction"
+        }))
+        .unwrap();
+        let main = db::PoolPair {
+            direct: DbPools::new(pool.clone()),
+            pooled: DbPools::new(
+                sqlx::postgres::PgPoolOptions::new()
+                    .connect_with(pool.connect_options().as_ref().clone())
+                    .await
+                    .unwrap(),
+            ),
+        };
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        assert!(
+            result.is_err(),
+            "explicit direct credentials must not inherit main pooled credentials"
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn scoped_schema_rejects_outlet_transaction_mode(pool: PgPool) {
+        let component = serde_json::from_value(serde_json::json!({
+            "mode": "schema", "name": "outlet", "pooled_schema_mode": "transaction"
+        }))
+        .unwrap();
+        let main = db::PoolPair::unsplit(DbPools::new(pool));
+        assert!(
+            setup_component_pools("outlet", &component, &main, std::time::Duration::from_secs(1))
+                .await
+                .is_err()
+        );
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn scoped_schema_rejects_other_database_before_creating_schema(pool: PgPool) {
+        let other = sqlx::postgres::PgPoolOptions::new()
+            .connect_with(pool.connect_options().as_ref().clone().database("postgres"))
+            .await
+            .unwrap();
+        let schema = format!("scoped_proof_{}", Uuid::new_v4().simple());
+        let component = serde_json::from_value(serde_json::json!({
+            "mode": "schema", "name": schema, "url": other.connect_options().to_url_lossy().as_str()
+        }))
+        .unwrap();
+        let main = db::PoolPair::unsplit(DbPools::new(pool.clone()));
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        // Clean up even on a failed assertion against the old implementation.
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
+            .bind(&schema)
+            .fetch_one(&other)
+            .await
+            .unwrap();
+        assert!(!exists);
+        assert!(result.is_err(), "schema mode must reject a different live database");
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn scoped_schema_uses_explicit_direct_identity_without_main_replica(pool: PgPool) {
+        let role = format!("scoped_{}", Uuid::new_v4().simple());
+        pool.execute(format!("CREATE ROLE {role} LOGIN PASSWORD 'scoped_test_password'").as_str())
+            .await
+            .unwrap();
+        pool.execute(format!("CREATE SCHEMA fusillade AUTHORIZATION {role}").as_str())
+            .await
+            .unwrap();
+        let endpoint = pool
+            .connect_options()
+            .as_ref()
+            .clone()
+            .username(&role)
+            .password("scoped_test_password")
+            .to_url_lossy();
+        // A main replica configured with another identity must not be inherited.
+        let main = db::PoolPair::unsplit(DbPools::with_replica(pool.clone(), pool.clone()));
+        let component = serde_json::from_value(serde_json::json!({
+            "mode": "schema", "name": "fusillade", "url": endpoint.as_str()
+        }))
+        .unwrap();
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        let (identity, has_replica) = match result {
+            Ok(pair) => {
+                let identity: String = sqlx::query_scalar("SELECT current_user")
+                    .fetch_one(pair.direct.write())
+                    .await
+                    .unwrap();
+                let has_replica = pair.pooled.has_replica();
+                pair.direct.write().close().await;
+                (identity, has_replica)
+            }
+            Err(error) => panic!("explicit direct identity setup failed: {error}"),
+        };
+        pool.execute("DROP SCHEMA fusillade CASCADE").await.unwrap();
+        pool.execute(format!("DROP ROLE {role}").as_str()).await.unwrap();
+        assert_eq!(identity, role);
+        assert!(!has_replica);
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn pooled_role_default_rejects_contaminated_session(pool: PgPool) {
+        pool.execute("CREATE SCHEMA fusillade").await.unwrap();
+        let mut endpoint = pool.connect_options().to_url_lossy();
+        endpoint.set_query(None);
+        let single = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(endpoint.as_str())
+            .await
+            .unwrap();
+        single.execute("SET search_path TO fusillade").await.unwrap();
+        assert!(
+            verify_schema_on_default_search_path("fusillade", "fusillade", &DbPools::new(single))
+                .await
+                .is_err(),
+            "a session override must not be mistaken for a persistent role default"
+        );
+    }
 
     #[sqlx::test]
     async fn pooled_component_endpoint_preserves_retained_response_lifecycle(pool: PgPool) {
         use fusillade_arsenal::manager::{RetainedResponseArchiveCutoffs, RetentionPolicy};
         use fusillade_arsenal::request::{PersistCompletedRealtimeInput, RequestId};
         use fusillade_arsenal::{DaemonStorage, Storage};
-        // A database default models a component role default without creating
-        // cluster-global roles in the test suite. Existing main connections keep
-        // their startup search_path; the explicit pooled URL sends no options.
-        let database = pool.connect_options().get_database().unwrap().to_owned();
-        pool.execute(format!("ALTER DATABASE \"{}\" SET search_path TO fusillade", database.replace('"', "\"\"")).as_str())
-            .await
-            .unwrap();
+        // The shared role retains its public default on the pooled endpoint.
         let mut endpoint = pool.connect_options().to_url_lossy();
         endpoint.set_query(None);
         let component: config::ComponentDb = serde_json::from_value(serde_json::json!({
-            "mode": "schema", "name": "fusillade", "pooled_url": endpoint.as_str(),
+            "mode": "schema", "name": "fusillade", "pooled_schema_mode": "transaction", "pooled_url": endpoint.as_str(),
             "pool": {"max_connections": 2, "min_connections": 0}
         }))
         .unwrap();
@@ -733,10 +957,11 @@ mod pooled_schema_tests {
             ) WHERE batch_id IS NULL AND state IN ('completed', 'failed', 'canceled')
         "#,
         )
-        .execute(pair.pooled.write())
+        .execute(pair.direct.write())
         .await
         .unwrap();
-        let manager = fusillade_arsenal::PostgresRequestManager::new(pair.pooled.clone(), Default::default());
+        let manager =
+            fusillade_arsenal::PostgresRequestManager::new(pair.pooled.clone(), Default::default()).with_query_schema("fusillade");
         assert!(manager.retained_response_archive_index_ready().await.unwrap());
         let now = chrono::Utc::now();
         let request_id = Uuid::new_v4();
@@ -775,7 +1000,7 @@ mod pooled_schema_tests {
             .unwrap();
         assert_eq!(outcome.groups_archived, 1);
         assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM requests")
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM fusillade.requests")
                 .fetch_one(pair.pooled.write())
                 .await
                 .unwrap(),
@@ -788,44 +1013,31 @@ mod pooled_schema_tests {
     }
 
     #[sqlx::test(migrations = false)]
-    async fn pooled_schema_rejects_wrong_replica_default(pool: PgPool) {
-        pool.execute("CREATE SCHEMA fusillade").await.unwrap();
-        let primary = create_schema_pool(
-            "fusillade",
-            pool.connect_options().as_ref().clone(),
-            &config::PoolSettings::default(),
-        )
-        .await
-        .unwrap();
+    async fn pooled_outlet_rejects_wrong_replica_default(pool: PgPool) {
+        pool.execute("CREATE SCHEMA outlet").await.unwrap();
+        let primary = create_schema_pool("outlet", pool.connect_options().as_ref().clone(), &config::PoolSettings::default())
+            .await
+            .unwrap();
         let replica = create_schema_pool(
-            "public,fusillade",
+            "public,outlet",
             pool.connect_options().as_ref().clone(),
             &config::PoolSettings::default(),
         )
         .await
         .unwrap();
         let pools = DbPools::with_replica(primary, replica);
-        assert!(
-            verify_schema_on_default_search_path("fusillade", "fusillade", &pools)
-                .await
-                .is_err()
-        );
+        assert!(verify_schema_on_default_search_path("outlet", "outlet", &pools).await.is_err());
     }
 
     #[sqlx::test(migrations = false)]
-    async fn pooled_schema_rejects_visible_but_noncurrent_schema(pool: PgPool) {
-        pool.execute("CREATE SCHEMA fusillade").await.unwrap();
+    async fn pooled_outlet_rejects_visible_but_noncurrent_schema(pool: PgPool) {
+        pool.execute("CREATE SCHEMA outlet").await.unwrap();
         let pooled = sqlx::postgres::PgPoolOptions::new()
-            .connect_with(
-                pool.connect_options()
-                    .as_ref()
-                    .clone()
-                    .options([("search_path", "public,fusillade")]),
-            )
+            .connect_with(pool.connect_options().as_ref().clone().options([("search_path", "public,outlet")]))
             .await
             .unwrap();
         assert!(
-            verify_schema_on_default_search_path("fusillade", "fusillade", &DbPools::new(pooled))
+            verify_schema_on_default_search_path("outlet", "outlet", &DbPools::new(pooled))
                 .await
                 .is_err()
         );
@@ -834,9 +1046,9 @@ mod pooled_schema_tests {
 
 /// Pooled/direct pools for a component database (fusillade, outlet).
 ///
-/// Schema mode uses the main direct endpoint for migrations, with a pinned
-/// search_path. Pooled traffic can use a component-specific endpoint and role
-/// whose default schema preserves retention identity. Dedicated mode has its
+/// Schema mode uses its explicit direct URL or the main direct endpoint for
+/// migrations, with a pinned search_path. Pooled queries default to a verified
+/// role schema; Fusillade also supports explicit transaction mode. Dedicated mode has its
 /// own `url` and optional `pooled_url`. Without a pooled endpoint, the pair is
 /// unsplit and sized by `pool`, preserving the existing connection behavior.
 async fn setup_component_pools(
@@ -845,10 +1057,15 @@ async fn setup_component_pools(
     main: &db::PoolPair,
     slow_threshold: std::time::Duration,
 ) -> anyhow::Result<db::PoolPair> {
+    component
+        .validate_schema_pooling(component_name, main.is_split())
+        .map_err(anyhow::Error::msg)?;
     let replica_settings = component.replica_pool_settings();
     match component {
         config::ComponentDb::Schema {
             name,
+            url,
+            pooled_schema_mode,
             pool,
             direct_pool,
             pooled_url,
@@ -858,22 +1075,37 @@ async fn setup_component_pools(
             let split = main.is_split() || pooled_url.is_some();
             let direct = create_schema_pool(
                 name,
-                main.direct.write().connect_options().as_ref().clone(),
+                match url {
+                    Some(url) => connect_options(url, slow_threshold)?,
+                    None => main.direct.write().connect_options().as_ref().clone(),
+                },
                 if split { direct_pool } else { pool },
             )
             .await?;
-            direct
-                .execute(&*format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", name.replace('"', "\"\"")))
+            if url.is_some() {
+                verify_same_live_database(component_name, &main.direct.write(), &direct).await?;
+            }
+            // Even CREATE SCHEMA IF NOT EXISTS requires database-wide CREATE.
+            // A scoped owner can migrate its existing schema without that grant.
+            let schema_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
+                .bind(name)
+                .fetch_one(&direct)
                 .await?;
+            if !schema_exists {
+                direct
+                    .execute(&*format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", name.replace('"', "\"\"")))
+                    .await?;
+            }
             let replica_options = match replica_url {
                 Some(url) => Some(connect_options(url, slow_threshold)?),
-                None if main.pooled.has_replica() => Some(main.pooled.read().connect_options().as_ref().clone()),
+                None if url.is_none() && main.pooled.has_replica() => Some(main.pooled.read().connect_options().as_ref().clone()),
                 None => None,
             };
             if split {
                 // Transaction poolers cannot preserve a session SET search_path.
-                // Each component role must have the right server-side default;
-                // never add startup options to a pooled endpoint.
+                // Explicit Fusillade transaction mode selects its schema locally;
+                // role-default mode requires a matching server-side default. Never
+                // add startup options to a pooled endpoint.
                 let options = match pooled_url {
                     Some(url) => connect_options(url, slow_threshold)?,
                     None => main.pooled.write().connect_options().as_ref().clone(),
@@ -883,7 +1115,11 @@ async fn setup_component_pools(
                     Some(options) => DbPools::with_replica(primary, db::pool_options(replica_settings).connect_with(options).await?),
                     None => DbPools::new(primary),
                 };
-                verify_schema_on_default_search_path(component_name, name, &pooled).await?;
+                if *pooled_schema_mode == config::PooledSchemaMode::Transaction {
+                    verify_schema_in_transaction(name, &pooled).await?;
+                } else {
+                    verify_schema_on_default_search_path(component_name, name, &pooled).await?;
+                }
                 Ok(db::PoolPair {
                     pooled,
                     direct: DbPools::new(direct),
@@ -1308,7 +1544,7 @@ async fn setup_database(
                 )
             "#,
         )
-        .fetch_one(fusillade.pooled.write())
+        .fetch_one(fusillade.direct.write())
         .await
         .map_err(|error| anyhow::anyhow!("failed to inspect retained-response retirement recovery state: {error}"))?;
         let required = partition_maintenance_required(
@@ -1325,16 +1561,6 @@ async fn setup_database(
                     if let Some(url) = daemon.retained_response_partition_maintenance_url.as_ref() {
                         PgConnectOptions::from_str(url.expose())?.options([("search_path", name.as_str())])
                     } else {
-                        // This also covers recovery discovered by preflight after
-                        // retirement flags have been disabled. Pooled component
-                        // roles may differ from the main migration role; the
-                        // maintenance attestation requires exact role identity.
-                        anyhow::ensure!(
-                            !fusillade.is_split(),
-                            "retained-response recovery on a pooled schema requires an explicit direct session endpoint \
-                             in background_services.batch_daemon.retained_response_partition_maintenance_url \
-                             using the same role as fusillade query traffic"
-                        );
                         // Schema mode: use the component's DIRECT pool options —
                         // a real session (never the pooled endpoint), carrying
                         // the component search_path startup option.
@@ -3822,7 +4048,7 @@ impl Application {
         pool: Option<PgPool>,
         tracer_provider: Option<telemetry::SdkTracerProvider>,
     ) -> anyhow::Result<Self> {
-        debug!("Starting control layer with configuration: {:#?}", config);
+        debug!("Starting control layer");
 
         // Setup database connections, run migrations, and initialize data
         let (_embedded_db, pools, partition_maintenance_pool) = setup_database(&config, pool).await?;
@@ -3899,6 +4125,15 @@ impl Application {
         .with_batch_insert_strategy(fusillade_arsenal::BatchInsertStrategy::Batched {
             batch_size: config.batches.files.batch_insert_size,
         });
+        if pools.fusillade.is_split()
+            && let config::ComponentDb::Schema {
+                name,
+                pooled_schema_mode: config::PooledSchemaMode::Transaction,
+                ..
+            } = config.database.fusillade()
+        {
+            request_manager = request_manager.with_query_schema(name.clone());
+        }
         if let Some(partition_maintenance_pool) = partition_maintenance_pool {
             request_manager = request_manager
                 .with_partition_maintenance_pool(partition_maintenance_pool)?
@@ -3968,7 +4203,7 @@ impl Application {
 
         // Register onwards as a fusillade daemon so realtime requests get a valid daemon_id.
         let onwards_daemon_id = uuid::Uuid::new_v4();
-        let fusillade_write_pool = sqlx_pool_router::DynPools::new(bg_services.request_manager.pools().clone());
+        let fusillade_write_pool = sqlx_pool_router::DynPools::new(pools.fusillade.direct.clone());
         let daemon_insert_result = sqlx::query(
             "INSERT INTO daemons (id, hostname, pid, version, config_snapshot, status, started_at, last_heartbeat)
              VALUES ($1, $2, $3, $4, $5, 'running', NOW(), NOW())",

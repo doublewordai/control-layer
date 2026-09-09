@@ -155,6 +155,7 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     partition_maintenance_lease_owner: Uuid,
     state_write_limiter: StateWriteLimiter,
     db_retry_config: crate::DbRetryConfig,
+    query_schema: Option<Arc<str>>,
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
     /// TRANSITIONAL ZDR hook - see [`crate::transform`]. Transforms response/
@@ -389,6 +390,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             partition_maintenance_lease_owner: Uuid::new_v4(),
             state_write_limiter,
             db_retry_config: crate::DbRetryConfig::default(),
+            query_schema: None,
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             response_transformer: std::sync::OnceLock::new(),
@@ -511,7 +513,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             WHERE namespace.nspname = current_schema()
         "#;
         let ordinary: Option<MaintenanceTarget> = sqlx::query_as(target_sql)
-            .fetch_optional(self.pools.write())
+            .fetch_optional(self.write_executor())
             .await
             .map_err(|_| {
                 FusilladeError::ValidationError(
@@ -600,6 +602,16 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         Ok(self)
     }
 
+    /// Select this schema within every query transaction instead of relying on
+    /// connection session state. This permits sharing transaction-pooler roles
+    /// and endpoints with other components. Dedicated session maintenance pools
+    /// must still have their own connection-level schema setting.
+    pub fn with_query_schema(mut self, schema: impl Into<String>) -> Self {
+        self.query_schema = Some(Arc::from(schema.into()));
+        self.partition_maintenance_attested = false;
+        self
+    }
+
     /// Set the retry cadence for transient database failures.
     ///
     /// The manager retries errors that look like SQLx pool-acquire timeouts,
@@ -619,22 +631,35 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
     fn read_executor(&self) -> crate::db::RetryingPgPool {
         crate::db::RetryingPgPool::new(&self.pools.read(), &self.db_retry_config)
+            .with_schema(self.query_schema.clone())
     }
 
     fn write_executor(&self) -> crate::db::RetryingPgPool {
         crate::db::RetryingPgPool::new(&self.pools.write(), &self.db_retry_config)
+            .with_schema(self.query_schema.clone())
     }
 
     async fn begin_read(
         &self,
     ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
-        crate::db::begin_transaction(&self.pools.read(), &self.db_retry_config).await
+        crate::db::begin_transaction_in_schema(
+            &self.pools.read(),
+            &self.db_retry_config,
+            self.query_schema.as_deref(),
+        )
+        .await
     }
 
-    async fn begin_write(
+    /// Begin a primary transaction with the configured component schema.
+    pub async fn begin_write(
         &self,
     ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
-        crate::db::begin_transaction(&self.pools.write(), &self.db_retry_config).await
+        crate::db::begin_transaction_in_schema(
+            &self.pools.write(),
+            &self.db_retry_config,
+            self.query_schema.as_deref(),
+        )
+        .await
     }
 
     async fn begin_response_write(
@@ -644,6 +669,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         retained_response::begin_response_write_transaction(
             &self.pools.write(),
             &self.db_retry_config,
+            self.query_schema.as_deref(),
             object_ids,
         )
         .await
@@ -1319,13 +1345,17 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     async fn finalize_file_size(
         pool: &PgPool,
         retry_config: &crate::DbRetryConfig,
+        query_schema: Option<&str>,
         file_id: FileId,
         estimated_size: i64,
     ) -> Result<bool> {
         let lock_key = Self::file_lock_key(file_id);
-        let mut transaction = crate::db::begin_transaction(pool, retry_config)
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+        let mut transaction =
+            crate::db::begin_transaction_in_schema(pool, retry_config, query_schema)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+                })?;
 
         // A transaction-scoped lock keeps lock ownership, the guarded update,
         // and lock release on one server transaction. This remains correct
@@ -1415,11 +1445,13 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 // Spawn background finalization - don't block listing
                 let pools = self.pools.clone();
                 let retry_config = self.db_retry_config.clone();
+                let query_schema = self.query_schema.clone();
 
                 tokio::spawn(async move {
                     if let Err(e) = Self::finalize_file_size(
                         &pools.write(),
                         &retry_config,
+                        query_schema.as_deref(),
                         file_id,
                         estimated_size,
                     )
@@ -1486,6 +1518,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         let finalized = Self::finalize_file_size(
             &self.pools.write(),
             &self.db_retry_config,
+            self.query_schema.as_deref(),
             file.id,
             estimated_size,
         )
@@ -4001,6 +4034,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // connection-budget re-division and must follow the swap.
         let pools = self.pools.clone();
         let retry_config = self.db_retry_config.clone();
+        let query_schema = self.query_schema.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
@@ -4014,7 +4048,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 "#,
                 *file_id as Uuid,
             )
-            .fetch_one(crate::db::RetryingPgPool::new(&pools.read(), &retry_config))
+            .fetch_one(
+                crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                    .with_schema(query_schema.clone()),
+            )
             .await;
 
             let purpose = match file_result {
@@ -4033,18 +4070,35 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             // Route to appropriate streaming logic based on purpose
             match purpose.as_deref() {
                 Some("batch_output") => {
-                    Self::stream_batch_output(pools, retry_config, file_id, offset, search, tx)
-                        .await;
+                    Self::stream_batch_output(
+                        pools,
+                        retry_config,
+                        query_schema,
+                        file_id,
+                        offset,
+                        search,
+                        tx,
+                    )
+                    .await;
                 }
                 Some("batch_error") => {
-                    Self::stream_batch_error(pools, retry_config, file_id, offset, search, tx)
-                        .await;
+                    Self::stream_batch_error(
+                        pools,
+                        retry_config,
+                        query_schema,
+                        file_id,
+                        offset,
+                        search,
+                        tx,
+                    )
+                    .await;
                 }
                 _ => {
                     // Regular file or purpose='batch': stream request templates
                     Self::stream_request_templates(
                         pools,
                         retry_config,
+                        query_schema,
                         file_id,
                         offset,
                         search,
@@ -6322,12 +6376,21 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // Live provider (see get_file_content_stream).
         let pools = self.pools.clone();
         let retry_config = self.db_retry_config.clone();
+        let query_schema = self.query_schema.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
         tokio::spawn(async move {
-            Self::stream_batch_results(pools, retry_config, batch_id, offset, search, status, tx)
-                .await;
+            Self::stream_batch_results(
+                pools,
+                retry_config,
+                query_schema,
+                batch_id,
+                offset,
+                (search, status),
+                tx,
+            )
+            .await;
         });
 
         Box::pin(ReceiverStream::new(rx))
@@ -7751,6 +7814,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     async fn stream_request_templates(
         pools: P,
         retry_config: crate::DbRetryConfig,
+        query_schema: Option<Arc<str>>,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -7793,7 +7857,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 BATCH_SIZE,
                 search_pattern.as_deref(),
             )
-            .fetch_all(crate::db::RetryingPgPool::new(&pools.read(), &retry_config))
+            .fetch_all(
+                crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                    .with_schema(query_schema.clone()),
+            )
             .await;
 
             match template_batch {
@@ -7847,6 +7914,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     async fn stream_batch_output(
         pools: P,
         retry_config: crate::DbRetryConfig,
+        query_schema: Option<Arc<str>>,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -7874,7 +7942,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             "#,
             *file_id as Uuid,
         )
-        .fetch_one(crate::db::RetryingPgPool::new(&pools.read(), &retry_config))
+        .fetch_one(
+            crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                .with_schema(query_schema.clone()),
+        )
         .await;
 
         let (batch_id, bucket) = match batch_result {
@@ -7941,7 +8012,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 search_pattern.as_deref(),
                 bucket,
             )
-            .fetch_all(crate::db::RetryingPgPool::new(&pools.read(), &retry_config))
+            .fetch_all(crate::db::RetryingPgPool::new(&pools.read(), &retry_config).with_schema(query_schema.clone()))
             .await;
 
             match request_batch {
@@ -8011,6 +8082,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     async fn stream_batch_error(
         pools: P,
         retry_config: crate::DbRetryConfig,
+        query_schema: Option<Arc<str>>,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -8033,7 +8105,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             "#,
             *file_id as Uuid,
         )
-        .fetch_one(crate::db::RetryingPgPool::new(&pools.read(), &retry_config))
+        .fetch_one(
+            crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                .with_schema(query_schema.clone()),
+        )
         .await;
 
         let (batch_id, bucket, _expires_at) = match batch_result {
@@ -8110,7 +8185,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
             let request_batch = query_builder
                 .build()
-                .fetch_all(crate::db::RetryingPgPool::new(&pools.read(), &retry_config))
+                .fetch_all(
+                    crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                        .with_schema(query_schema.clone()),
+                )
                 .await;
 
             match request_batch {
@@ -8167,13 +8245,14 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     async fn stream_batch_results(
         pools: P,
         retry_config: crate::DbRetryConfig,
+        query_schema: Option<Arc<str>>,
         batch_id: BatchId,
         offset: i64,
-        search: Option<String>,
-        status: Option<String>,
+        filters: (Option<String>, Option<String>),
         tx: mpsc::Sender<Result<crate::batch::BatchResultItem>>,
     ) {
         use crate::batch::{BatchResultItem, BatchResultStatus};
+        let (search, status) = filters;
 
         // First, get the file_id and expires_at from the batch
         // This allows us to query by file_id to avoid duplicates from SLA escalation
@@ -8182,7 +8261,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             r#"SELECT file_id, expires_at, archive_bucket FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
             *batch_id as Uuid,
         )
-        .fetch_optional(crate::db::RetryingPgPool::new(&pools.read(), &retry_config))
+        .fetch_optional(crate::db::RetryingPgPool::new(&pools.read(), &retry_config).with_schema(query_schema.clone()))
         .await
         {
             Ok(Some(row)) => {
@@ -8304,7 +8383,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             // For each template, we find the matching request for this batch.
             let request_batch = query_builder
                 .build()
-                .fetch_all(crate::db::RetryingPgPool::new(&pools.read(), &retry_config))
+                .fetch_all(
+                    crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                        .with_schema(query_schema.clone()),
+                )
                 .await;
 
             match request_batch {
