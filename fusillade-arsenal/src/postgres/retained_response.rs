@@ -1630,35 +1630,8 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
         retained.service_tier,
         'completed'::text AS outcome,
         COUNT(*)::BIGINT AS count
-    FROM retained_response_buckets bucket
-    JOIN pg_namespace namespace
-      ON namespace.nspname = bucket.partition_schema
-    JOIN pg_class child
-      ON child.relnamespace = namespace.oid
-     AND child.relname = bucket.partition_table
-     AND child.oid = bucket.partition_oid
-    JOIN pg_inherits inheritance
-      ON inheritance.inhrelid = child.oid
-     AND NOT inheritance.inhdetachpending
-    JOIN retained_response_objects retained
-      ON retained.delete_on = bucket.delete_on
-     AND retained.object_kind = 'request'
-    JOIN retained_response_request_routes route
-      ON route.request_id = retained.object_id
-     AND route.group_id = retained.group_id
-     AND route.delete_on = retained.delete_on
-    JOIN retained_response_group_routes group_route
-      ON group_route.group_id = retained.group_id
-     AND group_route.delete_on = retained.delete_on
-    WHERE bucket.state = 'active'
-      AND bucket.partition_schema = current_schema()
-      AND bucket.partition_table =
-          'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
-      AND inheritance.inhparent =
-          to_regclass(format('%I.retained_response_objects', current_schema()))
-      AND pg_get_expr(child.relpartbound, child.oid) = format(
-          'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
-      )
+    FROM retained_response_objects retained
+    WHERE retained.object_kind = 'request'
       AND retained.state = 'completed'
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
@@ -1674,6 +1647,39 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       -- bound: V1 proves terminal_at < delete_on.
       AND retained.delete_on >= COALESCE($7::date, ($1 AT TIME ZONE 'UTC')::date + 1)
       AND ($8::date IS NULL OR retained.delete_on <= $8::date)
+      -- Bucket fence as a semi-join over the (small) bucket registry with
+      -- the same catalog identity checks every retained read applies:
+      -- retiring/retired buckets and any partition that no longer matches
+      -- its registered identity contribute nothing. This is a count, so the
+      -- per-row route joins and the live anti-join the point/list readers
+      -- carry are deliberately absent: a move deletes the live row and
+      -- inserts the retained object in one transaction, so a request is
+      -- never visible on both sides, and route rows exist for every object
+      -- of an active bucket. With the mover keeping up, a trailing hour is
+      -- ~150k retained rows; three index probes per row put the previous
+      -- shape past the 60s statement timeout (2026-09-09).
+      AND retained.delete_on IN (
+          SELECT bucket.delete_on
+          FROM retained_response_buckets bucket
+          JOIN pg_namespace namespace
+            ON namespace.nspname = bucket.partition_schema
+          JOIN pg_class child
+            ON child.relnamespace = namespace.oid
+           AND child.relname = bucket.partition_table
+           AND child.oid = bucket.partition_oid
+          JOIN pg_inherits inheritance
+            ON inheritance.inhrelid = child.oid
+           AND NOT inheritance.inhdetachpending
+          WHERE bucket.state = 'active'
+            AND bucket.partition_schema = current_schema()
+            AND bucket.partition_table =
+                'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+            AND inheritance.inhparent =
+                to_regclass(format('%I.retained_response_objects', current_schema()))
+            AND pg_get_expr(child.relpartbound, child.oid) = format(
+                'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+            )
+      )
       AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
       AND retained.service_tier IS DISTINCT FROM 'background'
       AND (
@@ -1687,10 +1693,6 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
               OR (retained.service_tier IS NOT NULL AND retained.service_tier <> ALL($4))
           ))
       )
-      AND NOT EXISTS (
-          SELECT 1 FROM requests live
-          WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
-      )
     GROUP BY retained.model, retained.service_tier
 
     UNION ALL
@@ -1700,35 +1702,8 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
         retained.service_tier,
         'failed'::text AS outcome,
         COUNT(*)::BIGINT AS count
-    FROM retained_response_buckets bucket
-    JOIN pg_namespace namespace
-      ON namespace.nspname = bucket.partition_schema
-    JOIN pg_class child
-      ON child.relnamespace = namespace.oid
-     AND child.relname = bucket.partition_table
-     AND child.oid = bucket.partition_oid
-    JOIN pg_inherits inheritance
-      ON inheritance.inhrelid = child.oid
-     AND NOT inheritance.inhdetachpending
-    JOIN retained_response_objects retained
-      ON retained.delete_on = bucket.delete_on
-     AND retained.object_kind = 'request'
-    JOIN retained_response_request_routes route
-      ON route.request_id = retained.object_id
-     AND route.group_id = retained.group_id
-     AND route.delete_on = retained.delete_on
-    JOIN retained_response_group_routes group_route
-      ON group_route.group_id = retained.group_id
-     AND group_route.delete_on = retained.delete_on
-    WHERE bucket.state = 'active'
-      AND bucket.partition_schema = current_schema()
-      AND bucket.partition_table =
-          'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
-      AND inheritance.inhparent =
-          to_regclass(format('%I.retained_response_objects', current_schema()))
-      AND pg_get_expr(child.relpartbound, child.oid) = format(
-          'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
-      )
+    FROM retained_response_objects retained
+    WHERE retained.object_kind = 'request'
       AND retained.state = 'failed'
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
@@ -1744,6 +1719,39 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       -- bound: V1 proves terminal_at < delete_on.
       AND retained.delete_on >= COALESCE($7::date, ($1 AT TIME ZONE 'UTC')::date + 1)
       AND ($8::date IS NULL OR retained.delete_on <= $8::date)
+      -- Bucket fence as a semi-join over the (small) bucket registry with
+      -- the same catalog identity checks every retained read applies:
+      -- retiring/retired buckets and any partition that no longer matches
+      -- its registered identity contribute nothing. This is a count, so the
+      -- per-row route joins and the live anti-join the point/list readers
+      -- carry are deliberately absent: a move deletes the live row and
+      -- inserts the retained object in one transaction, so a request is
+      -- never visible on both sides, and route rows exist for every object
+      -- of an active bucket. With the mover keeping up, a trailing hour is
+      -- ~150k retained rows; three index probes per row put the previous
+      -- shape past the 60s statement timeout (2026-09-09).
+      AND retained.delete_on IN (
+          SELECT bucket.delete_on
+          FROM retained_response_buckets bucket
+          JOIN pg_namespace namespace
+            ON namespace.nspname = bucket.partition_schema
+          JOIN pg_class child
+            ON child.relnamespace = namespace.oid
+           AND child.relname = bucket.partition_table
+           AND child.oid = bucket.partition_oid
+          JOIN pg_inherits inheritance
+            ON inheritance.inhrelid = child.oid
+           AND NOT inheritance.inhdetachpending
+          WHERE bucket.state = 'active'
+            AND bucket.partition_schema = current_schema()
+            AND bucket.partition_table =
+                'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+            AND inheritance.inhparent =
+                to_regclass(format('%I.retained_response_objects', current_schema()))
+            AND pg_get_expr(child.relpartbound, child.oid) = format(
+                'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+            )
+      )
       AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
       AND retained.service_tier IS DISTINCT FROM 'background'
       AND (
@@ -1756,10 +1764,6 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
               (retained.service_tier IS NULL AND NOT $5)
               OR (retained.service_tier IS NOT NULL AND retained.service_tier <> ALL($4))
           ))
-      )
-      AND NOT EXISTS (
-          SELECT 1 FROM requests live
-          WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
       )
     GROUP BY retained.model, retained.service_tier
     ) terminal_counts

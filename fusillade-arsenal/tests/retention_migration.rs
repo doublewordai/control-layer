@@ -4,6 +4,59 @@ use fusillade_arsenal::MIGRATOR;
 
 const RETENTION_MIGRATION: i64 = 20260818000000;
 
+/// The trailing-demand query filters retained request objects by a
+/// terminal_at window; the (state, terminal_at) index must exist on the
+/// partitioned parent so every daily partition — including ones created
+/// later by the runway — carries it.
+#[sqlx::test]
+async fn retained_response_terminal_index_reaches_new_partitions(pool: sqlx::PgPool) {
+    MIGRATOR.run(&pool).await.unwrap();
+
+    let parent_definition: Option<String> = sqlx::query_scalar(
+        r#"
+        SELECT indexdef FROM pg_indexes
+        WHERE schemaname = current_schema()
+          AND tablename = 'retained_response_objects'
+          AND indexname = 'idx_retained_response_objects_state_terminal'
+        "#,
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    let parent_definition = parent_definition.expect("parent index must exist");
+    assert!(
+        parent_definition.contains("(state, terminal_at)")
+            && parent_definition.contains("WHERE (object_kind = 'request'::text)"),
+        "unexpected parent index definition: {parent_definition}"
+    );
+
+    sqlx::query("SELECT ensure_retained_response_partition(DATE '2027-03-01')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let child_attached: bool = sqlx::query_scalar(
+        r#"
+        SELECT EXISTS (
+            SELECT 1
+            FROM pg_inherits
+            JOIN pg_class child ON child.oid = pg_inherits.inhrelid
+            JOIN pg_index child_index ON child_index.indexrelid = child.oid
+            JOIN pg_class heap ON heap.oid = child_index.indrelid
+            WHERE pg_inherits.inhparent =
+                  'idx_retained_response_objects_state_terminal'::regclass
+              AND heap.relname = 'retained_response_objects_d20270301'
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        child_attached,
+        "a partition created after the migration must carry the terminal index"
+    );
+}
+
 #[sqlx::test]
 async fn retained_response_retirement_journal_requires_full_daily_identity(pool: sqlx::PgPool) {
     let columns: Vec<String> = sqlx::query_scalar(
