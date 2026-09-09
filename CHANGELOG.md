@@ -1,5 +1,12 @@
 # Changelog
 
+## [11.7.0](https://github.com/doublewordai/control-layer/compare/v11.6.3...v11.7.0) (2026-09-09)
+
+
+### Features
+
+* **organizations:** notify owners of a join request, and the requester on approval ([#1724](https://github.com/doublewordai/control-layer/issues/1724)) ([c45cb28](https://github.com/doublewordai/control-layer/commit/c45cb28b60334ea3c7eb998bd0ba2d66fe47f867))
+
 ## [11.6.3](https://github.com/doublewordai/control-layer/compare/v11.6.2...v11.6.3) (2026-09-09)
 
 
