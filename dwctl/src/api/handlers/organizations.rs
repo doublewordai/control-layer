@@ -4335,7 +4335,10 @@ mod tests {
         assert!(emails.contains(&owner.email), "the owner decides");
         assert!(emails.contains(&admin.email), "admins decide");
         assert!(!emails.contains(&member.email), "a plain member cannot approve");
-        assert!(!emails.contains(&joiner.email), "the requester is not notified of their own request");
+        assert!(
+            !emails.contains(&joiner.email),
+            "the requester is not notified of their own request"
+        );
         assert_eq!(emails.len(), 2);
     }
 

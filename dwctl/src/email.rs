@@ -637,12 +637,7 @@ impl EmailService {
         })
     }
 
-    fn render_org_join_approved_body(
-        &self,
-        org_name: &str,
-        role: &str,
-        dashboard_link: &str,
-    ) -> Result<String, minijinja::Error> {
+    fn render_org_join_approved_body(&self, org_name: &str, role: &str, dashboard_link: &str) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
         env.add_template("email", &self.templates.org_join_approved)?;
 
