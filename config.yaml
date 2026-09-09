@@ -40,12 +40,15 @@ database:
   #   max_connections: 8
   #   min_connections: 0
   #
-  # Fusillade inherits the main pooled endpoint and credentials. It selects its
-  # schema inside each query transaction, leaving the shared role default intact.
-  # Outlet requires its own endpoint with default search_path = outlet because
-  # its client does not select a transaction-local schema. Migrations use the
-  # main direct role; the outlet role must have privileges on migrated objects.
-  # Recycle existing pooler backends after changing outlet role defaults.
+  # Schema components default to pooled_schema_mode: role_default. Give each
+  # component a login whose persistent search_path selects its schema, using
+  # both url (direct migrations/session work) and pooled_url (query traffic).
+  # The direct schema URL must reach the same live database as main; startup
+  # verifies this before creating the schema or running component migrations.
+  # Recycle existing pooler backends after changing role defaults.
+  # Fusillade can instead share the main credentials with explicit
+  # pooled_schema_mode: transaction, which selects the schema in each query
+  # transaction. Outlet supports only role_default.
 
   # Main database pool settings for primary (and replica if not specified separately)
   # pool:
@@ -80,9 +83,16 @@ database:
   # fusillade:
   #   mode: schema
   #   name: fusillade
-  #   # Optional overrides; otherwise inherits the main pooled credentials:
-  #   # pooled_url: postgres://postgres:password@pooler:6432/dwctl
-  #   # replica_url: postgres://postgres:password@replica-pooler:6432/dwctl
+  #   # Scoped identity: use the same role for migrations, queries and maintenance.
+  #   # url: postgres://fusillade:password@localhost:5432/dwctl
+  #   # pooled_url: postgres://fusillade:password@pooler:6432/dwctl
+  #   # pooled_schema_mode: role_default # default; verify primary and replica
+  #   # replica_url: postgres://fusillade:password@replica-pooler:6432/dwctl
+  #   # An explicit url never inherits the main replica: reads fall back to this
+  #   # primary unless replica_url is set. With a main pooler, an explicit url
+  #   # also requires an explicit pooled_url to avoid changing query credentials.
+  #   # Shared main login compatibility: omit url and use
+  #   # pooled_schema_mode: transaction (Fusillade only).
   #   # direct_pool:
   #   #   max_connections: 2
   #   pool:
@@ -111,6 +121,8 @@ database:
   # outlet:
   #   mode: schema
   #   name: outlet
+  #   # url: postgres://outlet_pool:password@localhost:5432/dwctl
+  #   # pooled_schema_mode: role_default
   #   # pooled_url: postgres://outlet_pool:password@pooler:6432/dwctl
   #   # replica_url: postgres://outlet_pool:password@replica-pooler:6432/dwctl
   #   pool:

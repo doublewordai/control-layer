@@ -1,6 +1,6 @@
 # Transaction-pooled application tests
 
-The `dwctl / pooled database e2e` CI job runs the built application image against
+The `dwctl / pooled database e2e` CI matrix runs the built application image against
 PostgreSQL and PgBouncer. Merge groups, fork PRs, and Dependabot use a locally
 built binary when image publication is skipped. The required `workspace / rust gate` depends on this job.
 It runs on ordinary pull requests and merge-group checks, with the same
@@ -28,15 +28,21 @@ The application checks cover:
 Only the external model provider is replaced by a deterministic local HTTP server.
 Primary and replica query pools target the same PostgreSQL instance; this job does
 not simulate replication lag. It does not run browser, external provider, email,
-or webhook delivery tests. Fusillade inherits the main pooled endpoint and its
-non-superuser credentials with a `public` default schema; there is no separate
-Fusillade role or maintenance URL. Outlet uses its own schema-default role,
+or webhook delivery tests. The `shared` case gives Fusillade the main pooled
+endpoint and non-superuser credentials with a `public` default, explicitly
+selecting transaction-local schema mode. The `scoped` case gives Fusillade a
+separate SQL-created owner login and explicit direct, pooled and replica URLs,
+selecting `role_default`. It verifies isolation from main tables and ownership
+of migrated and newly created objects. The non-superuser main role creates the
+Fusillade role through PostgreSQL's creator ADMIN grant; Fusillade never inherits
+the main role. Neither case needs an explicit maintenance URL.
+Outlet uses its own schema-default role,
 which inherits the migration/table-owner role. Diagnostic application and PgBouncer logs are uploaded
 on success or failure. Temporary databases, roles, and processes are cleaned up.
 
 ## Run locally
 
-Requires Python 3.12+, PostgreSQL 16+ running locally with an administrative test
+Requires Python 3.12+, PostgreSQL 17+ running locally with an administrative test
 user, and PgBouncer 1.21+ on PATH. Use a disposable PostgreSQL instance: the harness
 creates a uniquely named database and roles and removes only those resources.
 Do not run PgBouncer as root.
@@ -47,7 +53,8 @@ python3 -m venv /tmp/pooled-e2e-venv
 cargo build -p dwctl
 POOLED_TEST_DATABASE_URL=postgres://postgres:password@127.0.0.1:5432/postgres \
   /tmp/pooled-e2e-venv/bin/python scripts/tests/pooled/e2e.py \
-  --binary target/debug/dwctl --artifacts /tmp/pooled-e2e-results
+  --binary target/debug/dwctl --schema-mode scoped --artifacts /tmp/pooled-e2e-scoped
+# Run again with --schema-mode shared --artifacts /tmp/pooled-e2e-shared.
 ```
 
 On Linux, `--image IMAGE` runs the same checks against an application image using

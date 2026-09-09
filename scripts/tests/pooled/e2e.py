@@ -222,7 +222,82 @@ def characterize_pool(pooled, direct):
     )
 
 
-def flows(app, connection, pool_admin, model_url, roles, admin_dsn):
+def verify_scoped_identity(direct, pooled_dsn, main_role):
+    """Verify migrated and future objects are owned by the isolated login."""
+    owner, superuser, create_role = direct.execute(
+        "SELECT current_user, rolsuper, rolcreaterole FROM pg_roles WHERE rolname=current_user"
+    ).fetchone()
+    check(not superuser and not create_role, "Fusillade has elevated role privileges")
+    check(
+        not direct.execute("SELECT pg_has_role(%s, 'MEMBER')", (main_role,)).fetchone()[
+            0
+        ],
+        "Fusillade must not inherit the main application role",
+    )
+    check(
+        not direct.execute(
+            "SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname='neon_superuser' "
+            "AND pg_has_role(oid, 'MEMBER'))"
+        ).fetchone()[0],
+        "Fusillade must not inherit neon_superuser",
+    )
+    check(
+        direct.execute(
+            "SELECT nspowner=current_user::regrole FROM pg_namespace WHERE nspname='fusillade'"
+        ).fetchone()[0],
+        "Fusillade does not own its schema",
+    )
+    drift = direct.execute(
+        """
+        SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
+        WHERE n.nspname='fusillade' AND c.relowner <> current_user::regrole
+        UNION ALL
+        SELECT p.proname FROM pg_proc p JOIN pg_namespace n ON n.oid=p.pronamespace
+        WHERE n.nspname='fusillade' AND p.proowner <> current_user::regrole
+        UNION ALL
+        SELECT t.typname FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace
+        WHERE n.nspname='fusillade' AND t.typowner <> current_user::regrole
+        """
+    ).fetchall()
+    check(not drift, f"Fusillade object ownership drift: {drift}")
+    check(
+        direct.execute("SELECT count(*) FROM fusillade._sqlx_migrations").fetchone()[0]
+        > 0,
+        "Fusillade migrations did not run as the scoped identity",
+    )
+    with psycopg.connect(pooled_dsn, autocommit=True) as pooled:
+        for connection in (direct, pooled):
+            check(
+                connection.execute("SELECT current_user, current_schema()").fetchone()
+                == (owner, "fusillade"),
+                "Fusillade direct/pooled role default drifted",
+            )
+            try:
+                connection.execute("SELECT * FROM public.users LIMIT 0")
+            except psycopg.errors.InsufficientPrivilege:
+                pass
+            else:
+                raise AssertionError(
+                    "Fusillade can read unrelated main application tables"
+                )
+        # A future object must inherit ownership from the actual pooled login.
+        with pooled.transaction():
+            pooled.execute("CREATE TABLE fusillade.pool_test_future_owner (id bigint)")
+            check(
+                pooled.execute(
+                    "SELECT relowner=current_user::regrole FROM pg_class "
+                    "WHERE oid='fusillade.pool_test_future_owner'::regclass"
+                ).fetchone()[0],
+                "future pooled objects are not owned by Fusillade",
+            )
+            pooled.execute("DROP TABLE fusillade.pool_test_future_owner")
+    print(
+        "PASS: scoped migrations, future ownership, and main-table isolation",
+        flush=True,
+    )
+
+
+def flows(app, connection, maintenance, pool_admin, model_url, roles, admin_dsn):
     base = f"http://127.0.0.1:{app.config['port']}"
     session = requests.Session()
 
@@ -423,19 +498,19 @@ def flows(app, connection, pool_admin, model_url, roles, admin_dsn):
     # next startup the real retirement daemon must detach/drop it using its
     # session-capable maintenance pool, not merely pass an endpoint attestation.
     expired_day = connection.execute("SELECT CURRENT_DATE - 2").fetchone()[0]
-    connection.execute("SET search_path TO fusillade")
-    connection.execute(
+    maintenance.execute("SET search_path TO fusillade")
+    maintenance.execute(
         "SELECT ensure_retained_response_partition(%s::date, NULL)", (expired_day,)
     )
     check(
-        connection.execute(
+        maintenance.execute(
             "SELECT state FROM retained_response_buckets WHERE delete_on=%s",
             (expired_day,),
         ).fetchone()[0]
         == "active",
         "expired partition fixture is not active",
     )
-    connection.execute("SET search_path TO public")
+    maintenance.execute("RESET search_path")
     # Observe the real DDL session, where a transaction pool would have erased
     # SET SESSION bounds. The event trigger is confined to this disposable DB
     # and exact expired partition; application migrations are unaffected.
@@ -443,6 +518,14 @@ def flows(app, connection, pool_admin, model_url, roles, admin_dsn):
         "SELECT 'retained_response_objects_d' || to_char(%s::date, 'YYYYMMDD')",
         (expired_day,),
     ).fetchone()[0]
+    check(
+        maintenance.execute(
+            "SELECT relowner=current_user::regrole FROM pg_class "
+            "WHERE oid=to_regclass('fusillade.' || %s)",
+            (partition,),
+        ).fetchone()[0],
+        "future retained-response partition is not owned by the maintenance identity",
+    )
     with psycopg.connect(
         admin_dsn, dbname=connection.info.dbname, autocommit=True
     ) as observer:
@@ -462,7 +545,7 @@ def flows(app, connection, pool_admin, model_url, roles, admin_dsn):
                 END IF;
             END
             $body$
-        """).format(sql.Literal(roles[0]), sql.Literal(partition))
+        """).format(sql.Literal(maintenance.info.user), sql.Literal(partition))
         observer.execute(function)
         observer.execute("""
             CREATE EVENT TRIGGER pool_test_maintenance ON ddl_command_start
@@ -527,6 +610,8 @@ def run(args):
     )
     name = "pool_test_" + uuid.uuid4().hex[:12]
     roles = [name + suffix for suffix in ("_main", "_outlet")]
+    if args.schema_mode == "scoped":
+        roles.append(name + "_fusillade")
     password = uuid.uuid4().hex
     with ExitStack() as stack:
         directory = Path(
@@ -547,13 +632,13 @@ def run(args):
                 )
 
         stack.callback(cleanup_database)
-        for role in roles:
+        for role in roles[:2]:
             admin.execute(
                 sql.SQL("CREATE ROLE {} LOGIN PASSWORD {}").format(
                     sql.Identifier(role), sql.Literal(password)
                 )
             )
-        admin.execute(sql.SQL("GRANT {} TO {}").format(*map(sql.Identifier, roles)))
+        admin.execute(sql.SQL("GRANT {} TO {}").format(*map(sql.Identifier, roles[:2])))
         admin.execute(
             sql.SQL("CREATE DATABASE {} OWNER {}").format(
                 sql.Identifier(name), sql.Identifier(roles[0])
@@ -564,6 +649,49 @@ def run(args):
                 sql.SQL("ALTER ROLE {} IN DATABASE {} SET search_path TO {}").format(
                     sql.Identifier(role), sql.Identifier(name), sql.Identifier(schema)
                 )
+            )
+        if args.schema_mode == "scoped":
+            # PostgreSQL 17 automatically gives a non-superuser creator ADMIN
+            # on its new role, but not inherited or SET privileges. Exercise
+            # that path instead of having the superuser provision Fusillade.
+            admin.execute(
+                sql.SQL("ALTER ROLE {} CREATEROLE").format(sql.Identifier(roles[0]))
+            )
+            with psycopg.connect(
+                admin_dsn,
+                user=roles[0],
+                password=password,
+                dbname=name,
+                autocommit=True,
+            ) as creator:
+                check(
+                    not creator.execute(
+                        "SELECT rolsuper FROM pg_roles WHERE rolname=current_user"
+                    ).fetchone()[0],
+                    "Fusillade must be bootstrapped by a non-superuser",
+                )
+                creator.execute(
+                    sql.SQL(
+                        "CREATE ROLE {} LOGIN NOSUPERUSER NOCREATEROLE PASSWORD {}"
+                    ).format(sql.Identifier(roles[2]), sql.Literal(password))
+                )
+                creator.execute(
+                    sql.SQL("GRANT {} TO {} WITH INHERIT TRUE, SET TRUE").format(
+                        sql.Identifier(roles[2]), sql.Identifier(roles[0])
+                    )
+                )
+                creator.execute(
+                    sql.SQL("CREATE SCHEMA fusillade AUTHORIZATION {}").format(
+                        sql.Identifier(roles[2])
+                    )
+                )
+                creator.execute(
+                    sql.SQL(
+                        "ALTER ROLE {} IN DATABASE {} SET search_path TO fusillade"
+                    ).format(sql.Identifier(roles[2]), sql.Identifier(name))
+                )
+            admin.execute(
+                sql.SQL("ALTER ROLE {} NOCREATEROLE").format(sql.Identifier(roles[0]))
             )
         port = free_port()
         auth = directory / "users.txt"
@@ -615,6 +743,8 @@ ignore_startup_parameters=extra_float_digits
 
         eventually("PgBouncer accepts connections", pool_ready)
         characterize_pool(dsn(roles[0], True), dsn(roles[0]))
+        if args.schema_mode == "scoped":
+            characterize_pool(dsn(roles[2], True), dsn(roles[2]))
         server = ThreadingHTTPServer(("127.0.0.1", 0), Model)
         threading.Thread(target=server.serve_forever, daemon=True).start()
         stack.callback(server.server_close)
@@ -669,8 +799,18 @@ ignore_startup_parameters=extra_float_digits
         config["database"]["fusillade"] = {
             "mode": "schema",
             "name": "fusillade",
+            "pooled_schema_mode": "transaction",
             "pool": pool,
         }
+        if args.schema_mode == "scoped":
+            config["database"]["fusillade"].update(
+                {
+                    "url": dsn(roles[2]),
+                    "pooled_url": dsn(roles[2], True),
+                    "replica_url": dsn(roles[2], True),
+                    "pooled_schema_mode": "role_default",
+                }
+            )
         for role, schema in zip(roles[1:], ("outlet",)):
             config["database"][schema] = {
                 "mode": "schema",
@@ -683,6 +823,14 @@ ignore_startup_parameters=extra_float_digits
         stack.callback(app.stop)
         app.start()
         direct = stack.enter_context(psycopg.connect(dsn(roles[0]), autocommit=True))
+        maintenance = stack.enter_context(
+            psycopg.connect(
+                dsn(roles[2] if args.schema_mode == "scoped" else roles[0]),
+                autocommit=True,
+            )
+        )
+        if args.schema_mode == "scoped":
+            verify_scoped_identity(maintenance, dsn(roles[2], True), roles[0])
         pool_admin = stack.enter_context(
             psycopg.connect(
                 dsn(roles[0], True, "pgbouncer"), autocommit=True, row_factory=dict_row
@@ -691,11 +839,14 @@ ignore_startup_parameters=extra_float_digits
         flows(
             app,
             direct,
+            maintenance,
             pool_admin,
             f"http://127.0.0.1:{server.server_port}",
             roles,
             admin_dsn,
         )
+        if args.schema_mode == "scoped":
+            verify_scoped_identity(maintenance, dsn(roles[2], True), roles[0])
         with psycopg.connect(dsn(roles[0], True), autocommit=True) as shared:
             for _ in range(4):
                 schema, can_manage_roles = shared.execute(
@@ -722,6 +873,12 @@ if __name__ == "__main__":
     target.add_argument("--binary", type=Path, help="locally built dwctl executable")
     target.add_argument(
         "--image", help="built dwctl image (Linux Docker host networking)"
+    )
+    parser.add_argument(
+        "--schema-mode",
+        choices=("shared", "scoped"),
+        default="shared",
+        help="shared login with transaction schema selection, or scoped Fusillade owner",
     )
     parser.add_argument("--artifacts", type=Path, default=Path("pooled-e2e-results"))
     run(parser.parse_args())
