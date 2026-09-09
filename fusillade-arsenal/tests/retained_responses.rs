@@ -55,13 +55,13 @@ struct WriteSignalingPools {
 }
 
 impl PoolProvider for WriteSignalingPools {
-    fn read(&self) -> &PgPool {
-        &self.read
+    fn read(&self) -> sqlx_pool_router::PoolHandle {
+        self.read.clone().into()
     }
 
-    fn write(&self) -> &PgPool {
+    fn write(&self) -> sqlx_pool_router::PoolHandle {
         self.write_requested.store(true, Ordering::Release);
-        &self.write
+        self.write.clone().into()
     }
 }
 
@@ -2839,6 +2839,68 @@ async fn deferred_oldest_group_does_not_consume_the_movement_budget(pool: PgPool
 }
 
 #[sqlx::test]
+async fn one_pass_discovers_a_page_of_the_oldest_graphs_across_tiers(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    // Interleave tiers so oldest-first across the whole queue differs from
+    // oldest-first within any one tier: a paged probe must merge the tier
+    // arms, not drain one tier before looking at the next.
+    let mut graphs = Vec::new();
+    for (index, (tier, hour)) in [
+        ("flex", 8),
+        ("priority", 9),
+        ("flex", 10),
+        ("priority", 11),
+        ("flex", 12),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        graphs.push(
+            singleton(
+                &pool,
+                tier,
+                TerminalState::Completed,
+                timestamp(&format!("2026-08-01T{hour:02}:00:00Z")),
+                &format!("paged-{index}"),
+            )
+            .await,
+        );
+    }
+    let manager = manager(&pool).await;
+    let retention_policy = policy(&[("flex", 86_400), ("priority", 86_400)]);
+
+    let first = archive(&manager, &retention_policy, 3, i64::MAX)
+        .await
+        .expect("a paged pass must archive up to its graph budget");
+
+    assert_eq!(first.groups_archived, 3);
+    assert!(
+        first.may_have_more,
+        "the spare discovered candidate proves more work"
+    );
+    for graph in &graphs[..3] {
+        assert_wholly_retained(&pool, graph).await;
+    }
+    for graph in &graphs[3..] {
+        assert_wholly_live(&pool, graph).await;
+    }
+
+    let second = archive(&manager, &retention_policy, 3, i64::MAX)
+        .await
+        .expect("the remainder must archive on the next pass");
+
+    assert_eq!(second.groups_archived, 2);
+    assert!(
+        !second.may_have_more,
+        "a short page proves the eligible set is exhausted"
+    );
+    for graph in &graphs {
+        assert_wholly_retained(&pool, graph).await;
+    }
+}
+
+#[sqlx::test]
 async fn archives_singleton_request_template_as_one_group(pool: PgPool) {
     install_candidate_index(&pool).await;
     ensure_partition(&pool, archive_date("2026-08-03")).await;
@@ -4632,6 +4694,70 @@ async fn read_mixed_live_and_retained_rows_do_not_double_count_or_split_demand(p
     assert_eq!(after_list.data.len(), 2);
     assert_eq!(after_flex, 2);
     assert_eq!(after_trailing, before_trailing);
+}
+
+#[sqlx::test]
+async fn trailing_live_identity_suppresses_retained_even_outside_filters(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let request_manager = manager(&pool).await;
+    for state in [TerminalState::Completed, TerminalState::Failed] {
+        let graph = singleton(
+            &pool,
+            "flex",
+            state,
+            timestamp("2026-08-01T10:00:00Z"),
+            "overlap-filter",
+        )
+        .await;
+        archive(&request_manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+            .await
+            .unwrap();
+        let windows = [("retained".to_owned(), -31_536_000, 0)];
+        let models = [MODEL.to_owned()];
+        let filter = ServiceTierFilter::Include(vec![Some("flex".to_owned())]);
+        let before = request_manager
+            .get_completed_request_counts_by_model_and_window(&windows, &models, &filter)
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].count, 1);
+        // A pending live row with a different model and tier still owns this
+        // identity. Filtering the live-ID set by demand would leak its archive.
+        sqlx::query("INSERT INTO requests (id, model, service_tier, created_by) VALUES ($1, 'other-model', 'background', $2)")
+            .bind(graph.request_ids[0]).bind(OWNER).execute(&pool).await.unwrap();
+        let suppressed = request_manager
+            .get_completed_request_counts_by_model_and_window(&windows, &models, &filter)
+            .await
+            .unwrap();
+        assert!(suppressed.is_empty());
+
+        // An unattributed batched live identity does not suppress the retained
+        // owner-visible identity: preserve the existing created_by boundary.
+        let batch_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO batches (expires_at) VALUES (now() + interval '1 day') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE requests SET created_by = NULL, batch_id = $2 WHERE id = $1")
+            .bind(graph.request_ids[0])
+            .bind(batch_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let unattributed = request_manager
+            .get_completed_request_counts_by_model_and_window(&windows, &models, &filter)
+            .await
+            .unwrap();
+        assert_eq!(unattributed, before);
+        // Fence this iteration's archive so the next outcome is independent.
+        sqlx::query("DELETE FROM retained_response_objects WHERE group_id = $1")
+            .bind(graph.group_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 }
 
 async fn assert_graph_reads_not_found(

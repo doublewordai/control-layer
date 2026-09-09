@@ -1158,7 +1158,7 @@ pub async fn upload_file<P: PoolProvider>(
         buffer_size: config.batches.files.upload_buffer_size,
         normalizer,
         normalizer_mode,
-        access_pool: Some(state.db.write().clone()),
+        access_pool: Some(state.db.write().into_inner()),
         // image_access is attributed to the acting human plus, for org-context
         // uploads, the owning org — so org members can view org-key images
         // while a personal upload stays private to the user. This is distinct

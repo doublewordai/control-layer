@@ -463,7 +463,7 @@ impl<'c> Repository for Users<'c> {
         let scrubbed_email = format!("deleted-{}@deleted.local", id);
         let scrubbed_username = format!("deleted-{}", id);
 
-        // Scrub the user row and hard-delete their API keys atomically so a
+        // Scrub the user row and revoke their API keys atomically so a
         // "deleted" account can never keep authenticating.
         let mut tx = self.db.begin().await?;
 
@@ -490,12 +490,154 @@ impl<'c> Repository for Users<'c> {
         .await?;
 
         // Only when we actually transitioned the user to deleted (idempotent on
-        // repeat calls). Hard-delete keys owned by the user (user_id) — these
-        // authenticate as them. Keys they merely created for others (created_by)
-        // belong to those users and are left alone. The api_keys DELETE trigger
-        // emits NOTIFY, so the onwards proxy drops them from its cache at once.
+        // repeat calls). Preserve keys attributed to them in another account
+        // for audit attribution, using the same soft deletion as org departure.
+        // Both UPDATE and DELETE triggers notify the onwards cache to revoke access.
         if result.rows_affected() > 0 {
+            sqlx::query!(
+                "UPDATE api_keys SET is_deleted = true WHERE created_by = $1 AND user_id != $1 AND is_deleted = false",
+                id
+            )
+            .execute(&mut *tx)
+            .await?;
+
             sqlx::query!(r#"DELETE FROM api_keys WHERE user_id = $1"#, id)
+                .execute(&mut *tx)
+                .await?;
+
+            // Hand over every workspace this user owned, or close it.
+            //
+            // Deleting a user used to scrub the row and walk away from their
+            // `user_organizations` rows, which left the workspace live, still
+            // claiming its email domain, and with nobody able to administer it:
+            // colleagues signing up were pointed at a workspace whose join
+            // requests no one could approve. `remove_member` has a last-owner
+            // guard for exactly this reason; account deletion walked straight
+            // past it.
+            //
+            // Succession order is the longest-standing live member who is
+            // closest to already holding the role: another owner (a no-op
+            // re-assert), then the earliest admin, then the earliest ordinary
+            // member. Only active memberships of live users count - a pending
+            // invitation is not somebody who can take over a workspace.
+            for org_id in sqlx::query_scalar!(
+                r#"SELECT organization_id FROM user_organizations WHERE user_id = $1 AND role = 'owner' AND status = 'active'"#,
+                id
+            )
+            .fetch_all(&mut *tx)
+            .await?
+            {
+                let successor = sqlx::query_scalar!(
+                    r#"
+                    SELECT uo.user_id
+                    FROM user_organizations uo
+                    JOIN users u ON u.id = uo.user_id
+                    WHERE uo.organization_id = $1
+                      AND uo.user_id <> $2
+                      AND uo.status = 'active'
+                      AND u.is_deleted = false
+                    ORDER BY CASE uo.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, uo.created_at ASC, uo.user_id ASC
+                    LIMIT 1
+                    "#,
+                    org_id,
+                    id
+                )
+                .fetch_optional(&mut *tx)
+                .await?;
+
+                match successor {
+                    Some(successor_id) => {
+                        sqlx::query!(
+                            r#"UPDATE user_organizations SET role = 'owner' WHERE organization_id = $1 AND user_id = $2 AND status = 'active'"#,
+                            org_id,
+                            successor_id
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                    None => {
+                        // Nobody left to hand it to, so the workspace goes the
+                        // same way the account does: scrubbed, flagged deleted,
+                        // and its keys revoked so nothing keeps authenticating
+                        // as it.
+                        //
+                        // Soft-deleted, not hard-deleted. `connections.api_key_id`
+                        // references `api_keys(id)` with NO ACTION, so removing a
+                        // key a connection still points at raises a foreign-key
+                        // violation and takes the whole account deletion down with
+                        // it. The `api_keys_notify_update` trigger fires the same
+                        // config-change NOTIFY as the delete trigger, so the proxy
+                        // still drops the key from its cache immediately - the
+                        // hard delete was buying nothing here that the soft one
+                        // does not.
+                        sqlx::query!(
+                            r#"
+                            UPDATE users
+                            SET email = $1, username = $2, display_name = NULL, avatar_url = NULL,
+                                is_deleted = true, updated_at = NOW()
+                            WHERE id = $3 AND user_type = 'organization' AND is_deleted = false
+                            "#,
+                            format!("deleted-{org_id}@deleted.local"),
+                            format!("deleted-{org_id}"),
+                            org_id
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+                        sqlx::query!(
+                            r#"UPDATE api_keys SET is_deleted = true WHERE user_id = $1 AND is_deleted = false"#,
+                            org_id
+                        )
+                        .execute(&mut *tx)
+                        .await?;
+                    }
+                }
+            }
+
+            // Revoke the org-scoped keys this user holds, before the
+            // memberships that identify them are dropped.
+            //
+            // The hard delete above only catches keys the user *owns*
+            // (`user_id = id`). A key issued to them inside a workspace is
+            // owned by the workspace and merely attributed to them
+            // (`user_id = organization_id`, `created_by = id`), so it survives
+            // - and API-key auth checks only `api_keys.is_deleted`, never
+            // whether the creator still exists. Without this, deleting an
+            // account leaves it able to keep authenticating into workspaces
+            // that outlived it. Same treatment the member-removal and leave
+            // paths already apply via `soft_delete_member_org_keys`.
+            //
+            // Attribution, not authorship: `created_by` on an org key is the
+            // member it belongs to (`api_keys.rs` sets it from `member_id`),
+            // so this does not touch keys this user issued to other people. It
+            // does take an org-wide key they created without naming a member,
+            // which is attributed to them - the same consequence
+            // `soft_delete_member_org_keys` already has when an org removes
+            // somebody. Logged because, unlike a removal, an account deletion
+            // is invisible to the workspace on the other end of it.
+            let revoked = sqlx::query!(
+                r#"
+                UPDATE api_keys SET is_deleted = true
+                WHERE created_by = $1
+                  AND is_deleted = false
+                  AND user_id IN (SELECT organization_id FROM user_organizations WHERE user_id = $1)
+                "#,
+                id
+            )
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if revoked > 0 {
+                tracing::info!(
+                    user_id = %abbrev_uuid(&id),
+                    revoked,
+                    "Revoked organization API keys held by a deleted user"
+                );
+            }
+
+            // The departing user is not a member of anything any more. Left
+            // behind, these rows are what made the workspaces above look owned
+            // by somebody who no longer exists.
+            sqlx::query!(r#"DELETE FROM user_organizations WHERE user_id = $1"#, id)
                 .execute(&mut *tx)
                 .await?;
         }
@@ -1158,6 +1300,19 @@ mod tests {
     use sqlx::PgPool;
     use std::str::FromStr;
 
+    async fn create_standard_user(conn: &mut PgConnection, username: &str) -> UserDBResponse {
+        Users::new(conn)
+            .create(&UserCreateDBRequest::from(UserCreate {
+                username: username.to_string(),
+                email: format!("{username}@example.com"),
+                display_name: None,
+                avatar_url: None,
+                roles: vec![Role::StandardUser],
+            }))
+            .await
+            .unwrap()
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_create_user(pool: PgPool) {
@@ -1251,6 +1406,91 @@ mod tests {
             repo.delete(user.id).await.unwrap()
         };
         assert!(!again);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_delete_user_soft_deletes_attributed_keys_preserving_audit_trail(pool: PgPool) {
+        use crate::db::{
+            handlers::organizations::Organizations,
+            models::{api_keys::ApiKeyCreateDBRequest, organizations::OrganizationCreateDBRequest},
+        };
+
+        let mut conn = pool.acquire().await.unwrap();
+        let deleted_user = create_standard_user(&mut conn, "deleted-key-holder").await;
+        let retained_user = create_standard_user(&mut conn, "retained-key-holder").await;
+        let key_owner = Organizations::new(&mut conn)
+            .create(
+                &OrganizationCreateDBRequest {
+                    name: "shared-key-owner".to_string(),
+                    email: "org@example.com".to_string(),
+                    display_name: None,
+                    avatar_url: None,
+                    created_by: retained_user.id,
+                },
+                &[Role::StandardUser],
+            )
+            .await
+            .unwrap();
+
+        let (deleted_user_key, retained_user_key) = {
+            let mut keys = ApiKeys::new(&mut conn);
+            let deleted_user_key = keys
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: key_owner.id,
+                    name: "deleted-user-key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    created_by: deleted_user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
+                })
+                .await
+                .unwrap();
+            let retained_user_key = keys
+                .create(&ApiKeyCreateDBRequest {
+                    user_id: key_owner.id,
+                    name: "retained-user-key".to_string(),
+                    description: None,
+                    purpose: ApiKeyPurpose::Realtime,
+                    requests_per_second: None,
+                    burst_size: None,
+                    created_by: retained_user.id,
+                    spend_limit: None,
+                    spend_limit_interval: None,
+                })
+                .await
+                .unwrap();
+            (deleted_user_key, retained_user_key)
+        };
+
+        assert!(Users::new(&mut conn).delete(deleted_user.id).await.unwrap());
+
+        let audit_record: (UserId, UserId, bool) = sqlx::query_as("SELECT user_id, created_by, is_deleted FROM api_keys WHERE id = $1")
+            .bind(deleted_user_key.id)
+            .fetch_one(&pool)
+            .await
+            .expect("revoked keys must remain available for audit attribution");
+        assert_eq!(audit_record, (key_owner.id, deleted_user.id, true));
+        assert!(
+            ApiKeys::new(&mut conn)
+                .get_user_id_by_secret(&deleted_user_key.secret)
+                .await
+                .unwrap()
+                .is_none(),
+            "the deleted user's attributed key must no longer authenticate"
+        );
+        let retained_key_is_active: bool = sqlx::query_scalar!(
+            "SELECT EXISTS(SELECT 1 FROM api_keys WHERE id = $1 AND is_deleted = false) as \"exists!\"",
+            retained_user_key.id
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert!(retained_key_is_active, "keys attributed to other users must remain active");
     }
 
     #[sqlx::test]

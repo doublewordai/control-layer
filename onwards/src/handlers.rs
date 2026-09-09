@@ -81,7 +81,7 @@ fn embedded_error_status(body: &serde_json::Value) -> Option<u16> {
 enum SseEventKind {
     /// A `data:` frame carrying an embedded provider error — the contained
     /// `error.code`, per [`embedded_error_status`].
-    Error(u16),
+    Error(u16, serde_json::Value),
     /// A `data:` frame carrying normal content (or the `[DONE]` sentinel).
     Data,
     /// No `data:` field: an SSE comment / keep-alive (e.g. `: keep-alive`), which
@@ -120,13 +120,12 @@ fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
     if data.trim() == "[DONE]" {
         return SseEventKind::Data;
     }
-    match serde_json::from_str::<serde_json::Value>(data.trim())
-        .ok()
-        .as_ref()
-        .and_then(embedded_error_status)
+    if let Ok(body) = serde_json::from_str::<serde_json::Value>(data.trim())
+        && let Some(status) = embedded_error_status(&body)
     {
-        Some(status) => SseEventKind::Error(status),
-        None => SseEventKind::Data,
+        SseEventKind::Error(status, body["error"].clone())
+    } else {
+        SseEventKind::Data
     }
 }
 
@@ -1107,7 +1106,7 @@ pub async fn target_message_handler<T: HttpClient>(
             Clean,
             /// Provider embedded an error status in the 2xx body
             /// (`{"error":{"code":N}}`).
-            Embedded(u16),
+            Embedded(u16, serde_json::Value),
             /// 2xx whose body *terminated* empty before any content frame — e.g.
             /// an upstream `200 OK` with an empty body. Treated as a retryable
             /// 502. Keyed on stream termination, never a time budget, so a
@@ -1159,8 +1158,8 @@ pub async fn target_message_handler<T: HttpClient>(
                     for _ in 0..SSE_PEEK_MAX_EVENTS {
                         match events.next().await {
                             Some(Ok(chunk)) => match classify_sse_event(&chunk) {
-                                SseEventKind::Error(status) => {
-                                    embedded = Some(status);
+                                SseEventKind::Error(status, error) => {
+                                    embedded = Some((status, error));
                                     peeked.push(Ok(chunk));
                                     break;
                                 }
@@ -1191,8 +1190,8 @@ pub async fn target_message_handler<T: HttpClient>(
                         for _ in 0..SSE_PEEK_MAX_EVENTS {
                             match events.next().await {
                                 Some(Ok(chunk)) => match classify_sse_event(&chunk) {
-                                    SseEventKind::Error(status) => {
-                                        embedded = Some(status);
+                                    SseEventKind::Error(status, error) => {
+                                        embedded = Some((status, error));
                                         peeked.push(Ok(chunk));
                                         break;
                                     }
@@ -1229,8 +1228,8 @@ pub async fn target_message_handler<T: HttpClient>(
                 // is dropped when we return.
                 let rest = futures_util::stream::iter(peeked).chain(events);
                 response = Response::from_parts(parts, axum::body::Body::from_stream(rest));
-                if let Some(status) = embedded {
-                    Scan2xx::Embedded(status)
+                if let Some((status, error)) = embedded {
+                    Scan2xx::Embedded(status, error)
                 } else if stream_ended && !saw_data {
                     // Stream closed/errored before any content frame: nothing was
                     // forwarded, so retrying is safe. A valid-but-slow stream that
@@ -1263,8 +1262,10 @@ pub async fn target_message_handler<T: HttpClient>(
                     let embedded = if buffered.windows(ERROR_KEY.len()).any(|w| w == ERROR_KEY) {
                         serde_json::from_slice::<serde_json::Value>(&buffered)
                             .ok()
-                            .as_ref()
-                            .and_then(embedded_error_status)
+                            .and_then(|body| {
+                                embedded_error_status(&body)
+                                    .map(|status| (status, body["error"].clone()))
+                            })
                     } else {
                         None
                     };
@@ -1276,7 +1277,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         .headers_mut()
                         .insert(CONTENT_LENGTH, HeaderValue::from(len));
                     match embedded {
-                        Some(status) => Scan2xx::Embedded(status),
+                        Some((status, error)) => Scan2xx::Embedded(status, error),
                         None => Scan2xx::Clean,
                     }
                 }
@@ -1286,7 +1287,7 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         match scan {
-            Scan2xx::Embedded(embedded) => {
+            Scan2xx::Embedded(embedded, provider_error) => {
                 warn!(
                     http_status = status,
                     embedded_status = embedded,
@@ -1314,17 +1315,34 @@ pub async fn target_message_handler<T: HttpClient>(
                 // non-retryable ones like 501/505 — collapses to a generic 503. This is
                 // deliberately more opaque than the non-embedded error path: a
                 // 200-with-error body is already anomalous, so we hide the specifics.
-                // Genuine client errors (other 4xx) are surfaced, sanitized, so the
-                // caller can fix the request.
+                // For trusted providers, retain the standard client-error fields
+                // so the caller can fix the request. Never log the body: even
+                // validation errors can echo request content.
+                let trusted = target.trusted.unwrap_or_else(|| pool.is_trusted());
                 let err = if embedded == 429 || embedded >= 500 {
                     OnwardsErrorResponse::service_unavailable()
                 } else {
                     OnwardsErrorResponse::builder()
                         .body(ErrorResponseBody {
-                            message: "The upstream provider rejected the request.".to_string(),
-                            r#type: "invalid_request_error".to_string(),
-                            param: None,
-                            code: "upstream_error".to_string(),
+                            message: trusted
+                                .then(|| provider_error["message"].as_str())
+                                .flatten()
+                                .unwrap_or("The upstream provider rejected the request.")
+                                .to_string(),
+                            r#type: trusted
+                                .then(|| provider_error["type"].as_str())
+                                .flatten()
+                                .unwrap_or("invalid_request_error")
+                                .to_string(),
+                            param: trusted
+                                .then(|| provider_error["param"].as_str())
+                                .flatten()
+                                .map(str::to_string),
+                            code: if trusted {
+                                embedded.to_string()
+                            } else {
+                                "upstream_error".to_string()
+                            },
                         })
                         .status(StatusCode::from_u16(embedded).unwrap_or(StatusCode::BAD_REQUEST))
                         .build()
@@ -1762,24 +1780,24 @@ mod tests {
         // A provider's first-frame error on a 200 stream.
         assert_eq!(
             classify_sse_event(b"data: {\"error\":{\"code\":429,\"message\":\"x\"}}\n\n"),
-            Error(429)
+            Error(429, serde_json::json!({"code":429,"message":"x"}))
         );
         // Error alongside otherwise-valid chunk fields (provider shape).
         assert_eq!(
             classify_sse_event(b"data: {\"id\":\"g\",\"choices\":[],\"error\":{\"code\":502}}\n\n"),
-            Error(502)
+            Error(502, serde_json::json!({"code":502}))
         );
         // Tolerant of `data:` with no space after the colon.
         assert_eq!(
             classify_sse_event(b"data:{\"error\":{\"code\":503}}\n\n"),
-            Error(503)
+            Error(503, serde_json::json!({"code":503}))
         );
         // Multi-line `data:` fields are concatenated with `\n` before parsing
         // (SSE spec): the two `data:` lines here join to the valid JSON
         // `{"error":{"code":429}}` (the embedded `\n` is JSON whitespace).
         assert_eq!(
             classify_sse_event(b"data: {\"error\":\ndata: {\"code\":429}}\n\n"),
-            Error(429)
+            Error(429, serde_json::json!({"code":429}))
         );
 
         // Normal content and the [DONE] sentinel are data frames, not errors.

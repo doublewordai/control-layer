@@ -1563,6 +1563,9 @@ pub(crate) async fn count_owner_flex_requests_since<P: PoolProvider>(
 }
 
 pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
+    WITH live_request_ids AS MATERIALIZED (
+        SELECT id FROM requests WHERE created_by IS NOT NULL
+    )
     SELECT model, service_tier, outcome, SUM(count)::BIGINT AS count
     FROM (
     SELECT
@@ -1630,36 +1633,12 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
         retained.service_tier,
         'completed'::text AS outcome,
         COUNT(*)::BIGINT AS count
-    FROM retained_response_buckets bucket
-    JOIN pg_namespace namespace
-      ON namespace.nspname = bucket.partition_schema
-    JOIN pg_class child
-      ON child.relnamespace = namespace.oid
-     AND child.relname = bucket.partition_table
-     AND child.oid = bucket.partition_oid
-    JOIN pg_inherits inheritance
-      ON inheritance.inhrelid = child.oid
-     AND NOT inheritance.inhdetachpending
-    JOIN retained_response_objects retained
-      ON retained.delete_on = bucket.delete_on
-     AND retained.object_kind = 'request'
-    JOIN retained_response_request_routes route
-      ON route.request_id = retained.object_id
-     AND route.group_id = retained.group_id
-     AND route.delete_on = retained.delete_on
-    JOIN retained_response_group_routes group_route
-      ON group_route.group_id = retained.group_id
-     AND group_route.delete_on = retained.delete_on
-    WHERE bucket.state = 'active'
-      AND bucket.partition_schema = current_schema()
-      AND bucket.partition_table =
-          'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
-      AND inheritance.inhparent =
-          to_regclass(format('%I.retained_response_objects', current_schema()))
-      AND pg_get_expr(child.relpartbound, child.oid) = format(
-          'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
-      )
+    FROM retained_response_objects retained
+    WHERE retained.object_kind = 'request'
       AND retained.state = 'completed'
+      -- Both identity columns are NOT NULL; NOT IN permits a hashed subplan
+      -- even when stale statistics underestimate the live identity count.
+      AND retained.object_id NOT IN (SELECT id FROM live_request_ids)
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
       -- Partition-prune bounds. Sweep-landed rows satisfy
@@ -1674,6 +1653,35 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       -- bound: V1 proves terminal_at < delete_on.
       AND retained.delete_on >= COALESCE($7::date, ($1 AT TIME ZONE 'UTC')::date + 1)
       AND ($8::date IS NULL OR retained.delete_on <= $8::date)
+      -- Bucket fence as a semi-join over the (small) bucket registry with
+      -- the same catalog identity checks every retained read applies:
+      -- retiring/retired buckets and any partition that no longer matches
+      -- its registered identity contribute nothing. This is a count, so the
+      -- route rows are unnecessary. Live identities are materialized once
+      -- above to preserve live-preferred reads even during repair overlaps,
+      -- without probing the broad user index for each retained object.
+      AND retained.delete_on IN (
+          SELECT bucket.delete_on
+          FROM retained_response_buckets bucket
+          JOIN pg_namespace namespace
+            ON namespace.nspname = bucket.partition_schema
+          JOIN pg_class child
+            ON child.relnamespace = namespace.oid
+           AND child.relname = bucket.partition_table
+           AND child.oid = bucket.partition_oid
+          JOIN pg_inherits inheritance
+            ON inheritance.inhrelid = child.oid
+           AND NOT inheritance.inhdetachpending
+          WHERE bucket.state = 'active'
+            AND bucket.partition_schema = current_schema()
+            AND bucket.partition_table =
+                'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+            AND inheritance.inhparent =
+                to_regclass(format('%I.retained_response_objects', current_schema()))
+            AND pg_get_expr(child.relpartbound, child.oid) = format(
+                'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+            )
+      )
       AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
       AND retained.service_tier IS DISTINCT FROM 'background'
       AND (
@@ -1686,10 +1694,6 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
               (retained.service_tier IS NULL AND NOT $5)
               OR (retained.service_tier IS NOT NULL AND retained.service_tier <> ALL($4))
           ))
-      )
-      AND NOT EXISTS (
-          SELECT 1 FROM requests live
-          WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
       )
     GROUP BY retained.model, retained.service_tier
 
@@ -1700,36 +1704,10 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
         retained.service_tier,
         'failed'::text AS outcome,
         COUNT(*)::BIGINT AS count
-    FROM retained_response_buckets bucket
-    JOIN pg_namespace namespace
-      ON namespace.nspname = bucket.partition_schema
-    JOIN pg_class child
-      ON child.relnamespace = namespace.oid
-     AND child.relname = bucket.partition_table
-     AND child.oid = bucket.partition_oid
-    JOIN pg_inherits inheritance
-      ON inheritance.inhrelid = child.oid
-     AND NOT inheritance.inhdetachpending
-    JOIN retained_response_objects retained
-      ON retained.delete_on = bucket.delete_on
-     AND retained.object_kind = 'request'
-    JOIN retained_response_request_routes route
-      ON route.request_id = retained.object_id
-     AND route.group_id = retained.group_id
-     AND route.delete_on = retained.delete_on
-    JOIN retained_response_group_routes group_route
-      ON group_route.group_id = retained.group_id
-     AND group_route.delete_on = retained.delete_on
-    WHERE bucket.state = 'active'
-      AND bucket.partition_schema = current_schema()
-      AND bucket.partition_table =
-          'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
-      AND inheritance.inhparent =
-          to_regclass(format('%I.retained_response_objects', current_schema()))
-      AND pg_get_expr(child.relpartbound, child.oid) = format(
-          'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
-      )
+    FROM retained_response_objects retained
+    WHERE retained.object_kind = 'request'
       AND retained.state = 'failed'
+      AND retained.object_id NOT IN (SELECT id FROM live_request_ids)
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
       -- Partition-prune bounds. Sweep-landed rows satisfy
@@ -1744,6 +1722,35 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       -- bound: V1 proves terminal_at < delete_on.
       AND retained.delete_on >= COALESCE($7::date, ($1 AT TIME ZONE 'UTC')::date + 1)
       AND ($8::date IS NULL OR retained.delete_on <= $8::date)
+      -- Bucket fence as a semi-join over the (small) bucket registry with
+      -- the same catalog identity checks every retained read applies:
+      -- retiring/retired buckets and any partition that no longer matches
+      -- its registered identity contribute nothing. This is a count, so the
+      -- route rows are unnecessary. Live identities are materialized once
+      -- above to preserve live-preferred reads even during repair overlaps,
+      -- without probing the broad user index for each retained object.
+      AND retained.delete_on IN (
+          SELECT bucket.delete_on
+          FROM retained_response_buckets bucket
+          JOIN pg_namespace namespace
+            ON namespace.nspname = bucket.partition_schema
+          JOIN pg_class child
+            ON child.relnamespace = namespace.oid
+           AND child.relname = bucket.partition_table
+           AND child.oid = bucket.partition_oid
+          JOIN pg_inherits inheritance
+            ON inheritance.inhrelid = child.oid
+           AND NOT inheritance.inhdetachpending
+          WHERE bucket.state = 'active'
+            AND bucket.partition_schema = current_schema()
+            AND bucket.partition_table =
+                'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+            AND inheritance.inhparent =
+                to_regclass(format('%I.retained_response_objects', current_schema()))
+            AND pg_get_expr(child.relpartbound, child.oid) = format(
+                'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+            )
+      )
       AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
       AND retained.service_tier IS DISTINCT FROM 'background'
       AND (
@@ -1756,10 +1763,6 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
               (retained.service_tier IS NULL AND NOT $5)
               OR (retained.service_tier IS NOT NULL AND retained.service_tier <> ALL($4))
           ))
-      )
-      AND NOT EXISTS (
-          SELECT 1 FROM requests live
-          WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
       )
     GROUP BY retained.model, retained.service_tier
     ) terminal_counts
@@ -3357,6 +3360,14 @@ async fn move_graph<P: PoolProvider>(
 // deletion day can still be in the future. This keeps an arbitrary due legacy
 // backlog outside the bounded probe budget while the lock-time checks remain
 // authoritative. A graph is one request, so its group id is its request id.
+//
+// Discovery is paged: one probe returns up to `$5` of the oldest eligible
+// graphs, in global terminal order, instead of a single row. Each tier arm
+// still walks the validated retention-due index in order, so the per-tier
+// `LIMIT $5` is an index-range read, and the outer sort merges the (at most)
+// tier-count small arms. A serial one-row probe per candidate was the whole
+// pass's critical path once moves fanned out: 512 round trips of discovery
+// before the first mover started.
 const CANDIDATE_DISCOVERY_SQL: &str = r#"
         WITH policy(service_tier, archive_after) AS (
             SELECT * FROM UNNEST($1::text[], $2::timestamptz[])
@@ -3394,41 +3405,48 @@ const CANDIDATE_DISCOVERY_SQL: &str = r#"
                              WHEN 'canceled' THEN request.canceled_at
                          END,
                          request.id
-                LIMIT 1
+                LIMIT $5
             ) candidate
             ORDER BY candidate.terminal_at, candidate.id
-            LIMIT 1
+            LIMIT $5
         )
         SELECT candidate.request_id, candidate.group_id
         FROM candidate_seed candidate
+        ORDER BY candidate.terminal_at, candidate.request_id
         "#;
 
-async fn next_candidate<P: PoolProvider>(
+/// One discovery probe: up to `page_size` of the oldest eligible graphs not
+/// already excluded, oldest first. Fewer rows than asked for means the
+/// eligible set is exhausted beyond this page.
+async fn next_candidates<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     tiers: &[String],
     archive_after: &[DateTime<Utc>],
     terminal_before: DateTime<Utc>,
     excluded_request_ids: &[Uuid],
-) -> MovementResult<Option<Candidate>> {
-    let row: Option<(Uuid, Uuid)> = sqlx::query_as(CANDIDATE_DISCOVERY_SQL)
+    page_size: i64,
+) -> MovementResult<Vec<Candidate>> {
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(CANDIDATE_DISCOVERY_SQL)
         .bind(tiers)
         .bind(archive_after)
         .bind(terminal_before)
         .bind(excluded_request_ids)
-        .fetch_optional(manager.read_executor())
+        .bind(page_size)
+        .fetch_all(manager.read_executor())
         .await
         .map_err(database_failure)?;
-    let Some((request_id, group_id)) = row else {
-        return Ok(None);
-    };
-    if group_id != request_id {
-        return Err(incomplete_graph());
-    }
-    Ok(Some(Candidate {
-        request_id,
-        group_id,
-        discovered_topology: graph_topology(request_id),
-    }))
+    rows.into_iter()
+        .map(|(request_id, group_id)| {
+            if group_id != request_id {
+                return Err(incomplete_graph());
+            }
+            Ok(Candidate {
+                request_id,
+                group_id,
+                discovered_topology: graph_topology(request_id),
+            })
+        })
+        .collect()
 }
 
 pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
@@ -3537,32 +3555,41 @@ async fn archive_batchless_responses<P: PoolProvider>(
         });
     }
     let candidate_limit = max_groups.saturating_add(1);
+    // Discovery normally completes in one probe: a page of `candidate_limit`
+    // rows. Further probes only run when a page came back full of graphs
+    // this pass had already seen (deduplicated by group), and even then the
+    // probe count stays bounded so a pathological queue cannot spin here.
     let max_probes = candidate_limit.saturating_mul(2);
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen_groups = std::collections::HashSet::new();
     let mut excluded_request_ids = Vec::new();
     let mut discovery_exhausted = false;
     for _ in 0..max_probes {
-        if candidates.len() as i64 == candidate_limit {
+        let page_size = candidate_limit - candidates.len() as i64;
+        if page_size <= 0 {
             break;
         }
-        let Some(candidate) = next_candidate(
+        let page = next_candidates(
             manager,
             &tiers,
             &archive_after,
             cutoffs.terminal_before(),
             &excluded_request_ids,
+            page_size,
         )
-        .await?
-        else {
-            discovery_exhausted = true;
-            break;
-        };
-        excluded_request_ids.extend(candidate.discovered_topology.request_ids.iter().copied());
+        .await?;
+        let page_exhausted = (page.len() as i64) < page_size;
+        for candidate in page {
+            excluded_request_ids.extend(candidate.discovered_topology.request_ids.iter().copied());
+            if seen_groups.insert(candidate.group_id) {
+                candidates.push(candidate);
+            }
+        }
         excluded_request_ids.sort_unstable();
         excluded_request_ids.dedup();
-        if seen_groups.insert(candidate.group_id) {
-            candidates.push(candidate);
+        if page_exhausted {
+            discovery_exhausted = true;
+            break;
         }
     }
     let mut outcome = RetainedResponseArchiveOutcome {
@@ -4147,6 +4174,7 @@ mod tests {
             .bind(vec![timestamp("2026-08-01T00:00:00Z")])
             .bind(timestamp("2026-08-08T00:00:00Z"))
             .bind(Vec::<Uuid>::new())
+            .bind(513_i64)
             .fetch_one(&mut *tx)
             .await
             .expect("candidate discovery must be explainable");

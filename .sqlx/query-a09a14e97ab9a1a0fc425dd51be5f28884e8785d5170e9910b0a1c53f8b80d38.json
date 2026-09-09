@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE user_organizations SET role = 'owner' WHERE organization_id = $1 AND user_id = $2 AND status = 'active'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a09a14e97ab9a1a0fc425dd51be5f28884e8785d5170e9910b0a1c53f8b80d38"
+}

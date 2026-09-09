@@ -68,7 +68,7 @@ pub struct ImageNormalizerMiddlewareState {
     /// bearer-token API key for `image_access` bookkeeping, and (b) by the
     /// per-user-mode lookup once the opt-in flag is wired through.
     /// `None` disables both (useful in tests).
-    pub pool: Option<PgPool>,
+    pub pool: Option<sqlx_pool_router::DynPools>,
 }
 
 /// Extract the Bearer token from `Authorization`, case-insensitive.
@@ -139,7 +139,7 @@ pub async fn image_normalizer_middleware(
     // `image_access` bookkeeping, not for mode selection — best-effort,
     // never blocks the request.
     let attribution_for_access = match (state.pool.as_ref(), extract_bearer_token(&request)) {
-        (Some(pool), Some(bearer)) => crate::api::handlers::images::resolve_image_attribution(pool, &bearer).await,
+        (Some(pool), Some(bearer)) => crate::api::handlers::images::resolve_image_attribution(&pool.write(), &bearer).await,
         _ => None,
     };
 
@@ -178,7 +178,7 @@ pub async fn image_normalizer_middleware(
                 let bytes_len = ingested.bytes_len;
                 let token = ingested.token;
                 tokio::spawn(async move {
-                    crate::api::handlers::images::record_image_access(&pool, attribution, token, &mime, bytes_len).await;
+                    crate::api::handlers::images::record_image_access(&pool.write(), attribution, token, &mime, bytes_len).await;
                 });
             }
             Ok::<String, NormalizeError>(signed.url)

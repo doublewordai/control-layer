@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                            UPDATE users\n                            SET email = $1, username = $2, display_name = NULL, avatar_url = NULL,\n                                is_deleted = true, updated_at = NOW()\n                            WHERE id = $3 AND user_type = 'organization' AND is_deleted = false\n                            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e5484d14aca330690b1be12c48f2cd33b7bf43a4154f7eddd7883540df557447"
+}

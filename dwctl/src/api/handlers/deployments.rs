@@ -451,7 +451,7 @@ pub async fn list_deployed_models<P: PoolProvider>(
 
     // Use ModelEnricher to add requested data
     let enricher = DeployedModelEnricher {
-        db: state.db.read(),
+        db: &state.db.read(),
         include_groups,
         include_metrics,
         include_status,
@@ -1071,7 +1071,7 @@ pub async fn get_deployed_model<P: PoolProvider>(
 
     // Use ModelEnricher to add related data
     let enricher = DeployedModelEnricher {
-        db: state.db.read(),
+        db: &state.db.read(),
         include_groups,
         include_metrics,
         include_status,

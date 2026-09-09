@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "11.4.5" # x-release-please-version
+version = "11.6.1" # x-release-please-version
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
@@ -154,7 +154,7 @@ async-stripe-billing = { version = "1.0.0-rc.0", features = [
   "billing_portal_session",
   "invoice_item",
 ] }
-sqlx-pool-router = "0.2.0"
+sqlx-pool-router = "1.0"
 minijinja = "2.15.1"
 multer = "3.1.0"
 ctor = "0.9"

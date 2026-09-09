@@ -98,12 +98,21 @@ pub async fn initial_cache(pool: &PgPool) -> Result<ZdrKeyCache, sqlx::Error> {
 /// Background task: keep `cache` fresh. Listens on `auth_config_changed` and
 /// reloads (debounced), with a periodic fallback reload to recover from any
 /// missed notification. Returns when `shutdown` fires.
-pub async fn run(pool: PgPool, cache: ZdrKeyCache, fallback_interval_ms: u64, shutdown: CancellationToken) -> Result<(), anyhow::Error> {
+pub async fn run(
+    pools: impl sqlx_pool_router::PoolProvider,
+    listener_pools: impl sqlx_pool_router::PoolProvider,
+    cache: ZdrKeyCache,
+    fallback_interval_ms: u64,
+    shutdown: CancellationToken,
+) -> Result<(), anyhow::Error> {
+    let pools = sqlx_pool_router::DynPools::new(pools);
+    // LISTEN needs a session: direct connections, never the pooled endpoint.
+    let listener_pools = sqlx_pool_router::DynPools::new(listener_pools);
     const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
     let fallback = (fallback_interval_ms > 0).then(|| std::time::Duration::from_millis(fallback_interval_ms));
 
     'outer: loop {
-        let mut listener = PgListener::connect_with(&pool).await?;
+        let mut listener = PgListener::connect_with(&listener_pools.write()).await?;
         listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await?;
         info!("Started ZDR key sync listener");
 
@@ -127,7 +136,7 @@ pub async fn run(pool: PgPool, cache: ZdrKeyCache, fallback_interval_ms: u64, sh
                     Ok(Some(_)) => {
                         if last_reload.elapsed() < MIN_RELOAD_INTERVAL { continue; }
                         last_reload = std::time::Instant::now();
-                        reload(&pool, &cache).await;
+                        reload(&pools.write(), &cache).await;
                     }
                     Ok(None) => {
                         debug!("ZDR key sync: connection lost, reconnecting");
@@ -141,7 +150,7 @@ pub async fn run(pool: PgPool, cache: ZdrKeyCache, fallback_interval_ms: u64, sh
                 _ = tick => {
                     if last_reload.elapsed() < MIN_RELOAD_INTERVAL { continue; }
                     last_reload = std::time::Instant::now();
-                    reload(&pool, &cache).await;
+                    reload(&pools.write(), &cache).await;
                 }
             }
         }
