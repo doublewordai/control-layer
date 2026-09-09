@@ -1184,8 +1184,19 @@ pub async fn approve_join_request<P: PoolProvider>(
     // lands, and surfacing an error here would invite an admin to retry an
     // approval that already succeeded.
     let mut users_repo = Users::new(&mut pool_conn);
-    let org_user = users_repo.get_by_id(id).await.ok().flatten();
-    let approved_user = users_repo.get_by_id(approved_user_id).await.ok().flatten();
+    // Swallowing the error would leave the warning below saying only that the
+    // parties could not be loaded, with no hint that the database was the
+    // reason — the difference between "this user vanished" and "the pool is
+    // failing" is the whole diagnosis.
+    let mut load = async |who: &str, user_id: UserId| match users_repo.get_by_id(user_id).await {
+        Ok(found) => found,
+        Err(e) => {
+            tracing::warn!(org_id = %id, "Failed to load the {who} for a join-approval notification: {e}");
+            None
+        }
+    };
+    let org_user = load("organization", id).await;
+    let approved_user = load("approved user", approved_user_id).await;
 
     match (org_user, approved_user) {
         (Some(org_user), Some(approved_user)) => {

@@ -7,7 +7,7 @@ use lettre::{
     message::{Mailbox, header::ContentType},
     transport::smtp::authentication::Credentials,
 };
-use minijinja::{Environment, context};
+use minijinja::{Environment, context, value::Value};
 use std::path::Path;
 
 struct EmailTemplates {
@@ -570,6 +570,22 @@ impl EmailService {
         })
     }
 
+    /// Flatten a value for use in a header.
+    ///
+    /// A display name is free text the account holder chose, and a subject
+    /// line is a single header field. A CR or LF in it is at best rejected by
+    /// the message builder — losing the notification entirely, since sends
+    /// here are best-effort — and at worst the start of a second header.
+    fn header_safe(value: &str) -> String {
+        value
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     /// Tell an owner or admin that somebody has asked to join their workspace.
     ///
     /// Deliberately its own template rather than a re-worded `org_invite`:
@@ -587,7 +603,11 @@ impl EmailService {
         requester_email: &str,
         requests_link: &str,
     ) -> Result<(), Error> {
-        let subject = format!("{requester_name} has asked to join {org_name}");
+        let subject = format!(
+            "{} has asked to join {}",
+            Self::header_safe(requester_name),
+            Self::header_safe(org_name)
+        );
         let body = self
             .render_org_join_request_body(org_name, requester_name, requester_email, requests_link)
             .map_err(|e| Error::Internal {
@@ -609,7 +629,7 @@ impl EmailService {
         role: &str,
         dashboard_link: &str,
     ) -> Result<(), Error> {
-        let subject = format!("You've been approved to join {org_name}");
+        let subject = format!("You've been approved to join {}", Self::header_safe(org_name));
         let body = self
             .render_org_join_approved_body(org_name, role, dashboard_link)
             .map_err(|e| Error::Internal {
@@ -627,24 +647,39 @@ impl EmailService {
         requests_link: &str,
     ) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
-        env.add_template("email", &self.templates.org_join_request)?;
+        // Registered under an `.html` name on purpose: minijinja picks its
+        // auto-escape mode from the template name's extension, and a bare
+        // "email" gets `AutoEscape::None`. These bodies interpolate a
+        // display name and address chosen by someone who is not yet a member
+        // of the workspace, so they must be escaped.
+        env.add_template("email.html", &self.templates.org_join_request)?;
 
-        env.get_template("email")?.render(context! {
+        env.get_template("email.html")?.render(context! {
             org_name,
             requester_name,
             requester_email,
-            requests_link,
+            // Escaping would render the `/` as `&#x2f;`, which the anchor
+            // survives but the plain-text fallback line below it does not.
+            // The link is built from operator config and a fixed path, never
+            // from user input, so it is safe to pass through.
+            requests_link => Value::from_safe_string(requests_link.to_string()),
         })
     }
 
     fn render_org_join_approved_body(&self, org_name: &str, role: &str, dashboard_link: &str) -> Result<String, minijinja::Error> {
         let mut env = Environment::new();
-        env.add_template("email", &self.templates.org_join_approved)?;
+        // Registered under an `.html` name on purpose: minijinja picks its
+        // auto-escape mode from the template name's extension, and a bare
+        // "email" gets `AutoEscape::None`. These bodies interpolate a
+        // display name and address chosen by someone who is not yet a member
+        // of the workspace, so they must be escaped.
+        env.add_template("email.html", &self.templates.org_join_approved)?;
 
-        env.get_template("email")?.render(context! {
+        env.get_template("email.html")?.render(context! {
             org_name,
             role,
-            dashboard_link,
+            // Config-derived, not user input — see `render_org_join_request_body`.
+            dashboard_link => Value::from_safe_string(dashboard_link.to_string()),
         })
     }
 
@@ -1047,6 +1082,42 @@ mod tests {
         assert!(body.contains("Acme"));
         assert!(body.contains("member"));
         assert!(body.contains("http://localhost:3001"));
+    }
+
+    /// A join request is filed by someone who is NOT yet a member — an
+    /// outsider whose display name is whatever they typed at signup. If it
+    /// reaches an owner's inbox unescaped, that outsider gets to put markup
+    /// in mail the workspace's admins are told to trust.
+    #[tokio::test]
+    async fn test_org_join_request_body_escapes_the_requester() {
+        let config = create_test_config();
+        let email_service = EmailService::new(&config).unwrap();
+
+        let body = email_service
+            .render_org_join_request_body(
+                "Acme",
+                "<script>alert(1)</script>",
+                "<img src=x onerror=alert(1)>@acme.test",
+                "http://localhost:3001/organization",
+            )
+            .unwrap();
+
+        assert!(!body.contains("<script>"), "requester name must not inject markup: {body}");
+        assert!(!body.contains("<img "), "requester address must not inject markup: {body}");
+        assert!(body.contains("&lt;script&gt;"), "expected the name HTML-escaped: {body}");
+    }
+
+    /// A CR/LF in a display name must not reach the Subject header. The name
+    /// is free text chosen by an outsider filing the request, and a send that
+    /// the builder rejects is a notification silently lost — these sends are
+    /// best-effort by design.
+    #[tokio::test]
+    async fn test_org_join_subject_is_header_safe() {
+        let flattened = EmailService::header_safe("Dana\r\nBcc: attacker@evil.test");
+
+        assert!(!flattened.contains('\r'));
+        assert!(!flattened.contains('\n'));
+        assert_eq!(flattened, "Dana Bcc: attacker@evil.test");
     }
 
     /// Every email has an operator override in `templates_dir`. A join-request
