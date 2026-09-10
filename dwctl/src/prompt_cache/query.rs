@@ -27,8 +27,6 @@
 //! the param passes through to the provider there — harmless (OpenAI-compatible servers ignore
 //! unknown query params), but only `/chat/completions` honours it.
 
-use axum::http::Uri;
-use axum::http::uri::PathAndQuery;
 use serde_json::{Value, json};
 
 /// The query parameter name, on `/chat/completions` only.
@@ -37,10 +35,10 @@ pub const CACHE_BREAKPOINT_PARAM: &str = "cacheBreakpoint";
 /// The one supported value: mark the last cacheable block of the request (Anthropic automatic-
 /// caching semantics — for turn-based chat that's the latest user message; for a request ending
 /// in tool results it's the last tool block, i.e. a strictly larger prefix).
-const LAST_USER_MESSAGE: &str = "lastUserMessage";
+pub(crate) const LAST_USER_MESSAGE: &str = "lastUserMessage";
 
 /// The marker injected for [`LAST_USER_MESSAGE`]. Explicit `1h` tier (not the policy default).
-fn last_user_message_marker() -> Value {
+pub(crate) fn last_user_message_marker() -> Value {
     json!({"type": "ephemeral", "ttl": "1h"})
 }
 
@@ -90,34 +88,6 @@ pub fn inject_marker(body: &mut Value, marker: Value) -> Inject {
             Inject::Applied
         }
     }
-}
-
-/// Remove every `cacheBreakpoint` pair from the URI's query (other params are preserved in
-/// order; the `?` is dropped entirely if nothing remains). Must run before forwarding: onwards
-/// sends `path_and_query` verbatim upstream. Returns the URI unchanged when the param is absent.
-pub fn strip_param(uri: &Uri) -> Uri {
-    fn param_key(pair: &str) -> &str {
-        pair.split_once('=').map(|(k, _)| k).unwrap_or(pair)
-    }
-    let Some(query) = uri.query() else { return uri.clone() };
-    if !query.split('&').any(|p| param_key(p) == CACHE_BREAKPOINT_PARAM) {
-        return uri.clone();
-    }
-    let kept: Vec<&str> = query.split('&').filter(|p| param_key(p) != CACHE_BREAKPOINT_PARAM).collect();
-    let path_and_query = if kept.is_empty() {
-        uri.path().to_string()
-    } else {
-        format!("{}?{}", uri.path(), kept.join("&"))
-    };
-    // The path and the kept pairs are substrings of an already-valid URI, so this re-parse can't
-    // fail; if it somehow does, keep the original URI (an unknown upstream query param) rather
-    // than failing the request.
-    let mut parts = uri.clone().into_parts();
-    match path_and_query.parse::<PathAndQuery>() {
-        Ok(pq) => parts.path_and_query = Some(pq),
-        Err(_) => return uri.clone(),
-    }
-    Uri::from_parts(parts).unwrap_or_else(|_| uri.clone())
 }
 
 #[cfg(test)]
@@ -180,27 +150,5 @@ mod tests {
         // Non-object bodies have nowhere to inject.
         let mut body = json!(["not", "an", "object"]);
         assert_eq!(inject_marker(&mut body, last_user_message_marker()), Inject::NotAnObject);
-    }
-
-    #[test]
-    fn strip_removes_param_and_preserves_others() {
-        let uri: Uri = "/v1/chat/completions?foo=bar&cacheBreakpoint=lastUserMessage&baz=1"
-            .parse()
-            .unwrap();
-        assert_eq!(strip_param(&uri).to_string(), "/v1/chat/completions?foo=bar&baz=1");
-
-        // Only the param → the whole query goes (no trailing '?').
-        let uri: Uri = "/v1/chat/completions?cacheBreakpoint=lastUserMessage".parse().unwrap();
-        assert_eq!(strip_param(&uri).to_string(), "/v1/chat/completions");
-
-        // Duplicates are all removed.
-        let uri: Uri = "/v1/chat/completions?cacheBreakpoint=a&x=y&cacheBreakpoint=b".parse().unwrap();
-        assert_eq!(strip_param(&uri).to_string(), "/v1/chat/completions?x=y");
-
-        // Absent → unchanged (same instance semantics, incl. no query at all).
-        let uri: Uri = "/v1/chat/completions?foo=bar".parse().unwrap();
-        assert_eq!(strip_param(&uri).to_string(), "/v1/chat/completions?foo=bar");
-        let uri: Uri = "/v1/chat/completions".parse().unwrap();
-        assert_eq!(strip_param(&uri).to_string(), "/v1/chat/completions");
     }
 }

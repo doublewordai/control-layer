@@ -16,6 +16,9 @@
 //! - **outbound_request**: last-mile streaming usage-flag injection
 //!   (`stream_options`, and forcing `stream` on batch traffic) before onwards. The id-scrub lives
 //!   in this module's own request parse (`scrub_request_id_fields`), not here.
+//! - **params**: the single parse of out-of-band functional parameters (a URL
+//!   query param, or a suffix on the model name) into the body fields they stand
+//!   in for, for clients that can only configure `base_url` and `model_name`.
 //! - **engine**: the multi-step Open Responses orchestration loop and the
 //!   daemon-side request processor.
 
@@ -23,6 +26,7 @@ pub mod handler;
 pub mod image_normalizer_middleware;
 pub mod middleware;
 pub mod outbound_request;
+pub mod params;
 pub mod response_store;
 pub mod store;
 pub mod streaming;
