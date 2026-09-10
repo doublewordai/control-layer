@@ -3722,6 +3722,110 @@ async fn read_apis_preserve_exact_values_filters_pages_and_counts_after_move(poo
 }
 
 #[sqlx::test]
+async fn active_first_page_ranks_in_flight_rows_before_newer_ones(pool: PgPool) {
+    // The in-flight arm reads from a materialized CTE and must apply the full
+    // page ordering itself, rank included. Ordering it by created_at alone is
+    // invisible until more rows are in flight than fit on one page: the arm
+    // then returns the NEWEST in-flight rows, and a lower-ranked but older row
+    // that belongs on page one is silently dropped off the end.
+    let base = timestamp("2026-08-01T12:00:00Z");
+    let mut ids = Vec::new();
+    for (index, suffix) in ["rank-oldest", "rank-second", "rank-third", "rank-newest"]
+        .iter()
+        .enumerate()
+    {
+        let graph = singleton(&pool, "priority", TerminalState::Pending, base, suffix).await;
+        ids.push(graph.request_ids[0]);
+        // created_at strictly ascending across ids[0..4].
+        sqlx::query("UPDATE requests SET created_at = $2 WHERE id = $1")
+            .bind(graph.request_ids[0])
+            .bind(base - TimeDelta::minutes(40 - 10 * index as i64))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    // Ranks deliberately disagree with recency. claimed/processing carry the
+    // daemon and timestamp fields their CHECK constraints require.
+    for (id, state) in [
+        (ids[0], "processing"),
+        (ids[1], "pending"),
+        (ids[2], "claimed"),
+        (ids[3], "pending"),
+    ] {
+        sqlx::query(
+            "UPDATE requests
+                SET state = $2,
+                    daemon_id = CASE WHEN $2 = 'pending' THEN NULL ELSE $3 END,
+                    claimed_at = CASE WHEN $2 = 'pending' THEN NULL ELSE $4 END,
+                    started_at = CASE WHEN $2 = 'processing' THEN $4 ELSE NULL END
+              WHERE id = $1",
+        )
+        .bind(id)
+        .bind(state)
+        .bind(Uuid::nil())
+        .bind(base)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let request_manager = manager(&pool).await;
+
+    // processing, then claimed, then the two pending newest-first.
+    let expected = [ids[0], ids[2], ids[3], ids[1]];
+    for (skip, expected_id) in expected.iter().enumerate() {
+        let page = request_manager
+            .list_requests(ListRequestsFilter {
+                created_by: Some(OWNER.to_owned()),
+                active_first: true,
+                limit: 1,
+                skip: skip as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            page.data.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![*expected_id],
+            "active-first page at skip={skip} must rank in-flight rows before newer ones"
+        );
+    }
+
+    // A page smaller than the in-flight set is where a created_at-only in-flight
+    // arm regresses: it would surface the two newest rows instead of the two
+    // lowest-ranked ones.
+    let first_page = request_manager
+        .list_requests(ListRequestsFilter {
+            created_by: Some(OWNER.to_owned()),
+            active_first: true,
+            limit: 2,
+            skip: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        first_page.data.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![ids[0], ids[2]]
+    );
+
+    // active_first=false is a pure recency ordering over the same rows.
+    let recency = request_manager
+        .list_requests(ListRequestsFilter {
+            created_by: Some(OWNER.to_owned()),
+            active_first: false,
+            limit: 4,
+            skip: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        recency.data.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![ids[3], ids[2], ids[1], ids[0]]
+    );
+}
+
+#[sqlx::test]
 async fn retained_pages_validate_routes_before_limit_and_merge_terminal_ties(pool: PgPool) {
     install_candidate_index(&pool).await;
     let delete_on = archive_date("2026-08-03");
