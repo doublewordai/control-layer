@@ -4418,6 +4418,14 @@ async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool:
     .await;
     let request_manager = manager(&pool).await;
     let before = capture_public_reads(&request_manager, &graph).await;
+    let terminal_before = serde_json::to_value(
+        request_manager
+            .get_terminal_request_detail(RequestId(graph.request_ids[0]))
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
 
     sqlx::query(
         r#"
@@ -4471,6 +4479,17 @@ async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool:
     // uncommitted archive.
     let during = capture_public_reads(&request_manager, &graph).await;
     assert_eq!(during, before);
+    assert_eq!(
+        serde_json::to_value(
+            request_manager
+                .get_terminal_request_detail(RequestId(graph.request_ids[0]))
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        terminal_before
+    );
 
     let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
         .bind(MOVEMENT_GATE_KEY)
@@ -4486,6 +4505,17 @@ async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool:
 
     let after = capture_public_reads(&request_manager, &graph).await;
     assert_eq!(after, before);
+    assert_eq!(
+        serde_json::to_value(
+            request_manager
+                .get_terminal_request_detail(RequestId(graph.request_ids[0]))
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        terminal_before
+    );
 }
 
 async fn set_bucket_state(pool: &PgPool, delete_on: NaiveDate, state: &str) {
