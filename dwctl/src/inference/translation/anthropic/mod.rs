@@ -382,7 +382,11 @@ mod tests {
     }
 
     #[test]
-    fn response_usage_omits_cache_fields_when_uncached() {
+    fn response_usage_reports_zero_cache_fields_when_uncached() {
+        // The live Anthropic API always includes the cache scalars (0 when
+        // caching is unused) — match it exactly. The per-TTL `cache_creation`
+        // object stays conditional, and its 24h tier is never emitted (24h
+        // writes are disabled at the server config level).
         let chat = json!({
             "id": "c", "model": "m",
             "choices": [ { "message": { "content": "hi" }, "finish_reason": "stop" } ],
@@ -391,8 +395,33 @@ mod tests {
         let bytes = response::from_chat_completions(Bytes::from(serde_json::to_vec(&chat).unwrap())).unwrap();
         let out: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(out["usage"]["input_tokens"], 10);
-        assert!(out["usage"].get("cache_read_input_tokens").is_none());
-        assert!(out["usage"].get("cache_creation_input_tokens").is_none());
+        assert_eq!(out["usage"]["cache_read_input_tokens"], 0);
+        assert_eq!(out["usage"]["cache_creation_input_tokens"], 0);
+        assert!(out["usage"].get("cache_creation").is_none());
+    }
+
+    #[test]
+    fn response_usage_never_emits_the_24h_tier() {
+        // The OpenAI frame carries all three tiers; the customer frame must
+        // carry only the two Anthropic defines — an always-zero 24h field
+        // would imply a product we have turned off.
+        let chat = json!({
+            "id": "c", "model": "m",
+            "choices": [ { "message": { "content": "hi" }, "finish_reason": "stop" } ],
+            "usage": { "prompt_tokens": 100, "completion_tokens": 2,
+                "prompt_tokens_details": { "cached_tokens": 0 },
+                "cache_creation_input_tokens": 40,
+                "cache_creation": { "ephemeral_5m_input_tokens": 40, "ephemeral_1h_input_tokens": 0, "ephemeral_24h_input_tokens": 0 } }
+        });
+        let bytes = response::from_chat_completions(Bytes::from(serde_json::to_vec(&chat).unwrap())).unwrap();
+        let out: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(out["usage"]["input_tokens"], 60, "100 - 40 created");
+        assert_eq!(out["usage"]["cache_creation"]["ephemeral_5m_input_tokens"], 40);
+        assert!(
+            out["usage"]["cache_creation"].get("ephemeral_24h_input_tokens").is_none(),
+            "24h tier must not reach the customer frame: {}",
+            out["usage"]
+        );
     }
 
     #[test]
