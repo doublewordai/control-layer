@@ -50,6 +50,12 @@ healthy retention progress.
 
 ## Deployment and verification
 
+Before upgrading a populated database, satisfy any earlier migration prerequisites
+in the release. In particular, the preceding retained-response created-index
+migration requires `scripts/prepare_retained_created_index.sql` to have completed;
+it fails startup safely if that index is missing or incomplete. That online index
+preparation is separate from the statistics-maintenance change.
+
 Apply the additive migration through the normal application migration path, then
 roll out the application. Old and new replicas can coexist; no table rewrite,
 blocking index rebuild, or scale-to-zero step is required. The runtime database role

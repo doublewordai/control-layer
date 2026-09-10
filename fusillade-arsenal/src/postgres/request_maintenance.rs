@@ -40,7 +40,7 @@ pub(super) async fn before_archive<P: PoolProvider>(
         Ok(Err(error)) => {
             counter!("fusillade_request_statistics_maintenance_total", "outcome" => "error")
                 .increment(1);
-            warn!("Request statistics maintenance failed; archive pass deferred");
+            warn!(error = %error, "Request statistics maintenance failed; archive pass deferred");
             Err(error)
         }
     }
