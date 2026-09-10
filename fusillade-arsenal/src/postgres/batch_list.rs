@@ -29,12 +29,19 @@ pub(super) fn push_query<'a>(
     let limit = filter.limit.unwrap_or(100);
     query_builder.push("WITH ");
     if include_active {
-        // Fence the globally small active set before applying customer filters.
+        // Fence the active set before applying ordering and page limits.
         // Otherwise the planner can walk an owner's terminal history looking
         // for active rows. The existing active partial index supplies this set directly.
         query_builder.push("active_batches AS MATERIALIZED (SELECT b.* FROM batches b WHERE b.deleted_at IS NULL AND (");
         query_builder.push(ACTIVE);
-        query_builder.push(")), ");
+        query_builder.push(")");
+        // Filter before materializing so another owner's backlog does not fill
+        // this page's intermediate result. The id-leading active index can still
+        // scan other owners' active rows; this bounds materialization, not I/O.
+        if let Some(owner) = &filter.created_by {
+            query_builder.push(" AND b.created_by = ").push_bind(owner);
+        }
+        query_builder.push("), ");
     }
     // Plan the bounded page independently of the expensive count LATERAL.
     // Inlining lets its row estimates bias the page toward a full owner bitmap
@@ -430,6 +437,44 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn owner_page_materializes_only_its_own_backlog(pool: PgPool) {
+        // Both owners have more active rows than fit on a page. Filtering only
+        // after the CTE would materialize 2,020 rows instead of this owner's 20.
+        sqlx::query(
+            r#"
+            INSERT INTO batches (id, endpoint, completion_window, created_by,
+                                 created_at, counts_frozen_at, expires_at)
+            SELECT md5(i::text)::uuid, '/v1/chat/completions', '24h',
+                   CASE WHEN i <= 20 THEN 'owner' ELSE 'other' END,
+                   '2026-01-01'::timestamptz + i * interval '1 second',
+                   NOW(), NOW() + interval '1 day'
+            FROM generate_series(1, 2020) i
+        "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE batches").execute(&pool).await.unwrap();
+        let filter = ListBatchesFilter {
+            created_by: Some("owner".into()),
+            active_first: true,
+            limit: Some(10),
+            ..Default::default()
+        };
+        let mut query = QueryBuilder::new("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ");
+        push_query(&mut query, &filter, None).unwrap();
+        let plan: Value = query.build_query_scalar().fetch_one(&pool).await.unwrap();
+        let active = plan[0]["Plan"]["Plans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["Subplan Name"] == "CTE active_batches")
+            .expect("materialized active set");
+        assert_eq!(active["Actual Rows"].as_u64(), Some(20), "{plan}");
+        assert_eq!(plan[0]["Plan"]["Actual Rows"].as_u64(), Some(10));
+    }
+
+    #[sqlx::test]
     async fn owner_and_admin_pages_preserve_ties_and_filters(pool: PgPool) {
         sqlx::query(r#"
             INSERT INTO batches (id, endpoint, created_by, created_at,
@@ -437,7 +482,7 @@ mod tests {
                 service_tier, completion_window, expires_at, metadata, api_key_id,
                 counts_frozen_at, total_requests, completed_requests, failed_requests, canceled_requests)
             SELECT md5(i::text)::uuid, '/v1/chat/completions',
-                CASE WHEN i <= 10 THEN 'owner' ELSE 'other' END,
+                CASE WHEN i <= 20 THEN 'owner' ELSE 'other' END,
                 '2026-01-01'::timestamptz + (i / 3) * interval '1 second',
                 CASE WHEN i % 5 = 1 THEN NOW() END,
                 CASE WHEN i % 5 = 2 THEN NOW() END,
@@ -450,7 +495,7 @@ mod tests {
                 jsonb_build_object('tag', CASE WHEN i % 2 = 0 THEN 'needle' ELSE 'hay' END),
                 md5((i % 2)::text)::uuid,
                 NOW(), 6, 3, 2, 1
-            FROM generate_series(1, 14) i
+            FROM generate_series(1, 34) i
         "#).execute(&pool).await.unwrap();
         let manager = PostgresRequestManager::new(
             TestDbPools::new(pool.clone()).await.unwrap(),
@@ -520,7 +565,7 @@ mod tests {
     #[sqlx::test]
     async fn migration_rejects_a_same_name_index_with_wrong_order(pool: PgPool) {
         let validation =
-            include_str!("../../migrations/20260909010001_validate_batch_owner_page_index.up.sql");
+            include_str!("../../migrations/20260910010001_validate_batch_owner_page_index.up.sql");
         let mut tx = pool.begin().await.unwrap();
         sqlx::raw_sql("DROP INDEX idx_batches_owner_created_at_id; CREATE INDEX idx_batches_owner_created_at_id ON batches (created_by, created_at, id) WHERE deleted_at IS NULL;")
             .execute(&mut *tx).await.unwrap();

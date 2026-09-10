@@ -4912,11 +4912,19 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         let mut query_builder = QueryBuilder::new("");
         batch_list::push_query(&mut query_builder, &filter, cursor)?;
 
+        // Bound pathological filters and live-count scans without leaking a
+        // session setting to the next caller on this pooled connection.
+        let mut tx = self.begin_read().await.map_err(anyhow::Error::from)?;
+        sqlx::query("SET LOCAL statement_timeout = '15s'")
+            .execute(&mut *tx)
+            .await
+            .map_err(anyhow::Error::from)?;
         let rows = query_builder
             .build()
-            .fetch_all(self.read_executor())
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
+        tx.commit().await.map_err(anyhow::Error::from)?;
 
         Ok(rows
             .into_iter()
