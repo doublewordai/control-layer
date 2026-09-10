@@ -619,14 +619,12 @@ impl<'c> ModelProvisioning<'c> {
     }
 
     async fn reconcile_groups(&mut self, model_id: Uuid, desired: &[String], groups: &HashMap<String, Uuid>) -> Result<()> {
-        sqlx::query("DELETE FROM deployment_groups WHERE deployment_id = $1")
-            .bind(model_id)
-            .execute(&mut *self.db)
-            .await
-            .context("clear provisioned model access groups")?;
+        let desired_ids: Vec<Uuid> = desired.iter().map(|name| groups[name]).collect();
         for name in desired {
             sqlx::query(
-                "INSERT INTO deployment_groups (deployment_id, group_id, granted_by) VALUES ($1,$2,'00000000-0000-0000-0000-000000000000')",
+                r#"INSERT INTO deployment_groups (deployment_id, group_id, granted_by)
+                   VALUES ($1,$2,'00000000-0000-0000-0000-000000000000')
+                   ON CONFLICT (deployment_id, group_id) DO NOTHING"#,
             )
             .bind(model_id)
             .bind(groups[name])
@@ -634,6 +632,12 @@ impl<'c> ModelProvisioning<'c> {
             .await
             .with_context(|| format!("grant access group {name:?}"))?;
         }
+        sqlx::query("DELETE FROM deployment_groups WHERE deployment_id = $1 AND NOT (group_id = ANY($2))")
+            .bind(model_id)
+            .bind(&desired_ids)
+            .execute(&mut *self.db)
+            .await
+            .context("remove omitted provisioned model access groups")?;
         Ok(())
     }
 
@@ -643,18 +647,20 @@ impl<'c> ModelProvisioning<'c> {
         desired: &[TrafficRule],
         redirect_ids: &HashMap<String, Uuid>,
     ) -> Result<()> {
-        sqlx::query("DELETE FROM model_traffic_rules WHERE deployed_model_id = $1")
-            .bind(model_id)
-            .execute(&mut *self.db)
-            .await
-            .context("clear provisioned traffic rules")?;
+        let desired_purposes: Vec<String> = desired.iter().map(|rule| rule.purpose().as_db_str().to_string()).collect();
         for rule in desired {
             let (action, target) = match rule {
                 TrafficRule::Deny { .. } => ("deny", None),
                 TrafficRule::Redirect { target, .. } => ("redirect", Some(redirect_ids[target])),
             };
             sqlx::query(
-                "INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action, redirect_target_id) VALUES ($1,$2,$3,$4)",
+                r#"INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action, redirect_target_id)
+                   VALUES ($1,$2,$3,$4)
+                   ON CONFLICT (deployed_model_id, api_key_purpose) DO UPDATE SET
+                       action = EXCLUDED.action,
+                       redirect_target_id = EXCLUDED.redirect_target_id
+                   WHERE model_traffic_rules.action IS DISTINCT FROM EXCLUDED.action
+                      OR model_traffic_rules.redirect_target_id IS DISTINCT FROM EXCLUDED.redirect_target_id"#,
             )
             .bind(model_id)
             .bind(rule.purpose().as_db_str())
@@ -664,6 +670,12 @@ impl<'c> ModelProvisioning<'c> {
             .await
             .context("insert provisioned traffic rule")?;
         }
+        sqlx::query("DELETE FROM model_traffic_rules WHERE deployed_model_id = $1 AND NOT (api_key_purpose = ANY($2))")
+            .bind(model_id)
+            .bind(&desired_purposes)
+            .execute(&mut *self.db)
+            .await
+            .context("remove omitted provisioned traffic rules")?;
         Ok(())
     }
 }
