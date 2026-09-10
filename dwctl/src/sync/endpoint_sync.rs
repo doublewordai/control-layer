@@ -509,6 +509,7 @@ where
     let mut new_models_created = 0;
     let mut models_deactivated = 0;
     let mut models_deleted = 0;
+    let sync_time = Utc::now();
 
     // Get current deployments for this endpoint
     let current_deployments = deployments_repo
@@ -667,7 +668,7 @@ where
             if !models_to_deploy.contains(&deployment.model_name) && !deployment.deleted {
                 if deployment.provisioning_source.is_some() {
                     if deployment.status != ModelStatus::Inactive {
-                        let update = DeploymentUpdateDBRequest::status_update(Some(ModelStatus::Inactive), Utc::now());
+                        let update = DeploymentUpdateDBRequest::status_update(Some(ModelStatus::Inactive), sync_time);
                         deployments_repo
                             .update(deployment.id, &update)
                             .await
@@ -709,7 +710,7 @@ where
         models_deleted,
         total_models_fetched: models_to_deploy.len(),
         filtered_models_count: models_to_deploy.len(),
-        synced_at: Utc::now(),
+        synced_at: sync_time,
     })
 }
 
