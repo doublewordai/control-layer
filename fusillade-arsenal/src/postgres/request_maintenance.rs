@@ -62,10 +62,24 @@ async fn refresh_request_statistics<P: PoolProvider>(
         .execute(&mut *tx)
         .await
         .map_err(database_error)?;
+    // A plain conditional UPDATE can lock a concurrently changed row even
+    // after rechecking its predicate and deciding not to update it. That losing
+    // claimant could then block the owner's maintenance transaction. Skip
+    // busy candidates instead of queueing claimants behind their owner.
     let claimed: Option<DateTime<Utc>> = sqlx::query_scalar(
-        "UPDATE request_statistics_maintenance SET attempted_at = clock_timestamp(), completed_at = NULL \
-         WHERE singleton AND attempted_at < clock_timestamp() - interval '1 minute' RETURNING attempted_at"
-    ).fetch_optional(&mut *tx).await.map_err(database_error)?;
+        "WITH candidate AS MATERIALIZED ( \
+             SELECT singleton FROM request_statistics_maintenance \
+             WHERE singleton AND attempted_at < clock_timestamp() - interval '1 minute' \
+             FOR UPDATE SKIP LOCKED \
+         ) \
+         UPDATE request_statistics_maintenance maintenance \
+         SET attempted_at = clock_timestamp(), completed_at = NULL \
+         FROM candidate WHERE maintenance.singleton = candidate.singleton \
+         RETURNING maintenance.attempted_at",
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(database_error)?;
     let Some(attempt) = claimed else {
         let complete: bool = sqlx::query_scalar(
             "SELECT completed_at IS NOT NULL FROM request_statistics_maintenance WHERE singleton",
@@ -91,8 +105,10 @@ async fn refresh_request_statistics<P: PoolProvider>(
         .map_err(database_error)?;
     // A delayed connection acquisition can outlive the cooldown. Recheck the
     // attempt under a row lock so an expired worker cannot overlap its successor.
+    // Allow the bounded lock wait here: a claimant rechecking a just-committed
+    // row can briefly hold its lock even when it ultimately claims nothing.
     let still_owner: Option<bool> = sqlx::query_scalar(
-        "SELECT singleton FROM request_statistics_maintenance WHERE singleton AND attempted_at = $1 FOR UPDATE NOWAIT",
+        "SELECT singleton FROM request_statistics_maintenance WHERE singleton AND attempted_at = $1 FOR UPDATE",
     ).bind(attempt).fetch_optional(&mut *tx).await.map_err(database_error)?;
     if still_owner.is_none() {
         tx.rollback().await.map_err(database_error)?;
@@ -144,6 +160,27 @@ async fn refresh_request_statistics<P: PoolProvider>(
 mod tests {
     use super::*;
     use crate::{PostgresStorageConfig, TestDbPools};
+
+    #[sqlx::test]
+    async fn maintenance_claim_skips_another_workers_row_lock(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::new(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            PostgresStorageConfig::default(),
+        );
+        let mut holder = pool.begin().await.unwrap();
+        sqlx::query("SELECT singleton FROM request_statistics_maintenance FOR UPDATE")
+            .execute(&mut *holder)
+            .await
+            .unwrap();
+        let ready =
+            tokio::time::timeout(Duration::from_secs(1), refresh_request_statistics(&manager))
+                .await
+                .expect("a competing claim must not wait for the owner")
+                .expect("a competing claim is normal coordination, not an error");
+        assert!(!ready);
+        holder.rollback().await.unwrap();
+        assert!(refresh_request_statistics(&manager).await.unwrap());
+    }
 
     #[sqlx::test]
     async fn maintenance_uses_transaction_schema_without_leaking_it(pool: sqlx::PgPool) {

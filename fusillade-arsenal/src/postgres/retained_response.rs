@@ -3909,6 +3909,44 @@ mod tests {
             "identity lookup must use the primary key: {plan}"
         );
         assert!(!plan_uses_index(&plan, "idx_requests_user_created_sort"));
+
+        // Cost estimates on a small fixture can still favor the primary key
+        // even with the original unfenced query. Make the competing path
+        // the only available index in this isolated test transaction, and
+        // verify that the ownership predicate cannot make it eligible.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE pg_index SET indisvalid = false WHERE indrelid = 'requests'::regclass AND indexrelid <> 'idx_requests_user_created_sort'::regclass",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("SET LOCAL enable_bitmapscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let unfenced: serde_json::Value = sqlx::query_scalar(
+            "EXPLAIN (FORMAT JSON) SELECT id FROM requests WHERE id = $1 AND created_by IS NOT NULL",
+        ).bind(id).fetch_one(&mut *tx).await.unwrap();
+        assert!(
+            plan_uses_index(&unfenced, "idx_requests_user_created_sort"),
+            "control query must expose the dangerous path: {unfenced}"
+        );
+        let fenced: serde_json::Value =
+            sqlx::query_scalar(&format!("EXPLAIN (FORMAT JSON) {LIVE_REQUEST_DETAIL_SQL}"))
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert!(
+            !plan_uses_index(&fenced, "idx_requests_user_created_sort"),
+            "the detail lookup must keep the partial index ineligible: {fenced}"
+        );
+        tx.rollback().await.unwrap();
         let detail = sqlx::query_as::<_, RequestDetail>(LIVE_REQUEST_DETAIL_SQL)
             .bind(id)
             .fetch_one(&pool)
