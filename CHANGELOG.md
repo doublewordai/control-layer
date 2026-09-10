@@ -1,5 +1,17 @@
 # Changelog
 
+## [11.9.0](https://github.com/doublewordai/control-layer/compare/v11.8.0...v11.9.0) (2026-09-10)
+
+
+### Features
+
+* Improve page load for batches page ([#1744](https://github.com/doublewordai/control-layer/issues/1744)) ([e720a9e](https://github.com/doublewordai/control-layer/commit/e720a9e5168d774d503a6b331d23b7388aac5a70))
+
+
+### Performance Improvements
+
+* **fusillade:** make the unscoped Responses page usable ([#1740](https://github.com/doublewordai/control-layer/issues/1740)) ([ddfc06a](https://github.com/doublewordai/control-layer/commit/ddfc06a25832c1e1a89ee1084f06eee10a8ae530))
+
 ## [11.8.0](https://github.com/doublewordai/control-layer/compare/v11.7.0...v11.8.0) (2026-09-09)
 
 
