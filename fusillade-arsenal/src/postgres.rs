@@ -8265,16 +8265,62 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         .await
         {
             Ok(Some(row)) => {
-                if let Some(fid) = row.file_id {
-                    (fid, row.expires_at, row.archive_bucket)
-                } else {
-                    let _ = tx
-                        .send(Err(FusilladeError::Other(anyhow!(
-                            "Batch has no associated file_id"
-                        ))))
-                        .await;
-                    return;
-                }
+                // Deleting the input file unlinks its batches (`delete_file`
+                // sets file_id = NULL) while keeping the batch itself
+                // visible, so the results stream must keep working for
+                // unlinked batches. Recover the input file from the templates
+                // this batch's requests reference — the same live +
+                // bucket-pruned archive union the stream query below reads.
+                // A batch with no request rows has no results to show; close
+                // the channel without an error.
+                let file_id = match row.file_id {
+                    Some(fid) => fid,
+                    None => {
+                        match sqlx::query_scalar::<_, Uuid>(
+                            r#"
+                            SELECT t.file_id
+                            FROM (
+                                SELECT template_id FROM requests WHERE batch_id = $1
+                                UNION ALL
+                                SELECT template_id FROM batch_requests_archive
+                                WHERE $2::date IS NOT NULL
+                                      AND archive_bucket = $2
+                                      AND batch_id = $1
+                            ) r
+                            JOIN request_templates_all t ON t.id = r.template_id
+                            WHERE t.file_id IS NOT NULL
+                            LIMIT 1
+                            "#,
+                        )
+                        .bind(*batch_id as Uuid)
+                        .bind(row.archive_bucket)
+                        .fetch_optional(
+                            crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                                .with_schema(query_schema.clone()),
+                        )
+                        .await
+                        {
+                            Ok(Some(fid)) => fid,
+                            Ok(None) => {
+                                tracing::debug!(
+                                    batch_id = %batch_id,
+                                    "unlinked batch has no request rows to resolve an input file from; serving no results"
+                                );
+                                return;
+                            }
+                            Err(e) => {
+                                let _ = tx
+                                    .send(Err(FusilladeError::Other(anyhow!(
+                                        "Failed to resolve unlinked batch input file: {}",
+                                        e
+                                    ))))
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                };
+                (file_id, row.expires_at, row.archive_bucket)
             }
             Ok(None) => {
                 let _ = tx
@@ -15000,6 +15046,109 @@ mod tests {
         for item in archived {
             item.expect("archived result item must be Ok");
         }
+    }
+
+    /// Deleting the input file unlinks every dependent batch (file_id = NULL)
+    /// while keeping the batch itself visible, so the results stream must
+    /// keep serving rows by resolving the input file from the templates the
+    /// batch's requests reference — live first, then the archive arm.
+    #[sqlx::test]
+    async fn test_batch_results_stream_serves_unlinked_batches(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_freeze_test_batch(&manager, "results-unlinked", 3).await;
+        sqlx::query!(
+            "UPDATE requests SET state = 'completed', completed_at = NOW(), response_status = 200,
+             response_body = '{\"ok\":true}' WHERE batch_id = $1",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        manager.get_batch(batch_id).await.unwrap(); // freeze
+
+        let source_file_id: Uuid = sqlx::query_scalar("SELECT file_id FROM batches WHERE id = $1")
+            .bind(*batch_id as Uuid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        manager.delete_file(FileId(source_file_id)).await.unwrap();
+        let unlinked: Option<Uuid> =
+            sqlx::query_scalar("SELECT file_id FROM batches WHERE id = $1")
+                .bind(*batch_id as Uuid)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(unlinked.is_none(), "delete_file must unlink the batch");
+
+        let unlinked_results: Vec<_> = manager
+            .get_batch_results_stream(batch_id, 0, None, None)
+            .collect()
+            .await;
+        assert_eq!(
+            unlinked_results.len(),
+            3,
+            "an unlinked batch must still serve its results"
+        );
+        for item in unlinked_results {
+            item.expect("unlinked result item must be Ok");
+        }
+
+        // Archive the batch too: the fallback resolution reads the archive
+        // arm, so archived rows must stay servable after unlinking.
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 3 }
+        );
+        let archived_results: Vec<_> = manager
+            .get_batch_results_stream(batch_id, 0, None, None)
+            .collect()
+            .await;
+        assert_eq!(
+            archived_results.len(),
+            3,
+            "an archived unlinked batch must still serve its results"
+        );
+        for item in archived_results {
+            item.expect("archived unlinked result item must be Ok");
+        }
+    }
+
+    /// An unlinked batch with no request rows left (nothing to resolve an
+    /// input file from) streams empty rather than erroring.
+    #[sqlx::test]
+    async fn test_batch_results_stream_empty_for_unlinked_batch_without_rows(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let batch_id = setup_freeze_test_batch(&manager, "results-unlinked-empty", 3).await;
+        manager.get_batch(batch_id).await.unwrap(); // freeze
+
+        sqlx::query!(
+            "DELETE FROM requests WHERE batch_id = $1",
+            *batch_id as Uuid
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let source_file_id: Uuid = sqlx::query_scalar("SELECT file_id FROM batches WHERE id = $1")
+            .bind(*batch_id as Uuid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        manager.delete_file(FileId(source_file_id)).await.unwrap();
+
+        let empty: Vec<_> = manager
+            .get_batch_results_stream(batch_id, 0, None, None)
+            .collect()
+            .await;
+        assert!(
+            empty.is_empty(),
+            "an unlinked batch without request rows must stream empty"
+        );
     }
 
     #[sqlx::test]
