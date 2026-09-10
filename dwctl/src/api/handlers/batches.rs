@@ -3441,6 +3441,99 @@ mod tests {
         // it was hidden before, so the logic is working.
     }
 
+    /// Deleting a batch's input file unlinks the batch (file_id = NULL) and the
+    /// orphan-purge daemon later removes its templates. The results view used to
+    /// require the file and failed with a 500 ("Batch has no associated file_id").
+    /// Requests are self-contained, so results must still be served: every request
+    /// comes back with `input_body: null`, on both the paginated and the streaming
+    /// paths, and in a stable creation order.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_results_served_after_input_file_deleted(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let batch_id = Uuid::new_v4();
+        let num_requests = 3;
+        // A batch whose input file has been deleted and whose templates have been
+        // purged: file_id = NULL on the batch, template_id dangling on the requests.
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests, completed_at) VALUES ($1, $2, NULL, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), $3, NOW())",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .bind(num_requests as i32)
+        .execute(&pool)
+        .await
+        .expect("Failed to create batch");
+
+        for i in 0..num_requests {
+            let (state, response_body, error) = if i == 1 {
+                ("failed", None, Some("upstream said no"))
+            } else {
+                ("completed", Some(format!(r#"{{"id":"chatcmpl-{i}"}}"#)), None)
+            };
+            // completed rows need response_status/body/completed_at; failed rows
+            // need error/failed_at (check constraints on fusillade.requests).
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, error, custom_id, created_at, completed_at, failed_at) \
+                 VALUES ($1, $2, $3, 'test-model', $4, CASE WHEN $4 = 'completed' THEN 200 END, $5, $6, $7, NOW() + ($8 || ' seconds')::interval, \
+                         CASE WHEN $4 = 'completed' THEN NOW() END, CASE WHEN $4 = 'failed' THEN NOW() END)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(batch_id)
+            .bind(Uuid::new_v4())
+            .bind(state)
+            .bind(response_body)
+            .bind(error)
+            .bind(format!("req-{i}"))
+            .bind(i.to_string())
+            .execute(&pool)
+            .await
+            .expect("Failed to create request");
+        }
+
+        let auth = add_auth_headers(&user);
+
+        for path in [
+            format!("/ai/v1/batches/{}/results", batch_id),
+            format!("/ai/v1/batches/{}/results?limit=10", batch_id),
+        ] {
+            let response = app
+                .get(&path)
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .await;
+
+            response.assert_status(StatusCode::OK);
+            response.assert_header("X-Last-Line", &num_requests.to_string());
+            let lines: Vec<serde_json::Value> = response
+                .text()
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+                .collect();
+            assert_eq!(lines.len(), num_requests, "{path}: every request is returned");
+            let custom_ids: Vec<&str> = lines.iter().map(|l| l["custom_id"].as_str().unwrap()).collect();
+            assert_eq!(custom_ids, ["req-0", "req-1", "req-2"], "{path}: creation order");
+            for line in &lines {
+                assert!(line["input_body"].is_null(), "{path}: input body is gone with the file");
+            }
+            assert_eq!(lines[0]["status"], "completed");
+            assert_eq!(lines[0]["response_body"]["id"], "chatcmpl-0");
+            assert_eq!(lines[1]["status"], "failed");
+            assert_eq!(lines[1]["error"], "upstream said no");
+        }
+
+        // Filters still apply on this path.
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results?status=failed", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status(StatusCode::OK);
+        assert_eq!(response.text().lines().count(), 1);
+    }
+
     /// Regression test for streaming batch results.
     ///
     /// Previously, get_batch_results collected ALL results into memory before

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT file_id, expires_at, archive_bucket FROM batches WHERE id = $1 AND deleted_at IS NULL",
+  "query": "SELECT file_id, archive_bucket FROM batches WHERE id = $1 AND deleted_at IS NULL",
   "describe": {
     "columns": [
       {
@@ -10,11 +10,6 @@
       },
       {
         "ordinal": 1,
-        "name": "expires_at",
-        "type_info": "Timestamptz"
-      },
-      {
-        "ordinal": 2,
         "name": "archive_bucket",
         "type_info": "Date"
       }
@@ -26,9 +21,8 @@
     },
     "nullable": [
       true,
-      true,
       true
     ]
   },
-  "hash": "088e9a03a4addb97b9146d1d52a0a3cb2191eab8ffeb78c08b5b0dc02776bb9a"
+  "hash": "6d6797881ddc6af3b48b46e002fea04215b1540c5ab7388a80d382b8d81b5df6"
 }
