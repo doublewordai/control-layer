@@ -55,6 +55,7 @@ use crate::request::{
 // later rollout step.
 #[allow(dead_code)]
 pub(crate) mod batch_archive_retirement;
+mod batch_list;
 pub(crate) mod partition_retirement;
 pub(crate) mod retained_response;
 pub(crate) mod retained_response_retirement;
@@ -4845,350 +4846,52 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
     #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
     async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>> {
-        let ListBatchesFilter {
-            created_by,
-            search,
-            after,
-            limit,
-            api_key_ids,
-            status,
-            created_after,
-            created_before,
-            active_first,
-            completion_windows,
-            service_tiers,
-        } = filter;
-        let limit = limit.unwrap_or(100);
-
-        // Single source of truth for active/terminal classification.
-        // 0 = active (no terminal or cancellation timestamp set), 1 = terminal.
-        // cancelling_at is included because cancel_batch sets both cancelling_at and
-        // cancelled_at atomically — a cancelling batch is effectively terminal.
-        // This matches the "in_progress" status filter which also excludes cancelling_at.
-        //
-        // This expression is used in the cursor lookup query and the CTE below.
-        // The CTE computes it as a column so ORDER BY clauses can reference
-        // `priority` without repeating the CASE expression. The cursor WHERE
-        // still uses priority_expr directly (SQL doesn't allow aliases in WHERE).
-        let priority_expr = "CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL \
-            AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL THEN 0 ELSE 1 END";
-
-        // If after is provided, get the cursor batch's created_at (and priority when
-        // active_first is enabled) for cursor-based pagination.
-        let (after_created_at, after_id, after_priority) = if let Some(after_id) = after {
-            if active_first {
-                // Need priority for 3-tuple cursor comparison.
-                // Table aliased as `b` so the CASE expression matches priority_expr exactly.
-                let row = sqlx::query!(
-                    r#"
-                    SELECT b.created_at,
-                           CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL
-                                     AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL
-                                THEN 0 ELSE 1 END as "priority!: i32"
-                    FROM batches b
-                    WHERE b.id = $1
-                    "#,
-                    *after_id as Uuid,
-                )
-                .fetch_optional(self.read_executor())
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e))
-                })?;
-
-                match row {
-                    Some(r) => (
-                        Some(r.created_at),
-                        Some(*after_id as Uuid),
-                        Some(r.priority),
-                    ),
-                    None => (None, Some(*after_id as Uuid), None),
-                }
-            } else {
-                let row = sqlx::query!(
-                    r#"
-                    SELECT created_at
-                    FROM batches
-                    WHERE id = $1
-                    "#,
-                    *after_id as Uuid,
-                )
-                .fetch_optional(self.read_executor())
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e))
-                })?;
-
-                (row.map(|r| r.created_at), Some(*after_id as Uuid), None)
-            }
-        } else {
-            (None, None, None)
-        };
-
-        // Two-phase query: first filter and paginate batches (cheap), then attach
-        // request counts only to the result page (expensive LATERAL runs on ≤limit rows).
-        //
-        // The CTE computes `priority` once via priority_expr so that ORDER BY
-        // clauses can reference the column name instead of repeating the CASE
-        // expression. (The cursor WHERE still uses priority_expr directly since
-        // SQL doesn't allow aliases in WHERE.)
-        let search_pattern = search.as_ref().map(|s| format!("%{}%", s.to_lowercase()));
-
-        let mut query_builder = QueryBuilder::new(
-            r#"
-            WITH filtered AS (
-                SELECT b.*, ("#,
-        );
-        query_builder.push(priority_expr);
-        query_builder.push(
-            r#") AS priority
+        // Resolve the cursor batch's sort keys with one primary-key lookup. A
+        // missing cursor batch falls back to the first page. The priority
+        // classification must match batch_list::ACTIVE; chronological listings
+        // simply ignore it.
+        let cursor = match filter.after {
+            Some(after_id) => sqlx::query!(
+                r#"
+                SELECT b.created_at,
+                       CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL
+                                 AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL
+                            THEN 0 ELSE 1 END as "priority!: i32"
                 FROM batches b
-                LEFT JOIN files f ON b.file_id = f.id
-                WHERE b.deleted_at IS NULL
-                  AND ("#,
-        );
-        query_builder.push_bind(&created_by);
-        query_builder.push("::TEXT IS NULL OR b.created_by = ");
-        query_builder.push_bind(&created_by);
-        query_builder.push(")");
-
-        // Cursor pagination: when active_first is enabled, we use a 3-tuple
-        // (priority, created_at, id) comparison. Otherwise, the classic 2-tuple.
-        // The `priority` column is computed in the CTE SELECT above.
-        if active_first {
-            // 3-tuple cursor: (priority ASC, created_at DESC, id DESC)
-            // Row comes after cursor when:
-            //   priority > cursor_priority  (lower priority group)
-            //   OR (priority = cursor_priority AND created_at < cursor_created_at)
-            //   OR (priority = cursor_priority AND created_at = cursor_created_at AND id < cursor_id)
-            query_builder.push(" AND (");
-            query_builder.push_bind(after_priority);
-            query_builder.push("::INT IS NULL OR (");
-            query_builder.push(priority_expr);
-            query_builder.push(") > ");
-            query_builder.push_bind(after_priority);
-            query_builder.push(" OR ((");
-            query_builder.push(priority_expr);
-            query_builder.push(") = ");
-            query_builder.push_bind(after_priority);
-            query_builder.push(" AND b.created_at < ");
-            query_builder.push_bind(after_created_at);
-            query_builder.push(") OR ((");
-            query_builder.push(priority_expr);
-            query_builder.push(") = ");
-            query_builder.push_bind(after_priority);
-            query_builder.push(" AND b.created_at = ");
-            query_builder.push_bind(after_created_at);
-            query_builder.push(" AND b.id < ");
-            query_builder.push_bind(after_id);
-            query_builder.push("))");
-        } else {
-            // Classic 2-tuple cursor: (created_at DESC, id DESC)
-            query_builder.push(" AND (");
-            query_builder.push_bind(after_created_at);
-            query_builder.push("::TIMESTAMPTZ IS NULL OR b.created_at < ");
-            query_builder.push_bind(after_created_at);
-            query_builder.push(" OR (b.created_at = ");
-            query_builder.push_bind(after_created_at);
-            query_builder.push(" AND b.id < ");
-            query_builder.push_bind(after_id);
-            query_builder.push("))");
-        }
-
-        query_builder.push(" AND (");
-        query_builder.push_bind(&search_pattern);
-        query_builder.push("::TEXT IS NULL OR LOWER(b.metadata::text) LIKE ");
-        query_builder.push_bind(&search_pattern);
-        query_builder.push(" OR LOWER(f.name) LIKE ");
-        query_builder.push_bind(&search_pattern);
-        query_builder.push(" OR b.id::text LIKE ");
-        query_builder.push_bind(&search_pattern);
-        query_builder.push(")");
-
-        if let Some(api_key_ids) = &api_key_ids {
-            query_builder.push(" AND b.api_key_id = ANY(");
-            query_builder.push_bind(api_key_ids.as_slice());
-            query_builder.push(")");
-        }
-
-        if let Some(created_after) = &created_after {
-            query_builder.push(" AND b.created_at >= ");
-            query_builder.push_bind(*created_after);
-        }
-
-        if let Some(created_before) = &created_before {
-            query_builder.push(" AND b.created_at <= ");
-            query_builder.push_bind(*created_before);
-        }
-
-        // Status filtering: map status names to DB column conditions.
-        // All filters use persisted batch columns only — no dependency on request counts.
-        // Derived sub-statuses (validating, finalizing) are resolved by the frontend
-        // from the count data attached in the second phase of this query.
-        if let Some(ref status) = status {
-            match status.as_str() {
-                "in_progress" => {
-                    // All non-terminal batches: covers validating, in_progress, and finalizing
-                    query_builder.push(" AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL");
-                }
-                "completed" => {
-                    query_builder.push(" AND b.completed_at IS NOT NULL");
-                }
-                "failed" => {
-                    query_builder.push(" AND b.failed_at IS NOT NULL AND b.completed_at IS NULL");
-                }
-                "cancelled" => {
-                    // Includes both cancelling and fully cancelled batches
-                    query_builder
-                        .push(" AND (b.cancelled_at IS NOT NULL OR b.cancelling_at IS NOT NULL)");
-                }
-                "expired" => {
-                    // Matches batches with SLA issues: either still in-progress past deadline,
-                    // or terminal batches that finished after their deadline.
-                    query_builder.push(
-                        " AND b.expires_at IS NOT NULL AND (\
-                            (b.expires_at < NOW() AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL) \
-                            OR (b.completed_at IS NOT NULL AND b.completed_at > b.expires_at) \
-                            OR (b.failed_at IS NOT NULL AND b.failed_at > b.expires_at) \
-                            OR (b.cancelled_at IS NOT NULL AND b.cancelled_at > b.expires_at)\
-                        )",
-                    );
-                }
-                unknown => {
-                    // Invalid client-supplied filter value - a bad request, not a server
-                    // fault. ValidationError so dwctl maps it to 400, not 500 (which pages).
-                    return Err(FusilladeError::ValidationError(format!(
-                        "Unknown batch status filter: '{}'. Valid values: in_progress, completed, failed, cancelled, expired",
-                        unknown
-                    )));
-                }
-            }
-        }
-
-        if let Some(ref tiers) = service_tiers
-            && let Some(unknown) = tiers.iter().find(|tier| tier.as_str() != "background")
-        {
-            return Err(FusilladeError::ValidationError(format!(
-                "Unknown batch service tier filter: '{unknown}'. Valid value: background"
-            )));
-        }
-
-        // Completion windows and service tiers are two representations of the
-        // same user-facing batch class filter. Combine them as a union when
-        // both are present so callers can request regular and background
-        // batches together.
-        match (&completion_windows, &service_tiers) {
-            (Some(windows), Some(tiers)) => {
-                query_builder.push(" AND (b.completion_window = ANY(");
-                query_builder.push_bind(windows.as_slice());
-                query_builder.push(") OR b.service_tier = ANY(");
-                query_builder.push_bind(tiers.as_slice());
-                query_builder.push("))");
-            }
-            (Some(windows), None) => {
-                query_builder.push(" AND b.completion_window = ANY(");
-                query_builder.push_bind(windows.as_slice());
-                query_builder.push(")");
-            }
-            (None, Some(tiers)) => {
-                query_builder.push(" AND b.service_tier = ANY(");
-                query_builder.push_bind(tiers.as_slice());
-                query_builder.push(")");
-            }
-            (None, None) => {}
-        }
-
-        // ORDER BY: when active_first is enabled, sort by the `priority` column
-        // computed in the CTE SELECT (0=active first, 1=terminal), then by
-        // created_at DESC within each group. Otherwise, pure chronological.
-        if active_first {
-            query_builder.push(" ORDER BY priority ASC, b.created_at DESC, b.id DESC LIMIT ");
-        } else {
-            query_builder.push(" ORDER BY b.created_at DESC, b.id DESC LIMIT ");
-        }
-        query_builder.push_bind(limit);
-
-        // Phase 2: attach request counts only to the filtered page of results.
-        // References the `priority` column from the CTE output.
-        let phase2_order = if active_first {
-            "ORDER BY b.priority ASC, b.created_at DESC, b.id DESC"
-        } else {
-            "ORDER BY b.created_at DESC, b.id DESC"
+                WHERE b.id = $1
+                "#,
+                *after_id as Uuid,
+            )
+            .fetch_optional(self.read_executor())
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e)))?
+            .map(|row| batch_list::BatchCursor {
+                created_at: row.created_at,
+                id: *after_id as Uuid,
+                priority: row.priority,
+            }),
+            None => None,
         };
 
-        query_builder.push(
-            r#"
-            )
-            SELECT
-                b.id, b.file_id, b.endpoint, b.service_tier, b.completion_window, b.metadata,
-                b.output_file_id, b.error_file_id, b.created_by, b.created_at,
-                b.expires_at, b.cancelling_at, b.errors,
-                b.total_requests,
-                b.requests_started_at,
-                b.finalizing_at,
-                b.completed_at,
-                b.failed_at,
-                b.cancelled_at,
-                b.deleted_at,
-                b.notification_sent_at,
-                b.api_key_id,
-                CASE WHEN b.counts_frozen_at IS NOT NULL THEN 0
-                     ELSE COALESCE(counts.pending, 0) END::BIGINT as pending_requests,
-                CASE WHEN b.counts_frozen_at IS NOT NULL THEN 0
-                     ELSE COALESCE(counts.in_progress, 0) END::BIGINT as in_progress_requests,
-                -- Frozen batches serve the persisted counters. For live
-                -- batches, `total_requests` is conserved once population
-                -- finishes (rows inserted at batch creation, never deleted),
-                -- so completed is derivable. Skipping the 'completed' scan
-                -- in the LATERAL saves the bulk of the work on terminal
-                -- batches, which can have millions of completed rows.
-                --
-                -- The `requests_started_at IS NULL` guard handles the
-                -- validating window: `total_requests` is set at batch
-                -- creation but request rows haven't been inserted yet,
-                -- so all the LATERAL counts are zero. Without the guard,
-                -- `total - 0 - 0 - 0 - 0` would report the missing rows
-                -- as completed instead of 0.
-                CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.completed_requests
-                     WHEN b.requests_started_at IS NULL THEN 0
-                     ELSE GREATEST(b.total_requests
-                         - COALESCE(counts.pending, 0)
-                         - COALESCE(counts.in_progress, 0)
-                         - COALESCE(counts.failed, 0)
-                         - COALESCE(counts.canceled, 0), 0)
-                END::BIGINT as completed_requests,
-                CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.failed_requests
-                     ELSE COALESCE(counts.failed, 0) END::BIGINT as failed_requests,
-                CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.canceled_requests
-                     ELSE COALESCE(counts.canceled, 0) END::BIGINT as canceled_requests
-            FROM filtered b
-            LEFT JOIN LATERAL (
-                SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
-                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
-                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
-                FROM requests
-                WHERE batch_id = b.id
-                  -- Frozen batches serve persisted counters; one-time filter
-                  -- skips the requests scan entirely.
-                  AND b.counts_frozen_at IS NULL
-                  -- Skip the 'completed' slice — it's typically the bulk
-                  -- of the index for terminal batches and we derive
-                  -- the count arithmetically above. Enumerated states
-                  -- let `idx_requests_batch_state` do narrow range
-                  -- probes instead of a full scan.
-                  AND state = ANY(ARRAY['pending', 'claimed', 'processing', 'failed', 'canceled'])
-            ) counts ON TRUE
-            "#,
-        );
-        query_builder.push(phase2_order);
+        let mut query_builder = QueryBuilder::new("");
+        batch_list::push_query(&mut query_builder, &filter, cursor)?;
 
+        // SET LOCAL keeps the budget from leaking to the next caller on this
+        // pooled connection.
+        let mut tx = self.begin_read().await.map_err(anyhow::Error::from)?;
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = '{}'",
+            batch_list::PAGE_BUDGET
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
         let rows = query_builder
             .build()
-            .fetch_all(self.read_executor())
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
+        tx.commit().await.map_err(anyhow::Error::from)?;
 
         Ok(rows
             .into_iter()
