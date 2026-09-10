@@ -1323,6 +1323,14 @@ fn list_requests_page_sql(shape: PageShape) -> String {
     } else {
         "$1::text IS NULL"
     };
+    // Same predicate, qualified for inside the `active` CTE. Applying it there
+    // rather than only outside keeps an owner-scoped page from materializing
+    // every other tenant's in-flight rows first.
+    let active_owner_inner = if owner_scoped {
+        "requests.created_by = $1::text"
+    } else {
+        "$1::text IS NULL"
+    };
     let retained_owner = if owner_scoped {
         "object.created_by = $1::text"
     } else {
@@ -1435,12 +1443,20 @@ fn list_requests_page_sql(shape: PageShape) -> String {
         -- depth rather than by concurrency. It is decoupled from history depth
         -- -- the thing that actually grows without limit -- but it is not
         -- constant, and there is no LIMIT here, so a sustained drain stall
-        -- makes this CTE proportional to the backlog. Today production holds a
-        -- single non-terminal batchless row. If that ever stops being true, the
-        -- fix is a partial index on
-        -- (created_by, rank, created_at DESC, id DESC) restricted to these
-        -- three states, which lets the arm become a bounded ordered scan; it
-        -- indexes only non-terminal rows, so it is sized by the backlog it
+        -- makes this CTE proportional to the backlog.
+        --
+        -- The owner predicate is therefore applied HERE and not only in the arm
+        -- below. MATERIALIZED is a planner fence, so filtering outside would
+        -- make an owner-scoped page materialize every other tenant's in-flight
+        -- rows before discarding them -- one tenant's drain stall would slow
+        -- every other tenant's page. Scoped inside, a backlog only ever costs
+        -- the owner that caused it.
+        --
+        -- Today production holds a single non-terminal batchless row. If an
+        -- unscoped page ever needs the same protection, the fix is a partial
+        -- index on (created_by, rank, created_at DESC, id DESC) restricted to
+        -- these three states, which lets the arm become a bounded ordered scan;
+        -- it indexes only non-terminal rows, so it is sized by the backlog it
         -- guards against rather than by the table.
         active AS MATERIALIZED (
             SELECT id, state, created_at, created_by, model, service_tier, batch_id,
@@ -1448,6 +1464,7 @@ fn list_requests_page_sql(shape: PageShape) -> String {
             FROM requests
             WHERE created_by IS NOT NULL
               AND state IN ('processing', 'claimed', 'pending')
+              AND {active_owner_inner}
         ),
         candidates AS (
             (SELECT
