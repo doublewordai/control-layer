@@ -4846,79 +4846,46 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
     #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
     async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>> {
-        let active_first = filter.active_first;
-        let after = filter.after;
-
-        // If after is provided, get the cursor batch's created_at (and priority when
-        // active_first is enabled) for cursor-based pagination.
-        let (after_created_at, after_id, after_priority) = if let Some(after_id) = after {
-            if active_first {
-                // Need priority for 3-tuple cursor comparison.
-                // Match the active/terminal classification in batch_list.
-                let row = sqlx::query!(
-                    r#"
-                    SELECT b.created_at,
-                           CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL
-                                     AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL
-                                THEN 0 ELSE 1 END as "priority!: i32"
-                    FROM batches b
-                    WHERE b.id = $1
-                    "#,
-                    *after_id as Uuid,
-                )
-                .fetch_optional(self.read_executor())
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e))
-                })?;
-
-                match row {
-                    Some(r) => (
-                        Some(r.created_at),
-                        Some(*after_id as Uuid),
-                        Some(r.priority),
-                    ),
-                    None => (None, Some(*after_id as Uuid), None),
-                }
-            } else {
-                let row = sqlx::query!(
-                    r#"
-                    SELECT created_at
-                    FROM batches
-                    WHERE id = $1
-                    "#,
-                    *after_id as Uuid,
-                )
-                .fetch_optional(self.read_executor())
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e))
-                })?;
-
-                (row.map(|r| r.created_at), Some(*after_id as Uuid), None)
-            }
-        } else {
-            (None, None, None)
+        // Resolve the cursor batch's sort keys with one primary-key lookup. A
+        // missing cursor batch falls back to the first page. The priority
+        // classification must match batch_list::ACTIVE; chronological listings
+        // simply ignore it.
+        let cursor = match filter.after {
+            Some(after_id) => sqlx::query!(
+                r#"
+                SELECT b.created_at,
+                       CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL
+                                 AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL
+                            THEN 0 ELSE 1 END as "priority!: i32"
+                FROM batches b
+                WHERE b.id = $1
+                "#,
+                *after_id as Uuid,
+            )
+            .fetch_optional(self.read_executor())
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e)))?
+            .map(|row| batch_list::BatchCursor {
+                created_at: row.created_at,
+                id: *after_id as Uuid,
+                priority: row.priority,
+            }),
+            None => None,
         };
 
-        let cursor =
-            after_created_at
-                .zip(after_id)
-                .map(|(created_at, id)| batch_list::BatchCursor {
-                    created_at,
-                    id,
-                    priority: after_priority.unwrap_or(0),
-                });
         let mut query_builder = QueryBuilder::new("");
         batch_list::push_query(&mut query_builder, &filter, cursor)?;
 
-        // Bound pathological filters and live-count scans without leaking a
-        // session setting to the next caller on this pooled connection.
+        // SET LOCAL keeps the budget from leaking to the next caller on this
+        // pooled connection.
         let mut tx = self.begin_read().await.map_err(anyhow::Error::from)?;
-        sqlx::query("SET LOCAL statement_timeout = '15s'")
-            .execute(&mut *tx)
-            .await
-            .map_err(anyhow::Error::from)?;
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = '{}'",
+            batch_list::PAGE_BUDGET
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
         let rows = query_builder
             .build()
             .fetch_all(&mut *tx)

@@ -12,6 +12,10 @@ use crate::error::{FusilladeError, Result};
 const ACTIVE: &str = "b.completed_at IS NULL AND b.failed_at IS NULL \
     AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL";
 
+/// Statement budget for one page. Measured shapes finish in milliseconds; this
+/// only trips on filters that walk an owner's whole history (search, COR-652).
+pub(super) const PAGE_BUDGET: &str = "15s";
+
 #[derive(Clone, Copy)]
 pub(super) struct BatchCursor {
     pub created_at: DateTime<Utc>,
@@ -50,7 +54,14 @@ pub(super) fn push_query<'a>(
     if active_first {
         query_builder.push("SELECT * FROM (");
         if include_active {
-            push_arm(query_builder, filter, "active_batches", Some(0), cursor)?;
+            push_arm(
+                query_builder,
+                filter,
+                "active_batches",
+                false,
+                cursor,
+                limit,
+            )?;
             query_builder.push(" UNION ALL ");
         }
         // A cursor in the active group must not constrain terminal timestamps:
@@ -59,13 +70,14 @@ pub(super) fn push_query<'a>(
             query_builder,
             filter,
             "batches",
-            Some(1),
+            true,
             cursor.filter(|c| c.priority == 1),
+            limit,
         )?;
         query_builder.push(") candidates ORDER BY priority, created_at DESC, id DESC LIMIT ");
         query_builder.push_bind(limit);
     } else {
-        push_arm(query_builder, filter, "batches", None, cursor)?;
+        push_arm(query_builder, filter, "batches", false, cursor, limit)?;
     }
     query_builder.push(") ");
     let phase2_order = if active_first {
@@ -143,15 +155,19 @@ pub(super) fn push_query<'a>(
     Ok(())
 }
 
+/// One ordering group, newest first, capped at `limit`. The terminal arm
+/// selects the complement of `ACTIVE` and labels its rows priority 1; the
+/// active arm and the plain chronological listing both carry priority 0.
 fn push_arm<'a>(
     query_builder: &mut QueryBuilder<'a, Postgres>,
     filter: &'a ListBatchesFilter,
     table: &'static str,
-    priority: Option<i32>,
+    terminal: bool,
     cursor: Option<BatchCursor>,
+    limit: i64,
 ) -> Result<()> {
     query_builder.push("(SELECT b.*, ");
-    query_builder.push(if priority == Some(1) { "1" } else { "0" });
+    query_builder.push(if terminal { "1" } else { "0" });
     query_builder.push(" AS priority FROM ");
     query_builder.push(table);
     query_builder.push(" b");
@@ -159,7 +175,7 @@ fn push_arm<'a>(
         query_builder.push(" LEFT JOIN files f ON b.file_id = f.id");
     }
     query_builder.push(" WHERE b.deleted_at IS NULL");
-    if priority == Some(1) {
+    if terminal {
         query_builder.push(" AND NOT (");
         query_builder.push(ACTIVE);
         query_builder.push(")");
@@ -281,9 +297,7 @@ fn push_arm<'a>(
     }
 
     query_builder.push(" ORDER BY b.created_at DESC, b.id DESC LIMIT ");
-    query_builder
-        .push_bind(filter.limit.unwrap_or(100))
-        .push(")");
+    query_builder.push_bind(limit).push(")");
     Ok(())
 }
 
@@ -397,6 +411,9 @@ mod tests {
                 // EXPLAIN with bound arguments can plan the inner statement as
                 // a custom plan. Explicit PREPARE/EXECUTE exercises the cached
                 // generic plan used after repeated SQLx executions.
+                // Shape-specific by design: this filter binds only the owner
+                // text, the bigint limit, and the cursor pair. A new parameter
+                // type means the query shape under test changed.
                 let types: Vec<String> = sqlx::query_scalar("SELECT unnest(parameter_types)::text FROM pg_prepared_statements WHERE name = 'owner_page'")
                     .fetch_all(&mut *tx).await.unwrap();
                 let args: Vec<String> = types
