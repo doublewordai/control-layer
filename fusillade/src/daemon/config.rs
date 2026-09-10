@@ -433,11 +433,11 @@ pub struct DaemonConfig {
     /// upstream signals local memory pressure, so with `adaptive_concurrency` on
     /// this is the only control that corresponds to running out of memory.
     ///
-    /// Claiming resumes on either of two conditions: usage falling below
-    /// `memory_gate_low_fraction`, or in-flight falling to
-    /// `memory_gate_release_in_flight_fraction` of what it was when the gate
-    /// engaged. The second exists because the first is not always reachable -
-    /// see that field for why.
+    /// Claiming resumes when usage falls below `memory_gate_low_fraction`.
+    /// Measuring rather than predicting has a cost the byte budget below
+    /// exists to pay: suppressing claims cannot retract work already
+    /// dispatched, so between engagement and the OOM kill the daemon relies on
+    /// in-flight work finishing inside the headroom the high mark leaves.
     #[serde(default)]
     pub memory_gate_high_fraction: f64,
     /// Fraction of the memory limit below which claiming resumes. Must be above
@@ -447,6 +447,31 @@ pub struct DaemonConfig {
     /// claim cycle while usage sits on the boundary.
     #[serde(default = "default_memory_gate_low_fraction")]
     pub memory_gate_low_fraction: f64,
+    /// Fraction of this process's own memory limit that claimed-but-unfinished
+    /// work may commit to before claiming stops. Zero disables the budget.
+    ///
+    /// The memory gate measures actual usage and can only react once the
+    /// working set has grown into its headroom; it cannot retract work already
+    /// dispatched. This budget bounds what the daemon admits instead: each
+    /// claim is charged its request bytes plus an estimate of its response
+    /// bytes (a per-model running average of observed responses, falling back
+    /// to `memory_budget_default_response_bytes` for models with no
+    /// completions yet), and claiming stops once the committed total reaches
+    /// the budget. Because the estimate is learned from this workload's own
+    /// completions, the in-flight count it permits self-corrects across
+    /// workloads instead of needing a per-model `batch_capacity` guess; the
+    /// memory gate remains the measured backstop for whatever the estimate
+    /// gets wrong.
+    ///
+    /// The check runs per claim cycle, so a single cycle can overshoot the
+    /// budget by up to one `claim_batch_size` worth of charges - the same
+    /// quantization the gate lives with.
+    #[serde(default)]
+    pub memory_budget_fraction: f64,
+    /// Response-size estimate charged per claimed request for a model with no
+    /// observed completions yet, while the byte budget is enabled.
+    #[serde(default = "default_memory_budget_default_response_bytes")]
+    pub memory_budget_default_response_bytes: usize,
     #[serde(skip, default = "default_model_escalations")]
     pub model_escalations: Arc<dashmap::DashMap<String, ModelEscalationConfig>>,
     #[serde(default)]
@@ -696,6 +721,15 @@ fn default_memory_gate_low_fraction() -> f64 {
     0.65
 }
 
+/// A generation-length response at a few hundred bytes per SSE frame reassembles
+/// to tens of KiB at the small end and megabytes for long reasoning chains. A
+/// quarter MiB is a deliberately unexciting middle: with no completions observed
+/// yet there is no evidence, and the memory gate remains the measured backstop
+/// for whatever this guess gets wrong.
+fn default_memory_budget_default_response_bytes() -> usize {
+    262_144
+}
+
 /// Half the work in flight at engagement. Low enough that a genuinely loaded pod
 /// holds for a meaningful stretch rather than flapping, high enough that it
 /// always recovers well before a full drain. If memory is still over the high
@@ -776,6 +810,8 @@ impl Default for DaemonConfig {
             adaptive_cut_factor: default_adaptive_cut_factor(),
             memory_gate_high_fraction: 0.0,
             memory_gate_low_fraction: default_memory_gate_low_fraction(),
+            memory_budget_fraction: 0.0,
+            memory_budget_default_response_bytes: default_memory_budget_default_response_bytes(),
             model_escalations: default_model_escalations(),
             inject_deadline_priority: false,
             background_concurrency_limit: 0,
@@ -973,6 +1009,37 @@ mod tests {
         assert_eq!(decoded.adaptive_growth_factor, 2.0);
         assert_eq!(decoded.adaptive_cut_factor, 0.5);
         assert_eq!(decoded.memory_gate_high_fraction, 0.75);
+    }
+
+    #[test]
+    fn memory_budget_ships_dark_and_round_trips() {
+        // The budget bounds what the daemon admits, so defaulting it on would
+        // change claim behaviour for every deployment on upgrade. Like the
+        // gate and the controller, it has to be a deliberate flip.
+        let default_config = DaemonConfig::default();
+        assert_eq!(default_config.memory_budget_fraction, 0.0);
+        assert_eq!(default_config.memory_budget_default_response_bytes, 262_144);
+
+        // Configs serialized before these keys existed must keep deserializing.
+        let mut serialized = serde_json::to_value(&default_config).unwrap();
+        {
+            let serialized = serialized.as_object_mut().unwrap();
+            serialized.remove("memory_budget_fraction");
+            serialized.remove("memory_budget_default_response_bytes");
+        }
+        let decoded: DaemonConfig = serde_json::from_value(serialized).unwrap();
+        assert_eq!(decoded.memory_budget_fraction, 0.0);
+        assert_eq!(decoded.memory_budget_default_response_bytes, 262_144);
+
+        let configured = DaemonConfig {
+            memory_budget_fraction: 0.5,
+            memory_budget_default_response_bytes: 1_048_576,
+            ..DaemonConfig::default()
+        };
+        let decoded: DaemonConfig =
+            serde_json::from_value(serde_json::to_value(configured).unwrap()).unwrap();
+        assert_eq!(decoded.memory_budget_fraction, 0.5);
+        assert_eq!(decoded.memory_budget_default_response_bytes, 1_048_576);
     }
 
     #[test]
