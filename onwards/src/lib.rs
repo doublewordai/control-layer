@@ -1425,6 +1425,72 @@ mod tests {
         );
     }
 
+    /// A real HTTP 429 (not a 200-with-error envelope) on every provider: the
+    /// fallback chain exhausts and the client must see the upstream's own 429.
+    /// The candidate error used to be a blanket 502, which misclassified the
+    /// rate limit as a 5xx server fault and paged the proxy-5xx alert for a
+    /// condition `onwards_upstream_failed_total` was already recording as 429.
+    #[tokio::test]
+    async fn test_status_fallback_exhaustion_surfaces_upstream_429() {
+        let mock = MockHttpClient::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"upstream rate limit","code":429}}"#,
+        );
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![429]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            429,
+            "an exhausted 429 fallback must stay a 429, not collapse to 502"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
+    }
+
+    /// Same exhaustion contract for a 5xx fallback status: the last upstream
+    /// status survives instead of being flattened to 502, matching the
+    /// single-provider path (which already returns the upstream status
+    /// untouched).
+    #[tokio::test]
+    async fn test_status_fallback_exhaustion_preserves_last_upstream_status() {
+        let mock = MockHttpClient::new(StatusCode::SERVICE_UNAVAILABLE, r#"{"oops":true}"#);
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![503]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            503,
+            "an exhausted 503 fallback must surface 503, not a flattened 502"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
+    }
+
     #[tokio::test]
     async fn test_streaming_embedded_error_retries_then_succeeds() {
         // First provider returns the 200+error frame; the retry succeeds and the
