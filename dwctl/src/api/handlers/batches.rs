@@ -1402,6 +1402,7 @@ Supports pagination via `limit` and `skip` query parameters, and filtering by `c
     responses(
         (status = 200, description = "Batch results as newline-delimited JSON. Check the `X-Incomplete` header to determine if more results exist.", content_type = "application/x-ndjson"),
         (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 410, description = "The batch's output or error file has been deleted, so its results are no longer available. Results whose input file was deleted are still returned, with `input_body` set to null."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
@@ -1436,6 +1437,32 @@ pub async fn get_batch_results<P: PoolProvider>(
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
+        });
+    }
+
+    // The output and error files are virtual and created with the batch, so a
+    // missing id can only mean the user deleted that file. Deleting a results
+    // file is the user's statement that those results should be gone, and this
+    // endpoint must not serve them through a side door. Report 410 and say which
+    // file went. (A deleted *input* file is different: the results still exist,
+    // they just come back without input bodies, so that case streams normally.)
+    let deleted_results_files: Vec<&str> = [
+        (batch.output_file_id.is_none(), "output file"),
+        (batch.error_file_id.is_none(), "error file"),
+    ]
+    .into_iter()
+    .filter_map(|(deleted, name)| deleted.then_some(name))
+    .collect();
+    if !deleted_results_files.is_empty() {
+        return Err(Error::Gone {
+            message: format!(
+                "Results for batch {} are no longer available: its {} deleted.",
+                batch_id_str,
+                match deleted_results_files.as_slice() {
+                    [one] => format!("{one} has been"),
+                    _ => "output and error files have been".to_string(),
+                }
+            ),
         });
     }
 
@@ -3441,6 +3468,32 @@ mod tests {
         // it was hidden before, so the logic is working.
     }
 
+    /// Give a hand-inserted batch the virtual output and error files that
+    /// create_batch would have made. The results endpoint treats a missing
+    /// output/error file id as "the user deleted it" and answers 410.
+    async fn attach_results_files(pool: &PgPool, batch_id: Uuid) -> (Uuid, Uuid) {
+        let output_file_id = Uuid::new_v4();
+        let error_file_id = Uuid::new_v4();
+        for (id, name) in [(output_file_id, "output.jsonl"), (error_file_id, "error.jsonl")] {
+            sqlx::query(
+                "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, $2, 'processed', NOW(), NOW())",
+            )
+            .bind(id)
+            .bind(name)
+            .execute(pool)
+            .await
+            .expect("Failed to create results file");
+        }
+        sqlx::query("UPDATE fusillade.batches SET output_file_id = $2, error_file_id = $3 WHERE id = $1")
+            .bind(batch_id)
+            .bind(output_file_id)
+            .bind(error_file_id)
+            .execute(pool)
+            .await
+            .expect("Failed to attach results files");
+        (output_file_id, error_file_id)
+    }
+
     /// Deleting a batch's input file unlinks the batch (file_id = NULL) and the
     /// orphan-purge daemon later removes its templates. The results view used to
     /// require the file and failed with a 500 ("Batch has no associated file_id").
@@ -3466,6 +3519,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
 
         for i in 0..num_requests {
             let (state, response_body, error) = if i == 1 {
@@ -3534,6 +3588,92 @@ mod tests {
         assert_eq!(response.text().lines().count(), 1);
     }
 
+    /// The output and error files are virtual and exist from batch creation, so a
+    /// missing id means the user deleted that file. Deleting a results file is a
+    /// statement that those results are gone: the results endpoint must answer
+    /// 410 (naming the deleted file) rather than serve the same rows anyway,
+    /// on both the paginated and the streaming paths. The batch itself stays
+    /// readable.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_results_gone_after_results_file_deleted(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let cases = [
+            ("output_file_id", "output file has been deleted"),
+            ("error_file_id", "error file has been deleted"),
+        ];
+        for (column, expected) in cases {
+            let batch_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests, completed_at) VALUES ($1, $2, NULL, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), 1, NOW())",
+            )
+            .bind(batch_id)
+            .bind(user.id.to_string())
+            .execute(&pool)
+            .await
+            .expect("Failed to create batch");
+            attach_results_files(&pool, batch_id).await;
+            // A completed request still exists; the endpoint must not serve it.
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, custom_id, created_at, completed_at) VALUES ($1, $2, $3, 'test-model', 'completed', 200, '{}', 'req-0', NOW(), NOW())",
+            )
+            .bind(Uuid::new_v4())
+            .bind(batch_id)
+            .bind(Uuid::new_v4())
+            .execute(&pool)
+            .await
+            .expect("Failed to create request");
+            // Mirror what delete_file does to the batch for that file.
+            sqlx::query(&format!("UPDATE fusillade.batches SET {column} = NULL WHERE id = $1"))
+                .bind(batch_id)
+                .execute(&pool)
+                .await
+                .expect("Failed to unlink results file");
+
+            for path in [
+                format!("/ai/v1/batches/{}/results", batch_id),
+                format!("/ai/v1/batches/{}/results?limit=10", batch_id),
+            ] {
+                let response = app
+                    .get(&path)
+                    .add_header(&auth[0].0, &auth[0].1)
+                    .add_header(&auth[1].0, &auth[1].1)
+                    .await;
+                response.assert_status(StatusCode::GONE);
+                let body = response.text();
+                assert!(body.contains(expected), "{path}: expected {expected:?} in {body:?}");
+            }
+
+            let response = app
+                .get(&format!("/ai/v1/batches/{}", batch_id))
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .await;
+            response.assert_status(StatusCode::OK);
+        }
+
+        // Both gone: the message names both.
+        let batch_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests, completed_at) VALUES ($1, $2, NULL, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), 0, NOW())",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("Failed to create batch");
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status(StatusCode::GONE);
+        assert!(response.text().contains("output and error files have been deleted"));
+    }
+
     /// Regression test for streaming batch results.
     ///
     /// Previously, get_batch_results collected ALL results into memory before
@@ -3578,6 +3718,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
 
         for i in 0..num_requests {
             let template_id = Uuid::new_v4();
@@ -3715,6 +3856,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
 
         // Create completed requests
         for i in 0..num_completed {
@@ -5150,6 +5292,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
 
         // Three requests with different reasoning token amounts
         let thinking_responses = vec![
