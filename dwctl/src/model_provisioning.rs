@@ -351,12 +351,6 @@ impl Catalog {
             .collect::<std::io::Result<Vec<_>>>()?;
         paths.retain(|path| matches!(path.extension().and_then(|value| value.to_str()), Some("yaml" | "yml")));
         paths.sort();
-        ensure!(
-            !paths.is_empty(),
-            "model provisioning directory {} contains no YAML files",
-            directory.display()
-        );
-
         let mut models = Vec::new();
         for path in paths {
             let source = path.strip_prefix(directory).unwrap_or(&path).to_string_lossy().replace('\\', "/");
@@ -372,12 +366,6 @@ impl Catalog {
                 });
             }
         }
-        ensure!(
-            !models.is_empty(),
-            "model provisioning directory {} contains no documents with a clay section",
-            directory.display()
-        );
-
         let catalog = Self { models };
         catalog.validate()?;
         Ok(catalog)
@@ -517,6 +505,13 @@ impl Catalog {
 }
 
 pub async fn apply(pool: &PgPool, catalog: &Catalog) -> Result<()> {
+    // An empty mounted directory is an unconfigured catalog, not an
+    // authoritative request to clear provisioning ownership. Return before
+    // opening a transaction so it is a true database no-op.
+    if catalog.models.is_empty() {
+        return Ok(());
+    }
+
     let mut transaction = pool.begin().await.context("begin model provisioning transaction")?;
     ModelProvisioning::new(&mut transaction).apply(catalog).await?;
     transaction.commit().await.context("commit model provisioning transaction")?;
@@ -731,11 +726,32 @@ clay:
     }
 
     #[test]
-    fn rejects_empty_or_backend_only_directory() {
+    fn accepts_empty_or_backend_only_directory_as_noop() {
         let directory = tempdir().unwrap();
-        assert!(Catalog::load(directory.path()).is_err());
+        assert!(Catalog::load(directory.path()).unwrap().models.is_empty());
         write(directory.path(), "backend.yaml", "model: org/model\nbackend: {}\n");
-        assert!(Catalog::load(directory.path()).is_err());
+        assert!(Catalog::load(directory.path()).unwrap().models.is_empty());
+    }
+
+    #[sqlx::test]
+    async fn empty_catalog_does_not_clear_provisioning_sources(pool: PgPool) {
+        let model_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO deployed_models (model_name, alias, created_by, is_composite, provisioning_source) VALUES ('existing', 'existing', '00000000-0000-0000-0000-000000000000', TRUE, 'existing.yaml') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let directory = tempdir().unwrap();
+        let catalog = Catalog::load(directory.path()).unwrap();
+        apply(&pool, &catalog).await.unwrap();
+
+        let source: Option<String> = sqlx::query_scalar("SELECT provisioning_source FROM deployed_models WHERE id = $1")
+            .bind(model_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(source.as_deref(), Some("existing.yaml"));
     }
 
     fn catalog_yaml(realtime_input: &str, include_batch: bool, cache_read: &str) -> String {

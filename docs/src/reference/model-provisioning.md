@@ -147,6 +147,10 @@ transaction then takes an advisory lock, resolves every reference, clears the
 `provisioning_source` marker from all models, and upserts the catalog. A failure
 rolls the entire operation back.
 
+An empty directory, or a directory containing only backend-only documents, is
+a no-op. No transaction is opened and existing provisioning markers are left
+unchanged.
+
 For models present in YAML, model fields, physical deployments, components,
 routing, access groups, traffic rules and active tariffs are authoritative.
 Manual dashboard changes to those fields remain visible until the next server
@@ -197,4 +201,5 @@ The Helm chart exposes a separate, opt-in ConfigMap through
 `modelProvisioning.files`. It mounts the files at
 `/app/model-provisioning.d`, enables startup provisioning through environment
 overrides, and includes the catalog checksum in the pod template so catalog
-changes trigger a rollout. Enabling the chart option with no files is an error.
+changes trigger a rollout. An enabled, empty ConfigMap mounts an empty
+directory and is a startup no-op.
