@@ -65,6 +65,25 @@ Created on first startup if it doesn't exist. The admin user has the `PlatformMa
 >
 > Change the default admin password immediately in production!
 
+### Model Provisioning
+
+```yaml
+model_provisioning:
+  enabled: true
+  directory: /app/model-provisioning.d
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `false` | Apply the declarative model catalog during startup. |
+| `directory` | path | `/app/model-provisioning.d` | Directory containing one `.yaml` or `.yml` document per canonical model. |
+
+When enabled, the directory must exist and contain at least one valid document
+with a `clay` section. Startup fails before any provisioning writes if loading,
+validation, or a referenced endpoint/group lookup fails. See [Model
+Provisioning](model-provisioning.md) for the document format and ownership
+rules.
+
 ## Database Configuration
 
 The Control Layer requires PostgreSQL. Two modes are available:

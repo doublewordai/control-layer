@@ -171,7 +171,20 @@ where
         if let Some(model_filter) = &endpoint_info.model_filter
             && !model_filter.contains(&existing_model.model_name)
         {
-            if let Err(e) = deployments_repo.delete(existing_model.id).await {
+            if existing_model.provisioning_source.is_some() {
+                if existing_model.status != ModelStatus::Inactive {
+                    let update = DeploymentUpdateDBRequest::status_update(Some(ModelStatus::Inactive), sync_time);
+                    if let Err(e) = deployments_repo.update(existing_model.id, &update).await {
+                        warn!(
+                            "Failed to deactivate provisioned filtered-out model {}: {}",
+                            existing_model.model_name, e
+                        );
+                    } else {
+                        models_deactivated += 1;
+                        changes_made += 1;
+                    }
+                }
+            } else if let Err(e) = deployments_repo.delete(existing_model.id).await {
                 warn!("Failed to delete filtered-out model {}: {}", existing_model.model_name, e);
             } else {
                 debug!("Deleted model {} (removed from filter)", existing_model.model_name);
@@ -188,7 +201,7 @@ where
                 let mut update = DeploymentUpdateDBRequest::status_update(None, sync_time);
 
                 // If model_type is not set, detect and set it
-                if existing_model.model_type.is_none() {
+                if existing_model.model_type.is_none() && existing_model.provisioning_source.is_none() {
                     let detected_type = crate::db::models::deployments::ModelType::detect_from_name(&existing_model.model_name);
                     update.model_type = Some(Some(detected_type));
                 }
@@ -203,7 +216,7 @@ where
                 let mut update = DeploymentUpdateDBRequest::status_update(Some(ModelStatus::Active), sync_time);
 
                 // If model_type is not set, detect and set it
-                if existing_model.model_type.is_none() {
+                if existing_model.model_type.is_none() && existing_model.provisioning_source.is_none() {
                     let detected_type = crate::db::models::deployments::ModelType::detect_from_name(&existing_model.model_name);
                     update.model_type = Some(Some(detected_type));
                 }
@@ -494,6 +507,7 @@ where
 {
     let mut changes_made = 0;
     let mut new_models_created = 0;
+    let mut models_deactivated = 0;
     let mut models_deleted = 0;
 
     // Get current deployments for this endpoint
@@ -523,6 +537,7 @@ where
     for deployment in &current_deployments {
         if models_to_deploy.contains(&deployment.model_name)
             && !deployment.deleted
+            && deployment.provisioning_source.is_none()
             && let Some(new_alias) = alias_mapping.get(&deployment.model_name)
         {
             let trimmed_alias = new_alias.trim().to_string();
@@ -650,7 +665,23 @@ where
     if endpoint.model_filter.is_some() {
         for deployment in &current_deployments {
             if !models_to_deploy.contains(&deployment.model_name) && !deployment.deleted {
-                // This deployment should be removed
+                if deployment.provisioning_source.is_some() {
+                    if deployment.status != ModelStatus::Inactive {
+                        let update = DeploymentUpdateDBRequest::status_update(Some(ModelStatus::Inactive), Utc::now());
+                        deployments_repo
+                            .update(deployment.id, &update)
+                            .await
+                            .map_err(|e| SyncError::Other(e.into()))?;
+                        models_deactivated += 1;
+                        changes_made += 1;
+                        tracing::info!(
+                            "Deactivated provisioned deployment '{}' (removed from filter)",
+                            deployment.model_name
+                        );
+                    }
+                    continue;
+                }
+
                 match deployments_repo.delete(deployment.id).await {
                     Ok(true) => {
                         models_deleted += 1;
@@ -674,7 +705,7 @@ where
         changes_made,
         new_models_created,
         models_reactivated: 0,
-        models_deactivated: 0,
+        models_deactivated,
         models_deleted,
         total_models_fetched: models_to_deploy.len(),
         filtered_models_count: models_to_deploy.len(),
@@ -716,6 +747,7 @@ mod tests {
         created_by: UserId,
         status: ModelStatus,
         last_sync: Option<DateTime<Utc>>,
+        provisioning_source: Option<String>,
     }
 
     impl From<MockDeployment> for DeploymentDBResponse {
@@ -760,6 +792,7 @@ mod tests {
                 reasoning_translation_overrides: None,
                 allowed_batch_completion_windows: None,
                 metadata: serde_json::Value::Object(serde_json::Map::new()),
+                provisioning_source: mock.provisioning_source,
             }
         }
     }
@@ -785,6 +818,22 @@ mod tests {
                 created_by: uuid::Uuid::nil(),
                 status: ModelStatus::Active,
                 last_sync: None,
+                provisioning_source: None,
+            };
+            self.deployments.write().await.insert(id, deployment);
+            id
+        }
+
+        async fn add_provisioned_deployment(&self, model_name: String, alias: String) -> DeploymentId {
+            let id = uuid::Uuid::new_v4();
+            let deployment = MockDeployment {
+                id,
+                model_name,
+                alias,
+                created_by: uuid::Uuid::nil(),
+                status: ModelStatus::Active,
+                last_sync: None,
+                provisioning_source: Some("model-catalog:model.yaml".to_string()),
             };
             self.deployments.write().await.insert(id, deployment);
             id
@@ -848,6 +897,7 @@ mod tests {
                 created_by: request.created_by,
                 status: ModelStatus::Active,
                 last_sync: None,
+                provisioning_source: None,
             };
             let response = DeploymentDBResponse::from(deployment.clone());
             self.deployments.write().await.insert(id, deployment);
@@ -889,6 +939,7 @@ mod tests {
                     created_by: deployment.created_by,
                     status: updated_response.status.clone(),
                     last_sync: updated_response.last_sync,
+                    provisioning_source: deployment.provisioning_source.clone(),
                 };
 
                 deployments.insert(id, updated_deployment);
@@ -1236,6 +1287,28 @@ mod tests {
 
         let result = crate::sync::endpoint_sync::update_endpoint_aliases(endpoint_info.clone(), &mut repo, &alias_mapping).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_update_endpoint_aliases_preserves_provisioned_alias_and_row() {
+        let mut repo = MockDeploymentsRepo::new();
+        let id = repo
+            .add_provisioned_deployment("google/gemma-3-12b-it".to_string(), "catalog-alias".to_string())
+            .await;
+        let mut endpoint_info = create_test_endpoint();
+        endpoint_info.model_filter = Some(Vec::new());
+        let alias_mapping = HashMap::from([("google/gemma-3-12b-it".to_string(), "endpoint-alias".to_string())]);
+
+        let result = crate::sync::endpoint_sync::update_endpoint_aliases(endpoint_info, &mut repo, &alias_mapping)
+            .await
+            .unwrap();
+
+        assert_eq!(result.models_deleted, 0);
+        assert_eq!(result.models_deactivated, 1);
+        let deployment = repo.get_by_id(id).await.unwrap().unwrap();
+        assert_eq!(deployment.alias, "catalog-alias");
+        assert_eq!(deployment.status, ModelStatus::Inactive);
+        assert_eq!(deployment.provisioning_source.as_deref(), Some("model-catalog:model.yaml"));
     }
 
     #[tokio::test]

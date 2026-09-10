@@ -777,6 +777,18 @@ const ModelInfo: React.FC = () => {
               </div>
             </div>
           </div>
+          {model.provisioning_source && (
+            <div
+              role="status"
+              className="flex items-start gap-3 rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-950"
+            >
+              <Info className="mt-0.5 h-4 w-4 shrink-0" />
+              <p>
+                This model is provisioned from {model.provisioning_source}.
+                Changes made here will be overwritten when the server restarts.
+              </p>
+            </div>
+          )}
         </div>
         <TabsContent value="overview">
           <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
