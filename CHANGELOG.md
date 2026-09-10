@@ -1,5 +1,12 @@
 # Changelog
 
+## [11.9.1](https://github.com/doublewordai/control-layer/compare/v11.9.0...v11.9.1) (2026-09-10)
+
+
+### Bug Fixes
+
+* **fusillade:** keep request polling stable during retention ([#1742](https://github.com/doublewordai/control-layer/issues/1742)) ([0ccdf8c](https://github.com/doublewordai/control-layer/commit/0ccdf8c91ef588cc4762469293987e21833e60dc))
+
 ## [11.9.0](https://github.com/doublewordai/control-layer/compare/v11.8.0...v11.9.0) (2026-09-10)
 
 
