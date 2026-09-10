@@ -1695,6 +1695,12 @@ where
     claim_mutex: Arc<tokio::sync::Mutex<()>>,
     requests_processed: Arc<AtomicU64>,
     requests_failed: Arc<AtomicU64>,
+    /// Daemon-owned lifecycle token: a CHILD of the token handed to
+    /// [`Daemon::new`]. The daemon cancels it when it (or a claim loop) fails
+    /// so its children stop; external cancellation (SIGTERM) propagates in
+    /// through the parent. Cancelling it must never reach the caller's token,
+    /// or the host's fail-fast supervisor would swallow the daemon's own
+    /// error instead of restarting the process.
     shutdown_token: tokio_util::sync::CancellationToken,
     /// Map of batch_id -> cancellation token for batch-level cancellation
     /// All requests in a batch share the same cancellation token
@@ -1717,6 +1723,20 @@ where
         config: DaemonConfig,
         shutdown_token: tokio_util::sync::CancellationToken,
     ) -> Self {
+        // The daemon owns the CANCEL side of this token: when the daemon (or
+        // one of its claim loops) fails internally, its teardown cancels the
+        // token to stop its children. Store a CHILD of the caller's token so
+        // that a daemon-internal cancel stays local while external
+        // cancellation (SIGTERM) still propagates in. If the daemon cancelled
+        // the caller's token directly, dwctl's fail-fast supervisor
+        // (BackgroundServices::wait_for_failure) would treat the daemon's own
+        // error completion as benign "during shutdown" and never exit the
+        // process — leaving batch/flex claiming dead inside a still-Running
+        // pod. Observed in production on curie 2026-09-10: both split daemon
+        // pods gave up after 10 consecutive 180s claim-timeouts during a DB
+        // saturation window, cancelled the shared token in their own teardown,
+        // and nothing restarted them for 35+ minutes.
+        let shutdown_token = shutdown_token.child_token();
         let should_retry = config.retry_predicate();
         let adaptive_concurrency = Arc::new(AdaptiveConcurrencyController::new(
             config.adaptive_growth_factor,
@@ -3637,6 +3657,12 @@ where
         }
 
         let mut daemon_children = supervise_daemon_handles(daemon_handles);
+        // The cancels below stop this daemon's children via the daemon-owned
+        // token (a child of the caller's token, see `Daemon::new`). They must
+        // never cancel the caller's token: dwctl's fail-fast supervisor only
+        // reports a background task's error while that token is still live,
+        // so a daemon-internal failure has to leave it untouched for the pod
+        // to be restarted instead of hanging with a dead claim loop.
         let run_result = loop {
             tokio::select! {
                 biased;
@@ -3686,10 +3712,10 @@ where
         }
         self.shutdown_token.cancel();
 
-        // Every child cooperates with the shared token. Join them concurrently
-        // so one panic is reported without preventing healthy siblings from
-        // completing their shutdown path. The heartbeat child marks the
-        // daemon record dead before it returns.
+        // Every child cooperates with the daemon-owned token. Join them
+        // concurrently so one panic is reported without preventing healthy
+        // siblings from completing their shutdown path. The heartbeat child
+        // marks the daemon record dead before it returns.
         let _child_panics = drain_supervised_daemon_children(&mut daemon_children).await;
 
         run_result
