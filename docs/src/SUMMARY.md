@@ -20,4 +20,3 @@
 # Conceptual Guides
 
 - [How Billing Works](conceptual-guides/how-billing-works.md)
-- [Request Retention and Database Maintenance](conceptual-guides/request-retention-maintenance.md)

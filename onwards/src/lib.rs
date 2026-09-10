@@ -1051,6 +1051,110 @@ mod tests {
         assert_eq!(served_by.onwards_model.as_deref(), Some("gpt-4-upstream"));
     }
 
+    /// Failure responses must stay attributable too. When every provider fails
+    /// and fallback is exhausted, the client-facing error response carries a
+    /// `ServedBy` extension naming the LAST provider the request was sent to —
+    /// so request logging and per-model 5xx metrics can name the failing
+    /// upstream instead of recording a blank `served_by`.
+    #[tokio::test]
+    async fn test_served_by_extension_set_on_fallback_exhaustion() {
+        use tower::ServiceExt;
+
+        let targets = fallback_targets("gpt-4", 1, vec![502]);
+        let mock = MockHttpClient::new(StatusCode::BAD_GATEWAY, "{}");
+        let app_state = AppState::with_client(targets, mock);
+        let router = build_router(app_state);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let served_by = response
+            .extensions()
+            .get::<crate::ServedBy>()
+            .expect("exhausted-fallback error response must carry ServedBy");
+        assert_eq!(served_by.url, "https://p0.example.com/");
+        assert_eq!(served_by.onwards_model, None);
+    }
+
+    /// With several providers the attribution names the last one ATTEMPTED, not
+    /// the first — the error is the outcome of the final attempt.
+    #[tokio::test]
+    async fn test_served_by_extension_names_last_attempted_provider() {
+        use tower::ServiceExt;
+
+        let targets = fallback_targets("gpt-4", 2, vec![502]);
+        let mock = MockHttpClient::new(StatusCode::BAD_GATEWAY, "{}");
+        let app_state = AppState::with_client(targets, mock.clone());
+        let router = build_router(app_state);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(mock.get_requests().len(), 2, "both providers attempted");
+        let served_by = response
+            .extensions()
+            .get::<crate::ServedBy>()
+            .expect("exhausted-fallback error response must carry ServedBy");
+        assert_eq!(served_by.url, "https://p1.example.com/");
+    }
+
+    /// A request that never reached any upstream (unknown model, rejected
+    /// before the failover loop) must NOT carry `ServedBy` — its absence still
+    /// means "no upstream involvement".
+    #[tokio::test]
+    async fn test_served_by_extension_absent_without_any_upstream_attempt() {
+        use tower::ServiceExt;
+
+        let targets = fallback_targets("gpt-4", 1, vec![502]);
+        let mock = MockHttpClient::new(StatusCode::BAD_GATEWAY, "{}");
+        let app_state = AppState::with_client(targets, mock);
+        let router = build_router(app_state);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "no-such-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert!(
+            response.extensions().get::<crate::ServedBy>().is_none(),
+            "no upstream was attempted, so no ServedBy"
+        );
+    }
+
     /// Strict-mode `Targets` with one alias backed by a fallback pool of `n`
     /// identical providers (all hit the shared mock client), configured to retry
     /// on the given upstream `on_status` codes.
