@@ -470,8 +470,9 @@ mod tests {
             .iter()
             .find(|node| node["Subplan Name"] == "CTE active_batches")
             .expect("materialized active set");
-        assert_eq!(active["Actual Rows"].as_u64(), Some(20), "{plan}");
-        assert_eq!(plan[0]["Plan"]["Actual Rows"].as_u64(), Some(10));
+        // EXPLAIN can encode row counts as integers or decimal numbers.
+        assert_eq!(active["Actual Rows"].as_f64(), Some(20.0), "{plan}");
+        assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
     }
 
     #[sqlx::test]
