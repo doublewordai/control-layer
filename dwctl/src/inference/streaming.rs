@@ -38,7 +38,9 @@ pub struct LiveRelayConfig {
     pub responses_reframe: Option<(ResponsesRequest, String)>,
 }
 
-/// Ensures only one of {poll task, relay task} sends the terminal frame(s).
+/// Ensures only one of {poll task, relay task} ever sends output to the
+/// client, not just the terminal frame(s) — else the client can see the
+/// same content twice.
 struct Terminal {
     claimed: AtomicBool,
     notify: Notify,
@@ -258,11 +260,18 @@ async fn run_live_relay(
     // every exit path (not just poll losing) with an explicit unsubscribe.
     let _unsub_guard = UnsubscribeOnDrop { relay: &relay, request_id };
 
+    // Set once this task wins `terminal`'s claim; nothing may reach `tx`
+    // before that, or the client sees this partial stream plus poll's
+    // full replay.
+    let mut owns_terminal = false;
+
     loop {
         tokio::select! {
             biased;
 
-            _ = terminal.claimed_by_other() => {
+            // Guarded: once we own it, `claimed_by_other()` can't tell "by
+            // me" from "by someone else" and would fire immediately.
+            _ = terminal.claimed_by_other(), if !owns_terminal => {
                 return;
             }
 
@@ -272,7 +281,7 @@ async fn run_live_relay(
                 };
 
                 if msg.done {
-                    if !terminal.claim() {
+                    if !owns_terminal && !terminal.claim() {
                         return;
                     }
                     tracing::debug!(%request_id, seq = msg.seq, "flex terminal claimed by: live_relay");
@@ -310,6 +319,15 @@ async fn run_live_relay(
                     continue;
                 };
 
+                // Claim only once we're actually forwarding something —
+                // chunks dropped above never reach the client.
+                if !owns_terminal {
+                    if !terminal.claim() {
+                        return;
+                    }
+                    owns_terminal = true;
+                }
+
                 match reframe.as_mut() {
                     Some((state, model, fallback_id)) => {
                         normalize_chat_completion_chunk_value(&mut parsed, model, fallback_id);
@@ -339,4 +357,90 @@ async fn send_streaming_event(tx: &mpsc::Sender<Result<Event, std::convert::Infa
     tx.send(Ok(Event::default().event(event.event_type.clone()).data(data)))
         .await
         .map_err(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::chunk_relay::{ChunkRelay, ChunkRelayConfig};
+
+    // Needs a real Redis; override TEST_REDIS_URL if `just redis-start`'s
+    // default doesn't apply — same convention as chunk_relay.rs's own tests.
+    fn test_relay_config() -> ChunkRelayConfig {
+        ChunkRelayConfig {
+            redis_url: std::env::var("TEST_REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_string()),
+            stream_ttl_secs: 60,
+            maxlen: 2000,
+            publish_channel_capacity: 1024,
+            reader_poll_interval_ms: 20,
+            publish_workers: 2,
+            reader_workers: 2,
+        }
+    }
+
+    async fn recv_within(rx: &mut mpsc::Receiver<Result<Event, std::convert::Infallible>>, timeout: Duration) -> Option<Event> {
+        match tokio::time::timeout(timeout, rx.recv()).await {
+            Ok(Some(Ok(event))) => Some(event),
+            Ok(None) | Err(_) => None,
+        }
+    }
+
+    /// After forwarding real content, `run_live_relay` must already own
+    /// `terminal` — a concurrent claim attempt has to fail.
+    #[tokio::test]
+    async fn forwarding_a_chunk_wins_the_terminal_claim() {
+        let relay = ChunkRelay::from_config(&test_relay_config()).expect("relay should build against local redis");
+        let request_id = Uuid::new_v4();
+        let terminal = Arc::new(Terminal::new());
+        let (tx, mut rx) = mpsc::channel(16);
+
+        let handle = tokio::spawn(run_live_relay(relay.clone(), request_id, None, tx, terminal.clone(), true, None));
+
+        relay.publish_nonblocking(request_id, 0, r#"{"choices":[{"delta":{"content":"hi"}}]}"#);
+        assert!(
+            recv_within(&mut rx, Duration::from_secs(5)).await.is_some(),
+            "expected the content chunk to be forwarded"
+        );
+
+        assert!(
+            !terminal.claim(),
+            "live_relay must already own the terminal after forwarding real content"
+        );
+
+        relay.publish_done_nonblocking(request_id, 1);
+        assert!(
+            recv_within(&mut rx, Duration::from_secs(5)).await.is_some(),
+            "expected the [DONE] sentinel once live_relay's own done chunk lands"
+        );
+
+        handle.await.expect("run_live_relay task should not panic");
+    }
+
+    /// Once `poll_fallback` has claimed, `run_live_relay` must forward
+    /// nothing at all, not even a first chunk.
+    #[tokio::test]
+    async fn sends_nothing_once_poll_fallback_has_already_claimed() {
+        let relay = ChunkRelay::from_config(&test_relay_config()).expect("relay should build against local redis");
+        let request_id = Uuid::new_v4();
+        let terminal = Arc::new(Terminal::new());
+        let (tx, mut rx) = mpsc::channel(16);
+
+        assert!(terminal.claim(), "test setup: simulated poll_fallback should win the claim");
+
+        let handle = tokio::spawn(run_live_relay(relay.clone(), request_id, None, tx, terminal.clone(), true, None));
+
+        relay.publish_nonblocking(request_id, 0, r#"{"choices":[{"delta":{"content":"hi"}}]}"#);
+        relay.publish_done_nonblocking(request_id, 1);
+
+        assert!(
+            recv_within(&mut rx, Duration::from_secs(2)).await.is_none(),
+            "live_relay must not forward anything once poll_fallback already owns the terminal"
+        );
+
+        handle.await.expect("run_live_relay task should not panic");
+    }
 }
