@@ -1021,7 +1021,22 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            // The candidate error becomes the client's response when every
+            // attempt is exhausted, so an upstream 429 must not be flattened
+            // into a 502: a provider rate limit is backpressure, not a proxy
+            // fault, and collapsing it (a) pages the 5xx proxy alert on ordinary
+            // throttling and (b) hides the retry signal clients and fusillade
+            // key on. The provider-limiter branch above already uses 429 as its
+            // candidate, and the strict sanitizer deliberately keeps the
+            // rate-limit family at 429 (only account-class codes are masked),
+            // so surfacing 429 here matches the rest of the stack. Other
+            // fallback statuses keep the generic 502.
+            let candidate = if status == 429 {
+                OnwardsErrorResponse::rate_limited()
+            } else {
+                OnwardsErrorResponse::bad_gateway()
+            };
+            return LoopAction::Continue(Some(candidate));
         }
 
         // Sanitize error responses when sanitize_response is enabled.
