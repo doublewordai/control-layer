@@ -261,6 +261,47 @@ fn withhold_trace_context(headers: &mut HeaderMap) {
     headers.remove("traceparent");
     headers.remove("tracestate");
 }
+/// Headers on upstream responses that must not reach the client.
+///
+/// `filter_headers_for_upstream` already strips these from *requests*, but the
+/// symmetric path — headers the *upstream provider* sends back — was never
+/// scrubbed. OpenRouter (and other Cloudflare-fronted providers) set
+/// `Set-Cookie: __cf_bm=…` on every response, and OpenRouter itself appends
+/// `x-generation-id`; both leaked to clients verbatim, revealing the routing
+/// topology and the third-party provider's session cookie. Hop-by-hop headers
+/// (RFC 7230 §6.1) are also stripped for correctness, matching the outbound
+/// filter.
+const RESPONSE_HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "upgrade",
+];
+
+/// Upstream-specific headers that reveal provider identity or routing
+/// topology to the client.
+const RESPONSE_PROVIDER_LEAKAGE: &[&str] = &[
+    // Cloudflare/OpenRouter bot-management cookie — set on every response by
+    // Cloudflare-fronted upstreams and of no use to an API client.
+    "set-cookie",
+    // OpenRouter's per-request generation id — exposes the third-party routing
+    // layer.
+    "x-generation-id",
+];
+
+/// Scrub upstream response headers before forwarding to the client.
+///
+/// Removes hop-by-hop headers (RFC 7230) and provider-specific headers that
+/// leak routing topology or set cookies on the client. This is the
+/// response-side counterpart to `filter_headers_for_upstream`.
+fn scrub_response_headers(headers: &mut HeaderMap) {
+    for header in RESPONSE_HOP_BY_HOP.iter().chain(RESPONSE_PROVIDER_LEAKAGE) {
+        headers.remove(*header);
+    }
+}
 
 /// Filters and modifies headers before forwarding to upstream
 ///
@@ -1013,6 +1054,10 @@ pub async fn target_message_handler<T: HttpClient>(
         last_upstream_status = Some(status);
         upstream_span.record("http.response.status_code", status);
         tracing::Span::current().record("http.response.status_code", status);
+
+        // Scrub upstream response headers that must not reach the client
+        // (hop-by-hop, provider cookies, routing-leak headers).
+        scrub_response_headers(response.headers_mut());
 
         // Check if we should fallback based on status code
         if pool.should_fallback_on_status(status) {
@@ -1813,6 +1858,66 @@ mod tests {
 
         // Non-UTF-8 is treated as opaque data (forwarded, never flagged).
         assert_eq!(classify_sse_event(&[0xFF, 0xFE]), Data);
+    }
+
+    #[test]
+    fn test_scrub_response_headers_removes_set_cookie() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "set-cookie",
+            "__cf_bm=abc123; Domain=openrouter.ai; Path=/"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        scrub_response_headers(&mut headers);
+
+        assert!(headers.get("set-cookie").is_none());
+        // Legitimate headers are preserved.
+        assert!(headers.get("content-type").is_some());
+    }
+
+    #[test]
+    fn test_scrub_response_headers_removes_x_generation_id() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-generation-id",
+            "gen-1789051506-voKHY3i3D2KI0C3XolgR".parse().unwrap(),
+        );
+
+        scrub_response_headers(&mut headers);
+
+        assert!(headers.get("x-generation-id").is_none());
+    }
+
+    #[test]
+    fn test_scrub_response_headers_removes_hop_by_hop() {
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", "keep-alive".parse().unwrap());
+        headers.insert("upgrade", "websocket".parse().unwrap());
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+
+        scrub_response_headers(&mut headers);
+
+        assert!(headers.get("connection").is_none());
+        assert!(headers.get("upgrade").is_none());
+        // transfer-encoding is not in our list (handled separately elsewhere);
+        // scrub only covers the documented hop-by-hop set.
+    }
+
+    #[test]
+    fn test_scrub_response_headers_preserves_legitimate_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", "application/json".parse().unwrap());
+        headers.insert("x-request-id", "req-123".parse().unwrap());
+        headers.insert("content-length", "42".parse().unwrap());
+
+        scrub_response_headers(&mut headers);
+
+        assert!(headers.get("content-type").is_some());
+        assert!(headers.get("x-request-id").is_some());
+        assert!(headers.get("content-length").is_some());
     }
 
     #[test]
