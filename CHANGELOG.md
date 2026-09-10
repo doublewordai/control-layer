@@ -1,5 +1,34 @@
 # Changelog
 
+## [11.8.0](https://github.com/doublewordai/control-layer/compare/v11.7.0...v11.8.0) (2026-09-09)
+
+
+### Features
+
+* **dashboard:** filter responses by account on the console ([#1733](https://github.com/doublewordai/control-layer/issues/1733)) ([6d2f4ba](https://github.com/doublewordai/control-layer/commit/6d2f4bac6eceba5648515459ca71d1f542e4ba46))
+* **responses:** surface the API key holder, not just the billing owner ([#1732](https://github.com/doublewordai/control-layer/issues/1732)) ([f9cc7f3](https://github.com/doublewordai/control-layer/commit/f9cc7f30ea2175819f977a10a53f3d35eb7239fc))
+
+## [11.7.0](https://github.com/doublewordai/control-layer/compare/v11.6.3...v11.7.0) (2026-09-09)
+
+
+### Features
+
+* **organizations:** notify owners of a join request, and the requester on approval ([#1724](https://github.com/doublewordai/control-layer/issues/1724)) ([c45cb28](https://github.com/doublewordai/control-layer/commit/c45cb28b60334ea3c7eb998bd0ba2d66fe47f867))
+
+## [11.6.3](https://github.com/doublewordai/control-layer/compare/v11.6.2...v11.6.3) (2026-09-09)
+
+
+### Bug Fixes
+
+* support scoped owners for pooled component connections ([#1721](https://github.com/doublewordai/control-layer/issues/1721)) ([1bd4127](https://github.com/doublewordai/control-layer/commit/1bd41270c6aac86f7af1deebd96139da8a2383d6))
+
+## [11.6.2](https://github.com/doublewordai/control-layer/compare/v11.6.1...v11.6.2) (2026-09-09)
+
+
+### Bug Fixes
+
+* add index for finalizer sweep ([#1728](https://github.com/doublewordai/control-layer/issues/1728)) ([a983682](https://github.com/doublewordai/control-layer/commit/a98368203a929e647199a6a94385116247214050))
+
 ## [11.6.1](https://github.com/doublewordai/control-layer/compare/v11.6.0...v11.6.1) (2026-09-09)
 
 

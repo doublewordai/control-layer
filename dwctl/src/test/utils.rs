@@ -227,6 +227,8 @@ pub fn create_test_config() -> crate::config::Config {
             },
             replica_pool: None,
             fusillade: crate::config::ComponentDb::Schema {
+                url: None,
+                pooled_schema_mode: crate::config::PooledSchemaMode::default(),
                 pooled_url: None,
                 replica_url: None,
                 direct_pool: crate::config::default_direct_pool(),
@@ -239,6 +241,8 @@ pub fn create_test_config() -> crate::config::Config {
                 replica_pool: None,
             },
             outlet: crate::config::ComponentDb::Schema {
+                url: None,
+                pooled_schema_mode: crate::config::PooledSchemaMode::default(),
                 pooled_url: None,
                 replica_url: None,
                 direct_pool: crate::config::default_direct_pool(),

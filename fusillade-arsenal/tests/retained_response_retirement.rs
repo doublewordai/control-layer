@@ -127,6 +127,23 @@ async fn partition_maintenance_pool_rejects_any_shape_except_max_one_min_zero(po
 }
 
 #[sqlx::test]
+async fn changing_query_schema_invalidates_maintenance_attestation(pool: PgPool) {
+    let manager = retirement_manager(&pool).await;
+    assert!(manager.supports_retained_response_partition_retirement());
+    let manager = manager.with_query_schema("public");
+    assert!(!manager.supports_retained_response_partition_retirement());
+    let manager = manager.attest_partition_maintenance_pool().await.unwrap();
+    assert!(manager.supports_retained_response_partition_retirement());
+    sqlx::query("CREATE SCHEMA other_component")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let manager = manager.with_query_schema("other_component");
+    assert!(!manager.supports_retained_response_partition_retirement());
+    assert!(manager.attest_partition_maintenance_pool().await.is_err());
+}
+
+#[sqlx::test]
 async fn maintenance_pool_attestation_rejects_a_different_schema(pool: PgPool) {
     sqlx::query("CREATE SCHEMA wrong_retirement_target")
         .execute(&pool)

@@ -292,6 +292,17 @@ impl Default for PoolSettings {
     }
 }
 
+/// How schema-mode query connections select their PostgreSQL schema.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PooledSchemaMode {
+    /// Use a component login with a persistent schema default, verified at startup.
+    #[default]
+    RoleDefault,
+    /// Select the schema within every query transaction (Fusillade only).
+    Transaction,
+}
+
 /// How a component (fusillade/outlet) connects to its database.
 ///
 /// Components can either share the main database using a separate PostgreSQL schema,
@@ -304,14 +315,22 @@ pub enum ComponentDb {
     Schema {
         /// Schema name (e.g., "fusillade", "outlet")
         name: String,
-        /// Optional transaction-pooled endpoint for this schema in the main
-        /// database. Use a component role whose default current_schema() is
-        /// `name`; a shared public-first search_path breaks retention identity.
-        /// Defaults to the main pooled endpoint when it has the correct schema.
+        /// Optional direct endpoint using a component identity in the same live
+        /// database as main. Used for migrations and session-scoped work.
+        /// Without it, the main direct credentials are reused.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+        /// Optional transaction-pooled endpoint. Defaults to main's endpoint
+        /// only when `url` is omitted. An explicit identity with a split main
+        /// pool must also supply its own pooled endpoint.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pooled_url: Option<String>,
-        /// Optional replica endpoint for this schema. When pooled, its role must
-        /// also default to `name`. Otherwise inherits the main replica endpoint.
+        /// Schema selection for transaction-pooled queries. Role-default mode
+        /// verifies both primary and replica; transaction mode is Fusillade-only.
+        #[serde(default)]
+        pooled_schema_mode: PooledSchemaMode,
+        /// Optional replica endpoint. An explicit direct identity falls back to
+        /// its primary; otherwise the main replica is inherited when available.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         replica_url: Option<String>,
         /// Connection pool settings for this component (primary and replica if not specified)
@@ -356,6 +375,30 @@ pub enum ComponentDb {
 }
 
 impl ComponentDb {
+    /// Reject configurations that would change the selected connection identity
+    /// or request transaction schema selection from an unsupported client.
+    pub(crate) fn validate_schema_pooling(&self, component_name: &str, main_is_split: bool) -> Result<(), String> {
+        if let Self::Schema {
+            url,
+            pooled_url,
+            pooled_schema_mode,
+            ..
+        } = self
+        {
+            if *pooled_schema_mode == PooledSchemaMode::Transaction && component_name != "fusillade" {
+                return Err(format!(
+                    "database.{component_name}.pooled_schema_mode: transaction is supported only for fusillade"
+                ));
+            }
+            if url.is_some() && main_is_split && pooled_url.is_none() {
+                return Err(format!(
+                    "database.{component_name}.pooled_url is required with an explicit schema url when main uses a pooled endpoint"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Get the primary pool settings for this component
     pub fn pool_settings(&self) -> &PoolSettings {
         match self {
@@ -392,6 +435,8 @@ impl ComponentDb {
 /// Default fusillade component configuration (schema mode with "fusillade" schema)
 pub fn default_fusillade_component() -> ComponentDb {
     ComponentDb::Schema {
+        url: None,
+        pooled_schema_mode: PooledSchemaMode::default(),
         pooled_url: None,
         replica_url: None,
         name: "fusillade".into(),
@@ -410,6 +455,8 @@ pub fn default_fusillade_component() -> ComponentDb {
 /// Default outlet component configuration (schema mode with "outlet" schema)
 pub fn default_outlet_component() -> ComponentDb {
     ComponentDb::Schema {
+        url: None,
+        pooled_schema_mode: PooledSchemaMode::default(),
         pooled_url: None,
         replica_url: None,
         name: "outlet".into(),
@@ -2024,9 +2071,9 @@ pub struct DaemonConfig {
     pub batch_archive_retention_days: Option<u32>,
 
     /// Explicit direct/session-capable primary endpoint used only for
-    /// retained-response partition DDL. Dedicated databases and pooled schema
-    /// components require an explicit endpoint using the same role as query
-    /// traffic. Unpooled schema mode can reuse its direct pool. Startup attests
+    /// retained-response partition DDL. Dedicated databases and schema components
+    /// using a different query role require an explicit endpoint with that role.
+    /// Schema mode with the main query role reuses its direct pool. Startup attests
     /// the database, role, schema, and ownership. Never serialized in config
     /// snapshots and redacted from debug output.
     #[serde(default, skip_serializing)]
@@ -3216,6 +3263,13 @@ impl Config {
 
     /// Validate the configuration for consistency and required fields
     pub fn validate(&self) -> Result<(), Error> {
+        for (name, component) in [("fusillade", self.database.fusillade()), ("outlet", self.database.outlet())] {
+            component
+                .validate_schema_pooling(name, self.database.external_pooled_url().is_some())
+                .map_err(|operation| Error::Internal {
+                    operation: format!("Config validation: {operation}"),
+                })?;
+        }
         if let Err(error) = self.background_services.batch_daemon.retention.validate() {
             return Err(Error::Internal {
                 operation: format!("Config validation: batch retention is invalid: {error}"),
@@ -3250,13 +3304,11 @@ impl Config {
             && (daemon.retained_response_retirement_enabled
                 || daemon.batch_archive_retirement_enabled
                 || daemon.template_retirement_enabled)
-            && (matches!(self.database.fusillade(), ComponentDb::Dedicated { .. })
-                || self.database.external_pooled_url().is_some()
-                || self.database.fusillade().pooled_url().is_some())
+            && matches!(self.database.fusillade(), ComponentDb::Dedicated { .. })
             && daemon.retained_response_partition_maintenance_url.is_none()
         {
             return Err(Error::Internal {
-                operation: "Config validation: partition retirement on a pooled or dedicated database requires an explicit direct session endpoint using the same role as fusillade query traffic".to_string(),
+                operation: "Config validation: partition retirement on a dedicated database requires an explicit direct session endpoint using the same role as fusillade query traffic".to_string(),
             });
         }
         if owns_archive_maintenance
@@ -4080,7 +4132,7 @@ database:
     }
 
     #[test]
-    fn pooled_schema_retirement_requires_component_session_endpoint() {
+    fn pooled_schema_retirement_reuses_direct_session_endpoint() {
         for component_only in [false, true] {
             let mut config = Config::default();
             configure_batchless_retention(&mut config);
@@ -4088,16 +4140,10 @@ database:
                 "type": "external", "url": "postgres://main@localhost/db",
                 "pooled_url": if component_only { None } else { Some("postgres://main@pooler/db") },
                 "fusillade": { "mode": "schema", "name": "fusillade",
-                    "pooled_url": "postgres://component@pooler/db" }
+                    "pooled_url": "postgres://main@pooler/db" }
             }))
             .unwrap();
             config.background_services.batch_daemon.retained_response_retirement_enabled = true;
-            let error = config
-                .validate()
-                .expect_err("pooled retirement must require an explicit component session endpoint");
-            assert!(error.to_string().contains("direct session endpoint"));
-            config.background_services.batch_daemon.retained_response_partition_maintenance_url =
-                Some(SensitiveDatabaseUrl("postgres://component@localhost/db".into()));
             config.validate().unwrap();
         }
     }

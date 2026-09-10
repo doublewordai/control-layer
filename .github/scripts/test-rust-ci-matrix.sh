@@ -85,6 +85,9 @@ require_exact_line '    name: dwctl / test' 'preserve the required dwctl test co
 require_text 'name: workspace / rust lint' 'scope Rust linting to the workspace'
 require_text 'needs: [changes, backend-crate-test, backend-dwctl-test, backend-lint, frontend-test, build, pooled-e2e]' \
   'gate backend-test on every crate, dwctl partition, lint, frontend test, image build, and pooled database E2E'
+require_block_line "$(extract_job pooled-e2e)" '        schema-mode: [shared, scoped]' \
+  'exercise both shared and scoped schema modes in the pooled database matrix'
+require_text '--schema-mode "${{ matrix.schema-mode }}"' 'pass the selected pooled schema mode to the E2E harness'
 require_exact_line '    name: workspace / rust gate' 'name the aggregate Rust gate clearly'
 require_text 'pattern: rust-coverage-*' 'download all per-package coverage artifacts'
 require_text 'MINIMUM_COVERAGE: "60"' 'preserve the aggregate line coverage threshold'
@@ -199,7 +202,7 @@ while IFS= read -r name; do
       # Partition checks are diagnostic fan-out jobs. The aggregate
       # `dwctl / test` context below remains the required branch-protection gate.
       ;;
-    'dwctl / pooled database e2e')
+    'dwctl / pooled database e2e (${{ matrix.schema-mode }})')
       # Required through workspace / rust gate; no new branch-protection
       # context needs to be configured for this fan-out job.
       ;;

@@ -1360,7 +1360,11 @@ jobs:
 
   pooled-e2e:
     if: always() && needs.changes.outputs.run-ci == 'true' && (needs.build.result == 'success' || needs.build.result == 'skipped') && (github.event_name == 'pull_request' || github.event_name == 'merge_group')
-    name: dwctl / pooled database e2e
+    name: dwctl / pooled database e2e (${{ matrix.schema-mode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        schema-mode: [shared, scoped]
     runs-on: depot-ubuntu-24.04
     timeout-minutes: 30
     needs: [changes, build]
@@ -1369,7 +1373,7 @@ jobs:
       packages: read
     services:
       postgres:
-        image: postgres:16
+        image: postgres:17
         env:
           POSTGRES_PASSWORD: password
         ports:
@@ -1435,13 +1439,13 @@ jobs:
           else
             target=(--binary target/ci/dwctl)
           fi
-          python scripts/tests/pooled/e2e.py "${target[@]}" --artifacts pooled-e2e-results 2>&1 | tee pooled-e2e.log
+          python scripts/tests/pooled/e2e.py "${target[@]}" --schema-mode "${{ matrix.schema-mode }}" --artifacts pooled-e2e-results 2>&1 | tee pooled-e2e.log
 
       - name: Upload pooled database diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pooled-database-e2e
+          name: pooled-database-e2e-${{ matrix.schema-mode }}
           path: |
             pooled-e2e.log
             pooled-e2e-results/

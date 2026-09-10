@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT u.email\n            FROM user_organizations uo\n            JOIN users u ON u.id = uo.user_id\n            WHERE uo.organization_id = $1\n              AND uo.status = 'active'\n              AND uo.role IN ('owner', 'admin')\n              AND u.is_deleted = false\n            ORDER BY u.email\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "email",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9c80facb95e6e45028fb70821600fc739713912da8e9c7385c49051955727373"
+}
