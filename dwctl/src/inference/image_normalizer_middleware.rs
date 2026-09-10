@@ -9,9 +9,9 @@
 //! prompt-cache layer — is deliberate: the cache hashes the stable
 //! content-addressed token, not the per-attempt signed URL, so a
 //! byte-identical image keeps a prefix chain intact across calls. A token
-//! is only signed on a marked daemon dispatch, and only for a caller whose
-//! user or organization submitted the image (`image_access`); a client
-//! presenting a token directly, or anyone else's token, gets a 403.
+//! is signed only for a caller whose user or organization submitted the
+//! image (`image_access`) — the daemon loopback, or a client re-sending a
+//! request it downloaded; anyone else's token gets a 403.
 //!
 //! Pattern: read the body once via `axum::body::to_bytes`, mutate the JSON
 //! in place, restore the body via `Body::from(...)`.
@@ -163,18 +163,6 @@ pub async fn image_normalizer_middleware(
         _ => None,
     };
 
-    // Tokens are an internal representation (what flex enqueue / file ingest
-    // store), so they are only ever legitimate on a daemon dispatch loopback,
-    // which the daemon marks. A client presenting a token directly is refused —
-    // even its own — rather than opening an unreviewed token-reuse surface.
-    // The marker is trustworthy for the same reason the stream marker is: the
-    // ingress strips every `x-fusillade-*` header from external requests.
-    let is_daemon_dispatch = request
-        .headers()
-        .get(crate::inference::outbound_request::DISPATCH_MARKER_HEADER)
-        .and_then(|v| v.to_str().ok())
-        == Some("1");
-
     let normalizer = state.normalizer.clone();
     let realtime_ttl = state.realtime_ttl;
     let token_ttl = state.token_ttl;
@@ -185,15 +173,14 @@ pub async fn image_normalizer_middleware(
         let is_data_uri = url.starts_with("data:");
         async move {
             // `dw-img://` token: sign it (no ingest — the bytes are already in
-            // the store), but only on a daemon dispatch AND only for the
-            // principal that owns the image (`image_access`: the submitting
-            // user, or anyone acting in the organization it was submitted
-            // under). Unattributable callers are refused rather than trusted:
-            // a token names bytes, and signing it hands out a URL to them.
+            // the store) for the principal that owns the image (`image_access`:
+            // the submitting user, or anyone acting in the organization it was
+            // submitted under). That covers both the daemon loopback carrying
+            // what enqueue / file ingest stored AND a client re-sending a
+            // request it downloaded. Unattributable callers are refused rather
+            // than trusted: a token names bytes, and signing it hands out a URL
+            // to them.
             if ImageToken::looks_like_token(&url) {
-                if !is_daemon_dispatch {
-                    return Err(NormalizeError::Forbidden);
-                }
                 let token: ImageToken = url
                     .parse()
                     .map_err(|e: TokenParseError| NormalizeError::BadInput(format!("invalid dw-img token: {e}")))?;
@@ -309,13 +296,21 @@ pub(crate) async fn normalize_value_to_tokens(
                 ImageInput::HttpUrl(url)
             };
             let ingested = normalizer.ingest(input).await?;
+            // AWAITED and REQUIRED, not fire-and-forget: this row is what
+            // authorises signing the token when the daemon loops the request
+            // back, and a claim can follow enqueue within ~100ms. A missing row
+            // would surface as a false 403 on the customer's own image, so a
+            // failed write fails the submission (503, retryable) instead.
             if let (Some(pool), Some(attribution)) = (access_pool, attribution) {
-                let mime = ingested.mime.clone();
-                let bytes_len = ingested.bytes_len;
-                let token = ingested.token;
-                tokio::spawn(async move {
-                    crate::api::handlers::images::record_image_access(&pool, attribution, token, &mime, bytes_len).await;
-                });
+                crate::api::handlers::images::try_record_image_access(
+                    &pool,
+                    attribution,
+                    ingested.token,
+                    &ingested.mime,
+                    ingested.bytes_len,
+                )
+                .await
+                .map_err(|e| NormalizeError::StoreFailed(format!("image_access bookkeeping: {e}")))?;
             }
             Ok::<String, NormalizeError>(ingested.token.to_dw_img_uri())
         }
@@ -600,21 +595,16 @@ mod tests {
         assert!(!url.contains("base64"), "raw base64 must be replaced");
     }
 
-    // ---- `dw-img://` token signing (the daemon loopback path) ----
+    // ---- `dw-img://` token signing (daemon loopback, or a client re-sending
+    // a request it downloaded — the same ownership rule covers both) ----
 
-    /// Post as a caller, optionally carrying the daemon's dispatch marker
-    /// (what a flex/batch loopback carries; the ingress strips it from
-    /// external requests).
-    async fn post_json_as(router: Router, bearer: Option<&str>, daemon_dispatch: bool, body: Value) -> (StatusCode, Value) {
+    async fn post_json_as(router: Router, bearer: Option<&str>, body: Value) -> (StatusCode, Value) {
         let mut req = Request::builder()
             .method(Method::POST)
             .uri("/chat/completions")
             .header("content-type", "application/json");
         if let Some(b) = bearer {
             req = req.header("authorization", format!("Bearer {b}"));
-        }
-        if daemon_dispatch {
-            req = req.header(crate::inference::outbound_request::DISPATCH_MARKER_HEADER, "1");
         }
         let resp = router
             .oneshot(req.body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap())
@@ -688,11 +678,12 @@ mod tests {
         ingested.token
     }
 
-    /// The fix for flex prompt caching with images: a daemon loopback carrying
-    /// the token that enqueue stored gets a signed URL from THIS layer (below
-    /// the prompt cache), for the principal that submitted the image.
+    /// The fix for flex prompt caching with images: a body carrying the token
+    /// that enqueue stored (the daemon loopback, or the customer re-sending a
+    /// request they downloaded) gets a signed URL from THIS layer (below the
+    /// prompt cache), for the principal that submitted the image.
     #[sqlx::test]
-    async fn signs_a_token_on_a_dispatch_for_the_principal_that_submitted_the_image(pool: sqlx::PgPool) {
+    async fn signs_a_token_for_the_principal_that_submitted_the_image(pool: sqlx::PgPool) {
         use crate::api::models::users::Role;
         use crate::test::utils::{create_test_api_key_for_user, create_test_user};
 
@@ -701,7 +692,7 @@ mod tests {
         let state = state_with_pool(&pool);
         let token = ingest_for_key(&pool, &state, &key.secret).await;
 
-        let (status, echoed) = post_json_as(build_router(state), Some(&key.secret), true, body_with_token(token)).await;
+        let (status, echoed) = post_json_as(build_router(state), Some(&key.secret), body_with_token(token)).await;
 
         assert_eq!(status, StatusCode::OK, "{echoed}");
         let url = echoed["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap();
@@ -731,7 +722,7 @@ mod tests {
         let state = state_with_pool(&pool);
         let token = ingest_for_key(&pool, &state, &alice_org_key).await;
 
-        let (status, echoed) = post_json_as(build_router(state), Some(&bob_org_key), true, body_with_token(token)).await;
+        let (status, echoed) = post_json_as(build_router(state), Some(&bob_org_key), body_with_token(token)).await;
 
         assert_eq!(status, StatusCode::OK, "{echoed}");
         let url = echoed["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap();
@@ -752,25 +743,7 @@ mod tests {
         let state = state_with_pool(&pool);
         let token = ingest_for_key(&pool, &state, &owner_key.secret).await;
 
-        let (status, body) = post_json_as(build_router(state), Some(&other_key.secret), true, body_with_token(token)).await;
-
-        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
-        assert_eq!(body["error"]["code"], "image_token_forbidden");
-    }
-
-    /// Tokens are internal: a client presenting one directly — even its own —
-    /// is refused. Only a marked daemon dispatch may have tokens signed.
-    #[sqlx::test]
-    async fn refuses_a_token_outside_a_daemon_dispatch(pool: sqlx::PgPool) {
-        use crate::api::models::users::Role;
-        use crate::test::utils::{create_test_api_key_for_user, create_test_user};
-
-        let owner = create_test_user(&pool, Role::StandardUser).await;
-        let owner_key = create_test_api_key_for_user(&pool, owner.id).await;
-        let state = state_with_pool(&pool);
-        let token = ingest_for_key(&pool, &state, &owner_key.secret).await;
-
-        let (status, body) = post_json_as(build_router(state), Some(&owner_key.secret), false, body_with_token(token)).await;
+        let (status, body) = post_json_as(build_router(state), Some(&other_key.secret), body_with_token(token)).await;
 
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(body["error"]["code"], "image_token_forbidden");
@@ -788,7 +761,7 @@ mod tests {
         let state = state_with_pool(&pool);
         let token = ingest_for_key(&pool, &state, &owner_key.secret).await;
 
-        let (status, body) = post_json_as(build_router(state), None, true, body_with_token(token)).await;
+        let (status, body) = post_json_as(build_router(state), None, body_with_token(token)).await;
 
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     }

@@ -173,9 +173,27 @@ pub async fn resolve_image_attribution(pool: &sqlx::PgPool, api_key: &str) -> Op
 /// path on this bookkeeping write — the security control (substituting the
 /// URL before forwarding to the upstream) does not depend on it.
 pub async fn record_image_access(pool: &sqlx::PgPool, attribution: ImageAttribution, token: ImageToken, mime: &str, bytes_len: u64) {
+    if let Err(e) = try_record_image_access(pool, attribution, token, mime, bytes_len).await {
+        warn!(error = %e, "failed to record image_access row (non-fatal)");
+    }
+}
+
+/// [`record_image_access`] that surfaces the failure. Use it wherever a LATER
+/// request depends on the row existing: the row is what authorises signing a
+/// `dw-img://` token at dispatch, so a queued (flex / batch) request whose
+/// bookkeeping write silently failed would be refused as not-owned when the
+/// daemon loops it back. Callers on those paths should fail the submission
+/// (retryable) rather than accept a request they cannot later serve.
+pub async fn try_record_image_access(
+    pool: &sqlx::PgPool,
+    attribution: ImageAttribution,
+    token: ImageToken,
+    mime: &str,
+    bytes_len: u64,
+) -> std::result::Result<(), sqlx::Error> {
     let sha_bytes: Vec<u8> = token.0.to_vec();
     let bytes_len_i64 = bytes_len as i64;
-    if let Err(e) = sqlx::query!(
+    sqlx::query!(
         r#"
         INSERT INTO image_access (user_id, organization_id, sha256, mime, bytes_len, first_seen_at, last_seen_at)
         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
@@ -193,9 +211,7 @@ pub async fn record_image_access(pool: &sqlx::PgPool, attribution: ImageAttribut
     )
     .execute(pool)
     .await
-    {
-        warn!(error = %e, "failed to record image_access row (non-fatal)");
-    }
+    .map(|_| ())
 }
 
 /// Whether the caller behind `attribution` may reference the image `token`

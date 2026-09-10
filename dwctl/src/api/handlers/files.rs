@@ -382,18 +382,26 @@ async fn normalize_template_body_in_place(
             match normalizer.ingest(input).await {
                 Ok(ingested) => {
                     if let (Some(pool), Some(attribution)) = (access_pool, access_attribution) {
-                        // Batch ingest is already async (file upload latency dominates),
-                        // so we AWAIT the bookkeeping write rather than fire-and-forget —
-                        // the user's later "view what I submitted" lookup depends on it.
-                        // Records real (mime, bytes_len) captured from the ingest result.
-                        crate::api::handlers::images::record_image_access(
+                        // AWAITED and REQUIRED: this row is what authorises signing
+                        // the token when the daemon dispatches the batch, so a
+                        // silently-failed write would later refuse the customer's
+                        // own image. Fail the upload (retryable) instead.
+                        if let Err(e) = crate::api::handlers::images::try_record_image_access(
                             &pool,
                             attribution,
                             ingested.token,
                             &ingested.mime,
                             ingested.bytes_len,
                         )
-                        .await;
+                        .await
+                        {
+                            if let Ok(mut g) = err_cell.lock()
+                                && g.is_none()
+                            {
+                                *g = Some(BatchNormalizeError::StoreFailed(format!("image_access bookkeeping: {e}")));
+                            }
+                            return Err(());
+                        }
                     }
                     Ok::<String, ()>(ingested.token.to_dw_img_uri())
                 }
