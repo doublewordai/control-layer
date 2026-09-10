@@ -1021,7 +1021,19 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            // When this ends up as the client's answer (all attempts exhausted),
+            // an upstream 429 is backpressure, not a broken gateway: the pool's
+            // own saturation paths — the local limiter and all-at-capacity —
+            // already answer 429, and `onwards_upstream_failed_total` keeps the
+            // true upstream status either way. Collapsing it to 502 turned
+            // provider rate limits into critical 5xx pages and told OpenAI-SDK
+            // clients the gateway was broken instead of "slow down".
+            let carried_error = if status == 429 {
+                OnwardsErrorResponse::rate_limited()
+            } else {
+                OnwardsErrorResponse::bad_gateway()
+            };
+            return LoopAction::Continue(Some(carried_error));
         }
 
         // Sanitize error responses when sanitize_response is enabled.
