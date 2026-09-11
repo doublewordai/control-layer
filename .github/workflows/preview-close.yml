@@ -3,7 +3,7 @@ name: Preview
 on:
   pull_request:
     branches: [main]
-    types: [closed]
+    types: [closed, labeled, unlabeled]
 
 permissions:
   contents: read
@@ -16,6 +16,7 @@ jobs:
   close:
     name: Close preview
     if: >-
+      github.event.action == 'closed' &&
       startsWith(github.head_ref, 'preview/') &&
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
@@ -29,6 +30,31 @@ jobs:
               owner: '${{ secrets.DEPLOY_TARGET_OWNER }}',
               repo: '${{ secrets.DEPLOY_TARGET_REPO }}',
               event_type: 'preview-closed',
+              client_payload: {
+                repository: context.repo.owner + '/' + context.repo.repo,
+                pull_request: context.payload.pull_request.number,
+                branch: context.payload.pull_request.head.ref,
+                sha: context.payload.pull_request.head.sha
+              }
+            })
+  load-test-changed:
+    name: Publish load-test change
+    if: >-
+      (github.event.action == 'labeled' || github.event.action == 'unlabeled') &&
+      github.event.label.name == 'load-test' &&
+      startsWith(github.event.pull_request.head.ref, 'preview/') &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish preview load-test change
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9
+        with:
+          github-token: ${{ secrets.PREVIEW_DISPATCH_TOKEN }}
+          script: |
+            await github.rest.repos.createDispatchEvent({
+              owner: '${{ secrets.DEPLOY_TARGET_OWNER }}',
+              repo: '${{ secrets.DEPLOY_TARGET_REPO }}',
+              event_type: 'preview-load-test-changed',
               client_payload: {
                 repository: context.repo.owner + '/' + context.repo.repo,
                 pull_request: context.payload.pull_request.number,
