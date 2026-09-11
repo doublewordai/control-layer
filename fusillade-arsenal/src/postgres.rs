@@ -46,8 +46,8 @@ use crate::manager::{
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
     CreateRealtimeInput, DaemonId, Failed, FailureReason, LeakStamp, Pending,
-    PersistCompletedRealtimeInput, Processing, Request, RequestData, RequestId, RequestState,
-    ServiceTierFilter,
+    PersistCompletedRealtimeInput, Processing, Request, RequestData, RequestDetail, RequestId,
+    RequestState, ServiceTierFilter,
 };
 
 // Retained graph representation and movement stay isolated from the main
@@ -57,6 +57,7 @@ use crate::request::{
 pub(crate) mod batch_archive_retirement;
 mod batch_list;
 pub(crate) mod partition_retirement;
+mod request_maintenance;
 pub(crate) mod retained_response;
 pub(crate) mod retained_response_retirement;
 pub(crate) mod template_retirement;
@@ -396,6 +397,30 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             batch_insert_strategy: BatchInsertStrategy::default(),
             response_transformer: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Read only status while a response is running, loading its payload once terminal.
+    /// Missing live rows use the retained-response reader, so movement between
+    /// the status probe and detail fetch remains safe. Reads use the primary.
+    pub async fn get_terminal_request_detail(
+        &self,
+        request_id: RequestId,
+    ) -> Result<Option<RequestDetail>> {
+        let status: Option<String> = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(request_id.0)
+            .fetch_optional(self.write_executor())
+            .await
+            .map_err(|error| {
+                FusilladeError::Other(anyhow!("Failed to read request status: {error}"))
+            })?;
+        if status
+            .as_deref()
+            .is_some_and(|state| !matches!(state, "completed" | "failed" | "canceled"))
+        {
+            return Ok(None);
+        }
+        let detail = retained_response::get_request_detail(self, request_id).await?;
+        Ok(matches!(detail.status.as_str(), "completed" | "failed" | "canceled").then_some(detail))
     }
 
     /// Compatibility constructor for callers that still build storage beside an
@@ -8860,6 +8885,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
     }
 
     async fn archive_batch(&self, batch_id: BatchId) -> Result<ArchiveOutcome> {
+        request_maintenance::before_archive(self).await?;
         let mut tx = self
             .begin_write()
             .await
@@ -24040,6 +24066,58 @@ mod tests {
         assert_eq!(detail.status, "processing");
         assert_eq!(detail.created_by, "test-user-id");
         assert!(detail.body.as_deref().unwrap().contains("gpt-4"));
+    }
+
+    #[sqlx::test]
+    async fn test_terminal_poll_does_not_read_pending_template(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::new(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            PostgresStorageConfig::default(),
+        );
+        let id = Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: id,
+                body: "{}".into(),
+                model: "test".into(),
+                endpoint: "http://localhost".into(),
+                method: "POST".into(),
+                path: "/".into(),
+                api_key: String::new(),
+                created_by: "owner".into(),
+            })
+            .await
+            .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE request_templates IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.get_terminal_request_detail(crate::request::RequestId(id)),
+        )
+        .await;
+        blocker.rollback().await.unwrap();
+        assert!(
+            result
+                .expect("pending polls must not wait for template access")
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query(
+            "UPDATE requests SET state = 'completed', response_body = 'done', response_status = 200, completed_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let detail = manager
+            .get_terminal_request_detail(crate::request::RequestId(id))
+            .await
+            .unwrap()
+            .expect("completed request must return its payload");
+        assert_eq!(detail.response_body.as_deref(), Some("done"));
     }
 
     #[sqlx::test]
