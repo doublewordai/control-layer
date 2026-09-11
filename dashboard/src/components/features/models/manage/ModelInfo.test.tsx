@@ -143,4 +143,32 @@ describe("ModelInfo", () => {
     const request = updateModel.mock.calls[0][0];
     expect(request.data).not.toHaveProperty("reasoning_translation_overrides");
   });
+
+  it("warns when the model is managed by startup provisioning", () => {
+    vi.mocked(useModel).mockReturnValue({
+      data: {
+        ...virtualModel,
+        provisioning_source: "model-catalog:zai-org--GLM-5.2-FP8.yaml",
+      },
+      isLoading: false,
+      error: null,
+    } as ReturnType<typeof useModel>);
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+    const { getByRole } = render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={["/models/manage/virtual-model-id"]}>
+          <Routes>
+            <Route path="/models/manage/:modelId" element={<ModelInfo />} />
+          </Routes>
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    expect(getByRole("status")).toHaveTextContent(
+      "This model is provisioned from model-catalog:zai-org--GLM-5.2-FP8.yaml. Changes made here will be overwritten when the server restarts.",
+    );
+  });
 });

@@ -771,6 +771,8 @@ pub struct DeploymentDBResponse {
     pub allowed_batch_completion_windows: Option<Vec<String>>,
     /// Catalog metadata (JSONB)
     pub metadata: serde_json::Value,
+    /// Declarative source reapplied during startup, or None for manually managed rows.
+    pub provisioning_source: Option<String>,
 }
 
 /// DB action for a traffic routing rule (used at the repository layer)

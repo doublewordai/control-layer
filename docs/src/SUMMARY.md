@@ -16,6 +16,7 @@
 # Reference
 
 - [Configuration Reference](reference/configuration.md)
+- [Model Provisioning](reference/model-provisioning.md)
 
 # Conceptual Guides
 

@@ -210,6 +210,7 @@ mod tests {
             reasoning_translation_overrides: None,
             allowed_batch_completion_windows: None,
             metadata: serde_json::Value::Object(serde_json::Map::new()),
+            provisioning_source: None,
         }
     }
 
