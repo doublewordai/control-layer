@@ -34,7 +34,7 @@ impl<'c> Webhooks<'c> {
             r#"
             INSERT INTO user_webhooks (user_id, url, secret, event_types, description, scope)
             VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING *
+            RETURNING id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope
             "#,
             request.user_id,
             request.url,
@@ -52,7 +52,7 @@ impl<'c> Webhooks<'c> {
     /// Get a webhook by ID.
     #[instrument(skip(self), fields(webhook_id = %abbrev_uuid(&id)), err)]
     pub async fn get_by_id(&mut self, id: WebhookId) -> Result<Option<Webhook>> {
-        let webhook = sqlx::query_as!(Webhook, r#"SELECT * FROM user_webhooks WHERE id = $1"#, id)
+        let webhook = sqlx::query_as!(Webhook, r#"SELECT id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope FROM user_webhooks WHERE id = $1"#, id)
             .fetch_optional(&mut *self.db)
             .await?;
 
@@ -65,7 +65,7 @@ impl<'c> Webhooks<'c> {
         let webhooks = sqlx::query_as!(
             Webhook,
             r#"
-            SELECT * FROM user_webhooks
+            SELECT id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope FROM user_webhooks
             WHERE user_id = $1
             ORDER BY created_at DESC
             "#,
@@ -112,7 +112,7 @@ impl<'c> Webhooks<'c> {
                     ELSE consecutive_failures
                 END
             WHERE id = $1
-            RETURNING *
+            RETURNING id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope
             "#,
             id,
             request.url,
@@ -147,7 +147,7 @@ impl<'c> Webhooks<'c> {
             UPDATE user_webhooks
             SET secret = $2
             WHERE id = $1
-            RETURNING *
+            RETURNING id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope
             "#,
             id,
             new_secret,
@@ -167,7 +167,7 @@ impl<'c> Webhooks<'c> {
         let webhooks = sqlx::query_as!(
             Webhook,
             r#"
-            SELECT * FROM user_webhooks
+            SELECT id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope FROM user_webhooks
             WHERE user_id = ANY($1)
               AND enabled = true
               AND disabled_at IS NULL
@@ -195,7 +195,7 @@ impl<'c> Webhooks<'c> {
         let webhooks = sqlx::query_as!(
             Webhook,
             r#"
-            SELECT w.*
+            SELECT w.id, w.user_id, w.url, w.secret, w.enabled, w.event_types, w.description, w.created_at, w.updated_at, w.consecutive_failures, w.disabled_at, w.scope
             FROM user_webhooks w
             INNER JOIN user_roles ur ON ur.user_id = w.user_id
             WHERE w.enabled = true
@@ -231,7 +231,7 @@ impl<'c> Webhooks<'c> {
                     ELSE disabled_at
                 END
             WHERE id = $1
-            RETURNING *
+            RETURNING id, user_id, url, secret, enabled, event_types, description, created_at, updated_at, consecutive_failures, disabled_at, scope
             "#,
             id,
             circuit_breaker_threshold,
@@ -269,7 +269,7 @@ impl<'c> Webhooks<'c> {
             r#"
             INSERT INTO webhook_deliveries (webhook_id, event_id, event_type, payload, resource_id, next_attempt_at)
             VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()))
-            RETURNING *
+            RETURNING id, webhook_id, event_id, event_type, payload, status, attempt_count, next_attempt_at, resource_id, last_status_code, last_error, created_at, updated_at
             "#,
             request.webhook_id,
             request.event_id,
@@ -298,7 +298,7 @@ impl<'c> Webhooks<'c> {
             VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()))
             ON CONFLICT (webhook_id, event_type, resource_id) WHERE resource_id IS NOT NULL
             DO NOTHING
-            RETURNING *
+            RETURNING id, webhook_id, event_id, event_type, payload, status, attempt_count, next_attempt_at, resource_id, last_status_code, last_error, created_at, updated_at
             "#,
             request.webhook_id,
             request.event_id,
@@ -347,9 +347,9 @@ impl<'c> Webhooks<'c> {
                 SET next_attempt_at = now() + interval '5 minutes'
                 FROM claimed
                 WHERE wd.id = claimed.id
-                RETURNING wd.*
+                RETURNING wd.id, wd.webhook_id, wd.event_id, wd.event_type, wd.payload, wd.status, wd.attempt_count, wd.next_attempt_at, wd.resource_id, wd.last_status_code, wd.last_error, wd.created_at, wd.updated_at
             )
-            SELECT u.*,
+            SELECT u.id, u.webhook_id, u.event_id, u.event_type, u.payload, u.status, u.attempt_count, u.next_attempt_at, u.resource_id, u.last_status_code, u.last_error, u.created_at, u.updated_at,
                    w.url AS webhook_url,
                    w.secret AS webhook_secret,
                    w.enabled AS webhook_enabled
@@ -518,7 +518,7 @@ mod tests {
     /// Read back a delivery row to verify state after mutations.
     async fn get_delivery(pool: &PgPool, id: DeliveryId) -> WebhookDelivery {
         let mut conn = pool.acquire().await.unwrap();
-        sqlx::query_as!(WebhookDelivery, "SELECT * FROM webhook_deliveries WHERE id = $1", id)
+        sqlx::query_as!(WebhookDelivery, "SELECT id, webhook_id, event_id, event_type, payload, status, attempt_count, next_attempt_at, resource_id, last_status_code, last_error, created_at, updated_at FROM webhook_deliveries WHERE id = $1", id)
             .fetch_one(&mut *conn)
             .await
             .unwrap()

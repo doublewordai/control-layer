@@ -1,6 +1,15 @@
 use crate::types::Operation;
-use metrics::counter;
+use metrics::{counter, describe_counter};
 use thiserror::Error;
+
+/// Register a zero sample before the first error so rate-based alerts can see it.
+pub(crate) fn initialize_database_error_metrics() {
+    describe_counter!(
+        "dwctl_db_cached_plan_errors_total",
+        "Database operations rejected because a cached prepared statement changed result type"
+    );
+    counter!("dwctl_db_cached_plan_errors_total").increment(0);
+}
 
 /// Unified error type for database operations that application code can handle
 #[derive(Error, Debug)]
@@ -70,6 +79,12 @@ impl From<sqlx::Error> for DbError {
                 DbError::PoolExhausted
             }
             sqlx::Error::Database(db_err) => {
+                // SQLSTATE 0A000 covers other unsupported features too. Only count
+                // result-descriptor invalidation, preserving the original error.
+                // Do not replay the operation: it may be a write or an aborted transaction.
+                if db_err.code().as_deref() == Some("0A000") && db_err.message().contains("cached plan must not change result type") {
+                    counter!("dwctl_db_cached_plan_errors_total").increment(1);
+                }
                 if db_err.is_unique_violation() {
                     let constraint = db_err.constraint().map(|s| s.to_string());
 
@@ -131,3 +146,62 @@ fn extract_conflicting_alias(detail: &str, constraint: Option<&str>) -> Option<S
 
 /// Type alias for database operation results
 pub type Result<T> = std::result::Result<T, DbError>;
+
+#[cfg(test)]
+mod tests {
+    use super::{DbError, initialize_database_error_metrics};
+    use metrics::with_local_recorder;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+    use sqlx::PgPool;
+
+    #[sqlx::test]
+    async fn cached_result_shape_failure_is_counted_without_retry(pool: PgPool) {
+        let mut connection = pool.acquire().await.unwrap();
+        sqlx::query("CREATE TABLE cached_shape (id integer)")
+            .execute(&mut *connection)
+            .await
+            .unwrap();
+        sqlx::query("SELECT * FROM cached_shape").fetch_all(&mut *connection).await.unwrap();
+        sqlx::query("ALTER TABLE cached_shape ADD COLUMN added text")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = sqlx::query("SELECT * FROM cached_shape")
+            .fetch_all(&mut *connection)
+            .await
+            .unwrap_err();
+        assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("0A000"));
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        with_local_recorder(&recorder, || {
+            initialize_database_error_metrics();
+            assert!(handle.render().contains("dwctl_db_cached_plan_errors_total 0"));
+            assert!(matches!(DbError::from(error), DbError::Other(_)));
+        });
+        assert!(handle.render().contains("dwctl_db_cached_plan_errors_total 1"));
+        // SQLx checks its existing statement cache even when persistent(false)
+        // is requested. This alone is not a safe stale-plan recovery mechanism.
+        let repeated = sqlx::query("SELECT * FROM cached_shape")
+            .persistent(false)
+            .fetch_all(&mut *connection)
+            .await
+            .unwrap_err();
+        assert!(repeated.to_string().contains("cached plan must not change result type"));
+    }
+
+    #[sqlx::test]
+    async fn unrelated_unsupported_feature_does_not_count_as_cached_plan(pool: PgPool) {
+        let error = sqlx::query("SELECT count(*) FROM pg_class FOR UPDATE")
+            .fetch_all(&pool)
+            .await
+            .unwrap_err();
+        assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("0A000"));
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        with_local_recorder(&recorder, || {
+            initialize_database_error_metrics();
+            assert!(matches!(DbError::from(error), DbError::Other(_)));
+        });
+        assert!(handle.render().contains("dwctl_db_cached_plan_errors_total 0"));
+    }
+}
