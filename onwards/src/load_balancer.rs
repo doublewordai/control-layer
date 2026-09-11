@@ -8,6 +8,7 @@
 //! Pool-level configuration (keys, rate limits) is shared across all providers.
 
 use crate::auth::KeySet;
+use crate::serving::ServingClass;
 use crate::target::{
     ConcurrencyGuard, ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter,
     RoutingAction, RoutingRule, Target,
@@ -40,6 +41,8 @@ pub struct ProviderPool {
     trusted: bool,
     /// Routing rules evaluated against key labels before processing
     routing_rules: Vec<RoutingRule>,
+    /// Elevated serving classes the alias has activated (default pool only).
+    serving_classes: Vec<ServingClass>,
 }
 
 /// A single provider within a pool
@@ -90,6 +93,7 @@ impl ProviderPool {
             strategy: LoadBalanceStrategy::default(),
             trusted: false,
             routing_rules: Vec::new(),
+            serving_classes: Vec::new(),
         }
     }
 
@@ -114,7 +118,19 @@ impl ProviderPool {
             strategy,
             trusted,
             routing_rules,
+            serving_classes: Vec::new(),
         }
+    }
+
+    /// Attach the alias's active serving classes (see [`crate::serving`]).
+    pub fn with_serving_classes(mut self, serving_classes: Vec<ServingClass>) -> Self {
+        self.serving_classes = serving_classes;
+        self
+    }
+
+    /// Elevated serving classes the alias has activated.
+    pub fn serving_classes(&self) -> &[ServingClass] {
+        &self.serving_classes
     }
 
     /// Create a pool with a single provider

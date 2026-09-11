@@ -14,6 +14,7 @@
 //! Pool-level configuration (keys, rate_limit) applies to all providers in the pool.
 //! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
 use crate::auth::KeySet;
+use crate::serving::{KeyServing, ServingClass};
 use crate::load_balancer::{Provider, ProviderPool};
 use crate::reasoning::ReasoningTranslationConfig;
 use anyhow::anyhow;
@@ -374,6 +375,13 @@ pub struct PoolSpec {
     #[serde(default)]
     pub routing_rules: Vec<RoutingRule>,
 
+    /// Elevated serving classes this alias has activated (see
+    /// [`crate::serving`]). A requested class the alias has not activated
+    /// resolves to `standard`. Meaningful on the `default` pool only: named
+    /// pools serve their own request class.
+    #[serde(default)]
+    pub serving_classes: Vec<ServingClass>,
+
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
 }
@@ -489,6 +497,7 @@ pub struct PoolConfig {
     pub sanitize_response: bool,
     pub trusted: bool,
     pub routing_rules: Vec<RoutingRule>,
+    pub serving_classes: Vec<ServingClass>,
     pub providers: Vec<ProviderSpec>,
 }
 
@@ -504,6 +513,7 @@ impl From<PoolSpec> for PoolConfig {
             sanitize_response: pool.sanitize_response,
             trusted: pool.trusted,
             routing_rules: pool.routing_rules,
+            serving_classes: pool.serving_classes,
             providers: pool.providers,
         }
     }
@@ -647,6 +657,7 @@ impl TargetSpecOrList {
                     sanitize_response: false,
                     trusted,
                     routing_rules: Vec::new(),
+                    serving_classes: Vec::new(),
                     providers,
                 })
             }
@@ -685,6 +696,7 @@ impl TargetSpecOrList {
                     sanitize_response,
                     trusted,
                     routing_rules: Vec::new(),
+                    serving_classes: Vec::new(),
                     providers: vec![provider],
                 })
             }
@@ -1020,6 +1032,13 @@ impl TargetPools {
         self.default.evaluate_routing_rules(labels)
     }
 
+    /// The elevated serving classes this alias has activated. Declared on the
+    /// default pool: activation is a property of the alias, not of which
+    /// pool serves a request class.
+    pub fn active_serving_classes(&self) -> &[ServingClass] {
+        self.default.serving_classes()
+    }
+
     /// Look a pool up by name.
     pub fn get(&self, name: &str) -> Option<&ProviderPool> {
         if name == DEFAULT_POOL {
@@ -1065,6 +1084,10 @@ pub struct KeyDefinition {
     /// Used by routing rules to match requests to actions.
     #[serde(default)]
     pub labels: HashMap<String, String>,
+    /// Serving policy for this key (its own class, the owning account's
+    /// settings and overlays). Omitted when nothing is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving: Option<KeyServing>,
 }
 
 /// A rule that matches on key labels and takes an action (deny or redirect).
@@ -1146,6 +1169,9 @@ pub struct Targets {
     pub key_concurrency_limiters: Arc<DashMap<String, ConcurrencyLimiter>>,
     /// Labels per actual API key (actual key -> labels map)
     pub key_labels: Arc<DashMap<String, HashMap<String, String>>>,
+    /// Serving policy per actual API key (actual key -> policy). Only keys
+    /// with a non-empty policy are present.
+    pub key_serving: Arc<DashMap<String, KeyServing>>,
     /// Enable strict mode with schema validation
     pub strict_mode: bool,
     /// HTTP connection pool configuration (global)
@@ -1337,7 +1363,8 @@ fn build_pool(
         pool_config.strategy,
         pool_config.trusted,
         pool_config.routing_rules,
-    ))
+    )
+    .with_serving_classes(pool_config.serving_classes))
 }
 
 impl Targets {
@@ -1381,6 +1408,7 @@ impl Targets {
         let key_rate_limiters = Arc::new(DashMap::new());
         let key_concurrency_limiters = Arc::new(DashMap::new());
         let key_labels = Arc::new(DashMap::new());
+        let key_serving = Arc::new(DashMap::new());
 
         for (_key_id, key_def) in key_definitions {
             if let Some(ref rate_limit) = key_def.rate_limit {
@@ -1401,6 +1429,11 @@ impl Targets {
             }
             if !key_def.labels.is_empty() {
                 key_labels.insert(key_def.key.clone(), key_def.labels);
+            }
+            if let Some(serving) = key_def.serving
+                && !serving.is_empty()
+            {
+                key_serving.insert(key_def.key.clone(), serving);
             }
         }
 
@@ -1439,6 +1472,7 @@ impl Targets {
             key_rate_limiters,
             key_concurrency_limiters,
             key_labels,
+            key_serving,
             strict_mode: config_file.strict_mode,
             http_pool_config: config_file.http_pool,
         })
@@ -1458,6 +1492,7 @@ impl Targets {
         let key_rate_limiters = Arc::clone(&self.key_rate_limiters);
         let key_concurrency_limiters = Arc::clone(&self.key_concurrency_limiters);
         let key_labels = Arc::clone(&self.key_labels);
+        let key_serving = Arc::clone(&self.key_serving);
 
         let mut stream = targets_stream.stream().await?;
 
@@ -1552,6 +1587,18 @@ impl Targets {
                         for entry in new_targets.key_labels.iter() {
                             key_labels.insert(entry.key().clone(), entry.value().clone());
                         }
+
+                        // Serving policies: same remove-then-upsert pattern.
+                        let current_serving_keys: Vec<String> =
+                            key_serving.iter().map(|entry| entry.key().clone()).collect();
+                        for key in current_serving_keys {
+                            if !new_targets.key_serving.contains_key(&key) {
+                                key_serving.remove(&key);
+                            }
+                        }
+                        for entry in new_targets.key_serving.iter() {
+                            key_serving.insert(entry.key().clone(), entry.value().clone());
+                        }
                     }
                     Err(e) => {
                         let err: anyhow::Error = e.into();
@@ -1642,6 +1689,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_serving: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         }
@@ -1705,6 +1753,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_serving: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1770,6 +1819,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            key_serving: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -2001,6 +2051,7 @@ mod tests {
                 }),
                 concurrency_limit: None,
                 labels: HashMap::new(),
+                serving: None,
             },
         );
 
@@ -2054,6 +2105,7 @@ mod tests {
                 rate_limit: None,
                 concurrency_limit: None,
                 labels: HashMap::new(),
+                serving: None,
             },
         );
 
@@ -2291,6 +2343,7 @@ mod tests {
                     max_concurrent_requests: 3,
                 }),
                 labels: HashMap::new(),
+                serving: None,
             },
         );
 
@@ -2327,6 +2380,7 @@ mod tests {
                 rate_limit: None,
                 concurrency_limit: None,
                 labels: HashMap::new(),
+                serving: None,
             },
         );
 
@@ -2631,6 +2685,7 @@ mod tests {
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
             }],
+            serving_classes: Vec::new(),
         };
 
         let pool_config = TargetSpecOrList::Pool(pool_spec)
@@ -3018,6 +3073,7 @@ mod tests {
                 rate_limit: None,
                 concurrency_limit: None,
                 labels: HashMap::from([("purpose".to_string(), "batch".to_string())]),
+                serving: None,
             },
         );
         key_definitions.insert(
@@ -3027,6 +3083,7 @@ mod tests {
                 rate_limit: None,
                 concurrency_limit: None,
                 labels: HashMap::from([("purpose".to_string(), "playground".to_string())]),
+                serving: None,
             },
         );
         key_definitions.insert(
@@ -3036,6 +3093,7 @@ mod tests {
                 rate_limit: None,
                 concurrency_limit: None,
                 labels: HashMap::new(),
+                serving: None,
             },
         );
 

@@ -437,6 +437,19 @@ pub async fn update_user<P: PoolProvider>(
         });
     }
 
+    // The serving account settings change how the account's traffic is routed
+    // and prioritised fleet-wide: an operator decision, never self-service.
+    if !can_update_all_users && (user_data.default_serving_class.is_some() || user_data.self_hosted_only.is_some()) {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Users, Operation::UpdateAll),
+            action: Operation::UpdateAll,
+            resource: "serving settings".to_string(),
+        });
+    }
+    if let Some(Some(class)) = &user_data.default_serving_class {
+        super::validate_elevated_serving_class(class)?;
+    }
+
     // Validate auto-topup fields if provided
     if let Some(Some(amount)) = &user_data.auto_topup_amount
         && *amount <= 0.0

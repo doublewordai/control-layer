@@ -794,6 +794,7 @@ mod tests {
                 allowed_batch_completion_windows: None,
                 metadata: serde_json::Value::Object(serde_json::Map::new()),
                 provisioning_source: mock.provisioning_source,
+                serving_classes: Vec::new(),
             }
         }
     }

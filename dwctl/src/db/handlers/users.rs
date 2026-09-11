@@ -119,6 +119,10 @@ struct User {
     pub verified: bool,
     pub zero_data_retention: bool,
     pub invoicing_enabled: bool,
+    /// Account setting: default serving class (migration 141).
+    pub default_serving_class: Option<String>,
+    /// Account setting: never fall over to an external provider (migration 141).
+    pub self_hosted_only: bool,
     /// Organizations only: admit signups from the claimed domain without
     /// review.
     ///
@@ -165,6 +169,8 @@ impl From<(Vec<Role>, User)> for UserDBResponse {
             verified: user.verified,
             zero_data_retention: user.zero_data_retention,
             invoicing_enabled: user.invoicing_enabled,
+            default_serving_class: user.default_serving_class,
+            self_hosted_only: user.self_hosted_only,
         }
     }
 }
@@ -265,11 +271,13 @@ impl<'c> Repository for Users<'c> {
                 u.verified,
                 u.invoicing_enabled,
                 u.zero_data_retention,
+                u.default_serving_class,
+                u.self_hosted_only,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = $1 AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.invoicing_enabled, u.zero_data_retention
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.invoicing_enabled, u.zero_data_retention, u.default_serving_class, u.self_hosted_only
             "#,
             id
         )
@@ -307,6 +315,8 @@ impl<'c> Repository for Users<'c> {
                 verified: row.verified,
                 invoicing_enabled: row.invoicing_enabled,
                 zero_data_retention: row.zero_data_retention,
+                default_serving_class: row.default_serving_class,
+                self_hosted_only: row.self_hosted_only,
                 // Not projected by this query; never read from `User`. See the field doc.
                 auto_join_enabled: false,
             };
@@ -356,11 +366,13 @@ impl<'c> Repository for Users<'c> {
                 u.verified,
                 u.invoicing_enabled,
                 u.zero_data_retention,
+                u.default_serving_class,
+                u.self_hosted_only,
                 ARRAY_AGG(ur.role) FILTER (WHERE ur.role IS NOT NULL) as "roles: Vec<Role>"
             FROM users u
             LEFT JOIN user_roles ur ON ur.user_id = u.id
             WHERE u.id = ANY($1) AND u.id != '00000000-0000-0000-0000-000000000000' AND u.is_deleted = false
-            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.invoicing_enabled, u.zero_data_retention
+            GROUP BY u.id, u.username, u.email, u.display_name, u.avatar_url, u.auth_source, u.created_at, u.updated_at, u.last_login, u.is_admin, u.password_hash, u.external_user_id, u.payment_provider_id, u.is_deleted, u.is_internal, u.batch_notifications_enabled, u.first_batch_email_sent, u.low_balance_notification_sent, u.low_balance_threshold, u.auto_topup_amount, u.auto_topup_threshold, u.auto_topup_monthly_limit, u.auto_topup_limit_notification_sent, u.user_type, u.verified, u.invoicing_enabled, u.zero_data_retention, u.default_serving_class, u.self_hosted_only
             "#,
             ids.as_slice()
         )
@@ -400,6 +412,8 @@ impl<'c> Repository for Users<'c> {
                 verified: row.verified,
                 invoicing_enabled: row.invoicing_enabled,
                 zero_data_retention: row.zero_data_retention,
+                default_serving_class: row.default_serving_class,
+                self_hosted_only: row.self_hosted_only,
                 // Not projected by this query; never read from `User`. See the field doc.
                 auto_join_enabled: false,
             };
@@ -697,6 +711,11 @@ impl<'c> Repository for Users<'c> {
                     ELSE auto_topup_retry_after
                 END,
                 zero_data_retention = COALESCE($14, zero_data_retention),
+                default_serving_class = CASE
+                    WHEN $15::boolean THEN $16
+                    ELSE default_serving_class
+                END,
+                self_hosted_only = COALESCE($17, self_hosted_only),
                 updated_at = NOW()
             WHERE id = $1
             RETURNING *
@@ -715,6 +734,9 @@ impl<'c> Repository for Users<'c> {
                 request.auto_topup_monthly_limit.is_some() as bool,
                 request.auto_topup_monthly_limit.flatten(),
                 request.zero_data_retention,
+                request.default_serving_class.is_some(),
+                request.default_serving_class.clone().flatten(),
+                request.self_hosted_only,
             )
             .fetch_optional(&mut *tx)
             .await?
@@ -1368,6 +1390,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             })
             .await
             .unwrap();
@@ -1446,6 +1469,7 @@ mod tests {
                     created_by: deleted_user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 })
                 .await
                 .unwrap();
@@ -1460,6 +1484,7 @@ mod tests {
                     created_by: retained_user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 })
                 .await
                 .unwrap();
@@ -1561,6 +1586,8 @@ mod tests {
             auto_topup_threshold: None,
             auto_topup_monthly_limit: None,
             zero_data_retention: None,
+            default_serving_class: None,
+            self_hosted_only: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -1583,6 +1610,8 @@ mod tests {
             auto_topup_threshold: None,
             auto_topup_monthly_limit: None,
             zero_data_retention: None,
+            default_serving_class: None,
+            self_hosted_only: None,
         };
 
         let updated_user = repo.update(created_user.id, &update_request).await.unwrap();
@@ -1619,6 +1648,8 @@ mod tests {
                 auto_topup_threshold: None,
                 auto_topup_monthly_limit: None,
                 zero_data_retention: None,
+                default_serving_class: None,
+                self_hosted_only: None,
             };
             repo.update(user.id, &update).await.unwrap();
         }
@@ -1868,6 +1899,8 @@ mod tests {
             auto_topup_threshold: None,
             auto_topup_monthly_limit: None,
             zero_data_retention: None,
+            default_serving_class: None,
+            self_hosted_only: None,
         };
         let updated = users.update(user_id, &update).await.unwrap();
         assert!(!updated.low_balance_notification_sent);

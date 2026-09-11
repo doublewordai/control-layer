@@ -59,6 +59,7 @@ struct ApiKey {
     pub spend_limit_interval: Option<String>,
     pub parent_api_key_id: Option<ApiKeyId>,
     pub secret_revealed_at: Option<DateTime<Utc>>,
+    pub serving_class: Option<String>,
 }
 
 impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
@@ -99,6 +100,7 @@ impl From<(Vec<DeploymentId>, ApiKey)> for ApiKeyDBResponse {
             spend_limit_interval: api_key.spend_limit_interval,
             parent_api_key_id: api_key.parent_api_key_id,
             secret_revealed_at: api_key.secret_revealed_at,
+            serving_class: api_key.serving_class,
         }
     }
 }
@@ -132,8 +134,8 @@ impl<'c> Repository for ApiKeys<'c> {
         let api_key = sqlx::query_as!(
             ApiKey,
             r#"
-            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, requests_per_second, burst_size, hidden, spend_limit, spend_limit_interval)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9, $10)
+            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, requests_per_second, burst_size, hidden, spend_limit, spend_limit_interval, serving_class)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9, $10, $11)
             RETURNING *
             "#,
             request.name,
@@ -145,7 +147,8 @@ impl<'c> Repository for ApiKeys<'c> {
             request.requests_per_second,
             request.burst_size,
             request.spend_limit,
-            request.spend_limit_interval
+            request.spend_limit_interval,
+            request.serving_class
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -157,7 +160,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let api_key = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = $1 AND is_deleted = false",
+            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at, serving_class FROM api_keys WHERE id = $1 AND is_deleted = false",
             id
         )
             .fetch_optional(&mut *self.db)
@@ -173,7 +176,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn get_bulk(&mut self, ids: Vec<Self::Id>) -> Result<HashMap<Self::Id, Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
+            "SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at, serving_class FROM api_keys WHERE id = ANY($1) AND is_deleted = false",
             &ids
         )
             .fetch_all(&mut *self.db)
@@ -191,7 +194,7 @@ impl<'c> Repository for ApiKeys<'c> {
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
-            r#"SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
+            r#"SELECT id, name, description, secret, purpose, user_id, created_by, created_at, last_used, requests_per_second, burst_size, hidden, is_deleted, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at, serving_class
             FROM api_keys
             WHERE hidden = false AND is_deleted = false
               AND ($1::uuid IS NULL OR user_id = $1)
@@ -260,6 +263,10 @@ impl<'c> Repository for ApiKeys<'c> {
                 burst_size = CASE
                     WHEN $5::integer IS NOT NULL THEN $5
                     ELSE burst_size
+                END,
+                serving_class = CASE
+                    WHEN $6::boolean THEN $7
+                    ELSE serving_class
                 END
             WHERE id = $1
             RETURNING *
@@ -268,7 +275,9 @@ impl<'c> Repository for ApiKeys<'c> {
             request.name,
             request.description,
             request.requests_per_second.unwrap_or(None),
-            request.burst_size.unwrap_or(None)
+            request.burst_size.unwrap_or(None),
+            request.serving_class.is_some(),
+            request.serving_class.clone().flatten()
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -931,7 +940,8 @@ impl<'c> ApiKeys<'c> {
                 ak.spend_limit,
                 ak.spend_limit_interval,
                 ak.parent_api_key_id,
-                ak.secret_revealed_at
+                ak.secret_revealed_at,
+                ak.serving_class
             FROM api_keys ak
             WHERE ak.user_id = $2  -- System user has access to all deployments
 
@@ -954,7 +964,8 @@ impl<'c> ApiKeys<'c> {
                 ak.spend_limit,
                 ak.spend_limit_interval,
                 ak.parent_api_key_id,
-                ak.secret_revealed_at
+                ak.secret_revealed_at,
+                ak.serving_class
             FROM api_keys ak
             INNER JOIN user_groups ug ON ak.user_id = ug.user_id
             INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
@@ -1000,7 +1011,8 @@ impl<'c> ApiKeys<'c> {
                 ak.spend_limit,
                 ak.spend_limit_interval,
                 ak.parent_api_key_id,
-                ak.secret_revealed_at
+                ak.secret_revealed_at,
+                ak.serving_class
             FROM api_keys ak
             INNER JOIN deployment_groups dg ON dg.group_id = '00000000-0000-0000-0000-000000000000'
             INNER JOIN deployed_models dm ON dg.deployment_id = dm.id
@@ -1211,6 +1223,7 @@ mod tests {
                     created_by: userid,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 };
 
                 api_key = api_repo.create(&api_key_create).await.unwrap();
@@ -1254,6 +1267,7 @@ mod tests {
                 created_by,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             })
             .await
             .unwrap()
@@ -1414,6 +1428,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
             let key2 = ApiKeyCreateDBRequest {
                 user_id: user.id,
@@ -1425,6 +1440,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
 
             api_repo.create(&key1).await.unwrap();
@@ -1483,6 +1499,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
             api_key = api_repo.create(&api_key_create).await.unwrap();
         }
@@ -1529,6 +1546,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
 
             // Test create via Repository trait
@@ -1551,6 +1569,7 @@ mod tests {
             description: Some("Updated description".to_string()),
             requests_per_second: None,
             burst_size: None,
+            serving_class: None,
         };
         let updated_key = api_repo.update(api_key.id, &update).await.unwrap();
         assert_eq!(updated_key.name, "Updated Key Name");
@@ -1656,6 +1675,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1789,6 +1809,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -1936,6 +1957,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -2109,6 +2131,7 @@ mod tests {
                 created_by: user1.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
             api_key1 = api_key_repo.create(&api_key1_create).await.unwrap();
 
@@ -2122,6 +2145,7 @@ mod tests {
                 created_by: user2.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
             api_key2 = api_key_repo.create(&api_key2_create).await.unwrap();
         }
@@ -2299,6 +2323,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -2444,6 +2469,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -2666,6 +2692,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
             api_key = api_key_repo.create(&api_key_create).await.unwrap();
         }
@@ -2753,6 +2780,7 @@ mod tests {
                     created_by: user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 };
                 api_repo.create(&key_create).await.unwrap();
             }
@@ -2888,6 +2916,7 @@ mod tests {
                 created_by: user1.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
             let key2 = ApiKeyCreateDBRequest {
                 user_id: user2.id,
@@ -2899,6 +2928,7 @@ mod tests {
                 created_by: user2.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
 
             api_repo.create(&key1).await.unwrap();
@@ -2967,6 +2997,7 @@ mod tests {
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
+            serving_class: None,
         };
         let key2_create = ApiKeyCreateDBRequest {
             user_id: user.id,
@@ -2978,6 +3009,7 @@ mod tests {
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
+            serving_class: None,
         };
         let key3_create = ApiKeyCreateDBRequest {
             user_id: user.id,
@@ -2989,6 +3021,7 @@ mod tests {
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
+            serving_class: None,
         };
 
         let mut api_conn = pool.acquire().await.unwrap();
@@ -3049,6 +3082,7 @@ mod tests {
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
+            serving_class: None,
         };
 
         let mut api_conn = pool.acquire().await.unwrap();
@@ -3131,6 +3165,7 @@ mod tests {
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
+            serving_class: None,
         };
         let mut api_conn = pool.acquire().await.unwrap();
         let mut api_repo = ApiKeys::new(&mut api_conn);
@@ -3222,6 +3257,7 @@ mod tests {
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
+            serving_class: None,
         };
         let key2_create = ApiKeyCreateDBRequest {
             user_id: user.id,
@@ -3233,6 +3269,7 @@ mod tests {
             created_by: user.id,
             spend_limit: None,
             spend_limit_interval: None,
+            serving_class: None,
         };
 
         let mut api_repo = ApiKeys::new(&mut tx);
@@ -3296,6 +3333,7 @@ mod tests {
             created_by: user1.id,
             spend_limit: None,
             spend_limit_interval: None,
+            serving_class: None,
         };
         let key2_create = ApiKeyCreateDBRequest {
             user_id: user2.id,
@@ -3307,6 +3345,7 @@ mod tests {
             created_by: user2.id,
             spend_limit: None,
             spend_limit_interval: None,
+            serving_class: None,
         };
         let mut api_repo = ApiKeys::new(&mut tx);
 
@@ -3554,6 +3593,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             })
             .await
             .unwrap();
@@ -3569,6 +3609,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             })
             .await
             .unwrap();
@@ -3700,6 +3741,7 @@ mod tests {
                     purpose: ApiKeyPurpose::Realtime,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 })
                 .await
                 .unwrap();
@@ -3796,6 +3838,7 @@ mod tests {
                     purpose: ApiKeyPurpose::Realtime,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 })
                 .await
                 .unwrap();
@@ -3861,6 +3904,7 @@ mod tests {
                     purpose: ApiKeyPurpose::Realtime,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 })
                 .await
                 .unwrap();
@@ -3955,6 +3999,7 @@ mod tests {
                     purpose: ApiKeyPurpose::Realtime,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 })
                 .await
                 .unwrap();
@@ -4099,6 +4144,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             })
             .await
             .unwrap();
@@ -4238,6 +4284,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             })
             .await
             .unwrap();
@@ -4377,6 +4424,7 @@ mod tests {
                 purpose: ApiKeyPurpose::Realtime,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             })
             .await
             .unwrap();
@@ -4440,6 +4488,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             };
 
             api_key = api_repo.create(&api_key_create).await.unwrap();
@@ -4503,6 +4552,7 @@ mod tests {
                     created_by: user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 })
                 .await
                 .unwrap();
@@ -4560,6 +4610,7 @@ mod tests {
                     created_by: user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 })
                 .await
                 .unwrap();
@@ -4575,6 +4626,7 @@ mod tests {
                     created_by: user.id,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 })
                 .await
                 .unwrap();
@@ -4644,6 +4696,7 @@ mod tests {
                 created_by: member.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             })
             .await
             .unwrap();
@@ -4873,6 +4926,7 @@ mod tests {
                     created_by: member_a.id,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 })
                 .await
                 .unwrap();
@@ -4887,6 +4941,7 @@ mod tests {
                     created_by: member_a.id,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 })
                 .await
                 .unwrap();
@@ -4902,6 +4957,7 @@ mod tests {
                     created_by: member_b.id,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 })
                 .await
                 .unwrap();
@@ -5004,6 +5060,7 @@ mod tests {
                         created_by: member_a.id,
                         spend_limit: None,
                         spend_limit_interval: None,
+                        serving_class: None,
                     })
                     .await
                     .unwrap();
@@ -5019,6 +5076,7 @@ mod tests {
                     created_by: member_b.id,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 })
                 .await
                 .unwrap();

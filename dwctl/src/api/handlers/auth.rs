@@ -515,6 +515,8 @@ pub async fn confirm_password_reset<P: PoolProvider>(
         auto_topup_threshold: None,
         auto_topup_monthly_limit: None,
         zero_data_retention: None,
+        default_serving_class: None,
+        self_hosted_only: None,
     };
 
     let mut tx = state.db.write().begin().await.unwrap();
@@ -652,6 +654,8 @@ pub async fn change_password<P: PoolProvider>(
         auto_topup_threshold: None,
         auto_topup_monthly_limit: None,
         zero_data_retention: None,
+        default_serving_class: None,
+        self_hosted_only: None,
     };
 
     user_repo.update(current_user.id, &update_request).await?;
@@ -812,6 +816,7 @@ pub async fn cli_callback<P: PoolProvider>(
             created_by: user_id,
             spend_limit: None,
             spend_limit_interval: None,
+            serving_class: None,
         })
         .await
         .map_err(Error::Database)?
@@ -829,6 +834,7 @@ pub async fn cli_callback<P: PoolProvider>(
             created_by: user_id,
             spend_limit: None,
             spend_limit_interval: None,
+            serving_class: None,
         })
         .await
         .map_err(Error::Database)?
@@ -2583,6 +2589,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             })
             .await
             .unwrap();

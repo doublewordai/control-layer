@@ -148,6 +148,14 @@
           ],
           "default": null
         },
+        "overlays": {
+          "description": "One organisation's modifiers on this model: its tariff, the classes it\nmay use, a default class, a routing override. Resolved by API-key\nowner, never addressed by name in a request.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Overlay"
+          }
+        },
         "routing": {
           "$ref": "#/$defs/Routing",
           "default": {
@@ -169,6 +177,14 @@
             },
             "pools": {},
             "strategy": "weighted_random"
+          }
+        },
+        "serving_classes": {
+          "description": "Elevated serving classes this model has activated. Empty = standard\nonly. Activate once the serving side has pools for the model.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ServingClassName"
           }
         },
         "settings": {
@@ -395,6 +411,56 @@
       },
       "additionalProperties": false
     },
+    "Overlay": {
+      "description": "An organisation's overlay on the enclosing model.",
+      "type": "object",
+      "properties": {
+        "classes": {
+          "description": "Elevated classes the org may use on this model (each must be in the\nmodel's `serving_classes`).",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/ServingClassName"
+          }
+        },
+        "default_class": {
+          "description": "Class the org's requests to this model ask for when neither the\nrequest nor the key names one. Must be one of `classes`.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ServingClassName"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "org": {
+          "description": "The organisation, by its account username.",
+          "type": "string"
+        },
+        "self_hosted_only": {
+          "description": "Per-model override of the account's `self_hosted_only` setting. Omit\nto inherit.",
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "default": null
+        },
+        "tariff": {
+          "description": "Name of one of this model's `tariffs` the org is charged under. Omit\nfor the model's general tariff.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "org"
+      ]
+    },
     "PhysicalDeployment": {
       "type": "object",
       "properties": {
@@ -583,6 +649,14 @@
       "enum": [
         "weighted_random",
         "priority"
+      ]
+    },
+    "ServingClassName": {
+      "description": "The two elevated serving classes a model can activate and an org can be\ngranted. `standard` is the absence of a choice and is never declared.",
+      "type": "string",
+      "enum": [
+        "interactive",
+        "throughput"
       ]
     },
     "Tariff": {

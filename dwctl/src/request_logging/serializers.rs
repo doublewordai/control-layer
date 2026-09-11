@@ -166,6 +166,15 @@ pub struct UsageMetrics {
     pub engine_cached_tokens: Option<i64>,
     /// Content-free request parameters read off the parsed request body.
     pub request_params: RequestParams,
+    /// Serving class the request asked for (suffix > key > overlay default >
+    /// account default), from the onwards `ServingClassOutcome` response
+    /// extension. `None` when nothing named a class, or when the request
+    /// never reached onwards' resolver.
+    pub requested_serving_class: Option<String>,
+    /// Serving class the request was dispatched under (interactive |
+    /// throughput | standard) after entitlement. `None` only when the request
+    /// never reached the resolver.
+    pub resolved_serving_class: Option<String>,
 }
 
 /// Content-free request parameters, read off the parsed request body.
@@ -596,6 +605,15 @@ impl UsageMetrics {
             served_by: response_data.extensions.get::<onwards::ServedBy>().map(|s| s.url.clone()),
             engine_cached_tokens,
             request_params,
+            requested_serving_class: response_data
+                .extensions
+                .get::<onwards::ServingClassOutcome>()
+                .and_then(|o| o.requested)
+                .map(|c| c.as_str().to_string()),
+            resolved_serving_class: response_data
+                .extensions
+                .get::<onwards::ServingClassOutcome>()
+                .map(|o| o.resolved.as_str().to_string()),
         }
     }
 }

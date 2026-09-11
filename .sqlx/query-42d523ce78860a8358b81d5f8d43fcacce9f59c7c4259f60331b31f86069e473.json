@@ -1,0 +1,44 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT mo.user_id, dm.alias, mo.granted_classes, mo.default_serving_class, mo.self_hosted_only\n        FROM model_overlays mo\n        INNER JOIN deployed_models dm ON dm.id = mo.deployed_model_id\n        WHERE dm.deleted = FALSE\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "granted_classes",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 3,
+        "name": "default_serving_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 4,
+        "name": "self_hosted_only",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "42d523ce78860a8358b81d5f8d43fcacce9f59c7c4259f60331b31f86069e473"
+}

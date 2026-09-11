@@ -44,6 +44,16 @@ pub struct OrganizationUpdate {
     /// organization, or by a platform manager holding UpdateAll on
     /// organizations — an org admin is refused. Omit to leave unchanged.
     pub zero_data_retention: Option<bool>,
+    /// Account setting: serving class this organisation's realtime requests
+    /// ask for when neither the request nor the key names one (`interactive`
+    /// or `throughput`); gated per model by the organisation's grant. Same
+    /// permission gate as `zero_data_retention`. Omit to leave unchanged;
+    /// null clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub default_serving_class: Option<Option<String>>,
+    /// Account setting: never fall over to an external provider. Same
+    /// permission gate as `zero_data_retention`. Omit to leave unchanged.
+    pub self_hosted_only: Option<bool>,
     /// Admit signups from this workspace's claimed email domain as members
     /// automatically. Same gate as `zero_data_retention` above — an **owner**
     /// or a platform manager with UpdateAll, never an org admin: it decides

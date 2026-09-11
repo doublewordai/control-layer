@@ -4558,6 +4558,7 @@ mod tests {
                 created_by: user.id,
                 spend_limit: Some(rust_decimal::Decimal::from(10)),
                 spend_limit_interval: None,
+                serving_class: None,
             })
             .await
             .unwrap();
