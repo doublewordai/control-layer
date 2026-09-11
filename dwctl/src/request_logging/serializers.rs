@@ -401,7 +401,7 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
             .unwrap_or(false)
             || sse_body;
         if anthropic_stream {
-            utils::parse_anthropic_streaming_response(&body_str)
+            utils::parse_anthropic_streaming_response(&body_str).or_else(|_| utils::parse_non_streaming_response(&body_str))
         } else {
             // Typed MessagesResponse first; fall back to the generic untagged parser so
             // error bodies (4xx/5xx JSON) are captured as AiResponse::Other rather than
@@ -415,7 +415,7 @@ pub fn parse_ai_response(request_data: &RequestData, response_data: &ResponseDat
                 // /v1/responses has its own SSE event format distinct from chat completions.
                 if let Some(responses_req) = &parsed_request.responses_request {
                     if responses_req.stream.unwrap_or(false) || sse_body {
-                        utils::parse_responses_streaming_response(&body_str)
+                        utils::parse_responses_streaming_response(&body_str).or_else(|_| utils::parse_non_streaming_response(&body_str))
                     } else {
                         // Try the typed Response parser first. Fall back to the generic untagged
                         // parser so that error bodies (4xx/5xx JSON) are captured as
@@ -2826,6 +2826,158 @@ mod tests {
         );
 
         assert_eq!(metrics.status_code, 500);
+    }
+
+    /// Regression guards for the streaming-branch JSON fallback on `/v1/messages` and
+    /// `/v1/responses`: a `stream: true` request whose captured body is NOT SSE (an
+    /// upstream JSON error envelope on a failed stream, or a blocking JSON body when the
+    /// upstream ignored `stream: true`) must fall back to the generic untagged parser
+    /// rather than return `SerializationError` — mirroring the sibling `stream: false`
+    /// branch and the chat-completions streaming parser (`parse_streaming_response`).
+
+    #[test]
+    fn messages_stream_with_non_sse_error_body_falls_back_to_other() {
+        let error_json = r#"{"type":"error","error":{"type":"invalid_request_error","message":"bad"}}"#;
+        let err_response = ResponseData {
+            extensions: Default::default(),
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::BAD_REQUEST,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(error_json)),
+            duration: Duration::from_millis(50),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let stream_true = parse_ai_response(&messages_request_data(true), &err_response);
+        let stream_false = parse_ai_response(&messages_request_data(false), &err_response);
+        match (&stream_true, &stream_false) {
+            (Ok(AiResponse::Other(_)), Ok(AiResponse::Other(_))) => {}
+            other => panic!("both stream arms should parse non-SSE JSON error to Other, got {other:?}"),
+        }
+
+        let metrics = UsageMetrics::extract(
+            Uuid::nil(),
+            &messages_request_data(true),
+            &err_response,
+            &stream_true.unwrap(),
+            &crate::config::Config::default(),
+        );
+        assert_eq!(
+            metrics.status_code, 400,
+            "4xx JSON error status is preserved, not overridden to 500"
+        );
+        assert_eq!(metrics.response_type, "other");
+        assert_eq!(metrics.response_model, None);
+    }
+
+    #[test]
+    fn messages_stream_with_non_sse_blocking_body_keeps_typed_metadata() {
+        let body = r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-3-5-sonnet","content":[{"type":"text","text":"hi"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":12,"output_tokens":8}}"#;
+        let response = ok_response(body);
+
+        let stream_true = messages_request_data(true);
+        let parsed = parse_ai_response(&stream_true, &response).expect("stream:true + non-SSE 200 OK must parse via fallback");
+        match &parsed {
+            AiResponse::Anthropic(resp) => assert_eq!(resp.model, "claude-3-5-sonnet"),
+            other => panic!("expected typed Anthropic body via the untagged fallback, got {other:?}"),
+        }
+        let metrics = UsageMetrics::extract(Uuid::nil(), &stream_true, &response, &parsed, &crate::config::Config::default());
+        assert_eq!(metrics.status_code, 200, "no parse_error alarm: the body parsed cleanly");
+        assert_eq!(metrics.response_model.as_deref(), Some("claude-3-5-sonnet"));
+        assert_eq!(metrics.response_type, "anthropic_message");
+        assert_eq!(metrics.prompt_tokens, 12);
+        assert_eq!(metrics.completion_tokens, 8);
+    }
+
+    #[test]
+    fn responses_stream_with_non_sse_error_body_falls_back_to_other() {
+        let error_json = r#"{"error":{"message":"invalid request","type":"invalid_request_error","code":"model_not_found"}}"#;
+        let err_response = ResponseData {
+            extensions: Default::default(),
+            correlation_id: 1,
+            timestamp: SystemTime::now(),
+            status: StatusCode::BAD_REQUEST,
+            headers: HashMap::new(),
+            body: Some(Bytes::from(error_json)),
+            duration: Duration::from_millis(50),
+            duration_to_first_byte: Duration::from_millis(50),
+        };
+
+        let stream_true = parse_ai_response(&responses_request_data(Some(true)), &err_response);
+        let stream_false = parse_ai_response(&responses_request_data(Some(false)), &err_response);
+        match (&stream_true, &stream_false) {
+            (Ok(AiResponse::Other(_)), Ok(AiResponse::Other(_))) => {}
+            other => panic!("both stream arms should parse non-SSE JSON error to Other, got {other:?}"),
+        }
+
+        let metrics = UsageMetrics::extract(
+            Uuid::nil(),
+            &responses_request_data(Some(true)),
+            &err_response,
+            &stream_true.unwrap(),
+            &crate::config::Config::default(),
+        );
+        assert_eq!(metrics.status_code, 400, "4xx JSON error status is preserved");
+        assert_eq!(metrics.response_type, "other");
+        assert_eq!(metrics.response_model, None);
+    }
+
+    #[test]
+    fn responses_stream_with_non_sse_blocking_body_keeps_typed_metadata() {
+        let request_data = responses_request_data(Some(true));
+        let response = responses_response_data(responses_api_body(true));
+        let parsed = parse_ai_response(&request_data, &response).expect("stream:true + non-SSE 200 OK must parse via fallback");
+        match &parsed {
+            AiResponse::Responses(resp) => assert_eq!(resp.model, "gpt-4o"),
+            other => panic!("expected typed Responses body via the untagged fallback, got {other:?}"),
+        }
+        let metrics = UsageMetrics::extract(Uuid::nil(), &request_data, &response, &parsed, &crate::config::Config::default());
+        assert_eq!(metrics.status_code, 200, "no parse_error alarm: the body parsed cleanly");
+        assert_eq!(metrics.response_model.as_deref(), Some("gpt-4o"));
+        assert_eq!(metrics.response_type, "response");
+        assert_eq!(metrics.prompt_tokens, 15);
+        assert_eq!(metrics.completion_tokens, 25);
+    }
+
+    /// Genuine SSE bodies on `stream: true` must still take the streaming parser and
+    /// produce the stream variant — the JSON fallback must not swallow real streams.
+    #[test]
+    fn messages_stream_with_sse_body_still_parses_as_stream() {
+        let request_data = messages_request_data(true);
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"claude-3-5-sonnet\",\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":5,\"output_tokens\":0}}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let parsed = parse_ai_response(&request_data, &ok_response(sse)).unwrap();
+        match parsed {
+            AiResponse::AnthropicStream(events) => assert!(!events.is_empty()),
+            other => panic!("genuine SSE on stream:true must parse as AnthropicStream, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn responses_stream_with_sse_body_still_parses_as_stream() {
+        let request_data = responses_request_data(Some(true));
+        let completed = responses_api_body(true);
+        let sse = format!("data: {{\"type\":\"response.completed\",\"sequence_number\":5,\"response\":{completed}}}\n\n");
+        let parsed = parse_ai_response(&request_data, &responses_response_data(sse)).unwrap();
+        match parsed {
+            AiResponse::ResponsesStream(events) => assert!(events.iter().any(|e| e.event_type == "response.completed")),
+            other => panic!("genuine SSE on stream:true must parse as ResponsesStream, got {other:?}"),
+        }
+    }
+
+    /// A body that is neither SSE nor valid JSON still returns `Err` (base64 fallback),
+    /// matching the non-streaming branch: the fallback is a JSON fallback, not a
+    /// "swallow everything" trap.
+    #[test]
+    fn messages_stream_with_unparseable_body_still_returns_err() {
+        let err = parse_ai_response(&messages_request_data(true), &ok_response("not sse and not json"));
+        assert!(err.is_err());
+        assert!(err.unwrap_err().fallback_data.starts_with("base64:"));
     }
 
     fn response_with_body(body: impl Into<Bytes>) -> ResponseData {
