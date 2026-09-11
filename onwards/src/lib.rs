@@ -3439,6 +3439,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_zero_budget_allows_omitted_output_limit_and_reaches_upstream() {
+        let reasoning_translation = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                "writes": [
+                    {
+                        "target_path": "/reasoning_effort",
+                        "values": {"none": "none"}
+                    },
+                    {
+                        "target_path": "/thinking_token_budget",
+                        "values": {"none": 0}
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "reasoning-model".to_string(),
+            pool(
+                Target::builder()
+                    .url("https://vllm.example.com".parse().unwrap())
+                    .reasoning_translation(reasoning_translation)
+                    .build(),
+            ),
+        );
+        let targets = Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, "{}");
+        let app_state = AppState::with_client(targets, mock_client.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "reasoning-model",
+                "messages": [],
+                "reasoning_effort": "none"
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), StatusCode::OK);
+        let requests = mock_client.get_requests();
+        assert_eq!(requests.len(), 1);
+        let upstream_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(upstream_body["reasoning_effort"], json!("none"));
+        assert_eq!(upstream_body["thinking_token_budget"], json!(0));
+        assert!(upstream_body.get("max_completion_tokens").is_none());
+    }
+
+    #[tokio::test]
     async fn test_reasoning_budget_is_validated_for_every_pool_provider() {
         let budget_config = |budget| {
             serde_json::from_value(json!({
