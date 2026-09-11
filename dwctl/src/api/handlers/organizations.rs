@@ -349,16 +349,9 @@ pub async fn create_organization<P: PoolProvider>(
     // username that hijacks every future signup at that domain. The name the
     // user typed still becomes the display name (below); only the routed
     // username is opaque.
-    // The suffix is truncated for a claimed domain because that namespace is
-    // per-company - a handful of workspaces at most, so eight hex characters
-    // are plenty. The opaque arm cannot do the same: every workspace with no
-    // domain to claim shares the one `user~` namespace, and `users.username`
-    // is UNIQUE, so a birthday collision there is a creation failure the caller
-    // did nothing to deserve. At 32 bits that becomes ~1% likely by 10,000 such
-    // workspaces; the full UUID costs nothing since nobody reads this value.
     let username = match claimable_domain.as_deref() {
         Some(domain) => format!("{domain}~{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
-        None => format!("user~{}", uuid::Uuid::new_v4().simple()),
+        None => format!("user~{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
     };
 
     let display_name = data.display_name.clone().or_else(|| Some(data.name.clone()));
@@ -3156,8 +3149,8 @@ mod tests {
         let body = resp.json::<serde_json::Value>();
         let username = body["username"].as_str().unwrap();
         assert!(
-            username.starts_with("user~") && username.len() == "user~".len() + 32,
-            "personal-email fallback must use an opaque user~<uuid> username, got {username}"
+            username.starts_with("user~") && username.len() == "user~".len() + 8,
+            "personal-email fallback must use an opaque user~<8 hex> username, got {username}"
         );
         assert_ne!(username, "acme.test", "the planted domain must not become the username");
         assert_eq!(body["display_name"].as_str().unwrap(), "acme.test");
