@@ -182,6 +182,23 @@ pub enum InferenceEndpointValidate {
     Existing {
         #[schema(value_type = String, format = "uuid")]
         endpoint_id: InferenceEndpointId,
+        /// Optional URL to validate instead of the endpoint's stored URL. When
+        /// provided, the backend resolves stored credentials for `endpoint_id`
+        /// but tests connectivity to `url`. Lets an operator who edited the URL
+        /// in the dashboard reuse the stored API key (no re-keying) while still
+        /// testing the candidate URL. Omit to validate the stored URL.
+        #[serde(default)]
+        url: Option<String>,
+        /// Optional override for the API key. When `None` (or absent) the
+        /// stored key is reused; when `Some`, the supplied key is tested.
+        #[serde(default)]
+        api_key: Option<String>,
+        /// Optional override for the authorization header name.
+        #[serde(default)]
+        auth_header_name: Option<String>,
+        /// Optional override for the authorization header prefix.
+        #[serde(default)]
+        auth_header_prefix: Option<String>,
     },
 }
 

@@ -1637,8 +1637,12 @@ export const handlers = [
   http.post("/admin/api/v1/endpoints/validate", async ({ request }) => {
     const body = (await request.json()) as EndpointValidateRequest;
 
-    // Simulate different responses based on URL for testing
-    const url = body.type === "new" ? body.url : "existing-endpoint-url";
+    // Simulate different responses based on URL for testing. The `existing`
+    // variant may carry an override `url` (used by EditEndpointModal when the
+    // operator edits the URL); honor it so the mock tests the candidate URL
+    // instead of the stored one.
+    const url =
+      body.type === "new" ? body.url : body.url ?? "existing-endpoint-url";
 
     if (url === "https://invalid-endpoint.com") {
       return HttpResponse.json({
