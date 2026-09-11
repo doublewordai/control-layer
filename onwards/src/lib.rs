@@ -1486,6 +1486,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_upstream_429_exhaustion_surfaces_429_not_502() {
+        // Every provider answers HTTP 429 and the pool retries on 429. When the
+        // retry budget is exhausted the client must see the upstream's 429
+        // (rate_limit_error): upstream throttling is backpressure, not a proxy
+        // fault. A 502 here misfiles ordinary rate limiting as a proxy 5xx and
+        // pages the per-model proxy error alert.
+        let mock = MockHttpClient::new(StatusCode::TOO_MANY_REQUESTS, "rate limited");
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![429]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            429,
+            "exhausted upstream 429s must surface as 429, not a 502"
+        );
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["type"], "rate_limit_error");
+        assert_eq!(body["error"]["code"], "rate_limit");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_upstream_503_exhaustion_still_collapses_to_502() {
+        // Companion to the 429 test above: only the rate-limit status keeps its
+        // semantics on exhaustion; other fallback statuses still collapse to the
+        // generic gateway error.
+        let mock = MockHttpClient::new(StatusCode::SERVICE_UNAVAILABLE, "upstream sad");
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![503]), mock.clone());
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(
+            response.status_code(),
+            502,
+            "non-429 fallback statuses keep the generic gateway collapse"
+        );
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "both providers should be tried"
+        );
+    }
+
+    #[tokio::test]
     async fn test_streaming_keepalive_before_error_is_still_detected() {
         // A keep-alive comment precedes the error frame; the peek must skip it
         // and still detect the 429, retry, and exhaust to 503.
