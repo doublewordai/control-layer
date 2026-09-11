@@ -1,5 +1,12 @@
 # Changelog
 
+## [11.10.0](https://github.com/doublewordai/control-layer/compare/v11.9.1...v11.10.0) (2026-09-11)
+
+
+### Features
+
+* add declarative model provisioning ([#1745](https://github.com/doublewordai/control-layer/issues/1745)) ([7bf0bf6](https://github.com/doublewordai/control-layer/commit/7bf0bf6260ffb5e06f4f1a5a6962c300e7228935))
+
 ## [11.9.1](https://github.com/doublewordai/control-layer/compare/v11.9.0...v11.9.1) (2026-09-10)
 
 

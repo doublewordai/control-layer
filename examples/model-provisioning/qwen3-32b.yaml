@@ -1,0 +1,46 @@
+model: Qwen/Qwen3-32B
+backend:
+  engine: sglang
+clay:
+  alias: qwen3-32b
+  display_name: Qwen 3 32B
+  type: chat
+  capabilities:
+    - reasoning
+  settings:
+    sanitize_responses: true
+    trusted: false
+  deployments:
+    - alias: qwen3-32b-piccolo
+      model_name: Qwen/Qwen3-32B
+      endpoint: piccolo
+      type: chat
+      capabilities:
+        - reasoning
+      settings:
+        sanitize_responses: true
+        trusted: false
+      provider_pricing:
+        mode: per_token
+        input_per_million_tokens: "0.40"
+        output_per_million_tokens: "1.20"
+  routing:
+    strategy: weighted_random
+    fallback:
+      enabled: true
+      on_rate_limit: true
+      on_status: [429, 499, 500, 502, 503, 504]
+      max_attempts: 3
+    pools:
+      default:
+        - deployment: qwen3-32b-piccolo
+          enabled: true
+          weight: 1
+          sort_order: 0
+  tariffs:
+    - name: Realtime
+      purpose: realtime
+      input_per_million_tokens: "0.80"
+      output_per_million_tokens: "2.40"
+  access_groups:
+    - Customers

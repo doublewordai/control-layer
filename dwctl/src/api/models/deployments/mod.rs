@@ -581,6 +581,9 @@ pub struct DeployedModelResponse {
     /// Catalog metadata for display purposes
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ModelCatalogMetadata>,
+    /// Declarative source reapplied during startup. Absent for manually managed models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provisioning_source: Option<String>,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
@@ -650,6 +653,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
                 .inspect_err(|e| tracing::warn!(error = %e, "failed to deserialize model metadata"))
                 .ok()
                 .filter(|m| *m != ModelCatalogMetadata::default()),
+            provisioning_source: db.provisioning_source,
         }
     }
 }

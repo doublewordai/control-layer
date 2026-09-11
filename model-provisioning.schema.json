@@ -1,0 +1,662 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ModelDocument",
+  "type": "object",
+  "properties": {
+    "backend": {
+      "description": "Reserved for the inference deployment automation. Ignored by dwctl.",
+      "default": null
+    },
+    "clay": {
+      "description": "Control-layer model graph. Omit for a backend-only document.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ClayModel"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "model": {
+      "description": "Canonical Hugging Face model identifier.",
+      "type": "string"
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "model"
+  ],
+  "$defs": {
+    "Backoff": {
+      "type": "object",
+      "properties": {
+        "factor": {
+          "type": "number",
+          "format": "double"
+        },
+        "initial_ms": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "jitter": {
+          "$ref": "#/$defs/Jitter",
+          "default": "full"
+        },
+        "max_ms": {
+          "type": "integer",
+          "format": "int32"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "initial_ms",
+        "max_ms",
+        "factor"
+      ]
+    },
+    "CacheTariff": {
+      "type": "object",
+      "properties": {
+        "min_prefix_tokens": {
+          "type": "integer",
+          "format": "int32"
+        },
+        "read_multiplier": {
+          "type": "string",
+          "default": "0.1"
+        },
+        "write_multiplier_1h": {
+          "type": "string"
+        },
+        "write_multiplier_24h": {
+          "type": "string"
+        },
+        "write_multiplier_5m": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "write_multiplier_5m",
+        "write_multiplier_1h",
+        "write_multiplier_24h",
+        "min_prefix_tokens"
+      ]
+    },
+    "ClayModel": {
+      "type": "object",
+      "properties": {
+        "access_groups": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "alias": {
+          "type": "string"
+        },
+        "cache_tariff": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheTariff"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "capabilities": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "deployments": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PhysicalDeployment"
+          }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "model_name": {
+          "description": "Defaults to the document's top-level `model` value.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "routing": {
+          "$ref": "#/$defs/Routing",
+          "default": {
+            "fallback": {
+              "backoff": null,
+              "enabled": true,
+              "max_attempts": null,
+              "max_total_backoff_ms": null,
+              "on_rate_limit": true,
+              "on_status": [
+                429,
+                499,
+                500,
+                502,
+                503,
+                504
+              ],
+              "with_replacement": false
+            },
+            "pools": {},
+            "strategy": "weighted_random"
+          }
+        },
+        "settings": {
+          "$ref": "#/$defs/ModelSettings",
+          "default": {
+            "allowed_batch_completion_windows": null,
+            "batch_capacity": null,
+            "burst_size": null,
+            "capacity": null,
+            "metadata": {},
+            "reasoning_translation_overrides": null,
+            "requests_per_second": null,
+            "sanitize_responses": false,
+            "throughput": null,
+            "trusted": false
+          }
+        },
+        "tariffs": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Tariff"
+          }
+        },
+        "traffic_rules": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/TrafficRule"
+          }
+        },
+        "type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "alias"
+      ]
+    },
+    "Component": {
+      "type": "object",
+      "properties": {
+        "deployment": {
+          "type": "string"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "render_kwargs": {
+          "default": null
+        },
+        "sort_order": {
+          "type": "integer",
+          "format": "int32",
+          "default": 0
+        },
+        "strip_leading_bos": {
+          "type": "boolean",
+          "default": false
+        },
+        "weight": {
+          "type": "integer",
+          "format": "int32",
+          "default": 1
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "deployment"
+      ]
+    },
+    "Fallback": {
+      "type": "object",
+      "properties": {
+        "backoff": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Backoff"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "max_attempts": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32",
+          "default": null
+        },
+        "max_total_backoff_ms": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32",
+          "default": null
+        },
+        "on_rate_limit": {
+          "type": "boolean",
+          "default": true
+        },
+        "on_status": {
+          "type": "array",
+          "default": [
+            429,
+            499,
+            500,
+            502,
+            503,
+            504
+          ],
+          "items": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
+        "with_replacement": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "Jitter": {
+      "type": "string",
+      "enum": [
+        "none",
+        "full"
+      ]
+    },
+    "ModelKind": {
+      "type": "string",
+      "enum": [
+        "chat",
+        "embeddings",
+        "reranker"
+      ]
+    },
+    "ModelSettings": {
+      "type": "object",
+      "properties": {
+        "allowed_batch_completion_windows": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "batch_capacity": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32",
+          "default": null
+        },
+        "burst_size": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32",
+          "default": null
+        },
+        "capacity": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32",
+          "default": null
+        },
+        "metadata": {
+          "default": {}
+        },
+        "reasoning_translation_overrides": {
+          "default": null
+        },
+        "requests_per_second": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "default": null
+        },
+        "sanitize_responses": {
+          "type": "boolean",
+          "default": false
+        },
+        "throughput": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "format": "float",
+          "default": null
+        },
+        "trusted": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "PhysicalDeployment": {
+      "type": "object",
+      "properties": {
+        "alias": {
+          "type": "string"
+        },
+        "capabilities": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "default": null,
+          "items": {
+            "type": "string"
+          }
+        },
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "endpoint": {
+          "type": "string"
+        },
+        "model_name": {
+          "type": "string"
+        },
+        "provider_pricing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProviderPricing"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "settings": {
+          "$ref": "#/$defs/ModelSettings",
+          "default": {
+            "allowed_batch_completion_windows": null,
+            "batch_capacity": null,
+            "burst_size": null,
+            "capacity": null,
+            "metadata": {},
+            "reasoning_translation_overrides": null,
+            "requests_per_second": null,
+            "sanitize_responses": false,
+            "throughput": null,
+            "trusted": false
+          }
+        },
+        "type": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ModelKind"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "alias",
+        "model_name",
+        "endpoint"
+      ]
+    },
+    "ProviderPricing": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "input_per_million_tokens": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "mode": {
+              "type": "string",
+              "const": "per_token"
+            },
+            "output_per_million_tokens": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "input_token_cost_ratio": {
+              "type": "string"
+            },
+            "mode": {
+              "type": "string",
+              "const": "hourly"
+            },
+            "rate": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "mode",
+            "rate",
+            "input_token_cost_ratio"
+          ]
+        }
+      ]
+    },
+    "Purpose": {
+      "type": "string",
+      "enum": [
+        "platform",
+        "realtime",
+        "batch",
+        "playground",
+        "continuation"
+      ]
+    },
+    "Routing": {
+      "type": "object",
+      "properties": {
+        "fallback": {
+          "$ref": "#/$defs/Fallback",
+          "default": {
+            "backoff": null,
+            "enabled": true,
+            "max_attempts": null,
+            "max_total_backoff_ms": null,
+            "on_rate_limit": true,
+            "on_status": [
+              429,
+              499,
+              500,
+              502,
+              503,
+              504
+            ],
+            "with_replacement": false
+          }
+        },
+        "pools": {
+          "description": "Named component pools. Supported names are `default` and `completions`.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "array",
+            "items": {
+              "$ref": "#/$defs/Component"
+            }
+          },
+          "default": {}
+        },
+        "strategy": {
+          "$ref": "#/$defs/RoutingStrategy",
+          "default": "weighted_random"
+        }
+      },
+      "additionalProperties": false
+    },
+    "RoutingStrategy": {
+      "type": "string",
+      "enum": [
+        "weighted_random",
+        "priority"
+      ]
+    },
+    "Tariff": {
+      "type": "object",
+      "properties": {
+        "completion_window": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        },
+        "input_per_million_tokens": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "output_per_million_tokens": {
+          "type": "string"
+        },
+        "purpose": {
+          "$ref": "#/$defs/Purpose"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "purpose",
+        "input_per_million_tokens",
+        "output_per_million_tokens"
+      ]
+    },
+    "TrafficRule": {
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "deny"
+            },
+            "purpose": {
+              "$ref": "#/$defs/Purpose"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "purpose"
+          ]
+        },
+        {
+          "type": "object",
+          "properties": {
+            "action": {
+              "type": "string",
+              "const": "redirect"
+            },
+            "purpose": {
+              "$ref": "#/$defs/Purpose"
+            },
+            "target": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false,
+          "required": [
+            "action",
+            "purpose",
+            "target"
+          ]
+        }
+      ]
+    }
+  }
+}
