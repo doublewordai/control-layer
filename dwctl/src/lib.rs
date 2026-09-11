@@ -3949,8 +3949,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         encryption_key: encryption_key.clone(),
         ingest_file_job: Arc::new(std::sync::OnceLock::new()),
         activate_batch_job: Arc::new(std::sync::OnceLock::new()),
-        create_batch_job: Arc::new(std::sync::OnceLock::new()),
-        cascade_batch_state_job: Arc::new(std::sync::OnceLock::new()),
     };
     let task_runner = Arc::new(tasks::TaskRunner::new(underway_pool, task_state, &config.background_services.task_workers).await?);
     for (name, handle) in task_runner.start(
