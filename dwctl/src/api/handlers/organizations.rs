@@ -1135,6 +1135,7 @@ pub async fn list_join_requests<P: PoolProvider>(
     request_body(content = ApproveJoinRequestRequest, description = "Optional role to grant; defaults to 'member'"),
     responses(
         (status = 204, description = "Request approved"),
+        (status = 400, description = "Bad request"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Join request not found"),
     ),
@@ -1169,6 +1170,33 @@ pub async fn approve_join_request<P: PoolProvider>(
     check_role_assignment_privilege(&current_user, id, &role, can_all, &mut pool_conn).await?;
 
     let mut repo = Organizations::new(&mut pool_conn);
+
+    // The membership cap guards every other path that turns a pending/invited
+    // row into an active one (accept_invite, add_member, create_organization,
+    // the auto-join arm of create_user_join_request). approve_join_request is
+    // the only one that activates a *different* user, so it cannot key the
+    // count on `current_user.id` — it must look up who the request belongs to
+    // first, then count *their* active memberships. The check and the flip
+    // stay non-atomic, matching the siblings' enforcement level.
+    let Some(request) = repo.get_join_request(id, request_id).await? else {
+        return Err(Error::NotFound {
+            resource: "Join request".to_string(),
+            id: format!("{request_id} in organization {id}"),
+        });
+    };
+    // A `requested` row is always filed by a signed-in user, but the column is
+    // nullable (invites-by-address have no account yet), so defend the unwrap.
+    let requester_id = request.user_id.ok_or_else(|| Error::NotFound {
+        resource: "Join request".to_string(),
+        id: format!("{request_id} in organization {id}"),
+    })?;
+    let org_count = repo.count_user_organizations(requester_id).await?;
+    if org_count >= MAX_ORGS_PER_USER {
+        return Err(Error::BadRequest {
+            message: format!("Cannot approve join request: user is already a member of {MAX_ORGS_PER_USER} organizations (maximum)"),
+        });
+    }
+
     let Some(approved_user_id) = repo.approve_join_request(id, request_id, &role).await? else {
         return Err(Error::NotFound {
             resource: "Join request".to_string(),
@@ -4438,6 +4466,134 @@ mod tests {
             .add_header(&owner_headers[1].0, &owner_headers[1].1)
             .await;
         resp.assert_status(axum::http::StatusCode::NOT_FOUND);
+    }
+
+    /// The membership cap guards every other activation path; approving a
+    /// pending request must too. A joiner who fills their `MAX_ORGS_PER_USER`
+    /// slots *after* filing the request must be rejected at approval rather
+    /// than approved into a fourth workspace.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_approve_join_request_rejects_when_joiner_at_max(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner_headers = add_auth_headers(&joiner);
+        let owner_headers = add_auth_headers(&owner);
+        let (org_id, request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+
+        // The joiner drives the guarded paths to hit MAX_ORGS_PER_USER. The
+        // requested org is a separate row (status = 'requested'), so it does
+        // not occupy a slot — only active memberships are counted.
+        for i in 0..super::MAX_ORGS_PER_USER {
+            let resp = server
+                .post("/admin/api/v1/organizations")
+                .add_header(&joiner_headers[0].0, &joiner_headers[0].1)
+                .add_header(&joiner_headers[1].0, &joiner_headers[1].1)
+                .json(&json!({
+                    "name": format!("extra-{i}"),
+                    "email": format!("billing-{i}@example.com"),
+                }))
+                .await;
+            resp.assert_status(axum::http::StatusCode::CREATED);
+        }
+
+        // Sanity: the joiner is at the cap, and the request survives it.
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+            assert_eq!(
+                repo.count_user_organizations(joiner.id).await.unwrap(),
+                super::MAX_ORGS_PER_USER,
+                "joiner is at the cap before approval"
+            );
+            assert_eq!(
+                repo.list_join_requests(org_id).await.unwrap().len(),
+                1,
+                "the request survives the user filling their slots"
+            );
+        }
+
+        // Approving a user already at the cap must be rejected, like every
+        // sibling activation path.
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/join-requests/{request_id}/approve"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::BAD_REQUEST);
+        assert!(resp.text().contains("maximum"), "the rejection must explain the cap");
+
+        // The membership must not have been activated: still at the cap, the
+        // request is still pending, and the joiner is not a member of the org.
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+        assert_eq!(
+            repo.count_user_organizations(joiner.id).await.unwrap(),
+            super::MAX_ORGS_PER_USER,
+            "the cap was not exceeded"
+        );
+        assert_eq!(
+            repo.list_join_requests(org_id).await.unwrap().len(),
+            1,
+            "the request is still pending, so it can be re-evaluated"
+        );
+        assert_eq!(
+            repo.get_user_org_role(joiner.id, org_id).await.unwrap(),
+            None,
+            "the joiner did not become a member"
+        );
+    }
+
+    /// One below the cap, approval must still succeed: the guard rejects at
+    /// `>= MAX_ORGS_PER_USER`, so a joiner holding `MAX - 1` active memberships
+    /// can be approved into the requested org to reach exactly the cap. This
+    /// guards against an off-by-one that over-blocks the happy path.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_approve_join_request_succeeds_one_below_max(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner = create_test_user(&pool, Role::StandardUser).await;
+        let joiner_headers = add_auth_headers(&joiner);
+        let owner_headers = add_auth_headers(&owner);
+        let (org_id, request_id) = org_with_join_request(&pool, owner.id, joiner.id).await;
+
+        // Fill to MAX - 1 active memberships (one short of the cap).
+        for i in 0..super::MAX_ORGS_PER_USER - 1 {
+            let resp = server
+                .post("/admin/api/v1/organizations")
+                .add_header(&joiner_headers[0].0, &joiner_headers[0].1)
+                .add_header(&joiner_headers[1].0, &joiner_headers[1].1)
+                .json(&json!({
+                    "name": format!("extra-{i}"),
+                    "email": format!("billing-{i}@example.com"),
+                }))
+                .await;
+            resp.assert_status(axum::http::StatusCode::CREATED);
+        }
+
+        // Approval brings the joiner to exactly the cap, not past it.
+        let resp = server
+            .post(&format!("/admin/api/v1/organizations/{org_id}/join-requests/{request_id}/approve"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .await;
+        resp.assert_status(axum::http::StatusCode::NO_CONTENT);
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = crate::db::handlers::Organizations::new(&mut conn);
+        assert_eq!(
+            repo.count_user_organizations(joiner.id).await.unwrap(),
+            super::MAX_ORGS_PER_USER,
+            "approval reaches exactly the cap"
+        );
+        assert_eq!(
+            repo.get_user_org_role(joiner.id, org_id).await.unwrap(),
+            Some("member".to_string()),
+            "the joiner is an active member of the requested org"
+        );
+        assert!(repo.list_join_requests(org_id).await.unwrap().is_empty(), "the request is cleared");
     }
 
     /// Declining removes the row rather than tombstoning it, so the user can
