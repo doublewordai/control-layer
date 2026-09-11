@@ -93,6 +93,8 @@ base64 = "0.22"
 bytes = "1.5"
 onwards = { path = "../onwards" }
 thiserror = "2.0.14"
+# Same CRC as sqlx-postgres: the migrate command must take sqlx's own lock id.
+crc = "3"
 axum-prometheus = "0.10"
 # Metrics facade and exporter (same versions as axum-prometheus uses)
 metrics = "0.24"

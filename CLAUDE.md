@@ -44,7 +44,12 @@ Uses SQLx with PostgreSQL following the Repository pattern:
 Handlers (API) → Repositories (db::handlers) → Models (db::models) → PostgreSQL
 ```
 
-- Migrations run automatically on startup from `dwctl/migrations/`
+- Migrations live in `dwctl/migrations/` (main schema) and
+  `fusillade-arsenal/migrations/` (Fusillade). `dwctl migrate` applies them;
+  `migrations.mode` (`run` locally, `check` in deployments) decides whether
+  the serving process applies them or only verifies compatibility. Read
+  `docs/migrations.md` before adding a migration, especially one that builds
+  an index `CONCURRENTLY`
 - The `underway` crate (background task queue) ships its own SQLx migrations
   that create the `underway` schema; `just db-setup` applies these too, but
   they are also applied at runtime via `underway::run_migrations`
