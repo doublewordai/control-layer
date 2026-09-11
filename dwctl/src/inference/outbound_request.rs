@@ -76,21 +76,6 @@ pub const STREAM_MARKER_KEY: &str = "stream";
 
 /// The header [`STREAM_MARKER_KEY`] arrives as.
 pub const STREAM_MARKER_HEADER: &str = "x-fusillade-batch-stream";
-
-/// `batch_metadata` key the daemon's dispatch sets on EVERY dispatch, so the
-/// edge image-normaliser layer can tell a daemon loopback from a client's own
-/// request. A loopback body carries the `dw-img://` tokens that flex enqueue /
-/// file ingest stored, under the principal that stored them — so the stored
-/// body IS the authorisation and the tokens are signed on trust, with the
-/// dispatch TTL. A client's own request with tokens is authorised against
-/// `image_access` and signed with the realtime TTL instead. Same trust
-/// argument as [`STREAM_MARKER_KEY`]: the ingress strips every `x-fusillade-*`
-/// header from external requests.
-pub const DISPATCH_MARKER_KEY: &str = "dispatch";
-
-/// The header [`DISPATCH_MARKER_KEY`] arrives as.
-pub const DISPATCH_MARKER_HEADER: &str = "x-fusillade-batch-dispatch";
-
 impl StreamTimeouts {
     /// Read the budgets from the daemon's configuration.
     ///

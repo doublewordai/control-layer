@@ -464,8 +464,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 // fails the submission (retryable) instead of silently
                 // persisting tokens without it.
                 let attribution = match api_key.as_deref() {
-                    Some(key) => match crate::api::handlers::images::try_resolve_image_attribution(&state.dwctl_pool.write(), key).await {
-                        Ok(attribution) => attribution,
+                    Some(key) => match crate::api::handlers::images::try_resolve_caller(&state.dwctl_pool.write(), key).await {
+                        Ok(caller) => caller.map(|c| c.attribution),
                         Err(e) => {
                             tracing::warn!(error = %e, "Image attribution lookup failed on flex enqueue");
                             return normalize_error_response(crate::image_normalizer::NormalizeError::Transient(

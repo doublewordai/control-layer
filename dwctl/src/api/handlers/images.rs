@@ -144,21 +144,35 @@ pub struct ImageAttribution {
 /// (`created_by <> user_id`) the organization is the key's `user_id`. Returns
 /// `None` if the key is unknown/deleted.
 pub async fn resolve_image_attribution(pool: &sqlx::PgPool, api_key: &str) -> Option<ImageAttribution> {
-    try_resolve_image_attribution(pool, api_key).await.ok().flatten()
+    try_resolve_caller(pool, api_key).await.ok().flatten().map(|c| c.attribution)
 }
 
-/// [`resolve_image_attribution`] that keeps the lookup error. `Ok(None)` is a
-/// definite "no such key"; `Err` is "could not look it up right now". Callers
-/// that AUTHORISE on the result (token signing, the flex enqueue bookkeeping
-/// that later authorisation depends on) must treat the two differently — a
-/// transient database failure is a retryable 503, never a 403.
-pub async fn try_resolve_image_attribution(
-    pool: &sqlx::PgPool,
-    api_key: &str,
-) -> std::result::Result<Option<ImageAttribution>, sqlx::Error> {
+/// What an API key secret tells the image layer about the request carrying it.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedCaller {
+    pub attribution: ImageAttribution,
+    /// The key is a hidden `batch`-purpose key: the one the fusillade daemon
+    /// dispatches with (flex enqueue and batch creation both store it on the
+    /// request), and one no client ever holds — hidden keys are never exposed.
+    /// The bearer is therefore an application-verifiable daemon identity, so
+    /// a request carrying it is a dispatch loopback of a body our own ingest
+    /// stored under this principal.
+    pub is_daemon_dispatch: bool,
+}
+
+/// [`resolve_image_attribution`] that keeps the lookup error and reports
+/// whether the key is the daemon's. `Ok(None)` is a definite "no such key";
+/// `Err` is "could not look it up right now". Callers that AUTHORISE on the
+/// result (token signing, the flex enqueue bookkeeping that later
+/// authorisation depends on) must treat the two differently — a transient
+/// database failure is a retryable 503, never a 403.
+pub async fn try_resolve_caller(pool: &sqlx::PgPool, api_key: &str) -> std::result::Result<Option<ResolvedCaller>, sqlx::Error> {
     let row = sqlx::query!(
         r#"
-        SELECT created_by AS "created_by!", user_id AS "user_id!"
+        SELECT
+            created_by AS "created_by!",
+            user_id AS "user_id!",
+            (purpose = 'batch' AND hidden) AS "is_daemon_dispatch!"
         FROM api_keys
         WHERE secret = $1 AND is_deleted = FALSE
         LIMIT 1
@@ -170,9 +184,12 @@ pub async fn try_resolve_image_attribution(
 
     Ok(row.map(|row| {
         let organization_id = (row.created_by != row.user_id).then_some(row.user_id);
-        ImageAttribution {
-            user_id: row.created_by,
-            organization_id,
+        ResolvedCaller {
+            attribution: ImageAttribution {
+                user_id: row.created_by,
+                organization_id,
+            },
+            is_daemon_dispatch: row.is_daemon_dispatch,
         }
     }))
 }
