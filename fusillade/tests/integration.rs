@@ -1,3 +1,4 @@
+use fusillade::DaemonMode;
 use fusillade::PostgresDaemon;
 use fusillade::batch::{BackgroundBatchInput, BatchInput, RequestTemplateInput};
 use fusillade::daemon::{
@@ -3629,4 +3630,67 @@ mod unverified_volume_counts {
             "created_at < cutoff must be excluded"
         );
     }
+}
+
+/// Regression test for the 2026-09-10 curie outage: when a claim loop gives up
+/// after repeated consecutive failures, the daemon tears its children down by
+/// cancelling its OWN lifecycle token — which must be a child of the caller's
+/// token so the caller's token survives. dwctl's fail-fast supervisor
+/// (`BackgroundServices::wait_for_failure`) only reports a background task's
+/// error while that token is still live; if the daemon cancelled the caller's
+/// token directly, the supervisor treated the error as benign "during
+/// shutdown" and the pod ran indefinitely with a dead claim loop (observed in
+/// production: both curie split daemon pods, 2026-09-10, 35+ minutes down).
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn claim_giveup_does_not_cancel_the_caller_shutdown_token(pool: sqlx::PgPool) {
+    let config = DaemonConfig {
+        claim_interval_ms: 10,
+        claim_loop_max_consecutive_failures: 2,
+        ..Default::default()
+    };
+    let store = postgres_store(pool.clone(), &config).await;
+    let daemon = postgres_daemon(store, Arc::new(MockHttpClient::new()), config);
+    let caller_shutdown = CancellationToken::new();
+    let handle = daemon
+        .run_with_mode(caller_shutdown.clone(), DaemonMode::RequestOnly)
+        .unwrap();
+
+    // Wait for the daemon to register itself in the database, then break the
+    // database so every subsequent claim transaction fails immediately. The
+    // registration INSERT commits before any claim loop starts, so waiting for
+    // the row makes the close race-free.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM daemons")
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0)
+            == 0
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("daemon must register before its claim loop runs");
+    pool.close().await;
+
+    // The claim loop must give up and the run loop must surface the error.
+    let joined = tokio::time::timeout(Duration::from_secs(60), handle)
+        .await
+        .expect("daemon should exit after claim give-up")
+        .expect("daemon task panicked");
+    let Err(_error) = joined else {
+        panic!(
+            "daemon exited cleanly after claim give-up; expected an Err the supervisor can act on"
+        );
+    };
+
+    // THE INVARIANT: the daemon's own teardown must not cancel the caller's
+    // token. The fail-fast supervisor relies on that to see this error and
+    // exit the process so Kubernetes restarts the pod.
+    assert!(
+        !caller_shutdown.is_cancelled(),
+        "daemon failure cancelled the caller's shutdown token; \
+         the fail-fast supervisor would swallow this error \
+         (production 2026-09-10: curie fusillade daemons dead in a live pod for 35+ minutes)"
+    );
 }
