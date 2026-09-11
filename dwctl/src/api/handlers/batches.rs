@@ -1698,6 +1698,7 @@ pub async fn delete_batch<P: PoolProvider>(
         (status = 200, description = "Requests queued for retry (or a cancellation was overturned and the batch resumed).", body = BatchResponse),
         (status = 400, description = "Nothing to retry: no failed or canceled requests, and the batch was not cancelled."),
         (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 503, description = "The batch's weekly archive partition is being retired (dropped); retriable rows are still present but cannot be moved back right now. Retry shortly, accompanied by a Retry-After header."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
@@ -1733,14 +1734,33 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
         });
     }
 
-    // Retry all failed requests for the batch in a single database operation
-    let retried_count = state
+    // Retry all failed requests for the batch in a single database operation.
+    // A `RetryBlockedByArchiveFence` outcome is distinct from both a genuine
+    // internal failure and the "nothing to retry" no-op: the batch's weekly
+    // archive partition is fenced for retirement, so its archived
+    // `failed`/`canceled` rows are still present but cannot be moved back
+    // right now. Map it to a retry-later `503` with `Retry-After` so retry-
+    // aware clients back off, never the `400` reserved for an empty no-op
+    // (the batch DOES have retriable rows) or the `500` reserved for real
+    // failures. After the retirement completes the partition is gone and a
+    // subsequent retry is an ordinary `Ok(0)` → `400` "nothing to retry".
+    let retried_count = match state
         .request_manager
         .retry_failed_requests_for_batch(fusillade::BatchId(batch_id))
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("retry failed requests: {}", e),
-        })?;
+    {
+        Ok(count) => count,
+        Err(fusillade::FusilladeError::RetryBlockedByArchiveFence) => {
+            return Err(Error::ServiceUnavailable {
+                message: "Batch archive partition is being retired; retry shortly".to_string(),
+            });
+        }
+        Err(e) => {
+            return Err(Error::Internal {
+                operation: format!("retry failed requests: {}", e),
+            });
+        }
+    };
 
     // retried_count == 0 is still SUCCESS when the retry overturned a
     // cancellation: the fast-resume flow (cancel + near-instant retry)
@@ -2224,6 +2244,7 @@ mod tests {
     use crate::errors::Error;
     use crate::test::utils::*;
     use axum::http::StatusCode;
+    use chrono::{DateTime, Datelike, NaiveDate, Utc};
     use fusillade::Storage;
     use rust_decimal::Decimal;
     use sqlx::PgPool;
@@ -5389,6 +5410,14 @@ mod tests {
         );
     }
 
+    /// A Monday `weeks_back` whole weeks before the current UTC week — the
+    /// ISO-week lower bound a `batch_requests_archive` child partition uses.
+    fn monday_utc(weeks_back: i64) -> NaiveDate {
+        let today = Utc::now().date_naive();
+        let this_monday = today - chrono::Duration::days(today.weekday().num_days_from_monday().into());
+        this_monday - chrono::Duration::days(7 * weeks_back)
+    }
+
     /// Helper: insert a batch with `n` pending requests directly into fusillade tables.
     /// Returns (batch_id, request_ids).
     async fn insert_batch_with_pending_requests(pool: &PgPool, user_id: Uuid, n: usize) -> (Uuid, Vec<Uuid>) {
@@ -5620,6 +5649,139 @@ mod tests {
             .add_header(&auth[1].0, &auth[1].1)
             .await;
         resp.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    /// A retry on a batch whose weekly `batch_requests_archive` partition is
+    /// fenced for retirement (`state='retiring'`) returns retry-later `503`
+    /// with a `Retry-After` header — never the `400` reserved for a genuine
+    /// "nothing to retry" no-op (the batch DOES have retriable archived rows;
+    /// they are just not movable right now) nor a `500`. The batch stays
+    /// `archive`+frozen: the storage guard refused the archive-move-back
+    /// before it could un-freeze the batch out from under the partition drop,
+    /// and the `failed` archived row stays in the partition (not re-pended,
+    /// not stranded by a premature move).
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_retry_on_a_fenced_archive_partition_returns_503_retry_after(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        // Build a weekly child partition of fusillade.batch_requests_archive.
+        // The app's PostgresRequestManager runs with search_path=public,fusillade,
+        // so an unqualified `batch_requests_archive` resolves to the fusillade
+        // parent and routes to this attached child.
+        let week = monday_utc(10);
+        let child = format!("batch_requests_archive_y{}w{:02}", week.iso_week().year(), week.iso_week().week());
+        sqlx::query(&format!(
+            "CREATE TABLE fusillade.{child} (LIKE fusillade.batch_requests_archive INCLUDING ALL)"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(&format!(
+            "ALTER TABLE fusillade.batch_requests_archive ATTACH PARTITION fusillade.{child} \
+             FOR VALUES FROM ('{week}') TO ('{}')",
+            week + chrono::Duration::days(7)
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO fusillade.batch_archive_buckets \
+             (week_start, partition_schema, partition_table, partition_oid) \
+             SELECT $1, 'fusillade', $2, to_regclass('fusillade.' || $2)::oid",
+        )
+        .bind(week)
+        .bind(&child)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // A processed source file + an archived/frozen batch bucketed in the
+        // fenced week, with one `failed` archived row to retry.
+        let file_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) \
+             VALUES ($1, 'fenced-retry.jsonl', 'processed', NOW(), NOW())",
+        )
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let batch_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO fusillade.batches \
+             (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, \
+              total_requests, location, archive_bucket, counts_frozen_at) \
+             VALUES ($1, $2, $3, '/v1/chat/completions', '24h', NOW() + INTERVAL '24 hours', \
+                     NOW(), 1, 'archive', $4, NOW() - INTERVAL '60 days')",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .bind(file_id)
+        .bind(week)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO fusillade.batch_requests_archive \
+             (id, batch_id, model, state, retry_attempt, created_at, updated_at, failed_at, \
+              error, response_status, response_body, response_size, archive_bucket) \
+             VALUES (gen_random_uuid(), $1, 'test-model', 'failed', 0, NOW(), NOW(), NOW(), \
+                     'transient', NULL, NULL, 0, $2)",
+        )
+        .bind(batch_id)
+        .bind(week)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Fence the week (model a committed claim() whose finish() has not run).
+        sqlx::query("UPDATE fusillade.batch_archive_buckets SET state = 'retiring' WHERE week_start = $1")
+            .bind(week)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let resp = app
+            .post(&format!("/ai/v1/batches/{batch_id}/retry"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        resp.assert_status(StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            resp.headers().get("retry-after").is_some(),
+            "503 must carry a Retry-After header so retry-aware clients back off"
+        );
+
+        // The batch is NOT un-frozen: the guard bailed before the
+        // archive-move-back, so the partition drop cannot strand the row.
+        let (location, frozen_at): (String, Option<DateTime<Utc>>) =
+            sqlx::query_as("SELECT location, counts_frozen_at FROM fusillade.batches WHERE id = $1")
+                .bind(batch_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(location, "archive");
+        assert!(frozen_at.is_some(), "fenced retry must not clear counts_frozen_at");
+
+        let archive_failed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)::bigint FROM fusillade.batch_requests_archive \
+             WHERE archive_bucket = $1 AND batch_id = $2 AND state = 'failed'",
+        )
+        .bind(week)
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(archive_failed, 1, "the failed archive row must survive the fenced retry");
+        let live: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM fusillade.requests WHERE batch_id = $1")
+            .bind(batch_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(live, 0, "no row may be re-pended to the live table");
     }
 
     // ── Explicit API key selection for dashboard batch creation ───────────

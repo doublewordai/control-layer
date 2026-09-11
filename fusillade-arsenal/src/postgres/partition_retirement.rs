@@ -48,6 +48,21 @@ pub(super) struct FamilySpec {
     /// completion. Binds: $1 lower bound, $2 upper bound, $3 completion
     /// timestamp. Must touch only content-free metadata.
     pub completion_sql: Option<&'static str>,
+    /// Optional boolean predicate run inside `finish()`'s DROP transaction,
+    /// AFTER the child is detached and locked `ACCESS EXCLUSIVE` but BEFORE
+    /// `DROP TABLE`. Returns `true` when it is still safe to drop — every
+    /// invariant the family's `candidate_sql` gated on at fence time still
+    /// holds for the rows in `[lower, upper)`; `false` aborts the drop
+    /// (`Err(RetirementIdentityMismatch)`, the transaction rolls back, the
+    /// detached child survives, and the journal retries on a later tick or
+    /// awaits an operator). Binds `$1 = lower_bound`, `$2 = upper_bound`,
+    /// and `$3 = retention_days` when `pre_drop_binds_retention`, else just
+    /// `$1`/`$2`. Defense-in-depth: the primary guard is each writer's own
+    /// `FOR SHARE` on the bucket row (see `retry_failed_requests_for_batch`
+    /// and `archive_batch`); this re-check is the safety net so the gap
+    /// stays closed even if a future writer forgets.
+    pub pre_drop_check_sql: Option<&'static str>,
+    pub pre_drop_binds_retention: bool,
 }
 
 impl FamilySpec {
@@ -557,6 +572,7 @@ async fn finish(
     family: &FamilySpec,
     identity: &Identity,
     owner: Uuid,
+    retention_days: Option<i32>,
 ) -> Result<RetainedResponseRetirementOutcome> {
     if inspect_identity(&mut *connection, family, identity).await? != Attachment::Detached {
         return Err(mismatch());
@@ -639,6 +655,43 @@ async fn finish(
         .map_err(retirement_database_error)?;
     if !locked {
         return Err(mismatch());
+    }
+
+    // Defense-in-depth re-check: re-verify the family's gate predicate over
+    // the rows in [lower, upper) inside the DROP transaction, AFTER every
+    // concurrent writer that could regress it has committed. By `finish()`
+    // time the child is detached and locked `ACCESS EXCLUSIVE`; any in-
+    // flight pre-detach writer touching the child has committed (its phase-
+    // 2 `ACCESS EXCLUSIVE` waited for it), and any post-detach writer
+    // prunes to empty and cannot regress `batches`/metadata (the only
+    // remaining writes are no-ops). So this read sees the true, final pre-
+    // drop state. If a writer un-froze a fenced-week batch (or otherwise
+    // regressed the gate) the predicate returns `false`: refuse the drop,
+    // roll back — the detached child survives and the journal retries on a
+    // later tick (or awaits an operator). The primary guard lives in each
+    // writer (`FOR SHARE` on the bucket row); this re-check is the safety
+    // net for a future writer that forgets.
+    if let Some(pre_drop_check_sql) = family.pre_drop_check_sql {
+        let check = sqlx::query_scalar::<_, bool>(pre_drop_check_sql);
+        let check = if family.pre_drop_binds_retention {
+            check
+                .bind(identity.lower)
+                .bind(identity.upper)
+                .bind(retention_days.ok_or_else(failed)?)
+        } else {
+            check.bind(identity.lower).bind(identity.upper)
+        };
+        let safe_to_drop = check
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(retirement_database_error)?;
+        if !safe_to_drop {
+            transaction
+                .rollback()
+                .await
+                .map_err(retirement_database_error)?;
+            return Err(mismatch());
+        }
     }
 
     let drop_statement = format!(
@@ -906,6 +959,7 @@ async fn detach_and_finish<P: PoolProvider>(
     family: &FamilySpec,
     identity: &Identity,
     owner: Uuid,
+    retention_days: Option<i32>,
 ) -> Result<RetainedResponseRetirementOutcome> {
     let attachment = inspect_identity(&mut *connection, family, identity).await?;
     let progress = match attachment {
@@ -916,7 +970,7 @@ async fn detach_and_finish<P: PoolProvider>(
     if progress == DetachProgress::Retryable {
         return Ok(RetainedResponseRetirementOutcome::Retryable);
     }
-    finish(connection, family, identity, owner).await
+    finish(connection, family, identity, owner, retention_days).await
 }
 
 /// One retirement tick for a family: resume unfinished work first, then (only
@@ -960,6 +1014,7 @@ pub(super) async fn retire<P: PoolProvider>(
         family,
         &identity,
         manager.partition_maintenance_lease_owner,
+        retention_days,
     )
     .await
     {
