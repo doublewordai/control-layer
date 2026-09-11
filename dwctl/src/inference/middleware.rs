@@ -459,8 +459,20 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 // Attribute the image to the acting human + owning org (for org
                 // keys), mirroring how CurrentUser is derived, so the console's
                 // org-scoped image-view authorization lines up.
+                // The attribution row written here is what authorises a client
+                // re-sending this request's tokens later, so a lookup failure
+                // fails the submission (retryable) instead of silently
+                // persisting tokens without it.
                 let attribution = match api_key.as_deref() {
-                    Some(key) => crate::api::handlers::images::resolve_image_attribution(&state.dwctl_pool.write(), key).await,
+                    Some(key) => match crate::api::handlers::images::try_resolve_image_attribution(&state.dwctl_pool.write(), key).await {
+                        Ok(attribution) => attribution,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Image attribution lookup failed on flex enqueue");
+                            return normalize_error_response(crate::image_normalizer::NormalizeError::Transient(
+                                "caller lookup failed".to_string(),
+                            ));
+                        }
+                    },
                     None => None,
                 };
                 let access_pool = Some(state.dwctl_pool.write().into_inner());

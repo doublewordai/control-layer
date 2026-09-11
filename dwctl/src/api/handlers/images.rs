@@ -144,6 +144,18 @@ pub struct ImageAttribution {
 /// (`created_by <> user_id`) the organization is the key's `user_id`. Returns
 /// `None` if the key is unknown/deleted.
 pub async fn resolve_image_attribution(pool: &sqlx::PgPool, api_key: &str) -> Option<ImageAttribution> {
+    try_resolve_image_attribution(pool, api_key).await.ok().flatten()
+}
+
+/// [`resolve_image_attribution`] that keeps the lookup error. `Ok(None)` is a
+/// definite "no such key"; `Err` is "could not look it up right now". Callers
+/// that AUTHORISE on the result (token signing, the flex enqueue bookkeeping
+/// that later authorisation depends on) must treat the two differently — a
+/// transient database failure is a retryable 503, never a 403.
+pub async fn try_resolve_image_attribution(
+    pool: &sqlx::PgPool,
+    api_key: &str,
+) -> std::result::Result<Option<ImageAttribution>, sqlx::Error> {
     let row = sqlx::query!(
         r#"
         SELECT created_by AS "created_by!", user_id AS "user_id!"
@@ -154,14 +166,15 @@ pub async fn resolve_image_attribution(pool: &sqlx::PgPool, api_key: &str) -> Op
         api_key,
     )
     .fetch_optional(pool)
-    .await
-    .ok()??;
+    .await?;
 
-    let organization_id = (row.created_by != row.user_id).then_some(row.user_id);
-    Some(ImageAttribution {
-        user_id: row.created_by,
-        organization_id,
-    })
+    Ok(row.map(|row| {
+        let organization_id = (row.created_by != row.user_id).then_some(row.user_id);
+        ImageAttribution {
+            user_id: row.created_by,
+            organization_id,
+        }
+    }))
 }
 
 /// Record that `attribution` submitted a request containing `token`. Idempotent
