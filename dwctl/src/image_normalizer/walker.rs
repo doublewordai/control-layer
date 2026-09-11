@@ -43,6 +43,9 @@ pub enum Mode {
     /// flex enqueue / file ingest stored, and signing them here (below the
     /// prompt-cache layer) is what keeps the cache identity of an image the
     /// stable content-addressed token rather than a per-dispatch signed URL.
+    /// Also the two submission paths' mode, where a token already in the
+    /// body is authorised against the submitter's `image_access` (and kept)
+    /// rather than persisted unchecked.
     AllAndTokens,
 }
 

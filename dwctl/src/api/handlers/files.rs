@@ -283,14 +283,16 @@ struct FileStreamConfig {
     /// Optional image normaliser. When `Some`, each parsed template's body is
     /// walked for `image_url` fields containing HTTP(S) URLs (per the user's
     /// mode); each is ingested into the content store and replaced with an
-    /// opaque `dw-img://` token. The dispatcher swaps tokens for short-lived
-    /// signed URLs at send time. When `None`, bodies pass through unchanged.
+    /// opaque `dw-img://` token. The edge image layer swaps tokens for
+    /// short-lived signed URLs when the dispatch loops back through it. When
+    /// `None`, bodies pass through unchanged.
     normalizer: Option<Arc<dyn ImageNormalizer>>,
     /// Walker mode. Image normalisation is a deployment-level posture
     /// (controlled by `config.image_normalizer.enabled`); when on, batch
-    /// ingest pins this to [`ImageNormalizerMode::All`] so every image
-    /// input — HTTP URLs *and* `data:` URIs — flows through the
-    /// content-addressed store.
+    /// ingest pins this to [`ImageNormalizerMode::AllAndTokens`] so every
+    /// image input — HTTP URLs *and* `data:` URIs — flows through the
+    /// content-addressed store, and a `dw-img://` token already in the file
+    /// is authorised against the uploader's `image_access` before it is kept.
     normalizer_mode: ImageNormalizerMode,
     /// Optional DB pool for `image_access` bookkeeping. `None` disables
     /// the bookkeeping (the substitution itself still runs).
@@ -374,6 +376,41 @@ async fn normalize_template_body_in_place(
         let err_cell = &err_cell;
         let is_data_uri = url.starts_with("data:");
         async move {
+            // A `dw-img://` token already in the file (a re-submitted request):
+            // authorise it NOW against `image_access` and keep it as is. The
+            // batch dispatch signs every token in a stored body on trust, so
+            // this is the only place a client-supplied token is checked.
+            if crate::image_normalizer::ImageToken::looks_like_token(&url) {
+                let outcome = match url.parse::<crate::image_normalizer::ImageToken>() {
+                    Err(e) => Err(BatchNormalizeError::BadInput(format!("invalid dw-img token: {e}"))),
+                    Ok(token) => match (access_pool.as_ref(), access_attribution) {
+                        (Some(pool), Some(attribution)) => {
+                            match crate::api::handlers::images::is_token_accessible(pool, &attribution, token).await {
+                                Ok(true) => Ok(()),
+                                Ok(false) => Err(BatchNormalizeError::BadInput(
+                                    "image token is not accessible to this caller".to_string(),
+                                )),
+                                Err(e) => Err(BatchNormalizeError::Transient(format!("image access lookup failed: {e}"))),
+                            }
+                        }
+                        // No way to authorise: refuse rather than persist on trust.
+                        _ => Err(BatchNormalizeError::BadInput(
+                            "image token is not accessible to this caller".to_string(),
+                        )),
+                    },
+                };
+                return match outcome {
+                    Ok(()) => Ok::<String, ()>(url),
+                    Err(mapped) => {
+                        if let Ok(mut g) = err_cell.lock()
+                            && g.is_none()
+                        {
+                            *g = Some(mapped);
+                        }
+                        Err(())
+                    }
+                };
+            }
             let input = if is_data_uri {
                 ImageInput::DataUri(url)
             } else {
@@ -415,8 +452,8 @@ async fn normalize_template_body_in_place(
                         crate::image_normalizer::NormalizeError::NotFound => {
                             BatchNormalizeError::StoreFailed("image token not found in store".to_string())
                         }
-                        // Ingest never authorises tokens (it only produces them), so this
-                        // variant cannot arise here; map it defensively as bad input.
+                        // Tokens are authorised above, before ingest, so this variant
+                        // cannot arise from ingest; map it defensively as bad input.
                         crate::image_normalizer::NormalizeError::Forbidden => {
                             BatchNormalizeError::BadInput("image token is not accessible to this caller".to_string())
                         }
@@ -1152,9 +1189,9 @@ pub async fn upload_file<P: PoolProvider>(
     let uploaded_by = Some(target_user_id.to_string());
 
     // Re-use the AppState-bound normaliser singleton (built once at
-    // startup). The dispatcher will JIT-resign any `dw-img://` tokens
-    // produced here with a fresh short-lived signed URL before sending
-    // to the provider.
+    // startup). The `dw-img://` tokens produced here are signed into fresh
+    // short-lived URLs by the edge image layer when the batch dispatch loops
+    // back through it (below the prompt cache, so the cache keys on the token).
     let normalizer = if config.image_normalizer.enabled {
         Some(state.image_normalizer.clone())
     } else {
@@ -1162,8 +1199,10 @@ pub async fn upload_file<P: PoolProvider>(
     };
     // Image normalisation is a system-wide setting (controlled by
     // `config.image_normalizer.enabled`). When on, every image input —
-    // HTTP(S) URL or `data:` URI — gets normalised through the store.
-    let normalizer_mode = ImageNormalizerMode::All;
+    // HTTP(S) URL or `data:` URI — gets normalised through the store, and any
+    // `dw-img://` token already in the file is authorised against the
+    // uploader's `image_access` before it is persisted.
+    let normalizer_mode = ImageNormalizerMode::AllAndTokens;
     let stream_config = FileStreamConfig {
         max_file_size: config.limits.files.max_file_size,
         max_requests_per_file: config.limits.files.max_requests_per_file,
@@ -2161,6 +2200,107 @@ mod tests {
     use sqlx::PgPool;
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
+
+    // ---- submission-time `dw-img://` token authorisation ----
+    //
+    // The batch dispatch signs every token in a stored body on trust, so a
+    // token already present in an uploaded file must be authorised here,
+    // against the uploader's `image_access`, before it is persisted.
+
+    const TINY_PNG_DATA_URI: &str =
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=";
+
+    /// A normaliser over an in-memory store, with one image ingested and
+    /// recorded in `image_access` for `owner`.
+    async fn normalizer_with_image_owned_by(
+        pool: &PgPool,
+        owner: Uuid,
+    ) -> (
+        Arc<dyn crate::image_normalizer::ImageNormalizer>,
+        crate::image_normalizer::ImageToken,
+    ) {
+        use crate::image_normalizer::{DefaultImageNormalizer, ImageInput, MemoryStore, config::FetcherConfig};
+
+        let store = Arc::new(MemoryStore::new().with_base_url("http://test.local/dw-img"));
+        let normalizer: Arc<dyn crate::image_normalizer::ImageNormalizer> =
+            Arc::new(DefaultImageNormalizer::new(FetcherConfig::default(), store));
+        let ingested = normalizer
+            .ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string()))
+            .await
+            .expect("ingest");
+        let attribution = crate::api::handlers::images::ImageAttribution {
+            user_id: owner,
+            organization_id: None,
+        };
+        crate::api::handlers::images::record_image_access(pool, attribution, ingested.token, &ingested.mime, ingested.bytes_len).await;
+        (normalizer, ingested.token)
+    }
+
+    fn template_with_token(token: crate::image_normalizer::ImageToken) -> fusillade::RequestTemplateInput {
+        let body = serde_json::json!({
+            "model": "vision",
+            "messages": [{ "role": "user", "content": [
+                { "type": "image_url", "image_url": { "url": token.to_dw_img_uri() } }
+            ]}]
+        });
+        fusillade::RequestTemplateInput {
+            custom_id: Some("req-1".to_string()),
+            endpoint: "chat".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            body: body.to_string(),
+            model: "vision".to_string(),
+            api_key: "unused".to_string(),
+        }
+    }
+
+    #[sqlx::test]
+    async fn upload_keeps_a_token_the_uploader_submitted(pool: PgPool) {
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let (normalizer, token) = normalizer_with_image_owned_by(&pool, owner.id).await;
+        let mut template = template_with_token(token);
+        let attribution = crate::api::handlers::images::ImageAttribution {
+            user_id: owner.id,
+            organization_id: None,
+        };
+
+        super::normalize_template_body_in_place(
+            Some(&normalizer),
+            super::ImageNormalizerMode::AllAndTokens,
+            &mut template,
+            Some(&pool),
+            Some(attribution),
+        )
+        .await
+        .expect("owned token is accepted");
+
+        let body: serde_json::Value = serde_json::from_str(&template.body).unwrap();
+        assert_eq!(body["messages"][0]["content"][0]["image_url"]["url"], token.to_dw_img_uri());
+    }
+
+    #[sqlx::test]
+    async fn upload_refuses_a_token_the_uploader_never_submitted(pool: PgPool) {
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let other = create_test_user(&pool, Role::StandardUser).await;
+        let (normalizer, token) = normalizer_with_image_owned_by(&pool, owner.id).await;
+        let mut template = template_with_token(token);
+        let attribution = crate::api::handlers::images::ImageAttribution {
+            user_id: other.id,
+            organization_id: None,
+        };
+
+        let err = super::normalize_template_body_in_place(
+            Some(&normalizer),
+            super::ImageNormalizerMode::AllAndTokens,
+            &mut template,
+            Some(&pool),
+            Some(attribution),
+        )
+        .await
+        .expect_err("foreign token is refused");
+
+        assert!(matches!(err, super::BatchNormalizeError::BadInput(_)), "{err:?}");
+    }
 
     async fn upload_batch_jsonl(
         app: &axum_test::TestServer,

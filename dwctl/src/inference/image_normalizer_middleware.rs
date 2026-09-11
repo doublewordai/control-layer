@@ -305,6 +305,13 @@ pub async fn image_normalizer_middleware(
 /// Records `image_access` for every ingested image when `access_pool` is
 /// supplied (then `attribution` is required). Returns the number of
 /// substitutions made.
+///
+/// A `dw-img://` token already in the body (a client re-sending a request
+/// it downloaded) is authorised HERE, at submission, against `image_access`
+/// — and kept as is if the caller's user/org submitted the image, refused
+/// (403) otherwise. This is what lets the dispatch loopback sign every token
+/// in a stored body on trust: nothing reaches the store unless our own
+/// ingest produced it under this principal or this check passed.
 pub(crate) async fn normalize_value_to_tokens(
     body: &mut Value,
     normalizer: &Arc<dyn ImageNormalizer>,
@@ -317,6 +324,19 @@ pub(crate) async fn normalize_value_to_tokens(
         let access_pool = access_pool.clone();
         let is_data_uri = url.starts_with("data:");
         async move {
+            if ImageToken::looks_like_token(&url) {
+                let token: ImageToken = url
+                    .parse()
+                    .map_err(|e: TokenParseError| NormalizeError::BadInput(format!("invalid dw-img token: {e}")))?;
+                let (Some(pool), Some(attribution)) = (access_pool.as_ref(), attribution) else {
+                    return Err(NormalizeError::Forbidden);
+                };
+                return match crate::api::handlers::images::is_token_accessible(pool, &attribution, token).await {
+                    Ok(true) => Ok(url),
+                    Ok(false) => Err(NormalizeError::Forbidden),
+                    Err(e) => Err(NormalizeError::Transient(format!("image access lookup failed: {e}"))),
+                };
+            }
             let input = if is_data_uri {
                 ImageInput::DataUri(url)
             } else {
@@ -346,7 +366,7 @@ pub(crate) async fn normalize_value_to_tokens(
             Ok::<String, NormalizeError>(ingested.token.to_dw_img_uri())
         }
     };
-    walker::substitute_with(body, Mode::All, substitute).await
+    walker::substitute_with(body, Mode::AllAndTokens, substitute).await
 }
 
 /// Map a [`NormalizeError`] to an HTTP response. Body shape is a small
@@ -855,6 +875,68 @@ mod tests {
         let (status, body) = post_json_as(build_router(state), None, body_with_token(token)).await;
 
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
+
+    // ---- submission-time token authorisation (flex enqueue) ----
+    //
+    // The dispatch signs every token in a stored body on trust, so the store
+    // must never receive a token the submitter may not use. Enqueue keeps a
+    // token the caller's principal submitted and refuses any other.
+
+    #[sqlx::test]
+    async fn enqueue_keeps_a_token_the_caller_submitted(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::{create_test_api_key_for_user, create_test_user};
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        let state = state_with_pool(&pool);
+        let token = ingest_for_key(&pool, &state, &key.secret).await;
+        let attribution = crate::api::handlers::images::resolve_image_attribution(&pool, &key.secret).await;
+        let mut body = body_with_token(token);
+
+        let n = normalize_value_to_tokens(&mut body, &state.normalizer, Some(pool.clone()), attribution)
+            .await
+            .expect("owned token is accepted");
+
+        assert_eq!(n, 1);
+        assert_eq!(body["messages"][0]["content"][1]["image_url"]["url"], token.to_dw_img_uri());
+    }
+
+    #[sqlx::test]
+    async fn enqueue_refuses_a_token_the_caller_never_submitted(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::{create_test_api_key_for_user, create_test_user};
+
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_key = create_test_api_key_for_user(&pool, owner.id).await;
+        let other = create_test_user(&pool, Role::StandardUser).await;
+        let other_key = create_test_api_key_for_user(&pool, other.id).await;
+        let state = state_with_pool(&pool);
+        let token = ingest_for_key(&pool, &state, &owner_key.secret).await;
+        let attribution = crate::api::handlers::images::resolve_image_attribution(&pool, &other_key.secret).await;
+        let mut body = body_with_token(token);
+
+        let err = normalize_value_to_tokens(&mut body, &state.normalizer, Some(pool.clone()), attribution)
+            .await
+            .expect_err("foreign token is refused");
+
+        assert!(matches!(err, NormalizeError::Forbidden), "{err:?}");
+    }
+
+    /// No bookkeeping pool means no way to authorise, so a token is refused
+    /// rather than persisted on trust.
+    #[tokio::test]
+    async fn enqueue_refuses_a_token_without_a_way_to_authorise_it() {
+        let state = state_for_tests();
+        let token = ingest_unrecorded(&state).await;
+        let mut body = body_with_token(token);
+
+        let err = normalize_value_to_tokens(&mut body, &state.normalizer, None, None)
+            .await
+            .expect_err("unauthorisable token is refused");
+
+        assert!(matches!(err, NormalizeError::Forbidden), "{err:?}");
     }
 
     #[test]
