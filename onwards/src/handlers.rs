@@ -1218,6 +1218,20 @@ pub async fn target_message_handler<T: HttpClient>(
                         .await
                         .is_err()
                     {
+                        // Counted, not just logged: this branch is the point of
+                        // no return for the request. Once the still-open stream
+                        // is forwarded, no retry or fallback can reach the
+                        // client, so an upstream that dies after this leaves no
+                        // proxy-side failure metric at all — the only trace is
+                        // the analytics reclassification of the in-band error
+                        // frame. This counter is what makes that population
+                        // (and the healthy slow-prefill streams that also pass
+                        // through here) attributable without database queries.
+                        metrics::counter!(
+                            "onwards_sse_decisive_wait_expired_total",
+                            "model" => model_name.to_string(),
+                        )
+                        .increment(1);
                         debug!(
                             "Timed out waiting for decisive SSE frame; forwarding stream unmodified"
                         );
