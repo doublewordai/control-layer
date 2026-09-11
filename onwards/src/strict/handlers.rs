@@ -1294,9 +1294,14 @@ async fn sanitize_streaming_responses_response(
 /// SSE hot path).
 ///
 /// Trust gating:
-/// - `trusted = true` (our own endpoints): preserve message/type/code
-///   verbatim — the embedded code is real signal we want downstream to
-///   see (e.g. retry on 500).
+/// - `trusted = true` (our own endpoints): re-emit only the allow-listed
+///   fields (`message`/`type`/`param`/`code`) and drop everything else the
+///   provider attached (e.g. `metadata`, forwarded headers, internal
+///   diagnostics) so provider internals never reach the client. This
+///   mirrors the leading-frame allow-list in `target_message_handler`
+///   (commit `e2bcc8ee`). The embedded `code` is kept verbatim (a JSON
+///   number) so the downstream reassembler's `code.as_u64()` reclassifier
+///   still derives the right HTTP status.
 /// - `trusted = false` (third-party gateways): rewrite message to a
 ///   generic one keyed off the embedded code, and apply
 ///   [`mask_account_class_status`] so account-class codes (401/402/403/451)
@@ -1315,8 +1320,18 @@ fn try_format_sse_error(value: &serde_json::Value, trusted: bool) -> Option<Stri
         // Strip surrounding chunk fields and emit only the error envelope
         // so `event.data.starts_with("{\"error\"")` in the downstream
         // reassembler matches reliably (OpenRouter-shape chunks would
-        // otherwise start with `{"id"`).
-        let envelope = json!({ "error": error_obj });
+        // otherwise start with `{"id"`). Re-emit only the allow-listed
+        // fields; arbitrary provider keys (e.g. `metadata`) are dropped.
+        let envelope = json!({
+            "error": {
+                "message": error_obj.get("message").cloned()
+                    .unwrap_or(json!("The upstream provider rejected the request.")),
+                "type": error_obj.get("type").cloned()
+                    .unwrap_or(json!("invalid_request_error")),
+                "param": error_obj.get("param").cloned(),
+                "code": error_obj.get("code").cloned().unwrap_or(json!(500)),
+            }
+        });
         Some(format!("data: {envelope}"))
     } else {
         // For untrusted providers, replace prose with a generic message
@@ -6189,6 +6204,101 @@ mod tests {
         assert!(line.contains("Input too long"));
     }
 
+    /// Regression for the metadata-leak bug: a trusted provider's
+    /// mid-stream embedded error must re-emit *only* the allow-listed
+    /// fields (`message`/`type`/`param`/`code`). Arbitrary provider keys
+    /// — `metadata`, forwarded headers, internal diagnostics — must be
+    /// dropped so provider internals never reach the client. This mirrors
+    /// the leading-frame allow-list in `target_message_handler`
+    /// (commit `e2bcc8ee`).
+    #[test]
+    fn test_try_format_sse_error_trusted_drops_provider_metadata() {
+        let value = json!({
+            "error": {
+                "message": "image_url.detail must be auto, low or high",
+                "type": "invalid_image_error",
+                "param": "image_url.detail",
+                "code": 400,
+                "metadata": {"private": "not part of the public error"},
+                "headers": {"x-provider-key": "secret"},
+                "debug": {"stack": ["frame_one", "frame_two"]},
+            }
+        });
+        let line = try_format_sse_error(&value, true).expect("trusted embedded error must emit");
+        assert!(
+            line.starts_with("data: "),
+            "expected an SSE data line, got: {line}"
+        );
+        let envelope: serde_json::Value =
+            serde_json::from_str(line.trim_start_matches("data: ")).unwrap();
+        let error = &envelope["error"];
+        // Allow-listed fields are preserved verbatim.
+        assert_eq!(
+            error["message"],
+            "image_url.detail must be auto, low or high"
+        );
+        assert_eq!(error["type"], "invalid_image_error");
+        assert_eq!(error["param"], "image_url.detail");
+        assert_eq!(
+            error["code"], 400,
+            "numeric code kept verbatim for the downstream reassembler"
+        );
+        // Everything else is dropped — no provider internals leak.
+        assert!(
+            error.get("metadata").is_none(),
+            "metadata must not leak mid-stream"
+        );
+        assert!(
+            error.get("headers").is_none(),
+            "forwarded headers must not leak"
+        );
+        assert!(
+            error.get("debug").is_none(),
+            "internal diagnostics must not leak"
+        );
+        // The error object carries exactly the four allow-listed keys.
+        let mut keys: Vec<&str> = error
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            ["code", "message", "param", "type"],
+            "only allow-listed fields survive"
+        );
+    }
+
+    /// A trusted embedded error that omits some allow-listed fields must
+    /// fall back to defaults (matching the leading-frame path) rather than
+    /// forwarding `null`s or absent keys verbatim. The `code` defaults to
+    /// 500 so the downstream reassembler still derives an error status.
+    #[test]
+    fn test_try_format_sse_error_trusted_defaults_for_missing_fields() {
+        let value = json!({"error": {"message": "something went wrong"}});
+        let line = try_format_sse_error(&value, true).expect("must emit");
+        let envelope: serde_json::Value =
+            serde_json::from_str(line.trim_start_matches("data: ")).unwrap();
+        let error = &envelope["error"];
+        assert_eq!(error["message"], "something went wrong");
+        assert_eq!(
+            error["type"], "invalid_request_error",
+            "missing type defaults to invalid_request_error"
+        );
+        assert!(error["param"].is_null(), "missing param serialises as null");
+        assert_eq!(
+            error["code"], 500,
+            "missing code defaults to 500 for the downstream reassembler"
+        );
+        assert_eq!(
+            error.get("metadata"),
+            None,
+            "no metadata key is fabricated by the defaults"
+        );
+    }
+
     #[test]
     fn test_try_format_sse_error_untrusted_sanitizes() {
         let data_part =
@@ -6330,10 +6440,12 @@ mod tests {
     /// as a stand-alone `{"error":...}` line (no surrounding chunk
     /// wrapper), so the downstream reassembler's prefix detector matches.
     /// Pre-fix behaviour forwarded the entire chunk verbatim, which
-    /// started with `{"id"` and slipped past the detector.
+    /// started with `{"id"` and slipped past the detector. Provider
+    /// internals carried in extra keys (e.g. `metadata`) must be dropped
+    /// — only the allow-listed `message`/`type`/`param`/`code` survive.
     #[tokio::test]
     async fn test_streaming_chat_trusted_emits_envelope_only_for_embedded_error() {
-        let chunk_with_embedded_error = "data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"qwen-internal\",\"choices\":[],\"error\":{\"message\":\"Engine was shut down during token generation\",\"type\":\"internal_server_error\",\"code\":500}}\n\n";
+        let chunk_with_embedded_error = "data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"qwen-internal\",\"choices\":[],\"error\":{\"message\":\"Engine was shut down during token generation\",\"type\":\"internal_server_error\",\"param\":null,\"code\":500,\"metadata\":{\"internal\":\"diagnostics\"}}}\n\n";
         let response = Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "text/event-stream")
@@ -6362,6 +6474,66 @@ mod tests {
         assert!(
             !body_str.contains("\"object\":\"chat.completion.chunk\""),
             "chunk wrapper must be stripped from the emitted error event"
+        );
+        // Provider internals (metadata) must not leak to the client —
+        // only the allow-listed fields are re-emitted.
+        assert!(
+            !body_str.contains("metadata"),
+            "trusted mid-stream error must drop metadata, got: {body_str}"
+        );
+        assert!(
+            !body_str.contains("diagnostics"),
+            "provider diagnostics must not leak, got: {body_str}"
+        );
+    }
+
+    /// Regression for the mid-stream metadata leak: the bug fired only
+    /// when an error arrived *after* at least one normal content frame
+    /// (the leading-frame scan handles the head of the stream). A trusted
+    /// provider that streams partial content and then reports a 4xx
+    /// carrying `metadata` must not leak that metadata to the client.
+    #[tokio::test]
+    async fn test_streaming_chat_trusted_drops_metadata_from_midstream_embedded_error() {
+        let content_chunk = "data: {\"id\":\"chunk-1\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"qwen-internal\",\"choices\":[{\"delta\":{\"content\":\"Hello\"},\"index\":0,\"finish_reason\":null}]}\n\n";
+        let error_chunk = "data: {\"id\":\"chunk-2\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\"model\":\"qwen-internal\",\"choices\":[],\"error\":{\"message\":\"image_url.detail must be auto, low or high\",\"type\":\"invalid_image_error\",\"param\":\"image_url.detail\",\"code\":400,\"metadata\":{\"private\":\"not part of the public error\"}}}\n\n";
+        let stream = format!("{content_chunk}{error_chunk}");
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(stream))
+            .unwrap();
+
+        let result =
+            sanitize_streaming_chat_response(response, "test-model".to_string(), true).await;
+        assert_eq!(result.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(result.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_str = String::from_utf8_lossy(&body);
+
+        // The first content frame is forwarded untouched.
+        let content_count = body_str.matches("Hello").count();
+        assert_eq!(
+            content_count, 1,
+            "content frame must survive, got: {body_str}"
+        );
+        // The embedded error is rewritten as a stand-alone envelope.
+        assert!(
+            body_str.contains("data: {\"error\""),
+            "expected a stand-alone error event, got: {body_str}"
+        );
+        // Allow-listed fields are preserved so the caller can act on the error.
+        assert!(body_str.contains("image_url.detail must be auto, low or high"));
+        assert!(body_str.contains("\"code\":400"));
+        // Provider internals must not leak — this is the bug's fix.
+        assert!(
+            !body_str.contains("metadata"),
+            "trusted mid-stream error must drop metadata, got: {body_str}"
+        );
+        assert!(
+            !body_str.contains("not part of the public error"),
+            "provider metadata payload must not leak, got: {body_str}"
         );
     }
 
