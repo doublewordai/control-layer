@@ -50,9 +50,13 @@ pub struct ApiKeyCreate {
 pub struct ApiKeyUpdate {
     pub name: Option<String>,
     pub description: Option<String>,
-    /// Per-API-key rate limit: requests per second (null = no limit, Some(None) = remove limit)
+    /// Per-API-key rate limit: requests per second. Absent = unchanged;
+    /// explicit null = remove the limit (clear to no limit); a value = set it.
+    #[serde(default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
     pub requests_per_second: Option<Option<f32>>,
-    /// Per-API-key rate limit: maximum burst size (null = no limit, Some(None) = remove limit)
+    /// Per-API-key rate limit: maximum burst size. Absent = unchanged;
+    /// explicit null = remove the limit (clear to no limit); a value = set it.
+    #[serde(default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
     pub burst_size: Option<Option<i32>>,
     /// Spending cap (credits). Absent = unchanged; explicit null = remove the
     /// cap; a value = set/change it. Setting a cap where none existed resets
@@ -253,5 +257,55 @@ impl ApiKeyInfoResponse {
             self.resets_at = state.resets_at;
         }
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiKeyUpdate;
+
+    #[test]
+    fn rate_limit_null_decodes_to_clear() {
+        let body: ApiKeyUpdate = serde_json::from_str(r#"{"requests_per_second": null, "burst_size": null}"#).unwrap();
+        assert_eq!(body.requests_per_second, Some(None), "JSON null means clear (Some(None))");
+        assert_eq!(body.burst_size, Some(None), "JSON null means clear (Some(None))");
+    }
+
+    #[test]
+    fn rate_limit_value_decodes_to_set() {
+        let body: ApiKeyUpdate = serde_json::from_str(r#"{"requests_per_second": 5.0, "burst_size": 10}"#).unwrap();
+        assert_eq!(body.requests_per_second, Some(Some(5.0)));
+        assert_eq!(body.burst_size, Some(Some(10)));
+    }
+
+    #[test]
+    fn rate_limit_absent_decodes_to_no_change() {
+        let body: ApiKeyUpdate = serde_json::from_str(r#"{"name": "x"}"#).unwrap();
+        assert_eq!(body.requests_per_second, None, "absent means no change (outer None)");
+        assert_eq!(body.burst_size, None, "absent means no change (outer None)");
+    }
+
+    #[test]
+    fn rate_limit_clear_round_trips() {
+        let body: ApiKeyUpdate = serde_json::from_str(r#"{"requests_per_second": null}"#).unwrap();
+        let json = serde_json::to_value(&body).unwrap();
+        let again: ApiKeyUpdate = serde_json::from_value(json).unwrap();
+        assert_eq!(again.requests_per_second, Some(None), "Some(None) survives serialise/deserialise");
+    }
+
+    #[test]
+    fn rate_limit_absent_is_not_serialised() {
+        let body = ApiKeyUpdate {
+            name: None,
+            description: None,
+            requests_per_second: None,
+            burst_size: None,
+            spend_limit: None,
+            spend_limit_interval: None,
+            reset_window: None,
+        };
+        let obj = serde_json::to_value(&body).unwrap().as_object().unwrap().clone();
+        assert!(!obj.contains_key("requests_per_second"), "absent field must not be serialised");
+        assert!(!obj.contains_key("burst_size"), "absent field must not be serialised");
     }
 }

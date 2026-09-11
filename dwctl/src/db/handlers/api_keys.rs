@@ -254,11 +254,11 @@ impl<'c> Repository for ApiKeys<'c> {
                     ELSE description
                 END,
                 requests_per_second = CASE
-                    WHEN $4::real IS NOT NULL THEN $4
+                    WHEN $4 THEN $5
                     ELSE requests_per_second
                 END,
                 burst_size = CASE
-                    WHEN $5::integer IS NOT NULL THEN $5
+                    WHEN $6 THEN $7
                     ELSE burst_size
                 END
             WHERE id = $1
@@ -267,8 +267,10 @@ impl<'c> Repository for ApiKeys<'c> {
             id,
             request.name,
             request.description,
-            request.requests_per_second.unwrap_or(None),
-            request.burst_size.unwrap_or(None)
+            request.requests_per_second.is_some() as bool,
+            request.requests_per_second.as_ref().and_then(|inner| inner.as_ref()),
+            request.burst_size.is_some() as bool,
+            request.burst_size.as_ref().and_then(|inner| inner.as_ref())
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -1559,6 +1561,110 @@ mod tests {
         let keys = api_repo.list(&ApiKeyFilter::new(0, 10, None)).await.unwrap();
         assert!(!keys.is_empty());
         assert!(keys.iter().any(|k| k.name == "Updated Key Name"));
+    }
+
+    /// Tri-state rate-limit update: `None` = keep, `Some(None)` = clear to NULL,
+    /// `Some(Some(v))` = set. The pre-fix repo collapsed `Some(None)` and `None`
+    /// into the same SQL NULL and kept the old value (the documented "remove
+    /// limit" capability silently did nothing).
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_rate_limit_tri_state(pool: PgPool) {
+        let user = create_user(&pool, "rps-user").await;
+
+        // Create a key WITH rate limits set.
+        let mut conn = pool.acquire().await.unwrap();
+        let created = ApiKeys::new(&mut conn)
+            .create(&ApiKeyCreateDBRequest {
+                user_id: user,
+                name: "capped".to_string(),
+                description: None,
+                purpose: ApiKeyPurpose::Realtime,
+                requests_per_second: Some(7.0),
+                burst_size: Some(14),
+                created_by: user,
+                spend_limit: None,
+                spend_limit_interval: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(created.requests_per_second, Some(7.0));
+        assert_eq!(created.burst_size, Some(14));
+
+        // Some(None) clears both columns to NULL.
+        let mut conn = pool.acquire().await.unwrap();
+        let cleared = ApiKeys::new(&mut conn)
+            .update(
+                created.id,
+                &ApiKeyUpdateDBRequest {
+                    name: None,
+                    description: None,
+                    requests_per_second: Some(None),
+                    burst_size: Some(None),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared.requests_per_second, None, "Some(None) must clear rps to NULL");
+        assert_eq!(cleared.burst_size, None, "Some(None) must clear burst to NULL");
+
+        let rps: Option<f32> = sqlx::query_scalar!("SELECT requests_per_second FROM api_keys WHERE id = $1", created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let burst: Option<i32> = sqlx::query_scalar!("SELECT burst_size FROM api_keys WHERE id = $1", created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rps, None, "DB rps column is NULL after clear");
+        assert_eq!(burst, None, "DB burst column is NULL after clear");
+
+        // Absent (outer None) keeps the current (now NULL) value; unrelated
+        // fields (name) still update.
+        let mut conn = pool.acquire().await.unwrap();
+        let kept = ApiKeys::new(&mut conn)
+            .update(
+                created.id,
+                &ApiKeyUpdateDBRequest {
+                    name: Some("renamed".to_string()),
+                    description: None,
+                    requests_per_second: None,
+                    burst_size: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(kept.name, "renamed");
+        assert_eq!(kept.requests_per_second, None, "absent keeps the cleared NULL");
+        assert_eq!(kept.burst_size, None, "absent keeps the cleared NULL");
+
+        // Some(Some(v)) sets a new value.
+        let mut conn = pool.acquire().await.unwrap();
+        let set_again = ApiKeys::new(&mut conn)
+            .update(
+                created.id,
+                &ApiKeyUpdateDBRequest {
+                    name: None,
+                    description: None,
+                    requests_per_second: Some(Some(3.0)),
+                    burst_size: Some(Some(6)),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(set_again.requests_per_second, Some(3.0));
+        assert_eq!(set_again.burst_size, Some(6));
+
+        let rps: Option<f32> = sqlx::query_scalar!("SELECT requests_per_second FROM api_keys WHERE id = $1", created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let burst: Option<i32> = sqlx::query_scalar!("SELECT burst_size FROM api_keys WHERE id = $1", created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rps, Some(3.0), "DB rps column reflects the set value");
+        assert_eq!(burst, Some(6), "DB burst column reflects the set value");
     }
 
     // Tests for group-based API key access control

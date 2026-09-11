@@ -1215,6 +1215,90 @@ mod tests {
             .assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
+    /// End-to-end: a PATCH with `{"requests_per_second": null, "burst_size": null}`
+    /// must clear BOTH per-key rate-limit columns to NULL. Pre-fix the endpoint
+    /// returned `200 OK` and silently left the old values in place.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_patch_api_key_rate_limit_clear_via_null(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let auth = add_auth_headers(&user);
+
+        // Create a key WITH per-key rate limits set.
+        let created: ApiKeyResponse = app
+            .post("/admin/api/v1/users/current/api-keys")
+            .json(&json!({"name": "capped-rps", "requests_per_second": 10.0, "burst_size": 20}))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        assert_eq!(created.requests_per_second, Some(10.0));
+        assert_eq!(created.burst_size, Some(20));
+
+        // PATCH with explicit null must clear both columns to NULL.
+        let resp = patch_key(&app, &user, created.id, json!({"requests_per_second": null, "burst_size": null})).await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body: ApiKeyInfoResponse = resp.json();
+        assert_eq!(body.requests_per_second, None, "explicit null must clear rps in the response");
+        assert_eq!(body.burst_size, None, "explicit null must clear burst in the response");
+
+        // Confirm the DB columns are actually NULL (not just the response).
+        let rps: Option<f32> = sqlx::query_scalar!("SELECT requests_per_second FROM api_keys WHERE id = $1", created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let burst: Option<i32> = sqlx::query_scalar!("SELECT burst_size FROM api_keys WHERE id = $1", created.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rps, None, "DB rps column is NULL after clear");
+        assert_eq!(burst, None, "DB burst column is NULL after clear");
+    }
+
+    /// End-to-end: set from NULL, absent keeps the value, and clearing one
+    /// field leaves the other untouched (independent tri-state per field).
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_patch_api_key_rate_limit_set_absent_and_partial_clear(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let auth = add_auth_headers(&user);
+
+        // Create with no limits.
+        let created: ApiKeyResponse = app
+            .post("/admin/api/v1/users/current/api-keys")
+            .json(&json!({"name": "no-limit"}))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await
+            .json();
+        assert_eq!(created.requests_per_second, None);
+        assert_eq!(created.burst_size, None);
+
+        // Set limits via PATCH.
+        let resp = patch_key(&app, &user, created.id, json!({"requests_per_second": 5.0, "burst_size": 8})).await;
+        resp.assert_status_ok();
+        let body: ApiKeyInfoResponse = resp.json();
+        assert_eq!(body.requests_per_second, Some(5.0));
+        assert_eq!(body.burst_size, Some(8));
+
+        // Absent rate-limit fields keep their value (PATCH only the name).
+        let resp = patch_key(&app, &user, created.id, json!({"name": "renamed"})).await;
+        resp.assert_status_ok();
+        let body: ApiKeyInfoResponse = resp.json();
+        assert_eq!(body.name, "renamed");
+        assert_eq!(body.requests_per_second, Some(5.0), "absent rate fields keep their value");
+        assert_eq!(body.burst_size, Some(8), "absent rate fields keep their value");
+
+        // Clear rps only; burst must remain untouched.
+        let resp = patch_key(&app, &user, created.id, json!({"requests_per_second": null})).await;
+        resp.assert_status_ok();
+        let body: ApiKeyInfoResponse = resp.json();
+        assert_eq!(body.requests_per_second, None, "clear rps only");
+        assert_eq!(body.burst_size, Some(8), "burst untouched when rps cleared independently");
+    }
+
     #[sqlx::test]
     #[test_log::test]
     async fn test_patch_api_key_permissions_and_system_keys(pool: PgPool) {
