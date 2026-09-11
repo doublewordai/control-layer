@@ -2592,6 +2592,7 @@ mod tests {
                 sync_interval: std::time::Duration::from_secs(3600),
                 default_models: None,
             }],
+            model_provisioning: Default::default(),
             metadata: crate::config::Metadata {
                 region: Some("Test Region".to_string()),
                 organization: Some("Test Org".to_string()),

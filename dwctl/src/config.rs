@@ -140,6 +140,8 @@ pub struct Config {
     pub secret_key: Option<String>,
     /// Model sources for syncing available models
     pub model_sources: Vec<ModelSource>,
+    /// Declarative model catalog applied transactionally during startup.
+    pub model_provisioning: ModelProvisioningConfig,
     /// Frontend metadata displayed in the UI
     pub metadata: Metadata,
     /// Payment provider configuration (Stripe, PayPal, etc.)
@@ -3019,6 +3021,7 @@ impl Default for Config {
             admin_password: Some("hunter2".to_string()),
             secret_key: None,
             model_sources: vec![],
+            model_provisioning: ModelProvisioningConfig::default(),
             metadata: Metadata::default(),
             payment: None,
             auth: AuthConfig::default(),
@@ -3056,6 +3059,25 @@ impl Default for ModelSource {
             api_key: None,
             sync_interval: Duration::from_secs(10),
             default_models: None,
+        }
+    }
+}
+
+/// Startup model provisioning configuration.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModelProvisioningConfig {
+    /// When false, startup does not read the directory or alter provisioning markers.
+    pub enabled: bool,
+    /// Directory containing rendered model catalog YAML documents.
+    pub directory: PathBuf,
+}
+
+impl Default for ModelProvisioningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            directory: PathBuf::from("/app/model-provisioning.d"),
         }
     }
 }
