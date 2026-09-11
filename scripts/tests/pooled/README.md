@@ -66,3 +66,18 @@ To check that the test detects a listener-routing regression, temporarily replac
 `DynPools::new(pools.main.pooled.clone())` in the application's listener provider,
 build a separate binary, and run the harness against it. The notification test
 must fail before its 15-second deadline; restore the production code afterwards.
+
+## Migrations with retained prepared statements
+
+After the session-isolation checks, the same PgBouncer process switches off
+`server_reset_query_always`. A negative control prepares a wildcard query on both
+backends, adds a column through a direct connection, and verifies PostgreSQL's
+`cached plan must not change result type` error from both an existing client and
+a fresh client. This assertion prevents a fixture that silently clears prepared
+statements from making the migration checks pass.
+
+The application then warms the models list queries, adds an unused model column
+through the direct connection, and verifies unchanged HTTP responses from the
+running application and after an application restart. PgBouncer stays alive.
+Both shared and scoped CI jobs run this phase. Reintroducing `SELECT dm.*` in the
+models list must fail the HTTP assertion after the column is added.
