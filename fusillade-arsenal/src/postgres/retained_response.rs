@@ -963,13 +963,12 @@ const RETAINED_OBJECT_COLUMNS: &str = "object.delete_on, object.group_id, object
     object.object_id, object.request_id, object.created_by, object.service_tier, object.state, \
     object.model, object.created_at, object.terminal_at, object.schema_version, object.payload";
 
-pub(crate) async fn get_request_detail<P: PoolProvider>(
-    manager: &PostgresRequestManager<P>,
-    request_id: RequestId,
-) -> Result<RequestDetail> {
-    let mut tx = begin_primary_read(manager).await?;
-    let live = sqlx::query_as::<_, RequestDetail>(
-        r#"
+// Fence the identity lookup before ownership filtering. A sparse partial user
+// index must not become the access path for a request-ID lookup.
+const LIVE_REQUEST_DETAIL_SQL: &str = r#"
+        WITH request_by_id AS MATERIALIZED (
+            SELECT * FROM requests WHERE id = $1
+        )
         SELECT
             request.id, request.batch_id, request.model, request.state,
             request.created_at, request.completed_at, request.failed_at,
@@ -981,18 +980,24 @@ pub(crate) async fn get_request_detail<P: PoolProvider>(
                 THEN template.body ELSE NULL END AS body,
             request.response_body, request.error, request.service_tier,
             request.created_by
-        FROM requests request
+        FROM request_by_id request
         LEFT JOIN LATERAL (
             SELECT * FROM request_templates_all t WHERE t.id = request.template_id LIMIT 1
         ) template ON TRUE
         LEFT JOIN files file ON template.file_id = file.id
         WHERE request.id = $1 AND request.created_by IS NOT NULL
-        "#,
-    )
-    .bind(request_id.0)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(read_database_failure)?;
+        "#;
+
+pub(crate) async fn get_request_detail<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    request_id: RequestId,
+) -> Result<RequestDetail> {
+    let mut tx = begin_primary_read(manager).await?;
+    let live = sqlx::query_as::<_, RequestDetail>(LIVE_REQUEST_DETAIL_SQL)
+        .bind(request_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(read_database_failure)?;
 
     let detail = if let Some(live) = live {
         Some(live)
@@ -3694,6 +3699,7 @@ async fn archive_batchless_responses<P: PoolProvider>(
     if policy.batchless_seconds_by_service_tier.is_empty() {
         return Ok(RetainedResponseArchiveOutcome::default());
     }
+    super::request_maintenance::before_archive(manager).await?;
     let index_ready: bool =
         sqlx::query_scalar("SELECT retained_response_archive_index_ready(current_schema())")
             .fetch_one(manager.read_executor())
@@ -3870,6 +3876,84 @@ mod tests {
     use serde_json::json;
     use sqlx::PgPool;
     use uuid::Uuid;
+
+    #[sqlx::test]
+    async fn detail_lookup_avoids_sparse_user_index_after_mass_deletion(pool: PgPool) {
+        sqlx::query("INSERT INTO requests (model, created_by) SELECT 'test', 'owner' FROM generate_series(1, 20000)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("ANALYZE requests")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let id: Uuid = sqlx::query_scalar("SELECT id FROM requests LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM requests WHERE id <> $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Reproduce the misleading partial-index estimate independently of the
+        // random ANALYZE sample. Catalog mutation is confined to this test DB.
+        sqlx::query("UPDATE pg_class SET reltuples = 0 WHERE oid = 'idx_requests_user_created_sort'::regclass")
+            .execute(&pool).await.unwrap();
+        let plan: serde_json::Value =
+            sqlx::query_scalar(&format!("EXPLAIN (FORMAT JSON) {LIVE_REQUEST_DETAIL_SQL}"))
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            plan_uses_index(&plan, "requests_pkey"),
+            "identity lookup must use the primary key: {plan}"
+        );
+        assert!(!plan_uses_index(&plan, "idx_requests_user_created_sort"));
+
+        // Cost estimates on a small fixture can still favor the primary key
+        // even with the original unfenced query. Make the competing path
+        // the only available index in this isolated test transaction, and
+        // verify that the ownership predicate cannot make it eligible.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE pg_index SET indisvalid = false WHERE indrelid = 'requests'::regclass AND indexrelid <> 'idx_requests_user_created_sort'::regclass",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("SET LOCAL enable_bitmapscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let unfenced: serde_json::Value = sqlx::query_scalar(
+            "EXPLAIN (FORMAT JSON) SELECT id FROM requests WHERE id = $1 AND created_by IS NOT NULL",
+        ).bind(id).fetch_one(&mut *tx).await.unwrap();
+        assert!(
+            plan_uses_index(&unfenced, "idx_requests_user_created_sort"),
+            "control query must expose the dangerous path: {unfenced}"
+        );
+        let fenced: serde_json::Value =
+            sqlx::query_scalar(&format!("EXPLAIN (FORMAT JSON) {LIVE_REQUEST_DETAIL_SQL}"))
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert!(
+            !plan_uses_index(&fenced, "idx_requests_user_created_sort"),
+            "the detail lookup must keep the partial index ineligible: {fenced}"
+        );
+        tx.rollback().await.unwrap();
+        let detail = sqlx::query_as::<_, RequestDetail>(LIVE_REQUEST_DETAIL_SQL)
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(detail.id, id);
+    }
 
     fn timestamp(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
