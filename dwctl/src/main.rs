@@ -1,5 +1,6 @@
-use clap::Parser;
-use dwctl::{Application, Config, telemetry};
+use clap::{Parser, Subcommand};
+use dwctl::config::Args;
+use dwctl::{Application, Config, migrations, telemetry};
 
 // jemalloc, for its decay behaviour rather than its allocation speed.
 //
@@ -88,9 +89,37 @@ fn main() -> anyhow::Result<()> {
         .block_on(async_main())
 }
 
+/// `dwctl` serves by default; `dwctl migrate` applies schema migrations and
+/// exits, for running from a pre-rollout Job with the release image.
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[command(flatten)]
+    args: Args,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Apply pending schema migrations to every configured database (main,
+    /// fusillade, underway, and outlet when request logging is enabled), then
+    /// exit. Repairs interrupted concurrent index builds first and verifies
+    /// the result. Safe to rerun; competing runners serialise on a database
+    /// advisory lock. Uses the same connection configuration as the server
+    /// (direct endpoints only).
+    Migrate {
+        /// Verify schema compatibility without executing any DDL, exiting
+        /// non-zero when the database is behind this release.
+        #[arg(long)]
+        check: bool,
+    },
+}
+
 async fn async_main() -> anyhow::Result<()> {
     // Parse CLI args
-    let args = dwctl::config::Args::parse();
+    let cli = Cli::parse();
+    let args = cli.args;
 
     // Load configuration
     let config = Config::load(&args)?;
@@ -108,6 +137,23 @@ async fn async_main() -> anyhow::Result<()> {
     let tracer_provider = telemetry::init_telemetry(config.enable_otel_export)?;
 
     tracing::debug!("{:?}", args);
+
+    if let Some(Command::Migrate { check }) = cli.command {
+        let result = migrations::run_command(&config, check).await;
+        if let Some(provider) = tracer_provider {
+            let _ = provider.shutdown();
+        }
+        return match result {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                // `{:#}` prints the context chain (target, migration version)
+                // ahead of the driver error, which is what an operator reading
+                // a failed Job needs first.
+                tracing::error!(error = format!("{error:#}"), "dwctl migrate failed");
+                Err(error)
+            }
+        };
+    }
 
     // Run the application with graceful shutdown on SIGTERM/Ctrl+C
     let shutdown = shutdown_signal();

@@ -159,6 +159,7 @@ pub mod keystore;
 mod leader_election;
 pub mod limits;
 mod metrics;
+pub mod migrations;
 pub mod model_provisioning;
 mod notifications;
 mod openapi;
@@ -655,7 +656,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
 /// set at the connection level (via `PgConnectOptions::options`) rather than
 /// with an `after_connect` hook, so it cannot be unset and works with replicas.
 /// Eager connection (`connect_with`) so `min_connections` is honoured at boot.
-async fn create_schema_pool(
+pub(crate) async fn create_schema_pool(
     schema: &str,
     opts: sqlx::postgres::PgConnectOptions,
     settings: &config::PoolSettings,
@@ -665,7 +666,7 @@ async fn create_schema_pool(
     db::pool_options(settings).connect_with(opts_with_schema).await
 }
 
-fn connect_options(url: &str, slow_threshold: std::time::Duration) -> anyhow::Result<PgConnectOptions> {
+pub(crate) fn connect_options(url: &str, slow_threshold: std::time::Duration) -> anyhow::Result<PgConnectOptions> {
     Ok(PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold))
 }
 
@@ -700,7 +701,7 @@ async fn verify_schema_on_default_search_path(component_name: &str, schema: &str
 /// creating schemas or migrating. Names, catalog OIDs and system identifiers can
 /// survive cloning; contention on a fresh database-scoped lock cannot. Both locks
 /// are transaction scoped so errors and cancellation cannot leak session locks.
-async fn verify_same_live_database(component_name: &str, main: &PgPool, component: &PgPool) -> anyhow::Result<()> {
+pub(crate) async fn verify_same_live_database(component_name: &str, main: &PgPool, component: &PgPool) -> anyhow::Result<()> {
     let challenge = Uuid::new_v4().as_u128() as i64;
     let mut main_transaction = main.begin().await?;
     let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
@@ -1321,7 +1322,7 @@ async fn setup_database(
             .await
             .expect("Failed to create TestDbPools");
         let replica_pool = test_pools.read().into_inner();
-        migrator().run(&existing_pool).await?;
+        migrations::at_startup(config.migrations.mode, &migrations::Target::main(), &existing_pool).await?;
         (None, db::PoolPair::unsplit(DbPools::with_replica(existing_pool, replica_pool)))
     } else {
         // Database connection - handle both embedded and external
@@ -1365,8 +1366,10 @@ async fn setup_database(
             .connect_with(connect_options(&database_url, slow_threshold)?)
             .await?;
 
-        // Migrations take a session-level advisory lock: always a direct connection.
-        migrator().run(&direct).await?;
+        // Migrations take a session-level advisory lock: always a direct
+        // connection. `migrations.mode` decides whether this process applies
+        // them or only verifies the schema is compatible.
+        migrations::at_startup(config.migrations.mode, &migrations::Target::main(), &direct).await?;
 
         let replica = match config.database.external_replica_url() {
             Some(replica_url) => {
@@ -1421,7 +1424,7 @@ async fn setup_database(
     info!("Setting up fusillade batch processing pool");
     let fusillade = setup_component_pools("fusillade", config.database.fusillade(), &main, slow_threshold).await?;
     // sqlx's migrator holds a session advisory lock: direct connections.
-    fusillade_arsenal::migrator().run(&*fusillade.direct.write()).await?;
+    migrations::at_startup(config.migrations.mode, &migrations::Target::fusillade(), &fusillade.direct.write()).await?;
 
     // Every batch-capable process performs the content-free preflight, even
     // when its daemon is disabled. That makes disabling the last archive
@@ -1596,13 +1599,13 @@ async fn setup_database(
 
     // Underway migrations (background task queue) — one transaction, but keep
     // them on the direct connection like every other migration.
-    underway::run_migrations(&*main.direct.write()).await?;
+    migrations::underway_at_startup(config.migrations.mode, &main.direct.write()).await?;
 
     // Outlet request-logging pools, if enabled
     let outlet = if config.enable_request_logging {
         info!("Setting up outlet request logging pool (logging enabled)");
         let outlet = setup_component_pools("outlet", config.database.outlet(), &main, slow_threshold).await?;
-        outlet_postgres::migrator().run(&*outlet.direct.write()).await?;
+        migrations::at_startup(config.migrations.mode, &migrations::Target::outlet(), &outlet.direct.write()).await?;
         Some(outlet)
     } else {
         info!("Skipping outlet pool setup (logging disabled)");

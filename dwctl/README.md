@@ -252,7 +252,11 @@ sqlx database reset # add `-y` to skip confirmation and `-f` if you get a
 
 ## Database Schema
 
-Migrations are stored in the `migrations/` directory, and run automatically on startup.
+Migrations are stored in the `migrations/` directory. By default they run
+automatically on startup (`migrations.mode: run`); deployments run them from a
+pre-rollout Job with `dwctl migrate` and set `migrations.mode: check` on the
+serving pods. See [docs/migrations.md](../docs/migrations.md) for how to add
+migrations, concurrent indexes and destructive changes.
 
 - `001_initial.sql` - Users, groups, models tables
 - `002_listen_notify.sql` - PostgreSQL notify triggers
