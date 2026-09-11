@@ -373,6 +373,116 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
     Ok(())
 }
 
+/// What one parsed JSONL record of a synced file becomes.
+enum SyncedRecord {
+    /// Store this template; `line_error` is its tier-2 validation error, if any
+    /// (the template is still stored, with a scrubbed body, so it becomes a
+    /// failed request).
+    Template {
+        template: fusillade::RequestTemplateInput,
+        line_error: Option<String>,
+    },
+    /// The record could not be checked right now (a retryable failure);
+    /// abort this ingest so the job can run again.
+    Abort,
+}
+
+/// Turn one parsed JSONL record into the template to store. ONE path for both
+/// the newline-terminated records of the main loop and the unterminated final
+/// record, so every rule — validation, `priority` stripping and the
+/// `dw-img://` token authorisation the trusted dispatch path relies on —
+/// applies to every record.
+async fn prepare_synced_record(
+    parsed: serde_json::Value,
+    line_number: u64,
+    api_path: &str,
+    ai_base_url: &str,
+    token_pool: &sqlx::PgPool,
+    token_attribution: crate::api::handlers::images::ImageAttribution,
+) -> SyncedRecord {
+    let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();
+    let body = parsed.get("body").map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string());
+    let model = parsed
+        .get("body")
+        .and_then(|b| b.get("model"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Collect validation errors (tier 2) — still ingest the template
+    let mut line_error: Option<String> = None;
+
+    if !matches!(method.as_str(), "POST" | "GET" | "PUT" | "PATCH" | "DELETE") {
+        line_error = Some(format!("invalid HTTP method: {method}"));
+    } else if model.is_empty() {
+        line_error = Some("missing model field in body".to_string());
+    } else {
+        const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
+        if body.len() > MAX_BODY_SIZE {
+            line_error = Some(format!("oversized body: {} bytes", body.len()));
+        }
+    }
+    if line_error.is_none()
+        && let Some(ref cid) = custom_id
+        && cid.chars().any(|c| c.is_control())
+    {
+        line_error = Some("control characters in custom_id".to_string());
+    }
+
+    // Synced bodies are stored as is (the edge normalises image URLs at
+    // dispatch), but a `dw-img://` token already in the record must be
+    // authorised NOW: the dispatch signs every token in a stored body on
+    // trust. Not ours to use → tier-2 error; could not check → abort.
+    if line_error.is_none()
+        && body.contains("dw-img://")
+        && let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body)
+    {
+        match crate::api::handlers::files::authorize_submitted_tokens(&mut body_val, token_pool, token_attribution).await {
+            Ok(()) => {}
+            Err(e) if e.is_retryable() => {
+                tracing::error!(
+                    line_num = line_number,
+                    error = e.message(),
+                    "Could not authorise image token in synced record; aborting ingest"
+                );
+                return SyncedRecord::Abort;
+            }
+            Err(e) => line_error = Some(e.message().to_string()),
+        }
+    }
+
+    // For tier-2 errors, scrub the body to avoid storing large/invalid
+    // payloads — the template exists only so it becomes a failed request.
+    let body = if line_error.is_some() {
+        "{}".to_string()
+    } else {
+        // Strip `priority` from body if present and re-serialize
+        if let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body) {
+            if body_val.as_object_mut().is_some_and(|o| o.remove("priority").is_some()) {
+                serde_json::to_string(&body_val).unwrap_or(body)
+            } else {
+                body
+            }
+        } else {
+            body
+        }
+    };
+
+    let template = fusillade::RequestTemplateInput {
+        custom_id,
+        endpoint: ai_base_url.to_string(),
+        method,
+        // Always use the configured endpoint — ignore per-line url to prevent
+        // targeting unsupported/internal paths (consistent with batch-level routing).
+        path: api_path.to_string(),
+        body,
+        model,
+        api_key: String::new(), // Set at batch activation via batch.api_key
+    };
+    SyncedRecord::Template { template, line_error }
+}
+
 pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'static>(
     state: &TaskState<P>,
     input: &IngestFileInput,
@@ -573,60 +683,15 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                 // Tier 3: valid → ingest normally
                 match serde_json::from_str::<serde_json::Value>(line) {
                     Ok(parsed) => {
-                        let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
-                        let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();
-                        // Always use the configured endpoint — ignore per-line url to prevent
-                        // targeting unsupported/internal paths (consistent with batch-level routing).
-                        let url = api_path.clone();
-                        let body = parsed.get("body").map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string());
-                        let model = parsed
-                            .get("body")
-                            .and_then(|b| b.get("model"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
-
-                        // Collect validation errors (tier 2) — still ingest the template
-                        let mut line_error: Option<String> = None;
-
-                        if !matches!(method.as_str(), "POST" | "GET" | "PUT" | "PATCH" | "DELETE") {
-                            line_error = Some(format!("invalid HTTP method: {method}"));
-                        } else if model.is_empty() {
-                            line_error = Some("missing model field in body".to_string());
-                        } else {
-                            const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
-                            if body.len() > MAX_BODY_SIZE {
-                                line_error = Some(format!("oversized body: {} bytes", body.len()));
-                            }
-                        }
-                        if line_error.is_none()
-                            && let Some(ref cid) = custom_id
-                            && cid.chars().any(|c| c.is_control())
-                        {
-                            line_error = Some("control characters in custom_id".to_string());
-                        }
-
-                        // Synced bodies are stored as is (the edge normalises image
-                        // URLs at dispatch), but a `dw-img://` token already in the
-                        // line must be authorised NOW: the dispatch signs every token
-                        // in a stored body on trust. Not ours to use → tier-2 error;
-                        // could not check → abort this ingest so it can be retried.
-                        if line_error.is_none()
-                            && body.contains("dw-img://")
-                            && let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body)
-                        {
-                            match crate::api::handlers::files::authorize_submitted_tokens(&mut body_val, &token_pool, token_attribution)
-                                .await
+                        let (template, line_error) =
+                            match prepare_synced_record(parsed, line_number, &api_path, &ai_base_url, &token_pool, token_attribution).await
                             {
-                                Ok(()) => {}
-                                Err(e) if e.is_retryable() => {
-                                    tracing::error!(line_num = line_number, error = e.message(), "Could not authorise image token in synced line; aborting ingest");
+                                SyncedRecord::Template { template, line_error } => (template, line_error),
+                                SyncedRecord::Abort => {
                                     let _ = tx.send(FileStreamItem::Abort).await;
                                     return (template_count, skipped_lines, validation_errors);
                                 }
-                                Err(e) => line_error = Some(e.message().to_string()),
-                            }
-                        }
+                            };
 
                         if let Some(ref err) = line_error {
                             if validation_errors.len() < MAX_LINE_WARNINGS as usize {
@@ -638,33 +703,6 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                                 validation_errors.push((template_count, line_number, err.clone()));
                             }
                         }
-
-                        // For tier-2 errors, scrub the body to avoid storing large/invalid
-                        // payloads — the template exists only so it becomes a failed request.
-                        let body = if line_error.is_some() {
-                            "{}".to_string()
-                        } else {
-                            // Strip `priority` from body if present and re-serialize
-                            if let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body) {
-                                if body_val.as_object_mut().is_some_and(|o| o.remove("priority").is_some()) {
-                                    serde_json::to_string(&body_val).unwrap_or(body)
-                                } else {
-                                    body
-                                }
-                            } else {
-                                body
-                            }
-                        };
-
-                        let template = fusillade::RequestTemplateInput {
-                            custom_id,
-                            endpoint: ai_base_url.clone(),
-                            method,
-                            path: url,
-                            body,
-                            model,
-                            api_key: String::new(), // Set at batch activation via batch.api_key
-                        };
 
                         if tx.send(FileStreamItem::Template(template)).await.is_err() {
                             return (template_count, skipped_lines, validation_errors);
@@ -703,37 +741,14 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
             line_number += 1;
             match serde_json::from_str::<serde_json::Value>(remaining) {
                 Ok(parsed) => {
-                    let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();
-                    // Always use the configured endpoint — ignore per-line url to prevent
-                    // targeting unsupported/internal paths (consistent with batch-level routing).
-                    let url = api_path.clone();
-                    let body = parsed.get("body").map(|v| v.to_string()).unwrap_or_else(|| "{}".to_string());
-                    let model = parsed
-                        .get("body")
-                        .and_then(|b| b.get("model"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    let mut line_error: Option<String> = None;
-
-                    if !matches!(method.as_str(), "POST" | "GET" | "PUT" | "PATCH" | "DELETE") {
-                        line_error = Some(format!("invalid HTTP method: {method}"));
-                    } else if model.is_empty() {
-                        line_error = Some("missing model field in body".to_string());
-                    } else {
-                        const MAX_BODY_SIZE: usize = 10 * 1024 * 1024;
-                        if body.len() > MAX_BODY_SIZE {
-                            line_error = Some(format!("oversized body: {} bytes", body.len()));
-                        }
-                    }
-                    if line_error.is_none()
-                        && let Some(ref cid) = custom_id
-                        && cid.chars().any(|c| c.is_control())
-                    {
-                        line_error = Some("control characters in custom_id".to_string());
-                    }
+                    let (template, line_error) =
+                        match prepare_synced_record(parsed, line_number, &api_path, &ai_base_url, &token_pool, token_attribution).await {
+                            SyncedRecord::Template { template, line_error } => (template, line_error),
+                            SyncedRecord::Abort => {
+                                let _ = tx.send(FileStreamItem::Abort).await;
+                                return (template_count, skipped_lines, validation_errors);
+                            }
+                        };
 
                     if let Some(ref err) = line_error {
                         if validation_errors.len() < MAX_LINE_WARNINGS as usize {
@@ -744,31 +759,6 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                         }
                     }
 
-                    // For tier-2 errors, scrub the body to avoid storing large/invalid payloads
-                    let body = if line_error.is_some() {
-                        "{}".to_string()
-                    } else {
-                        // Strip `priority` from body if present and re-serialize
-                        if let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body) {
-                            if body_val.as_object_mut().is_some_and(|o| o.remove("priority").is_some()) {
-                                serde_json::to_string(&body_val).unwrap_or(body)
-                            } else {
-                                body
-                            }
-                        } else {
-                            body
-                        }
-                    };
-
-                    let template = fusillade::RequestTemplateInput {
-                        custom_id,
-                        endpoint: ai_base_url.clone(),
-                        method,
-                        path: url,
-                        body,
-                        model,
-                        api_key: String::new(),
-                    };
                     if tx.send(FileStreamItem::Template(template)).await.is_err() {
                         return (template_count, skipped_lines, validation_errors);
                     }

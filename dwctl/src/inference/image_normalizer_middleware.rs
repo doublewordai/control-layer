@@ -978,8 +978,8 @@ mod tests {
     async fn a_repeated_dispatch_reads_the_image_prefix_it_wrote_while_upstream_gets_signed_urls(pool: sqlx::PgPool) {
         use crate::api::models::users::Role;
         use crate::prompt_cache::{
-            CacheIndex, CacheLayerState, Classifier, IndexScope, ModelConfigResolver, PostgresIndex, PrincipalResolver,
-            TelemetryPolicy, TierPolicy, TokenizerClient, cache_middleware, parse_chat_completions,
+            CacheIndex, CacheLayerState, Classifier, IndexScope, ModelConfigResolver, PostgresIndex, PrincipalResolver, TelemetryPolicy,
+            TierPolicy, TokenizerClient, cache_middleware, parse_chat_completions,
         };
         use crate::test::utils::{create_test_endpoint, create_test_model, create_test_user};
         use wiremock::matchers::{method, path};
