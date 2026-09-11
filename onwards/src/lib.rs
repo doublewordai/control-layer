@@ -3090,6 +3090,56 @@ mod tests {
         }
     }
 
+    /// End-to-end coverage for pool-level `response_headers` flowing through
+    /// `Targets::from_config` (the `build_pool` path) into the live HTTP
+    /// response. The `response_headers_pricing` module above exercises the
+    /// per-provider path via `Target::builder().response_headers(...)`; this
+    /// module drives the config-parse path that previously dropped pool-level
+    /// headers. See docs/src/response-headers.md ("provider-level headers
+    /// take precedence").
+    mod response_headers_pool_level_e2e {
+        use super::*;
+        use crate::target::ConfigFile;
+
+        /// Pool-level headers must appear on the outgoing HTTP response when no
+        /// per-provider headers are set (the documented default-for-all path).
+        #[tokio::test]
+        async fn pool_level_response_headers_reach_outgoing_http_response() {
+            let json = r#"{
+                "targets": {
+                    "gpt-4": {
+                        "providers": [
+                            { "url": "https://api.openai.com/v1/", "onwards_key": "sk-1" }
+                        ],
+                        "response_headers": {
+                            "Input-Price-Per-Token": "0.0001",
+                            "Output-Price-Per-Token": "0.0002"
+                        }
+                    }
+                }
+            }"#;
+            let config: ConfigFile = serde_json::from_str(json).unwrap();
+            let targets = target::Targets::from_config(config).unwrap();
+
+            let mock_client = MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#);
+            let app_state = AppState::with_client(targets, mock_client);
+            let router = build_router(app_state);
+            let server = TestServer::new(router).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert_eq!(response.header("Input-Price-Per-Token"), "0.0001");
+            assert_eq!(response.header("Output-Price-Per-Token"), "0.0002");
+        }
+    }
+
     mod load_balancing {
         use super::*;
         use crate::load_balancer::{Provider, ProviderPool};
