@@ -4263,6 +4263,60 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_self_redirect_check_constraint_rejects(pool: PgPool) {
+        let base_url = url::Url::parse("http://localhost:8080").unwrap();
+        let sources = vec![crate::config::ModelSource {
+            name: "test".to_string(),
+            url: base_url.clone(),
+            api_key: None,
+            sync_interval: std::time::Duration::from_secs(3600),
+            default_models: None,
+        }];
+        crate::seed_database(&sources, &pool).await.unwrap();
+
+        let user = create_test_user(&pool).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        let model;
+        {
+            let mut tx = pool.begin().await.unwrap();
+            {
+                let mut repo = Deployments::new(tx.acquire().await.unwrap());
+                model = repo
+                    .create(
+                        &DeploymentCreateDBRequest::builder()
+                            .created_by(user.id)
+                            .model_name("self-redirect-db-model".to_string())
+                            .alias("self-redirect-db-alias".to_string())
+                            .hosted_on(test_endpoint_id)
+                            .build(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            tx.commit().await.unwrap();
+        }
+
+        // Inserting a redirect rule whose target is the model itself must be
+        // rejected by the `no_self_redirect` CHECK constraint (migration 139),
+        // the storage-layer backstop for `resolve_traffic_rules`.
+        let result = sqlx::query!(
+            "INSERT INTO model_traffic_rules (deployed_model_id, api_key_purpose, action, redirect_target_id) VALUES ($1, 'batch', 'redirect', $1)",
+            model.id
+        )
+        .execute(&pool)
+        .await;
+
+        assert!(result.is_err(), "DB must reject a self-referencing redirect rule");
+        let err_str = format!("{}", result.unwrap_err());
+        assert!(
+            err_str.contains("no_self_redirect") || err_str.contains("check constraint"),
+            "expected a CHECK constraint violation, got: {err_str}"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_list_with_provider_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
         let sources = vec![crate::config::ModelSource {

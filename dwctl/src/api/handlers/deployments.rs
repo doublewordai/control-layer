@@ -120,6 +120,7 @@ fn validate_metadata(metadata: &ModelCatalogMetadata) -> Result<()> {
 async fn resolve_traffic_rules(
     rules: &[TrafficRoutingRule],
     model_alias: &str,
+    deployment_id: Option<DeploymentId>,
     repo: &mut Deployments<'_>,
 ) -> Result<Vec<(ApiKeyPurpose, TrafficRuleAction)>> {
     let mut resolved = Vec::with_capacity(rules.len());
@@ -140,6 +141,18 @@ async fn resolve_traffic_rules(
                 let target_id = repo.resolve_alias_to_id(target).await?.ok_or_else(|| Error::BadRequest {
                     message: format!("Redirect target model '{}' does not exist", target),
                 })?;
+                // Guard on the resolved UUID, not the alias string: on a
+                // PATCH that renames the alias, `model_alias` is the *new*
+                // alias while the DB still holds the *old* one. A rule
+                // targeting the old alias resolves to the model's own id via
+                // `resolve_alias_to_id`, slipping past the string check above.
+                // Anchoring to the id that will actually be stored is the
+                // only check robust to that rename-before-commit window.
+                if deployment_id == Some(target_id) {
+                    return Err(Error::BadRequest {
+                        message: format!("Traffic routing rule cannot redirect model '{}' to itself", model_alias),
+                    });
+                }
                 TrafficRuleAction::Redirect(target_id)
             }
         };
@@ -627,7 +640,10 @@ pub async fn create_deployed_model<P: PoolProvider>(
     };
     let resolved_rules = if let Some(rules) = traffic_rules_input {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-        Some(resolve_traffic_rules(rules, alias, &mut repo).await?)
+        // The model row does not exist yet, so there is no self id to guard
+        // against — the string check in `resolve_traffic_rules` covers a
+        // redirect to the alias being created.
+        Some(resolve_traffic_rules(rules, alias, None, &mut repo).await?)
     } else {
         None
     };
@@ -822,7 +838,9 @@ pub async fn update_deployed_model<P: PoolProvider>(
         Some(Some(rules)) => {
             let effective_alias = update.alias.as_deref().unwrap_or(&model_alias);
             let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
-            Some(Some(resolve_traffic_rules(rules, effective_alias, &mut repo).await?))
+            Some(Some(
+                resolve_traffic_rules(rules, effective_alias, Some(deployment_id), &mut repo).await?,
+            ))
         }
         Some(None) => Some(None), // Clear all rules
         None => None,             // No change
@@ -3786,5 +3804,138 @@ mod tests {
             fetched.traffic_routing_rules.is_none(),
             "traffic rules should be cleared after cascade delete of redirect target"
         );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_model_rename_and_redirect_to_old_alias_self_redirect(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // 1) Create a model with alias "rename-self-A".
+        let create_resp = app
+            .post("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "type": "standard",
+                "model_name": "rename-self-model",
+                "alias": "rename-self-A",
+                "hosted_on": test_endpoint_id,
+            }))
+            .await;
+        create_resp.assert_status_ok();
+        let created: DeployedModelResponse = create_resp.json();
+
+        // 2) PATCH renames the alias to "rename-self-B" AND adds a redirect rule
+        //    targeting the model's CURRENT alias "rename-self-A" in the same
+        //    request. Before the fix, rule resolution ran while the DB still
+        //    held the old alias, so `resolve_alias_to_id("rename-self-A")`
+        //    returned the model's own id, the string check compared the target
+        //    against the *new* alias (mismatch, so it passed), and a
+        //    self-referencing row (redirect_target_id == deployed_model_id)
+        //    was persisted. The guard must now reject this with 400.
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "alias": "rename-self-B",
+                "traffic_routing_rules": [
+                    { "api_key_purpose": "batch", "action": { "type": "redirect", "target": "rename-self-A" } }
+                ]
+            }))
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
+
+        // 3) The rejected PATCH must roll back the whole transaction: the
+        //    alias is unchanged and no traffic rule row was persisted.
+        let fetched = app
+            .get(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .await;
+        fetched.assert_status_ok();
+        let model: DeployedModelResponse = fetched.json();
+        assert_eq!(model.alias, "rename-self-A", "alias rename must roll back on a rejected PATCH");
+        assert!(
+            model.traffic_routing_rules.is_none(),
+            "no traffic rule should be persisted for a rejected PATCH"
+        );
+
+        // 4) Storage backstop: no self-referencing row survives in the table.
+        let persisted: Option<Option<uuid::Uuid>> = sqlx::query_scalar!(
+            r#"SELECT redirect_target_id FROM model_traffic_rules WHERE deployed_model_id = $1"#,
+            created.id
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+        assert!(
+            persisted.is_none(),
+            "self-redirect row was persisted (redirect_target_id == deployed_model_id)"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_update_model_rename_and_redirect_to_other_model_succeeds(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&pool).await;
+
+        // A separate redirect target model.
+        create_test_deployment(&pool, admin_user.id, "rename-other-target", "rename-other-target-alias").await;
+
+        // The source model, with alias "rename-other-A".
+        let create_resp = app
+            .post("/admin/api/v1/models")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "type": "standard",
+                "model_name": "rename-other-source",
+                "alias": "rename-other-A",
+                "hosted_on": test_endpoint_id,
+            }))
+            .await;
+        create_resp.assert_status_ok();
+        let created: DeployedModelResponse = create_resp.json();
+
+        // PATCH renames to "rename-other-B" and redirects to a DIFFERENT model.
+        // This must NOT be over-rejected by the new self-redirect guard: the
+        // resolved target id is the other model, not the source's own.
+        let response = app
+            .patch(&format!("/admin/api/v1/models/{}", created.id))
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&json!({
+                "alias": "rename-other-B",
+                "traffic_routing_rules": [
+                    { "api_key_purpose": "batch", "action": { "type": "redirect", "target": "rename-other-target-alias" } }
+                ]
+            }))
+            .await;
+
+        response.assert_status_ok();
+        let updated: DeployedModelResponse = response.json();
+        assert_eq!(updated.alias, "rename-other-B");
+
+        let rules = updated.traffic_routing_rules.expect("traffic rules should be set");
+        let batch_rule = rules
+            .iter()
+            .find(|r| r.api_key_purpose == ApiKeyPurpose::Batch)
+            .expect("expected a batch traffic rule");
+        match &batch_rule.action {
+            crate::api::models::deployments::TrafficRoutingAction::Redirect { target } => {
+                assert_eq!(
+                    target, "rename-other-target-alias",
+                    "redirect must target the other model, not the source itself"
+                );
+            }
+            _ => panic!("expected redirect action"),
+        }
     }
 }
