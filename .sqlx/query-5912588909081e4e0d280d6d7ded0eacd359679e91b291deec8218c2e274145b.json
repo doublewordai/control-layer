@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT EXISTS (\n            SELECT 1\n            FROM model_tariffs mt\n            JOIN deployed_models dm ON dm.id = mt.deployed_model_id\n            WHERE dm.alias = $1\n              AND dm.deleted = false\n              AND mt.valid_until IS NULL\n              AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)\n        ) as \"has_paid_tariff!\"\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "has_paid_tariff!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "5912588909081e4e0d280d6d7ded0eacd359679e91b291deec8218c2e274145b"
+}
