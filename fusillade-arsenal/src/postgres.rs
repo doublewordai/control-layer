@@ -7982,28 +7982,27 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         use crate::batch::{BatchResultItem, BatchResultStatus};
         let (search, status) = filters;
 
-        // First, get the file_id and expires_at from the batch
-        // This allows us to query by file_id to avoid duplicates from SLA escalation
-        // and to check if we should filter retriable errors
-        let (file_id, _expires_at, archive_bucket) = match sqlx::query!(
-            r#"SELECT file_id, expires_at, archive_bucket FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
+        // First, get the file_id and archive bucket from the batch.
+        //
+        // file_id is None once the input file has been deleted: delete_file
+        // unlinks the batch and the orphan-purge daemon later removes the
+        // templates. The requests themselves are self-contained (custom_id,
+        // model, state, response_body, error all live on the request row), so
+        // results stay downloadable; only the input body and the file's line
+        // ordering are lost. With a file we walk templates in line order and
+        // join each to its request; without one we walk requests in creation
+        // order and left-join whatever template still exists.
+        let (file_id, archive_bucket) = match sqlx::query!(
+            r#"SELECT file_id, archive_bucket FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
             *batch_id as Uuid,
         )
-        .fetch_optional(crate::db::RetryingPgPool::new(&pools.read(), &retry_config).with_schema(query_schema.clone()))
+        .fetch_optional(
+            crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                .with_schema(query_schema.clone()),
+        )
         .await
         {
-            Ok(Some(row)) => {
-                if let Some(fid) = row.file_id {
-                    (fid, row.expires_at, row.archive_bucket)
-                } else {
-                    let _ = tx
-                        .send(Err(FusilladeError::Other(anyhow!(
-                            "Batch has no associated file_id"
-                        ))))
-                        .await;
-                    return;
-                }
-            }
+            Ok(Some(row)) => (row.file_id, row.archive_bucket),
             Ok(None) => {
                 let _ = tx
                     .send(Err(FusilladeError::Other(anyhow!("Batch not found"))))
@@ -8033,23 +8032,51 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             other => vec![other.to_string()],
         });
 
+        let mut last_created_at: Option<DateTime<Utc>> = None;
+        let mut last_id: Uuid = Uuid::nil();
+
         loop {
-            // Use OFFSET only on first batch, then use cursor pagination by line_number
-            let (line_filter, offset_val) = if is_first_batch {
-                (-1i32, offset)
+            // Use OFFSET only on the first page, then keyset pagination:
+            // by line_number when walking templates, by (created_at, id)
+            // when walking requests.
+            let (line_filter, cursor_time, cursor_id, offset_val) = if is_first_batch {
+                (-1i32, None, Uuid::nil(), offset)
             } else {
-                (last_line_number, 0i64)
+                (last_line_number, last_created_at, last_id, 0i64)
             };
             is_first_batch = false;
 
-            // Build dynamic query with error filter
-            // The error filter only applies to failed requests
             // The requests side is a union of the live table and the
             // batch archive: a frozen batch's rows may have been moved (or
             // be mid-move — the move txn is atomic, so under one snapshot
             // every row is in exactly one arm and the union is exact). The
             // archive arm is NULL-gated on the stamped bucket so unarchived
             // batches pay nothing and archived ones prune to one partition.
+            let push_requests_union = |qb: &mut QueryBuilder<'_, sqlx::Postgres>| {
+                qb.push(
+                    r#"
+                    SELECT id, custom_id, model, state, response_body, error, template_id, created_at
+                    FROM requests
+                    WHERE batch_id = "#,
+                );
+                qb.push_bind(*batch_id as Uuid);
+                qb.push(
+                    r#"
+                    UNION ALL
+                    SELECT id, custom_id, model, state, response_body, error, template_id, created_at
+                    FROM batch_requests_archive
+                    WHERE "#,
+                );
+                qb.push_bind(archive_bucket);
+                qb.push(
+                    r#"::date IS NOT NULL
+                      AND archive_bucket = "#,
+                );
+                qb.push_bind(archive_bucket);
+                qb.push(" AND batch_id = ");
+                qb.push_bind(*batch_id as Uuid);
+            };
+
             let mut query_builder = QueryBuilder::new(
                 r#"
                 SELECT
@@ -8060,40 +8087,46 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     t.body as input_body,
                     r.response_body,
                     r.error,
-                    t.line_number
-                FROM request_templates_all t
-                JOIN (
-                    SELECT id, custom_id, model, state, response_body, error, template_id
-                    FROM requests
-                    WHERE batch_id = "#,
+                    t.line_number,
+                    r.created_at
+                FROM "#,
             );
-            query_builder.push_bind(*batch_id as Uuid);
-            query_builder.push(
-                r#"
-                    UNION ALL
-                    SELECT id, custom_id, model, state, response_body, error, template_id
-                    FROM batch_requests_archive
-                    WHERE "#,
-            );
-            query_builder.push_bind(archive_bucket);
-            query_builder.push(
-                r#"::date IS NOT NULL
-                      AND archive_bucket = "#,
-            );
-            query_builder.push_bind(archive_bucket);
-            query_builder.push(" AND batch_id = ");
-            query_builder.push_bind(*batch_id as Uuid);
-            query_builder.push(
-                r#"
-                ) r ON r.template_id = t.id"#,
-            );
-            query_builder.push(" WHERE t.file_id = ");
-            query_builder.push_bind(file_id);
+            if let Some(file_id) = file_id {
+                // Input file present: walk templates in file line order and
+                // join each to its request for this batch.
+                query_builder.push("request_templates_all t JOIN (");
+                push_requests_union(&mut query_builder);
+                query_builder.push(") r ON r.template_id = t.id WHERE t.file_id = ");
+                query_builder.push_bind(file_id);
+                query_builder.push(" AND (");
+                query_builder.push_bind(line_filter);
+                query_builder.push(" = -1 OR t.line_number > ");
+                query_builder.push_bind(line_filter);
+                query_builder.push(")");
+            } else {
+                // Input file deleted: walk the batch's requests in creation
+                // order and attach whatever template still exists. The
+                // LATERAL ... LIMIT 1 probe mirrors get_request_detail so a
+                // template present in both generations cannot fan out.
+                query_builder.push("(");
+                push_requests_union(&mut query_builder);
+                query_builder.push(
+                    r#") r
+                LEFT JOIN LATERAL (
+                    SELECT body, line_number FROM request_templates_all t WHERE t.id = r.template_id LIMIT 1
+                ) t ON TRUE
+                WHERE ("#,
+                );
+                query_builder.push_bind(cursor_time);
+                query_builder.push("::timestamptz IS NULL OR r.created_at > ");
+                query_builder.push_bind(cursor_time);
+                query_builder.push(" OR (r.created_at = ");
+                query_builder.push_bind(cursor_time);
+                query_builder.push(" AND r.id > ");
+                query_builder.push_bind(cursor_id);
+                query_builder.push("))");
+            }
             query_builder.push(" AND (");
-            query_builder.push_bind(line_filter);
-            query_builder.push(" = -1 OR t.line_number > ");
-            query_builder.push_bind(line_filter);
-            query_builder.push(") AND (");
             query_builder.push_bind(search_pattern.as_deref());
             query_builder.push("::text IS NULL OR LOWER(r.custom_id) LIKE ");
             query_builder.push_bind(search_pattern.as_deref());
@@ -8102,7 +8135,11 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             query_builder.push("::text[] IS NULL OR r.state = ANY(");
             query_builder.push_bind(state_filter.as_deref());
             query_builder.push("))");
-            query_builder.push(" ORDER BY t.line_number ASC OFFSET ");
+            if file_id.is_some() {
+                query_builder.push(" ORDER BY t.line_number ASC OFFSET ");
+            } else {
+                query_builder.push(" ORDER BY r.created_at ASC, r.id ASC OFFSET ");
+            }
             query_builder.push_bind(offset_val);
             query_builder.push(" LIMIT ");
             query_builder.push_bind(BATCH_SIZE);
@@ -8126,20 +8163,28 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     tracing::debug!("Fetched batch of {} results", requests.len());
 
                     for row in requests {
-                        let line_number: i32 = row.get("line_number");
-                        last_line_number = line_number;
+                        let line_number: Option<i32> = row.get("line_number");
+                        let created_at: DateTime<Utc> = row.get("created_at");
+                        let id: Uuid = row.get("id");
+                        last_line_number = line_number.unwrap_or(last_line_number);
+                        last_created_at = Some(created_at);
+                        last_id = id;
 
-                        let input_body_str: String = row.get("input_body");
+                        let input_body_str: Option<String> = row.get("input_body");
                         let response_body_opt: Option<String> = row.get("response_body");
                         let state: String = row.get("state");
-                        let id: Uuid = row.get("id");
                         let custom_id: Option<String> = row.get("custom_id");
                         let model: String = row.get("model");
                         let error: Option<String> = row.get("error");
 
-                        // Parse input body as JSON
-                        let input_body: serde_json::Value = serde_json::from_str(&input_body_str)
-                            .unwrap_or_else(|_| serde_json::Value::String(input_body_str.clone()));
+                        // Parse input body as JSON. None when the input file (and so the
+                        // template) has been deleted; the request itself is still returned.
+                        let input_body: serde_json::Value = match input_body_str {
+                            Some(s) => {
+                                serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
+                            }
+                            None => serde_json::Value::Null,
+                        };
 
                         // Parse response body as JSON if present
                         let response_body: Option<serde_json::Value> =

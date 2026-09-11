@@ -312,7 +312,9 @@ pub struct BatchResultItem {
     pub custom_id: Option<String>,
     /// Model used for this request
     pub model: String,
-    /// Original request body from the input template
+    /// Original request body from the input template. `null` once the batch's
+    /// input file has been deleted and its templates purged; the request's own
+    /// fields (custom_id, model, response, error, status) are unaffected.
     pub input_body: serde_json::Value,
     /// Full response object (choices, usage, etc.) for completed requests
     pub response_body: Option<serde_json::Value>,
