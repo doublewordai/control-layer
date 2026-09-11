@@ -644,8 +644,17 @@ impl<'c> Organizations<'c> {
     /// cases apart: `requested` is "you already asked", `active` is "you are
     /// already in", `pending` is "you were invited and haven't accepted".
     /// Every one of those is a state the caller must describe, not a failure.
+    ///
+    /// The boolean returned alongside the row is `true` only on a genuinely
+    /// new insertion — `false` when the `ON CONFLICT DO NOTHING` branch ran
+    /// and the row handed back is whatever was already there. `status` alone
+    /// cannot tell the two apart: a freshly inserted `requested` row and the
+    /// existing `requested` row returned on a re-press are indistinguishable,
+    /// so any side-effect attached to this call (a notification, a counter)
+    /// must gate on the boolean, not on `status`, or it re-fires on every
+    /// re-press.
     #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), user_id = %abbrev_uuid(&user_id)), err)]
-    pub async fn create_join_request(&mut self, org_id: UserId, user_id: UserId) -> Result<OrganizationMemberDBResponse> {
+    pub async fn create_join_request(&mut self, org_id: UserId, user_id: UserId) -> Result<(OrganizationMemberDBResponse, bool)> {
         let inserted = sqlx::query_as!(
             MemberRow,
             r#"
@@ -662,7 +671,7 @@ impl<'c> Organizations<'c> {
         .await?;
 
         if let Some(row) = inserted {
-            return Ok(row.into());
+            return Ok((row.into(), true));
         }
 
         let existing = sqlx::query_as!(
@@ -680,7 +689,7 @@ impl<'c> Organizations<'c> {
         .await?
         .ok_or(DbError::NotFound)?;
 
-        Ok(existing.into())
+        Ok((existing.into(), false))
     }
 
     /// A user's own outstanding join requests, oldest first.
