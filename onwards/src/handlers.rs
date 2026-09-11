@@ -1021,7 +1021,20 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            // When no later attempt succeeds, this error becomes the client's
+            // final response, so its status must reflect what happened. An
+            // upstream 429 says the PROVIDER is saturated — surfacing it as
+            // 502 "Bad Gateway" mislabels provider backpressure as a proxy
+            // fault, and as rate_limit_error it would misattribute it to the
+            // client. Map it to the same sanitized 503 the embedded-error
+            // path below returns on exhaustion ("never the upstream's rate
+            // limit"). Genuine upstream server failures keep 502.
+            let fallback_error = if status == 429 {
+                OnwardsErrorResponse::service_unavailable()
+            } else {
+                OnwardsErrorResponse::bad_gateway()
+            };
+            return LoopAction::Continue(Some(fallback_error));
         }
 
         // Sanitize error responses when sanitize_response is enabled.
@@ -2578,6 +2591,131 @@ mod tests {
 
         // Should timeout (Err from tokio::time::timeout)
         assert!(result.is_err(), "Expected timeout but request completed");
+    }
+
+    /// Mock HttpClient that always answers with one fixed status and an empty body.
+    #[derive(Debug, Clone)]
+    struct StaticStatusMockClient {
+        response_status: u16,
+    }
+
+    #[async_trait::async_trait]
+    impl HttpClient for StaticStatusMockClient {
+        async fn request(
+            &self,
+            _req: axum::extract::Request,
+        ) -> Result<axum::response::Response, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(axum::response::Response::builder()
+                .status(self.response_status)
+                .body(axum::body::Body::empty())
+                .unwrap())
+        }
+    }
+
+    /// Build an AppState whose routing table maps `model_name` to a
+    /// single-provider pool carrying the production-standard fallback config
+    /// (`enabled`, `on_status` = {429, 500, 502, 503, 504}, no explicit
+    /// max_attempts — the deployment-table defaults).
+    fn state_with_fallback_pool<T: HttpClient>(model_name: &str, mock_client: T) -> AppState<T> {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::{FallbackConfig, LoadBalanceStrategy};
+
+        let target = Target::builder()
+            .url("https://provider.example.com/".parse().unwrap())
+            .build();
+
+        let fallback_config = FallbackConfig {
+            enabled: true,
+            on_status: vec![429, 500, 502, 503, 504],
+            on_rate_limit: true,
+            ..Default::default()
+        };
+
+        let pool = ProviderPool::with_config(
+            vec![Provider::new(target, 1)],
+            None,
+            None,
+            None,
+            Some(fallback_config),
+            LoadBalanceStrategy::default(),
+            false,
+            Vec::new(),
+        )
+        .into();
+
+        let targets = dashmap::DashMap::new();
+        targets.insert(model_name.to_string(), pool);
+
+        AppState {
+            targets: crate::target::Targets {
+                targets: std::sync::Arc::new(targets),
+                key_rate_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
+                key_concurrency_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
+                key_labels: std::sync::Arc::new(dashmap::DashMap::new()),
+                strict_mode: false,
+                http_pool_config: None,
+            },
+            http_client: mock_client,
+            response_transform_fn: None,
+            response_id_header: None,
+            body_limit: crate::DEFAULT_BODY_LIMIT,
+        }
+    }
+
+    fn chat_completion_request(model: &str) -> axum::extract::Request {
+        axum::extract::Request::builder()
+            .uri("/v1/chat/completions")
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(format!(
+                r#"{{"model":"{model}","messages":[{{"role":"user","content":"hi"}}]}}"#
+            )))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_upstream_rate_limit_exhaustion_surfaces_503_not_502() {
+        // Production shape of the 2026-09-10 ControlLayerProxyErrors alert for
+        // zai-org/GLM-5.3-Flash: a single-provider pool (fallback.max_attempts
+        // defaults to the provider count) whose provider answers 429. The
+        // status-fallback consumes the one-attempt budget and the stored error
+        // becomes the client's response. The upstream said "I am rate
+        // limited", so the client must see the same sanitized 503 the
+        // embedded-error path returns — not 502 Bad Gateway, which mislabels
+        // provider backpressure as a proxy fault.
+        let model = "fallback-429-model";
+        let state = state_with_fallback_pool(
+            model,
+            StaticStatusMockClient {
+                response_status: 429,
+            },
+        );
+
+        let result = target_message_handler(State(state), chat_completion_request(model)).await;
+
+        let error = result.expect_err("upstream 429 with exhausted fallback budget must fail");
+        assert_eq!(error.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        let body = error.body.expect("error body must be present");
+        assert_eq!(body.code, "service_unavailable");
+        assert_eq!(body.r#type, "internal_error");
+    }
+
+    #[tokio::test]
+    async fn test_upstream_server_error_exhaustion_still_returns_502() {
+        // Non-rate-limit fallback statuses keep their existing 502 mapping:
+        // an upstream server failure IS a bad-gateway situation.
+        let model = "fallback-500-model";
+        let state = state_with_fallback_pool(
+            model,
+            StaticStatusMockClient {
+                response_status: 500,
+            },
+        );
+
+        let result = target_message_handler(State(state), chat_completion_request(model)).await;
+
+        let error = result.expect_err("upstream 500 with exhausted fallback budget must fail");
+        assert_eq!(error.status, axum::http::StatusCode::BAD_GATEWAY);
     }
 
     #[test]
