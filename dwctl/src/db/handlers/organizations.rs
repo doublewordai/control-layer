@@ -91,18 +91,6 @@ impl<'c> Organizations<'c> {
         Self { db }
     }
 
-    /// Returns `true` if a non-deleted organization with the given ID exists.
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&id)), err)]
-    pub async fn exists(&mut self, id: UserId) -> Result<bool> {
-        let exists = sqlx::query_scalar!(
-            "SELECT EXISTS(SELECT 1 FROM users WHERE id = $1 AND user_type = 'organization' AND is_deleted = false) as \"exists!\"",
-            id
-        )
-        .fetch_one(&mut *self.db)
-        .await?;
-        Ok(exists)
-    }
-
     /// Find an organization by its domain (stored as username).
     /// Returns `None` if no active (non-deleted) organization exists with that domain.
     #[instrument(skip(self), fields(domain = %domain), err)]
@@ -1062,19 +1050,6 @@ impl<'c> Organizations<'c> {
         .await?;
 
         Ok(result.rows_affected() > 0)
-    }
-
-    /// Count active members of an organization (for member_count in list responses)
-    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id)), err)]
-    pub async fn count_members(&mut self, org_id: UserId) -> Result<i64> {
-        let count = sqlx::query_scalar!(
-            "SELECT COUNT(*) FROM user_organizations WHERE organization_id = $1 AND status = 'active'",
-            org_id
-        )
-        .fetch_one(&mut *self.db)
-        .await?;
-
-        Ok(count.unwrap_or(0))
     }
 
     /// Look up the current pending email-change row for an org, if any.
