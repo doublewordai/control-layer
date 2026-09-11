@@ -1076,10 +1076,9 @@ mod tests {
             virtual_model: ALIAS.into(),
             tokenizer_version: TOK_VER.into(),
         };
-        let hash = parse_chat_completions(&serde_json::to_vec(&stored_body).unwrap(), &tiers, &TelemetryPolicy::default())
-            .unwrap()
-            .cumulative_hashes[0]
-            .clone();
+        // The hash at the marked (image) block — the prefix that includes the token.
+        let parsed = parse_chat_completions(&serde_json::to_vec(&stored_body).unwrap(), &tiers, &TelemetryPolicy::default()).unwrap();
+        let hash = parsed.cumulative_hashes[parsed.breakpoints[0].block_index].clone();
         let idx = PostgresIndex::new(pool.clone(), 1);
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         while idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty() {

@@ -194,10 +194,11 @@ pub async fn try_resolve_caller(pool: &sqlx::PgPool, api_key: &str) -> std::resu
     }))
 }
 
-/// Record that `attribution` submitted a request containing `token`. Idempotent
-/// on `(user_id, sha256)`: updates `last_seen_at` on conflict, and preserves an
-/// existing org grant (`COALESCE`) so a later personal submission of the same
-/// image by the same user does not revoke organization visibility.
+/// Record that `attribution` submitted a request containing `token`. One grant
+/// per (user, organization-or-personal, image): idempotent on that key (updates
+/// `last_seen_at` on conflict), so submitting the same image under a second
+/// organization adds a grant for it rather than replacing the first one, and a
+/// later personal submission never revokes organization visibility.
 ///
 /// Best-effort: errors are logged and swallowed. We never block the request
 /// path on this bookkeeping write — the security control (substituting the
@@ -228,11 +229,10 @@ pub async fn try_record_image_access(
         r#"
         INSERT INTO image_access (user_id, organization_id, sha256, mime, bytes_len, first_seen_at, last_seen_at)
         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-        ON CONFLICT (user_id, sha256) DO UPDATE
+        ON CONFLICT (user_id, sha256, grant_scope) DO UPDATE
         SET last_seen_at = NOW(),
             mime = EXCLUDED.mime,
-            bytes_len = EXCLUDED.bytes_len,
-            organization_id = COALESCE(EXCLUDED.organization_id, image_access.organization_id)
+            bytes_len = EXCLUDED.bytes_len
         "#,
         attribution.user_id,
         attribution.organization_id,
@@ -326,6 +326,43 @@ mod tests {
         };
         let req = ApiKeyCreateDBRequest::new(org_id, member_id, create);
         ApiKeys::new(&mut conn).create(&req).await.unwrap().secret
+    }
+
+    /// Grants are per organization, not one-per-user: the same member
+    /// submitting the same image under two organizations leaves BOTH
+    /// organizations' members able to use it, and a later personal
+    /// submission revokes neither.
+    #[sqlx::test]
+    async fn the_same_image_submitted_under_two_organizations_grants_both(pool: PgPool) {
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await; // member of org A only
+        let carol = create_test_user(&pool, Role::StandardUser).await; // member of org B only
+        let dave = create_test_user(&pool, Role::StandardUser).await; // member of neither
+        let org_a = create_test_org(&pool, alice.id).await;
+        let org_b = create_test_org(&pool, alice.id).await;
+        let img = token(7);
+
+        // Alice submits the image under org A, then org B, then personally.
+        for organization_id in [Some(org_a.id), Some(org_b.id), None] {
+            record_image_access(
+                &pool,
+                ImageAttribution {
+                    user_id: alice.id,
+                    organization_id,
+                },
+                img,
+                "image/png",
+                10,
+            )
+            .await;
+        }
+
+        let acting = |user_id: uuid::Uuid, organization_id: Option<uuid::Uuid>| ImageAttribution { user_id, organization_id };
+        assert!(is_token_accessible(&pool, &acting(bob.id, Some(org_a.id)), img).await.unwrap(), "org A keeps its grant");
+        assert!(is_token_accessible(&pool, &acting(carol.id, Some(org_b.id)), img).await.unwrap(), "org B gets its own grant");
+        assert!(is_token_accessible(&pool, &acting(alice.id, None), img).await.unwrap(), "the submitter, personally");
+        assert!(!is_token_accessible(&pool, &acting(dave.id, None), img).await.unwrap(), "a stranger");
+        assert!(!can_view(&pool, img, dave.id, None).await, "a stranger, on the console view");
     }
 
     #[sqlx::test]
