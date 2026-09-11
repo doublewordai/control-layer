@@ -319,7 +319,7 @@ background_services:
     #   max_late_writer_seconds: <seconds>
     # batchless_archive_sweep_enabled: false
     # batchless_archive_backfill_enabled: false
-    # retained_response_retirement_enabled: false # Reserved; true is rejected until retirement ships
+    # retained_response_retirement_enabled: false
 
     # Observability
     status_log_interval_ms: 2000 # Interval for logging daemon status (set to null to disable)
