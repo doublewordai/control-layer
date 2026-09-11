@@ -329,7 +329,7 @@ impl std::fmt::Debug for FileStreamConfig {
 /// "bad input" — important for user-facing messaging (transient outages
 /// should not surface as "fix your file").
 #[derive(Debug)]
-enum BatchNormalizeError {
+pub(crate) enum BatchNormalizeError {
     /// User-supplied URL/data was unacceptable (bad scheme, denied IP,
     /// MIME mismatch, oversized, malformed). Surface as a validation
     /// error.
@@ -350,6 +350,90 @@ enum BatchNormalizeError {
     /// The content store itself failed (GCS unreachable, IAM error).
     /// Surface as "service unavailable".
     StoreFailed(String),
+}
+
+impl BatchNormalizeError {
+    /// The client-facing message. Never carries database or store internals —
+    /// those are logged at the point of failure.
+    pub(crate) fn message(&self) -> &str {
+        match self {
+            Self::BadInput(m) | Self::Unfetchable(m) | Self::FetchFailed(m) | Self::Transient(m) | Self::StoreFailed(m) => m,
+        }
+    }
+
+    /// Whether the failure is the submission's own fault (fix the input) or
+    /// ours (retry later).
+    pub(crate) fn is_retryable(&self) -> bool {
+        matches!(self, Self::FetchFailed(_) | Self::Transient(_) | Self::StoreFailed(_))
+    }
+}
+
+const TOKEN_NOT_ACCESSIBLE: &str = "image token is not accessible to this caller";
+
+/// Authorise a `dw-img://` token a client placed in a body it is submitting
+/// for queued execution. The dispatch later signs every token in the stored
+/// body on trust, so this — and our own ingest — are the only ways a token
+/// gets into the store. Allowed if the caller's user/org submitted the image
+/// (`image_access`); refused otherwise, and refused when there is no way to
+/// check. A lookup failure is retryable and never exposes the database error.
+async fn authorize_submitted_token(
+    url: &str,
+    pool: Option<&sqlx::PgPool>,
+    attribution: Option<crate::api::handlers::images::ImageAttribution>,
+) -> std::result::Result<(), BatchNormalizeError> {
+    let token = url
+        .parse::<crate::image_normalizer::ImageToken>()
+        .map_err(|e| BatchNormalizeError::BadInput(format!("invalid dw-img token: {e}")))?;
+    let (Some(pool), Some(attribution)) = (pool, attribution) else {
+        return Err(BatchNormalizeError::BadInput(TOKEN_NOT_ACCESSIBLE.to_string()));
+    };
+    match crate::api::handlers::images::is_token_accessible(pool, &attribution, token).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(BatchNormalizeError::BadInput(TOKEN_NOT_ACCESSIBLE.to_string())),
+        Err(e) => {
+            tracing::warn!(error = %e, "image_access lookup failed while authorising a submitted token");
+            Err(BatchNormalizeError::Transient("image access lookup failed".to_string()))
+        }
+    }
+}
+
+/// Authorise every `dw-img://` token already present in `body` (see
+/// [`authorize_submitted_token`]), leaving the body otherwise untouched.
+/// For submission paths that do not normalise images at ingest — connection
+/// sync stores external JSONL as is and the edge normalises URLs at dispatch
+/// — so that a synced body cannot smuggle another principal's token into the
+/// trusted dispatch path.
+pub(crate) async fn authorize_submitted_tokens(
+    body: &mut serde_json::Value,
+    pool: &sqlx::PgPool,
+    attribution: crate::api::handlers::images::ImageAttribution,
+) -> std::result::Result<(), BatchNormalizeError> {
+    let err_cell: std::sync::Mutex<Option<BatchNormalizeError>> = std::sync::Mutex::new(None);
+    let walked = image_walker::substitute_with(body, ImageNormalizerMode::TokensOnly, |url| {
+        let err_cell = &err_cell;
+        async move {
+            match authorize_submitted_token(&url, Some(pool), Some(attribution)).await {
+                Ok(()) => Ok::<String, ()>(url),
+                Err(e) => {
+                    if let Ok(mut g) = err_cell.lock()
+                        && g.is_none()
+                    {
+                        *g = Some(e);
+                    }
+                    Err(())
+                }
+            }
+        }
+    })
+    .await;
+    match walked {
+        Ok(_) => Ok(()),
+        Err(()) => Err(err_cell
+            .into_inner()
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| BatchNormalizeError::BadInput(TOKEN_NOT_ACCESSIBLE.to_string()))),
+    }
 }
 
 async fn normalize_template_body_in_place(
@@ -381,24 +465,7 @@ async fn normalize_template_body_in_place(
             // batch dispatch signs every token in a stored body on trust, so
             // this is the only place a client-supplied token is checked.
             if crate::image_normalizer::ImageToken::looks_like_token(&url) {
-                let outcome = match url.parse::<crate::image_normalizer::ImageToken>() {
-                    Err(e) => Err(BatchNormalizeError::BadInput(format!("invalid dw-img token: {e}"))),
-                    Ok(token) => match (access_pool.as_ref(), access_attribution) {
-                        (Some(pool), Some(attribution)) => {
-                            match crate::api::handlers::images::is_token_accessible(pool, &attribution, token).await {
-                                Ok(true) => Ok(()),
-                                Ok(false) => Err(BatchNormalizeError::BadInput(
-                                    "image token is not accessible to this caller".to_string(),
-                                )),
-                                Err(e) => Err(BatchNormalizeError::Transient(format!("image access lookup failed: {e}"))),
-                            }
-                        }
-                        // No way to authorise: refuse rather than persist on trust.
-                        _ => Err(BatchNormalizeError::BadInput(
-                            "image token is not accessible to this caller".to_string(),
-                        )),
-                    },
-                };
+                let outcome = authorize_submitted_token(&url, access_pool.as_ref(), access_attribution).await;
                 return match outcome {
                     Ok(()) => Ok::<String, ()>(url),
                     Err(mapped) => {
@@ -434,10 +501,11 @@ async fn normalize_template_body_in_place(
                         )
                         .await
                         {
+                            tracing::warn!(error = %e, "image_access bookkeeping failed on file upload");
                             if let Ok(mut g) = err_cell.lock()
                                 && g.is_none()
                             {
-                                *g = Some(BatchNormalizeError::StoreFailed(format!("image_access bookkeeping: {e}")));
+                                *g = Some(BatchNormalizeError::StoreFailed("image_access bookkeeping failed".to_string()));
                             }
                             return Err(());
                         }

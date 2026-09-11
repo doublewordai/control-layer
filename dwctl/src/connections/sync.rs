@@ -455,6 +455,15 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
         (owner_id, key_id)
     };
 
+    // Who a `dw-img://` token already present in a synced line is authorised
+    // against: the triggering member, acting for the owning organization when
+    // the connection belongs to one (same shape as an org API key).
+    let token_pool = dwctl.write().into_inner();
+    let token_attribution = crate::api::handlers::images::ImageAttribution {
+        user_id: sync_op.triggered_by,
+        organization_id: (connection.user_id != sync_op.triggered_by).then_some(connection.user_id),
+    };
+
     // 5. Stream file from provider
     let byte_stream = prov
         .stream_file(&input.external_key)
@@ -595,6 +604,28 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                             && cid.chars().any(|c| c.is_control())
                         {
                             line_error = Some("control characters in custom_id".to_string());
+                        }
+
+                        // Synced bodies are stored as is (the edge normalises image
+                        // URLs at dispatch), but a `dw-img://` token already in the
+                        // line must be authorised NOW: the dispatch signs every token
+                        // in a stored body on trust. Not ours to use → tier-2 error;
+                        // could not check → abort this ingest so it can be retried.
+                        if line_error.is_none()
+                            && body.contains("dw-img://")
+                            && let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body)
+                        {
+                            match crate::api::handlers::files::authorize_submitted_tokens(&mut body_val, &token_pool, token_attribution)
+                                .await
+                            {
+                                Ok(()) => {}
+                                Err(e) if e.is_retryable() => {
+                                    tracing::error!(line_num = line_number, error = e.message(), "Could not authorise image token in synced line; aborting ingest");
+                                    let _ = tx.send(FileStreamItem::Abort).await;
+                                    return (template_count, skipped_lines, validation_errors);
+                                }
+                                Err(e) => line_error = Some(e.message().to_string()),
+                            }
                         }
 
                         if let Some(ref err) = line_error {
