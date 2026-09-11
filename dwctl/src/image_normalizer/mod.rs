@@ -133,10 +133,6 @@ pub trait ImageNormalizer: Send + Sync {
     /// Generate a fresh signed URL for `token` with TTL `ttl`.
     async fn sign(&self, token: ImageToken, ttl: Duration) -> Result<SignedImageUrl, NormalizeError>;
 
-    /// Read bytes for `token` directly. Used by the dashboard image
-    /// endpoint (after authorisation).
-    async fn read(&self, token: ImageToken) -> Result<(String, Bytes), NormalizeError>;
-
     /// True if `url` already points at an object in our own store (a URL we
     /// previously signed). Callers use this to avoid re-ingesting/re-signing
     /// an already-normalised URL — which would waste a re-fetch and clobber a
@@ -158,9 +154,6 @@ impl ImageNormalizer for DisabledNormalizer {
         Err(NormalizeError::BadInput("image normalisation is disabled".into()))
     }
     async fn sign(&self, _token: ImageToken, _ttl: Duration) -> Result<SignedImageUrl, NormalizeError> {
-        Err(NormalizeError::BadInput("image normalisation is disabled".into()))
-    }
-    async fn read(&self, _token: ImageToken) -> Result<(String, Bytes), NormalizeError> {
         Err(NormalizeError::BadInput("image normalisation is disabled".into()))
     }
 }
@@ -226,10 +219,6 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
 
     async fn sign(&self, token: ImageToken, ttl: Duration) -> Result<SignedImageUrl, NormalizeError> {
         Ok(self.store.sign(token, ttl).await?)
-    }
-
-    async fn read(&self, token: ImageToken) -> Result<(String, Bytes), NormalizeError> {
-        Ok(self.store.read(token).await?)
     }
 
     fn owns_url(&self, url: &str) -> bool {
@@ -336,11 +325,6 @@ mod tests {
         // sign returns a usable URL with the token hex baked in.
         let signed = n.sign(token, Duration::from_secs(60)).await.unwrap();
         assert!(signed.url.contains(&token.to_hex()));
-
-        // read returns the original bytes back.
-        let (mime, bytes) = n.read(token).await.unwrap();
-        assert_eq!(mime, "image/png");
-        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
     }
 
     #[tokio::test]
