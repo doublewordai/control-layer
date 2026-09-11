@@ -1021,7 +1021,13 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            // The candidate error carries the upstream's own status: a later
+            // provider's success discards it, and an exhausted chain hands it
+            // to the client. A blanket 502 here misclassified exhausted
+            // rate-limit fallbacks as 5xx server faults — paging the
+            // proxy-5xx alert for what `onwards_upstream_failed_total` was
+            // already recording as status 429.
+            return LoopAction::Continue(Some(OnwardsErrorResponse::upstream_status(status)));
         }
 
         // Sanitize error responses when sanitize_response is enabled.
