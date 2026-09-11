@@ -582,24 +582,6 @@ mod tests {
         );
     }
 
-    async fn mark_fusillade_request_processing(pool: &PgPool, id: uuid::Uuid) -> sqlx::Result<()> {
-        sqlx::query(
-            r#"
-            UPDATE requests
-            SET state = 'processing',
-                daemon_id = gen_random_uuid(),
-                claimed_at = NOW(),
-                started_at = NOW()
-            WHERE id = $1
-            "#,
-        )
-        .bind(id)
-        .execute(pool)
-        .await?;
-
-        Ok(())
-    }
-
     #[sqlx::test]
     async fn test_demand_requires_system_permission(pool: sqlx::PgPool) {
         let (server, _bg): (TestServer, _) = create_test_app(pool.clone(), false).await;
