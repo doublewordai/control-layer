@@ -157,7 +157,7 @@ impl<'c> Connections<'c> {
             r#"
             INSERT INTO connections (user_id, api_key_id, kind, provider, name, config_encrypted)
             VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING *
+            RETURNING id, user_id, api_key_id, kind, provider, name, config_encrypted, created_at, updated_at, deleted_at
             "#,
             user_id,
             api_key_id,
@@ -174,7 +174,7 @@ impl<'c> Connections<'c> {
 
     #[instrument(skip(self), fields(id = %id), err)]
     pub async fn get_by_id(&mut self, id: Uuid) -> Result<Option<Connection>> {
-        let row = sqlx::query_as!(ConnectionRow, "SELECT * FROM connections WHERE id = $1 AND deleted_at IS NULL", id,)
+        let row = sqlx::query_as!(ConnectionRow, "SELECT id, user_id, api_key_id, kind, provider, name, config_encrypted, created_at, updated_at, deleted_at FROM connections WHERE id = $1 AND deleted_at IS NULL", id,)
             .fetch_optional(&mut *self.db)
             .await?;
 
@@ -202,7 +202,7 @@ impl<'c> Connections<'c> {
         let rows = sqlx::query_as!(
             ConnectionRow,
             r#"
-            SELECT * FROM connections
+            SELECT id, user_id, api_key_id, kind, provider, name, config_encrypted, created_at, updated_at, deleted_at FROM connections
             WHERE user_id = $1
               AND deleted_at IS NULL
               AND ($2::text IS NULL OR kind = $2)
@@ -253,7 +253,7 @@ impl<'c> Connections<'c> {
                 name = COALESCE($2, name),
                 config_encrypted = COALESCE($3, config_encrypted)
             WHERE id = $1 AND deleted_at IS NULL
-            RETURNING *
+            RETURNING id, user_id, api_key_id, kind, provider, name, config_encrypted, created_at, updated_at, deleted_at
             "#,
             id,
             name,
@@ -294,7 +294,7 @@ impl<'c> SyncOperations<'c> {
             r#"
             INSERT INTO sync_operations (connection_id, triggered_by, strategy, strategy_config, sync_config)
             VALUES ($1, $2, $3, $4, $5)
-            RETURNING *
+            RETURNING id, connection_id, status, strategy, strategy_config, files_found, files_skipped, files_ingested, files_failed, batches_created, error_summary, triggered_by, sync_config, started_at, completed_at, created_at
             "#,
             connection_id,
             triggered_by,
@@ -312,7 +312,7 @@ impl<'c> SyncOperations<'c> {
     pub async fn get_by_id(&mut self, id: Uuid) -> Result<Option<SyncOperation>> {
         let row = sqlx::query_as!(
             SyncOperationRow,
-            "SELECT * FROM sync_operations WHERE id = $1 AND status != 'deleted'",
+            "SELECT id, connection_id, status, strategy, strategy_config, files_found, files_skipped, files_ingested, files_failed, batches_created, error_summary, triggered_by, sync_config, started_at, completed_at, created_at FROM sync_operations WHERE id = $1 AND status != 'deleted'",
             id,
         )
         .fetch_optional(&mut *self.db)
@@ -325,7 +325,7 @@ impl<'c> SyncOperations<'c> {
     pub async fn list_by_connection(&mut self, connection_id: Uuid) -> Result<Vec<SyncOperation>> {
         let rows = sqlx::query_as!(
             SyncOperationRow,
-            "SELECT * FROM sync_operations WHERE connection_id = $1 AND status != 'deleted' ORDER BY created_at DESC",
+            "SELECT id, connection_id, status, strategy, strategy_config, files_found, files_skipped, files_ingested, files_failed, batches_created, error_summary, triggered_by, sync_config, started_at, completed_at, created_at FROM sync_operations WHERE connection_id = $1 AND status != 'deleted' ORDER BY created_at DESC",
             connection_id,
         )
         .fetch_all(&mut *self.db)
@@ -489,7 +489,7 @@ impl<'c> SyncEntries<'c> {
             INSERT INTO sync_entries (sync_id, connection_id, external_key, external_last_modified, external_size_bytes)
             SELECT $1, $2, t.key, t.last_modified, t.size_bytes
             FROM unnest($3::text[], $4::timestamptz[], $5::bigint[]) AS t(key, last_modified, size_bytes)
-            RETURNING *
+            RETURNING id, sync_id, connection_id, external_key, external_last_modified, external_size_bytes, status, file_id, batch_id, template_count, error, created_at, updated_at, skipped_lines, validation_errors
             "#,
             sync_id,
             connection_id,
@@ -623,7 +623,7 @@ impl<'c> SyncEntries<'c> {
     pub async fn list_by_sync(&mut self, sync_id: Uuid) -> Result<Vec<SyncEntry>> {
         let rows = sqlx::query_as!(
             SyncEntryRow,
-            "SELECT * FROM sync_entries WHERE sync_id = $1 ORDER BY external_key",
+            "SELECT id, sync_id, connection_id, external_key, external_last_modified, external_size_bytes, status, file_id, batch_id, template_count, error, created_at, updated_at, skipped_lines, validation_errors FROM sync_entries WHERE sync_id = $1 ORDER BY external_key",
             sync_id,
         )
         .fetch_all(&mut *self.db)
@@ -635,7 +635,7 @@ impl<'c> SyncEntries<'c> {
     /// Get entry by ID.
     #[instrument(skip(self), fields(id = %id), err)]
     pub async fn get_by_id(&mut self, id: Uuid) -> Result<Option<SyncEntry>> {
-        let row = sqlx::query_as!(SyncEntryRow, "SELECT * FROM sync_entries WHERE id = $1", id,)
+        let row = sqlx::query_as!(SyncEntryRow, "SELECT id, sync_id, connection_id, external_key, external_last_modified, external_size_bytes, status, file_id, batch_id, template_count, error, created_at, updated_at, skipped_lines, validation_errors FROM sync_entries WHERE id = $1", id,)
             .fetch_optional(&mut *self.db)
             .await?;
 

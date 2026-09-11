@@ -1,0 +1,188 @@
+[
+  {
+    "path": "dwctl/src/db/handlers/capacity_reservations.rs",
+    "source": "SELECT * FROM UNNEST($1::uuid[], $2::text[], $3::bigint[], $4::timestamptz[])",
+    "count": 1,
+    "reason": "Typed UNNEST input has a fixed result schema independent of base-table columns."
+  },
+  {
+    "path": "dwctl/src/db/handlers/credits.rs",
+    "source": "SELECT * FROM (",
+    "count": 2,
+    "reason": "UNION arms explicitly select transaction fields; the outer projection is fixed."
+  },
+  {
+    "path": "dwctl/src/db/handlers/groups.rs",
+    "source": "SELECT * FROM existing",
+    "count": 1,
+    "reason": "existing and inserted CTEs explicitly select/return id and name; no table-row expansion reaches the client."
+  },
+  {
+    "path": "dwctl/src/db/handlers/groups.rs",
+    "source": "SELECT * FROM inserted",
+    "count": 1,
+    "reason": "existing and inserted CTEs explicitly select/return id and name; no table-row expansion reaches the client."
+  },
+  {
+    "path": "dwctl/src/request_logging/batcher.rs",
+    "source": "SELECT * FROM UNNEST(",
+    "count": 1,
+    "reason": "Typed UNNEST input has a fixed result schema independent of base-table columns."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres/batch_list.rs",
+    "source": "query_builder.push(\"active_batches AS MATERIALIZED (SELECT b.* FROM batches b WHERE b.deleted_at IS NULL AND (\");",
+    "count": 1,
+    "reason": "Intermediate materialized/ordered batch rows only; push_query ends in an explicit final SELECT, so added batch columns do not change its client result."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres/batch_list.rs",
+    "source": "query_builder.push(\"SELECT * FROM (\");",
+    "count": 1,
+    "reason": "Intermediate materialized/ordered batch rows only; push_query ends in an explicit final SELECT, so added batch columns do not change its client result."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres/batch_list.rs",
+    "source": "query_builder.push(\"(SELECT b.*, \");",
+    "count": 1,
+    "reason": "Intermediate materialized/ordered batch rows only; push_query ends in an explicit final SELECT, so added batch columns do not change its client result."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres/retained_response.rs",
+    "source": "SELECT * FROM requests WHERE id = $1",
+    "count": 1,
+    "reason": "Intermediate request lookup or fixed membership UNION; the final SELECT explicitly names the result fields."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres/retained_response.rs",
+    "source": "SELECT * FROM request_templates_all t WHERE t.id = request.template_id LIMIT 1",
+    "count": 2,
+    "reason": "Lateral template lookup only; the enclosing SELECT or RETURNING explicitly names client-visible fields."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres/retained_response.rs",
+    "source": "SELECT * FROM live_members",
+    "count": 1,
+    "reason": "Intermediate request lookup or fixed membership UNION; the final SELECT explicitly names the result fields."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres/retained_response.rs",
+    "source": "SELECT * FROM retained_members",
+    "count": 1,
+    "reason": "Intermediate request lookup or fixed membership UNION; the final SELECT explicitly names the result fields."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres/retained_response.rs",
+    "source": "SELECT * FROM UNNEST($1::text[], $2::timestamptz[])",
+    "count": 1,
+    "reason": "Typed UNNEST input has a fixed result schema independent of base-table columns."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT * FROM UNNEST($1::text[], $2::bigint[], $3::int2[], $4::bigint[])",
+    "count": 1,
+    "reason": "Typed UNNEST input has a fixed result schema independent of base-table columns."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT * FROM batch_counts",
+    "count": 1,
+    "reason": "Intermediate typed input, fixed count/ranking CTE, or template lookup; enclosing statement explicitly projects its final results."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT * FROM batchless_counts",
+    "count": 1,
+    "reason": "Intermediate typed input, fixed count/ranking CTE, or template lookup; enclosing statement explicitly projects its final results."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT * FROM unnest($6::TEXT[], $7::BIGINT[]) AS u(user_id, active_count)",
+    "count": 1,
+    "reason": "Typed UNNEST input has a fixed result schema independent of base-table columns."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT * FROM active_request_templates t WHERE t.id = tc.template_id LIMIT 1",
+    "count": 2,
+    "reason": "Lateral template lookup only; the enclosing SELECT or RETURNING explicitly names client-visible fields."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT *",
+    "count": 2,
+    "reason": "Intermediate typed input, fixed count/ranking CTE, or template lookup; enclosing statement explicitly projects its final results."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT c.*,",
+    "count": 2,
+    "reason": "Intermediate typed input, fixed count/ranking CTE, or template lookup; enclosing statement explicitly projects its final results."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT o.*,",
+    "count": 1,
+    "reason": "Intermediate typed input, fixed count/ranking CTE, or template lookup; enclosing statement explicitly projects its final results."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT * FROM active_request_templates t WHERE t.id = claimed.template_id LIMIT 1",
+    "count": 1,
+    "reason": "Lateral template lookup only; the enclosing SELECT or RETURNING explicitly names client-visible fields."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT * FROM request_templates_all t",
+    "count": 2,
+    "reason": "Lateral template lookup only; the enclosing SELECT or RETURNING explicitly names client-visible fields."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT * FROM unnest($7::TEXT[], $8::BIGINT[]) AS u(user_id, active_count)",
+    "count": 1,
+    "reason": "Typed UNNEST input has a fixed result schema independent of base-table columns."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT * FROM (",
+    "count": 1,
+    "reason": "Intermediate typed input, fixed count/ranking CTE, or template lookup; enclosing statement explicitly projects its final results."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT rb.*, row_number() OVER (",
+    "count": 1,
+    "reason": "Intermediate typed input, fixed count/ranking CTE, or template lookup; enclosing statement explicitly projects its final results."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT r.*, $2::date",
+    "count": 1,
+    "reason": "Archive INSERT SELECT (or its test fixture) returns no row descriptor to the client. Archive/request column parity is covered by the archive schema tests; this is not a reader projection."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres.rs",
+    "source": "SELECT r.*, date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date",
+    "count": 1,
+    "reason": "Archive INSERT SELECT (or its test fixture) returns no row descriptor to the client. Archive/request column parity is covered by the archive schema tests; this is not a reader projection."
+  },
+  {
+    "path": "dwctl/src/db/errors.rs",
+    "source": "sqlx::query(\"SELECT * FROM cached_shape\").fetch_all(&mut *connection).await.unwrap();",
+    "count": 1,
+    "reason": "Intentional negative regression in cfg(test): reproduces stale-plan failure and verifies that persistent(false) does not invalidate an already cached statement. Not a production query."
+  },
+  {
+    "path": "dwctl/src/db/errors.rs",
+    "source": "let error = sqlx::query(\"SELECT * FROM cached_shape\")",
+    "count": 1,
+    "reason": "Intentional negative regression in cfg(test): reproduces stale-plan failure and verifies that persistent(false) does not invalidate an already cached statement. Not a production query."
+  },
+  {
+    "path": "dwctl/src/db/errors.rs",
+    "source": "let repeated = sqlx::query(\"SELECT * FROM cached_shape\")",
+    "count": 1,
+    "reason": "Intentional negative regression in cfg(test): reproduces stale-plan failure and verifies that persistent(false) does not invalidate an already cached statement. Not a production query."
+  }
+]

@@ -325,7 +325,15 @@ impl<'c> Repository for Deployments<'c> {
                 reasoning_translation_overrides
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38)
-            RETURNING *
+            RETURNING id, model_name, alias, display_name, description,
+                type, capabilities, created_by, hosted_on, status,
+                last_sync, deleted, created_at, updated_at, requests_per_second,
+                burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode,
+                downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
+                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement,
+                fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
+                backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, reasoning_translation_overrides,
+                allowed_batch_completion_windows, metadata, provisioning_source
             "#,
         )
         .bind(request.model_name.trim())
@@ -614,7 +622,15 @@ impl<'c> Repository for Deployments<'c> {
 
             updated_at = NOW()
         WHERE id = $1
-        RETURNING *
+        RETURNING id, model_name, alias, display_name, description,
+                type, capabilities, created_by, hosted_on, status,
+                last_sync, deleted, created_at, updated_at, requests_per_second,
+                burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode,
+                downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
+                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement,
+                fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
+                backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, reasoning_translation_overrides,
+                allowed_batch_completion_windows, metadata, provisioning_source
         "#,
         )
         .bind(id)
@@ -695,9 +711,21 @@ impl<'c> Repository for Deployments<'c> {
 
     #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
-        // Use LEFT JOIN with inference_endpoints to enable searching by endpoint name
-        let mut query =
-            QueryBuilder::new("SELECT dm.* FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1");
+        // Explicit results keep prepared statements compatible with additive migrations,
+        // including server statements retained by a transaction pooler across clients.
+        // Use LEFT JOIN with inference_endpoints to enable searching by endpoint name.
+        let mut query = QueryBuilder::new(
+            "SELECT dm.id, dm.model_name, dm.alias, dm.display_name, dm.description,
+                dm.type, dm.capabilities, dm.created_by, dm.hosted_on, dm.status,
+                dm.last_sync, dm.deleted, dm.created_at, dm.updated_at, dm.requests_per_second,
+                dm.burst_size, dm.capacity, dm.batch_capacity, dm.throughput, dm.downstream_pricing_mode,
+                dm.downstream_input_price_per_token, dm.downstream_output_price_per_token, dm.downstream_hourly_rate, dm.downstream_input_token_cost_ratio, dm.is_composite,
+                dm.lb_strategy, dm.fallback_enabled, dm.fallback_on_rate_limit, dm.fallback_on_status, dm.fallback_with_replacement,
+                dm.fallback_max_attempts, dm.backoff_enabled, dm.backoff_initial_ms, dm.backoff_max_ms, dm.backoff_factor,
+                dm.backoff_jitter, dm.backoff_max_total_ms, dm.sanitize_responses, dm.trusted, dm.reasoning_translation_overrides,
+                dm.allowed_batch_completion_windows, dm.metadata, dm.provisioning_source
+             FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
+        );
 
         Self::apply_filters(&mut query, filter);
 
@@ -873,7 +901,7 @@ impl<'c> Deployments<'c> {
         // Build a CTE that selects the filtered model set (ignoring pagination,
         // sort, and search so facets reflect the full universe visible to this user).
         let mut query = QueryBuilder::new(
-            "WITH visible AS (SELECT dm.* FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
+            "WITH visible AS (SELECT dm.metadata, dm.capabilities, dm.type FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
         );
 
         let facets_filter = DeploymentFilter {
