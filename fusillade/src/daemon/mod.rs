@@ -960,11 +960,15 @@ async fn run_batch_archive_phase<S>(
     }
 }
 
-/// Runs one batchless archive pass. Returns `true` when the pass proved more
-/// eligible work remains (`may_have_more`), so the worker can go straight
-/// into its next pass instead of sleeping out the tick interval. A failed or
-/// cancelled pass returns `false`: it keeps the metric raised, but a hot loop
-/// on a failing pass would only amplify the failure.
+/// Runs one batchless archive pass. Returns `true` when the pass both proved
+/// more eligible work remains (`may_have_more`) **and** archived at least one
+/// graph, so the worker can go straight into its next pass instead of sleeping
+/// out the tick interval. A pass that reported more work but archived nothing
+/// (all candidates SkippedLocked, Deferred, or swallowed IncompleteGraph)
+/// returns `false`: re-running it immediately would hot-loop on a queue it
+/// cannot drain. A failed or cancelled pass returns `false`: it keeps the
+/// metric raised, but a hot loop on a failing pass would only amplify the
+/// failure.
 async fn run_batchless_archive_phase<S>(
     storage: &S,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -1060,7 +1064,14 @@ where
                     "Retained-response archive phase completed"
                 );
             }
-            outcome.may_have_more
+            // A pass that discovered work but archived nothing discovered
+            // no progress: the storage can still report `may_have_more`
+            // (SkippedLocked, Deferred, or swallowed IncompleteGraph all
+            // leave it `true` without incrementing `groups_archived`). Re-
+            // running such a pass immediately would hot-loop, hammering the
+            // database on a queue it cannot drain, so only a pass that
+            // actually archived graphs is allowed to skip the interval.
+            outcome.may_have_more && outcome.groups_archived > 0
         }
         Ok(None) => false,
         Err(error) => {
@@ -3503,11 +3514,14 @@ where
                         "Archive mover started"
                     );
                     // The interval paces an idle worker. While a pass keeps
-                    // proving there is more to move, the next pass starts
-                    // straight away: sleeping a full interval between
-                    // back-to-back passes of a multi-day drain is pure idle
-                    // time on the critical path. Errors and empty passes fall
-                    // back to the interval, so a failing pass never hot-loops.
+                    // proving there is more to move *and* keeps making
+                    // progress, the next pass starts straight away: sleeping
+                    // a full interval between back-to-back passes of a
+                    // multi-day drain is pure idle time on the critical path.
+                    // Errors, empty passes, and zero-progress passes (where
+                    // the storage reported more work but archived nothing)
+                    // all fall back to the interval, so a pass that cannot
+                    // drain never hot-loops.
                     let mut more_work = false;
                     loop {
                         if more_work {
@@ -3886,6 +3900,7 @@ mod tests {
         batchless_cutoffs: std::sync::Mutex<Vec<RetainedResponseArchiveCutoffs>>,
         overdue_concurrency: std::sync::Mutex<Vec<usize>>,
         batchless_may_have_more: std::sync::atomic::AtomicBool,
+        batchless_groups_archived: std::sync::atomic::AtomicU64,
         fail_batchless: std::sync::atomic::AtomicBool,
         fail_weekly: std::sync::atomic::AtomicBool,
         fail_retained: std::sync::atomic::AtomicBool,
@@ -3919,6 +3934,7 @@ mod tests {
                 batchless_cutoffs: std::sync::Mutex::new(Vec::new()),
                 overdue_concurrency: std::sync::Mutex::new(Vec::new()),
                 batchless_may_have_more: std::sync::atomic::AtomicBool::new(false),
+                batchless_groups_archived: std::sync::atomic::AtomicU64::new(0),
                 fail_batchless: std::sync::atomic::AtomicBool::new(false),
                 fail_weekly: std::sync::atomic::AtomicBool::new(false),
                 fail_retained: std::sync::atomic::AtomicBool::new(false),
@@ -3952,6 +3968,7 @@ mod tests {
             }
             Ok(crate::RetainedResponseArchiveOutcome {
                 may_have_more: self.batchless_may_have_more.load(Ordering::SeqCst),
+                groups_archived: self.batchless_groups_archived.load(Ordering::SeqCst),
                 ..Default::default()
             })
         }
@@ -4699,12 +4716,24 @@ mod tests {
             "an empty pass paces the worker on its interval"
         );
 
+        // A pass that discovered work and archived it re-runs immediately.
         storage
             .batchless_may_have_more
             .store(true, Ordering::SeqCst);
+        storage.batchless_groups_archived.store(3, Ordering::SeqCst);
         assert!(
             run(storage.clone()).await,
-            "a pass that proved more work asks for an immediate next pass"
+            "a productive pass that archived graphs asks for an immediate next pass"
+        );
+
+        // A pass that discovered work but archived nothing must NOT hot-loop:
+        // SkippedLocked, Deferred, and swallowed IncompleteGraph all leave
+        // may_have_more true while groups_archived stays zero, so the worker
+        // must fall back to the interval instead of re-running immediately.
+        storage.batchless_groups_archived.store(0, Ordering::SeqCst);
+        assert!(
+            !run(storage.clone()).await,
+            "a zero-progress pass must fall back to the interval, not hot-loop"
         );
 
         storage.fail_batchless.store(true, Ordering::SeqCst);
