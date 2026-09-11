@@ -862,7 +862,21 @@ pub async fn target_message_handler<T: HttpClient>(
                     request_path
                 }
             } else {
-                request_path
+                // Also check if the last path segment of the target matches the
+                // beginning of the request path. This handles targets like
+                // "http://host/ai/v1/" where the full prefix "ai/v1" doesn't
+                // match the request path "v1/chat/completions", but the last
+                // segment "v1" does – avoiding an unintended /v1/v1 duplication.
+                let last_segment = target_path_no_slash.rsplit('/').next().unwrap_or(target_path_no_slash);
+                if let Some(rest) = request_path.strip_prefix(last_segment) {
+                    if rest.is_empty() || rest.starts_with('/') {
+                        rest.strip_prefix('/').unwrap_or(rest)
+                    } else {
+                        request_path
+                    }
+                } else {
+                    request_path
+                }
             }
         } else {
             request_path
@@ -2440,6 +2454,46 @@ mod tests {
         let result = target_url.join(path_to_join).unwrap();
         // Should NOT strip "v1" since "v1x" is not the same as "v1/"
         assert_eq!(result.as_str(), "https://api.example.com/v1/v1x/something");
+    }
+
+    #[test]
+    fn test_path_stripping_with_longer_target_prefix_ending_in_v1() {
+        // Test: target URL has a longer path that ends with "/v1" (e.g. "/ai/v1"),
+        // and the request path starts with "v1/". The full target_path_no_slash
+        // ("ai/v1") doesn't match, but the last segment ("v1") does, so we should
+        // strip it to avoid a /v1/v1 double-prefix.
+
+        let target_url = url::Url::parse("http://127.0.0.1:3001/ai/v1/").unwrap();
+        let target_path = target_url.path().trim_end_matches('/'); // "/ai/v1"
+        let request_path = "v1/chat/completions";
+
+        let path_to_join = if !target_path.is_empty() && target_path != "/" {
+            let target_path_no_slash = &target_path[1..];
+            if let Some(rest) = request_path.strip_prefix(target_path_no_slash) {
+                if rest.is_empty() || rest.starts_with('/') {
+                    rest.strip_prefix('/').unwrap_or(rest)
+                } else {
+                    request_path
+                }
+            } else {
+                let last_segment = target_path_no_slash.rsplit('/').next().unwrap_or(target_path_no_slash);
+                if let Some(rest) = request_path.strip_prefix(last_segment) {
+                    if rest.is_empty() || rest.starts_with('/') {
+                        rest.strip_prefix('/').unwrap_or(rest)
+                    } else {
+                        request_path
+                    }
+                } else {
+                    request_path
+                }
+            }
+        } else {
+            request_path
+        };
+
+        let result = target_url.join(path_to_join).unwrap();
+        // Should produce /ai/v1/chat/completions, not /ai/v1/v1/chat/completions
+        assert_eq!(result.as_str(), "http://127.0.0.1:3001/ai/v1/chat/completions");
     }
 
     // Timeout behavior tests

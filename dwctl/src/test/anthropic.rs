@@ -130,7 +130,7 @@ async fn anthropic_models_uses_control_layer_model_discovery(pool: PgPool) {
 async fn anthropic_messages_blocking_end_to_end(pool: PgPool) {
     let mock = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/chat/completions"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "chatcmpl-1", "object": "chat.completion", "created": 1, "model": "gpt-4",
             "choices": [ { "index": 0, "message": { "role": "assistant", "content": "Hello from the gateway" }, "finish_reason": "stop" } ],
@@ -187,7 +187,7 @@ async fn anthropic_messages_streaming_end_to_end(pool: PgPool) {
     );
     let mock = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/chat/completions"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_raw(sse.as_bytes().to_vec(), "text/event-stream"))
         .mount(&mock)
         .await;
