@@ -158,6 +158,16 @@ jobs:
             sleep 1
           done
 
+      - name: Start Redis
+        # The flex live-relay tests (chunk_relay, outbound_request) need a
+        # real Redis; they default to redis://localhost:6379.
+        run: |
+          docker run -d --name redis -p 6379:6379 redis:7
+          for _ in $(seq 1 30); do
+            docker exec redis redis-cli ping && break
+            sleep 1
+          done
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:

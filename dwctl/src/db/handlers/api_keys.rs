@@ -2620,6 +2620,7 @@ mod tests {
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: Default::default(),
             keystore: None,
+            flex_live_streaming: Default::default(),
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();
 
