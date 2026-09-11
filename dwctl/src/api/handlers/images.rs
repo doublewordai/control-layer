@@ -208,12 +208,13 @@ pub async fn record_image_access(pool: &sqlx::PgPool, attribution: ImageAttribut
     }
 }
 
-/// [`record_image_access`] that surfaces the failure. Use it wherever a LATER
-/// request depends on the row existing: the row is what authorises signing a
-/// `dw-img://` token at dispatch, so a queued (flex / batch) request whose
-/// bookkeeping write silently failed would be refused as not-owned when the
-/// daemon loops it back. Callers on those paths should fail the submission
-/// (retryable) rather than accept a request they cannot later serve.
+/// [`record_image_access`] that surfaces the failure. Use it wherever a later
+/// client request must be able to re-submit the resulting `dw-img://` token:
+/// client-presented tokens are authorised through this row, while daemon
+/// dispatches sign the tokens in a stored body on trust without consulting
+/// `image_access`. Callers on the queued (flex / batch) paths should fail the
+/// submission (retryable) rather than persist tokens the client could never
+/// re-submit.
 pub async fn try_record_image_access(
     pool: &sqlx::PgPool,
     attribution: ImageAttribution,

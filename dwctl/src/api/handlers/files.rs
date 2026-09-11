@@ -419,10 +419,12 @@ async fn normalize_template_body_in_place(
             match normalizer.ingest(input).await {
                 Ok(ingested) => {
                     if let (Some(pool), Some(attribution)) = (access_pool, access_attribution) {
-                        // AWAITED and REQUIRED: this row is what authorises signing
-                        // the token when the daemon dispatches the batch, so a
-                        // silently-failed write would later refuse the customer's
-                        // own image. Fail the upload (retryable) instead.
+                        // AWAITED and REQUIRED so this principal can later re-submit
+                        // the token it downloads. The batch dispatch itself signs
+                        // the stored token on trust without consulting
+                        // `image_access`; fail the upload (retryable) if this grant
+                        // cannot be recorded, rather than persist a token the
+                        // uploader could never re-submit.
                         if let Err(e) = crate::api::handlers::images::try_record_image_access(
                             &pool,
                             attribution,

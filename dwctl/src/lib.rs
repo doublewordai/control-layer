@@ -2403,9 +2403,10 @@ pub async fn build_router(
         // Re-use the AppState-bound singleton built once at startup.
         let normalizer = state.image_normalizer.clone();
         let realtime_ttl = cfg.image_normalizer.signing.realtime_ttl();
-        // Tokens only ever arrive on a daemon loopback (flex enqueue / file
-        // ingest store them), so they are signed with the dispatch TTL: long
-        // enough to outlive one full processing attempt.
+        // Tokens arriving on a daemon loopback (flex enqueue / file ingest
+        // store them) are signed with the dispatch TTL: long enough to outlive
+        // one full processing attempt. Client-presented tokens are authorised
+        // separately and use the realtime TTL.
         let processing_timeout = std::time::Duration::from_millis(cfg.background_services.batch_daemon.processing_timeout_ms);
         let token_ttl = cfg.image_normalizer.signing.dispatch_ttl(processing_timeout);
         let image_normalizer_state = crate::inference::image_normalizer_middleware::ImageNormalizerMiddlewareState {
