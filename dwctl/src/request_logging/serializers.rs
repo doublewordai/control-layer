@@ -115,7 +115,9 @@ pub struct HttpAnalyticsRow {
     /// Empty string for non-batch requests or when not provided.
     pub batch_request_source: String,
     /// URL of the upstream that served the request (onwards `ServedBy`
-    /// extension), for per-component attribution of composite models.
+    /// extension), for per-component attribution of composite models. On failed
+    /// requests this names the last upstream the routing layer attempted, so
+    /// 5xx rows stay attributable; `None` only when no upstream was contacted.
     pub served_by: Option<String>,
 }
 
@@ -155,8 +157,9 @@ pub struct UsageMetrics {
     /// URL of the upstream that actually served the request, read from the
     /// onwards `ServedBy` response extension. For composite models this is the
     /// selected component's endpoint (after any fallback), which is the only
-    /// place per-request routing attribution is knowable. `None` when the
-    /// request never reached an upstream (or predates the extension).
+    /// place per-request routing attribution is knowable. On failed requests it
+    /// names the last upstream attempted, so 5xx rows stay attributable. `None`
+    /// when the request never reached an upstream (or predates the extension).
     pub served_by: Option<String>,
     /// Cached-prompt count as reported by the UPSTREAM in
     /// `usage.prompt_tokens_details.cached_tokens` (SGLang/vLLM through the dynamo
