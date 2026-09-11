@@ -1003,7 +1003,9 @@ mod tests {
         .await
         .unwrap();
 
-        // Tokenizer stand-in: one marked block (the image) → one segment.
+        // Tokenizer stand-in. The write span runs from the first block to the
+        // marked one, so two segments (the text block, then the image block)
+        // are counted; the breakpoint's cumulative count is the second.
         let tok = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/v1/models"))
@@ -1016,7 +1018,7 @@ mod tests {
             .and(path("/v1/tokenize"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "virtual_model": ALIAS, "tokenizer_version": TOK_VER,
-                "segment_counts": [1500], "cumulative": [1500], "total": 1500
+                "segment_counts": [1400, 100], "cumulative": [1400, 1500], "total": 1500
             })))
             .mount(&tok)
             .await;
