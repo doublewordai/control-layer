@@ -1,5 +1,12 @@
 # Changelog
 
+## [11.10.1](https://github.com/doublewordai/control-layer/compare/v11.10.0...v11.10.1) (2026-09-11)
+
+
+### Documentation
+
+* Add repo-skill for DB migrations ([#1755](https://github.com/doublewordai/control-layer/issues/1755)) ([c28c352](https://github.com/doublewordai/control-layer/commit/c28c3529b5a575d5509f730e7be0d7910d15754c))
+
 ## [11.10.0](https://github.com/doublewordai/control-layer/compare/v11.9.1...v11.10.0) (2026-09-11)
 
 
