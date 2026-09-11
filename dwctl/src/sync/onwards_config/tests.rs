@@ -1747,6 +1747,333 @@ async fn test_onwards_config_reconnects_after_connection_loss(pool: sqlx::PgPool
     sync_handle.abort();
 }
 
+/// Regression test for the runtime pool-swap crash: when the direct pool behind
+/// `listener_db` is swapped via `DbPools::replace` and the old pool is explicitly
+/// closed (the documented close-after-replace pattern), `PgListener::connect_with`
+/// keeps the listener pinned to the old pool, so `try_recv()` yields
+/// `Err(PoolClosed)` (whose message contains "closed pool"). The sync task must
+/// treat that as recoverable — break to the outer loop, which re-resolves
+/// `self.listener_db.write()` to the live pool and reconnects — rather than
+/// `return Err` and crash the dwctl process via `BackgroundServices::wait_for_failure`.
+#[sqlx::test]
+#[test_log::test]
+async fn test_onwards_config_survives_pool_swap_and_close(pool: sqlx::PgPool) {
+    use sqlx_pool_router::DbPools;
+
+    // Build a DbPools so we can swap-and-close, exactly as production wiring does:
+    // both the query pool (`db`) and the LISTEN pool (`listener_db`) route through
+    // the same swappable provider.
+    let db_pools = DbPools::new(pool.clone());
+    let (sync, _initial_targets, _stream) = super::OnwardsConfigSync::new_with_daemon_limits(
+        db_pools.clone(),
+        db_pools.clone(),
+        None,
+        10,
+        Vec::new(),
+        false,
+        RateLimitTiersConfig::default(),
+    )
+    .await
+    .expect("Failed to create OnwardsConfigSync");
+
+    let (status_tx, mut status_rx) = mpsc::channel(10);
+    let config = SyncConfig {
+        status_tx: Some(status_tx),
+        fallback_interval_milliseconds: 0,
+    };
+    let shutdown_token = CancellationToken::new();
+    let mut sync_handle = tokio::spawn({
+        let shutdown = shutdown_token.clone();
+        async move { sync.start(config, shutdown).await }
+    });
+
+    // Wait for the initial connection on the original pool.
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
+
+    // Build a replacement pool pointed at the same per-test database (derived
+    // from the test pool's own connect options), modelling production pool
+    // replacement (per-role connection budgets / resizing) against the same DB.
+    let new_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .expect("Failed to connect replacement pool");
+    // Keep a handle so we can drain it cleanly at the end, letting the
+    // sqlx::test harness drop the per-test database.
+    let new_pool_for_close = new_pool.clone();
+
+    // Swap in the replacement, then explicitly CLOSE the old pool — the
+    // documented `DbPools::replace` + `old_primary.close().await` pattern. The
+    // listener's pinned old pool is now closed, so `try_recv` returns
+    // `Err(PoolClosed)` (whose message contains "closed pool").
+    let (old_primary, _old_replica) = db_pools.replace(new_pool, None);
+    old_primary.close().await;
+
+    // The listener must NOT fatal-exit. With the fix it breaks to the outer
+    // loop, re-resolves `listener_db.write()` to the replacement pool, and
+    // reconnects — emitting Disconnected, Reconnecting, then (outer loop)
+    // Connecting and Connected. With the bug, `start()` would `return Err`
+    // here and the status channel would close.
+    let status = timeout(Duration::from_secs(5), status_rx.recv())
+        .await
+        .expect("Timeout waiting for Disconnected status after pool close")
+        .expect("status channel closed before Disconnected");
+    assert_eq!(
+        status,
+        super::SyncStatus::Disconnected,
+        "Should receive Disconnected after the old pool is closed"
+    );
+
+    let status = timeout(Duration::from_secs(5), status_rx.recv())
+        .await
+        .expect("Timeout waiting for Reconnecting status after pool close")
+        .expect("status channel closed before Reconnecting");
+    assert_eq!(
+        status,
+        super::SyncStatus::Reconnecting,
+        "Should receive Reconnecting after the old pool is closed"
+    );
+
+    // Then the listener re-establishes on the replacement pool. With the bug,
+    // the task has already returned `Err` and the channel is closed, so this
+    // resolves to `Ok(false)` instead of `Ok(true)`.
+    let reconnected = timeout(Duration::from_secs(10), async {
+        loop {
+            match status_rx.recv().await {
+                Some(super::SyncStatus::Connected) => return true,
+                Some(status) => println!("Received status: {:?}", status),
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert!(
+        matches!(reconnected, Ok(true)),
+        "Should reconnect on the replacement pool after a swap+close, not fatal-exit \
+         (status result: {reconnected:?})",
+    );
+
+    // Verify the sync task is STILL RUNNING — the bug would have made it exit.
+    let result = timeout(Duration::from_millis(100), &mut sync_handle).await;
+    assert!(
+        result.is_err(),
+        "Sync task should still be running after reconnecting on the replacement pool"
+    );
+
+    // Clean shutdown: the task exits via the shutdown branch, then we drain the
+    // replacement pool so the per-test database can be dropped by the harness.
+    shutdown_token.cancel();
+    let join = sync_handle.await;
+    assert!(
+        matches!(join, Ok(Ok(()))),
+        "Sync task should shut down cleanly after cancellation (got: {join:?})",
+    );
+    new_pool_for_close.close().await;
+}
+
+/// Stronger automated variant of the swap-and-close scenario (G4): after the
+/// listener reconnects on the replacement pool, a `NOTIFY auth_config_changed`
+/// fired against the new pool must still drive a full reload and produce a
+/// fresh `Targets` update through the `WatchTargetsStream`. This proves the
+/// re-subscribed listener is live on the new pool, not just connected.
+#[sqlx::test]
+#[test_log::test]
+async fn test_onwards_config_reload_after_pool_swap(pool: sqlx::PgPool) {
+    use futures::StreamExt;
+    use onwards::target::TargetsStream;
+    use rust_decimal::Decimal;
+    use sqlx_pool_router::DbPools;
+
+    use crate::Role;
+    use crate::db::handlers::{Deployments, InferenceEndpoints, Repository, Tariffs};
+    use crate::db::models::{
+        deployments::DeploymentCreateDBRequest, inference_endpoints::InferenceEndpointCreateDBRequest, tariffs::TariffCreateDBRequest,
+    };
+
+    // Pre-create an endpoint + deployment so a tariff NOTIFY has a deployment to
+    // attach to and so `load_targets_from_db` has a target to surface.
+    let test_user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+    let endpoint = {
+        let mut tx = pool.begin().await.unwrap();
+        let ep = InferenceEndpoints::new(&mut tx)
+            .create(&InferenceEndpointCreateDBRequest {
+                created_by: test_user.id,
+                name: "test-endpoint-swap".to_string(),
+                description: None,
+                url: url::Url::from_str("https://api.test.com").unwrap(),
+                api_key: None,
+                model_filter: None,
+                auth_header_name: Some("Authorization".to_string()),
+                auth_header_prefix: Some("Bearer ".to_string()),
+                reasoning_translation: None,
+                accepts_scheduling_priority: false,
+            })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        ep
+    };
+    let deployment = {
+        let mut tx = pool.begin().await.unwrap();
+        let dep = Deployments::new(&mut tx)
+            .create(&DeploymentCreateDBRequest {
+                created_by: test_user.id,
+                model_name: "test-model-swap".to_string(),
+                alias: "test-alias-swap".to_string(),
+                display_name: None,
+                description: None,
+                model_type: None,
+                capabilities: None,
+                hosted_on: Some(endpoint.id),
+                requests_per_second: None,
+                burst_size: None,
+                capacity: None,
+                batch_capacity: None,
+                throughput: None,
+                provider_pricing: None,
+                is_composite: false,
+                lb_strategy: None,
+                fallback_enabled: None,
+                fallback_on_rate_limit: None,
+                fallback_on_status: None,
+                fallback_with_replacement: None,
+                fallback_max_attempts: None,
+                backoff_enabled: false,
+                backoff_initial_ms: 100,
+                backoff_max_ms: 5_000,
+                backoff_factor: 2.0,
+                backoff_jitter: "full".to_string(),
+                backoff_max_total_ms: None,
+                sanitize_responses: true,
+                trusted: false,
+                reasoning_translation_overrides: None,
+                allowed_batch_completion_windows: None,
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        dep
+    };
+
+    // Both the query pool (`db`) and the LISTEN pool (`listener_db`) route
+    // through the same swappable provider, exactly as production wiring does.
+    let db_pools = DbPools::new(pool.clone());
+    let (sync, _initial_targets, stream) = super::OnwardsConfigSync::new_with_daemon_limits(
+        db_pools.clone(),
+        db_pools.clone(),
+        None,
+        10,
+        Vec::new(),
+        false,
+        RateLimitTiersConfig::default(),
+    )
+    .await
+    .expect("Failed to create OnwardsConfigSync");
+
+    // The targets update stream yields on each reload (`sender.send` in
+    // `full_reload`). It does NOT yield the initial value, so the first item
+    // observed will correspond to the first reload after `start()` connects.
+    let mut targets_stream = stream.stream().await.expect("TargetsStream::stream failed");
+
+    let (status_tx, mut status_rx) = mpsc::channel(16);
+    let config = SyncConfig {
+        status_tx: Some(status_tx),
+        fallback_interval_milliseconds: 0,
+    };
+    let shutdown_token = CancellationToken::new();
+    let mut sync_handle = tokio::spawn({
+        let shutdown = shutdown_token.clone();
+        async move { sync.start(config, shutdown).await }
+    });
+
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
+
+    // Swap in a replacement pool pointed at the same per-test DB, then close
+    // the old pool (documented close-after-replace pattern).
+    let new_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect_with(pool.connect_options().as_ref().clone())
+        .await
+        .expect("Failed to connect replacement pool");
+    let new_pool_for_close = new_pool.clone();
+    let (old_primary, _old_replica) = db_pools.replace(new_pool, None);
+    old_primary.close().await;
+
+    // Wait for the listener to reconnect on the replacement pool.
+    let status = timeout(Duration::from_secs(5), status_rx.recv())
+        .await
+        .expect("Timeout waiting for Disconnected after pool close")
+        .expect("status channel closed before Disconnected");
+    assert_eq!(status, super::SyncStatus::Disconnected);
+    let status = timeout(Duration::from_secs(5), status_rx.recv())
+        .await
+        .expect("Timeout waiting for Reconnecting after pool close")
+        .expect("status channel closed before Reconnecting");
+    assert_eq!(status, super::SyncStatus::Reconnecting);
+    let reconnected = timeout(Duration::from_secs(10), async {
+        loop {
+            match status_rx.recv().await {
+                Some(super::SyncStatus::Connected) => return true,
+                Some(status) => println!("Received status: {:?}", status),
+                None => return false,
+            }
+        }
+    })
+    .await;
+    assert!(
+        matches!(reconnected, Ok(true)),
+        "Should reconnect on the replacement pool (status result: {reconnected:?})",
+    );
+
+    // Fire a NOTIFY on the replacement pool by creating a tariff on the
+    // pre-existing deployment. The re-subscribed listener on the new pool must
+    // receive it and run a full reload, producing a fresh Targets update.
+    {
+        let mut tariff_tx = new_pool_for_close.begin().await.expect("begin tariff tx");
+        Tariffs::new(&mut tariff_tx)
+            .create(&TariffCreateDBRequest {
+                deployed_model_id: deployment.id,
+                name: "default".to_string(),
+                input_price_per_token: Decimal::new(1, 6),
+                output_price_per_token: Decimal::new(2, 6),
+                api_key_purpose: None,
+                completion_window: None,
+                valid_from: None,
+            })
+            .await
+            .expect("create tariff");
+        tariff_tx.commit().await.expect("commit tariff tx");
+    }
+
+    let next_targets = timeout(Duration::from_secs(5), targets_stream.next())
+        .await
+        .expect("Timeout waiting for post-swap reload to produce a Targets update")
+        .expect("targets stream closed")
+        .expect("TargetsStream error");
+    // The reload ran against the replacement pool and surfaced the model that
+    // now has a tariff, proving the listener on the new pool processed the NOTIFY.
+    assert!(
+        next_targets.targets.contains_key("test-alias-swap"),
+        "post-swap reload should surface 'test-alias-swap'; got keys: {:?}",
+        next_targets.targets.iter().map(|r| r.key().clone()).collect::<Vec<_>>(),
+    );
+
+    // The sync task is still running.
+    let result = timeout(Duration::from_millis(100), &mut sync_handle).await;
+    assert!(result.is_err(), "Sync task should still be running after the post-swap reload",);
+
+    shutdown_token.cancel();
+    let join = sync_handle.await;
+    assert!(
+        matches!(join, Ok(Ok(()))),
+        "Sync task should shut down cleanly after cancellation (got: {join:?})",
+    );
+    new_pool_for_close.close().await;
+}
+
 /// Test that fallback sync triggers periodic reloads even without LISTEN/NOTIFY activity
 #[sqlx::test]
 #[test_log::test]
