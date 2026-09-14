@@ -845,6 +845,10 @@ pub struct ResponseUsage {
     pub input_tokens_details: InputTokensDetails,
     #[serde(default)]
     pub output_tokens_details: OutputTokensDetails,
+    /// Cache billing fields retained from the raw Chat Completions usage. The
+    /// standard cached-token detail alone does not carry the write-tier split.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// Details about input tokens
@@ -1013,6 +1017,7 @@ mod tests {
                 total_tokens: 15,
                 input_tokens_details: InputTokensDetails { cached_tokens: 0 },
                 output_tokens_details: OutputTokensDetails { reasoning_tokens: 0 },
+                extra: Default::default(),
             }),
             max_output_tokens: None,
             max_tool_calls: None,

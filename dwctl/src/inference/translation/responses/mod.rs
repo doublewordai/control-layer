@@ -88,12 +88,16 @@ impl ProtocolTranslator for OpenResponses {
         let mut raw: Value = serde_json::from_slice(&body)
             .map_err(|e| TranslationError::Internal(format!("upstream response was not Chat Completions: {e}")))?;
         normalize_chat_completion_response_value(&mut raw, &req.model);
+        let cache_usage = util::cache_usage_fields(raw.get("usage"));
         let chat: ChatCompletionResponse = serde_json::from_value(raw)
             .map_err(|e| TranslationError::Internal(format!("upstream response was not Chat Completions: {e}")))?;
 
         // Stamp the platform tracking id so `GET /v1/responses/{id}` resolves; fall
         // back to the upstream completion id when there's no tracking row.
-        let out = response::to_responses_response(&chat, &req, response_id);
+        let mut out = response::to_responses_response(&chat, &req, response_id);
+        if let Some(usage) = out.usage.as_mut() {
+            usage.extra = cache_usage;
+        }
         serde_json::to_vec(&out)
             .map(Bytes::from)
             .map_err(|e| TranslationError::Internal(e.to_string()))
@@ -204,7 +208,11 @@ impl StreamReframer for ResponsesStreamReframer {
             return Vec::new();
         };
         let state = self.state.as_mut().expect("state is Some");
-        state.process_chunk(&parsed).iter().flat_map(|e| e.to_sse().into_bytes()).collect()
+        let events = state.process_chunk(&parsed);
+        if parsed.usage.is_some() {
+            state.preserve_cache_usage(chunk.get("usage"));
+        }
+        events.iter().flat_map(|e| e.to_sse().into_bytes()).collect()
     }
 
     fn error(&mut self, message: &str) -> Vec<u8> {
@@ -259,6 +267,63 @@ mod tests {
         assert_eq!(chat["model"], "gpt-4o");
         assert_eq!(chat["messages"][0]["role"], "user");
         assert_eq!(chat["messages"][0]["content"], "hi");
+    }
+
+    #[test]
+    fn blocking_response_preserves_cache_billing_fields() {
+        let request = Bytes::from_static(br#"{"model":"m","input":"hi"}"#);
+        let usage = serde_json::json!({
+            "prompt_tokens": 2000, "completion_tokens": 2, "total_tokens": 2002,
+            "prompt_tokens_details": {"cached_tokens": 1000},
+            "cache_read_input_tokens": 1000,
+            "cache_creation_input_tokens": 600,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 100,
+                "ephemeral_1h_input_tokens": 200,
+                "ephemeral_24h_input_tokens": 300
+            },
+            "unrelated_provider_field": "do not forward"
+        });
+        let body = serde_json::json!({
+            "id": "c1", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": usage
+        });
+        let translated = OpenResponses::new()
+            .translate_response(&request, None, Bytes::from(body.to_string()))
+            .unwrap();
+        let response: Value = serde_json::from_slice(&translated).unwrap();
+        assert_eq!(response["usage"]["input_tokens"], 2000);
+        assert_eq!(response["usage"]["input_tokens_details"]["cached_tokens"], 1000);
+        for field in ["cache_read_input_tokens", "cache_creation_input_tokens", "cache_creation"] {
+            assert_eq!(
+                response["usage"][field], usage[field],
+                "billing field {field} must survive translation"
+            );
+        }
+        assert!(response["usage"].get("unrelated_provider_field").is_none());
+    }
+
+    #[test]
+    fn displayed_cache_tokens_do_not_create_billing_fields() {
+        let request = Bytes::from_static(br#"{"model":"m","input":"hi"}"#);
+        let body = serde_json::json!({
+            "id": "c1", "object": "chat.completion", "created": 0, "model": "m",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 2000, "completion_tokens": 2, "total_tokens": 2002,
+                "prompt_tokens_details": {"cached_tokens": 1000}}
+        });
+        let translated = OpenResponses::new()
+            .translate_response(&request, None, Bytes::from(body.to_string()))
+            .unwrap();
+        let response: Value = serde_json::from_slice(&translated).unwrap();
+        assert_eq!(response["usage"]["input_tokens_details"]["cached_tokens"], 1000);
+        for field in ["cache_read_input_tokens", "cache_creation_input_tokens", "cache_creation"] {
+            assert!(
+                response["usage"].get(field).is_none(),
+                "display-only counts must not synthesize {field}"
+            );
+        }
     }
 
     /// Stands in for onwards' chat-completions handler, reached via the alias

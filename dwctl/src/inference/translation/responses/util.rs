@@ -80,5 +80,15 @@ pub(crate) fn chat_usage_to_response_usage(u: &Usage) -> ResponseUsage {
         total_tokens: u.total_tokens,
         input_tokens_details: InputTokensDetails { cached_tokens },
         output_tokens_details: OutputTokensDetails { reasoning_tokens },
+        extra: Map::new(),
     }
+}
+
+/// The typed Chat Completions usage discards these extension fields. Preserve
+/// only the cache accounting fields so Responses billing sees the same split.
+pub(super) fn cache_usage_fields(usage: Option<&Value>) -> Map<String, Value> {
+    ["cache_read_input_tokens", "cache_creation_input_tokens", "cache_creation"]
+        .into_iter()
+        .filter_map(|field| usage?.get(field).map(|value| (field.to_string(), value.clone())))
+        .collect()
 }

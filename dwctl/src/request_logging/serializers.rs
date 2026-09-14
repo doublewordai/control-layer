@@ -691,8 +691,8 @@ pub(crate) fn extract_engine_cached_tokens(response_data: &ResponseData) -> Opti
 
 /// Token counts read straight from a raw `usage` JSON object, for bodies the typed parse
 /// cannot represent. Field semantics mirror [`TokenMetrics`]'s arms exactly: an OpenAI
-/// `prompt_tokens` is already the total input; an Anthropic `input_tokens` excludes the
-/// cache buckets, which are added back — reading it verbatim is the August incident.
+/// `prompt_tokens` and Responses `input_tokens` already include cached input; an Anthropic
+/// `input_tokens` excludes the cache buckets, which are added back.
 ///
 /// Shared by the live path's raw-usage fallback and [`crate::recompute`]'s replay of stored
 /// fusillade bodies, so the two can never read the same unrepresentable body differently.
@@ -709,6 +709,9 @@ pub(crate) fn raw_usage_tokens(usage: &Value) -> Option<RawUsageTokens> {
     let get = |k: &str| usage.get(k).and_then(Value::as_i64);
     let prompt = match get("prompt_tokens") {
         Some(p) => p,
+        // Responses always emits this detail object, including when its cache
+        // billing extensions are present. Its input count already includes them.
+        None if usage.get("input_tokens_details").is_some() => get("input_tokens")?,
         None => {
             get("input_tokens")?
                 + get("cache_read_input_tokens").unwrap_or(0).max(0)
@@ -718,6 +721,7 @@ pub(crate) fn raw_usage_tokens(usage: &Value) -> Option<RawUsageTokens> {
     let completion = get("completion_tokens").or_else(|| get("output_tokens")).unwrap_or(0);
     let reasoning = usage
         .pointer("/completion_tokens_details/reasoning_tokens")
+        .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or(0);
     // Floor everything at 0 (malformed bodies must not reach the cost maths), and derive the
@@ -734,6 +738,7 @@ pub(crate) fn raw_usage_tokens(usage: &Value) -> Option<RawUsageTokens> {
 }
 
 /// Locate the response's final `usage` object and map it with `from_usage`.
+/// Responses SSE terminal events nest this object under `response.usage`.
 ///
 /// Factored out of [`extract_cache_tokens`] so that a caller reading a *raw upstream* body
 /// can apply different field semantics without duplicating the body handling — the
@@ -774,7 +779,13 @@ pub(crate) fn extract_from_last_usage<T: Default>(response_data: &ResponseData, 
             let trimmed = data.trim();
             if trimmed != "[DONE]"
                 && let Ok(value) = serde_json::from_str::<Value>(trimmed)
-                && let Some(usage) = value.get("usage").filter(|u| u.is_object())
+                && let Some(usage) = value
+                    .get("usage")
+                    .or_else(|| match value.get("type").and_then(Value::as_str) {
+                        Some("response.completed" | "response.incomplete" | "response.failed") => value.pointer("/response/usage"),
+                        _ => None,
+                    })
+                    .filter(|u| u.is_object())
             {
                 last = from_usage(usage);
             }
@@ -2869,6 +2880,31 @@ mod tests {
         assert_eq!(c.read, 1500);
         assert_eq!(c.creation_24h, 1500);
         assert_eq!(c.creation_1h, 0);
+    }
+
+    #[test]
+    fn responses_terminal_usage_preserves_cache_split_and_total_input() {
+        let usage = serde_json::json!({
+            "input_tokens": 2000, "output_tokens": 5, "total_tokens": 2005,
+            "input_tokens_details": {"cached_tokens": 1000},
+            "output_tokens_details": {"reasoning_tokens": 2},
+            "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 600,
+            "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200, "ephemeral_24h_input_tokens": 300}
+        });
+        for event_type in ["response.completed", "response.incomplete", "response.failed"] {
+            let event = serde_json::json!({"type": event_type, "response": {"usage": usage}});
+            let body = format!("event: {event_type}\ndata: {event}\n\ndata: [DONE]\n\n");
+            let response = response_with_body(body);
+            let cache = extract_cache_tokens(&response);
+            assert_eq!(
+                (cache.read, cache.creation_5m, cache.creation_1h, cache.creation_24h),
+                (1000, 100, 200, 300)
+            );
+            let tokens = super::extract_from_last_usage(&response, super::raw_usage_tokens).unwrap();
+            assert_eq!(tokens.prompt, 2000, "Responses input already includes cached tokens");
+            assert_eq!(tokens.completion, 5);
+            assert_eq!(tokens.reasoning, 2);
+        }
     }
 
     /// `prompt_tokens_details.cached_tokens` is the ENGINE's prefix-cache hit (SGLang/vLLM
