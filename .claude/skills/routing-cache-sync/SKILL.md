@@ -29,6 +29,16 @@ at commit, and disconnected listeners can miss it. Every serving instance needs
 fresh routing state; do not make cache refresh leader-only. Local notification
 rate limiting is not a fleet-wide rate limiter or a zero-lag balance guarantee.
 
+## Declarative model changes
+
+Use the existing catalog loader and transactional provisioning path. Validate the
+complete catalog before applying it, preserve stable alias identities, and keep
+endpoint synchronization from overwriting YAML-owned rows. Omitted models become
+manually managed rather than being deleted; an empty/backend-only catalog is a
+no-op that preserves ownership markers. Test these separately from cache reloads.
+See [model provisioning](../../../docs/src/reference/model-provisioning.md) and
+the current [loader](../../../dwctl/src/model_provisioning.rs).
+
 ## Regression examples
 
 For key revocation, assert access initially works, commit the revocation, then
