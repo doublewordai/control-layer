@@ -33,7 +33,8 @@ consequence for every migration you write:
 > the previous release, or expand/contract across two releases.
 
 The implementation is `dwctl/src/migrations.rs` (runner, compatibility check,
-command) and `fusillade-arsenal/src/managed_index.rs` (index recovery).
+command). It deliberately contains no schema knowledge of its own: every
+statement that changes the database lives in a migration file.
 
 ## Transactional migrations (the default)
 
@@ -68,47 +69,36 @@ rules, because it cannot run inside a transaction:
    matches with `starts_with`) and contain **exactly one statement**:
    Postgres wraps a multi-statement simple query in an implicit transaction,
    which `CONCURRENTLY` rejects. Put the `COMMENT ON INDEX` and any
-   validation in the following migration.
+   validation in a following migration.
 2. SQLx records the migration only after the statement returns. An
    interrupted build (cancelled backend, killed pod, "deadlock detected")
    leaves an INVALID index and no row. On the next run `IF NOT EXISTS` sees
    the invalid index, skips the build, and the migration is recorded as
    applied — the 11.9.1 incident. `IF NOT EXISTS` is therefore never proof
    that the index is usable.
-3. **Register the index in `fusillade_arsenal::managed_index::managed_indexes()`**
-   (or the equivalent list for the target). The migration runner inspects
-   every registered index before the migrator runs: an invalid index with the
-   intended definition is rebuilt with `REINDEX INDEX CONCURRENTLY`, an absent
-   index whose migration is already recorded is built, and an index with a
-   different definition fails the run with both definitions in the message
-   and is never touched. After the migrator the runner verifies every
-   registered index is valid, and `ANALYZE`s any table whose index it built.
+3. **Make the sequence recoverable in SQL.** Ship three files, and leave
+   numbering room between them (timestamps ten seconds apart, never
+   adjacent integers) so a repair can be slotted in later if ever needed:
 
-A registry entry:
+   | file                              | contents                                             |
+   |-----------------------------------|------------------------------------------------------|
+   | `…10_add_<index>.up.sql`          | `-- no-transaction` + `CREATE INDEX CONCURRENTLY IF NOT EXISTS …` |
+   | `…20_reindex_<index>.up.sql`      | `-- no-transaction` + `REINDEX INDEX CONCURRENTLY <index>;`       |
+   | `…30_validate_<index>.up.sql`     | transactional `DO $$ … $$` checking definition, `indisvalid`, `indisready`; `COMMENT ON INDEX` |
 
-```rust
-ManagedIndex {
-    name: "idx_batches_owner_created_at_id",
-    table: "batches",
-    // Exactly what pg_get_indexdef prints after `ON <table> `; doubles as the
-    // SQL used to (re)build it. `managed_index_definitions_match_catalog`
-    // fails if this drifts from the migration.
-    definition: "USING btree (created_by, created_at DESC, id DESC) WHERE (deleted_at IS NULL)",
-    created_by_migration: 20260910010000,
-    kind: IndexKind::Plain,
-},
-```
+   The reindex step is what makes an interrupted build self-healing: on a
+   clean build it is one extra concurrent pass (bounded, no write lock), on
+   an interrupted one it turns the INVALID index into a valid one, and if
+   *it* is interrupted the next run repeats it. Neither step is recorded
+   until it succeeds, so a retry always resumes at the right place. The
+   validation step then fails only for a genuinely wrong definition, which
+   is an operator decision (rename or drop by hand), never something a
+   migration guesses at.
 
-Get the `definition` string from a migrated database:
-`SELECT pg_get_indexdef('idx_...'::regclass);` and take everything from
-`USING`. The test pins it, so a wrong string fails `cargo test -p
-fusillade-arsenal managed_index` rather than production.
-
-Pair the build with a validation migration (see
-`20260910010001_validate_batch_owner_page_index.up.sql`) that checks the
-definition in `pg_index` and raises otherwise. With the registry in place the
-validation is belt and braces: it documents the intent in SQL and makes
-`sqlx migrate run` on a laptop fail the same way the Job would.
+   If `REINDEX INDEX CONCURRENTLY` itself is interrupted it can leave an
+   invalid `<index>_ccnew` behind; the next `REINDEX` run tolerates it, and
+   `DROP INDEX CONCURRENTLY IF EXISTS <index>_ccnew` in its own
+   `-- no-transaction` file cleans it up.
 
 Reads while the build runs are unaffected. The previous release keeps using
 whatever index it used before; do not drop that one in the same release.
@@ -118,15 +108,13 @@ whatever index it used before; do not drop that one in the same release.
 `CREATE INDEX CONCURRENTLY` is not supported on a partitioned parent. The
 procedure is: create the parent index `ON ONLY` (metadata only), build one
 child `CONCURRENTLY` per leaf partition, `ATTACH PARTITION` each child; the
-parent becomes valid once every partition has an attached valid child. Register
-the index with `IndexKind::Partitioned { child_prefix }` and the runner does
-all of that before the migrator runs, so a populated database no longer needs
-the `scripts/prepare_retained_*_index.sql` prebuild. Keep the migration itself
-as the existing ones are: build directly only when every partition is empty,
-otherwise validate that preparation happened.
-
-Partitions created later inherit the parent index automatically; the runner's
-per-partition check covers partitions created between two releases.
+parent becomes valid once every partition has an attached valid child. That
+needs a statement per partition, so it cannot be a migration on a populated
+database. Keep the existing pattern: the migration builds directly only when
+every partition is empty and otherwise validates that
+`scripts/prepare_retained_*_index.sql` was run beforehand; document the
+prebuild in the release notes for that version. Partitions created later
+inherit the parent index automatically.
 
 ## Destructive and shape-changing migrations
 
@@ -155,10 +143,9 @@ never held across the whole table.
 
 ## Checklist before opening a PR
 
-* `cargo test -p dwctl --lib migrations::` and `cargo test -p
-  fusillade-arsenal managed_index` pass.
-* New `CONCURRENTLY` index → registry entry + validation migration +
-  `managed_index_definitions_match_catalog` passes.
+* `cargo test -p dwctl --lib migrations::` passes.
+* New `CONCURRENTLY` index → build, reindex and validate files with
+  numbering room between them.
 * The previous release can serve against the migrated schema (additive, or
   the expand half of an expand/contract).
 * `.github/scripts/test-fusillade-migration-checksums.py` (run by `just lint

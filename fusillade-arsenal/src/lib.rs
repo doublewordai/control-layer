@@ -6,7 +6,6 @@ use std::time::Duration;
 use fusillade_core::FusilladeError;
 
 mod db;
-pub mod managed_index;
 pub mod postgres;
 pub mod transform;
 mod utils;

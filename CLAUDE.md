@@ -52,9 +52,10 @@ Handlers (API) → Repositories (db::handlers) → Models (db::models) → Postg
 - Migrations live in `dwctl/migrations/` (main schema) and
   `fusillade-arsenal/migrations/` (Fusillade). `dwctl migrate` applies them;
   `migrations.mode` (`run` locally, `check` in deployments) decides whether
-  the serving process applies them or only verifies compatibility. Read
-  `docs/migrations.md` before adding a migration, especially one that builds
-  an index `CONCURRENTLY`
+  the serving process applies them or only verifies compatibility. Every
+  statement that changes the schema lives in a migration file; read
+  `docs/migrations.md` before adding one, especially an index built
+  `CONCURRENTLY`
 - The `underway` crate (background task queue) ships its own SQLx migrations
   that create the `underway` schema; `just db-setup` applies these too, but
   they are also applied at runtime via `underway::run_migrations`

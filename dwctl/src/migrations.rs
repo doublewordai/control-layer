@@ -13,12 +13,13 @@
 //!
 //! Historically every API and daemon pod ran all four at boot. That couples
 //! DDL to pod lifecycle and startup deadlines, and a migration that fails
-//! part-way (see [`fusillade_arsenal::managed_index`]) stops every new pod
-//! from starting. This module separates the two concerns:
+//! part-way stops every new pod from starting. This module separates the two
+//! concerns; the migrations themselves stay the only place schema work is
+//! defined (see `docs/migrations.md`).
 //!
-//! * [`apply`] runs a target's pending migrations, repairing managed indexes
-//!   first and verifying them afterwards. `dwctl migrate` calls it for every
-//!   target from a Kubernetes Job before the application rolls.
+//! * [`apply`] runs a target's pending migrations one at a time with
+//!   progress logging. `dwctl migrate` calls it for every target from a
+//!   Kubernetes Job before the application rolls.
 //! * [`check`] never executes DDL. It proves the database carries every
 //!   migration this binary ships (matching checksums) and tolerates a database
 //!   that is *ahead*, so old replicas keep serving while an additive migration
@@ -41,11 +42,10 @@ use std::str::FromStr;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use fusillade_arsenal::managed_index::{self, ManagedIndex, RepairAction, RepairReport};
 use sqlx::migrate::{Migrate, Migrator};
 use sqlx::postgres::PgConnectOptions;
 use sqlx::{Connection, PgPool};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::config::{ComponentDb, Config, DatabaseConfig, MigrationsMode, PoolSettings};
 use crate::{connect_options, create_schema_pool, verify_same_live_database};
@@ -54,9 +54,6 @@ use crate::{connect_options, create_schema_pool, verify_same_live_database};
 pub struct Target {
     pub name: &'static str,
     pub migrator: Migrator,
-    /// Indexes whose concurrent builds are repaired before and verified after
-    /// the migrator runs.
-    pub managed_indexes: &'static [ManagedIndex],
 }
 
 impl Target {
@@ -64,7 +61,6 @@ impl Target {
         Self {
             name: "main",
             migrator: crate::migrator(),
-            managed_indexes: &[],
         }
     }
 
@@ -76,7 +72,6 @@ impl Target {
                 migrations: Cow::Borrowed(shared.migrations.as_ref()),
                 ..*shared
             },
-            managed_indexes: managed_index::managed_indexes(),
         }
     }
 
@@ -84,7 +79,6 @@ impl Target {
         Self {
             name: "outlet",
             migrator: outlet_postgres::migrator(),
-            managed_indexes: &[],
         }
     }
 
@@ -153,15 +147,6 @@ pub struct ApplyReport {
     pub applied: Vec<i64>,
     /// Versions that were already recorded before this run.
     pub already_applied: usize,
-    pub repairs: Vec<RepairReport>,
-}
-
-impl ApplyReport {
-    pub fn repaired(&self) -> impl Iterator<Item = &RepairReport> {
-        self.repairs
-            .iter()
-            .filter(|r| !matches!(r.action, RepairAction::Untouched(_)) || !r.dropped_leftovers.is_empty())
-    }
 }
 
 /// Outcome of [`check`] for one target.
@@ -200,10 +185,10 @@ fn version_set(rows: &HashMap<i64, AppliedRow>) -> HashSet<i64> {
     rows.values().filter(|r| r.success).map(|r| r.version).collect()
 }
 
-/// Apply every pending migration of `target`, repairing managed indexes first
-/// and verifying them afterwards. `pool` must hand out direct connections.
+/// Apply every pending migration of `target`. `pool` must hand out direct
+/// connections.
 ///
-/// The whole run — bookkeeping table, repair, migrations, verification — is
+/// The whole run — bookkeeping table and migrations — is
 /// serialised behind SQLx's database-scoped advisory lock, held on one
 /// dedicated connection that is closed on every path (see [`Target::run_to`]
 /// for why a pooled connection must not outlive a failure with that lock).
@@ -216,7 +201,7 @@ pub async fn apply(target: &Target, pool: &PgPool) -> anyhow::Result<ApplyReport
         .await
         .with_context(|| format!("{name}: acquiring a direct connection"))?
         .detach();
-    let result = apply_locked(target, pool, &mut conn).await;
+    let result = apply_locked(target, &mut conn).await;
     let _ = conn.close().await;
     result
 }
@@ -268,7 +253,7 @@ async fn acquire_migration_lock(conn: &mut sqlx::PgConnection, name: &str) -> an
     }
 }
 
-async fn apply_locked(target: &Target, pool: &PgPool, conn: &mut sqlx::PgConnection) -> anyhow::Result<ApplyReport> {
+async fn apply_locked(target: &Target, conn: &mut sqlx::PgConnection) -> anyhow::Result<ApplyReport> {
     let name = target.name;
     let lock_id = acquire_migration_lock(conn, name).await?;
     conn.ensure_migrations_table()
@@ -283,8 +268,7 @@ async fn apply_locked(target: &Target, pool: &PgPool, conn: &mut sqlx::PgConnect
     let before = recorded(conn).await?.unwrap_or_default();
     let already = version_set(&before);
 
-    // Checksum drift is the one thing repair must not paper over: report it
-    // before touching anything.
+    // Checksum drift: report it before touching anything.
     let mismatched: Vec<i64> = target
         .migrator
         .iter()
@@ -297,18 +281,6 @@ async fn apply_locked(target: &Target, pool: &PgPool, conn: &mut sqlx::PgConnect
             "{name}: released migration file(s) changed after they were applied: {mismatched:?}. \
              Migration files are immutable once released; restore them and ship a new migration instead"
         );
-    }
-
-    let repairs = managed_index::repair_all(pool, target.managed_indexes, &already)
-        .await
-        .with_context(|| format!("{name}: repairing managed indexes"))?;
-    for report in &repairs {
-        if !report.dropped_leftovers.is_empty() {
-            warn!(target = name, index = report.index, dropped = ?report.dropped_leftovers, "dropped invalid rebuild leftovers");
-        }
-        if !matches!(report.action, RepairAction::Untouched(_)) {
-            info!(target = name, index = report.index, action = ?report.action, "managed index repaired");
-        }
     }
 
     let pending: Vec<_> = target
@@ -352,10 +324,6 @@ async fn apply_locked(target: &Target, pool: &PgPool, conn: &mut sqlx::PgConnect
         applied.push(version);
     }
 
-    let after = recorded(conn).await?.unwrap_or_default();
-    managed_index::verify_all(pool, target.managed_indexes, &version_set(&after))
-        .await
-        .with_context(|| format!("{name}: verifying managed indexes after migration"))?;
     sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(lock_id)
         .execute(&mut *conn)
@@ -364,7 +332,6 @@ async fn apply_locked(target: &Target, pool: &PgPool, conn: &mut sqlx::PgConnect
         target: name,
         applied,
         already_applied: already.len(),
-        repairs,
     })
 }
 
@@ -600,12 +567,10 @@ pub async fn run_command(config: &Config, check_only: bool) -> anyhow::Result<Co
     }
 
     for report in &summary.applied {
-        let repaired: Vec<_> = report.repaired().map(|r| (r.index, r.action.clone())).collect();
         info!(
             target = report.target,
             applied = report.applied.len(),
             already_applied = report.already_applied,
-            repaired = ?repaired,
             "migration target complete"
         );
     }
@@ -645,7 +610,6 @@ mod tests {
         let fusillade_pool = fusillade_pool_without_migrations(&pool).await;
         let fusillade = apply(&Target::fusillade(), &fusillade_pool).await.unwrap();
         assert!(fusillade.applied.len() > 80);
-        assert!(fusillade.repaired().next().is_none(), "a fresh database needs no repair");
         apply_underway(&pool).await.unwrap();
         check(&Target::main(), &pool).await.unwrap();
         check(&Target::fusillade(), &fusillade_pool).await.unwrap();
@@ -661,7 +625,6 @@ mod tests {
         assert!(second.applied.is_empty());
         let second = apply(&Target::fusillade(), &fusillade_pool).await.unwrap();
         assert!(second.applied.is_empty());
-        assert!(second.repaired().next().is_none());
     }
 
     #[sqlx::test(migrations = false)]
@@ -747,65 +710,6 @@ mod tests {
         assert!(check(&target, &pool).await.is_err());
     }
 
-    /// The 11.9.1 incident: the creating migration is recorded, the index is
-    /// invalid, the validation migration has not run. `apply` must repair the
-    /// index and then get the validation migration through.
-    #[sqlx::test(migrations = false)]
-    async fn invalid_index_with_recorded_creation_migration_is_recovered(pool: PgPool) {
-        let fusillade_pool = fusillade_pool_without_migrations(&pool).await;
-        let target = Target::fusillade();
-        target.run_to(20260910010000, &fusillade_pool).await.unwrap();
-        sqlx::query("UPDATE pg_index SET indisvalid = false WHERE indexrelid = 'idx_batches_owner_created_at_id'::regclass")
-            .execute(&fusillade_pool)
-            .await
-            .unwrap();
-        // Without repair the next migration fails exactly as it did in production.
-        let raw = target.run_to(20260910010001, &fusillade_pool).await.unwrap_err().to_string();
-        assert!(raw.contains("missing, invalid, or has the wrong definition"), "{raw}");
-
-        let report = apply(&target, &fusillade_pool).await.unwrap();
-        let repaired: Vec<_> = report.repaired().collect();
-        assert_eq!(repaired.len(), 1);
-        assert_eq!(repaired[0].index, "idx_batches_owner_created_at_id");
-        assert_eq!(repaired[0].action, RepairAction::Reindexed);
-        assert!(report.applied.contains(&20260910010001));
-        let valid: bool =
-            sqlx::query_scalar("SELECT indisvalid FROM pg_index WHERE indexrelid = 'idx_batches_owner_created_at_id'::regclass")
-                .fetch_one(&fusillade_pool)
-                .await
-                .unwrap();
-        assert!(valid);
-        check(&target, &fusillade_pool).await.unwrap();
-    }
-
-    /// An interrupted build *before* the migration was recorded: invalid
-    /// index, no row. The retry must not let `IF NOT EXISTS` record a broken
-    /// index as success.
-    #[sqlx::test(migrations = false)]
-    async fn interrupted_concurrent_build_is_recovered_on_retry(pool: PgPool) {
-        let fusillade_pool = fusillade_pool_without_migrations(&pool).await;
-        let target = Target::fusillade();
-        target.run_to(20260910000000, &fusillade_pool).await.unwrap();
-        // What an interrupted CREATE INDEX CONCURRENTLY leaves behind.
-        sqlx::query(
-            "CREATE INDEX idx_batches_owner_created_at_id ON batches (created_by, created_at DESC, id DESC) WHERE deleted_at IS NULL",
-        )
-        .execute(&fusillade_pool)
-        .await
-        .unwrap();
-        sqlx::query(
-            "UPDATE pg_index SET indisvalid = false, indisready = false WHERE indexrelid = 'idx_batches_owner_created_at_id'::regclass",
-        )
-        .execute(&fusillade_pool)
-        .await
-        .unwrap();
-        let report = apply(&target, &fusillade_pool).await.unwrap();
-        assert!(report.applied.contains(&20260910010000));
-        assert!(report.applied.contains(&20260910010001));
-        assert_eq!(report.repaired().next().unwrap().action, RepairAction::Reindexed);
-        check(&target, &fusillade_pool).await.unwrap();
-    }
-
     /// A gap in the recorded history (the 11.9.1 repair deleted the failed
     /// validation row while later migrations were already applied) must be
     /// filled, not rejected as "previously applied but missing".
@@ -821,32 +725,6 @@ mod tests {
         let report = apply(&target, &fusillade_pool).await.unwrap();
         assert_eq!(report.applied, vec![20260910010001]);
         check(&target, &fusillade_pool).await.unwrap();
-    }
-
-    #[sqlx::test(migrations = false)]
-    async fn wrong_definition_fails_clearly_and_leaves_the_index(pool: PgPool) {
-        let fusillade_pool = fusillade_pool_without_migrations(&pool).await;
-        let target = Target::fusillade();
-        target.run_to(20260910000000, &fusillade_pool).await.unwrap();
-        sqlx::query("CREATE INDEX idx_batches_owner_created_at_id ON batches (created_by, created_at, id)")
-            .execute(&fusillade_pool)
-            .await
-            .unwrap();
-        let err = apply(&target, &fusillade_pool).await.unwrap_err();
-        let message = format!("{err:#}");
-        assert!(message.contains("wrong definition"), "{message}");
-        assert!(message.contains("was not modified"), "{message}");
-        let def: String = sqlx::query_scalar("SELECT pg_get_indexdef('idx_batches_owner_created_at_id'::regclass)")
-            .fetch_one(&fusillade_pool)
-            .await
-            .unwrap();
-        assert!(def.contains("(created_by, created_at, id)"), "index must be untouched: {def}");
-        // Nothing past the repair point was recorded.
-        let recorded: Option<i64> = sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE version = 20260910010000")
-            .fetch_optional(&fusillade_pool)
-            .await
-            .unwrap();
-        assert!(recorded.is_none());
     }
 
     /// Upgrade from the previous supported release (11.9.1): its newest

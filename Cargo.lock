@@ -2402,7 +2402,6 @@ dependencies = [
  "sqlx",
  "sqlx-pool-router 1.0.0",
  "test-log",
- "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
