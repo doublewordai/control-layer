@@ -3090,6 +3090,172 @@ mod tests {
         }
     }
 
+    /// The scrub is a single call in `target_message_handler`, placed before
+    /// every branch that rebuilds the response from its parts. These tests
+    /// exercise it end-to-end rather than through the helper, because the
+    /// regression that matters is a refactor moving or losing that call site —
+    /// which the unit tests in `handlers` cannot see.
+    mod response_header_scrubbing {
+        use super::*;
+        use std::collections::HashMap;
+        use target::{Target, Targets};
+
+        /// The header set a Cloudflare-fronted provider actually returns.
+        const LEAKED: &[(&str, &str)] = &[
+            ("set-cookie", "__cf_bm=abc123; Path=/"),
+            ("x-generation-id", "gen-1789051506-voKHY3i3D2KI0C3XolgR"),
+            ("cf-ray", "9a1b2c3d4e5f6789-LHR"),
+            ("cf-cache-status", "DYNAMIC"),
+            ("server", "cloudflare"),
+            ("alt-svc", "h3=\":443\"; ma=86400"),
+            ("nel", "{\"report_to\":\"cf-nel\"}"),
+            ("report-to", "{\"group\":\"cf-nel\"}"),
+            ("via", "1.1 google"),
+            ("x-powered-by", "Express"),
+        ];
+
+        fn leak(mut mock: MockHttpClient) -> MockHttpClient {
+            for (name, value) in LEAKED {
+                mock.set_header(name, value.to_string());
+            }
+            mock
+        }
+
+        fn assert_scrubbed(response: &axum_test::TestResponse) {
+            for (name, _) in LEAKED {
+                assert!(
+                    response.maybe_header(*name).is_none(),
+                    "upstream `{name}` reached the client"
+                );
+            }
+        }
+
+        fn single_target(response_headers: Option<HashMap<String, String>>) -> Targets {
+            let target = Target::builder()
+                .url("https://provider.example.com/".parse().unwrap())
+                .maybe_response_headers(response_headers)
+                .build();
+            let targets_map = Arc::new(DashMap::new());
+            targets_map.insert("gpt-4".to_string(), pool(target));
+            Targets {
+                targets: targets_map,
+                key_rate_limiters: Arc::new(DashMap::new()),
+                key_concurrency_limiters: Arc::new(DashMap::new()),
+                key_labels: Arc::new(DashMap::new()),
+                strict_mode: false,
+                http_pool_config: None,
+            }
+        }
+
+        #[tokio::test]
+        async fn upstream_leak_headers_never_reach_the_client() {
+            let mock = leak(MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#));
+            let server = TestServer::new(build_router(AppState::with_client(
+                single_target(None),
+                mock,
+            )))
+            .unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert_scrubbed(&response);
+            // The response is otherwise untouched.
+            assert_eq!(response.header("content-type"), "application/json");
+        }
+
+        /// Strict mode buffers the body and rebuilds the response from its
+        /// parts for the embedded-error scan. The scrub must survive that.
+        #[tokio::test]
+        async fn scrub_survives_the_strict_mode_rebuild() {
+            let mock = leak(MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#));
+            let targets = embedded_error_targets("gpt-4", 1);
+            let server =
+                TestServer::new(build_router(AppState::with_client(targets, mock))).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert_scrubbed(&response);
+        }
+
+        /// Streaming responses are re-wrapped (`SseBufferedStream`, then
+        /// `GuardedStream`) after the scrub, and the mock's own
+        /// `connection: keep-alive` exercises the hop-by-hop half.
+        #[tokio::test]
+        async fn scrub_applies_to_streaming_responses() {
+            let mock = leak(MockHttpClient::new_streaming(
+                StatusCode::OK,
+                vec![OK_CONTENT_FRAME.to_string()],
+            ));
+            let server = TestServer::new(build_router(AppState::with_client(
+                single_target(None),
+                mock,
+            )))
+            .unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "stream": true,
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert_scrubbed(&response);
+            assert!(
+                response.maybe_header("connection").is_none(),
+                "hop-by-hop `connection` reached the client"
+            );
+            assert_eq!(response.header("content-type"), "text/event-stream");
+        }
+
+        /// Operator-configured `response_headers` are injected ~500 lines after
+        /// the scrub. Pin the ordering: a future move of the scrub call site
+        /// past the injection would silently drop pricing headers.
+        #[tokio::test]
+        async fn operator_response_headers_outlive_the_scrub() {
+            let mut configured = HashMap::new();
+            configured.insert("Input-Price-Per-Token".to_string(), "0.00003".to_string());
+            // Deliberately collides with a scrubbed name: an operator setting
+            // `server` explicitly must win over the strip.
+            configured.insert("server".to_string(), "onwards".to_string());
+
+            let mock = leak(MockHttpClient::new(StatusCode::OK, r#"{"success": true}"#));
+            let targets = single_target(Some(configured));
+            let server =
+                TestServer::new(build_router(AppState::with_client(targets, mock))).unwrap();
+
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }))
+                .await;
+
+            assert_eq!(response.status_code(), 200);
+            assert_eq!(response.header("Input-Price-Per-Token"), "0.00003");
+            assert_eq!(response.header("server"), "onwards");
+            assert!(response.maybe_header("set-cookie").is_none());
+            assert!(response.maybe_header("cf-ray").is_none());
+        }
+    }
+
     mod load_balancing {
         use super::*;
         use crate::load_balancer::{Provider, ProviderPool};

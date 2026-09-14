@@ -261,17 +261,15 @@ fn withhold_trace_context(headers: &mut HeaderMap) {
     headers.remove("traceparent");
     headers.remove("tracestate");
 }
-/// Headers on upstream responses that must not reach the client.
+
+/// RFC 7230 §6.1 hop-by-hop headers: meaningful only for a single transport
+/// connection, so a proxy MUST NOT forward them in either direction.
 ///
-/// `filter_headers_for_upstream` already strips these from *requests*, but the
-/// symmetric path — headers the *upstream provider* sends back — was never
-/// scrubbed. OpenRouter (and other Cloudflare-fronted providers) set
-/// `Set-Cookie: __cf_bm=…` on every response, and OpenRouter itself appends
-/// `x-generation-id`; both leaked to clients verbatim, revealing the routing
-/// topology and the third-party provider's session cookie. Hop-by-hop headers
-/// (RFC 7230 §6.1) are also stripped for correctness, matching the outbound
-/// filter.
-const RESPONSE_HOP_BY_HOP: &[&str] = &[
+/// `transfer-encoding` is deliberately absent. It is hop-by-hop per the spec,
+/// but response framing on the outbound connection is hyper's to decide, and
+/// the body-rewriting paths below already drop it where they set an explicit
+/// `content-length`. Removing it here would have no effect beyond that.
+const HOP_BY_HOP: &[&str] = &[
     "connection",
     "keep-alive",
     "proxy-authenticate",
@@ -281,25 +279,68 @@ const RESPONSE_HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
-/// Upstream-specific headers that reveal provider identity or routing
-/// topology to the client.
+/// Upstream response headers that identify the third-party provider or the
+/// edge fronting it.
+///
+/// `filter_headers_for_upstream` has always stripped the request side; the
+/// symmetric path — headers the *upstream provider* sends back — was never
+/// scrubbed, so these reached API clients verbatim.
 const RESPONSE_PROVIDER_LEAKAGE: &[&str] = &[
-    // Cloudflare/OpenRouter bot-management cookie — set on every response by
-    // Cloudflare-fronted upstreams and of no use to an API client.
+    // Cloudflare's bot-management cookie, set on every response by
+    // Cloudflare-fronted upstreams and of no use to an API client. Stripping it
+    // also stops a third party's session cookie being planted on our callers.
     "set-cookie",
-    // OpenRouter's per-request generation id — exposes the third-party routing
-    // layer.
+    // OpenRouter's per-request generation id — names the routing layer.
     "x-generation-id",
+    // Identifies the upstream's server/edge software ("cloudflare", the
+    // provider's framework). Nothing downstream keys off it.
+    "server",
+    "x-powered-by",
+    // Proxy chain, per RFC 7230 §5.7.1 — the upstream's hops, not ours.
+    "via",
+    // Alternative-service advertisement. Beyond naming the edge, this one is a
+    // correctness bug: the upstream is advertising *its own* HTTP/3 endpoints,
+    // but a client receiving it on our response applies that advice to the
+    // onwards host.
+    "alt-svc",
+    // Network Error Logging / reporting endpoints — point at the provider's
+    // collectors, and would have clients report on our behalf.
+    "nel",
+    "report-to",
+    "reporting-endpoints",
 ];
+
+/// Prefixes whose every variant is upstream-edge metadata. Cloudflare emits a
+/// family here (`cf-ray`, `cf-cache-status`, `cf-placement`, …) that grows
+/// without notice, so match on the prefix rather than chase the list — the
+/// same treatment `filter_headers_for_upstream` gives `sec-ch-ua*`.
+const RESPONSE_LEAKAGE_PREFIXES: &[&str] = &["cf-"];
 
 /// Scrub upstream response headers before forwarding to the client.
 ///
 /// Removes hop-by-hop headers (RFC 7230) and provider-specific headers that
 /// leak routing topology or set cookies on the client. This is the
 /// response-side counterpart to `filter_headers_for_upstream`.
+///
+/// Headers a client legitimately acts on are deliberately preserved, even
+/// though they describe the upstream: `retry-after` (a 429/503 is only
+/// actionable with it) and the `x-ratelimit-*` family.
 fn scrub_response_headers(headers: &mut HeaderMap) {
-    for header in RESPONSE_HOP_BY_HOP.iter().chain(RESPONSE_PROVIDER_LEAKAGE) {
+    for header in HOP_BY_HOP.iter().chain(RESPONSE_PROVIDER_LEAKAGE) {
         headers.remove(*header);
+    }
+
+    let prefixed: Vec<_> = headers
+        .keys()
+        .filter(|name| {
+            RESPONSE_LEAKAGE_PREFIXES
+                .iter()
+                .any(|prefix| name.as_str().starts_with(prefix))
+        })
+        .cloned()
+        .collect();
+    for header in prefixed {
+        headers.remove(header);
     }
 }
 
@@ -312,16 +353,10 @@ fn scrub_response_headers(headers: &mut HeaderMap) {
 /// - Adding upstream authentication if configured
 /// - Adding X-Forwarded-* headers for transparency
 fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
-    // Headers to remove: hop-by-hop (RFC 7230), auth, browser context, and routing headers
+    // Headers to remove beyond the shared `HOP_BY_HOP` set: auth, browser
+    // context, and routing headers. Hop-by-hop lives in one const so the
+    // request and response filters cannot drift apart.
     const HEADERS_TO_STRIP: &[&str] = &[
-        // RFC 7230 hop-by-hop headers (MUST remove per spec)
-        "connection",
-        "keep-alive",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "te",
-        "trailer",
-        "upgrade",
         // Authentication headers (prevent credential leakage to downstream)
         "authorization",
         "x-api-key",
@@ -346,7 +381,7 @@ fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
         "model-override",
     ];
 
-    for header in HEADERS_TO_STRIP {
+    for header in HOP_BY_HOP.iter().chain(HEADERS_TO_STRIP) {
         headers.remove(*header);
     }
 
@@ -1879,6 +1914,22 @@ mod tests {
     }
 
     #[test]
+    fn test_scrub_response_headers_removes_every_set_cookie_value() {
+        // `set-cookie` is the one header upstreams routinely send more than
+        // once, and `HeaderMap::get` only ever sees the first. Pin that
+        // `remove` drops the whole entry rather than leaving later cookies
+        // behind — a partial strip would still plant a provider cookie.
+        let mut headers = HeaderMap::new();
+        headers.append("set-cookie", "__cf_bm=abc123; Path=/".parse().unwrap());
+        headers.append("set-cookie", "_cfuvid=xyz789; Path=/".parse().unwrap());
+        headers.append("set-cookie", "session=third; Path=/".parse().unwrap());
+
+        scrub_response_headers(&mut headers);
+
+        assert_eq!(headers.get_all("set-cookie").iter().count(), 0);
+    }
+
+    #[test]
     fn test_scrub_response_headers_removes_x_generation_id() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -1892,6 +1943,43 @@ mod tests {
     }
 
     #[test]
+    fn test_scrub_response_headers_removes_edge_fingerprint() {
+        // The headers that actually name the edge in front of a provider.
+        let mut headers = HeaderMap::new();
+        headers.insert("server", "cloudflare".parse().unwrap());
+        headers.insert("x-powered-by", "Express".parse().unwrap());
+        headers.insert("via", "1.1 google".parse().unwrap());
+        headers.insert("alt-svc", r#"h3=":443"; ma=86400"#.parse().unwrap());
+        headers.insert("nel", r#"{"report_to":"cf-nel"}"#.parse().unwrap());
+        headers.insert("report-to", r#"{"group":"cf-nel"}"#.parse().unwrap());
+        headers.insert("reporting-endpoints", "cf=\"https://x\"".parse().unwrap());
+
+        scrub_response_headers(&mut headers);
+
+        assert!(headers.is_empty(), "leftover: {headers:?}");
+    }
+
+    #[test]
+    fn test_scrub_response_headers_removes_cf_prefixed_family() {
+        // Matched by prefix, so a cf-* header we have never seen is stripped
+        // too — that is the point of the prefix rule.
+        let mut headers = HeaderMap::new();
+        headers.insert("cf-ray", "9a1b2c3d4e5f6789-LHR".parse().unwrap());
+        headers.insert("cf-cache-status", "DYNAMIC".parse().unwrap());
+        headers.insert("cf-placement", "local-LHR".parse().unwrap());
+        headers.insert("cf-some-future-header", "whatever".parse().unwrap());
+        headers.insert("content-type", "application/json".parse().unwrap());
+
+        scrub_response_headers(&mut headers);
+
+        assert!(headers.get("cf-ray").is_none());
+        assert!(headers.get("cf-cache-status").is_none());
+        assert!(headers.get("cf-placement").is_none());
+        assert!(headers.get("cf-some-future-header").is_none());
+        assert!(headers.get("content-type").is_some());
+    }
+
+    #[test]
     fn test_scrub_response_headers_removes_hop_by_hop() {
         let mut headers = HeaderMap::new();
         headers.insert("connection", "keep-alive".parse().unwrap());
@@ -1902,8 +1990,10 @@ mod tests {
 
         assert!(headers.get("connection").is_none());
         assert!(headers.get("upgrade").is_none());
-        // transfer-encoding is not in our list (handled separately elsewhere);
-        // scrub only covers the documented hop-by-hop set.
+        // `transfer-encoding` is hop-by-hop per RFC 7230 but deliberately left
+        // out of `HOP_BY_HOP`: outbound framing is hyper's, and the
+        // body-rewriting paths drop it where they set `content-length`.
+        assert!(headers.get("transfer-encoding").is_some());
     }
 
     #[test]
@@ -1918,6 +2008,22 @@ mod tests {
         assert!(headers.get("content-type").is_some());
         assert!(headers.get("x-request-id").is_some());
         assert!(headers.get("content-length").is_some());
+    }
+
+    #[test]
+    fn test_scrub_response_headers_preserves_client_actionable_headers() {
+        // These describe the upstream, but a client cannot back off correctly
+        // without them, so they are exempt from the leakage strip by design.
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", "30".parse().unwrap());
+        headers.insert("x-ratelimit-remaining", "0".parse().unwrap());
+        headers.insert("x-ratelimit-reset", "1789051506".parse().unwrap());
+
+        scrub_response_headers(&mut headers);
+
+        assert!(headers.get("retry-after").is_some());
+        assert!(headers.get("x-ratelimit-remaining").is_some());
+        assert!(headers.get("x-ratelimit-reset").is_some());
     }
 
     #[test]
