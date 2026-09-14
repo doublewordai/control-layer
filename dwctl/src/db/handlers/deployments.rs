@@ -336,7 +336,7 @@ impl<'c> Repository for Deployments<'c> {
                 lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement,
                 fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
                 backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, reasoning_translation_overrides,
-                allowed_batch_completion_windows, metadata, provisioning_source
+                allowed_batch_completion_windows, metadata, provisioning_source, serving_classes
             "#,
         )
         .bind(request.model_name.trim())
@@ -633,7 +633,7 @@ impl<'c> Repository for Deployments<'c> {
                 lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement,
                 fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
                 backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, reasoning_translation_overrides,
-                allowed_batch_completion_windows, metadata, provisioning_source
+                allowed_batch_completion_windows, metadata, provisioning_source, serving_classes
         "#,
         )
         .bind(id)
@@ -726,7 +726,7 @@ impl<'c> Repository for Deployments<'c> {
                 dm.lb_strategy, dm.fallback_enabled, dm.fallback_on_rate_limit, dm.fallback_on_status, dm.fallback_with_replacement,
                 dm.fallback_max_attempts, dm.backoff_enabled, dm.backoff_initial_ms, dm.backoff_max_ms, dm.backoff_factor,
                 dm.backoff_jitter, dm.backoff_max_total_ms, dm.sanitize_responses, dm.trusted, dm.reasoning_translation_overrides,
-                dm.allowed_batch_completion_windows, dm.metadata, dm.provisioning_source
+                dm.allowed_batch_completion_windows, dm.metadata, dm.provisioning_source, dm.serving_classes
              FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
         );
 

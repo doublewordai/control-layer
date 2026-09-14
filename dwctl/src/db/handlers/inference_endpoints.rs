@@ -90,7 +90,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             r#"
             INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by, reasoning_translation, accepts_scheduling_priority)
             VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8, $9, $10)
-            RETURNING *
+            RETURNING name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority
             "#,
             request.name,
             request.description,
@@ -111,7 +111,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
 
     #[instrument(skip(self), fields(endpoint_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
-        let endpoint = sqlx::query_as!(InferenceEndpoint, "SELECT * FROM inference_endpoints WHERE id = $1", id)
+        let endpoint = sqlx::query_as!(InferenceEndpoint, "SELECT name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority FROM inference_endpoints WHERE id = $1", id)
             .fetch_optional(&mut *self.db)
             .await?;
 
@@ -127,7 +127,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             return Ok(std::collections::HashMap::new());
         }
 
-        let rows = sqlx::query!("SELECT * FROM inference_endpoints WHERE id = ANY($1)", &ids)
+        let rows = sqlx::query!("SELECT name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority FROM inference_endpoints WHERE id = ANY($1)", &ids)
             .fetch_all(&mut *self.db)
             .await?;
 
@@ -204,7 +204,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
                 accepts_scheduling_priority = COALESCE($11, accepts_scheduling_priority),
                 updated_at = NOW()
             WHERE id = $1
-            RETURNING *
+            RETURNING name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority
             "#,
             id,
             request.name,
@@ -229,7 +229,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let endpoints = sqlx::query_as!(
             InferenceEndpoint,
-            "SELECT * FROM inference_endpoints ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            "SELECT name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority FROM inference_endpoints ORDER BY created_at DESC LIMIT $1 OFFSET $2",
             filter.limit,
             filter.skip
         )
