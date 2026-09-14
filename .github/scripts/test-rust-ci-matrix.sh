@@ -60,7 +60,7 @@ require_text 'backend-crate-test:' 'define a per-crate test job'
 require_text 'name: ${{ matrix.package }} / test' 'scope every crate test check to its package'
 require_text 'fail-fast: false' 'allow every crate result to complete'
 
-for package in fusillade fusillade-core fusillade-arsenal onwards; do
+for package in fusillade fusillade-core fusillade-arsenal onwards openai-reassembler; do
   require_text "- package: ${package}" "test ${package} in the matrix"
 done
 
@@ -92,7 +92,7 @@ require_exact_line '    name: workspace / rust gate' 'name the aggregate Rust ga
 require_text 'pattern: rust-coverage-*' 'download all per-package coverage artifacts'
 require_text 'MINIMUM_COVERAGE: "60"' 'preserve the aggregate line coverage threshold'
 require_text '.github/scripts/aggregate-rust-coverage.py' 'merge duplicate source lines before checking coverage'
-require_text 'Expected 8 coverage files' 'aggregate every workspace crate coverage artifact'
+require_text 'Expected 9 coverage files' 'aggregate every workspace crate coverage artifact'
 require_text 'cargo package --locked --package onwards --all-features' 'validate the publishable Onwards package'
 require_text 'name: onwards / image' 'scope the standalone image build to Onwards'
 require_text 'name: dwctl / image' 'scope the control-layer image build to dwctl'
@@ -170,12 +170,13 @@ require_block_line "$semantic_title_step" '        uses: amannn/action-semantic-
 require_block_line "$merge_group_title_step" "        if: github.event_name == 'merge_group'" 'limit the merge-group title no-op to merge-group events'
 require_block_line "$merge_group_title_step" '        run: echo "Pull request title was validated before this merge-group commit was queued."' 'run the merge-group title no-op in its own step'
 
-required_check_names=(
+expected_check_names=(
   'dashboard / test'
   'dwctl / test'
   'fusillade / test'
   'fusillade-core / test'
   'fusillade-arsenal / test'
+  'openai-reassembler / test'
   'onwards / test'
   'workspace / rust lint'
   'workspace / rust gate'
@@ -195,6 +196,7 @@ while IFS= read -r name; do
         'fusillade / test'
         'fusillade-core / test'
         'fusillade-arsenal / test'
+        'openai-reassembler / test'
         'onwards / test'
       )
       ;;
@@ -221,9 +223,9 @@ while IFS= read -r name; do
 done < <(awk '/^    name: / { sub(/^    name: /, ""); print }' "$workflow" "$pr_title_workflow")
 
 if ! diff -u \
-  <(printf '%s\n' "${required_check_names[@]}") \
+  <(printf '%s\n' "${expected_check_names[@]}") \
   <(printf '%s\n' "${actual_check_names[@]}"); then
-  echo "CI and PR-title workflows must declare exactly the 15 repository-required check contexts" >&2
+  echo "CI and PR-title workflows must declare the required check contexts and all per-crate checks" >&2
   exit 1
 fi
 
