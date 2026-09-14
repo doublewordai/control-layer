@@ -88,7 +88,7 @@ impl ProtocolTranslator for OpenResponses {
         let mut raw: Value = serde_json::from_slice(&body)
             .map_err(|e| TranslationError::Internal(format!("upstream response was not Chat Completions: {e}")))?;
         normalize_chat_completion_response_value(&mut raw, &req.model);
-        let cache_usage = util::cache_usage_fields(raw.get("usage"));
+        let cache_write_tokens = util::cache_write_tokens(raw.get("usage"));
         let chat: ChatCompletionResponse = serde_json::from_value(raw)
             .map_err(|e| TranslationError::Internal(format!("upstream response was not Chat Completions: {e}")))?;
 
@@ -96,7 +96,7 @@ impl ProtocolTranslator for OpenResponses {
         // back to the upstream completion id when there's no tracking row.
         let mut out = response::to_responses_response(&chat, &req, response_id);
         if let Some(usage) = out.usage.as_mut() {
-            usage.extra = cache_usage;
+            usage.input_tokens_details.cache_write_tokens = cache_write_tokens;
         }
         serde_json::to_vec(&out)
             .map(Bytes::from)
@@ -210,7 +210,7 @@ impl StreamReframer for ResponsesStreamReframer {
         let state = self.state.as_mut().expect("state is Some");
         let events = state.process_chunk(&parsed);
         if parsed.usage.is_some() {
-            state.preserve_cache_usage(chunk.get("usage"));
+            state.preserve_cache_write_tokens(chunk.get("usage"));
         }
         events.iter().flat_map(|e| e.to_sse().into_bytes()).collect()
     }
@@ -270,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn blocking_response_preserves_cache_billing_fields() {
+    fn blocking_response_emits_standard_cache_usage_only() {
         let request = Bytes::from_static(br#"{"model":"m","input":"hi"}"#);
         let usage = serde_json::json!({
             "prompt_tokens": 2000, "completion_tokens": 2, "total_tokens": 2002,
@@ -295,11 +295,9 @@ mod tests {
         let response: Value = serde_json::from_slice(&translated).unwrap();
         assert_eq!(response["usage"]["input_tokens"], 2000);
         assert_eq!(response["usage"]["input_tokens_details"]["cached_tokens"], 1000);
+        assert_eq!(response["usage"]["input_tokens_details"]["cache_write_tokens"], 600);
         for field in ["cache_read_input_tokens", "cache_creation_input_tokens", "cache_creation"] {
-            assert_eq!(
-                response["usage"][field], usage[field],
-                "billing field {field} must survive translation"
-            );
+            assert!(response["usage"].get(field).is_none(), "internal field {field} must not be public");
         }
         assert!(response["usage"].get("unrelated_provider_field").is_none());
     }
@@ -318,6 +316,7 @@ mod tests {
             .unwrap();
         let response: Value = serde_json::from_slice(&translated).unwrap();
         assert_eq!(response["usage"]["input_tokens_details"]["cached_tokens"], 1000);
+        assert_eq!(response["usage"]["input_tokens_details"]["cache_write_tokens"], 0);
         for field in ["cache_read_input_tokens", "cache_creation_input_tokens", "cache_creation"] {
             assert!(
                 response["usage"].get(field).is_none(),

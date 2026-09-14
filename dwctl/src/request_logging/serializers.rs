@@ -40,6 +40,7 @@
 //! [outlet]: https://github.com/doublewordai/outlet
 
 use crate::config::Config;
+use crate::prompt_cache::CacheBilling;
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, CompletionChunk, ParsedAIRequest, ResponsesRequest};
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
@@ -544,9 +545,8 @@ impl UsageMetrics {
             metrics.total_tokens = raw.total;
         }
 
-        // The cache split lives in extension fields the typed parse drops, so read it from
-        // the raw `usage` object. It only exists on a successful response that carried a
-        // usage frame, so an errored/partial stream naturally extracts zero (no cache bill).
+        // Prefer the cache layer's internal accounting, which survives protocol
+        // translation. Legacy/direct responses fall back to raw usage extensions.
         let cache_tokens = extract_cache_tokens(response_data);
         // The cache layer (inside outlet) rewrites `prompt_tokens_details.cached_tokens`
         // before this body is read, so prefer the value it stashed on the way through.
@@ -662,12 +662,23 @@ fn cache_tokens_from_usage(usage: &Value) -> CacheTokens {
     }
 }
 
-/// Extract the cache split from a response body, handling both shapes: a non-streaming
+/// Prefer internal cache accounting; an unfilled cell means no cache usage was emitted.
+/// Without a cell (historical/direct responses), extract from the body: a non-streaming
 /// JSON body carries `usage` at the top level; a streaming SSE body carries it in the
 /// terminal `data:` frame (take the last one seen). Returns all-zero when there is no
 /// usage object (non-cache request, error body, or a stream that died before its usage
 /// frame) — which is exactly the no-cache-billing case.
 pub(crate) fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
+    if let Some(capture) = response_data.extensions.get::<CacheBilling>() {
+        let stats = capture.get().unwrap_or_default();
+        let count = |value| i64::try_from(value).unwrap_or(i64::MAX);
+        return CacheTokens {
+            read: count(stats.read),
+            creation_5m: count(stats.creation_5m),
+            creation_1h: count(stats.creation_1h),
+            creation_24h: count(stats.creation_24h),
+        };
+    }
     extract_from_last_usage(response_data, cache_tokens_from_usage)
 }
 
@@ -1190,6 +1201,7 @@ mod tests {
         RequestParams, UsageMetrics, extract_cache_tokens, extract_engine_cached_tokens, extract_finish_reason, parse_ai_request,
         parse_ai_response,
     };
+    use crate::prompt_cache::{CacheBilling, CacheStats};
     use crate::request_logging::models::{AiRequest, AiResponse};
     use axum::http::{Method, StatusCode, Uri};
     use bytes::Bytes;
@@ -1197,6 +1209,7 @@ mod tests {
     use onwards::strict::schemas::completions::CompletionResponse;
     use onwards::strict::schemas::embeddings::{Embedding, EmbeddingData, EmbeddingsResponse, EmbeddingsUsage};
     use outlet::{RequestData, ResponseData};
+    use serde_json::Value;
     use std::{
         collections::HashMap,
         time::{Duration, SystemTime},
@@ -2905,6 +2918,75 @@ mod tests {
             assert_eq!(tokens.completion, 5);
             assert_eq!(tokens.reasoning, 2);
         }
+    }
+
+    #[test]
+    fn responses_standard_usage_bills_from_internal_metadata() {
+        for streaming in [false, true] {
+            let mut body: Value = serde_json::from_str(&responses_api_body(true)).unwrap();
+            body["usage"] = serde_json::json!({
+                "input_tokens": 2000, "output_tokens": 5, "total_tokens": 2005,
+                "input_tokens_details": {"cached_tokens": 1000, "cache_write_tokens": 600},
+                "output_tokens_details": {"reasoning_tokens": 2}
+            });
+            let body = if streaming {
+                format!("data: {{\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{body}}}\n\n")
+            } else {
+                body.to_string()
+            };
+            let request = responses_request_data(Some(streaming));
+            let mut response = responses_response_data(body);
+            let capture = CacheBilling::default();
+            response.extensions.insert(capture.clone());
+            // Outlet clones extensions before a stream's usage frame is read.
+            capture.set(CacheStats {
+                read: 1000,
+                creation_5m: 100,
+                creation_1h: 200,
+                creation_24h: 300,
+                ..Default::default()
+            });
+            let parsed = parse_ai_response(&request, &response).unwrap();
+            let metrics = UsageMetrics::extract(
+                Uuid::new_v4(),
+                &request,
+                &response,
+                &parsed,
+                &crate::test::utils::create_test_config(),
+            );
+            assert_eq!(metrics.prompt_tokens, 2000);
+            assert_eq!(metrics.completion_tokens, 5);
+            assert_eq!(metrics.reasoning_tokens, 2);
+            assert_eq!(metrics.cache_read_input_tokens, 1000);
+            assert_eq!(metrics.cache_creation_5m_input_tokens, 100);
+            assert_eq!(metrics.cache_creation_1h_input_tokens, 200);
+            assert_eq!(metrics.cache_creation_24h_input_tokens, 300);
+        }
+    }
+
+    #[test]
+    fn internal_cache_accounting_takes_precedence_over_public_usage() {
+        let mut response = response_with_body(
+            serde_json::json!({
+                "usage": {"cache_read_input_tokens": 999, "cache_creation": {"ephemeral_1h_input_tokens": 999}}
+            })
+            .to_string(),
+        );
+        let capture = CacheBilling::default();
+        response.extensions.insert(capture.clone());
+        let absent = extract_cache_tokens(&response);
+        assert_eq!(
+            (absent.read, absent.creation_1h),
+            (0, 0),
+            "an unfilled cell must not trust provider counts"
+        );
+        capture.set(CacheStats {
+            read: 10,
+            creation_1h: 20,
+            ..Default::default()
+        });
+        let captured = extract_cache_tokens(&response);
+        assert_eq!((captured.read, captured.creation_1h), (10, 20));
     }
 
     /// `prompt_tokens_details.cached_tokens` is the ENGINE's prefix-cache hit (SGLang/vLLM

@@ -26,7 +26,7 @@ use super::types::{
     ContentPart, FunctionCallItem, Item, ItemStatus, MessageContent, MessageItem, ReasoningContent, ReasoningItem, ResponseStatus,
     ResponseUsage, ResponsesRequest, ResponsesResponse, SummaryContent, TextConfig, TextFormat, TruncationStrategy,
 };
-use super::util::{cache_usage_fields, chat_usage_to_response_usage, merge_reasoning_text};
+use super::util::{cache_write_tokens, chat_usage_to_response_usage, merge_reasoning_text};
 
 /// State machine for tracking streaming response state
 #[derive(Debug, Clone)]
@@ -167,11 +167,11 @@ impl StreamingState {
         events
     }
 
-    /// Retain billing extensions from the same raw chunk that supplied usage,
+    /// Retain the public cache-write total from the raw chunk that supplied usage,
     /// before `response.completed` serializes the accumulated response.
-    pub(super) fn preserve_cache_usage(&mut self, raw_usage: Option<&Value>) {
+    pub(super) fn preserve_cache_write_tokens(&mut self, raw_usage: Option<&Value>) {
         if let Some(usage) = self.usage.as_mut() {
-            usage.extra = cache_usage_fields(raw_usage);
+            usage.input_tokens_details.cache_write_tokens = cache_write_tokens(raw_usage);
         }
     }
 
