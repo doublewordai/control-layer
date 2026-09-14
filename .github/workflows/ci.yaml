@@ -459,8 +459,8 @@ jobs:
         run: |
           shopt -s nullglob
           coverage_files=(rust-coverage/*.info)
-          if (( ${#coverage_files[@]} != 8 )); then
-            echo "Expected 8 coverage files, found ${#coverage_files[@]}" >&2
+          if (( ${#coverage_files[@]} != 9 )); then
+            echo "Expected 9 coverage files, found ${#coverage_files[@]}" >&2
             exit 1
           fi
 
