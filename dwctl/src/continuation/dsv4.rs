@@ -57,7 +57,12 @@ use serde_json::ser::Formatter;
 use serde_json::{Number, Value};
 
 use super::accumulate::{AccumulateError, StreamAccumulator, capture_envelope, single_choice};
+use super::forward::{ForwardParser, ForwardSeed};
 use super::rewrap::Envelope;
+
+pub mod forward;
+
+use forward::Dsv4Forward;
 
 // The DSML tags. `｜` is U+FF5C FULLWIDTH VERTICAL LINE, not an ASCII pipe.
 const TOOL_CALLS_OPEN: &str = "<｜DSML｜tool_calls>";
@@ -445,6 +450,11 @@ fn seam_safe(text: String) -> String {
 /// One tool call's accumulated fragments, keyed by the delta's `index`.
 struct ToolSlot {
     index: i64,
+    /// The id the CLIENT received for this call, when one arrived. Id and name
+    /// are independently optional per streaming delta, and the resume must
+    /// repeat an id the client holds (never mint a second for the same index)
+    /// and supply one it never got.
+    id: Option<String>,
     name: Option<String>,
     arguments: String,
 }
@@ -460,9 +470,10 @@ pub struct Dsv4Reconstructor {
     content: String,
     tools: Vec<ToolSlot>,
     saw_any_tool_frame: bool,
-    /// Generation began inside an open `<think>` — the rendered default for this
-    /// family, and what the resume render reproduces.
-    thinking: bool,
+    /// The RESOLVED default for whether generation began inside an open
+    /// `<think>` (route/translation resolution). Only consulted while the
+    /// stream itself has not proven the mode — see [`Self::thinking`].
+    thinking_default: bool,
     cap: usize,
     envelope: Option<Envelope>,
     finish_reason: bool,
@@ -475,17 +486,18 @@ impl Dsv4Reconstructor {
     /// from the route's `render_kwargs` (see [`super::RouteInfo::thinking`]),
     /// because that is what the prefix is rendered with: tokenizer-svc renders
     /// this family in thinking mode by default, but a route serving it in chat
-    /// mode ends `</think>` already and must not get a second one. The mode
-    /// cannot be inferred from the deltas — a thinking-mode turn that does no
-    /// thinking emits `</think>` first with no `reasoning_content` at all, which
-    /// is exactly the `plat-reasoning` fixture.
+    /// mode ends `</think>` already and must not get a second one. This is the
+    /// DEFAULT: observed `reasoning_content` overrides it (see
+    /// [`Self::thinking`]) — but the converse cannot be inferred, because a
+    /// thinking-mode turn that does no thinking emits `</think>` first with no
+    /// `reasoning_content` at all (exactly the `plat-reasoning` fixture).
     pub fn new(cap: usize, thinking: bool) -> Self {
         Self {
             reasoning: String::new(),
             content: String::new(),
             tools: Vec::new(),
             saw_any_tool_frame: false,
-            thinking,
+            thinking_default: thinking,
             cap,
             envelope: None,
             finish_reason: false,
@@ -513,16 +525,99 @@ impl Dsv4Reconstructor {
         self.len_bytes() + extra <= self.cap
     }
 
+    /// The mode this stream is KNOWN to run in. Observed `reasoning_content`
+    /// is PROOF of an open think block — a chat-mode prompt cannot produce it —
+    /// and outranks the resolved default, whichever member served the stream.
+    /// This is what keeps the splice and the resume render correct for a leg
+    /// served by a provider whose translation we cannot see (e.g. the
+    /// OpenRouter reserve): the moment reasoning streams, the mode is fact,
+    /// not configuration. Without reasoning the default stands, and either
+    /// default is SELF-CONSISTENT (splice and render always agree — see
+    /// `render_thinking`), so a mis-defaulted content-only stream produces a
+    /// coherent prompt of the other mode, never a leaked `</think>`.
+    fn thinking(&self) -> bool {
+        !self.reasoning.is_empty() || self.thinking_default
+    }
+
     fn slot(&mut self, index: i64) -> &mut ToolSlot {
         if let Some(pos) = self.tools.iter().position(|t| t.index == index) {
             return &mut self.tools[pos];
         }
         self.tools.push(ToolSlot {
             index,
+            id: None,
             name: None,
             arguments: String::new(),
         });
         self.tools.last_mut().expect("just pushed")
+    }
+
+    /// Where in the DSML sequence the resume leg's first token lands.
+    ///
+    /// This is the same state [`Self::reconstruct`] renders the tail of the
+    /// prefix from, read out instead of written down — which is the point:
+    /// the forward parser must believe exactly what the prefix says, or the
+    /// resumed text is interpreted in a structure the model is not in. Each
+    /// arm below is the inverse of one branch of [`encode_tool_call`]:
+    ///
+    /// | prefix ends … | seed |
+    /// |---|---|
+    /// | mid-reasoning, `<think>` still open | [`ForwardSeed::Reasoning`] |
+    /// | in the body, before any tool frame | [`ForwardSeed::Content`] |
+    /// | `<｜DSML｜tool_calls>` / a closed `</｜DSML｜invoke>` | [`ForwardSeed::BetweenToolCalls`] |
+    /// | inside an invoke (open tag, partial name, partial value) | [`ForwardSeed::InToolCall`] |
+    ///
+    /// The last two are told apart by exactly the test `encode_tool_call` uses
+    /// to decide whether to close the invoke — complete-JSON arguments — so a
+    /// prefix that ends `</｜DSML｜invoke>` can never be seeded as if it were
+    /// still inside that call.
+    pub fn forward_seed(&self) -> ForwardSeed {
+        if !self.saw_any_tool_frame {
+            // A `</think>` is in the prefix iff the body started, so anything
+            // else is still inside the think block — but only a thinking-mode
+            // leg HAS one to close; a chat-mode prompt already ended with it.
+            let started_body = !self.content.is_empty();
+            return if self.thinking() && !started_body {
+                ForwardSeed::Reasoning
+            } else {
+                ForwardSeed::Content
+            };
+        }
+
+        let Some(last) = self.tools.last() else {
+            return ForwardSeed::BetweenToolCalls {
+                next_index: 0,
+                reuse_id: None,
+            };
+        };
+        let index = u32::try_from(last.index).unwrap_or(0);
+        // A slot with no name renders as nothing at all (see `encode_tool_call`),
+        // so the prefix stops before this call — but its index is already spent
+        // as far as the client is concerned, so the next invoke reuses it rather
+        // than restarting the numbering, and repeats any id the client already
+        // received for it (an id-only opening delta) instead of minting a second.
+        if last.name.is_none() {
+            return ForwardSeed::BetweenToolCalls {
+                next_index: index,
+                reuse_id: last.id.clone(),
+            };
+        }
+        let (_, tail) = parse_partial_args(&last.arguments);
+        let closed = last.arguments.trim_end().ends_with('}') && tail.is_none();
+        if closed || self.finish_reason {
+            ForwardSeed::BetweenToolCalls {
+                next_index: index.saturating_add(1),
+                reuse_id: None,
+            }
+        } else {
+            ForwardSeed::InToolCall {
+                index,
+                args_so_far: last.arguments.clone(),
+                // The client got this call's name but never an id: the parser
+                // mints one and rides it on the first resumed fragment.
+                id_owed: last.id.is_none(),
+            }
+        }
     }
 
     /// Rebuild the raw emitted text from the accumulated channels.
@@ -533,7 +628,7 @@ impl Dsv4Reconstructor {
         let started_body = !self.content.is_empty() || self.saw_any_tool_frame;
 
         out.push_str(&self.reasoning);
-        if self.thinking && started_body {
+        if self.thinking() && started_body {
             out.push_str(THINK_END);
         }
         out.push_str(&self.content);
@@ -612,6 +707,7 @@ impl StreamAccumulator for Dsv4Reconstructor {
         // reasoning text we have no measured position for in the sequence.
         let present = |k: &str| delta.get(k).is_some_and(|v| !v.is_null());
         if present("function_call") || (present("reasoning") && !present("reasoning_content")) {
+            super::metrics::record_unsupported_delta(if present("function_call") { "function_call" } else { "reasoning" });
             return self.disarm(AccumulateError::UnsupportedDelta);
         }
 
@@ -643,7 +739,10 @@ impl StreamAccumulator for Dsv4Reconstructor {
                     .filter(|a| !a.is_empty())
                     .unwrap_or_default()
                     .to_string();
-                if !self.fits(name.as_ref().map_or(0, String::len) + args.len()) {
+                let id = call.get("id").and_then(Value::as_str).filter(|i| !i.is_empty()).map(str::to_string);
+                // Every retained byte — id included — counts against the cap;
+                // `len_bytes` must account for whatever this admits.
+                if !self.fits(id.as_ref().map_or(0, String::len) + name.as_ref().map_or(0, String::len) + args.len()) {
                     return self.disarm(AccumulateError::CapExceeded);
                 }
                 // Reconstruction assumes tool calls arrive serially — a sibling
@@ -654,11 +753,24 @@ impl StreamAccumulator for Dsv4Reconstructor {
                 // truncated arguments, so disarm instead of corrupting the
                 // prefix.
                 if self.tools.last().is_some_and(|last| last.index != index) && self.tools.iter().any(|t| t.index == index) {
+                    super::metrics::record_unsupported_delta("tool_calls");
                     return self.disarm(AccumulateError::UnsupportedDelta);
                 }
                 let slot = self.slot(index);
+                if id.is_some() {
+                    slot.id = id;
+                }
                 if name.is_some() {
                     slot.name = name;
+                }
+                // A faithful DSML parser cannot emit arguments before the
+                // invoke name (the name is part of the opening tag). Arguments
+                // reaching a still name-less slot are bytes the client holds
+                // that the regenerated prefix will not contain — unmodelable,
+                // disarm rather than corrupt.
+                if slot.name.is_none() && !args.is_empty() {
+                    super::metrics::record_unsupported_delta("tool_calls");
+                    return self.disarm(AccumulateError::UnsupportedDelta);
                 }
                 slot.arguments.push_str(&args);
             }
@@ -682,7 +794,7 @@ impl StreamAccumulator for Dsv4Reconstructor {
             + self
                 .tools
                 .iter()
-                .map(|t| t.name.as_ref().map_or(0, String::len) + t.arguments.len())
+                .map(|t| t.id.as_ref().map_or(0, String::len) + t.name.as_ref().map_or(0, String::len) + t.arguments.len())
                 .sum::<usize>()
     }
 
@@ -702,15 +814,29 @@ impl StreamAccumulator for Dsv4Reconstructor {
         let _ = self.disarm(cause);
     }
 
-    /// Plain reframing is faithful only when the continuation can produce
-    /// nothing but content: no tool syntax anywhere in the turn, and the
-    /// think block (if the turn has one) already closed — for this family
-    /// content only begins after `</think>`, so non-empty content is that
-    /// proof. Anything else waits for the paired forward parser (v2).
-    fn plain_resume_ok(&self) -> bool {
-        !self.saw_any_tool_frame && (!self.thinking || !self.content.is_empty())
+    /// The DSML parser, seeded from this reconstructor's death-point state.
+    /// Pairing them here is what lifts the reasoning/tool disarm for this
+    /// family and nothing else.
+    fn forward_parser(&self) -> Box<dyn ForwardParser> {
+        Box::new(Dsv4Forward::new(self.forward_seed()))
+    }
+
+    /// The render follows the same evidence-or-default mode as the splice —
+    /// their AGREEMENT is what makes either default self-consistent.
+    fn render_thinking(&self) -> Option<bool> {
+        Some(self.thinking())
+    }
+
+    /// Role repair rides the family reconstructor, alongside its parser: this
+    /// family's captures include a provider that delivers `role` only on a
+    /// late frame, so a rescue can otherwise leave the message roleless.
+    fn repairs_role(&self) -> bool {
+        true
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod forward_tests;
