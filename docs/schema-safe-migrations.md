@@ -1,5 +1,8 @@
 # Database migrations with rolling deployments
 
+For query-authoring patterns, pool selection, and validation commands, see the
+[SQLx queries skill](../.claude/skills/sqlx-queries/SKILL.md).
+
 An application restart does not necessarily create new PostgreSQL sessions.
 Transaction poolers can retain prepared statements and share them between old
 and new application clients. Migrations must support both application versions
