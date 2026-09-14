@@ -11,6 +11,7 @@ use bon::Builder;
 use hyper::StatusCode;
 use serde::{Deserialize, Serialize};
 
+use crate::ServedBy;
 use crate::reasoning::ReasoningError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,9 +26,21 @@ pub struct ErrorResponseBody {
 pub struct OnwardsErrorResponse {
     pub body: Option<ErrorResponseBody>,
     pub status: StatusCode,
+    /// The last upstream this error's request reached, when any attempt was
+    /// made. Lets integrators (request logging, metrics) attribute client-facing
+    /// failures to the provider that produced them; `None` when the request
+    /// never reached an upstream (auth/validation rejections, empty pool).
+    pub served_by: Option<ServedBy>,
 }
 
 impl OnwardsErrorResponse {
+    /// Attach the last attempted upstream to this error so failure responses
+    /// stay attributable in request logging and metrics.
+    pub fn with_served_by(mut self, served_by: Option<ServedBy>) -> Self {
+        self.served_by = served_by;
+        self
+    }
+
     pub fn reasoning(error: &ReasoningError) -> Self {
         OnwardsErrorResponse {
             body: Some(ErrorResponseBody {
@@ -38,6 +51,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::from_u16(error.status_code())
                 .expect("reasoning errors use valid HTTP status codes"),
+            served_by: None,
         }
     }
 
@@ -52,6 +66,7 @@ impl OnwardsErrorResponse {
                 code: "model_not_found".to_string(),
             }),
             status: StatusCode::NOT_FOUND,
+            served_by: None,
         }
     }
 
@@ -64,6 +79,7 @@ impl OnwardsErrorResponse {
                 code: "rate_limit".to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            served_by: None,
         }
     }
 
@@ -76,6 +92,7 @@ impl OnwardsErrorResponse {
                 code: "concurrency_limit_exceeded".to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            served_by: None,
         }
     }
 
@@ -88,6 +105,7 @@ impl OnwardsErrorResponse {
                 code: "internal_error".to_string(),
             }),
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            served_by: None,
         }
     }
 
@@ -100,6 +118,7 @@ impl OnwardsErrorResponse {
                 code: "internal_error".to_string(),
             }),
             status: StatusCode::BAD_GATEWAY,
+            served_by: None,
         }
     }
 
@@ -112,6 +131,7 @@ impl OnwardsErrorResponse {
                 code: "service_unavailable".to_string(),
             }),
             status: StatusCode::SERVICE_UNAVAILABLE,
+            served_by: None,
         }
     }
 
@@ -125,6 +145,7 @@ impl OnwardsErrorResponse {
                 code: "gateway_timeout".to_string(),
             }),
             status: StatusCode::GATEWAY_TIMEOUT,
+            served_by: None,
         }
     }
 
@@ -139,6 +160,7 @@ impl OnwardsErrorResponse {
                 code: "payload_too_large".to_string(),
             }),
             status: StatusCode::PAYLOAD_TOO_LARGE,
+            served_by: None,
         }
     }
 
@@ -151,6 +173,7 @@ impl OnwardsErrorResponse {
                 code: "unprocessable_request".to_string(),
             }),
             status: StatusCode::UNPROCESSABLE_ENTITY,
+            served_by: None,
         }
     }
 
@@ -167,6 +190,7 @@ impl OnwardsErrorResponse {
                 code: code.to_string(),
             }),
             status: StatusCode::BAD_REQUEST,
+            served_by: None,
         }
     }
 
@@ -179,6 +203,7 @@ impl OnwardsErrorResponse {
                 code: "forbidden".to_string(),
             }),
             status: StatusCode::FORBIDDEN,
+            served_by: None,
         }
     }
 
@@ -192,6 +217,7 @@ impl OnwardsErrorResponse {
                 code: "unauthenticated".to_string(),
             }),
             status: StatusCode::UNAUTHORIZED,
+            served_by: None,
         }
     }
 }
@@ -204,10 +230,14 @@ struct ErrorEnvelope<'a> {
 
 impl IntoResponse for OnwardsErrorResponse {
     fn into_response(self) -> Response {
-        match self.body {
+        let mut response = match self.body {
             Some(ref body) => (self.status, Json(ErrorEnvelope { error: body })).into_response(),
             None => self.status.into_response(), // No body, just status
+        };
+        if let Some(served_by) = self.served_by {
+            response.extensions_mut().insert(served_by);
         }
+        response
     }
 }
 

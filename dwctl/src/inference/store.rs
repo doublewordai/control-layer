@@ -268,8 +268,8 @@ pub async fn poll_until_terminal<P: PoolProvider + Clone>(
     let start = std::time::Instant::now();
 
     loop {
-        match request_manager.get_terminal_request_detail(RequestId(request_id)).await {
-            Ok(Some(mut detail)) => match detail.status.as_str() {
+        match request_manager.get_request_detail(RequestId(request_id)).await {
+            Ok(mut detail) => match detail.status.as_str() {
                 "completed" | "failed" | "canceled" => {
                     // ZDR: the daemon stored the body encrypted; decrypt before
                     // it is rendered back to the (blocking or streaming) caller.
@@ -290,7 +290,6 @@ pub async fn poll_until_terminal<P: PoolProvider + Clone>(
                 }
                 _ => {}
             },
-            Ok(None) => {}
             Err(fusillade::FusilladeError::RequestNotFound(_)) => {}
             Err(e) => {
                 return Err(StoreError::StorageError(format!("Failed to poll request: {e}")));

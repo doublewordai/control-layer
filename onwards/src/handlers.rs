@@ -227,12 +227,15 @@ pub(crate) struct ResolvedTrust(pub(crate) bool);
 /// load-balancer selection (i.e. after any fallback/retry), so it names the
 /// provider whose response was returned; its presence means "an upstream
 /// answered", not "the request succeeded" — check the status code for that.
-/// Absent when no upstream produced a response (auth/validation rejections,
-/// exhausted fallbacks, gateway-generated errors). For streaming tool loops the
-/// response is returned before follow-up iterations run, so it names the
-/// provider of the initial iteration. Integrators (e.g. request-logging
-/// middleware) can read it to attribute traffic to a concrete upstream without
-/// re-deriving the routing decision.
+/// Also present on gateway-generated error responses once at least one upstream
+/// was attempted (exhausted fallbacks, per-attempt failures): there it names
+/// the last provider the request was sent to, so failures stay attributable in
+/// request logging and metrics. Absent only when no upstream was ever reached
+/// (auth/validation rejections, empty pool, concurrency limits). For streaming
+/// tool loops the response is returned before follow-up iterations run, so it
+/// names the provider of the initial iteration. Integrators (e.g.
+/// request-logging middleware) can read it to attribute traffic to a concrete
+/// upstream without re-deriving the routing decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServedBy {
     /// Full URL of the upstream target that served the request.
@@ -687,6 +690,13 @@ pub async fn target_message_handler<T: HttpClient>(
     // response, so an upstream 529 and an upstream 500 are both 503 and the
     // distinction that matters for backpressure is gone.
     let mut last_upstream_status: Option<u16> = None;
+    // The upstream this request LAST reached for, so an error that leaves the
+    // failover loop can still be attributed to a provider. `ServedBy` is set on
+    // success responses deep inside the loop; failure responses exit here (all
+    // attempts exhausted) or straight out of an attempt (Done(Err)), and without
+    // this those errors carry no upstream attribution at all — which left
+    // per-model 5xx dashboards unable to name the failing provider.
+    let mut last_attempted: Option<ServedBy> = None;
 
     // Iterate through providers (with fallback support).
     // select_iter() uses weighted least connections: picks the provider with the
@@ -699,6 +709,10 @@ pub async fn target_message_handler<T: HttpClient>(
     for (_member_idx, target, connection_guard) in pool.select_iter() {
         any_attempted = true;
         attempt_number += 1;
+        last_attempted = Some(ServedBy {
+            url: target.url.to_string(),
+            onwards_model: target.onwards_model.clone(),
+        });
 
         let attempt_span = tracing::info_span!(
             "onwards.provider_attempt",
@@ -1614,7 +1628,16 @@ pub async fn target_message_handler<T: HttpClient>(
                 }
                 continue;
             }
-            LoopAction::Done(result) => return result,
+            LoopAction::Done(result) => {
+                // Errors that leave mid-attempt (sanitization, non-retryable
+                // embedded errors, timeout/network without fallback) did reach
+                // an upstream — carry `last_attempted` so they stay
+                // attributable, exactly as success responses are.
+                return match result {
+                    Err(err) => Err(err.with_served_by(last_attempted.clone())),
+                    ok => ok,
+                };
+            }
         }
     }
 
@@ -1642,7 +1665,7 @@ pub async fn target_message_handler<T: HttpClient>(
         )
         .increment(1);
         record_response_status(status);
-        Err(final_error)
+        Err(final_error.with_served_by(last_attempted.clone()))
     } else if !pool.is_empty() {
         // Pool has providers but select_iter() yielded nothing — all at capacity
         metrics::counter!(
