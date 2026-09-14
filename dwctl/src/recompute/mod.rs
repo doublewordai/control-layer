@@ -146,25 +146,55 @@ pub async fn recompute_corpus(
     aliases.sort();
     aliases.dedup();
     let cache_tariffs = crate::pricing::lookup_cache_tariffs(pool, &aliases).await?;
-    // Rows that recorded cache tokens but whose tariff history no longer resolves (e.g. the
-    // deployed model was deleted, cascading its tariffs away). Those re-price at list rate,
-    // which is NOT what the live path charged — the report must say so rather than present
-    // the difference as a correction.
+    // Two distinct reasons cache-multiplier resolution can come back `None` on a row that
+    // recorded cache tokens, each reported with its own warning so an operator can tell them
+    // apart:
+    //
+    // - `rows_tariff_unresolvable`: the model's tariff history was deleted with its model, so
+    //   no version resolves at any instant.
+    // - `rows_cache_pricing_time_unresolvable`: a flex row predates migration 134, so its
+    //   `submitted_at` was never recorded and the live path's pricing instant is unrecoverable.
+    //   Resolving at dispatch instead would pick the wrong version across a boundary, so the
+    //   row is excluded from cache-multiplier repricing entirely (`resolve_cache_mults`
+    //   returns `None`) and reprices at list rate. See `CorpusRow::cache_pricing_time_is_unresolved`.
+    //
+    // Both re-price at list rate, which is NOT what the live path charged — the report must
+    // say so rather than present the difference as a correction.
     let mut rows_tariff_unresolvable = 0i64;
+    let mut rows_cache_pricing_time_unresolvable = 0i64;
 
     // Price with the per-token rates resolved at inference time, carried on the row, and
     // the cache multipliers from the tariff version valid at the row's pricing timestamp —
-    // exactly the live batcher's resolution. `None` means the model was not
-    // dwctl-cache-enabled then: any cache tokens on the row are the provider's own and
-    // bill at list price, as they did live. The result is rounded to
+    // exactly the live batcher's resolution. `None` means either the model was not
+    // dwctl-cache-enabled then (any cache tokens on the row are the provider's own and bill
+    // at list price, as they did live), or the row's pricing instant is unrecoverable so the
+    // multipliers are deliberately left unresolved. The result is rounded to
     // `http_analytics.total_cost`'s scale — numeric(12,8), half away from zero — because
     // the stored side already was; comparing at full precision manufactures sub-cent
     // "changes" on any tariff whose arithmetic doesn't land on 8dp (measured: 194 phantom
     // changed rows, net -$0.00000097, on a healthy 400-row corpus).
-    let mut rows_tariff_unresolvable_count = |row: &source::CorpusRow, mults: &Option<crate::pricing::CacheMultipliers>| {
+    let mut count_unresolvable = |row: &source::CorpusRow, mults: Option<crate::pricing::CacheMultipliers>| {
         if mults.is_none() && row.stored_cache_total() > 0 {
-            rows_tariff_unresolvable += 1;
+            if row.cache_pricing_time_is_unresolved() {
+                rows_cache_pricing_time_unresolvable += 1;
+            } else {
+                rows_tariff_unresolvable += 1;
+            }
         }
+    };
+    // Resolve the cache multipliers for a row at the same instant the live path did, unless
+    // that instant is unrecoverable — in which case return `None` rather than resolve at the
+    // wrong moment and emit a confident wrong number. `cache_pricing_time_is_unresolved`
+    // only fires on flex rows predating migration 134; batch rows resolve from their batch's
+    // `created_at` and realtime rows resolve at dispatch (their correct instant).
+    let resolve_cache_mults = |row: &source::CorpusRow| -> Option<crate::pricing::CacheMultipliers> {
+        if row.cache_pricing_time_is_unresolved() {
+            return None;
+        }
+        row.model
+            .as_deref()
+            .and_then(|alias| cache_tariffs.get(alias))
+            .and_then(|versions| crate::pricing::resolve_cache_multipliers(versions, row.pricing_timestamp()))
     };
     let price = |row: &source::CorpusRow, usage: &RecomputedUsage, mults: Option<crate::pricing::CacheMultipliers>| {
         crate::pricing::charged_cost(
@@ -198,12 +228,8 @@ pub async fn recompute_corpus(
 
         let report_row = match replayed {
             Ok(usage) => {
-                let cache_mults = row
-                    .model
-                    .as_deref()
-                    .and_then(|alias| cache_tariffs.get(alias))
-                    .and_then(|versions| crate::pricing::resolve_cache_multipliers(versions, row.pricing_timestamp()));
-                rows_tariff_unresolvable_count(row, &cache_mults);
+                let cache_mults = resolve_cache_mults(row);
+                count_unresolvable(row, cache_mults);
                 let cost = price(row, &usage, cache_mults);
                 let mut report_row = report::ReportRow::replayed(row, &usage, cost);
 
@@ -241,12 +267,8 @@ pub async fn recompute_corpus(
                 };
                 match rescued {
                     Some(usage) => {
-                        let cache_mults = row
-                            .model
-                            .as_deref()
-                            .and_then(|alias| cache_tariffs.get(alias))
-                            .and_then(|versions| crate::pricing::resolve_cache_multipliers(versions, row.pricing_timestamp()));
-                        rows_tariff_unresolvable_count(row, &cache_mults);
+                        let cache_mults = resolve_cache_mults(row);
+                        count_unresolvable(row, cache_mults);
                         let cost = price(row, &usage, cache_mults);
                         let mut report_row = report::ReportRow::replayed(row, &usage, cost);
                         report_row.prompt_render_total = Some(usage.counts.prompt);
@@ -313,6 +335,16 @@ pub async fn recompute_corpus(
             "{rows_tariff_unresolvable} row(s) recorded cache tokens but no cache tariff resolves at their \
              pricing time (tariff history deleted with its model?): they re-price at list rate, which is not \
              what was charged — do not apply their cost deltas without resolving the tariff first"
+        ));
+    }
+    if rows_cache_pricing_time_unresolvable > 0 {
+        warnings.push(format!(
+            "{rows_cache_pricing_time_unresolvable} flex row(s) predate migration 134 (which added \
+             http_analytics.submitted_at) and have no recorded submission time: their cache-pricing instant is \
+             unrecoverable (fusillade purges dispatched requests, so the value cannot be reconstructed), so the \
+             live path's cache-tariff version cannot be reproduced. They re-price at list rate, which is not \
+             what was charged — do not apply their cache cost deltas without first establishing the original \
+             pricing instant"
         ));
     }
 
