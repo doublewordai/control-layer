@@ -159,6 +159,7 @@ pub mod keystore;
 mod leader_election;
 pub mod limits;
 mod metrics;
+pub mod model_provisioning;
 mod notifications;
 mod openapi;
 mod payment_providers;
@@ -1635,6 +1636,11 @@ async fn setup_database(
 
     // Seed database with initial configuration (only runs once)
     seed_database(&config.model_sources, &main.pooled.write()).await?;
+
+    if config.model_provisioning.enabled {
+        let catalog = model_provisioning::Catalog::load(&config.model_provisioning.directory)?;
+        model_provisioning::apply(&main.pooled.write(), &catalog).await?;
+    }
 
     Ok((
         embedded_db,

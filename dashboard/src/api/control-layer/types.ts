@@ -327,6 +327,7 @@ export interface Model {
   endpoint?: Endpoint; // only present when include=endpoints
   // Virtual model fields (is_composite maps to "virtual" in UI terminology)
   is_composite?: boolean; // true = virtual model, false = hosted model
+  provisioning_source?: string;
   lb_strategy?: LoadBalancingStrategy | null;
   fallback?: FallbackConfig | null;
   components?: ModelComponent[]; // only present when include=components
