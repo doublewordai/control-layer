@@ -1645,7 +1645,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         )
         .bind(request_id.0)
         .bind(requested_durable)
-        .fetch_optional(&*self.pools.write())
+        .fetch_optional(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(e.into()))?
         .ok_or(FusilladeError::RequestNotFound(request_id))?;
@@ -12561,6 +12561,44 @@ mod tests {
                 routed_model: req.data.model.clone(),
             },
         }
+    }
+
+    #[sqlx::test]
+    async fn durable_billing_assignment_respects_query_schema(pool: sqlx::PgPool) {
+        let (manager, request) = claim_one_processing(&pool, None).await;
+        assert!(
+            !manager
+                .assign_billing_mode(request.data.id, false)
+                .await
+                .unwrap()
+        );
+        sqlx::raw_sql("CREATE SCHEMA billing_component; CREATE TABLE billing_component.requests (id UUID PRIMARY KEY, billing_mode TEXT)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO billing_component.requests (id) VALUES ($1)")
+            .bind(request.data.id.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let scoped = manager.with_query_schema("billing_component");
+        assert!(
+            scoped
+                .assign_billing_mode(request.data.id, true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            scoped
+                .assign_billing_mode(request.data.id, false)
+                .await
+                .unwrap()
+        );
+        let public_mode: String =
+            sqlx::query_scalar("SELECT billing_mode FROM public.requests WHERE id=$1")
+                .bind(request.data.id.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(public_mode, "legacy");
     }
 
     #[sqlx::test]
