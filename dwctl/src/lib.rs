@@ -197,6 +197,7 @@ use crate::{
 };
 use sqlx_pool_router::{DbPools, PoolProvider};
 
+use crate::db::errors::initialize_database_error_metrics;
 use anyhow::Context;
 use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -368,7 +369,7 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             // compliance ratios are only exact at a bucket edge.
             const SUBMISSION_LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0, 1800.0, 3600.0];
 
-            PrometheusBuilder::new()
+            let handle = PrometheusBuilder::new()
                 .set_buckets_for_metric(Matcher::Full("dwctl_analytics_lag_seconds".to_string()), ANALYTICS_LAG_BUCKETS)
                 .expect("Failed to set custom buckets for dwctl_analytics_lag_seconds")
                 .set_buckets_for_metric(Matcher::Full("dwctl_cache_sync_lag_seconds".to_string()), CACHE_SYNC_LAG_BUCKETS)
@@ -414,7 +415,9 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                 )
                 .expect("Failed to set custom buckets for fusillade_request_pickup_delay_seconds")
                 .install_recorder()
-                .expect("Failed to install Prometheus recorder")
+                .expect("Failed to install Prometheus recorder");
+            initialize_database_error_metrics();
+            handle
         })
         .clone()
 }

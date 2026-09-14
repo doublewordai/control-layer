@@ -662,6 +662,9 @@ lint target *args="":
                 fusillade/src \
                 fusillade-core/src \
                 fusillade-arsenal/src
+            echo "Checking stable SQL result projections..."
+            python3 scripts/tests/schema_migrations/test_projection_guard.py
+            python3 scripts/check_query_projections.py
             echo "Checking SQLx prepared queries..."
             cargo sqlx prepare --check --workspace
             echo "Checking local Rust workspace topology..."
