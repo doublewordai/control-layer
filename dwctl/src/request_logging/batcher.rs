@@ -112,7 +112,8 @@ pub struct RawAnalyticsRecord {
     pub server_address: String,
     pub server_port: u16,
     /// URL of the upstream that served the request (onwards `ServedBy`
-    /// extension) — per-component attribution for composite models.
+    /// extension) — per-component attribution for composite models. On failed
+    /// requests this names the last upstream the routing layer attempted.
     pub served_by: Option<String>,
 
     // === Auth (unresolved - just the token) ===

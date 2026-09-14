@@ -11,6 +11,7 @@ use bon::Builder;
 use hyper::StatusCode;
 use serde::{Deserialize, Serialize};
 
+use crate::handlers::ServedBy;
 use crate::reasoning::ReasoningError;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,9 +26,22 @@ pub struct ErrorResponseBody {
 pub struct OnwardsErrorResponse {
     pub body: Option<ErrorResponseBody>,
     pub status: StatusCode,
+    /// The upstream this error is attributed to, when an upstream was actually
+    /// contacted. Surfaced as the `ServedBy` response extension so integrators
+    /// (request logging, GenAI metrics) can attribute failures to a concrete
+    /// upstream — including exhausted-fallback responses, where this names the
+    /// target of the last failed attempt. Absent for gateway-generated errors
+    /// that never reached an upstream (auth/validation rejections).
+    pub served_by: Option<ServedBy>,
 }
 
 impl OnwardsErrorResponse {
+    /// Attribute this error to `target` so the response carries `ServedBy`.
+    pub fn with_served_by(mut self, served_by: ServedBy) -> Self {
+        self.served_by = Some(served_by);
+        self
+    }
+
     pub fn reasoning(error: &ReasoningError) -> Self {
         OnwardsErrorResponse {
             body: Some(ErrorResponseBody {
@@ -38,6 +52,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::from_u16(error.status_code())
                 .expect("reasoning errors use valid HTTP status codes"),
+            served_by: None,
         }
     }
 
@@ -52,6 +67,7 @@ impl OnwardsErrorResponse {
                 code: "model_not_found".to_string(),
             }),
             status: StatusCode::NOT_FOUND,
+            served_by: None,
         }
     }
 
@@ -64,6 +80,7 @@ impl OnwardsErrorResponse {
                 code: "rate_limit".to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            served_by: None,
         }
     }
 
@@ -76,6 +93,7 @@ impl OnwardsErrorResponse {
                 code: "concurrency_limit_exceeded".to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            served_by: None,
         }
     }
 
@@ -88,6 +106,7 @@ impl OnwardsErrorResponse {
                 code: "internal_error".to_string(),
             }),
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            served_by: None,
         }
     }
 
@@ -100,6 +119,7 @@ impl OnwardsErrorResponse {
                 code: "internal_error".to_string(),
             }),
             status: StatusCode::BAD_GATEWAY,
+            served_by: None,
         }
     }
 
@@ -112,6 +132,7 @@ impl OnwardsErrorResponse {
                 code: "service_unavailable".to_string(),
             }),
             status: StatusCode::SERVICE_UNAVAILABLE,
+            served_by: None,
         }
     }
 
@@ -125,6 +146,7 @@ impl OnwardsErrorResponse {
                 code: "gateway_timeout".to_string(),
             }),
             status: StatusCode::GATEWAY_TIMEOUT,
+            served_by: None,
         }
     }
 
@@ -139,6 +161,7 @@ impl OnwardsErrorResponse {
                 code: "payload_too_large".to_string(),
             }),
             status: StatusCode::PAYLOAD_TOO_LARGE,
+            served_by: None,
         }
     }
 
@@ -151,6 +174,7 @@ impl OnwardsErrorResponse {
                 code: "unprocessable_request".to_string(),
             }),
             status: StatusCode::UNPROCESSABLE_ENTITY,
+            served_by: None,
         }
     }
 
@@ -167,6 +191,7 @@ impl OnwardsErrorResponse {
                 code: code.to_string(),
             }),
             status: StatusCode::BAD_REQUEST,
+            served_by: None,
         }
     }
 
@@ -179,6 +204,7 @@ impl OnwardsErrorResponse {
                 code: "forbidden".to_string(),
             }),
             status: StatusCode::FORBIDDEN,
+            served_by: None,
         }
     }
 
@@ -192,6 +218,7 @@ impl OnwardsErrorResponse {
                 code: "unauthenticated".to_string(),
             }),
             status: StatusCode::UNAUTHORIZED,
+            served_by: None,
         }
     }
 }
@@ -204,10 +231,19 @@ struct ErrorEnvelope<'a> {
 
 impl IntoResponse for OnwardsErrorResponse {
     fn into_response(self) -> Response {
-        match self.body {
-            Some(ref body) => (self.status, Json(ErrorEnvelope { error: body })).into_response(),
-            None => self.status.into_response(), // No body, just status
+        let OnwardsErrorResponse {
+            body,
+            status,
+            served_by,
+        } = self;
+        let mut response = match body {
+            Some(ref body) => (status, Json(ErrorEnvelope { error: body })).into_response(),
+            None => status.into_response(), // No body, just status
+        };
+        if let Some(served_by) = served_by {
+            response.extensions_mut().insert(served_by);
         }
+        response
     }
 }
 
@@ -216,6 +252,35 @@ mod tests {
     use super::*;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
+
+    /// A set `served_by` must surface as the `ServedBy` response extension so
+    /// integrators can attribute the failure to the concrete upstream.
+    #[tokio::test]
+    async fn test_error_response_carries_served_by_when_set() {
+        let error = OnwardsErrorResponse::bad_gateway().with_served_by(ServedBy {
+            url: "https://p1.example.com/".to_string(),
+            onwards_model: Some("gpt-4-upstream".to_string()),
+        });
+        let response = error.into_response();
+
+        let served_by = response
+            .extensions()
+            .get::<ServedBy>()
+            .expect("attributed error response must carry ServedBy");
+        assert_eq!(served_by.url, "https://p1.example.com/");
+        assert_eq!(served_by.onwards_model.as_deref(), Some("gpt-4-upstream"));
+    }
+
+    /// Unattributed errors (gateway-generated, no upstream contacted) must not
+    /// carry a misleading attribution.
+    #[tokio::test]
+    async fn test_error_response_without_served_by_has_no_extension() {
+        let response = OnwardsErrorResponse::rate_limited().into_response();
+        assert!(
+            response.extensions().get::<ServedBy>().is_none(),
+            "unattributed error must not carry ServedBy"
+        );
+    }
 
     #[tokio::test]
     async fn test_error_response_has_openai_envelope() {

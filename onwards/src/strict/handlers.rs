@@ -1385,6 +1385,12 @@ fn parse_provider_status_code(code: &serde_json::Value) -> Option<u16> {
 async fn sanitize_error_response(mut response: Response) -> Response {
     let status = response.status();
 
+    // Preserve the `ServedBy` attribution the routing layer attached: the
+    // rebuild below drops extensions, and the caller must still be able to
+    // tell which upstream produced this error (the body is sanitized, the
+    // attribution is ours, not the provider's).
+    let served_by = response.extensions().get::<crate::ServedBy>().cloned();
+
     // Drain the body (bounded, so a misbehaving provider cannot make us buffer
     // an arbitrarily large response) to record its length, but do NOT log its
     // content. ZDR: provider error bodies can echo prompt/response content, so
@@ -1395,7 +1401,7 @@ async fn sanitize_error_response(mut response: Response) -> Response {
             Ok(bytes) => bytes,
             Err(e) => {
                 error!(error = %e, "Failed to read error response body");
-                return standard_error_response(status);
+                return attach_served_by(standard_error_response(status), served_by);
             }
         };
 
@@ -1406,7 +1412,15 @@ async fn sanitize_error_response(mut response: Response) -> Response {
     );
 
     // Return standard error based on status code
-    standard_error_response(status)
+    attach_served_by(standard_error_response(status), served_by)
+}
+
+/// Re-attach a `ServedBy` attribution onto a rebuilt error response.
+fn attach_served_by(mut response: Response, served_by: Option<crate::ServedBy>) -> Response {
+    if let Some(served_by) = served_by {
+        response.extensions_mut().insert(served_by);
+    }
+    response
 }
 
 /// Map an HTTP status code to a generic (error_type, message) pair.
@@ -1605,6 +1619,31 @@ mod tests {
             logs.contains("body_len"),
             "expected body_len metadata in logs, got:\n{logs}"
         );
+    }
+
+    /// The rebuild inside `sanitize_error_response` drops extensions; the
+    /// `ServedBy` attribution the routing layer attached must survive it, so
+    /// forwarded upstream 5xx stay attributable (request logs / GenAI metrics
+    /// read the extension, not the sanitized body).
+    #[tokio::test(flavor = "current_thread")]
+    async fn sanitize_error_response_preserves_served_by() {
+        let mut response = Response::builder()
+            .status(520)
+            .body(Body::from("{\"error\": \"unknown\"}"))
+            .unwrap();
+        response.extensions_mut().insert(crate::ServedBy {
+            url: "https://openrouter.example/".to_string(),
+            onwards_model: None,
+        });
+
+        let out = sanitize_error_response(response).await;
+
+        assert_eq!(out.status(), StatusCode::from_u16(520).unwrap());
+        let served_by = out
+            .extensions()
+            .get::<crate::ServedBy>()
+            .expect("sanitized error response must keep the ServedBy attribution");
+        assert_eq!(served_by.url, "https://openrouter.example/");
     }
 
     #[test]

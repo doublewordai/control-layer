@@ -228,11 +228,13 @@ pub(crate) struct ResolvedTrust(pub(crate) bool);
 /// provider whose response was returned; its presence means "an upstream
 /// answered", not "the request succeeded" — check the status code for that.
 /// Absent when no upstream produced a response (auth/validation rejections,
-/// exhausted fallbacks, gateway-generated errors). For streaming tool loops the
+/// gateway-generated errors). When a request failed against an upstream —
+/// including exhausted fallbacks, where it names the target of the last failed
+/// attempt — the error response carries it too. For streaming tool loops the
 /// response is returned before follow-up iterations run, so it names the
 /// provider of the initial iteration. Integrators (e.g. request-logging
-/// middleware) can read it to attribute traffic to a concrete upstream without
-/// re-deriving the routing decision.
+/// middleware) can read it to attribute traffic (and failures) to a concrete
+/// upstream without re-deriving the routing decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServedBy {
     /// Full URL of the upstream target that served the request.
@@ -250,6 +252,15 @@ fn resolve_trace_propagation(target: &Target, pool_trusted: bool) -> bool {
     target
         .propagate_trace_context
         .unwrap_or_else(|| target.trusted.unwrap_or(pool_trusted))
+}
+
+/// The `ServedBy` attribution for `target`, used to attach the extension to
+/// error responses produced while attempting that upstream.
+fn served_by_of(target: &Target) -> ServedBy {
+    ServedBy {
+        url: target.url.to_string(),
+        onwards_model: target.onwards_model.clone(),
+    }
 }
 
 /// Remove W3C trace-context headers (`traceparent`, `tracestate`) from the
@@ -986,11 +997,12 @@ pub async fn target_message_handler<T: HttpClient>(
             Err(UpstreamOutcome::Timeout) => {
                 upstream_span.record("http.response.status_code", 504_u16);
                 tracing::Span::current().record("onwards.fallback", "timeout");
+                let err = OnwardsErrorResponse::gateway_timeout().with_served_by(served_by_of(target));
                 if pool.fallback_enabled() {
-                    return LoopAction::Continue(Some(OnwardsErrorResponse::gateway_timeout()));
+                    return LoopAction::Continue(Some(err));
                 } else {
                     record_response_status(504);
-                    return LoopAction::Done(Err(OnwardsErrorResponse::gateway_timeout()));
+                    return LoopAction::Done(Err(err));
                 }
             }
             Err(UpstreamOutcome::Error(e)) => {
@@ -999,11 +1011,12 @@ pub async fn target_message_handler<T: HttpClient>(
                     upstream_uri, e
                 );
                 tracing::Span::current().record("onwards.fallback", "network_error");
+                let err = OnwardsErrorResponse::bad_gateway().with_served_by(served_by_of(target));
                 // Only continue to next provider if fallback is enabled
                 if pool.fallback_enabled() {
-                    return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+                    return LoopAction::Continue(Some(err));
                 } else {
-                    return LoopAction::Done(Err(OnwardsErrorResponse::bad_gateway()));
+                    return LoopAction::Done(Err(err));
                 }
             }
             Ok(response) => response,
@@ -1021,7 +1034,9 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            return LoopAction::Continue(Some(
+                OnwardsErrorResponse::bad_gateway().with_served_by(served_by_of(target)),
+            ));
         }
 
         // Sanitize error responses when sanitize_response is enabled.
@@ -1053,6 +1068,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         code: "upstream_error".to_string(),
                     })
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_REQUEST))
+                    .served_by(served_by_of(target))
                     .build()
             } else {
                 OnwardsErrorResponse::builder()
@@ -1063,6 +1079,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         code: "internal_error".to_string(),
                     })
                     .status(StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY))
+                    .served_by(served_by_of(target))
                     .build()
             };
 
@@ -1307,7 +1324,10 @@ pub async fn target_message_handler<T: HttpClient>(
                     // Retry internally. If every attempt / provider fallback is
                     // exhausted the caller gets a sanitized 503 — never the
                     // upstream's rate limit (see the non-retryable arm below).
-                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
+                    return LoopAction::Continue(Some(
+                        OnwardsErrorResponse::service_unavailable()
+                            .with_served_by(served_by_of(target)),
+                    ));
                 }
 
                 record_response_status(embedded);
@@ -1321,6 +1341,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 let trusted = target.trusted.unwrap_or_else(|| pool.is_trusted());
                 let err = if embedded == 429 || embedded >= 500 {
                     OnwardsErrorResponse::service_unavailable()
+                        .with_served_by(served_by_of(target))
                 } else {
                     OnwardsErrorResponse::builder()
                         .body(ErrorResponseBody {
@@ -1345,6 +1366,7 @@ pub async fn target_message_handler<T: HttpClient>(
                             },
                         })
                         .status(StatusCode::from_u16(embedded).unwrap_or(StatusCode::BAD_REQUEST))
+                        .served_by(served_by_of(target))
                         .build()
                 };
                 return LoopAction::Done(Err(err));
@@ -1362,13 +1384,18 @@ pub async fn target_message_handler<T: HttpClient>(
                     tracing::Span::current().record("onwards.fallback", "empty_body");
                     // Retry internally; on exhaustion the loop's final-error handling
                     // surfaces the sanitized 503 carried below.
-                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
+                    return LoopAction::Continue(Some(
+                        OnwardsErrorResponse::service_unavailable()
+                            .with_served_by(served_by_of(target)),
+                    ));
                 }
 
                 // Not configured to retry 502s: collapse the anomalous empty 200 to a
                 // generic 503 rather than forwarding a bodyless success to the client.
                 record_response_status(503);
-                return LoopAction::Done(Err(OnwardsErrorResponse::service_unavailable()));
+                return LoopAction::Done(Err(
+                    OnwardsErrorResponse::service_unavailable().with_served_by(served_by_of(target)),
+                ));
             }
             Scan2xx::Clean => {}
         }

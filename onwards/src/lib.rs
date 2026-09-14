@@ -1051,6 +1051,52 @@ mod tests {
         assert_eq!(served_by.onwards_model.as_deref(), Some("gpt-4-upstream"));
     }
 
+    /// When every fallback target fails, the error response must still name the
+    /// upstream of the LAST failed attempt via the `ServedBy` extension. This
+    /// is the attribution the per-model 5xx analytics needed during the
+    /// 2026-09-10 Nemotron fallback incident, where every failed request
+    /// recorded `served_by = NULL` and the failing provider could only be
+    /// recovered from logs.
+    #[tokio::test]
+    async fn test_served_by_extension_names_last_target_on_exhausted_fallback() {
+        use tower::ServiceExt;
+
+        let mock_client =
+            MockHttpClient::new(StatusCode::BAD_GATEWAY, r#"{"error": {"message": "down"}}"#);
+        let app_state =
+            AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock_client.clone());
+        let router = build_router(app_state);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            mock_client.get_requests().len(),
+            2,
+            "both fallback targets must have been attempted"
+        );
+        let served_by = response
+            .extensions()
+            .get::<crate::ServedBy>()
+            .expect("exhausted-fallback error must carry ServedBy");
+        assert_eq!(
+            served_by.url, "https://p1.example.com/",
+            "attribution names the last attempted target, not the first"
+        );
+    }
+
     /// Strict-mode `Targets` with one alias backed by a fallback pool of `n`
     /// identical providers (all hit the shared mock client), configured to retry
     /// on the given upstream `on_status` codes.
