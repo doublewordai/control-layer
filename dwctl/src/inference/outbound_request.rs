@@ -125,6 +125,7 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
     // layer already translated to the completions shape - masking the coupling
     // rather than removing it.
     let force_stream = should_force_stream(&parts);
+    let capture_usage = parts.extensions.get::<super::billing_events::CaptureUsage>().is_some();
 
     let path = parts.uri.path();
     // `/chat/completions` also ends with `/completions`; both take the stream flags.
@@ -133,7 +134,7 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
         // dispatch still gets its response reassembled.
         let response = next.run(Request::from_parts(parts, body)).await;
         return if force_stream {
-            reassemble_stream(response, cfg.timeouts).await
+            reassemble_stream_with_capture(response, cfg.timeouts, capture_usage).await
         } else {
             response
         };
@@ -160,7 +161,7 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
     };
 
     if force_stream {
-        reassemble_stream(response, cfg.timeouts).await
+        reassemble_stream_with_capture(response, cfg.timeouts, capture_usage).await
     } else {
         response
     }
@@ -201,7 +202,12 @@ fn transform(bytes: &Bytes, force_stream: bool) -> Option<Vec<u8>> {
 /// Ported from fusillade's streaming client, which used to do this after the
 /// response had already passed request logging. The behaviours it preserves are
 /// load-bearing and are called out individually below.
+#[cfg(test)]
 async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Response {
+    reassemble_stream_with_capture(response, timeouts, false).await
+}
+
+async fn reassemble_stream_with_capture(response: Response, timeouts: StreamTimeouts, capture: bool) -> Response {
     use eventsource_stream::Eventsource;
 
     let (parts, body) = response.into_parts();
@@ -290,8 +296,14 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
         return json_body_response(parts, status, data.clone());
     }
 
-    match sink.finish() {
-        Ok(body) => json_body_response(parts, status, body),
+    match sink.finish_with_usage(capture) {
+        Ok((body, usage)) => {
+            let mut response = json_body_response(parts, status, body);
+            if let Some(usage) = usage {
+                response.extensions_mut().insert(usage);
+            }
+            response
+        }
         Err(e) => {
             warn!(error = %e, "failed to reassemble SSE stream into a response body");
             sse_parse_error(&e.to_string())
@@ -356,8 +368,17 @@ impl Sink {
         }
     }
 
-    fn finish(self) -> anyhow::Result<String> {
-        if self.reassemble { self.reassembler.finish() } else { Ok(self.raw) }
+    fn finish_with_usage(self, capture: bool) -> anyhow::Result<(String, Option<super::billing_events::CapturedUsage>)> {
+        if !self.reassemble {
+            return Ok((self.raw, None));
+        }
+        if capture {
+            self.reassembler
+                .finish_with(super::billing_events::CapturedUsage::from_response)
+                .map(|(body, usage)| (body, Some(usage)))
+        } else {
+            self.reassembler.finish().map(|body| (body, None))
+        }
     }
 }
 
@@ -412,7 +433,6 @@ fn json_body_response(mut parts: axum::http::response::Parts, status: StatusCode
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::Request as HttpRequest;
     use std::convert::Infallible;
     use std::time::Duration;
 

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                            UPDATE requests SET\n                                state = 'pending',\n                                retry_attempt = $2,\n                                not_before = $3,\n                                daemon_id = NULL,\n                                claimed_at = NULL,\n                                started_at = NULL\n                            WHERE id = $1 AND accepted_event_id IS NULL\n                            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2e7b8ef7240c47ae99ef965d7433ebd899f1beabb2c4b247fc084ddda57914c0"
+}

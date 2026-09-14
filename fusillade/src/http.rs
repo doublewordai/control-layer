@@ -3,7 +3,7 @@
 //! This module defines the `HttpClient` trait to abstract HTTP request execution,
 //! enabling testability with mock implementations.
 
-use crate::error::Result;
+use crate::error::{FusilladeError, Result};
 pub use crate::request::HttpResponse;
 use crate::request::RequestData;
 use async_trait::async_trait;
@@ -532,6 +532,28 @@ impl ReqwestHttpClient {
         })?;
 
         let status = response.status().as_u16();
+        if response.status().is_success()
+            && request
+                .batch_metadata
+                .get("billing-mode")
+                .map(String::as_str)
+                == Some("durable")
+        {
+            let expected = request
+                .batch_metadata
+                .get("billing-event-id")
+                .and_then(|value| uuid::Uuid::parse_str(value).ok());
+            let accepted = response
+                .headers()
+                .get("x-fusillade-billing-event-id")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| uuid::Uuid::parse_str(value).ok());
+            if expected.is_none() || accepted != expected {
+                return Err(FusilladeError::HttpClient(
+                    "Durable completion missing matching billing acknowledgement".into(),
+                ));
+            }
+        }
 
         record_submission_ttft(request, status);
         let body = response.text().await.map_err(map_reqwest_error)?;
@@ -915,6 +937,56 @@ mod tests {
             Duration::from_secs(1),
         )
         .with_upload_stall_poll_interval(Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn durable_billing_acknowledgement_is_required_on_success() {
+        use axum::{Router, routing::post};
+        let event = uuid::Uuid::new_v4();
+        for acknowledgement in [
+            Some(event.to_string()),
+            None,
+            Some(uuid::Uuid::new_v4().to_string()),
+            Some("invalid".into()),
+        ] {
+            let expected_success = acknowledgement.as_deref() == Some(event.to_string().as_str());
+            let app = Router::new().route(
+                "/test",
+                post(move || async move {
+                    let mut headers = axum::http::HeaderMap::new();
+                    if let Some(value) = acknowledgement {
+                        headers.insert("x-fusillade-billing-event-id", value.parse().unwrap());
+                    }
+                    (headers, "unchanged response bytes")
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let request = RequestData {
+                id: crate::request::RequestId(uuid::Uuid::new_v4()),
+                batch_id: None,
+                template_id: crate::batch::TemplateId(uuid::Uuid::new_v4()),
+                custom_id: None,
+                endpoint: format!("http://{addr}"),
+                method: "POST".into(),
+                path: "/test".into(),
+                body: "{}".into(),
+                model: "test".into(),
+                api_key: String::new(),
+                created_by: String::new(),
+                batch_metadata: HashMap::from([
+                    ("billing-mode".into(), "durable".into()),
+                    ("billing-event-id".into(), event.to_string()),
+                ]),
+            };
+            let result = ReqwestHttpClient::default().execute(&request, "").await;
+            assert_eq!(result.is_ok(), expected_success);
+            if let Ok(response) = result {
+                assert_eq!(response.body, "unchanged response bytes");
+            }
+            server.abort();
+        }
     }
 
     #[tokio::test]

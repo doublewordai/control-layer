@@ -55,6 +55,7 @@ pub struct DispatchProcessor {
     /// separates them from a client's own request. See
     /// [`crate::inference::outbound_request::STREAM_MARKER_KEY`].
     streamable_endpoints: Vec<String>,
+    durable_billing: Option<(bool, sqlx_pool_router::DynPools, u64)>,
     default: DefaultRequestProcessor,
 }
 
@@ -71,6 +72,7 @@ impl DispatchProcessor {
             image_normalizer: None,
             dispatch_ttl: Duration::from_secs(0),
             streamable_endpoints: Vec::new(),
+            durable_billing: None,
             default: DefaultRequestProcessor,
         }
     }
@@ -78,6 +80,12 @@ impl DispatchProcessor {
     /// Paths whose dispatches are marked for streaming and reassembly.
     pub fn with_streamable_endpoints(mut self, endpoints: Vec<String>) -> Self {
         self.streamable_endpoints = endpoints;
+        self
+    }
+
+    /// Persist billing ownership before dispatch and pause when recovery is unhealthy.
+    pub fn with_durable_billing(mut self, enabled: bool, pool: sqlx_pool_router::DynPools, max_age_secs: u64) -> Self {
+        self.durable_billing = Some((enabled, pool, max_age_secs));
         self
     }
 
@@ -143,6 +151,42 @@ where
         should_retry: ShouldRetry,
         cancellation: CancellationFuture,
     ) -> fusillade::Result<RequestCompletionResult> {
+        if let Some((enabled, pool, max_age_secs)) = &self.durable_billing {
+            let durable = match storage
+                .assign_billing_mode(request.data.id, *enabled && self.should_mark(&request.data.path))
+                .await
+            {
+                Ok(durable) => durable,
+                Err(error) => {
+                    tracing::warn!(%error, "Unable to persist billing ownership; deferring dispatch");
+                    return Ok(RequestCompletionResult::Failed(Self::failed(
+                        request,
+                        FailureReason::NetworkError {
+                            error: "Billing admission is temporarily unavailable".into(),
+                        },
+                    )));
+                }
+            };
+            request
+                .data
+                .batch_metadata
+                .insert("billing-mode".into(), if durable { "durable" } else { "legacy" }.into());
+            if durable
+                && (!self.should_mark(&request.data.path)
+                    || !matches!(
+                        crate::inference::billing_worker::admission_ready(pool, *max_age_secs).await,
+                        Ok(true)
+                    ))
+            {
+                return Ok(RequestCompletionResult::Failed(Self::failed(
+                    request,
+                    FailureReason::NetworkError {
+                        error: "Billing admission is temporarily unavailable".into(),
+                    },
+                )));
+            }
+        }
+
         // ZDR: the stored request body is a self-describing ciphertext envelope.
         // Decrypt it here, before JIT signing and dispatch, so the rest of the
         // flow (and the whole loopback edge) sees plaintext. The response is
@@ -343,6 +387,21 @@ where
         // signal the edge needs - and without it a streaming client on a
         // configured path has its stream collapsed into a single body.
         if self.should_mark(&request.data.path) {
+            use crate::inference::billing_events::{ATTEMPT_KEY, EVENT_ID_KEY, MODEL_KEY, OWNER_ID_KEY};
+            // One ID per execution, independent of the logical request's retry history.
+            request
+                .data
+                .batch_metadata
+                .insert(EVENT_ID_KEY.into(), uuid::Uuid::new_v4().to_string());
+            request
+                .data
+                .batch_metadata
+                .insert(OWNER_ID_KEY.into(), request.data.created_by.clone());
+            request.data.batch_metadata.insert(MODEL_KEY.into(), request.data.model.clone());
+            request
+                .data
+                .batch_metadata
+                .insert(ATTEMPT_KEY.into(), request.state.retry_attempt.to_string());
             request
                 .data
                 .batch_metadata

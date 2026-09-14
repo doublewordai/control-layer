@@ -953,3 +953,22 @@ image_normalizer:
 # bucket retention MUST exceed the maximum time a batch can sit
 # between ingest and final dispatch attempt (typically the batch
 # completion window, 24h for OpenAI-style "24h" batches).
+
+# Durable billing for daemon requests on streamable endpoints.
+analytics:
+  durable_billing:
+    dispatch_enabled: false
+    worker_enabled: false
+    # Run only the durable worker plus /healthz, /readyz and /metrics, independently of inference.
+    worker_only: false
+    poll_interval_ms: 1000
+    batch_size: 100
+    retention_hours: 24
+    # Match the external http_analytics retention policy when configured.
+    analytics_retention_days: null
+    max_backlog_age_secs: 300
+    publish_max_retries: 3
+    publish_retry_delay_ms: 100
+  # Capture legacy-mode events for comparison only; the worker never charges them.
+  # Pending events do not expire. Enable only after deploying upgraded daemons.
+  capture_fusillade_billing_events: false

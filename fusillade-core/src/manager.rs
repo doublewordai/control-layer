@@ -750,6 +750,21 @@ pub enum BackgroundClaimKind {
 /// need to validate them.
 #[async_trait]
 pub trait Storage: Send + Sync {
+    /// Atomically assign a request's immutable billing mode before dispatch.
+    /// Returns the persisted choice, including when a retry requests another mode.
+    async fn assign_billing_mode(
+        &self,
+        _request_id: RequestId,
+        requested_durable: bool,
+    ) -> Result<bool> {
+        if requested_durable {
+            return Err(crate::FusilladeError::ValidationError(
+                "Storage does not support durable billing".into(),
+            ));
+        }
+        Ok(false)
+    }
+
     /// Create a new file with templates.
     async fn create_file(
         &self,

@@ -5364,3 +5364,52 @@ async fn an_incomplete_graph_is_skipped_and_the_next_graph_still_moves(pool: PgP
     assert_wholly_live(&pool, &broken).await;
     assert_wholly_retained(&pool, &next).await;
 }
+
+#[sqlx::test]
+async fn durable_billing_evidence_survives_batchless_retention_and_erasure(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let terminal_at = timestamp("2026-08-01T10:00:00Z");
+    let graph = singleton(
+        &pool,
+        "flex",
+        TerminalState::Pending,
+        terminal_at,
+        "durable-evidence",
+    )
+    .await;
+    let manager = manager(&pool).await;
+    let event_id = Uuid::new_v4();
+    assert!(
+        manager
+            .assign_billing_mode(RequestId(graph.request_ids[0]), true)
+            .await
+            .unwrap()
+    );
+    let mut completed = generic_terminal_write(&graph);
+    completed.state.completed_at = terminal_at;
+    completed
+        .data
+        .batch_metadata
+        .insert("billing-mode".into(), "durable".into());
+    completed
+        .data
+        .batch_metadata
+        .insert("billing-event-id".into(), event_id.to_string());
+    manager.persist(&completed).await.unwrap();
+    let expected = (event_id, terminal_at, Some(OWNER.to_owned()), None::<Uuid>);
+    let read_evidence = || async {
+        sqlx::query_as::<_, (Uuid, DateTime<Utc>, Option<String>, Option<Uuid>)>(
+            "SELECT accepted_event_id,completed_at,owner_id,batch_id FROM billing_acceptances WHERE request_id=$1",
+        ).bind(graph.request_ids[0]).fetch_one(&pool).await.unwrap()
+    };
+    assert_eq!(read_evidence().await, expected);
+    archive(&manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+        .await
+        .unwrap();
+    assert_wholly_retained(&pool, &graph).await;
+    assert_eq!(read_evidence().await, expected);
+    manager.delete_response_group(graph.group_id).await.unwrap();
+    assert_wholly_erased(&pool, &graph).await;
+    assert_eq!(read_evidence().await, expected);
+}

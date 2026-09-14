@@ -195,6 +195,15 @@ impl Reassembler {
 
     /// Assemble the accumulated state into a non-streaming response body.
     pub fn finish(self) -> anyhow::Result<String> {
+        self.finish_with(|_| ()).map(|(body, ())| body)
+    }
+
+    /// Observe the already assembled JSON value while producing the usual wire body.
+    ///
+    /// The observer runs once on a successful assembly and can extract owned metadata
+    /// without deserializing the returned body. No additional JSON parse or serialization
+    /// is performed. Failed assembly does not call the observer.
+    pub fn finish_with<T>(self, observe: impl FnOnce(&Value) -> T) -> anyhow::Result<(String, T)> {
         // The Responses API emits typed events (`response.created`,
         // `response.output_text.delta`, etc.). The final `response.completed`
         // event contains the full response object under the `"response"` key,
@@ -210,7 +219,8 @@ impl Reassembler {
                     "response.completed event JSON does not contain top-level \"response\" field"
                 )
             };
-            return serde_json::to_string(response).map_err(Into::into);
+            let body = serde_json::to_string(response)?;
+            return Ok((body, observe(response)));
         }
 
         if let Some(e) = self.chunk_error {
@@ -237,7 +247,7 @@ impl Reassembler {
         response["choices"] = Value::Array(assembled_choices);
         response["usage"] = self.usage;
 
-        Ok(response.to_string())
+        Ok((response.to_string(), observe(&response)))
     }
 }
 
@@ -932,5 +942,53 @@ mod tests {
         let out: Value =
             serde_json::from_str(&reassemble(&stream("text_completion")).unwrap()).unwrap();
         assert_eq!(out["object"], "text_completion");
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+
+    fn accumulator(responses: bool) -> Reassembler {
+        let mut acc = Reassembler::new();
+        acc.push(&eventsource_stream::Event {
+            event: if responses { "response.completed" } else { "message" }.into(),
+            data: if responses {
+                r#"{"response":{"id":"r1","model":"m","output":[],"usage":{"input_tokens":12,"output_tokens":7}}}"#
+            } else {
+                r#"{"id":"c1","model":"m","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"answer"}}],"usage":{"prompt_tokens":12,"completion_tokens":7}}"#
+            }.into(),
+            ..Default::default()
+        });
+        acc
+    }
+
+    #[test]
+    fn observer_receives_existing_value_without_changing_wire_output() {
+        for responses in [false, true] {
+            let expected = accumulator(responses).finish().unwrap();
+            let mut calls = 0;
+            let (actual, tokens) = accumulator(responses)
+                .finish_with(|value| {
+                    calls += 1;
+                    value["usage"][if responses {
+                        "output_tokens"
+                    } else {
+                        "completion_tokens"
+                    }]
+                    .as_u64()
+                    .unwrap()
+                })
+                .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(tokens, 7);
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn malformed_stream_does_not_call_observer() {
+        let result = Reassembler::new().finish_with(|_| panic!("no completed value"));
+        assert!(result.is_err());
     }
 }

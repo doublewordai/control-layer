@@ -136,6 +136,36 @@ pub struct RawAnalyticsRecord {
     pub trace_id: Option<String>,
 }
 
+/// Secret-free, immutable attribution captured before durable dispatch.
+/// Usage presence must be validated by the event decoder before constructing `raw`.
+pub(crate) struct DurableBillingInput {
+    pub raw: RawAnalyticsRecord,
+    pub owner_id: Uuid,
+    pub api_key_id: Uuid,
+    pub api_key_purpose: ApiKeyPurpose,
+    pub cap_scope_root: Option<Uuid>,
+    pub model_id: Uuid,
+}
+
+/// Historical pricing resolved before acquiring the worker's billing locks.
+#[derive(Clone)]
+pub(crate) struct PreparedDurableBilling(EnrichedRecord);
+
+impl PreparedDurableBilling {
+    pub(crate) fn total_cost(&self) -> Decimal {
+        self.0.total_cost.expect("prepared durable pricing")
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct DurableBillingResult {
+    pub input_price_per_token: Decimal,
+    pub output_price_per_token: Decimal,
+    pub uncached_cost: Decimal,
+    pub total_cost: Decimal,
+    pub analytics_id: i64,
+}
+
 /// Enriched data resolved during batch processing
 #[derive(Debug, Clone)]
 struct EnrichedRecord {
@@ -616,6 +646,213 @@ where
         Ok(enriched)
     }
 
+    /// Resolve retained pricing using immutable model and billing identities. Call
+    /// before opening the billing transaction: all pool reads happen in this stage.
+    /// No bearer-token lookup or current key-purpose lookup participates in billing.
+    pub(crate) async fn prepare_durable(&self, input: DurableBillingInput) -> Result<PreparedDurableBilling, sqlx::Error> {
+        let invalid = |code: &str| sqlx::Error::Protocol(code.to_owned());
+        let raw = input.raw;
+        if raw.bearer_token.is_some() {
+            return Err(invalid("durable_billing_secret_present"));
+        }
+        if input.owner_id.is_nil() || input.api_key_id.is_nil() || input.model_id.is_nil() {
+            return Err(invalid("durable_billing_identity_missing"));
+        }
+        if raw.fusillade_request_id.is_none_or(|id| id.is_nil())
+            || raw.batch_created_at.is_none()
+            || (raw.fusillade_batch_id.is_some() && raw.batch_completion_window.is_none())
+        {
+            return Err(invalid("durable_billing_batch_metadata_missing"));
+        }
+        if !(200..300).contains(&raw.status_code)
+            || [
+                raw.prompt_tokens,
+                raw.completion_tokens,
+                raw.reasoning_tokens,
+                raw.total_tokens,
+                raw.cache_read_input_tokens,
+                raw.cache_creation_5m_input_tokens,
+                raw.cache_creation_1h_input_tokens,
+                raw.cache_creation_24h_input_tokens,
+            ]
+            .into_iter()
+            .any(|count| count < 0)
+        {
+            return Err(invalid("durable_billing_usage_invalid"));
+        }
+        let identities_exist: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE id = $1) AND EXISTS (SELECT 1 FROM api_keys WHERE id = $2)")
+                .bind(input.owner_id)
+                .bind(input.api_key_id)
+                .fetch_one(&self.pool)
+                .await?;
+        if !identities_exist {
+            return Err(invalid("durable_billing_identity_missing"));
+        }
+        // Query by the snapshotted UUID, never by an alias that may have been reused.
+        let provider_name: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT ie.name FROM deployed_models dm LEFT JOIN inference_endpoints ie ON ie.id = dm.hosted_on WHERE dm.id = $1",
+        )
+        .bind(input.model_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(provider_name) = provider_name else {
+            return Err(invalid("durable_billing_model_missing"));
+        };
+        use sqlx::Row;
+        let rows = sqlx::query(
+            "SELECT api_key_purpose, valid_from, valid_until, input_price_per_token, output_price_per_token, completion_window
+             FROM model_tariffs WHERE deployed_model_id = $1 ORDER BY valid_from DESC",
+        )
+        .bind(input.model_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let tariffs = rows
+            .iter()
+            .map(|row| {
+                Ok(TariffInfo {
+                    purpose: parse_api_key_purpose(row.try_get("api_key_purpose")?),
+                    effective_from: row.try_get("valid_from")?,
+                    valid_until: row.try_get("valid_until")?,
+                    input_price_per_token: row.try_get("input_price_per_token")?,
+                    output_price_per_token: row.try_get("output_price_per_token")?,
+                    completion_window: row.try_get("completion_window")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        let pricing_timestamp = raw.batch_created_at.unwrap_or(raw.timestamp);
+        let (input_price, output_price) = find_best_tariff(
+            &tariffs,
+            Some(&input.api_key_purpose),
+            raw.batch_completion_window.as_deref(),
+            pricing_timestamp,
+        );
+        let (Some(input_price), Some(output_price)) = (input_price, output_price) else {
+            return Err(invalid("durable_billing_pricing_missing"));
+        };
+        if input_price < Decimal::ZERO || output_price < Decimal::ZERO {
+            return Err(invalid("durable_billing_pricing_invalid"));
+        }
+        let rows = sqlx::query(
+            "SELECT write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, read_multiplier, valid_from, valid_until
+             FROM model_cache_tariffs WHERE deployed_model_id = $1 ORDER BY valid_from DESC",
+        )
+        .bind(input.model_id)
+        .fetch_all(&self.pool)
+        .await?;
+        let cache_tariffs = rows
+            .iter()
+            .map(|row| {
+                Ok(CacheTariffRow {
+                    write_multiplier_5m: row.try_get("write_multiplier_5m")?,
+                    write_multiplier_1h: row.try_get("write_multiplier_1h")?,
+                    write_multiplier_24h: row.try_get("write_multiplier_24h")?,
+                    read_multiplier: row.try_get("read_multiplier")?,
+                    valid_from: row.try_get("valid_from")?,
+                    valid_until: row.try_get("valid_until")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()?;
+        let cache_multipliers = resolve_cache_multipliers(&cache_tariffs, pricing_timestamp);
+        let total_cost = charged_cost(
+            &TokenCounts::from(&raw),
+            raw.request_model.as_deref(),
+            Some(input_price),
+            Some(output_price),
+            cache_multipliers,
+            ANALYTICS_BATCHER,
+        )
+        .ok_or_else(|| invalid("durable_billing_pricing_invalid"))?;
+        let uncached_cost = compute_list_price(&raw, Some(input_price), Some(output_price));
+        Ok(PreparedDurableBilling(EnrichedRecord {
+            raw,
+            user_id: Some(input.owner_id),
+            api_key_id: Some(input.api_key_id),
+            access_source: "api_key".to_owned(),
+            api_key_purpose: Some(input.api_key_purpose),
+            provider_name,
+            input_price_per_token: Some(input_price),
+            output_price_per_token: Some(output_price),
+            total_cost: Some(total_cost),
+            uncached_cost,
+            cap_scope_root: input.cap_scope_root,
+        }))
+    }
+
+    /// Write every billing projection in the caller's transaction. The caller MUST
+    /// first acquire the unique logical-request receipt, and must commit that receipt
+    /// and these effects together. This method never commits or acquires a pool connection.
+    pub(crate) async fn write_durable(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        prepared: PreparedDurableBilling,
+    ) -> Result<DurableBillingResult, sqlx::Error> {
+        let record = prepared.0;
+        let total_cost = record.total_cost.expect("prepared durable pricing");
+        let input_price_per_token = record.input_price_per_token.expect("prepared input pricing");
+        let output_price_per_token = record.output_price_per_token.expect("prepared output pricing");
+        let uncached_cost = record.uncached_cost.expect("prepared list pricing");
+        // The worker holds the newly reserved unique receipt. An existing debit
+        // therefore signals inconsistent retained state, not an ordinary replay.
+        // Check before writing any projections, including for a zero-cost event.
+        let source_id = format!("durable-billing:{}", record.raw.fusillade_request_id.expect("prepared request id"));
+        let ledger_exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM credits_transactions WHERE source_id = $1)")
+            .bind(source_id)
+            .fetch_one(&mut **tx)
+            .await?;
+        if ledger_exists {
+            return Err(sqlx::Error::Protocol("durable_billing_ledger_conflict".into()));
+        }
+        let identity = (record.raw.instance_id, record.raw.correlation_id);
+        let records = [record];
+        let (analytics_ids, newly_inserted) = self.batch_insert_analytics(tx, &records).await?;
+        // An unexpected pre-existing analytics projection is a reconciliation case;
+        // never allow it to suppress this receipt's authoritative usage fold.
+        let analytics_id = *analytics_ids
+            .get(&identity)
+            .ok_or_else(|| sqlx::Error::Protocol("durable_billing_analytics_missing".into()))?;
+        if !newly_inserted.contains(&analytics_id) {
+            return Err(sqlx::Error::Protocol("durable_billing_analytics_conflict".into()));
+        }
+        let duplicates = self
+            .batch_insert_credits(tx, &records, &analytics_ids, &newly_inserted, true)
+            .await?;
+        if duplicates != 0 {
+            return Err(sqlx::Error::Protocol("durable_billing_ledger_conflict".into()));
+        }
+        Ok(DurableBillingResult {
+            input_price_per_token,
+            output_price_per_token,
+            uncached_cost,
+            total_cost,
+            analytics_id,
+        })
+    }
+
+    /// Best-effort observability after the caller has committed the receipt. These
+    /// metrics are not accounting state and must never be emitted before commit.
+    pub(crate) async fn record_durable_metrics(&self, prepared: &PreparedDurableBilling) {
+        let record = &prepared.0;
+        if let Some(notify) = &self.usage_refresh_notify {
+            notify.notify_one();
+        }
+        let elapsed = Utc::now().signed_duration_since(record.raw.timestamp).num_milliseconds();
+        histogram!("dwctl_analytics_lag_seconds").record((elapsed - record.raw.duration_ms) as f64 / 1000.0);
+        if let Some(ref recorder) = self.metrics_recorder {
+            recorder.record_from_analytics(&self.enriched_to_row(record)).await;
+        }
+        if let Some(cost) = record.total_cost.filter(|cost| *cost > Decimal::ZERO) {
+            counter!(
+                "dwctl_credits_deducted_nanocredits_total",
+                "user_id" => record.user_id.expect("prepared owner").to_string(),
+                "model" => record.raw.request_model.clone().unwrap_or_default(),
+                "served_by" => crate::metrics::served_by_host(record.raw.served_by.as_deref())
+            )
+            .increment((cost.to_f64().unwrap_or(0.0) * 1_000_000_000.0).round() as u64);
+        }
+        counter!("dwctl_analytics_batched_records_total").increment(1);
+    }
+
     /// Batch lookup user info by bearer tokens.
     ///
     /// `cap_scope_root` is the spending-cap scope for the key (see
@@ -762,7 +999,9 @@ where
         let (analytics_ids, newly_inserted) = self.batch_insert_analytics(&mut tx, records).await?;
 
         // Phase 2: Batch INSERT credit_transactions (+ fold batch_aggregates)
-        let duplicates = self.batch_insert_credits(&mut tx, records, &analytics_ids, &newly_inserted).await?;
+        let duplicates = self
+            .batch_insert_credits(&mut tx, records, &analytics_ids, &newly_inserted, false)
+            .await?;
         if duplicates > 0 {
             warn!(duplicates = duplicates, "Some credit transactions were duplicates");
             counter!("dwctl_credits_duplicates_total").increment(duplicates);
@@ -1045,6 +1284,7 @@ where
         records: &[EnrichedRecord],
         analytics_ids: &HashMap<(Uuid, i64), i64>,
         newly_inserted: &HashSet<i64>,
+        durable: bool,
     ) -> Result<u64, sqlx::Error> {
         // Collect records that need credit transactions
         let mut user_ids: Vec<Uuid> = Vec::new();
@@ -1099,7 +1339,14 @@ where
 
             user_ids.push(user_id);
             amounts.push(total_cost);
-            source_ids.push(analytics_id.to_string());
+            source_ids.push(if durable {
+                format!(
+                    "durable-billing:{}",
+                    record.raw.fusillade_request_id.expect("validated durable request id")
+                )
+            } else {
+                analytics_id.to_string()
+            });
             descriptions.push(Some(format!(
                 "API usage: {} ({} input + {} output tokens)",
                 model, record.raw.prompt_tokens, record.raw.completion_tokens
@@ -1114,7 +1361,7 @@ where
             cap_scope_roots.push(record.cap_scope_root);
         }
 
-        if user_ids.is_empty() {
+        if user_ids.is_empty() && !durable {
             return Ok(0);
         }
 
@@ -1262,7 +1509,9 @@ where
                 .bind(&payload)
                 .execute(&mut **tx)
                 .await?;
-            counter!("dwctl_balance_crossings_total", "direction" => "down").increment(crossed_down.len() as u64);
+            if !durable {
+                counter!("dwctl_balance_crossings_total", "direction" => "down").increment(crossed_down.len() as u64);
+            }
         }
 
         // Fold this flush's billed amounts into the per-cap-scope spend
@@ -1400,7 +1649,9 @@ where
                     .bind(&payload)
                     .execute(&mut **tx)
                     .await?;
-                counter!("dwctl_spend_cap_crossings_total").increment(crossed_caps);
+                if !durable {
+                    counter!("dwctl_spend_cap_crossings_total").increment(crossed_caps);
+                }
             }
         }
 
@@ -1591,8 +1842,8 @@ where
             .await?;
         }
 
-        // Record metrics only for successfully inserted credit transactions
-        for row in &inserted_rows {
+        // Durable callers publish metrics after committing their receipt.
+        for row in inserted_rows.iter().filter(|_| !durable) {
             if let Some((_, user_id, amount, model, served_by)) = source_id_to_record.get(&row.source_id) {
                 // Nanocredits (1 credit = 1e9). Tariffs price tokens at
                 // DECIMAL(12,8), so a single token can cost 1e-8 credits; nano
@@ -2100,6 +2351,253 @@ mod integration_tests {
         // Run batcher until channel is drained
         let shutdown = CancellationToken::new();
         batcher.run(shutdown).await;
+    }
+
+    async fn durable_fixture(pool: &sqlx::PgPool, price: Decimal) -> DurableBillingInput {
+        let model_id = create_test_model(pool, &format!("durable-original-{}", Uuid::new_v4())).await;
+        setup_tariff(pool, model_id, price, price, ApiKeyPurpose::Batch).await;
+        let owner_id = setup_user_with_balance(pool, Decimal::from(100)).await;
+        let secret = create_api_key_for_user(pool, owner_id, ApiKeyPurpose::Batch).await;
+        let api_key_id = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
+            .bind(secret)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE api_keys SET spend_limit = 50, purpose = 'realtime' WHERE id = $1")
+            .bind(api_key_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        // Neither the mutable key purpose nor the display alias may select pricing.
+        sqlx::query("UPDATE deployed_models SET alias = 'durable-renamed-' || id::text WHERE id = $1")
+            .bind(model_id)
+            .execute(pool)
+            .await
+            .unwrap();
+        let mut raw = create_raw_record("durable-original", None, 10, 5);
+        raw.fusillade_batch_id = Some(Uuid::new_v4());
+        raw.fusillade_request_id = Some(Uuid::new_v4());
+        raw.batch_created_at = Some(Utc::now());
+        raw.batch_completion_window = Some("24h".into());
+        DurableBillingInput {
+            raw,
+            owner_id,
+            api_key_id,
+            api_key_purpose: ApiKeyPurpose::Batch,
+            cap_scope_root: Some(api_key_id),
+            model_id,
+        }
+    }
+
+    #[sqlx::test]
+    async fn durable_adapter_rolls_back_every_projection(pool: sqlx::PgPool) {
+        let input = durable_fixture(&pool, Decimal::ONE).await;
+        let owner_id = input.owner_id;
+        let api_key_id = input.api_key_id;
+        let batch_id = input.raw.fusillade_batch_id.unwrap();
+        let request_id = input.raw.fusillade_request_id.unwrap();
+        let (batcher, _) =
+            AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), crate::test::utils::create_test_config(), None);
+        let prepared = batcher.prepare_durable(input).await.unwrap();
+        let retry = PreparedDurableBilling(prepared.0.clone());
+        let mut tx = pool.begin().await.unwrap();
+        let result = batcher.write_durable(&mut tx, prepared).await.unwrap();
+        assert_eq!(result.total_cost, Decimal::from(15));
+        tx.rollback().await.unwrap();
+        let counts: (i64, i64, i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM http_analytics WHERE id = $1),
+                    (SELECT count(*) FROM credits_transactions WHERE source_id = $2),
+                    (SELECT count(*) FROM api_key_spend_checkpoints WHERE api_key_id = $3),
+                    (SELECT count(*) FROM batch_aggregates WHERE fusillade_batch_id = $4)",
+        )
+        .bind(result.analytics_id)
+        .bind(format!("durable-billing:{request_id}"))
+        .bind(api_key_id)
+        .bind(batch_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0, 0, 0));
+        let balance: Decimal = sqlx::query_scalar("SELECT balance FROM user_balance_checkpoints WHERE user_id = $1")
+            .bind(owner_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(balance, Decimal::from(100));
+        let mut tx = pool.begin().await.unwrap();
+        let conflicting_replay = retry.clone();
+        let committed = batcher.write_durable(&mut tx, retry).await.unwrap();
+        tx.commit().await.unwrap();
+        let amount: Decimal = sqlx::query_scalar("SELECT amount FROM credits_transactions WHERE source_id = $1")
+            .bind(format!("durable-billing:{request_id}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(amount, committed.total_cost);
+        let aggregate: (i64, Decimal) =
+            sqlx::query_as("SELECT total_requests, total_amount FROM batch_aggregates WHERE fusillade_batch_id = $1")
+                .bind(batch_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(aggregate, (1, Decimal::from(15)));
+        let spend: Decimal = sqlx::query_scalar("SELECT total_spend FROM api_key_spend_checkpoints WHERE api_key_id = $1")
+            .bind(api_key_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(spend, Decimal::from(15));
+        // The receipt owner must reconcile a retained ledger row instead of
+        // creating any projection, even if it supplied a different analytics identity.
+        let mut conflicting_replay = conflicting_replay;
+        conflicting_replay.0.raw.instance_id = Uuid::new_v4();
+        let mut tx = pool.begin().await.unwrap();
+        assert!(matches!(batcher.write_durable(&mut tx, conflicting_replay).await,
+            Err(sqlx::Error::Protocol(code)) if code == "durable_billing_ledger_conflict"));
+        let requests: i64 = sqlx::query_scalar("SELECT total_requests FROM batch_aggregates WHERE fusillade_batch_id = $1")
+            .bind(batch_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(requests, 1);
+        let analytics: i64 = sqlx::query_scalar("SELECT count(*) FROM http_analytics WHERE fusillade_batch_id = $1")
+            .bind(batch_id)
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(analytics, 1);
+        tx.rollback().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn durable_adapter_supports_batchless_background_requests(pool: sqlx::PgPool) {
+        let mut input = durable_fixture(&pool, Decimal::ONE).await;
+        // Batchless background work has no window and uses the established
+        // fallback to the model's realtime tariff.
+        setup_tariff(&pool, input.model_id, Decimal::ONE, Decimal::ONE, ApiKeyPurpose::Realtime).await;
+        input.raw.fusillade_batch_id = None;
+        input.raw.batch_completion_window = None;
+        input.raw.batch_created_at = Some(Utc::now());
+        let request_id = input.raw.fusillade_request_id.unwrap();
+        let owner_id = input.owner_id;
+        let (batcher, _) =
+            AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), crate::test::utils::create_test_config(), None);
+        let prepared = batcher.prepare_durable(input).await.unwrap();
+        assert_eq!(prepared.total_cost(), Decimal::from(15));
+        let mut tx = pool.begin().await.unwrap();
+        let result = batcher.write_durable(&mut tx, prepared).await.unwrap();
+        tx.commit().await.unwrap();
+        let ledger: (Decimal, Option<Uuid>, Option<String>, bool) =
+            sqlx::query_as("SELECT amount, fusillade_batch_id, service_tier, is_aggregated FROM credits_transactions WHERE source_id = $1")
+                .bind(format!("durable-billing:{request_id}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ledger, (Decimal::from(15), None, Some("realtime".into()), false));
+        let analytics: (i64, Decimal, Option<Uuid>) =
+            sqlx::query_as("SELECT total_tokens, total_cost, fusillade_batch_id FROM http_analytics WHERE id = $1")
+                .bind(result.analytics_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(analytics, (15, Decimal::from(15), None));
+        let aggregates: i64 = sqlx::query_scalar("SELECT count(*) FROM batch_aggregates")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(aggregates, 0);
+        crate::db::handlers::analytics::refresh_user_model_usage_daily(&pool).await.unwrap();
+        // Existing cursor folding consumes durable analytics once, just as legacy.
+        crate::db::handlers::analytics::refresh_user_model_usage_daily(&pool).await.unwrap();
+        let daily: (i64, i64, Decimal, i64) =
+            sqlx::query_as("SELECT input_tokens, output_tokens, cost, request_count FROM user_model_usage_daily WHERE user_id = $1")
+                .bind(owner_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(daily, (10, 5, Decimal::from(15), 1));
+    }
+
+    #[sqlx::test]
+    async fn durable_adapter_zero_cost_still_folds_usage(pool: sqlx::PgPool) {
+        let input = durable_fixture(&pool, Decimal::ZERO).await;
+        let batch_id = input.raw.fusillade_batch_id.unwrap();
+        let request_id = input.raw.fusillade_request_id.unwrap();
+        let (batcher, _) =
+            AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), crate::test::utils::create_test_config(), None);
+        let prepared = batcher.prepare_durable(input).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let result = batcher.write_durable(&mut tx, prepared).await.unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(result.total_cost, Decimal::ZERO);
+        let aggregate: (i64, i64, Decimal) =
+            sqlx::query_as("SELECT total_requests, total_tokens, total_amount FROM batch_aggregates WHERE fusillade_batch_id = $1")
+                .bind(batch_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(aggregate, (1, 15, Decimal::ZERO));
+        let credits: i64 = sqlx::query_scalar("SELECT count(*) FROM credits_transactions WHERE source_id = $1")
+            .bind(format!("durable-billing:{request_id}"))
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(credits, 0);
+    }
+
+    #[sqlx::test]
+    async fn durable_adapter_resolves_historical_cache_pricing_by_model_id(pool: sqlx::PgPool) {
+        let mut input = durable_fixture(&pool, Decimal::ONE).await;
+        let model_id = input.model_id;
+        let priced_at = Utc::now();
+        input.raw.batch_created_at = Some(priced_at);
+        input.raw.cache_read_input_tokens = 5;
+        input.raw.cache_creation_1h_input_tokens = 2;
+        sqlx::query(
+            "INSERT INTO model_cache_tariffs
+             (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h,
+              read_multiplier, min_prefix_tokens, valid_from, valid_until)
+             VALUES ($1, 1.25, 2.0, 2.5, 0.1, 1024, $2::timestamptz - interval '1 second', $2::timestamptz + interval '1 second')",
+        )
+        .bind(model_id)
+        .bind(priced_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO model_cache_tariffs
+             (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h,
+              read_multiplier, min_prefix_tokens, valid_from)
+             VALUES ($1, 1.25, 3.0, 2.5, 0.9, 1024, $2::timestamptz + interval '1 second')",
+        )
+        .bind(model_id)
+        .bind(priced_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let (batcher, _) =
+            AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), crate::test::utils::create_test_config(), None);
+        let prepared = batcher.prepare_durable(input).await.unwrap();
+        // 3 uncached + 5*0.1 read + 2*2.0 creation + 5 output.
+        assert_eq!(prepared.0.total_cost, Some(Decimal::from_str("12.5").unwrap()));
+        assert_eq!(prepared.0.uncached_cost, Some(Decimal::from(15)));
+    }
+
+    #[sqlx::test]
+    async fn durable_adapter_rejects_missing_pricing_and_secrets(pool: sqlx::PgPool) {
+        let mut input = durable_fixture(&pool, Decimal::ONE).await;
+        let (batcher, _) =
+            AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), crate::test::utils::create_test_config(), None);
+        input.raw.bearer_token = Some("must-not-be-looked-up".into());
+        assert!(
+            matches!(batcher.prepare_durable(input).await, Err(sqlx::Error::Protocol(code)) if code == "durable_billing_secret_present")
+        );
+        // The requested timestamp precedes the retained tariff: explicit failure, never free usage.
+        let mut input = durable_fixture(&pool, Decimal::ONE).await;
+        input.raw.batch_created_at = Some(Utc::now() - chrono::Duration::days(1));
+        assert!(
+            matches!(batcher.prepare_durable(input).await, Err(sqlx::Error::Protocol(code)) if code == "durable_billing_pricing_missing")
+        );
     }
 
     #[sqlx::test]

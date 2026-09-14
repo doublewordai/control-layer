@@ -1426,6 +1426,18 @@ async fn setup_database(
     // sqlx's migrator holds a session advisory lock: direct connections.
     fusillade_arsenal::migrator().run(&*fusillade.direct.write()).await?;
 
+    if config.analytics.durable_billing.worker_only {
+        return Ok((
+            embedded_db,
+            db::DatabasePools {
+                main,
+                fusillade,
+                outlet: None,
+            },
+            None,
+        ));
+    }
+
     // Every batch-capable process performs the content-free preflight, even
     // when its daemon is disabled. That makes disabling the last archive
     // owner fail closed while durable retirement or route cleanup remains.
@@ -2525,6 +2537,12 @@ pub async fn build_router(
         }
     };
 
+    // Await durable capture after cache accounting and before protocol translation.
+    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
+        crate::inference::billing_events::BillingEventQueue::new(state.db.clone()).with_config(config.analytics.clone()),
+        crate::inference::billing_events::capture,
+    ));
+
     // Apply the edge protocol-translation middleware. Placement is deliberate: it
     // sits INNER to the outlet and the inference middleware, but OUTER to cache /
     // image-normalisation / tool-injection / onwards.
@@ -3433,6 +3451,20 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     // Track all background task handles for graceful shutdown
     let mut background_tasks = BackgroundTaskBuilder::new();
 
+    let usage_refresh_notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    if config.analytics.durable_billing.worker_enabled {
+        let worker = crate::inference::billing_worker::BillingWorker::new(
+            dyn_pools.clone(),
+            sqlx_pool_router::DynPools::new(fusillade_pools.clone()),
+            config.clone(),
+        )
+        .with_metrics(metrics_recorder.clone())
+        .with_usage_refresh_notify(usage_refresh_notify.clone());
+        let worker_shutdown = shutdown_token.clone();
+        background_tasks.spawn("durable-billing-worker", async move { worker.run(worker_shutdown).await });
+    }
+
     // `model_capacity_limits` (the shared map between the fusillade
     // daemon's concurrency control and the onwards config-sync writer)
     // is now owned by the caller — see the function-level doc.
@@ -3858,7 +3890,6 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     // Start the usage-refresh daemon: incrementally folds new http_analytics rows into
     // user_model_usage_daily. The analytics batcher (below) nudges it after every flush;
     // this shares an in-process Notify with it rather than round-tripping through Postgres.
-    let usage_refresh_notify = std::sync::Arc::new(tokio::sync::Notify::new());
     if config.enable_analytics && config.background_services.usage_refresh.enabled {
         let daemon_pool = dyn_pools.clone();
         let daemon_config = config.background_services.usage_refresh.clone();
@@ -4022,6 +4053,106 @@ pub struct Application {
     bg_services: BackgroundServices,
 }
 
+/// Run a billing-only process with independent health and metrics endpoints.
+/// Pool and migration setup is shared with the server; no inference services start.
+pub async fn serve_billing_worker<F>(
+    mut config: Config,
+    tracer_provider: Option<telemetry::SdkTracerProvider>,
+    shutdown: F,
+) -> anyhow::Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    config.analytics.durable_billing.worker_only = true;
+    let (embedded_db, pools, _) = setup_database(&config, None).await?;
+    let token = tokio_util::sync::CancellationToken::new();
+    let _guard = token.clone().drop_guard();
+    let gen_ai_registry = prometheus::Registry::new();
+    let metrics_recorder = if config.enable_metrics {
+        Some(GenAiMetrics::new(&gen_ai_registry)?)
+    } else {
+        None
+    };
+    let worker = crate::inference::billing_worker::BillingWorker::new(
+        sqlx_pool_router::DynPools::new(pools.main.pooled.clone()),
+        sqlx_pool_router::DynPools::new(pools.fusillade.pooled.clone()),
+        config.clone(),
+    )
+    .with_metrics(metrics_recorder);
+    let readiness_pool = sqlx_pool_router::DynPools::new(pools.main.pooled.clone());
+    let mut router = Router::new()
+        .route("/healthz", get(|| async { "OK" }))
+        .route("/readyz", get(move || {
+            let pool = readiness_pool.clone();
+            async move {
+                // Read the primary and bound readiness latency. Queue lag must not
+                // make the worker unready: it is responsible for clearing that lag.
+                let ready = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    sqlx::query_scalar::<_, bool>(
+                        "SELECT EXISTS(SELECT 1 FROM billing_worker_heartbeat WHERE singleton AND last_seen_at > now() - interval '30 seconds')"
+                    ).fetch_one(&*pool.write()).await
+                }).await;
+                if matches!(ready, Ok(Ok(true))) {
+                    (http::StatusCode::OK, "OK")
+                } else {
+                    (http::StatusCode::SERVICE_UNAVAILABLE, "Billing worker is not ready")
+                }
+            }
+        }));
+    if config.enable_metrics {
+        let handle = get_or_install_prometheus_handle();
+        router = router.route(
+            "/metrics",
+            get(move || {
+                let handle = handle.clone();
+                let registry = gen_ai_registry.clone();
+                async move {
+                    use prometheus::Encoder;
+                    let mut output = handle.render();
+                    let mut buffer = Vec::new();
+                    match prometheus::TextEncoder::new().encode(&registry.gather(), &mut buffer) {
+                        Ok(()) => {
+                            output.push_str(&String::from_utf8_lossy(&buffer));
+                            (http::StatusCode::OK, output)
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "Unable to encode billing worker metrics");
+                            (http::StatusCode::INTERNAL_SERVER_ERROR, "Unable to encode metrics".to_string())
+                        }
+                    }
+                }
+            }),
+        );
+    }
+    let listener = TcpListener::bind(config.bind_address()).await?;
+    let server_token = token.clone();
+    let server = axum::serve(listener, router).with_graceful_shutdown(async move { server_token.cancelled().await });
+    let worker_run = worker.run(token.clone());
+    tokio::pin!(worker_run);
+    let server_run = std::future::IntoFuture::into_future(server);
+    tokio::pin!(server_run);
+    let result = tokio::select! {
+        result = &mut worker_run => { token.cancel(); let _ = server_run.await; result }
+        result = &mut server_run => { token.cancel(); let _ = worker_run.await; result.map_err(Into::into) }
+        _ = shutdown => { token.cancel(); let worker_result = worker_run.await; let server_result = server_run.await; worker_result.and(server_result.map_err(Into::into)) }
+    };
+    for pair in [&pools.main, &pools.fusillade] {
+        pair.pooled.close().await;
+        if pair.is_split() {
+            pair.direct.close().await;
+        }
+    }
+    if let Some(provider) = tracer_provider
+        && let Err(error) = provider.force_flush()
+    {
+        tracing::error!(%error, "Failed to flush billing worker telemetry");
+    }
+    if let Some(embedded_db) = embedded_db {
+        embedded_db.stop().await?;
+    }
+    result
+}
+
 impl Application {
     /// Create a new application instance with all resources initialized
     ///
@@ -4079,7 +4210,7 @@ impl Application {
 
         // Create GenAI metrics recorder if both metrics and analytics are enabled
         // This is created here (before background services) so the analytics batcher can use it
-        let metrics_recorder = if config.enable_metrics && config.enable_analytics {
+        let metrics_recorder = if config.enable_metrics && (config.enable_analytics || config.analytics.durable_billing.worker_enabled) {
             let gen_ai_registry = prometheus::Registry::new();
             Some(GenAiMetrics::new(&gen_ai_registry).map_err(|e| anyhow::anyhow!("Failed to create GenAI metrics: {}", e))?)
         } else {
@@ -4188,6 +4319,11 @@ impl Application {
             let dispatch_ttl = config.image_normalizer.signing.dispatch_ttl(processing_timeout);
             let mut dispatch_processor = crate::inference::engine::dispatch_processor::DispatchProcessor::new()
                 .with_keystore(keystore.clone())
+                .with_durable_billing(
+                    config.analytics.durable_billing.dispatch_enabled,
+                    sqlx_pool_router::DynPools::new(db_pools.clone()),
+                    config.analytics.durable_billing.max_backlog_age_secs,
+                )
                 .with_streamable_endpoints(config.background_services.batch_daemon.streamable_endpoints.clone());
             if config.image_normalizer.enabled {
                 dispatch_processor = dispatch_processor.with_image_normalizer(image_normalizer.clone(), dispatch_ttl);
