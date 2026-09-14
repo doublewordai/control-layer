@@ -20,6 +20,7 @@ metadata = json.loads(
 )
 
 expected_packages = {
+    "openai-reassembler",
     "dwctl",
     "onwards",
     "fusillade",
@@ -60,9 +61,11 @@ local_dependencies = {
         "fusillade": "../fusillade",
         "fusillade-arsenal": "../fusillade-arsenal",
         "onwards": "../onwards",
+        "openai-reassembler": "../openai-reassembler",
     },
     "fusillade/Cargo.toml": {
         "fusillade-core": "../fusillade-core",
+        "openai-reassembler": "../openai-reassembler",
         "fusillade-arsenal": "../fusillade-arsenal",
     },
     "fusillade-arsenal/Cargo.toml": {"fusillade-core": "../fusillade-core"},
@@ -298,7 +301,7 @@ fi
 
 node .github/scripts/test-onwards-floating-tags.cjs
 
-for linted_package in dwctl fusillade fusillade-core fusillade-arsenal; do
+for linted_package in dwctl fusillade fusillade-core fusillade-arsenal openai-reassembler; do
   if ! grep -Fq -- "--package $linted_package" "$justfile"; then
     echo "Rust linting must retain $linted_package" >&2
     exit 1
@@ -478,3 +481,10 @@ for obsolete_script in \
     exit 1
   fi
 done
+
+# The reassembler is required during both dependency planning and compilation.
+if [[ "$(grep -Fc 'COPY openai-reassembler/ openai-reassembler/' Dockerfile)" != 2 ]] || \
+   ! grep -Fq 'COPY openai-reassembler/ openai-reassembler/' onwards/Dockerfile; then
+  echo "All workspace Docker builds must include the local reassembler" >&2
+  exit 1
+fi

@@ -1,0 +1,19 @@
+[package]
+name = "openai-reassembler"
+version = "0.4.0"
+edition = "2024"
+publish = false
+description = "Reassemble OpenAI-compatible SSE streaming responses into non-streaming format"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/doublewordai/control-layer"
+keywords = ["openai", "sse", "streaming"]
+categories = ["web-programming"]
+
+[dependencies]
+eventsource-stream = "0.2"
+serde_json = "1"
+anyhow = "1"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }

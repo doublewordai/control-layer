@@ -60,7 +60,7 @@ require_text 'backend-crate-test:' 'define a per-crate test job'
 require_text 'name: ${{ matrix.package }} / test' 'scope every crate test check to its package'
 require_text 'fail-fast: false' 'allow every crate result to complete'
 
-for package in fusillade fusillade-core fusillade-arsenal onwards; do
+for package in fusillade fusillade-core fusillade-arsenal onwards openai-reassembler; do
   require_text "- package: ${package}" "test ${package} in the matrix"
 done
 
