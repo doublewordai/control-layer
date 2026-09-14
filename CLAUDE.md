@@ -2,6 +2,11 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Repository Skills
+
+Maintain shared skills in `.claude/skills/`. Codex discovers the same skills via
+`.agents/skills -> ../.claude/skills`; no per-skill links or inventory are needed.
+
 ## Project Overview
 
 The Doubleword Control Layer (dwctl) is a high-performance AI model gateway

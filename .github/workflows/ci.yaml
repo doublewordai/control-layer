@@ -396,6 +396,12 @@ jobs:
       - name: Lint Rust workspace
         run: just lint rust -- -D warnings
 
+      - name: Validate model provisioning format
+        run: |
+          cargo run --quiet -p dwctl --bin dwctl-model-provisioning -- schema > /tmp/model-provisioning.schema.json
+          diff -u model-provisioning.schema.json /tmp/model-provisioning.schema.json
+          cargo run --quiet -p dwctl --bin dwctl-model-provisioning -- validate examples/model-provisioning
+
       - name: Validate publishable Onwards package
         run: cargo package --locked --package onwards --all-features
 
