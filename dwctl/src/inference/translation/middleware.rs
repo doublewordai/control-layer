@@ -86,8 +86,13 @@ pub async fn translation_middleware(State(registry): State<TranslationRegistry>,
     let downstream_req = Request::from_parts(parts, Body::from(translated.body));
 
     let response = next.run(downstream_req).await;
-
-    translate_response_back(translator.as_ref(), &original_request, response_id.as_deref(), response).await
+    // Translation rebuilds the public body, but outlet still needs internal
+    // billing/routing metadata. Streaming cells are cloned at head time and
+    // filled by the inner body before outlet reads them at completion.
+    let extensions = response.extensions().clone();
+    let mut translated = translate_response_back(translator.as_ref(), &original_request, response_id.as_deref(), response).await;
+    translated.extensions_mut().extend(extensions);
+    translated
 }
 
 /// Translate the downstream response back into the foreign protocol. `request`
