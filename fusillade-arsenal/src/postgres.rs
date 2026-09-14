@@ -1215,6 +1215,8 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 ) sub
                 LIMIT $4
             )
+              AND state IN ('claimed', 'processing')
+              AND accepted_event_id IS NULL
             "#,
             claim_timeout_ms.to_string(),
             processing_timeout_ms.to_string(),
@@ -1633,6 +1635,23 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 /// - Requests without a template (`template_id IS NULL`), which are not claimable.
 /// - Requests from batches that are being cancelled (`b.cancelling_at IS NOT NULL`).
 impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
+    async fn assign_billing_mode(
+        &self,
+        request_id: RequestId,
+        requested_durable: bool,
+    ) -> Result<bool> {
+        let durable = sqlx::query_scalar::<_, bool>(
+            "UPDATE requests SET billing_mode = COALESCE(billing_mode, CASE WHEN $2 THEN 'durable' ELSE 'legacy' END) WHERE id = $1 RETURNING billing_mode = 'durable'",
+        )
+        .bind(request_id.0)
+        .bind(requested_durable)
+        .fetch_optional(self.write_executor())
+        .await
+        .map_err(|e| FusilladeError::Other(e.into()))?
+        .ok_or(FusilladeError::RequestNotFound(request_id))?;
+        Ok(durable)
+    }
+
     async fn sum_owner_batch_requests_in_window(
         &self,
         owner: &str,
@@ -3082,7 +3101,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 daemon_id = NULL,
                                 claimed_at = NULL,
                                 started_at = NULL
-                            WHERE id = $1
+                            WHERE id = $1 AND accepted_event_id IS NULL
                             "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
@@ -3172,6 +3191,54 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         })?;
                     }
                     AnyRequest::Completed(req) => {
+                        // Lock before validating persisted mode; assignment and competing
+                        // terminal writers must not race acceptance. A stale completion
+                        // is dropped without changing the original accepted event.
+                        let row = sqlx::query_as::<_, (Option<String>, String)>(
+                            "SELECT billing_mode, state FROM requests WHERE id = $1 FOR UPDATE",
+                        )
+                        .bind(req.data.id.0)
+                        .fetch_optional(&mut *tx)
+                        .await
+                        .map_err(|e| FusilladeError::Other(e.into()))?;
+                        let Some(row) = row else {
+                            // The row may have moved to retained storage or been
+                            // erased while this writer waited. Preserve the shared
+                            // retained replay and erasure-fence classification.
+                            return Self::dropped_or_missing_in_transaction(&mut tx, req.data.id)
+                                .await;
+                        };
+                        if matches!(row.1.as_str(), "completed" | "failed") {
+                            return Ok(None);
+                        }
+                        let accepted_event_id = if row.0.as_deref() == Some("durable") {
+                            if req
+                                .data
+                                .batch_metadata
+                                .get("billing-mode")
+                                .map(String::as_str)
+                                != Some("durable")
+                            {
+                                return Err(FusilladeError::ValidationError(
+                                    "Durable completion missing billing mode".into(),
+                                ));
+                            }
+                            Some(
+                                req.data
+                                    .batch_metadata
+                                    .get("billing-event-id")
+                                    .and_then(|value| Uuid::parse_str(value).ok())
+                                    .ok_or_else(|| {
+                                        FusilladeError::ValidationError(
+                                            "Durable completion missing valid accepted event ID"
+                                                .into(),
+                                        )
+                                    })?,
+                            )
+                        } else {
+                            None
+                        };
+
                         // Store the raw response body size
                         let response_size = calculate_response_body_size(&req.state.response_body)
                             .ok_or_else(|| {
@@ -3207,6 +3274,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     completed_at = $5,
                                     response_size = $6,
                                     routed_model = $7,
+                                    accepted_event_id = $8,
                                     canceled_at = NULL
                                 FROM prev
                                 WHERE r.id = prev.id
@@ -3231,6 +3299,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             req.state.completed_at,
                             response_size,
                             req.state.routed_model,
+                            accepted_event_id,
                         )
                         .fetch_optional(&mut *tx)
                         .await
@@ -3367,6 +3436,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 Err(FusilladeError::RequestNotFound(id)) => {
                     return Err(FusilladeError::RequestNotFound(id));
                 }
+                Err(error @ FusilladeError::ValidationError(_)) => return Err(error),
                 Err(error)
                     if RetainedResponseWriteError::from_fusillade_error(&error).is_some() =>
                 {
@@ -5467,11 +5537,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, not_before,
                                       daemon_id, claimed_at, started_at, response_status, response_body,
                                       completed_at, error, failed_at, canceled_at, created_at, updated_at,
-                                      custom_id, model, response_size, routed_model, service_tier, created_by)
+                                      custom_id, model, response_size, routed_model, service_tier, created_by, billing_mode, accepted_event_id)
                 SELECT id, batch_id, template_id, 'pending', 0, NULL,
                        NULL, NULL, NULL, NULL, NULL,
                        NULL, NULL, NULL, NULL, created_at, NOW(),
-                       custom_id, model, 0, NULL, service_tier, created_by
+                       custom_id, model, 0, NULL, service_tier, created_by, billing_mode, accepted_event_id
                 FROM batch_requests_archive
                 WHERE id = ANY($1) AND state = 'failed'
                 ON CONFLICT (id) DO NOTHING
@@ -5713,11 +5783,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 INSERT INTO requests (id, batch_id, template_id, state, retry_attempt, not_before,
                                       daemon_id, claimed_at, started_at, response_status, response_body,
                                       completed_at, error, failed_at, canceled_at, created_at, updated_at,
-                                      custom_id, model, response_size, routed_model, service_tier, created_by)
+                                      custom_id, model, response_size, routed_model, service_tier, created_by, billing_mode, accepted_event_id)
                 SELECT id, batch_id, template_id, 'pending', 0, NULL,
                        NULL, NULL, NULL, NULL, NULL,
                        NULL, NULL, NULL, NULL, created_at, NOW(),
-                       custom_id, model, 0, NULL, service_tier, created_by
+                       custom_id, model, 0, NULL, service_tier, created_by, billing_mode, accepted_event_id
                 FROM batch_requests_archive
                 WHERE archive_bucket = $2 AND batch_id = $1 AND state IN ('failed', 'canceled')
                 ON CONFLICT (id) DO NOTHING
@@ -9015,13 +9085,13 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             return Ok(ArchiveOutcome::SkippedNoPartition);
         }
 
-        // Forward move. Positional alignment (`r.*, $bucket`) is guaranteed
-        // by the schema-parity test suite (archive = requests' columns +
-        // archive_bucket appended last). ON CONFLICT makes crash-resume
-        // replay a no-op for rows already copied.
+        // Name target columns explicitly: archive_bucket retains its physical
+        // position when new request fields are appended. The parity round-trip
+        // test protects this mapping. ON CONFLICT makes crash-resume replay
+        // a no-op for rows already copied.
         let inserted = sqlx::query(
             r#"
-            INSERT INTO batch_requests_archive
+            INSERT INTO batch_requests_archive (id, batch_id, template_id, state, retry_attempt, not_before, daemon_id, claimed_at, started_at, response_status, response_body, completed_at, error, failed_at, canceled_at, created_at, updated_at, custom_id, model, response_size, routed_model, service_tier, created_by, billing_mode, accepted_event_id, archive_bucket)
             SELECT r.*, $2::date
             FROM requests r
             WHERE r.batch_id = $1
@@ -12494,6 +12564,318 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn durable_billing_assignment_respects_query_schema(pool: sqlx::PgPool) {
+        let (manager, request) = claim_one_processing(&pool, None).await;
+        assert!(
+            !manager
+                .assign_billing_mode(request.data.id, false)
+                .await
+                .unwrap()
+        );
+        sqlx::raw_sql("CREATE SCHEMA billing_component; CREATE TABLE billing_component.requests (id UUID PRIMARY KEY, billing_mode TEXT)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO billing_component.requests (id) VALUES ($1)")
+            .bind(request.data.id.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let scoped = manager.with_query_schema("billing_component");
+        assert!(
+            scoped
+                .assign_billing_mode(request.data.id, true)
+                .await
+                .unwrap()
+        );
+        assert!(
+            scoped
+                .assign_billing_mode(request.data.id, false)
+                .await
+                .unwrap()
+        );
+        let public_mode: String =
+            sqlx::query_scalar("SELECT billing_mode FROM public.requests WHERE id=$1")
+                .bind(request.data.id.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(public_mode, "legacy");
+    }
+
+    #[sqlx::test]
+    async fn durable_billing_assignment_is_immutable_under_concurrency(pool: sqlx::PgPool) {
+        let (manager, request) = claim_one_processing(&pool, None).await;
+        let (first, second) = tokio::join!(
+            manager.assign_billing_mode(request.data.id, true),
+            manager.assign_billing_mode(request.data.id, false),
+        );
+        let assigned = first.unwrap();
+        assert_eq!(assigned, second.unwrap());
+        assert_eq!(
+            assigned,
+            manager
+                .assign_billing_mode(request.data.id, !assigned)
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            manager
+                .assign_billing_mode(RequestId(Uuid::new_v4()), true)
+                .await,
+            Err(FusilladeError::RequestNotFound(_))
+        ));
+    }
+
+    #[sqlx::test]
+    async fn durable_billing_completion_requires_acceptance_and_preserves_first_result(
+        pool: sqlx::PgPool,
+    ) {
+        let (manager, request) = claim_one_processing(&pool, None).await;
+        assert!(
+            manager
+                .assign_billing_mode(request.data.id, true)
+                .await
+                .unwrap()
+        );
+        let mut completed = completed_from(&request, "first response");
+        assert!(manager.persist(&completed).await.is_err());
+        completed
+            .data
+            .batch_metadata
+            .insert("billing-mode".into(), "durable".into());
+        completed
+            .data
+            .batch_metadata
+            .insert("billing-event-id".into(), "invalid".into());
+        assert!(manager.persist(&completed).await.is_err());
+        let event = Uuid::new_v4();
+        completed
+            .data
+            .batch_metadata
+            .insert("billing-event-id".into(), event.to_string());
+        manager.persist(&completed).await.unwrap();
+
+        // Replay and a late second physical attempt cannot replace accepted usage.
+        manager.persist(&completed).await.unwrap();
+        completed.state.response_body = "second response".into();
+        completed
+            .data
+            .batch_metadata
+            .insert("billing-event-id".into(), Uuid::new_v4().to_string());
+        manager.persist(&completed).await.unwrap();
+        manager
+            .persist(&Request {
+                data: completed.data.clone(),
+                state: crate::request::Pending {
+                    retry_attempt: 1,
+                    not_before: None,
+                    batch_expires_at: None,
+                },
+            })
+            .await
+            .unwrap();
+        let row: (String, String, Option<Uuid>) = sqlx::query_as(
+            "SELECT state, response_body, accepted_event_id FROM requests WHERE id = $1",
+        )
+        .bind(request.data.id.0)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            ("completed".into(), "first response".into(), Some(event))
+        );
+        assert!(
+            manager
+                .assign_billing_mode(request.data.id, false)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[sqlx::test]
+    async fn durable_billing_concurrent_completions_accept_one_matching_result(pool: sqlx::PgPool) {
+        let (manager, request) = claim_one_processing(&pool, None).await;
+        manager
+            .assign_billing_mode(request.data.id, true)
+            .await
+            .unwrap();
+        let event_a = Uuid::new_v4();
+        let event_b = Uuid::new_v4();
+        let mut first = completed_from(&request, "first");
+        first
+            .data
+            .batch_metadata
+            .insert("billing-mode".into(), "durable".into());
+        first
+            .data
+            .batch_metadata
+            .insert("billing-event-id".into(), event_a.to_string());
+        let mut second = first.clone();
+        second.state.response_body = "second".into();
+        second
+            .data
+            .batch_metadata
+            .insert("billing-event-id".into(), event_b.to_string());
+        let (a, b) = tokio::join!(manager.persist(&first), manager.persist(&second));
+        a.unwrap();
+        b.unwrap();
+        let row: (String, Uuid) =
+            sqlx::query_as("SELECT response_body, accepted_event_id FROM requests WHERE id = $1")
+                .bind(request.data.id.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(row == ("first".into(), event_a) || row == ("second".into(), event_b));
+    }
+
+    #[sqlx::test]
+    async fn durable_billing_evidence_survives_batch_archival_and_payload_deletion(
+        pool: sqlx::PgPool,
+    ) {
+        let (manager, request) = claim_one_processing(&pool, None).await;
+        let batch_id = request.data.batch_id.unwrap();
+        sqlx::query("UPDATE batches SET created_by = 'batch-billing-owner' WHERE id = $1")
+            .bind(batch_id.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        manager
+            .assign_billing_mode(request.data.id, true)
+            .await
+            .unwrap();
+        let event_id = Uuid::new_v4();
+        let mut completed = completed_from(&request, "private payload");
+        completed
+            .data
+            .batch_metadata
+            .insert("billing-mode".into(), "durable".into());
+        completed
+            .data
+            .batch_metadata
+            .insert("billing-event-id".into(), event_id.to_string());
+        manager.persist(&completed).await.unwrap();
+        manager.get_batch(batch_id).await.unwrap();
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 1 }
+        );
+        sqlx::query("DELETE FROM batch_requests_archive WHERE id = $1")
+            .bind(request.data.id.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let evidence: (Uuid, Option<String>, Option<Uuid>) = sqlx::query_as(
+            "SELECT accepted_event_id,owner_id,batch_id FROM billing_acceptances WHERE request_id=$1"
+        ).bind(request.data.id.0).fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            evidence,
+            (
+                event_id,
+                Some("batch-billing-owner".into()),
+                Some(batch_id.0)
+            )
+        );
+        // Payload/request erasure must never make the logical identity reusable
+        // through either durable or legacy terminal completion entrypoints.
+        sqlx::query("INSERT INTO requests (id, state, model, daemon_id, claimed_at, started_at, created_by) VALUES ($1, 'processing', 'test', gen_random_uuid(), now(), now(), 'replacement-owner')")
+            .bind(request.data.id.0)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .complete_request(request.data.id, "replacement", 200)
+                .await
+                .is_err()
+        );
+        assert!(sqlx::query("UPDATE requests SET state='completed',billing_mode='durable',accepted_event_id=$2,completed_at=now() WHERE id=$1")
+            .bind(request.data.id.0).bind(Uuid::new_v4()).execute(&pool).await.is_err());
+        assert!(
+            sqlx::query("DELETE FROM billing_acceptances WHERE request_id=$1")
+                .bind(request.data.id.0)
+                .execute(&pool)
+                .await
+                .is_err()
+        );
+    }
+
+    #[sqlx::test]
+    async fn durable_billing_evidence_rolls_back_with_failed_completion(pool: sqlx::PgPool) {
+        let (manager, request) = claim_one_processing(&pool, None).await;
+        manager
+            .assign_billing_mode(request.data.id, true)
+            .await
+            .unwrap();
+        let mut completed = completed_from(&request, "private payload");
+        completed
+            .data
+            .batch_metadata
+            .insert("billing-mode".into(), "durable".into());
+        completed
+            .data
+            .batch_metadata
+            .insert("billing-event-id".into(), Uuid::new_v4().to_string());
+        sqlx::raw_sql("CREATE FUNCTION reject_durable_result() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected result failure'; END $$; CREATE TRIGGER reject_durable_result AFTER UPDATE ON requests FOR EACH ROW WHEN (NEW.state='completed') EXECUTE FUNCTION reject_durable_result();")
+            .execute(&pool).await.unwrap();
+        assert!(manager.persist(&completed).await.is_err());
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM billing_acceptances WHERE request_id=$1")
+                .bind(request.data.id.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 0);
+        sqlx::query("DROP TRIGGER reject_durable_result ON requests")
+            .execute(&pool)
+            .await
+            .unwrap();
+        manager.persist(&completed).await.unwrap();
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM billing_acceptances WHERE request_id=$1")
+                .bind(request.data.id.0)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[sqlx::test]
+    async fn durable_billing_mode_survives_failed_request_retry(pool: sqlx::PgPool) {
+        let (manager, request) = claim_one_processing(&pool, None).await;
+        assert!(
+            manager
+                .assign_billing_mode(request.data.id, true)
+                .await
+                .unwrap()
+        );
+        let failed = failed_from(
+            &request,
+            FailureReason::NonRetriableHttpStatus {
+                status: 400,
+                body: "bad".into(),
+            },
+        );
+        manager.persist(&failed).await.unwrap();
+        manager
+            .persist(&Request {
+                data: request.data.clone(),
+                state: crate::request::Pending {
+                    retry_attempt: 1,
+                    not_before: None,
+                    batch_expires_at: None,
+                },
+            })
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .assign_billing_mode(request.data.id, false)
+                .await
+                .unwrap()
+        );
+    }
+
+    #[sqlx::test]
     async fn request_state_writes_respect_configured_concurrency(pool: sqlx::PgPool) {
         let config = crate::PostgresStorageConfig {
             max_concurrent_state_writes: 2,
@@ -14546,7 +14928,7 @@ mod tests {
         // DELETE/stamp committed: pre-copy a single row into the archive
         // exactly as the move would have.
         sqlx::query(
-            "INSERT INTO batch_requests_archive
+            "INSERT INTO batch_requests_archive (id, batch_id, template_id, state, retry_attempt, not_before, daemon_id, claimed_at, started_at, response_status, response_body, completed_at, error, failed_at, canceled_at, created_at, updated_at, custom_id, model, response_size, routed_model, service_tier, created_by, billing_mode, accepted_event_id, archive_bucket)
              SELECT r.*, date_trunc('week', (SELECT created_at FROM batches WHERE id = $1) AT TIME ZONE 'UTC')::date
              FROM requests r WHERE r.batch_id = $1
              ORDER BY r.id LIMIT 1",

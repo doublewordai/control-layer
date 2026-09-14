@@ -2876,6 +2876,11 @@ impl Default for CreditsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnalyticsConfig {
+    /// Durable accepted-completion billing and standalone worker settings.
+    pub durable_billing: DurableBillingConfig,
+    /// Capture durable Fusillade usage events for a future billing consumer.
+    /// Legacy charging remains active; captured events must be reconciled before charging.
+    pub capture_fusillade_billing_events: bool,
     /// Maximum number of records to write in a single batch.
     /// At high load, records queue while writing, naturally forming larger batches.
     /// Default: 100
@@ -2898,10 +2903,46 @@ pub struct AnalyticsConfig {
 impl Default for AnalyticsConfig {
     fn default() -> Self {
         Self {
+            durable_billing: DurableBillingConfig::default(),
+            capture_fusillade_billing_events: false,
             batch_size: 100,
             max_retries: 3,
             retry_base_delay_ms: 100,
             balance_notification_interval_milliseconds: 5000,
+        }
+    }
+}
+
+/// Durable billing rollout and recovery controls.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DurableBillingConfig {
+    pub dispatch_enabled: bool,
+    pub worker_enabled: bool,
+    pub worker_only: bool,
+    pub poll_interval_ms: u64,
+    pub batch_size: usize,
+    pub retention_hours: u64,
+    /// External http_analytics retention policy; None means missing history is unverifiable.
+    pub analytics_retention_days: Option<u32>,
+    pub max_backlog_age_secs: u64,
+    pub publish_max_retries: u32,
+    pub publish_retry_delay_ms: u64,
+}
+
+impl Default for DurableBillingConfig {
+    fn default() -> Self {
+        Self {
+            dispatch_enabled: false,
+            worker_enabled: false,
+            worker_only: false,
+            poll_interval_ms: 1000,
+            batch_size: 100,
+            retention_hours: 24,
+            analytics_retention_days: None,
+            max_backlog_age_secs: 300,
+            publish_max_retries: 3,
+            publish_retry_delay_ms: 100,
         }
     }
 }
@@ -3285,6 +3326,23 @@ impl Config {
 
     /// Validate the configuration for consistency and required fields
     pub fn validate(&self) -> Result<(), Error> {
+        let billing = &self.analytics.durable_billing;
+        if billing
+            .analytics_retention_days
+            .is_some_and(|days| days == 0 || days > i32::MAX as u32)
+            || billing.poll_interval_ms == 0
+            || billing.batch_size == 0
+            || billing.batch_size > i64::MAX as usize
+            || billing.retention_hours == 0
+            || billing.retention_hours > (i64::MAX as u64 / 3600)
+            || billing.max_backlog_age_secs == 0
+            || billing.max_backlog_age_secs > i64::MAX as u64
+            || billing.publish_retry_delay_ms == 0
+        {
+            return Err(Error::Internal {
+                operation: "Config validation: durable billing intervals, batch size, retention and backlog bounds must be positive and fit SQL bounds".into(),
+            });
+        }
         for (name, component) in [("fusillade", self.database.fusillade()), ("outlet", self.database.outlet())] {
             component
                 .validate_schema_pooling(name, self.database.external_pooled_url().is_some())
@@ -3746,6 +3804,22 @@ impl Config {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durable_billing_defaults_and_invalid_worker_bounds() {
+        let mut config = super::Config::default();
+        let billing = &config.analytics.durable_billing;
+        assert!(!billing.dispatch_enabled && !billing.worker_enabled && !billing.worker_only);
+        assert_eq!(billing.retention_hours, 24);
+        config.analytics.durable_billing.poll_interval_ms = 0;
+        assert!(config.validate().unwrap_err().to_string().contains("durable billing"));
+        config.analytics.durable_billing.poll_interval_ms = 1000;
+        config.analytics.durable_billing.batch_size = 0;
+        assert!(config.validate().unwrap_err().to_string().contains("durable billing"));
+        config.analytics.durable_billing.batch_size = 100;
+        config.analytics.durable_billing.max_backlog_age_secs = 0;
+        assert!(config.validate().unwrap_err().to_string().contains("durable billing"));
+    }
+
     /// The built-in list is a snapshot and will always lag some provider.
     /// `auth.personal_email_domains` is how an operator closes that gap without
     /// waiting for a release, so it has to actually be consulted.

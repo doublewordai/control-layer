@@ -111,6 +111,9 @@ async fn async_main() -> anyhow::Result<()> {
 
     // Run the application with graceful shutdown on SIGTERM/Ctrl+C
     let shutdown = shutdown_signal();
+    if config.analytics.durable_billing.worker_only {
+        return dwctl::serve_billing_worker(config, tracer_provider, shutdown).await;
+    }
     Application::new_with_config_path(config, Some(args.config.clone()), tracer_provider)
         .await?
         .serve(shutdown)

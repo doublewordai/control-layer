@@ -235,9 +235,15 @@ pub(crate) fn scrub_provider_cache_fields(usage: &mut serde_json::Map<String, Va
 /// rewritten body, or `None` when nothing needed to change (not JSON, no `usage` object, or the
 /// usage was already clean).
 pub fn scrub_usage_json(body: &[u8]) -> Option<Bytes> {
+    scrub_usage_json_with(body, |_| {})
+}
+
+fn scrub_usage_json_with(body: &[u8], observe: impl FnOnce(&Value)) -> Option<Bytes> {
     let mut json: Value = serde_json::from_slice(body).ok()?;
     let usage = json.as_object_mut()?.get_mut("usage")?.as_object_mut()?;
-    if !scrub_provider_cache_fields(usage) {
+    let changed = scrub_provider_cache_fields(usage);
+    observe(&json);
+    if !changed {
         return None;
     }
     serde_json::to_vec(&json).ok().map(Bytes::from)
@@ -305,11 +311,16 @@ fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &Cache
 /// Inject the cache stats into a non-streaming chat-completion JSON body. Returns the
 /// rewritten body, or `None` if it can't be parsed or has no `usage` object.
 pub fn inject_into_usage_json(body: &[u8], stats: &CacheStats) -> Option<Bytes> {
+    inject_into_usage_json_with(body, stats, |_| {})
+}
+
+fn inject_into_usage_json_with(body: &[u8], stats: &CacheStats, observe: impl FnOnce(&Value)) -> Option<Bytes> {
     let mut json: Value = serde_json::from_slice(body).ok()?;
     let obj = json.as_object_mut()?;
     let model = obj.get("model").and_then(Value::as_str).map(String::from);
     let usage = obj.get_mut("usage")?.as_object_mut()?;
     splice_cache_fields(usage, stats, model.as_deref());
+    observe(&json);
     serde_json::to_vec(&json).ok().map(Bytes::from)
 }
 
@@ -528,7 +539,12 @@ pub async fn inject_into_response_nonstreaming(response: Response, stats: &Cache
     if let Some(v) = read_upstream_cached_tokens_json(&body_bytes) {
         capture.set(v);
     }
-    match inject_into_usage_json(&body_bytes, stats) {
+    let rewritten = inject_into_usage_json_with(&body_bytes, stats, |json| {
+        if let Some(usage) = parts.extensions.get_mut::<crate::inference::billing_events::CapturedUsage>() {
+            usage.update_cache(json);
+        }
+    });
+    match rewritten {
         Some(rewritten) => {
             let len = rewritten.len();
             parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
@@ -597,7 +613,11 @@ pub async fn scrub_response_nonstreaming(response: Response, capture: &UpstreamC
     if let Some(v) = read_upstream_cached_tokens_json(&body_bytes) {
         capture.set(v);
     }
-    let rewritten = scrub_usage_json(&body_bytes);
+    let rewritten = scrub_usage_json_with(&body_bytes, |json| {
+        if let Some(usage) = parts.extensions.get_mut::<crate::inference::billing_events::CapturedUsage>() {
+            usage.update_cache(json);
+        }
+    });
     if rewritten.is_some() {
         // We emit plain JSON (parse succeeded), so drop any stale Content-Encoding.
         parts.headers.remove(axum::http::header::CONTENT_ENCODING);
@@ -645,6 +665,28 @@ mod tests {
         cell.set(9);
         assert_eq!(cell.get(), Some(5));
         assert_eq!(cell.clone().get(), Some(5), "clones share the cell");
+    }
+
+    #[tokio::test]
+    async fn billing_snapshot_tracks_clamped_cache_fields_without_losing_engine_counts() {
+        use crate::inference::billing_events::CapturedUsage;
+        let value = serde_json::json!({"usage": {"prompt_tokens": 100, "completion_tokens": 7,
+            "prompt_tokens_details": {"cached_tokens": 80}, "cache_read_input_tokens": 80}});
+        let mut response = Response::new(axum::body::Body::from(value.to_string()));
+        response.extensions_mut().insert(CapturedUsage::from_response(&value));
+        let (response, success) = inject_into_response_nonstreaming(response, &stats(), &UpstreamCachedTokens::default()).await;
+        assert!(success);
+        let usage = response.extensions().get::<CapturedUsage>().unwrap();
+        assert_eq!(usage.cache_read_input_tokens, Some(40)); // read capped to prompt - creations
+        assert_eq!(usage.cache_creation_5m_input_tokens, Some(10));
+        assert_eq!(usage.cache_creation_1h_input_tokens, Some(20));
+        assert_eq!(usage.cache_creation_24h_input_tokens, Some(30));
+        assert_eq!(usage.engine_cached_tokens, Some(80));
+        let response = scrub_response_nonstreaming(response, &UpstreamCachedTokens::default()).await;
+        let usage = response.extensions().get::<CapturedUsage>().unwrap();
+        assert_eq!(usage.cache_read_input_tokens, None);
+        assert_eq!(usage.cache_creation_5m_input_tokens, None);
+        assert_eq!(usage.engine_cached_tokens, Some(80));
     }
 
     fn stats() -> CacheStats {

@@ -147,6 +147,13 @@ impl RequestHandler for AnalyticsHandler {
     ///
     /// All database work (enrichment, writes, credit deduction) happens in the batcher.
     async fn handle_response(&self, request_data: RequestData, response_data: ResponseData) {
+        // These headers are stripped from public traffic and stamped by the daemon.
+        // The durable worker owns both charging and billable aggregates.
+        if extract_header_as_string(&request_data, "x-fusillade-batch-billing-mode").as_deref() == Some("durable")
+            && extract_header_as_string(&request_data, "x-fusillade-batch-stream").as_deref() == Some("1")
+        {
+            return;
+        }
         let correlation_id = request_data.correlation_id;
         let span = info_span!(
             "dwctl.analytics_handler",
@@ -397,6 +404,27 @@ mod tests {
         let data = create_test_response_data();
         assert_eq!(data.correlation_id, 123);
         assert_eq!(data.status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn durable_dispatch_bypasses_legacy_billing_and_aggregates() {
+        let (tx, mut rx) = mpsc::channel::<RawAnalyticsRecord>(10);
+        let handler = AnalyticsHandler::new(tx, Uuid::new_v4(), Config::default());
+        handler
+            .handle_response(
+                request_data_with_headers(&[("x-fusillade-batch-billing-mode", "durable"), ("x-fusillade-batch-stream", "1")]),
+                create_test_response_data(),
+            )
+            .await;
+        assert!(rx.try_recv().is_err());
+        // A mode label alone is insufficient: ordinary traffic remains legacy.
+        handler
+            .handle_response(
+                request_data_with_headers(&[("x-fusillade-batch-billing-mode", "durable")]),
+                create_test_response_data(),
+            )
+            .await;
+        assert!(rx.try_recv().is_ok());
     }
 
     #[tokio::test]

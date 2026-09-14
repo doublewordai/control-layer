@@ -19,6 +19,9 @@
 //! - **engine**: the multi-step Open Responses orchestration loop and the
 //!   daemon-side request processor.
 
+pub(crate) mod billing_events;
+pub(crate) mod billing_reconciliation;
+pub(crate) mod billing_worker;
 pub mod handler;
 pub mod image_normalizer_middleware;
 pub mod middleware;
