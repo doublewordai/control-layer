@@ -325,6 +325,9 @@ impl ReasoningTranslationConfig {
             .get(&request.effort())
             .and_then(Value::as_u64)
             .expect("validated budget mappings contain non-negative integers");
+        if budget == 0 {
+            return Ok(());
+        }
         let output_param = request.output_limit_param();
         let Some(output_value) = request.output_limit_value() else {
             return Err(ReasoningError::unprocessable(
@@ -1098,6 +1101,135 @@ mod tests {
             error.message(),
             "reasoning_effort 'high' maps to an 8192-token reasoning budget for this model, but max_completion_tokens is 8192. Increase max_completion_tokens above 8192 or select a lower reasoning_effort."
         );
+    }
+
+    #[test]
+    fn zero_budget_allows_omitted_output_limit_for_chat_completions() {
+        let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                "writes": [
+                    {
+                        "target_path": "/reasoning_effort",
+                        "values": {"none": "none"}
+                    },
+                    {
+                        "target_path": "/thinking_token_budget",
+                        "values": {"none": 0}
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+        let mut body = json!({
+            "model": "model",
+            "messages": [],
+            "reasoning_effort": "none"
+        });
+
+        config.apply("/chat/completions", &mut body).unwrap();
+
+        assert_eq!(body["reasoning_effort"], json!("none"));
+        assert_eq!(body["thinking_token_budget"], json!(0));
+    }
+
+    #[test]
+    fn zero_budget_allows_omitted_output_limit_for_responses() {
+        let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "responses": {
+                "unsupported_efforts": ["minimal", "low", "medium", "high", "xhigh", "max"],
+                "writes": [
+                    {
+                        "target_path": "/reasoning_effort",
+                        "values": {"none": "none"}
+                    },
+                    {
+                        "target_path": "/thinking_token_budget",
+                        "values": {"none": 0}
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+        let mut body = json!({
+            "model": "model",
+            "input": "Hello",
+            "reasoning": {"effort": "none"}
+        });
+
+        config.apply("/responses", &mut body).unwrap();
+
+        assert_eq!(body["reasoning_effort"], json!("none"));
+        assert_eq!(body["thinking_token_budget"], json!(0));
+        assert!(body.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn zero_budget_short_circuits_for_any_effort_mapped_to_zero() {
+        let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["none", "minimal", "medium", "high", "xhigh", "max"],
+                "writes": [
+                    {
+                        "target_path": "/reasoning_effort",
+                        "values": {"low": "low"}
+                    },
+                    {
+                        "target_path": "/thinking_token_budget",
+                        "values": {"low": 0}
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+        let mut body = json!({
+            "model": "model",
+            "messages": [],
+            "reasoning_effort": "low"
+        });
+
+        config.apply("/chat/completions", &mut body).unwrap();
+
+        assert_eq!(body["reasoning_effort"], json!("low"));
+        assert_eq!(body["thinking_token_budget"], json!(0));
+    }
+
+    #[test]
+    fn mixed_zero_and_nonzero_budgets_enforce_guard_only_for_nonzero_effort() {
+        let config: ReasoningTranslationConfig = serde_json::from_value(json!({
+            "chat_completions": {
+                "unsupported_efforts": ["minimal", "low", "medium", "xhigh", "max"],
+                "writes": [
+                    {
+                        "target_path": "/reasoning_effort",
+                        "values": {"none": "none", "high": "high"}
+                    },
+                    {
+                        "target_path": "/thinking_token_budget",
+                        "values": {"none": 0, "high": 8192}
+                    }
+                ]
+            }
+        }))
+        .unwrap();
+
+        let mut zero_body = json!({
+            "model": "model",
+            "messages": [],
+            "reasoning_effort": "none"
+        });
+        config.apply("/chat/completions", &mut zero_body).unwrap();
+
+        let mut nonzero_body = json!({
+            "model": "model",
+            "messages": [],
+            "reasoning_effort": "high"
+        });
+        let error = config
+            .apply("/chat/completions", &mut nonzero_body)
+            .unwrap_err();
+        assert_eq!(error.status_code(), 422);
+        assert_eq!(error.code(), "reasoning_budget_requires_max_tokens");
     }
 
     #[test]
