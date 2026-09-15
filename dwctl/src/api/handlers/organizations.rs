@@ -2098,7 +2098,7 @@ pub async fn create_user_join_request<P: PoolProvider>(
         }));
     }
 
-    let row = org_repo.create_join_request(org.id, target_user_id).await?;
+    let (row, created) = org_repo.create_join_request(org.id, target_user_id).await?;
 
     // The insert is idempotent by colliding on `UNIQUE (user_id, organization_id)`
     // and handing back whatever row was already there — which is not always a
@@ -2121,8 +2121,12 @@ pub async fn create_user_join_request<P: PoolProvider>(
     // the write: the row is already committed, so failing the call over a mail
     // error would report "nothing happened" to a user whose request is in fact
     // filed and waiting. Only a fresh `requested` row is worth a mail — the
-    // other two outcomes mean nobody has a decision to make.
-    if outcome == DomainJoinOutcome::Requested {
+    // other two outcomes mean nobody has a decision to make, and a re-press of
+    // an outstanding request replays the call without touching the row.
+    // `create_join_request` surfaces that distinction as `created`: gating on
+    // `outcome` alone would re-fan-out to every admin on every double-click,
+    // retry or reload, so the mail waits for a genuinely new insertion.
+    if outcome == DomainJoinOutcome::Requested && created {
         let recipients = match org_repo.list_admin_emails(org.id).await {
             Ok(emails) => emails,
             Err(e) => {
@@ -3731,7 +3735,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let request = repo.create_join_request(org.id, joiner_id).await.unwrap();
+        let (request, _created) = repo.create_join_request(org.id, joiner_id).await.unwrap();
         (org.id, request.id)
     }
 
@@ -3974,6 +3978,141 @@ mod tests {
             !body["domain_match"].is_null(),
             "still on the intercept screen, now showing the request as sent"
         );
+    }
+
+    /// A re-press of an outstanding join request must not re-notify the
+    /// org's admins. The row write is idempotent (`ON CONFLICT DO NOTHING`),
+    /// and the notification side-effect has to share that idempotency: a
+    /// double-click, a retry, or a reloaded tab is the exact re-press the
+    /// DB layer was written to make harmless, so the second press is a
+    /// silent no-op for mail even though it still returns
+    /// `outcome == "requested"` and the same request id.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_join_request_re_press_does_not_re_notify_admins(pool: PgPool) {
+        // Isolate the email dir per test so parallel tests' mail doesn't
+        // pollute the scan — same pattern as
+        // `test_patch_writes_both_verification_emails`.
+        let scratch = std::env::temp_dir().join(format!("dwctl-test-emails-joinrep-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let mut config = create_test_config();
+        config.email.transport = crate::config::EmailTransportConfig::File {
+            path: scratch.to_string_lossy().to_string(),
+        };
+
+        let (server, _bg) = create_test_app_with_config(pool.clone(), config, false).await;
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let _org_id = org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let joiner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let headers = add_auth_headers(&joiner);
+
+        let ask = || async {
+            let resp = server
+                .post("/admin/api/v1/users/current/join-requests")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .await;
+            resp.assert_status_ok();
+            resp.json::<serde_json::Value>()
+        };
+
+        let eml_count = || {
+            std::fs::read_dir(&scratch)
+                .unwrap()
+                .filter(|e| e.as_ref().unwrap().path().extension().and_then(|s| s.to_str()) == Some("eml"))
+                .count()
+        };
+
+        let first = ask().await;
+        assert_eq!(first["outcome"].as_str().unwrap(), "requested");
+        assert_eq!(eml_count(), 1, "first press should notify the one admin");
+
+        let second = ask().await;
+        assert_eq!(second["outcome"].as_str().unwrap(), "requested");
+        assert_eq!(
+            second["join_request"]["id"].as_str().unwrap(),
+            first["join_request"]["id"].as_str().unwrap(),
+            "the same request, not a second one"
+        );
+        assert_eq!(
+            eml_count(),
+            1,
+            "re-press must not re-notify admins; the row write is idempotent and the mail must be too"
+        );
+    }
+
+    /// The DB contract the mail gate depends on: `create_join_request` returns
+    /// `created == true` only on a genuine insert and `false` on the
+    /// `ON CONFLICT DO NOTHING` fallback, with the existing row handed back
+    /// unchanged — for both an outstanding `requested` row and an outstanding
+    /// `pending` invitation occupying the same slot.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_create_join_request_reports_whether_it_inserted(pool: PgPool) {
+        let owner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+        let org_id = org_claiming_domain(&pool, owner.id, "acme.test").await;
+        let joiner = create_test_user_on_domain(&pool, Role::StandardUser, "acme.test").await;
+
+        let (first_row, first_created) = {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::db::handlers::Organizations::new(&mut conn)
+                .create_join_request(org_id, joiner.id)
+                .await
+                .unwrap()
+        };
+        assert!(first_created, "a fresh insert reports created == true");
+        assert_eq!(first_row.status, "requested");
+        assert_eq!(first_row.organization_id, org_id);
+
+        let (second_row, second_created) = {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::db::handlers::Organizations::new(&mut conn)
+                .create_join_request(org_id, joiner.id)
+                .await
+                .unwrap()
+        };
+        assert!(!second_created, "a re-press on an outstanding request reports created == false");
+        assert_eq!(second_row.id, first_row.id, "the same row comes back");
+        assert_eq!(second_row.status, "requested");
+        assert_eq!(
+            second_row.created_at, first_row.created_at,
+            "the existing row is returned unchanged"
+        );
+
+        // An invitation occupies the same `UNIQUE (user_id, organization_id)`
+        // slot, so a join request against it must collide and surface the
+        // pending row with `created == false` rather than overwriting it.
+        let owner_b = create_test_user_on_domain(&pool, Role::StandardUser, "beta.test").await;
+        let org_b = org_claiming_domain(&pool, owner_b.id, "beta.test").await;
+        let invitee = create_test_user_on_domain(&pool, Role::StandardUser, "beta.test").await;
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::db::handlers::Organizations::new(&mut conn)
+                .create_invite(
+                    org_b,
+                    Some(invitee.id),
+                    &invitee.email,
+                    "member",
+                    owner_b.id,
+                    "test-token-hash",
+                    chrono::Utc::now() + chrono::Duration::days(7),
+                )
+                .await
+                .unwrap();
+        }
+        let (invite_collision, invite_created) = {
+            let mut conn = pool.acquire().await.unwrap();
+            crate::db::handlers::Organizations::new(&mut conn)
+                .create_join_request(org_b, invitee.id)
+                .await
+                .unwrap()
+        };
+        assert!(
+            !invite_created,
+            "a join request against an outstanding invitation reports created == false"
+        );
+        assert_eq!(invite_collision.status, "pending", "the invitation comes back, not a fresh request");
     }
 
     /// Scenario 2, late: the owner switched auto-join on after this user
