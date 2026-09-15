@@ -59,3 +59,5 @@ LOCAL_OVERRIDES.md
 docker-compose.local.yml
 
 .superpowers
+# Compiled Python bytecode from utility scripts
+__pycache__/
