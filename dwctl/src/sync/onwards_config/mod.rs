@@ -1051,6 +1051,9 @@ fn convert_composite_to_target_spec(
                 .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
             backoff,
             max_total_backoff_ms,
+            // No per-model value yet: inherit the proxy-wide default
+            // (`onwards.first_token_timeout_ms`).
+            first_token_timeout_ms: None,
         })
     } else {
         None
@@ -1360,6 +1363,9 @@ fn convert_to_config_file(
                         .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
                     backoff,
                     max_total_backoff_ms,
+                    // A single-provider pool never arms first-token failover
+                    // (there is no other provider to fail over to).
+                    first_token_timeout_ms: None,
                 })
             } else {
                 None

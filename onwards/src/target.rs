@@ -216,6 +216,21 @@ pub struct FallbackConfig {
     /// Bounds only the inter-attempt sleeps, not upstream request time.
     #[serde(default)]
     pub max_total_backoff_ms: Option<u64>,
+
+    /// Failover deadline for the first token of a streamed response, in
+    /// milliseconds. Overrides the proxy-wide default
+    /// ([`AppState::with_first_token_timeout`](crate::AppState::with_first_token_timeout));
+    /// `0` disables it for this pool.
+    ///
+    /// Only armed for `"stream": true` requests, when the pool has another
+    /// provider to fail over to and the attempt is not the last one the budget
+    /// allows — so it can reroute a stalled request but never fail one that
+    /// would otherwise have succeeded. It bounds the wait for response headers
+    /// and, in strict mode, for the first real SSE frame (keep-alive comments
+    /// don't count). Nothing has reached the client by then, so the next
+    /// provider starts cleanly.
+    #[serde(default)]
+    pub first_token_timeout_ms: Option<u64>,
 }
 
 impl FallbackConfig {

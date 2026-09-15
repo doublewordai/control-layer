@@ -37,6 +37,7 @@ Controls automatic retry on other providers when requests fail:
 | `enabled` | bool | `false` | Master switch for fallback |
 | `on_status` | int[] | -- | Status codes that trigger fallback (supports wildcards) |
 | `on_rate_limit` | bool | `false` | Fallback when hitting local rate limits |
+| `first_token_timeout_ms` | int | -- | Failover deadline for the first token of a streamed response; `0` disables (see below) |
 
 Status code wildcards:
 
@@ -45,6 +46,18 @@ Status code wildcards:
 - `502` matches exact 502
 
 When fallback triggers, the next provider is selected based on strategy (weighted random resamples from remaining pool; priority uses definition order).
+
+### First-token failover
+
+A provider can accept a streamed request and then stall: the headers arrive, but no token ever does. `first_token_timeout_ms` bounds that wait, so the request fails over instead of hanging. Set a proxy-wide default with `AppState::with_first_token_timeout`; a pool's own value overrides it.
+
+The deadline is only armed when all of these hold, so it can reroute a stalled request but never fail one that would otherwise have succeeded:
+
+- The request is `"stream": true`. A non-streaming response only sends headers once the whole completion is done, so a deadline would cut off long answers.
+- The pool has more than one provider, and the attempt is not the last one the attempt budget allows.
+- The request doesn't carry the header set with `AppState::with_first_token_timeout_exempt_header`.
+
+It bounds the wait for response headers and, in strict mode, the wait for the first real SSE frame. Keep-alive comments don't count. Nothing has reached the client at that point, so the next provider starts cleanly.
 
 ## Pool-level options
 

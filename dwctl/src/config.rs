@@ -1187,13 +1187,30 @@ impl Default for RequestLimitsConfig {
 /// Onwards AI proxy configuration.
 ///
 /// Controls behavior of the onwards routing layer used for AI proxy requests.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OnwardsConfig {
     /// Enable strict mode with schema validation and typed handlers.
     /// When false (default), all requests are passed through transparently.
     /// When true, only known OpenAI API paths are accepted and validated.
     pub strict_mode: bool,
+    /// Failover deadline for the first token of a realtime streamed response,
+    /// in milliseconds. While a model still has another provider to fail over
+    /// to, an attempt that hasn't produced response headers and (in strict
+    /// mode) a first SSE frame within this window is abandoned and the next
+    /// provider tried. The final attempt is never cut off, and fusillade daemon
+    /// traffic (batch, flex, background) is exempt. Default: 10000. Set to 0 to
+    /// disable.
+    pub first_token_timeout_ms: u64,
+}
+
+impl Default for OnwardsConfig {
+    fn default() -> Self {
+        Self {
+            strict_mode: false,
+            first_token_timeout_ms: 10_000,
+        }
+    }
 }
 
 /// Cached-input pricing — the dwctl-owned cache tower layer. All cache configuration lives

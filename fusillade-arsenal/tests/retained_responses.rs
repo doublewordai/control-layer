@@ -3722,6 +3722,98 @@ async fn read_apis_preserve_exact_values_filters_pages_and_counts_after_move(poo
 }
 
 #[sqlx::test]
+async fn model_filter_pages_preserve_live_retained_order_and_owner_scope(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let base = timestamp("2026-08-01T10:00:00Z");
+    let mut ids = Vec::new();
+    for (index, (tier, state, model, owner)) in [
+        ("flex", TerminalState::Completed, MODEL, OWNER),
+        ("flex", TerminalState::Completed, "other-model", OWNER),
+        ("priority", TerminalState::Completed, MODEL, OWNER),
+        ("priority", TerminalState::Completed, "other-model", OWNER),
+        ("priority", TerminalState::Pending, MODEL, OWNER),
+        ("priority", TerminalState::Pending, "other-model", OWNER),
+        ("flex", TerminalState::Completed, MODEL, "other-owner"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let graph = singleton(&pool, tier, state, base, &format!("model-page-{index}")).await;
+        let id = graph.request_ids[0];
+        sqlx::query(
+            "UPDATE requests SET model = $2, created_by = $3, created_at = $4 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(model)
+        .bind(owner)
+        .bind(
+            base - TimeDelta::minutes(if index == 4 || index == 5 {
+                20 - index as i64
+            } else {
+                10 - index as i64
+            }),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    let request_manager = manager(&pool).await;
+    let outcome = archive(&request_manager, &policy(&[("flex", 86_400)]), 3, i64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(outcome.groups_archived, 3);
+
+    // The two pending requests outrank the live/retained terminal rows, and the
+    // other owner's newest retained row must never enter this owner's page.
+    for (models, ranked, recent) in [
+        (None, vec![5, 4, 3, 2, 1, 0], vec![3, 2, 1, 0, 5, 4]),
+        (Some(vec![]), vec![], vec![]),
+        (Some(vec![MODEL]), vec![4, 2, 0], vec![2, 0, 4]),
+        (Some(vec!["other-model"]), vec![5, 3, 1], vec![3, 1, 5]),
+        (
+            Some(vec![MODEL, "other-model"]),
+            vec![5, 4, 3, 2, 1, 0],
+            vec![3, 2, 1, 0, 5, 4],
+        ),
+        (Some(vec![MODEL, MODEL]), vec![4, 2, 0], vec![2, 0, 4]),
+        (Some(vec!["missing-model"]), vec![], vec![]),
+    ] {
+        for active_first in [true, false] {
+            let expected = if active_first { &ranked } else { &recent };
+            for (limit, skip) in [(10, 0), (2, 1)] {
+                let page = request_manager
+                    .list_requests(ListRequestsFilter {
+                        created_by: Some(OWNER.to_owned()),
+                        models: models
+                            .as_ref()
+                            .map(|values| values.iter().map(|value| (*value).to_owned()).collect()),
+                        active_first,
+                        limit,
+                        skip,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let expected_ids: Vec<_> = expected
+                    .iter()
+                    .skip(skip as usize)
+                    .take(limit as usize)
+                    .map(|index| ids[*index])
+                    .collect();
+                assert_eq!(
+                    page.data.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    expected_ids,
+                    "models={models:?}, active_first={active_first}, skip={skip}"
+                );
+                assert_eq!(page.total_count, expected.len() as i64);
+            }
+        }
+    }
+}
+
+#[sqlx::test]
 async fn active_first_page_ranks_in_flight_rows_before_newer_ones(pool: PgPool) {
     // The in-flight arm reads from a materialized CTE and must apply the full
     // page ordering itself, rank included. Ordering it by created_at alone is

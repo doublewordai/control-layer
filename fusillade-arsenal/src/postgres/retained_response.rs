@@ -1197,14 +1197,13 @@ const COUNT_BUDGET: &str = "100ms";
 /// indefinitely behind a lock queue.
 const ESTIMATE_BUDGET: &str = "5s";
 
-/// Budget for the page query itself. Every measured shape returns in
-/// single-digit milliseconds warm, so this only trips on a pathological filter
-/// combination -- notably a status filter whose value matches nothing, where
-/// the scan has no early exit and walks the whole history. Without a budget
-/// that query ran unbounded on the WRITE pool (`begin_primary_read`), holding a
-/// primary connection for minutes and outliving the request that started it. A
-/// bounded failure is strictly better than an unbounded hang.
-const PAGE_BUDGET: &str = "15s";
+/// Budget for the page query itself. Allow slower reads up to 30 seconds while
+/// bounding pathological filters -- notably a status filter whose value matches
+/// nothing, where the scan has no early exit and walks the whole history.
+/// Without a budget that query ran unbounded on the WRITE pool
+/// (`begin_primary_read`), holding a primary connection for minutes and outliving
+/// the request that started it.
+const PAGE_BUDGET: &str = "30s";
 
 /// `SET LOCAL` is transaction-scoped: it is applied once per transaction and
 /// re-applied whenever the fallback replaces the transaction.
@@ -1296,6 +1295,7 @@ async fn count_requests_with_budget<P: PoolProvider>(
 pub(crate) struct PageShape {
     pub(crate) active_first: bool,
     pub(crate) owner_scoped: bool,
+    pub(crate) single_model: bool,
     pub(crate) created_after: bool,
     pub(crate) created_before: bool,
 }
@@ -1305,6 +1305,10 @@ impl PageShape {
         Self {
             active_first: filter.active_first,
             owner_scoped: filter.created_by.is_some(),
+            single_model: filter
+                .models
+                .as_ref()
+                .is_some_and(|models| models.len() == 1),
             created_after: filter.created_after.is_some(),
             created_before: filter.created_before.is_some(),
         }
@@ -1315,6 +1319,7 @@ fn list_requests_page_sql(shape: PageShape) -> String {
     let PageShape {
         active_first,
         owner_scoped,
+        single_model,
         created_after,
         created_before,
     } = shape;
@@ -1341,6 +1346,19 @@ fn list_requests_page_sql(shape: PageShape) -> String {
     } else {
         "$1::text IS NULL"
     };
+    // A singleton equality fixes the model-leading index prefix so its remaining
+    // created_at ordering can satisfy LIMIT, even with a generic prepared plan.
+    // Keep the array parameter bound and preserve ANY semantics for other sizes.
+    let model_predicate = |column: &str| {
+        if single_model {
+            format!("{column} = ($3::text[])[1]")
+        } else {
+            format!("($3::text[] IS NULL OR {column} = ANY($3))")
+        }
+    };
+    let active_model = model_predicate("active.model");
+    let live_model = model_predicate("request.model");
+    let retained_model = model_predicate("object.model");
     let live_dates = format!(
         "{}{}",
         if created_after {
@@ -1509,7 +1527,7 @@ fn list_requests_page_sql(shape: PageShape) -> String {
             FROM active
             WHERE {active_owner}
               AND ($2::text IS NULL OR active.state = $2)
-              AND ($3::text[] IS NULL OR active.model = ANY($3)){active_dates}
+              AND {active_model}{active_dates}
               AND ($6::text[] IS NULL OR active.service_tier = ANY($6))
             ORDER BY {active_order}
             LIMIT $7 + $8)
@@ -1557,7 +1575,7 @@ fn list_requests_page_sql(shape: PageShape) -> String {
               -- cover every batchless row exactly once.
               AND request.state NOT IN ('processing', 'claimed', 'pending')
               AND ($2::text IS NULL OR request.state = $2)
-              AND ($3::text[] IS NULL OR request.model = ANY($3)){live_dates}
+              AND {live_model}{live_dates}
               AND ($6::text[] IS NULL OR request.service_tier = ANY($6))
             ORDER BY {terminal_order}
             LIMIT $7 + $8)
@@ -1605,7 +1623,7 @@ fn list_requests_page_sql(shape: PageShape) -> String {
               AND object.created_by IS NOT NULL
               AND {retained_owner}
               AND ($2::text IS NULL OR object.state = $2)
-              AND ($3::text[] IS NULL OR object.model = ANY($3)){retained_dates}
+              AND {retained_model}{retained_dates}
               AND ($6::text[] IS NULL OR object.service_tier = ANY($6))
               AND NOT EXISTS (
                   SELECT 1 FROM requests live
@@ -4107,6 +4125,7 @@ mod tests {
                 list_requests_page_sql(PageShape {
                     active_first,
                     owner_scoped: true,
+                    single_model: false,
                     created_after: false,
                     created_before: false
                 })
@@ -4125,6 +4144,71 @@ mod tests {
             assert!(
                 visited > 0.0 && visited < 100.0,
                 "a ten-row owner page must not visit its entire retained history (visited {visited}): {plan}"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn retained_single_model_page_bounds_history_scan_with_generic_plan(pool: PgPool) {
+        sqlx::query("SELECT ensure_retained_response_partition('2026-08-20', NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO retained_response_objects (
+                delete_on, group_id, object_kind, object_id, request_id,
+                created_by, service_tier, state, model, created_at,
+                terminal_at, schema_version, payload
+            ) SELECT '2026-08-20', md5(i::text)::uuid, 'request', md5(i::text)::uuid,
+                md5(i::text)::uuid, CASE WHEN i % 2 = 0 THEN 'owner' ELSE 'other' END,
+                'flex', 'completed', CASE WHEN i <= 400 THEN 'target-model' ELSE 'other-model-' || (i % 200)::text END,
+                '2026-08-11'::timestamptz + i * interval '1 second',
+                '2026-08-12', 1, '{}'::jsonb
+            FROM generate_series(1, 40000) i
+        "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO retained_response_group_routes (group_id, delete_on) SELECT group_id, delete_on FROM retained_response_objects")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) SELECT object_id, group_id, delete_on FROM retained_response_objects")
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql("ANALYZE retained_response_objects; ANALYZE retained_response_objects_d20260820; ANALYZE retained_response_group_routes; ANALYZE retained_response_request_routes;")
+            .execute(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for (active_first, owner_scoped) in
+            [(true, true), (false, true), (true, false), (false, false)]
+        {
+            let sql = format!(
+                "PREPARE owner_page(text, text, text[], timestamptz, timestamptz, text[], bigint, bigint) AS {}",
+                list_requests_page_sql(PageShape::of(&ListRequestsFilter {
+                    active_first,
+                    created_by: owner_scoped.then(|| "owner".to_owned()),
+                    models: Some(vec!["target-model".to_owned()]),
+                    ..Default::default()
+                }))
+            );
+            sqlx::raw_sql(&sql).execute(&mut *tx).await.unwrap();
+            let owner = if owner_scoped { "'owner'" } else { "NULL" };
+            let plan: serde_json::Value = sqlx::query_scalar(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE owner_page({owner}, NULL, ARRAY['target-model'], NULL, NULL, ARRAY['flex', 'priority'], 10, 5)"
+            ))
+                .fetch_one(&mut *tx).await.unwrap();
+            sqlx::query("DEALLOCATE owner_page")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
+            let visited = retained_rows_visited(&plan);
+            assert!(
+                visited > 0.0 && visited < 100.0,
+                "a ten-row model page must not visit unrelated model history (visited {visited}): {plan}"
             );
         }
     }
@@ -4193,6 +4277,7 @@ mod tests {
         let page_rows = sqlx::query(&list_requests_page_sql(PageShape {
             active_first: false,
             owner_scoped: false,
+            single_model: false,
             created_after: true,
             created_before: false,
         }))
@@ -4218,6 +4303,7 @@ mod tests {
                 list_requests_page_sql(PageShape {
                     active_first: false,
                     owner_scoped: false,
+                    single_model: false,
                     created_after: true,
                     created_before: false,
                 }),
@@ -4651,6 +4737,7 @@ mod tests {
         let both = list_requests_page_sql(PageShape {
             active_first: true,
             owner_scoped: true,
+            single_model: false,
             created_after: true,
             created_before: true,
         });
@@ -4666,6 +4753,7 @@ mod tests {
         let neither = list_requests_page_sql(PageShape {
             active_first: true,
             owner_scoped: true,
+            single_model: false,
             created_after: false,
             created_before: false,
         });
@@ -4678,6 +4766,7 @@ mod tests {
         let after_only = list_requests_page_sql(PageShape {
             active_first: false,
             owner_scoped: false,
+            single_model: false,
             created_after: true,
             created_before: false,
         });
@@ -4693,6 +4782,7 @@ mod tests {
         let sql = list_requests_page_sql(PageShape {
             active_first: true,
             owner_scoped: true,
+            single_model: false,
             created_after: false,
             created_before: false,
         });
