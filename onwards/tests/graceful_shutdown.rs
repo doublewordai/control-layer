@@ -349,3 +349,50 @@ async fn sigint_closes_idle_keep_alive_connections_without_waiting_for_the_deadl
         0
     );
 }
+
+#[tokio::test]
+async fn metrics_ceiling_after_successful_drain_exits_successfully() {
+    let mut gateway = Gateway::start(2).await;
+    // Establish that the proxy is working with a normal request that completes
+    // before the signal, so the proxy drain has nothing left to wait on. The
+    // non-stream handler blocks on the `finish` permit until it has produced
+    // headers, so the send must run concurrently with the permit release.
+    let request = gateway.request(false);
+    let response = tokio::spawn(async move { request.send().await.unwrap() });
+    timeout(Duration::from_secs(5), gateway.engine.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+    gateway.engine.finish.add_permits(1);
+    let response = response.await.unwrap();
+    let _ = response.json::<Value>().await.unwrap();
+
+    // Open a TCP connection to the metrics port and slow-feed HTTP headers
+    // without the terminating blank line. hyper keeps the connection task
+    // alive in the header-read phase, past the hard-coded 5s metrics ceiling.
+    let mut slow = TcpStream::connect(gateway.metrics).await.unwrap();
+    slow.write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n")
+        .await
+        .unwrap();
+
+    gateway.signal("-TERM").await;
+    gateway.wait_for_drain().await;
+
+    // The proxy drain succeeds (no active stream); only the metrics ceiling
+    // fires. Per the shutdown contract, a metrics ceiling after a successful
+    // drain must NOT fail the process exit code.
+    assert!(gateway.exit().await.success(), "{}", gateway.log());
+    assert!(
+        gateway.log().contains("Gateway request drain complete"),
+        "{}",
+        gateway.log()
+    );
+    assert!(
+        gateway
+            .log()
+            .contains("metrics server shutdown deadline exceeded"),
+        "{}",
+        gateway.log()
+    );
+}
