@@ -39,8 +39,8 @@ use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
 use crate::metrics::errors::component::ANALYTICS_BATCHER;
 use crate::pricing::{
-    CacheMultipliers, CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, clamp_implicit_read_multiplier, find_best_tariff,
-    list_price, resolve_cache_multipliers,
+    CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, clamp_implicit_read_multiplier, find_best_tariff, list_price,
+    resolve_cache_multipliers,
 };
 use crate::request_logging::serializers::{HttpAnalyticsRow, RequestParams};
 use chrono::{DateTime, Utc};
@@ -1724,6 +1724,7 @@ pub(crate) fn compute_billing_tier(fusillade_batch_id: Option<Uuid>, completion_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pricing::CacheMultipliers;
 
     #[test]
     fn test_compute_billing_tier() {

@@ -204,10 +204,16 @@ pub async fn recompute_corpus(
                 // the prompt, no creations). Without this every implicit row recomputes
                 // to list price and reports a phantom overcharge.
                 if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Engine.as_str())
-                    && usage.counts.cache_read == 0
                     && let Some(engine) = extract_engine_cached_tokens(&resp)
                 {
+                    // Replace, never merge: live implicit billing ignored any provider
+                    // cache split the raw body carried (an Anthropic-shaped upstream can
+                    // report both) — read = capped engine hit, no creations.
                     usage.counts.cache_read = engine.clamp(0, usage.counts.prompt);
+                    usage.counts.cache_creation_5m = 0;
+                    usage.counts.cache_creation_1h = 0;
+                    usage.counts.cache_creation_24h = 0;
+                    usage.cache_tier_inferred = false;
                 }
                 usage
             })
@@ -304,6 +310,14 @@ pub async fn recompute_corpus(
             // real cache tokens manufactures a disagreement that blames the serving path for
             // our own inability to read the request.
             if replay::is_zdr_envelope(Some(body)) {
+                continue;
+            }
+            // An engine-sourced (implicit) row was billed from the upstream's own report,
+            // not the module's index — the classifier correctly reconstructs a zero split
+            // for its marker-less body, and comparing that against the stored engine read
+            // would flag every healthy implicit row as a billing disagreement. The read
+            // was already validated against the body by the replay overlay above.
+            if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Engine.as_str()) {
                 continue;
             }
 
