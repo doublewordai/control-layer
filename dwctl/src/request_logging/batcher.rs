@@ -39,7 +39,8 @@ use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
 use crate::metrics::errors::component::ANALYTICS_BATCHER;
 use crate::pricing::{
-    CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, find_best_tariff, list_price, resolve_cache_multipliers,
+    CacheMultipliers, CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, find_best_tariff, list_price,
+    resolve_cache_multipliers,
 };
 use crate::request_logging::serializers::{HttpAnalyticsRow, RequestParams};
 use chrono::{DateTime, Utc};
@@ -196,6 +197,20 @@ impl From<&RawAnalyticsRecord> for TokenCounts {
             cache_creation_1h: raw.cache_creation_1h_input_tokens,
             cache_creation_24h: raw.cache_creation_24h_input_tokens,
         }
+    }
+}
+
+/// An engine-sourced (implicit) cache read must never bill above list price: the customer
+/// sent no markers and never opted into cache pricing, so a read multiplier above 1 —
+/// accepted by tariff validation but a misconfiguration in practice (a surcharge for a
+/// cache hit) — clamps to 1 for these reads only. Module-sourced (explicit) reads keep
+/// the configured multiplier untouched.
+fn clamp_implicit_read_multiplier(mults: Option<CacheMultipliers>, read_source: Option<&str>) -> Option<CacheMultipliers> {
+    match (mults, read_source) {
+        (Some(m), Some(s)) if s == crate::prompt_cache::CacheReadSource::Engine.as_str() && m.read > Decimal::ONE => {
+            Some(CacheMultipliers { read: Decimal::ONE, ..m })
+        }
+        _ => mults,
     }
 }
 
@@ -592,6 +607,7 @@ where
                     "response carried cache tokens but the model is not dwctl-cache-enabled; ignoring them and billing at list price"
                 );
             }
+            let cache_mults_resolved = clamp_implicit_read_multiplier(cache_mults_resolved, raw.cache_read_source.as_deref());
             let total_cost = charged_cost(
                 &TokenCounts::from(&raw),
                 raw.request_model.as_deref(),
@@ -2531,6 +2547,35 @@ mod integration_tests {
             (stored - submitted).num_seconds().abs() < 1,
             "expected {submitted}, stored {stored}"
         );
+    }
+
+    #[test]
+    fn implicit_reads_clamp_the_read_multiplier_to_list_price() {
+        let mults = CacheMultipliers {
+            read: Decimal::new(15, 1), // 1.5 — misconfigured surcharge
+            write_5m: Decimal::new(125, 2),
+            write_1h: Decimal::TWO,
+            write_24h: Decimal::new(25, 1),
+        };
+        // Engine-sourced read: clamped to 1 (never above list price).
+        let clamped = clamp_implicit_read_multiplier(Some(mults), Some("engine")).unwrap();
+        assert_eq!(clamped.read, Decimal::ONE);
+        assert_eq!(clamped.write_1h, Decimal::TWO, "write premiums untouched");
+        // Module-sourced (explicit) read: configured multiplier stands.
+        assert_eq!(
+            clamp_implicit_read_multiplier(Some(mults), Some("module")).unwrap().read,
+            Decimal::new(15, 1)
+        );
+        // Sane multipliers pass through unchanged for both sources.
+        let sane = CacheMultipliers {
+            read: Decimal::new(1, 1),
+            ..mults
+        };
+        assert_eq!(
+            clamp_implicit_read_multiplier(Some(sane), Some("engine")).unwrap().read,
+            Decimal::new(1, 1)
+        );
+        assert!(clamp_implicit_read_multiplier(None, Some("engine")).is_none());
     }
 
     /// The same last hop for `cache_read_source`: the value rides the `CacheBilling`

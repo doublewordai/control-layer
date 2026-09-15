@@ -27,7 +27,9 @@
 //! or the `cacheBreakpoint` query param) — never by cache values. An UNARMED request
 //! bills the upstream's own reported cache hit — engine-cache passthrough (see
 //! [`super::inject`]'s `splice_cache_fields`) — so a tariff row alone buys implicit,
-//! best-effort caching for marker-less clients. An ARMED request is wholly explicit:
+//! best-effort caching for marker-less clients. (Billing clamps the read multiplier to
+//! 1 for engine-sourced reads — a >1 multiplier is a misconfiguration, and an unmarked
+//! customer must never pay above list price for a cache hit.) An ARMED request is wholly explicit:
 //! deterministic module numbers, zeros included, engine report ignored. Strictly one
 //! paradigm per request, so a customer's cache numbers are always explainable from
 //! their own markers.
@@ -318,7 +320,9 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         // reads as a discount we didn't give.
         return scrub_response_nonstreaming(response, &upstream_cached).await;
     }
-    let (response, billing_ok) = inject_into_response_nonstreaming(response, &outcome.stats, &upstream_cached, had_markers).await;
+    // Passthrough gate: markers pick the paradigm — no markers means implicit.
+    let allow_implicit = !had_markers;
+    let (response, billing_ok) = inject_into_response_nonstreaming(response, &outcome.stats, &upstream_cached, allow_implicit).await;
     if !outcome.pending.is_empty() {
         if billing_ok {
             spawn_commit(state.classifier.clone(), outcome.pending);
@@ -463,7 +467,7 @@ fn defer_classify_into_stream(
     classifier: Classifier,
     upstream_cached: UpstreamCachedTokens,
     cache_billing: CacheBilling,
-    armed: bool,
+    had_markers: bool,
 ) -> Response {
     let (parts, body) = response.into_parts();
     let status_ok = parts.status.is_success();
@@ -519,7 +523,7 @@ fn defer_classify_into_stream(
                         &chunk,
                         UsageEdit::Inject {
                             stats: &o.stats,
-                            armed,
+                            allow_implicit: !had_markers,
                         },
                     ),
                     // Inactive — and `None` can't happen (the classify join above runs on the
