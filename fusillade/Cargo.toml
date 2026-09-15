@@ -37,7 +37,7 @@ thiserror = "2"
 async-trait = "0.1"
 futures = "0.3"
 eventsource-stream = "0.2"
-openai-reassembler = "0.4.0"
+openai-reassembler = { path = "../openai-reassembler" }
 parking_lot = "0.12"
 scopeguard = "1"
 humantime = "2"

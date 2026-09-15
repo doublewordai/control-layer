@@ -1,8 +1,8 @@
 name: CI
 
 on:
-  pull_request:
-    branches: [main]
+  # Validate stacked pull requests as well as changes targeting main.
+  pull_request: {}
   merge_group:
     types: [checks_requested]
 
@@ -254,6 +254,9 @@ jobs:
           - package: fusillade-arsenal
             runner: depot-ubuntu-24.04-8
             database: true
+          - package: openai-reassembler
+            runner: depot-ubuntu-24.04-8
+            database: false
           - package: onwards
             runner: depot-ubuntu-24.04-8
             database: false
@@ -456,8 +459,8 @@ jobs:
         run: |
           shopt -s nullglob
           coverage_files=(rust-coverage/*.info)
-          if (( ${#coverage_files[@]} != 8 )); then
-            echo "Expected 8 coverage files, found ${#coverage_files[@]}" >&2
+          if (( ${#coverage_files[@]} != 9 )); then
+            echo "Expected 9 coverage files, found ${#coverage_files[@]}" >&2
             exit 1
           fi
 
