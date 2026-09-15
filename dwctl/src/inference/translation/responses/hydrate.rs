@@ -67,3 +67,66 @@ pub async fn hydrate_previous_response(store: &dyn ResponseStore, owner: &str, r
     *request_value = serde_json::to_value(&req).map_err(|e| HydrationError::Internal(format!("re-serialising hydrated request: {e}")))?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    use super::*;
+    use crate::inference::response_store::StoreError;
+
+    struct StaticResponseStore(Value);
+
+    #[async_trait]
+    impl ResponseStore for StaticResponseStore {
+        async fn store(&self, _response: &Value) -> Result<String, StoreError> {
+            unreachable!("the hydration path only reads from the response store")
+        }
+
+        async fn get_context(&self, _response_id: &str, owner: &str) -> Result<Option<Value>, StoreError> {
+            assert_eq!(owner, "test-owner");
+            Ok(Some(self.0.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn hydrates_output_from_partial_retrieval_shape() {
+        let store = StaticResponseStore(json!({
+            "id": "resp_previous",
+            "object": "response",
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [{
+                "type": "message",
+                "id": "msg_previous",
+                "role": "assistant",
+                "content": [{
+                    "type": "output_text",
+                    "text": "previous answer",
+                    "annotations": [],
+                    "logprobs": []
+                }],
+                "status": "completed"
+            }]
+        }));
+        let mut request = json!({
+            "model": "gpt-4o",
+            "input": "next question",
+            "previous_response_id": "resp_previous"
+        });
+
+        let result = hydrate_previous_response(&store, "test-owner", &mut request).await;
+        assert!(
+            result.is_ok(),
+            "partial retrieval response should provide enough context to hydrate"
+        );
+
+        let input = request["input"].as_array().expect("hydrated input should be an item array");
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "assistant");
+        assert_eq!(input[0]["content"][0]["text"], "previous answer");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"], "next question");
+    }
+}
