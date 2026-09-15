@@ -164,7 +164,7 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/chat/completions"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "chatcmpl-strict-test",
             "object": "chat.completion",
@@ -377,7 +377,7 @@ async fn test_strict_mode_body_limit_uses_configured_max_body_size(pool: PgPool)
     let mock_server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/chat/completions"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "chatcmpl-strict-test",
             "object": "chat.completion",
@@ -589,7 +589,7 @@ async fn test_strict_mode_allows_completions(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/completions"))
+        .and(wiremock::matchers::path("/v1/completions"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "id": "cmpl-strict-test",
             "object": "text_completion",
@@ -767,7 +767,7 @@ async fn test_strict_mode_allows_embeddings(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/embeddings"))
+        .and(wiremock::matchers::path("/v1/embeddings"))
         .respond_with(wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "object": "list",
             "data": [{
@@ -1000,7 +1000,7 @@ async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
 
     // Mock provider returns error with sensitive internal details
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/chat/completions"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
         .respond_with(wiremock::ResponseTemplate::new(500).set_body_json(serde_json::json!({
             "error": {
                 "message": "Internal server error: database connection failed at 10.0.0.5:5432",
@@ -1176,7 +1176,7 @@ async fn test_strict_mode_trusted_flag_bypasses_sanitization(pool: PgPool) {
     });
 
     wiremock::Mock::given(wiremock::matchers::method("POST"))
-        .and(wiremock::matchers::path("/chat/completions"))
+        .and(wiremock::matchers::path("/v1/chat/completions"))
         .respond_with(wiremock::ResponseTemplate::new(429).set_body_json(error_response.clone()))
         .mount(&mock_server)
         .await;
@@ -1369,7 +1369,7 @@ async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
 
         // Setup mock for this test case
         wiremock::Mock::given(wiremock::matchers::method("POST"))
-            .and(wiremock::matchers::path("/chat/completions"))
+            .and(wiremock::matchers::path("/v1/chat/completions"))
             .respond_with(wiremock::ResponseTemplate::new(status_code).set_body_string(response_body.to_string()))
             .mount(&mock_server)
             .await;

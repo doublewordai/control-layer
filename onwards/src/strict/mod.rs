@@ -888,4 +888,220 @@ mod tests {
             );
         }
     }
+
+    // ── strict-mode upstream URI construction ───────────────────────────────
+    //
+    // The strict router is mounted under `.nest("/v1", …)` which strips the
+    // `/v1` prefix before handlers see the path. Each strict handler forwards a
+    // hard-coded outbound path to `target_message_handler`, whose join logic was
+    // written (and unit-tested in `handlers.rs::test_path_stripping_without_duplicate`)
+    // to receive a `/v1`-prefixed request path so it builds the correct upstream
+    // URI for the documented bare-URL target config (`"url": "https://api.openai.com"`,
+    // no `/v1`). Forwarding a `/v1`-less path drops `/v1` from the upstream URI
+    // entirely, causing upstream 404s on OpenAI-compatible `/v1/*` upstreams.
+    //
+    // These tests pin the exact upstream URI the mock client received for every
+    // strict endpoint, for BOTH target URL shapes: the documented bare URL and
+    // the `/v1`-bearing URL used by the rest of the strict test suite (which
+    // silently masked the bug because its join path de-duplicates `/v1`).
+
+    /// Build strict-mode state whose single target has `url` and whose upstream
+    /// returns `mock_body` verbatim with HTTP 200.
+    fn strict_state_with_url(
+        url: &str,
+        model: &str,
+        mock_body: &str,
+    ) -> (AppState<MockHttpClient>, MockHttpClient) {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            model.to_string(),
+            Target::builder()
+                .url(url.parse().unwrap())
+                .build()
+                .into_pool(),
+        );
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(StatusCode::OK, mock_body);
+        (
+            AppState::with_client(targets, mock_client.clone()),
+            mock_client,
+        )
+    }
+
+    /// Post `body` to `uri` on the strict router and assert the upstream URI the
+    /// mock client received equals `expected` exactly. Guards against the strict
+    /// handlers dropping `/v1` from the upstream URI (bare target URL) or
+    /// duplicating it (`/v1`-bearing target URL).
+    async fn assert_upstream_uri(
+        url: &str,
+        model: &str,
+        uri: &str,
+        body: &str,
+        mock_body: &str,
+        expected: &str,
+    ) {
+        let (state, mock_client) = strict_state_with_url(url, model, mock_body);
+        let request = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = build_strict_router(state).oneshot(request).await.unwrap();
+        assert!(
+            response.status().is_success(),
+            "{uri}: {}",
+            response.status()
+        );
+        let requests = mock_client.get_requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "{uri}: expected exactly one upstream request, got {}",
+            requests.len()
+        );
+        assert_eq!(
+            requests[0].uri, expected,
+            "{uri}: strict handler forwarded to the wrong upstream URI"
+        );
+    }
+
+    const CHAT_RESPONSE: &str = r#"{"id":"chatcmpl-1","object":"chat.completion","choices":[{"message":{"role":"assistant","content":"hi"}}]}"#;
+    const COMPLETIONS_RESPONSE: &str = r#"{"id":"cmpl-1","object":"text_completion","created":0,"model":"gpt-3.5-turbo-instruct","choices":[{"text":"hi","index":0,"logprobs":null,"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+    const EMBEDDINGS_RESPONSE: &str = r#"{"object":"list","data":[{"object":"embedding","embedding":[0.1,0.2],"index":0}],"model":"text-embedding-3-small","usage":{"prompt_tokens":1,"total_tokens":1}}"#;
+    const RESPONSES_RESPONSE: &str = r#"{"id":"resp_1","object":"response","created_at":0,"completed_at":null,"status":"completed","incomplete_details":null,"model":"gpt-4o","previous_response_id":null,"instructions":null,"output":[],"error":null,"tools":[],"tool_choice":"auto","truncation":"disabled","parallel_tool_calls":true,"text":{"format":{"type":"text"}},"top_p":1.0,"presence_penalty":0.0,"frequency_penalty":0.0,"top_logprobs":0,"temperature":1.0,"reasoning":null,"usage":null,"max_output_tokens":null,"max_tool_calls":null,"store":false,"background":false,"service_tier":"default","metadata":null,"safety_identifier":null,"prompt_cache_key":null}"#;
+
+    // Bare target URL (the documented config shape) — strict handlers must keep
+    // `/v1` in the upstream URI for all four endpoints. This is the headline
+    // regression: before the fix each handler forwarded a `/v1`-less path after
+    // `nest("/v1", …)` stripped the prefix, so the upstream URI lost `/v1`.
+
+    #[tokio::test]
+    async fn strict_chat_completions_keeps_v1_for_bare_target_url() {
+        assert_upstream_uri(
+            "https://api.openai.com",
+            "gpt-4",
+            "/chat/completions",
+            r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#,
+            CHAT_RESPONSE,
+            "https://api.openai.com/v1/chat/completions",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn strict_completions_keeps_v1_for_bare_target_url() {
+        assert_upstream_uri(
+            "https://api.openai.com",
+            "gpt-3.5-turbo-instruct",
+            "/completions",
+            r#"{"model":"gpt-3.5-turbo-instruct","prompt":"hi"}"#,
+            COMPLETIONS_RESPONSE,
+            "https://api.openai.com/v1/completions",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn strict_responses_keeps_v1_for_bare_target_url() {
+        assert_upstream_uri(
+            "https://api.openai.com",
+            "gpt-4o",
+            "/responses",
+            r#"{"model":"gpt-4o","input":"hi"}"#,
+            RESPONSES_RESPONSE,
+            "https://api.openai.com/v1/responses",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn strict_embeddings_keeps_v1_for_bare_target_url() {
+        assert_upstream_uri(
+            "https://api.openai.com",
+            "text-embedding-3-small",
+            "/embeddings",
+            r#"{"model":"text-embedding-3-small","input":"hi"}"#,
+            EMBEDDINGS_RESPONSE,
+            "https://api.openai.com/v1/embeddings",
+        )
+        .await;
+    }
+
+    /// Strict and non-strict modes must forward to the SAME upstream URI for the
+    /// same bare target URL, so flipping `strict_mode: true` cannot change where
+    /// a request is forwarded. The `/v1`-bearing target shape is already covered
+    /// by the rest of the strict suite (every other test uses a `/v1` URL) and by
+    /// `handlers::tests::test_path_stripping_with_duplicate_prefix`, so the
+    /// de-duplication invariant is not re-asserted here.
+    #[tokio::test]
+    async fn strict_matches_nonstrict_upstream_uri_for_bare_target_url() {
+        let url = "https://api.openai.com";
+        let model = "gpt-4";
+        let body = r#"{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}"#;
+
+        // Strict mode.
+        let (strict_state, strict_client) = strict_state_with_url(url, model, CHAT_RESPONSE);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = build_strict_router(strict_state)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let strict_uri = strict_client.get_requests()[0].uri.clone();
+
+        // Non-strict mode: the same request enters as `/v1/chat/completions`
+        // (non-strict does not nest under `/v1`) and is forwarded unchanged.
+        let nonstrict_mock = MockHttpClient::new(StatusCode::OK, CHAT_RESPONSE);
+        let nonstrict_targets = Targets {
+            targets: {
+                let map = Arc::new(DashMap::new());
+                map.insert(
+                    model.to_string(),
+                    Target::builder()
+                        .url(url.parse().unwrap())
+                        .build()
+                        .into_pool(),
+                );
+                map
+            },
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode: false,
+            http_pool_config: None,
+        };
+        let nonstrict_state = AppState::with_client(nonstrict_targets, nonstrict_mock.clone());
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = crate::build_router(nonstrict_state)
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+        let nonstrict_uri = nonstrict_mock.get_requests()[0].uri.clone();
+
+        assert_eq!(
+            strict_uri, nonstrict_uri,
+            "strict and non-strict modes must forward to the same upstream URI \
+             for a bare target URL; strict={strict_uri} non-strict={nonstrict_uri}"
+        );
+        assert_eq!(strict_uri, "https://api.openai.com/v1/chat/completions");
+    }
 }
