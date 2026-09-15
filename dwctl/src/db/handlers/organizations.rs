@@ -738,6 +738,35 @@ impl<'c> Organizations<'c> {
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
+    /// The pending join request `request_id` filed against `org_id`, if any.
+    ///
+    /// Scoped to both the organization and the request id (so a caller who
+    /// manages one organization can't read another's queue) and filtered to
+    /// `requested`, so a request that was already decided reads as `None` —
+    /// the same signal [`Organizations::approve_join_request`] returns. The
+    /// requester's id is needed *before* the flip to gate the membership cap
+    /// against the user being activated rather than the acting admin: the
+    /// approved user's id only comes back from `approve_join_request` after
+    /// the row is already live.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), request_id = %abbrev_uuid(&request_id)), err)]
+    pub async fn get_join_request(&mut self, org_id: UserId, request_id: Uuid) -> Result<Option<OrganizationMemberDBResponse>> {
+        let row = sqlx::query_as!(
+            MemberRow,
+            r#"
+            SELECT uo.id, uo.user_id, uo.organization_id, uo.role, uo.status,
+                   uo.created_at, uo.invite_email, uo.invited_by, uo.expires_at
+            FROM user_organizations uo
+            WHERE uo.id = $1 AND uo.organization_id = $2 AND uo.status = 'requested'
+            "#,
+            request_id,
+            org_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(row.map(Into::into))
+    }
+
     /// Approve a join request: the requester becomes an active member.
     ///
     /// Scoped to `org_id` as well as the request id so a caller who can manage
