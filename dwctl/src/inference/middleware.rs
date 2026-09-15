@@ -447,18 +447,32 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     .unwrap();
             }
             // Flex is persisted now and dispatched later by the daemon, so —
-            // unlike realtime — it does NOT pass through the image-normaliser
-            // layer. Normalise image inputs to `dw-img://` tokens here so the
-            // daemon's dispatch-time JIT signing hands the provider a signed
-            // URL rather than the raw image/URL (closing the same exposure the
-            // realtime and `/v1/files` paths already close). No-op when the
-            // feature is disabled.
+            // unlike realtime — this leg does NOT pass through the
+            // image-normaliser layer. Normalise image inputs to `dw-img://`
+            // tokens here; the daemon's dispatch loops back through the edge,
+            // where the normaliser layer signs the tokens (below the
+            // prompt-cache layer, so the cache keys on the stable token) and
+            // hands the provider a signed URL rather than the raw image/URL —
+            // closing the same exposure the realtime and `/v1/files` paths
+            // already close. No-op when the feature is disabled.
             if state.image_normalizer_enabled {
                 // Attribute the image to the acting human + owning org (for org
                 // keys), mirroring how CurrentUser is derived, so the console's
                 // org-scoped image-view authorization lines up.
+                // The attribution row written here is what authorises a client
+                // re-sending this request's tokens later, so a lookup failure
+                // fails the submission (retryable) instead of silently
+                // persisting tokens without it.
                 let attribution = match api_key.as_deref() {
-                    Some(key) => crate::api::handlers::images::resolve_image_attribution(&state.dwctl_pool.write(), key).await,
+                    Some(key) => match crate::api::handlers::images::try_resolve_caller(&state.dwctl_pool.write(), key).await {
+                        Ok(caller) => caller.map(|c| c.attribution),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "Image attribution lookup failed on flex enqueue");
+                            return normalize_error_response(crate::image_normalizer::NormalizeError::Transient(
+                                "caller lookup failed".to_string(),
+                            ));
+                        }
+                    },
                     None => None,
                 };
                 let access_pool = Some(state.dwctl_pool.write().into_inner());

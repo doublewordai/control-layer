@@ -21,10 +21,15 @@
 //!    short-lived signed URL ready to hand to an upstream provider.
 //!
 //! Realtime requests are single-stage (sign immediately at middleware
-//! time, ~15min TTL because the request completes in seconds). Batch
-//! requests are two-stage: ingest at file upload (token stored in the DB)
-//! and sign just before each dispatch attempt (~30min TTL per attempt, so
-//! retries get fresh URLs and the leak window per attempt is bounded).
+//! time, ~15min TTL because the request completes in seconds). Queued
+//! requests (flex, batch files) are two-stage: ingest at submission (the
+//! token is what sits in the DB), and sign when the daemon's dispatch loops
+//! back through the edge middleware (dispatch TTL per attempt, so retries
+//! get fresh URLs and the leak window per attempt is bounded). Signing
+//! happens in the edge middleware — BELOW the prompt-cache layer — on
+//! purpose: the cache hashes the stable content-addressed token, never the
+//! per-attempt signed URL, so a byte-identical image keeps a prefix chain
+//! intact across calls.
 //!
 //! ## Module layout
 //!
@@ -81,6 +86,10 @@ pub enum NormalizeError {
     StoreFailed(String),
     #[error("token not found in store")]
     NotFound,
+    /// A `dw-img://` token was presented by a caller who never submitted
+    /// that image (no `image_access` row for their user or organization).
+    #[error("image token is not accessible to this caller")]
+    Forbidden,
 }
 
 impl From<fetcher::FetchError> for NormalizeError {

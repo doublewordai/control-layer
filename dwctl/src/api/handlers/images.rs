@@ -144,9 +144,35 @@ pub struct ImageAttribution {
 /// (`created_by <> user_id`) the organization is the key's `user_id`. Returns
 /// `None` if the key is unknown/deleted.
 pub async fn resolve_image_attribution(pool: &sqlx::PgPool, api_key: &str) -> Option<ImageAttribution> {
+    try_resolve_caller(pool, api_key).await.ok().flatten().map(|c| c.attribution)
+}
+
+/// What an API key secret tells the image layer about the request carrying it.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedCaller {
+    pub attribution: ImageAttribution,
+    /// The key is a hidden `batch`-purpose key: the one the fusillade daemon
+    /// dispatches with (flex enqueue and batch creation both store it on the
+    /// request), and one no client ever holds — hidden keys are never exposed.
+    /// The bearer is therefore an application-verifiable daemon identity, so
+    /// a request carrying it is a dispatch loopback of a body our own ingest
+    /// stored under this principal.
+    pub is_daemon_dispatch: bool,
+}
+
+/// [`resolve_image_attribution`] that keeps the lookup error and reports
+/// whether the key is the daemon's. `Ok(None)` is a definite "no such key";
+/// `Err` is "could not look it up right now". Callers that AUTHORISE on the
+/// result (token signing, the flex enqueue bookkeeping that later
+/// authorisation depends on) must treat the two differently — a transient
+/// database failure is a retryable 503, never a 403.
+pub async fn try_resolve_caller(pool: &sqlx::PgPool, api_key: &str) -> std::result::Result<Option<ResolvedCaller>, sqlx::Error> {
     let row = sqlx::query!(
         r#"
-        SELECT created_by AS "created_by!", user_id AS "user_id!"
+        SELECT
+            created_by AS "created_by!",
+            user_id AS "user_id!",
+            (purpose = 'batch' AND hidden) AS "is_daemon_dispatch!"
         FROM api_keys
         WHERE secret = $1 AND is_deleted = FALSE
         LIMIT 1
@@ -154,36 +180,59 @@ pub async fn resolve_image_attribution(pool: &sqlx::PgPool, api_key: &str) -> Op
         api_key,
     )
     .fetch_optional(pool)
-    .await
-    .ok()??;
+    .await?;
 
-    let organization_id = (row.created_by != row.user_id).then_some(row.user_id);
-    Some(ImageAttribution {
-        user_id: row.created_by,
-        organization_id,
-    })
+    Ok(row.map(|row| {
+        let organization_id = (row.created_by != row.user_id).then_some(row.user_id);
+        ResolvedCaller {
+            attribution: ImageAttribution {
+                user_id: row.created_by,
+                organization_id,
+            },
+            is_daemon_dispatch: row.is_daemon_dispatch,
+        }
+    }))
 }
 
-/// Record that `attribution` submitted a request containing `token`. Idempotent
-/// on `(user_id, sha256)`: updates `last_seen_at` on conflict, and preserves an
-/// existing org grant (`COALESCE`) so a later personal submission of the same
-/// image by the same user does not revoke organization visibility.
+/// Record that `attribution` submitted a request containing `token`. One grant
+/// per (user, organization-or-personal, image): idempotent on that key (updates
+/// `last_seen_at` on conflict), so submitting the same image under a second
+/// organization adds a grant for it rather than replacing the first one, and a
+/// later personal submission never revokes organization visibility.
 ///
 /// Best-effort: errors are logged and swallowed. We never block the request
 /// path on this bookkeeping write — the security control (substituting the
 /// URL before forwarding to the upstream) does not depend on it.
 pub async fn record_image_access(pool: &sqlx::PgPool, attribution: ImageAttribution, token: ImageToken, mime: &str, bytes_len: u64) {
+    if let Err(e) = try_record_image_access(pool, attribution, token, mime, bytes_len).await {
+        warn!(error = %e, "failed to record image_access row (non-fatal)");
+    }
+}
+
+/// [`record_image_access`] that surfaces the failure. Use it wherever a later
+/// client request must be able to re-submit the resulting `dw-img://` token:
+/// client-presented tokens are authorised through this row, while daemon
+/// dispatches sign the tokens in a stored body on trust without consulting
+/// `image_access`. Callers on the queued (flex / batch) paths should fail the
+/// submission (retryable) rather than persist tokens the client could never
+/// re-submit.
+pub async fn try_record_image_access(
+    pool: &sqlx::PgPool,
+    attribution: ImageAttribution,
+    token: ImageToken,
+    mime: &str,
+    bytes_len: u64,
+) -> std::result::Result<(), sqlx::Error> {
     let sha_bytes: Vec<u8> = token.0.to_vec();
     let bytes_len_i64 = bytes_len as i64;
-    if let Err(e) = sqlx::query!(
+    sqlx::query!(
         r#"
         INSERT INTO image_access (user_id, organization_id, sha256, mime, bytes_len, first_seen_at, last_seen_at)
         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-        ON CONFLICT (user_id, sha256) DO UPDATE
+        ON CONFLICT (user_id, sha256, grant_scope) DO UPDATE
         SET last_seen_at = NOW(),
             mime = EXCLUDED.mime,
-            bytes_len = EXCLUDED.bytes_len,
-            organization_id = COALESCE(EXCLUDED.organization_id, image_access.organization_id)
+            bytes_len = EXCLUDED.bytes_len
         "#,
         attribution.user_id,
         attribution.organization_id,
@@ -193,9 +242,22 @@ pub async fn record_image_access(pool: &sqlx::PgPool, attribution: ImageAttribut
     )
     .execute(pool)
     .await
-    {
-        warn!(error = %e, "failed to record image_access row (non-fatal)");
-    }
+    .map(|_| ())
+}
+
+/// Whether the caller behind `attribution` may reference the image `token`
+/// in a request — i.e. whether they (or their organization) submitted it.
+/// Same rule as the console's image view, applied at request time so a
+/// `dw-img://` token presented on the wire is only ever signed for the
+/// principal that owns the bytes. Daemon dispatches pass because the hidden
+/// batch key resolves to the same user/org that enqueued the request.
+pub async fn is_token_accessible(
+    pool: &sqlx::PgPool,
+    attribution: &ImageAttribution,
+    token: ImageToken,
+) -> std::result::Result<bool, sqlx::Error> {
+    let mut conn = pool.acquire().await?;
+    is_authorized_to_view(&mut conn, &token.0, attribution.user_id, attribution.organization_id).await
 }
 
 /// Whether `viewer` — optionally acting in organization `active_org` — is
@@ -264,6 +326,43 @@ mod tests {
         };
         let req = ApiKeyCreateDBRequest::new(org_id, member_id, create);
         ApiKeys::new(&mut conn).create(&req).await.unwrap().secret
+    }
+
+    /// Grants are per organization, not one-per-user: the same member
+    /// submitting the same image under two organizations leaves BOTH
+    /// organizations' members able to use it, and a later personal
+    /// submission revokes neither.
+    #[sqlx::test]
+    async fn the_same_image_submitted_under_two_organizations_grants_both(pool: PgPool) {
+        let alice = create_test_user(&pool, Role::StandardUser).await;
+        let bob = create_test_user(&pool, Role::StandardUser).await; // member of org A only
+        let carol = create_test_user(&pool, Role::StandardUser).await; // member of org B only
+        let dave = create_test_user(&pool, Role::StandardUser).await; // member of neither
+        let org_a = create_test_org(&pool, alice.id).await;
+        let org_b = create_test_org(&pool, alice.id).await;
+        let img = token(7);
+
+        // Alice submits the image under org A, then org B, then personally.
+        for organization_id in [Some(org_a.id), Some(org_b.id), None] {
+            record_image_access(
+                &pool,
+                ImageAttribution {
+                    user_id: alice.id,
+                    organization_id,
+                },
+                img,
+                "image/png",
+                10,
+            )
+            .await;
+        }
+
+        let acting = |user_id: uuid::Uuid, organization_id: Option<uuid::Uuid>| ImageAttribution { user_id, organization_id };
+        assert!(is_token_accessible(&pool, &acting(bob.id, Some(org_a.id)), img).await.unwrap(), "org A keeps its grant");
+        assert!(is_token_accessible(&pool, &acting(carol.id, Some(org_b.id)), img).await.unwrap(), "org B gets its own grant");
+        assert!(is_token_accessible(&pool, &acting(alice.id, None), img).await.unwrap(), "the submitter, personally");
+        assert!(!is_token_accessible(&pool, &acting(dave.id, None), img).await.unwrap(), "a stranger");
+        assert!(!can_view(&pool, img, dave.id, None).await, "a stranger, on the console view");
     }
 
     #[sqlx::test]

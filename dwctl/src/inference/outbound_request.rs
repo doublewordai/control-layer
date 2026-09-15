@@ -76,7 +76,6 @@ pub const STREAM_MARKER_KEY: &str = "stream";
 
 /// The header [`STREAM_MARKER_KEY`] arrives as.
 pub const STREAM_MARKER_HEADER: &str = "x-fusillade-batch-stream";
-
 impl StreamTimeouts {
     /// Read the budgets from the daemon's configuration.
     ///
