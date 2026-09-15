@@ -1144,3 +1144,62 @@ async fn preflight_script_verifies_index_partitions_and_journal_state(pool: sqlx
         "unexpected preflight failure: {error}"
     );
 }
+
+const ROUTE_AUTOVACUUM_DOWN: &str =
+    include_str!("../migrations/20260915000000_tune_retained_response_route_autovacuum.down.sql");
+
+async fn route_table_reloptions(pool: &sqlx::PgPool) -> Vec<(String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT relname::text, array_to_string(reloptions, ',') \
+         FROM pg_class \
+         WHERE relname IN ('retained_response_group_routes', 'retained_response_request_routes') \
+           AND relnamespace = current_schema()::regnamespace \
+         ORDER BY relname",
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// The daily purge deletes on the order of a million route rows per table.
+/// Proportional autovacuum thresholds would let dead index entries pile up
+/// for weeks, so both route tables carry absolute thresholds, and the
+/// rollback restores the server defaults.
+#[sqlx::test]
+async fn route_tables_use_absolute_autovacuum_thresholds(pool: sqlx::PgPool) {
+    let tuned = route_table_reloptions(&pool).await;
+    assert_eq!(tuned.len(), 2, "both route tables must exist: {tuned:?}");
+    for (relation, options) in &tuned {
+        let options = options
+            .as_deref()
+            .unwrap_or_else(|| panic!("{relation} must carry storage parameters"));
+        for expected in [
+            "autovacuum_vacuum_scale_factor=0.0",
+            "autovacuum_vacuum_threshold=100000",
+            "autovacuum_analyze_scale_factor=0.0",
+            "autovacuum_analyze_threshold=100000",
+            "autovacuum_vacuum_insert_scale_factor=0.0",
+            "autovacuum_vacuum_insert_threshold=100000",
+        ] {
+            assert!(
+                options.split(',').any(|option| option == expected),
+                "{relation} must set {expected}, found {options}"
+            );
+        }
+    }
+
+    let mut transaction = pool.begin().await.unwrap();
+    sqlx::raw_sql(ROUTE_AUTOVACUUM_DOWN)
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+    transaction.commit().await.unwrap();
+    let reset = route_table_reloptions(&pool).await;
+    assert_eq!(reset.len(), 2);
+    for (relation, options) in &reset {
+        assert_eq!(
+            options, &None,
+            "{relation} must return to the server defaults after rollback"
+        );
+    }
+}
