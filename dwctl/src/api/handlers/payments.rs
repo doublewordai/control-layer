@@ -808,6 +808,8 @@ pub async fn process_auto_topup<P: PoolProvider>(
         auto_topup_threshold: Some(Some(body.threshold)),
         auto_topup_monthly_limit: Some(body.monthly_limit),
         zero_data_retention: None,
+        default_serving_class: None,
+        self_hosted_only: None,
     };
 
     let mut conn = state.db.write().acquire().await.map_err(|e| {
@@ -980,6 +982,8 @@ pub async fn enable_auto_topup<P: PoolProvider>(
                 auto_topup_threshold: Some(Some(body.threshold)),
                 auto_topup_monthly_limit: Some(body.monthly_limit),
                 zero_data_retention: None,
+                default_serving_class: None,
+                self_hosted_only: None,
             };
 
             Users::new(&mut conn).update(target.id, &update).await.map_err(|e| {
@@ -1055,6 +1059,8 @@ pub async fn disable_auto_topup<P: PoolProvider>(State(state): State<AppState<P>
         auto_topup_threshold: Some(None),
         auto_topup_monthly_limit: Some(None),
         zero_data_retention: None,
+        default_serving_class: None,
+        self_hosted_only: None,
     };
 
     Users::new(&mut conn).update(target.id, &update).await.map_err(|e| match e {

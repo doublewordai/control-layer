@@ -33,6 +33,11 @@ pub struct OrganizationUpdateDBRequest {
     pub low_balance_threshold: Option<Option<f32>>,
     /// Account-wide zero-data-retention flag. `None` = don't change.
     pub zero_data_retention: Option<bool>,
+    /// Account setting: default serving class. `None` = don't change,
+    /// `Some(None)` = clear, `Some(Some(class))` = set.
+    pub default_serving_class: Option<Option<String>>,
+    /// Account setting: never fall over to an external provider. `None` = don't change.
+    pub self_hosted_only: Option<bool>,
 }
 
 /// Database response for an organization membership

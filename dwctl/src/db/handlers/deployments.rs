@@ -198,6 +198,8 @@ struct DeployedModel {
     // Catalog metadata
     pub metadata: serde_json::Value,
     pub provisioning_source: Option<String>,
+    /// Elevated serving classes this model has activated (subset of interactive, throughput).
+    pub serving_classes: Vec<String>,
 }
 
 pub struct Deployments<'c> {
@@ -266,6 +268,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             allowed_batch_completion_windows: m.allowed_batch_completion_windows,
             metadata: m.metadata,
             provisioning_source: m.provisioning_source,
+            serving_classes: m.serving_classes,
         }
     }
 }
@@ -333,7 +336,7 @@ impl<'c> Repository for Deployments<'c> {
                 lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement,
                 fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
                 backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, reasoning_translation_overrides,
-                allowed_batch_completion_windows, metadata, provisioning_source
+                allowed_batch_completion_windows, metadata, provisioning_source, serving_classes
             "#,
         )
         .bind(request.model_name.trim())
@@ -396,7 +399,7 @@ impl<'c> Repository for Deployments<'c> {
     #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as::<_, DeployedModel>(
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source, serving_classes FROM deployed_models WHERE id = $1",
         )
             .bind(id)
             .fetch_optional(&mut *self.db)
@@ -421,7 +424,7 @@ impl<'c> Repository for Deployments<'c> {
         }
 
         let deployments = sqlx::query_as::<_, DeployedModel>(
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source, serving_classes FROM deployed_models WHERE id = ANY($1)",
         )
             .bind(ids.as_slice())
             .fetch_all(&mut *self.db)
@@ -630,7 +633,7 @@ impl<'c> Repository for Deployments<'c> {
                 lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement,
                 fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
                 backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, reasoning_translation_overrides,
-                allowed_batch_completion_windows, metadata, provisioning_source
+                allowed_batch_completion_windows, metadata, provisioning_source, serving_classes
         "#,
         )
         .bind(id)
@@ -723,7 +726,7 @@ impl<'c> Repository for Deployments<'c> {
                 dm.lb_strategy, dm.fallback_enabled, dm.fallback_on_rate_limit, dm.fallback_on_status, dm.fallback_with_replacement,
                 dm.fallback_max_attempts, dm.backoff_enabled, dm.backoff_initial_ms, dm.backoff_max_ms, dm.backoff_factor,
                 dm.backoff_jitter, dm.backoff_max_total_ms, dm.sanitize_responses, dm.trusted, dm.reasoning_translation_overrides,
-                dm.allowed_batch_completion_windows, dm.metadata, dm.provisioning_source
+                dm.allowed_batch_completion_windows, dm.metadata, dm.provisioning_source, dm.serving_classes
              FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
         );
 

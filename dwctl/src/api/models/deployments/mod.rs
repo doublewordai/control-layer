@@ -584,6 +584,10 @@ pub struct DeployedModelResponse {
     /// Declarative source reapplied during startup. Absent for manually managed models.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provisioning_source: Option<String>,
+    /// Elevated serving classes this model has activated (`interactive`,
+    /// `throughput`). Empty = standard only. Declared in the model catalog.
+    #[serde(default)]
+    pub serving_classes: Vec<String>,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
@@ -654,6 +658,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
                 .ok()
                 .filter(|m| *m != ModelCatalogMetadata::default()),
             provisioning_source: db.provisioning_source,
+            serving_classes: db.serving_classes,
         }
     }
 }

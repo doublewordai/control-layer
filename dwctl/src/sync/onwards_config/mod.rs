@@ -2,6 +2,7 @@
 
 use crate::db::models::deployments::DEFAULT_COMPONENT_POOL;
 use crate::metrics::errors::component::ONWARDS_SYNC;
+use crate::types::UserId;
 use std::{
     collections::{BTreeMap, HashMap},
     num::NonZeroU32,
@@ -15,6 +16,7 @@ use onwards::target::{
     ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
     inheritable_routing_rules,
 };
+use onwards::{KeyServing, ServingClass, ServingOverlay};
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -68,6 +70,8 @@ struct OnwardsTarget {
     reasoning_translation: Option<ReasoningTranslationConfig>,
     /// Traffic routing rules from the model_traffic_rules table
     routing_rules: Vec<RoutingRule>,
+    /// Elevated serving classes this alias has activated (`deployed_models.serving_classes`).
+    serving_classes: Vec<ServingClass>,
 
     // Fallback / backoff config. Standard (single-provider) models only retry
     // when fallback is on AND `with_replacement` is true (otherwise the
@@ -114,6 +118,77 @@ struct OnwardsApiKey {
     /// Account-wide zero-data-retention flag on the api_key's owning user.
     /// Surfaced to onwards as a "zdr" key label; onwards does not act on it yet.
     zero_data_retention: bool,
+    /// The owning account (`api_keys.user_id`): the org for org keys. Keys the
+    /// account's overlays and account settings.
+    user_id: UserId,
+    /// Serving class this key requests by default (`api_keys.serving_class`).
+    serving_class: Option<ServingClass>,
+    /// Account setting: default serving class (`users.default_serving_class`).
+    user_default_serving_class: Option<ServingClass>,
+    /// Account setting: never fall over to an external provider (`users.self_hosted_only`).
+    user_self_hosted_only: bool,
+}
+
+/// An org's overlays across models, keyed by model alias, as read from
+/// `model_overlays`. Shared by every key the org owns.
+type OverlaysByOwner = HashMap<UserId, HashMap<String, ServingOverlay>>;
+
+/// Parse a stored class name; the CHECK constraints guarantee the set, so an
+/// unknown value is a schema drift worth a warning rather than a crash.
+fn parse_stored_class(value: Option<&str>) -> Option<ServingClass> {
+    let value = value?;
+    match value.parse::<ServingClass>() {
+        Ok(class) => Some(class),
+        Err(err) => {
+            warn!(%err, "ignoring unknown serving class stored in the database");
+            None
+        }
+    }
+}
+
+fn parse_stored_classes(values: &[String]) -> Vec<ServingClass> {
+    values.iter().filter_map(|v| parse_stored_class(Some(v))).collect()
+}
+
+/// Loads every org's overlays, keyed by owner then alias.
+async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByOwner, anyhow::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT mo.user_id, dm.alias, mo.granted_classes, mo.default_serving_class, mo.self_hosted_only
+        FROM model_overlays mo
+        INNER JOIN deployed_models dm ON dm.id = mo.deployed_model_id
+        WHERE dm.deleted = FALSE
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut overlays: OverlaysByOwner = HashMap::new();
+    for row in rows {
+        overlays.entry(row.user_id).or_default().insert(
+            row.alias,
+            ServingOverlay {
+                granted: parse_stored_classes(&row.granted_classes),
+                default_class: parse_stored_class(row.default_serving_class.as_deref()),
+                self_hosted_only: row.self_hosted_only,
+            },
+        );
+    }
+    Ok(overlays)
+}
+
+/// The serving policy onwards attaches to a key: the key's own class, the
+/// owning account's settings and every overlay the account holds. `None`
+/// when nothing is set, so an unaffected key's definition is byte-identical
+/// to before serving classes existed.
+fn key_serving_policy(api_key: &OnwardsApiKey, overlays: &OverlaysByOwner) -> Option<KeyServing> {
+    let policy = KeyServing {
+        class: api_key.serving_class,
+        default_class: api_key.user_default_serving_class,
+        self_hosted_only: api_key.user_self_hosted_only,
+        overlays: overlays.get(&api_key.user_id).cloned().unwrap_or_default(),
+    };
+    (!policy.is_empty()).then_some(policy)
 }
 
 /// Manages the integration between onwards-pilot and the onwards proxy
@@ -510,6 +585,8 @@ struct OnwardsCompositeModel {
     trusted: bool,
     /// Traffic routing rules from the database
     routing_rules: Vec<RoutingRule>,
+    /// Elevated serving classes this alias has activated.
+    serving_classes: Vec<ServingClass>,
     components: Vec<CompositeModelComponent>,
     // API keys that have access to this composite model
     api_keys: Vec<OnwardsApiKey>,
@@ -590,7 +667,11 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ak.requests_per_second,
             ak.burst_size,
             ak.user_verified,
-            ak.user_zero_data_retention
+            ak.user_zero_data_retention,
+            ak.user_id,
+            ak.serving_class,
+            ak.user_default_serving_class,
+            ak.user_self_hosted_only
         FROM deployed_models cm
         CROSS JOIN LATERAL (
             SELECT DISTINCT
@@ -599,8 +680,12 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 ak.purpose,
                 ak.requests_per_second,
                 ak.burst_size,
+                ak.user_id,
+                ak.serving_class,
                 u.verified as user_verified,
-                u.zero_data_retention as user_zero_data_retention
+                u.zero_data_retention as user_zero_data_retention,
+                u.default_serving_class as user_default_serving_class,
+                u.self_hosted_only as user_self_hosted_only
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
             WHERE (
@@ -719,7 +804,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             backoff_jitter,
             backoff_max_total_ms,
             sanitize_responses,
-            trusted
+            trusted,
+            serving_classes
         FROM deployed_models
         WHERE is_composite = TRUE
           AND deleted = FALSE
@@ -760,6 +846,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
                 routing_rules: Vec::new(), // Populated from separate query below
+                serving_classes: parse_stored_classes(&row.serving_classes),
                 components: Vec::new(),
                 api_keys: Vec::new(),
             },
@@ -797,7 +884,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                         row.model_reasoning_translation_overrides,
                         &row.deployment_alias,
                     ),
-                    routing_rules: Vec::new(), // Components don't have their own routing rules
+                    routing_rules: Vec::new(),   // Components don't have their own routing rules
+                    serving_classes: Vec::new(), // Activation is the composite's, not a member's
                     // Components don't surface their own fallback/backoff —
                     // the composite's PoolSpec.fallback drives retries across
                     // the whole pool.
@@ -836,6 +924,10 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     burst_size: row.burst_size,
                     user_verified: row.user_verified,
                     zero_data_retention: row.user_zero_data_retention,
+                    user_id: row.user_id,
+                    serving_class: parse_stored_class(row.serving_class.as_deref()),
+                    user_default_serving_class: parse_stored_class(row.user_default_serving_class.as_deref()),
+                    user_self_hosted_only: row.user_self_hosted_only,
                 });
             }
         }
@@ -859,6 +951,7 @@ fn convert_composite_to_target_spec(
     composite: &OnwardsCompositeModel,
     key_definitions: &mut HashMap<String, KeyDefinition>,
     rate_limit_tiers: &RateLimitTiersConfig,
+    overlays: &OverlaysByOwner,
 ) -> (String, TargetSpecOrList) {
     // Add this composite model's API keys to key_definitions
     for api_key in &composite.api_keys {
@@ -886,6 +979,7 @@ fn convert_composite_to_target_spec(
                 rate_limit,
                 concurrency_limit: None,
                 labels,
+                serving: key_serving_policy(api_key, overlays),
             },
         );
     }
@@ -1084,6 +1178,12 @@ fn convert_composite_to_target_spec(
         } else {
             inheritable_routing_rules(&composite.routing_rules)
         },
+        // Activation is a property of the alias, declared on its default pool.
+        serving_classes: if pool_name == DEFAULT_COMPONENT_POOL {
+            composite.serving_classes.clone()
+        } else {
+            Vec::new()
+        },
     };
 
     let mut pools: HashMap<String, PoolSpec> = pool_providers
@@ -1143,6 +1243,7 @@ fn convert_to_config_file(
     composites: Vec<OnwardsCompositeModel>,
     strict_mode: bool,
     rate_limit_tiers: &RateLimitTiersConfig,
+    overlays: &OverlaysByOwner,
 ) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
@@ -1177,6 +1278,7 @@ fn convert_to_config_file(
                         rate_limit,
                         concurrency_limit: None,
                         labels,
+                        serving: key_serving_policy(api_key, overlays),
                     },
                 );
             }
@@ -1281,6 +1383,7 @@ fn convert_to_config_file(
                 sanitize_response: target.sanitize_responses,
                 trusted: false,
                 routing_rules: target.routing_rules,
+                serving_classes: target.serving_classes,
             };
 
             (target.alias, TargetSpecOrList::Pool(pool_spec))
@@ -1299,7 +1402,7 @@ fn convert_to_config_file(
             );
         }
 
-        let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions, rate_limit_tiers);
+        let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions, rate_limit_tiers, overlays);
         target_specs.insert(alias, spec);
     }
 
@@ -1377,7 +1480,12 @@ pub async fn load_targets_from_db(
             ak.requests_per_second as api_key_requests_per_second,
             ak.burst_size as api_key_burst_size,
             ak.user_verified as "api_key_user_verified?",
-            ak.user_zero_data_retention as "api_key_user_zero_data_retention?"
+            ak.user_zero_data_retention as "api_key_user_zero_data_retention?",
+            ak.user_id as "api_key_user_id?",
+            ak.serving_class as api_key_serving_class,
+            ak.user_default_serving_class as api_key_user_default_serving_class,
+            ak.user_self_hosted_only as "api_key_user_self_hosted_only?",
+            dm.serving_classes
         FROM deployed_models dm
         INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
         LEFT JOIN LATERAL (
@@ -1387,8 +1495,12 @@ pub async fn load_targets_from_db(
                 ak.purpose,
                 ak.requests_per_second,
                 ak.burst_size,
+                ak.user_id,
+                ak.serving_class,
                 u.verified as user_verified,
-                u.zero_data_retention as user_zero_data_retention
+                u.zero_data_retention as user_zero_data_retention,
+                u.default_serving_class as user_default_serving_class,
+                u.self_hosted_only as user_self_hosted_only
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
             WHERE (
@@ -1508,6 +1620,7 @@ pub async fn load_targets_from_db(
                     &row.alias,
                 ),
                 routing_rules: Vec::new(), // Populated from separate query below
+                serving_classes: parse_stored_classes(&row.serving_classes),
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
                 fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
@@ -1533,12 +1646,22 @@ pub async fn load_targets_from_db(
         // tie it to the same "row materialised" check as the other api_key columns
         // so a future schema/SQL change can't silently demote keys to the
         // unverified tier.
-        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(user_verified), Some(zero_data_retention)) = (
+        if let (
+            Some(api_key_id),
+            Some(api_key_secret),
+            Some(api_key_purpose),
+            Some(user_verified),
+            Some(zero_data_retention),
+            Some(user_id),
+            Some(user_self_hosted_only),
+        ) = (
             row.api_key_id,
             row.api_key_secret,
             row.api_key_purpose,
             row.api_key_user_verified,
             row.api_key_user_zero_data_retention,
+            row.api_key_user_id,
+            row.api_key_user_self_hosted_only,
         ) {
             target.api_keys.push(OnwardsApiKey {
                 id: api_key_id,
@@ -1548,6 +1671,10 @@ pub async fn load_targets_from_db(
                 burst_size: row.api_key_burst_size,
                 user_verified,
                 zero_data_retention,
+                user_id,
+                serving_class: parse_stored_class(row.api_key_serving_class.as_deref()),
+                user_default_serving_class: parse_stored_class(row.api_key_user_default_serving_class.as_deref()),
+                user_self_hosted_only,
             });
         }
     }
@@ -1610,7 +1737,10 @@ pub async fn load_targets_from_db(
         .collect();
 
     // Convert to ConfigFile format
-    let config = convert_to_config_file(targets, composites, strict_mode, rate_limit_tiers);
+    // Overlays are per org, shared by every key the org owns; load them once.
+    let overlays = load_overlays_from_db(db).await?;
+
+    let config = convert_to_config_file(targets, composites, strict_mode, rate_limit_tiers, &overlays);
 
     // Convert ConfigFile to Targets
     Targets::from_config(config)

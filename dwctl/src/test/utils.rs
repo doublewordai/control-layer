@@ -545,6 +545,8 @@ pub async fn get_system_user(pool: &mut PgConnection) -> UserResponse {
         organizations: None,
         active_organization_id: None,
         onboarding_redirect_url: None,
+        default_serving_class: None,
+        self_hosted_only: false,
     }
 }
 
@@ -572,6 +574,7 @@ pub async fn create_test_api_key_for_user(pool: &PgPool, user_id: UserId) -> Api
             member_id: None,
             spend_limit: None,
             spend_limit_interval: None,
+            serving_class: None,
         },
     );
 
@@ -737,6 +740,8 @@ pub async fn create_test_org(pool: &PgPool, created_by: UserId) -> UserResponse 
         organizations: None,
         active_organization_id: None,
         onboarding_redirect_url: None,
+        default_serving_class: None,
+        self_hosted_only: false,
     }
 }
 

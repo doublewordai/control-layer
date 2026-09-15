@@ -38,6 +38,7 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         reasoning_translation: None,
         endpoint_url: url::Url::parse(endpoint_url).unwrap(),
         routing_rules: Vec::new(),
+        serving_classes: Vec::new(),
         fallback_enabled: false,
         fallback_on_rate_limit: false,
         fallback_on_status: Vec::new(),
@@ -81,7 +82,7 @@ fn test_convert_to_config_file() {
     let target2 = create_test_target("claude-3", "claude-alias", "https://api.anthropic.com");
 
     let targets = vec![target1, target2];
-    let config = convert_to_config_file(targets, vec![], false, &RateLimitTiersConfig::default());
+    let config = convert_to_config_file(targets, vec![], false, &RateLimitTiersConfig::default(), &Default::default());
 
     // Verify the config
     assert_eq!(config.targets.len(), 2);
@@ -116,7 +117,7 @@ fn test_convert_to_config_file_with_single_target() {
     let target = create_test_target("valid-model", "valid-alias", "https://api.valid.com");
 
     let targets = vec![target];
-    let config = convert_to_config_file(targets, vec![], false, &RateLimitTiersConfig::default());
+    let config = convert_to_config_file(targets, vec![], false, &RateLimitTiersConfig::default(), &Default::default());
 
     // Should have exactly one target
     assert_eq!(config.targets.len(), 1);
@@ -1630,6 +1631,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             created_by: test_user.id,
             spend_limit: None,
             spend_limit_interval: None,
+            serving_class: None,
         })
         .await
         .unwrap();
@@ -1938,4 +1940,88 @@ async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool
     let regular = targets.targets.get("regular-public").expect("regular-public should exist");
     assert_eq!(regular.value().pool_count(), 1);
     assert!(regular.value().resolved_name(onwards::target::RequestClass::Completions).is_none());
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_cache_shape_serving_policy_and_active_classes(pool: sqlx::PgPool) {
+    use onwards::{KeyServing, ServingClass, ServingOverlay};
+
+    // The model activates both elevated classes; user A holds a key-level
+    // class, account settings, and an overlay on the model; user B has none.
+    sqlx::query!("UPDATE deployed_models SET serving_classes = '{interactive,throughput}' WHERE alias = 'regular-public'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query!("UPDATE api_keys SET serving_class = 'interactive' WHERE secret = $1", KEY_A_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query!(
+        "UPDATE users SET default_serving_class = 'throughput', self_hosted_only = true WHERE id = '00000000-0000-0000-0000-0000000000a1'"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query!(
+        r#"INSERT INTO model_overlays (user_id, deployed_model_id, tariff_name, granted_classes, default_serving_class, self_hosted_only)
+           VALUES ('00000000-0000-0000-0000-0000000000a1', '40000000-0000-0000-0000-000000000001', 'bespoke', '{interactive}', NULL, false)"#
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+
+    let policy = targets
+        .key_serving
+        .get(KEY_A_SECRET)
+        .expect("user A's key carries a serving policy");
+    assert_eq!(
+        *policy.value(),
+        KeyServing {
+            class: Some(ServingClass::Interactive),
+            default_class: Some(ServingClass::Throughput),
+            self_hosted_only: true,
+            overlays: std::collections::HashMap::from([(
+                "regular-public".to_string(),
+                ServingOverlay {
+                    granted: vec![ServingClass::Interactive],
+                    default_class: None,
+                    self_hosted_only: Some(false),
+                },
+            )]),
+        }
+    );
+    assert!(
+        targets.key_serving.get(KEY_B_SECRET).is_none(),
+        "a key with nothing set carries no policy, so its definition is byte-identical to before"
+    );
+    assert!(targets.key_serving.get(KEY_BATCH_SECRET).is_none());
+
+    let public = targets.targets.get("regular-public").unwrap();
+    assert_eq!(
+        public.value().active_serving_classes(),
+        &[ServingClass::Interactive, ServingClass::Throughput]
+    );
+    let private = targets.targets.get("regular-private").unwrap();
+    assert!(private.value().active_serving_classes().is_empty());
+    let composite = targets.targets.get("composite-priority").unwrap();
+    assert!(composite.value().active_serving_classes().is_empty());
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn test_cache_shape_composite_active_classes_sit_on_the_default_pool(pool: sqlx::PgPool) {
+    use onwards::ServingClass;
+
+    sqlx::query!("UPDATE deployed_models SET serving_classes = '{throughput}' WHERE alias = 'composite-priority'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").unwrap();
+    assert_eq!(composite.value().active_serving_classes(), &[ServingClass::Throughput]);
 }

@@ -9,6 +9,7 @@ use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::models::ListModelResponse;
 use crate::sse::SseBufferedStream;
+use crate::serving::{self, RequestedServingClass, ServingClassOutcome, ServingResolution};
 use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
 use axum::{
     Json,
@@ -305,6 +306,25 @@ pub struct ServedBy {
     pub onwards_model: Option<String>,
 }
 
+/// Rewrite the request body's `model` to the bare alias after a class suffix
+/// was stripped. Bodies that do not parse (or carry no `model`) are returned
+/// untouched: the `Model-Override` header path has no body model to rewrite.
+fn rewrite_body_model(body: axum::body::Bytes, alias: &str) -> axum::body::Bytes {
+    if body.is_empty() {
+        return body;
+    }
+    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    match parsed.get_mut("model") {
+        Some(model) if model.is_string() => {
+            *model = serde_json::Value::String(alias.to_string());
+            serde_json::to_vec(&parsed).map(Into::into).unwrap_or(body)
+        }
+        _ => body,
+    }
+}
+
 /// Resolve whether W3C trace context headers should be propagated to an
 /// upstream provider. The per-provider `propagate_trace_context` overrides;
 /// when unset, defaults to the resolved trusted value (per-provider `trusted`
@@ -431,6 +451,8 @@ pub async fn target_message_handler<T: HttpClient>(
         otel.name = "onwards.request",
         gen_ai.request.model = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
+        onwards.serving.requested = tracing::field::Empty,
+        onwards.serving.resolved = tracing::field::Empty,
     );
 
     // Extract W3C trace context (traceparent + tracestate) from inbound headers
@@ -481,6 +503,26 @@ pub async fn target_message_handler<T: HttpClient>(
                 "Could not parse onwards model from request. 'model' parameter must be supplied in either the body or in the Model-Override header.",
                 Some("model"),
             ));
+        }
+    };
+
+    // A class suffix (`alias:interactive`) is a request for a serving class,
+    // not part of the model's identity. dwctl strips it ahead of us and hands
+    // the class over as an extension so every layer above keys on the bare
+    // alias; a suffix that still reaches here (standalone deployments, direct
+    // callers) is parsed the same way, and the body rewritten so no upstream
+    // ever sees it. An unknown class is a 400, never silently ignored.
+    let suffix_class = req.extensions().get::<RequestedServingClass>().map(|c| c.0);
+    let (model_name, suffix_class, body_bytes) = match serving::split_class_suffix(&model_name) {
+        Ok((_, None)) => (model_name, suffix_class, body_bytes),
+        Ok((alias, Some(class))) => {
+            let alias = alias.to_string();
+            let body_bytes = rewrite_body_model(body_bytes, &alias);
+            (alias, suffix_class.or(Some(class)), body_bytes)
+        }
+        Err(unknown) => {
+            record_response_status(400);
+            return Err(OnwardsErrorResponse::bad_request(&unknown.to_string(), Some("model")));
         }
     };
 
@@ -623,6 +665,39 @@ pub async fn target_message_handler<T: HttpClient>(
             }
         // If no bearer token, no labels to match — rules are skipped (allow by default)
     }
+
+    // Resolve the serving class: one flat field from the request's suffix, the
+    // key's policy (its own class, the account's settings, the account's
+    // overlay for THIS alias) and the alias's active classes. Done after
+    // routing rules so a redirected request is resolved against the pool
+    // that will serve it; the overlay is still looked up by the alias the
+    // customer called, which is the name the deal was made against.
+    let serving_resolution: ServingResolution = {
+        let key_serving = bearer_token.and_then(|token| state.targets.key_serving.get(token).map(|r| r.value().clone()));
+        let key_purpose = bearer_token
+            .and_then(|token| state.targets.key_labels.get(token))
+            .and_then(|labels| labels.get("purpose").cloned());
+        let resolution = serving::resolve(
+            suffix_class,
+            key_serving.as_ref(),
+            &model_name,
+            pool.serving_classes(),
+            key_purpose.as_deref(),
+        );
+        let span = tracing::Span::current();
+        if let Some(requested) = resolution.requested {
+            span.record("onwards.serving.requested", requested.as_str());
+        }
+        span.record("onwards.serving.resolved", resolution.resolved.as_str());
+        metrics::counter!(
+            "onwards_serving_class_requests_total",
+            "model" => model_name.to_string(),
+            "requested" => resolution.requested.map(|c| c.as_str()).unwrap_or(""),
+            "resolved" => resolution.resolved.as_str(),
+        )
+        .increment(1);
+        resolution
+    };
 
     let canonical_reasoning = if let Some(reasoning) = req
         .extensions()
@@ -789,6 +864,24 @@ pub async fn target_message_handler<T: HttpClient>(
         });
 
     for (_member_idx, target, connection_guard) in pool.select_iter() {
+        // A self-hosted-only account never reaches an external member: the
+        // composite's eligible set is narrowed to its trusted (self-hosted)
+        // providers for this request, whatever the alias's own failover list
+        // says. The skipped member still consumes an attempt from the budget,
+        // so a pool of [dynamo, openrouter] ends with the dynamo outcome
+        // rather than an external one.
+        if serving_resolution.self_hosted_only && !target.trusted.unwrap_or_else(|| pool.is_trusted()) {
+            debug!(
+                "Skipping external provider {} for a self-hosted-only account",
+                target.url
+            );
+            metrics::counter!(
+                "onwards_self_hosted_only_skips_total",
+                "model" => model_name.to_string(),
+            )
+            .increment(1);
+            continue;
+        }
         any_attempted = true;
         attempt_number += 1;
         // This attempt's first-frame deadline; `None` on the final attempt.
@@ -1002,6 +1095,26 @@ pub async fn target_message_handler<T: HttpClient>(
 
         // Filter headers for upstream forwarding
         filter_headers_for_upstream(&mut attempt_headers, target);
+
+        // Stamp the v1 envelope — pool tag plus priority band — on a member
+        // whose serving stack understands scheduling fields (the dynamo
+        // frontend). Only elevated classes carry anything: `standard` and the
+        // daemon legs travel untagged, byte-identical to today, so a partial
+        // rollout is safe. Headers already present are overwritten, never
+        // removed: this same crate runs again as the hop inside the serving
+        // namespace, with no key policy of its own, and must forward what the
+        // first hop stamped. Client-supplied values are scrubbed at dwctl's
+        // ingress, alongside the body priority (the same perimeter the
+        // priority strip relies on).
+        if target.accepts_scheduling_priority
+            && let Some(tag) = serving_resolution.resolved.pool_tag()
+        {
+            attempt_headers.insert(serving::POOL_TAG_HEADER, HeaderValue::from_static(tag));
+            attempt_headers.insert(
+                serving::PRIORITY_HEADER,
+                HeaderValue::from(serving_resolution.resolved.priority_band()),
+            );
+        }
 
         // Apply W3C trace-context policy for this upstream, gated on the
         // per-target propagate_trace_context flag (defaults to the resolved
@@ -1631,6 +1744,9 @@ pub async fn target_message_handler<T: HttpClient>(
             url: target.url.to_string(),
             onwards_model: target.onwards_model.clone(),
         });
+        response
+            .extensions_mut()
+            .insert::<ServingClassOutcome>(serving_resolution.outcome());
 
         // Attach the connection guard and inflight guard to the response body so both
         // are decremented when the body stream completes, not when the handler returns.
@@ -2626,6 +2742,7 @@ mod tests {
                 key_rate_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
                 key_concurrency_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
                 key_labels: std::sync::Arc::new(dashmap::DashMap::new()),
+                key_serving: std::sync::Arc::new(dashmap::DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             },

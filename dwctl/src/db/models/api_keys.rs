@@ -71,6 +71,8 @@ pub struct ApiKeyCreateDBRequest {
     /// also mint the cap-scope child key (handler responsibility).
     pub spend_limit: Option<Decimal>,
     pub spend_limit_interval: Option<String>,
+    /// Serving class requested by default (validated against the class set by the handler).
+    pub serving_class: Option<String>,
 }
 
 impl ApiKeyCreateDBRequest {
@@ -85,6 +87,7 @@ impl ApiKeyCreateDBRequest {
             created_by,
             spend_limit: create.spend_limit,
             spend_limit_interval: create.spend_limit_interval,
+            serving_class: create.serving_class,
         }
     }
 }
@@ -96,6 +99,8 @@ pub struct ApiKeyUpdateDBRequest {
     pub description: Option<String>,
     pub requests_per_second: Option<Option<f32>>,
     pub burst_size: Option<Option<i32>>,
+    /// None = unchanged, Some(None) = clear, Some(Some(class)) = set.
+    pub serving_class: Option<Option<String>>,
 }
 
 /// Database response for an API key
@@ -129,6 +134,8 @@ pub struct ApiKeyDBResponse {
     /// an issued key awaiting its holder's one-off reveal; self-created keys
     /// are born revealed. Rotation never touches this.
     pub secret_revealed_at: Option<DateTime<Utc>>,
+    /// Serving class requested by default (migration 143). NULL = none.
+    pub serving_class: Option<String>,
 }
 
 /// Spend display state for one cap scope (read from `api_key_spend_checkpoints`

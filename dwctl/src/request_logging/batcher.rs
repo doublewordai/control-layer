@@ -119,6 +119,10 @@ pub struct RawAnalyticsRecord {
     /// URL of the upstream that served the request (onwards `ServedBy`
     /// extension) — per-component attribution for composite models.
     pub served_by: Option<String>,
+    /// Serving class the request asked for / was served under (onwards
+    /// `ServingClassOutcome` extension). See `serializers::UsageMetrics`.
+    pub requested_serving_class: Option<String>,
+    pub resolved_serving_class: Option<String>,
 
     // === Auth (unresolved - just the token) ===
     /// The bearer token from the Authorization header (not yet resolved to user_id)
@@ -831,6 +835,8 @@ where
         let mut total_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut uncached_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut served_by_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut requested_class_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut resolved_class_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut finish_reason_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut user_agent_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut submitted_at_vec: Vec<Option<DateTime<Utc>>> = Vec::with_capacity(records.len());
@@ -888,6 +894,8 @@ where
             total_cost_vec.push(record.total_cost);
             uncached_cost_vec.push(record.uncached_cost);
             served_by_vec.push(record.raw.served_by.clone());
+            requested_class_vec.push(record.raw.requested_serving_class.clone());
+            resolved_class_vec.push(record.raw.resolved_serving_class.clone());
             finish_reason_vec.push(record.raw.finish_reason.clone());
             user_agent_vec.push(record.raw.user_agent.clone());
             // Already carried for batch-creation pricing; now also persisted, so the
@@ -917,7 +925,7 @@ where
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
                 total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at,
                 engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count,
-                cache_read_source
+                cache_read_source, requested_serving_class, resolved_serving_class
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -930,7 +938,7 @@ where
                 $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],
                 $37::timestamptz[],
                 $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[],
-                $46::text[]
+                $46::text[], $47::text[], $48::text[]
             )
             ON CONFLICT (instance_id, correlation_id)
             DO UPDATE SET
@@ -973,7 +981,9 @@ where
                 n = EXCLUDED.n,
                 tool_count = EXCLUDED.tool_count,
                 message_count = EXCLUDED.message_count,
-                cache_read_source = EXCLUDED.cache_read_source
+                cache_read_source = EXCLUDED.cache_read_source,
+                requested_serving_class = EXCLUDED.requested_serving_class,
+                resolved_serving_class = EXCLUDED.resolved_serving_class
             RETURNING id, instance_id, correlation_id, (xmax = 0) AS "newly_inserted!"
             "#,
             &instance_ids,
@@ -1022,6 +1032,8 @@ where
             &tool_count_vec as &[Option<i32>],
             &message_count_vec as &[Option<i32>],
             &cache_read_source_vec as &[Option<String>],
+            &requested_class_vec as &[Option<String>],
+            &resolved_class_vec as &[Option<String>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1740,6 +1752,8 @@ mod tests {
     fn test_raw_analytics_record_creation() {
         let record = RawAnalyticsRecord {
             served_by: None,
+            requested_serving_class: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 123,
             timestamp: chrono::Utc::now(),
@@ -1793,6 +1807,8 @@ mod tests {
     fn cost_record(prompt: i64, completion: i64, read: i64, c5: i64, c1: i64, c24: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
             served_by: None,
+            requested_serving_class: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 1,
             timestamp: chrono::Utc::now(),
@@ -2053,6 +2069,7 @@ mod integration_tests {
                 created_by: user_id,
                 spend_limit: None,
                 spend_limit_interval: None,
+                serving_class: None,
             })
             .await
             .unwrap();
@@ -2064,6 +2081,8 @@ mod integration_tests {
     fn create_raw_record(model: &str, bearer_token: Option<String>, prompt_tokens: i64, completion_tokens: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
             served_by: None,
+            requested_serving_class: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: rand::random::<i64>().abs(),
             timestamp: chrono::Utc::now(),

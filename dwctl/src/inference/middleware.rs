@@ -98,7 +98,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     }
 
     // Read and parse the request body
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
+    strip_serving_envelope_headers(&mut parts.headers);
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -122,7 +123,34 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // extension fields and a legitimate `previous_response_id` are left intact.
     scrub_request_id_fields(&mut request_value);
 
-    strip_scheduling_priority(&mut request_value);
+    let scrubbed_pool_field = strip_scheduling_priority(&mut request_value);
+
+    // A serving-class suffix (`alias:interactive`) is a request for a class,
+    // not part of the model's identity: strip it here, at the outermost layer,
+    // so analytics, the prompt cache and billing all key on the bare alias,
+    // and hand the class to onwards as a request extension. An unknown class
+    // is a 400 (a typo must not silently change how a request is served).
+    let requested_class = match strip_serving_class_suffix(&mut request_value) {
+        Ok(class) => class,
+        Err(err) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"error": {"message": err.to_string(), "type": "invalid_request_error", "param": "model"}})
+                        .to_string(),
+                ))
+                .unwrap();
+        }
+    };
+
+    // The realtime path forwards `body_bytes` verbatim; a stripped suffix (or
+    // a scrubbed pool field) must not survive in them.
+    let body_bytes = if requested_class.is_some() || scrubbed_pool_field {
+        bytes::Bytes::from(request_value.to_string())
+    } else {
+        body_bytes
+    };
 
     let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
     let model = model.as_str();
@@ -244,6 +272,11 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             .unwrap();
     }
     let is_daemon_processed = matches!(service_tier, ServiceTier::Flex | ServiceTier::Background);
+    // Daemon-processed tiers always run as `standard` (their deadline priority
+    // carries the ordering): a suffix on them is dropped and logged, not rejected.
+    if is_daemon_processed && let Some(class) = requested_class {
+        tracing::info!(model = %model, service_tier = %service_tier, requested_class = %class, "Serving-class suffix ignored on a daemon-processed tier");
+    }
 
     tracing::debug!(
         model = %model,
@@ -422,7 +455,19 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 api_key: api_key.clone().unwrap_or_default(),
                 created_by: created_by.unwrap_or_default(),
             };
-            handle_realtime(&state, realtime_input, &resp_id, model, background, zdr, parts, body_bytes, next).await
+            handle_realtime(
+                &state,
+                realtime_input,
+                &resp_id,
+                model,
+                background,
+                zdr,
+                requested_class,
+                parts,
+                body_bytes,
+                next,
+            )
+            .await
         }
         ServiceTier::Flex | ServiceTier::Background => {
             let is_background_tier = matches!(service_tier, ServiceTier::Background);
@@ -775,6 +820,7 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     model: &str,
     background: bool,
     zdr: bool,
+    requested_class: Option<onwards::ServingClass>,
     parts: axum::http::request::Parts,
     body_bytes: bytes::Bytes,
     next: Next,
@@ -803,6 +849,9 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     // Strip the "resp_" prefix — onwards re-adds it.
     let raw_id = resp_id.strip_prefix("resp_").unwrap_or(resp_id);
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
+    if let Some(class) = requested_class {
+        req.extensions_mut().insert(onwards::RequestedServingClass(class));
+    }
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
     req.headers_mut().insert(
@@ -1194,7 +1243,12 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) {
 /// (shared-locations.conf.gotmpl, "dont allow fusillade header spoofing") — a
 /// dwctl reachable without traversing that proxy would let a client set the
 /// header and skip this strip. Defense-in-depth here depends on that perimeter.
-fn strip_scheduling_priority(value: &mut serde_json::Value) {
+///
+/// Returns whether the typed pool selector (`nvext.interactivity_pool`) was
+/// removed: unlike `priority`, that field is not in onwards' strict schema, so
+/// the caller must re-serialise the body for it to actually be gone.
+fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
+    let mut scrubbed_pool_field = false;
     if let Some(obj) = value.as_object_mut() {
         obj.remove("priority");
         // The carrier the dynamo frontend ACTUALLY honours is
@@ -1202,15 +1256,43 @@ fn strip_scheduling_priority(value: &mut serde_json::Value) {
         // its validation) — remove exactly that key so an external caller
         // cannot steer the scheduler through the vendor extension, while the
         // rest of a caller's `nvext` (e.g. cache_control) passes through.
-        if let Some(hints) = obj
-            .get_mut("nvext")
-            .and_then(|n| n.as_object_mut())
-            .and_then(|n| n.get_mut("agent_hints"))
-            .and_then(|h| h.as_object_mut())
-        {
-            hints.remove("priority");
+        if let Some(nvext) = obj.get_mut("nvext").and_then(|n| n.as_object_mut()) {
+            // The serving-class pool selector is ours to set (onwards stamps
+            // it as a header after resolution), never the caller's.
+            scrubbed_pool_field = nvext.remove(onwards::serving::NVEXT_POOL_FIELD).is_some();
+            if let Some(hints) = nvext.get_mut("agent_hints").and_then(|h| h.as_object_mut()) {
+                hints.remove("priority");
+            }
         }
     }
+    scrubbed_pool_field
+}
+
+/// Remove the serving-class envelope headers a caller may have sent. Only
+/// onwards' resolver sets them, on the member that understands them; anything
+/// inbound is an attempt to steer the serving stack directly. Same perimeter
+/// argument as [`strip_scheduling_priority`]: internal legs (fusillade,
+/// continuation) never pass through here and keep what they carry.
+fn strip_serving_envelope_headers(headers: &mut axum::http::HeaderMap) {
+    headers.remove(onwards::serving::POOL_TAG_HEADER);
+    headers.remove(onwards::serving::PRIORITY_HEADER);
+}
+
+/// Strip a serving-class suffix (`alias:class`) from the request's `model`,
+/// in place, returning the requested class. A model without a suffix is left
+/// untouched; an unknown class is an error listing the valid set.
+fn strip_serving_class_suffix(
+    value: &mut serde_json::Value,
+) -> Result<Option<onwards::ServingClass>, onwards::serving::UnknownServingClass> {
+    let Some(model) = value.get("model").and_then(|m| m.as_str()) else {
+        return Ok(None);
+    };
+    let (alias, class) = onwards::serving::split_class_suffix(model)?;
+    if class.is_some() {
+        let alias = alias.to_string();
+        value["model"] = serde_json::Value::String(alias);
+    }
+    Ok(class)
 }
 
 #[cfg(test)]
@@ -1247,6 +1329,54 @@ mod tests {
         let mut clean = serde_json::json!({"model": "m"});
         strip_scheduling_priority(&mut clean);
         assert_eq!(clean, serde_json::json!({"model": "m"}));
+    }
+
+    #[test]
+    fn serving_class_suffix_is_stripped_and_returned() {
+        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2:interactive", "messages": []});
+        let class = strip_serving_class_suffix(&mut body).unwrap();
+        assert_eq!(class, Some(onwards::ServingClass::Interactive));
+        assert_eq!(body["model"], "zai-org/GLM-5.2", "layers above onwards key on the bare alias");
+
+        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2", "messages": []});
+        assert_eq!(strip_serving_class_suffix(&mut body).unwrap(), None);
+        assert_eq!(body["model"], "zai-org/GLM-5.2");
+
+        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2:fast"});
+        let err = strip_serving_class_suffix(&mut body).unwrap_err();
+        assert!(err.to_string().contains("'fast'"));
+        assert_eq!(body["model"], "zai-org/GLM-5.2:fast", "an invalid request is left as sent");
+
+        // No model at all (Model-Override header path): nothing to do.
+        let mut body = serde_json::json!({"messages": []});
+        assert_eq!(strip_serving_class_suffix(&mut body).unwrap(), None);
+    }
+
+    #[test]
+    fn serving_envelope_headers_are_removed_from_external_requests() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(onwards::serving::POOL_TAG_HEADER, "interactive".parse().unwrap());
+        headers.insert(onwards::serving::PRIORITY_HEADER, "999".parse().unwrap());
+        headers.insert("x-custom", "keep".parse().unwrap());
+        strip_serving_envelope_headers(&mut headers);
+        assert!(!headers.contains_key(onwards::serving::POOL_TAG_HEADER));
+        assert!(!headers.contains_key(onwards::serving::PRIORITY_HEADER));
+        assert_eq!(headers.get("x-custom").unwrap(), "keep");
+    }
+
+    #[test]
+    fn strip_scheduling_priority_also_scrubs_the_pool_selector() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {"interactivity_pool": "interactive", "cache_control": {"enabled": true}, "agent_hints": {"priority": 5}}
+        });
+        assert!(strip_scheduling_priority(&mut body), "the pool field was present and removed");
+        assert!(body["nvext"].get("interactivity_pool").is_none());
+        assert!(body["nvext"]["agent_hints"].get("priority").is_none());
+        assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+
+        let mut body = serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}});
+        assert!(!strip_scheduling_priority(&mut body), "nothing to re-serialise for");
     }
 
     #[test]
@@ -1411,6 +1541,7 @@ mod tests {
                     member_id: None,
                     spend_limit: None,
                     spend_limit_interval: None,
+                    serving_class: None,
                 },
             ))
             .await
@@ -1474,6 +1605,7 @@ mod tests {
                         member_id: None,
                         spend_limit: None,
                         spend_limit_interval: None,
+                        serving_class: None,
                     },
                 ))
                 .await
@@ -1524,6 +1656,7 @@ mod tests {
                         member_id: None,
                         spend_limit: None,
                         spend_limit_interval: None,
+                        serving_class: None,
                     },
                 ))
                 .await

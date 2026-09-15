@@ -9,8 +9,8 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use crate::model_provisioning::{
-    CacheTariff, Catalog, CatalogModel, ClayModel, Component, PhysicalDeployment, ProviderPricing, Tariff, TrafficRule, parse_decimal,
-    parse_per_million,
+    CacheTariff, Catalog, CatalogModel, ClayModel, Component, Overlay, PhysicalDeployment, ProviderPricing, Tariff, TrafficRule,
+    parse_decimal, parse_per_million,
 };
 
 /// A fixed application-level lock ID. Transaction scope makes a crashed startup
@@ -47,6 +47,7 @@ impl<'c> ModelProvisioning<'c> {
             .context("read model provisioning effective timestamp")?;
 
         let (endpoints, groups) = self.preflight_named_references(catalog).await?;
+        let orgs = self.preflight_overlay_orgs(catalog).await?;
         self.preflight_existing_model_types(catalog).await?;
         self.preflight_future_tariffs(catalog, effective_at).await?;
 
@@ -93,6 +94,8 @@ impl<'c> ModelProvisioning<'c> {
             self.reconcile_groups(model_id, &model.clay.access_groups, &groups).await?;
             self.reconcile_traffic_rules(model_id, &model.clay.traffic_rules, &redirect_ids)
                 .await?;
+            self.reconcile_overlays(model_id, &model.source, &model.clay.overlays, &orgs)
+                .await?;
         }
 
         tracing::info!(models = catalog.models.len(), %effective_at, "Applied declarative model catalog");
@@ -114,6 +117,32 @@ impl<'c> ModelProvisioning<'c> {
         let endpoints = resolve_names(self.db, "inference_endpoints", endpoint_names).await?;
         let groups = resolve_names(self.db, "groups", group_names).await?;
         Ok((endpoints, groups))
+    }
+
+    /// Overlays name their organisation by account username; every one must
+    /// exist before anything is written.
+    async fn preflight_overlay_orgs(&mut self, catalog: &Catalog) -> Result<HashMap<String, Uuid>> {
+        let usernames: HashSet<String> = catalog
+            .models
+            .iter()
+            .flat_map(|model| model.clay.overlays.iter().map(|overlay| overlay.org.clone()))
+            .collect();
+        if usernames.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let requested: Vec<String> = usernames.iter().cloned().collect();
+        let rows = sqlx::query("SELECT id, username FROM users WHERE username = ANY($1) AND is_deleted = FALSE")
+            .bind(&requested)
+            .fetch_all(&mut *self.db)
+            .await
+            .context("resolve overlay organisations")?;
+        let resolved: HashMap<String, Uuid> = rows
+            .into_iter()
+            .map(|row| Ok((row.try_get("username")?, row.try_get("id")?)))
+            .collect::<Result<_, sqlx::Error>>()?;
+        let missing: Vec<String> = usernames.into_iter().filter(|name| !resolved.contains_key(name)).collect();
+        ensure!(missing.is_empty(), "unknown overlay organisation(s): {}", missing.join(", "));
+        Ok(resolved)
     }
 
     async fn preflight_existing_model_types(&mut self, catalog: &Catalog) -> Result<()> {
@@ -220,6 +249,13 @@ impl<'c> ModelProvisioning<'c> {
             };
         let source = format!("model-catalog:{}", desired.source);
         let pricing = pricing_fields(provider_pricing)?;
+        // Activation is the virtual model's; a physical deployment row is a
+        // composite member and never activates classes of its own.
+        let serving_classes: Vec<&str> = if is_composite {
+            desired.clay.serving_classes.iter().map(|class| class.as_db_str()).collect()
+        } else {
+            Vec::new()
+        };
         let fallback = &desired.clay.routing.fallback;
         let backoff_enabled = is_composite && fallback.backoff.is_some();
         let backoff_initial = fallback.backoff.as_ref().map_or(100, |backoff| backoff.initial_ms);
@@ -237,11 +273,11 @@ impl<'c> ModelProvisioning<'c> {
                    fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms,
                    backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
                    sanitize_responses, trusted, allowed_batch_completion_windows, metadata,
-                   reasoning_translation_overrides, provisioning_source, deleted, updated_at
+                   reasoning_translation_overrides, provisioning_source, deleted, updated_at, serving_classes
                ) VALUES (
                    $1,$2,$3,$4,$5,$6,'00000000-0000-0000-0000-000000000000',$7,
                    $8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,
-                   $27,$28,$29,$30,$31,$32,$33,$34,$35,$36,FALSE,$37
+                   $27,$28,$29,$30,$31,$32,$33,$34,$35,$36,FALSE,$37,$38
                )
                ON CONFLICT (alias) DO UPDATE SET
                    model_name = EXCLUDED.model_name,
@@ -278,6 +314,7 @@ impl<'c> ModelProvisioning<'c> {
                    metadata = EXCLUDED.metadata,
                    reasoning_translation_overrides = EXCLUDED.reasoning_translation_overrides,
                    provisioning_source = EXCLUDED.provisioning_source,
+                   serving_classes = EXCLUDED.serving_classes,
                    deleted = FALSE,
                    updated_at = CASE WHEN ROW(
                        deployed_models.model_name, deployed_models.display_name, deployed_models.description,
@@ -293,7 +330,8 @@ impl<'c> ModelProvisioning<'c> {
                        deployed_models.backoff_jitter, deployed_models.backoff_max_total_ms,
                        deployed_models.sanitize_responses, deployed_models.trusted,
                        deployed_models.allowed_batch_completion_windows, deployed_models.metadata,
-                       deployed_models.reasoning_translation_overrides, deployed_models.deleted
+                       deployed_models.reasoning_translation_overrides, deployed_models.deleted,
+                       deployed_models.serving_classes
                    ) IS DISTINCT FROM ROW(
                        EXCLUDED.model_name, EXCLUDED.display_name, EXCLUDED.description,
                        EXCLUDED.type, EXCLUDED.capabilities, EXCLUDED.hosted_on,
@@ -314,7 +352,8 @@ impl<'c> ModelProvisioning<'c> {
                        CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.backoff_jitter ELSE deployed_models.backoff_jitter END,
                        CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.backoff_max_total_ms ELSE deployed_models.backoff_max_total_ms END,
                        EXCLUDED.sanitize_responses, EXCLUDED.trusted, EXCLUDED.allowed_batch_completion_windows,
-                       EXCLUDED.metadata, EXCLUDED.reasoning_translation_overrides, FALSE
+                       EXCLUDED.metadata, EXCLUDED.reasoning_translation_overrides, FALSE,
+                       EXCLUDED.serving_classes
                    ) THEN $37 ELSE deployed_models.updated_at END"#,
         )
         .bind(model_name)
@@ -354,6 +393,7 @@ impl<'c> ModelProvisioning<'c> {
         .bind(&settings.reasoning_translation_overrides)
         .bind(source)
         .bind(effective_at)
+        .bind(serving_classes)
         .execute(&mut *self.db)
         .await
         .with_context(|| format!("upsert model alias {alias:?}"))?;
@@ -676,6 +716,57 @@ impl<'c> ModelProvisioning<'c> {
             .execute(&mut *self.db)
             .await
             .context("remove omitted provisioned traffic rules")?;
+        Ok(())
+    }
+
+    /// Materialise the model's overlays. Rows the catalog owns for this model
+    /// but no longer declares are removed; hand-managed rows (NULL
+    /// `provisioning_source`) for orgs the catalog does not mention are left
+    /// alone, so the two can coexist during a migration.
+    async fn reconcile_overlays(&mut self, model_id: Uuid, source: &str, desired: &[Overlay], orgs: &HashMap<String, Uuid>) -> Result<()> {
+        let provisioning_source = format!("model-catalog:{source}");
+        let mut desired_org_ids = Vec::with_capacity(desired.len());
+        for overlay in desired {
+            let org_id = orgs[&overlay.org];
+            desired_org_ids.push(org_id);
+            let granted: Vec<&str> = overlay.classes.iter().map(|class| class.as_db_str()).collect();
+            sqlx::query(
+                r#"INSERT INTO model_overlays (
+                       user_id, deployed_model_id, tariff_name, granted_classes, default_serving_class,
+                       self_hosted_only, provisioning_source
+                   ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+                   ON CONFLICT (user_id, deployed_model_id) DO UPDATE SET
+                       tariff_name = EXCLUDED.tariff_name,
+                       granted_classes = EXCLUDED.granted_classes,
+                       default_serving_class = EXCLUDED.default_serving_class,
+                       self_hosted_only = EXCLUDED.self_hosted_only,
+                       provisioning_source = EXCLUDED.provisioning_source,
+                       updated_at = NOW()
+                   WHERE model_overlays.tariff_name IS DISTINCT FROM EXCLUDED.tariff_name
+                      OR model_overlays.granted_classes IS DISTINCT FROM EXCLUDED.granted_classes
+                      OR model_overlays.default_serving_class IS DISTINCT FROM EXCLUDED.default_serving_class
+                      OR model_overlays.self_hosted_only IS DISTINCT FROM EXCLUDED.self_hosted_only
+                      OR model_overlays.provisioning_source IS DISTINCT FROM EXCLUDED.provisioning_source"#,
+            )
+            .bind(org_id)
+            .bind(model_id)
+            .bind(overlay.tariff.as_deref())
+            .bind(&granted)
+            .bind(overlay.default_class.map(|class| class.as_db_str()))
+            .bind(overlay.self_hosted_only)
+            .bind(&provisioning_source)
+            .execute(&mut *self.db)
+            .await
+            .with_context(|| format!("upsert provisioned overlay for org {:?}", overlay.org))?;
+        }
+        sqlx::query(
+            "DELETE FROM model_overlays WHERE deployed_model_id = $1 AND provisioning_source IS NOT NULL AND NOT (user_id = ANY($2))",
+        )
+        .bind(model_id)
+        .bind(&desired_org_ids)
+        .execute(&mut *self.db)
+        .await
+        .context("remove omitted provisioned overlays")?;
         Ok(())
     }
 }

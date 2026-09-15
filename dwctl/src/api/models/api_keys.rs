@@ -43,6 +43,13 @@ pub struct ApiKeyCreate {
     /// rolling windows). Requires spend_limit.
     #[serde(default)]
     pub spend_limit_interval: Option<String>,
+    /// Serving class this key requests by default (`interactive` or
+    /// `throughput`; null = no key-level preference). A request's own
+    /// `model:class` suffix outranks it. Only takes effect on models that have
+    /// activated the class and for accounts granted it; otherwise requests are
+    /// served as `standard` and the demand is recorded.
+    #[serde(default)]
+    pub serving_class: Option<String>,
 }
 
 // API Key update.
@@ -70,6 +77,10 @@ pub struct ApiKeyUpdate {
     /// may reset them (this does not grant credits).
     #[serde(default)]
     pub reset_window: Option<bool>,
+    /// Serving class this key requests by default. Absent = unchanged;
+    /// explicit null = remove the key-level preference; a value = set it.
+    #[serde(default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
+    pub serving_class: Option<Option<String>>,
 }
 
 // API Key response models
@@ -112,6 +123,8 @@ pub struct ApiKeyResponse {
     pub total_spend: Option<Decimal>,
     /// When the current cap window resets (null for one-off caps and uncapped keys)
     pub resets_at: Option<DateTime<Utc>>,
+    /// Serving class this key requests by default (null = none)
+    pub serving_class: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -152,6 +165,8 @@ pub struct ApiKeyInfoResponse {
     pub total_spend: Option<Decimal>,
     /// When the current cap window resets (null for one-off caps and uncapped keys)
     pub resets_at: Option<DateTime<Utc>>,
+    /// Serving class this key requests by default (null = none)
+    pub serving_class: Option<String>,
 }
 
 /// Response carrying an API key's secret — returned ONLY by the dedicated
@@ -202,6 +217,7 @@ impl From<ApiKeyDBResponse> for ApiKeyResponse {
             spend: None,
             total_spend: None,
             resets_at: None,
+            serving_class: db.serving_class,
         }
     }
 }
@@ -240,6 +256,7 @@ impl From<ApiKeyDBResponse> for ApiKeyInfoResponse {
             spend: None,
             total_spend: None,
             resets_at: None,
+            serving_class: db.serving_class,
         }
     }
 }

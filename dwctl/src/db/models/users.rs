@@ -56,6 +56,11 @@ pub struct UserUpdateDBRequest {
     pub auto_topup_monthly_limit: Option<Option<f32>>,
     /// Account-wide zero-data-retention flag. `None` = don't change.
     pub zero_data_retention: Option<bool>,
+    /// Account setting: default serving class. `None` = don't change,
+    /// `Some(None)` = clear, `Some(Some(class))` = set.
+    pub default_serving_class: Option<Option<String>>,
+    /// Account setting: never fall over to an external provider. `None` = don't change.
+    pub self_hosted_only: Option<bool>,
 }
 
 impl UserUpdateDBRequest {
@@ -71,6 +76,8 @@ impl UserUpdateDBRequest {
             auto_topup_threshold: update.auto_topup_threshold,
             auto_topup_monthly_limit: update.auto_topup_monthly_limit,
             zero_data_retention: update.zero_data_retention,
+            default_serving_class: update.default_serving_class,
+            self_hosted_only: update.self_hosted_only,
         }
     }
 }
@@ -113,4 +120,8 @@ pub struct UserDBResponse {
     pub zero_data_retention: bool,
     /// Bill this account by emailed invoice rather than an immediate card charge.
     pub invoicing_enabled: bool,
+    /// Account setting: serving class the account's requests ask for by default.
+    pub default_serving_class: Option<String>,
+    /// Account setting: never fall over to an external provider.
+    pub self_hosted_only: bool,
 }

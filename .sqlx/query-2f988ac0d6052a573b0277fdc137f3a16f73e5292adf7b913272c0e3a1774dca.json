@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, requests_per_second, burst_size, hidden, spend_limit, spend_limit_interval)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9, $10)\n            RETURNING id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at\n            ",
+  "query": "\n            UPDATE api_keys\n            SET\n                name = COALESCE($2, name),\n                description = CASE\n                    WHEN $3::text IS NOT NULL THEN $3\n                    ELSE description\n                END,\n                requests_per_second = CASE\n                    WHEN $4::real IS NOT NULL THEN $4\n                    ELSE requests_per_second\n                END,\n                burst_size = CASE\n                    WHEN $5::integer IS NOT NULL THEN $5\n                    ELSE burst_size\n                END,\n                serving_class = CASE\n                    WHEN $6::boolean THEN $7\n                    ELSE serving_class\n                END\n            WHERE id = $1\n            RETURNING *\n            ",
   "describe": {
     "columns": [
       {
@@ -87,19 +87,21 @@
         "ordinal": 16,
         "name": "secret_revealed_at",
         "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 17,
+        "name": "serving_class",
+        "type_info": "Text"
       }
     ],
     "parameters": {
       "Left": [
+        "Uuid",
         "Varchar",
         "Text",
-        "Varchar",
-        "Varchar",
-        "Uuid",
-        "Uuid",
         "Float4",
         "Int4",
-        "Numeric",
+        "Bool",
         "Text"
       ]
     },
@@ -120,8 +122,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "0b88997250a93e35e8452e2154cf715ebbb0b5343b02851a4c4bba35c8672070"
+  "hash": "2f988ac0d6052a573b0277fdc137f3a16f73e5292adf7b913272c0e3a1774dca"
 }

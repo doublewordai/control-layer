@@ -498,6 +498,7 @@ mod tests {
             allowed_batch_completion_windows: None,
             metadata: None,
             provisioning_source: None,
+            serving_classes: Vec::new(),
         }
     }
 

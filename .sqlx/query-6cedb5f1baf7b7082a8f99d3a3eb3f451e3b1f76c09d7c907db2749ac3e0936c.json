@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = 'individual'",
+  "query": "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, default_serving_class, self_hosted_only FROM users WHERE external_user_id = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false",
   "describe": {
     "columns": [
       {
@@ -152,6 +152,16 @@
         "ordinal": 29,
         "name": "auto_join_enabled",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 30,
+        "name": "default_serving_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 31,
+        "name": "self_hosted_only",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -189,8 +199,10 @@
       false,
       true,
       false,
+      false,
+      true,
       false
     ]
   },
-  "hash": "d216a676b3e6d53491830096e5d004449ef6d54e1d4f6e104a0a6d94ce6cbad2"
+  "hash": "6cedb5f1baf7b7082a8f99d3a3eb3f451e3b1f76c09d7c907db2749ac3e0936c"
 }

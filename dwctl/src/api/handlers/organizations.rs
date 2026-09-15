@@ -2,6 +2,7 @@
 
 use crate::{
     AppState,
+    api::handlers::validate_elevated_serving_class,
     api::models::{
         organizations::{
             AddMemberRequest, ApproveJoinRequestRequest, InviteDetailsResponse, InviteMemberRequest, InviteMemberResponse,
@@ -618,6 +619,19 @@ pub async fn update_organization<P: PoolProvider>(
             resource: format!("zero data retention for organization {id}"),
         });
     }
+    // The serving account settings change how the organisation's traffic is
+    // routed and prioritised fleet-wide; same gate as ZDR.
+    if !can_all && (data.default_serving_class.is_some() || data.self_hosted_only.is_some()) && caller_org_role.as_deref() != Some("owner")
+    {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
+            action: Operation::UpdateOwn,
+            resource: format!("serving settings for organization {id}"),
+        });
+    }
+    if let Some(Some(class)) = &data.default_serving_class {
+        validate_elevated_serving_class(class)?;
+    }
 
     // SECURITY: same owner-only gate, for the same kind of reason. Auto-join
     // decides who gets into the workspace with nobody reviewing them — it is
@@ -796,6 +810,8 @@ pub async fn update_organization<P: PoolProvider>(
         batch_notifications_enabled: data.batch_notifications_enabled,
         low_balance_threshold: data.low_balance_threshold,
         zero_data_retention: data.zero_data_retention,
+        default_serving_class: data.default_serving_class,
+        self_hosted_only: data.self_hosted_only,
     };
     debug_assert!(
         db_request.email.is_none(),
@@ -2891,6 +2907,8 @@ pub async fn confirm_email_change<P: PoolProvider>(
             batch_notifications_enabled: None,
             low_balance_threshold: None,
             zero_data_retention: None,
+            default_serving_class: None,
+            self_hosted_only: None,
         };
         org_repo.update(pending.organization_id, &update).await?;
         // The `confirm_*_email_side` UPDATE above already locked this row, so
