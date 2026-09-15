@@ -180,7 +180,7 @@ pub struct UsageMetrics {
 /// All `None` when the body did not parse as a typed chat/completions request
 /// (embeddings, the Responses API, opaque bodies). `stream` is `Some(false)` when a typed
 /// request omitted the field, because "not streaming" is the meaningful value there.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RequestParams {
     pub stream: Option<bool>,
     /// `max_completion_tokens` when present, else `max_tokens`.

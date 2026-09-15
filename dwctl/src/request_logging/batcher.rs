@@ -9,17 +9,17 @@
 //! ```text
 //! Request → AnalyticsHandler (extract only) → Channel → AnalyticsBatcher
 //!                                                            ↓
-//!                                                 [Accumulate in buffer]
+//!                                               [Opportunistic batch]
 //!                                                            ↓
-//!                                              [Flush immediately (write-through)]
-//!                                                            ↓
-//!                                              Phase 1: Batch enrich
+//!                                              Phase 1: enrich + publish
 //!                                                - Token → user_id lookup
 //!                                                - Model → pricing lookup
+//!                                                - INSERT analytics_outbox
 //!                                                            ↓
-//!                                              Phase 2: Batch write (transaction)
+//!                                              Phase 2: claim + project (transaction)
 //!                                                - INSERT http_analytics
 //!                                                - INSERT credit_transactions
+//!                                                - DELETE analytics_outbox
 //!                                                            ↓
 //!                                              Phase 3: Record metrics
 //! ```
@@ -28,8 +28,10 @@
 //!
 //! - **All DB work in batcher**: The handler sends unenriched `RawAnalyticsRecord`s.
 //!   Enrichment (user lookup, pricing lookup) happens in the batcher via batch queries.
-//! - **Transactional writes**: Analytics and credit inserts happen in a single transaction.
-//!   Either both succeed or both roll back.
+//! - **Durable hand-off**: Enriched, content-free records are persisted before projection;
+//!   bearer tokens are explicitly excluded from the serialized payload.
+//! - **Transactional projection**: Analytics, credit inserts and outbox deletion happen in
+//!   a single transaction. Either all succeed or the durable row remains for retry.
 //! - **Batch enrichment**: User and pricing lookups are batched using `IN` clauses,
 //!   reducing from O(N) queries to O(1) per batch.
 
@@ -47,6 +49,8 @@ use chrono::{DateTime, Utc};
 use metrics::{counter, histogram};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::{Notify, mpsc};
@@ -61,7 +65,7 @@ const CHANNEL_BUFFER_SIZE: usize = 10_000;
 ///
 /// This contains only data that can be extracted from the request/response
 /// without any database lookups. Enrichment happens in the batcher.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawAnalyticsRecord {
     // === Core metrics (from request/response) ===
     pub instance_id: Uuid,
@@ -122,6 +126,7 @@ pub struct RawAnalyticsRecord {
 
     // === Auth (unresolved - just the token) ===
     /// The bearer token from the Authorization header (not yet resolved to user_id)
+    #[serde(skip, default)]
     pub bearer_token: Option<String>,
 
     // === Fusillade batch metadata (from headers) ===
@@ -142,7 +147,7 @@ pub struct RawAnalyticsRecord {
 }
 
 /// Enriched data resolved during batch processing
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EnrichedRecord {
     raw: RawAnalyticsRecord,
     user_id: Option<Uuid>,
@@ -281,85 +286,129 @@ where
         self
     }
 
-    /// Runs the batcher's background write loop.
+    /// Runs the publisher and projector loops in one background task.
     ///
-    /// This should be spawned as a tokio task. The strategy is:
-    /// 1. Block until at least one record arrives
-    /// 2. Non-blocking drain of all available records in the channel
-    /// 3. Write the batch immediately
-    /// 4. Repeat
-    ///
-    /// This minimizes latency at low load (single record → immediate write) while
-    /// getting batching efficiency at high load (records queue while writing → bigger batch).
+    /// Raw records are opportunistically batched, enriched and durably inserted
+    /// into `analytics_outbox`. Independently of new traffic, the projector
+    /// periodically claims outbox rows and writes analytics + credits + outbox
+    /// deletion in one transaction. Existing rows are therefore recovered on
+    /// startup without needing a new request to wake the worker.
     pub async fn run(mut self, shutdown_token: CancellationToken) {
         info!(
             max_batch_size = self.batch_size,
             max_retries = self.max_retries,
             retry_base_delay_ms = self.retry_base_delay.as_millis() as u64,
-            "Analytics batcher started (write-through mode with retry)"
+            "Analytics batcher started (durable outbox mode)"
         );
 
         let mut buffer: Vec<RawAnalyticsRecord> = Vec::with_capacity(self.batch_size);
+        // A successful publish projects immediately. This slower tick only
+        // recovers rows left behind by a crash or another instance, avoiding
+        // empty database transactions four times a second while idle.
+        let mut recovery_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut observation_tick = tokio::time::interval(std::time::Duration::from_secs(10));
+        observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            // Step 1: Wait for at least one record OR shutdown
+            let mut observe = false;
+            let mut recover = false;
             tokio::select! {
-                biased; // Check shutdown first
+                biased;
 
                 _ = shutdown_token.cancelled() => {
                     info!("Shutdown signal received, draining analytics channel");
                     self.receiver.close();
-                    // Drain remaining records in batches to avoid OOM with large backlogs
                     while let Some(record) = self.receiver.recv().await {
                         buffer.push(record);
-                        if buffer.len() >= self.batch_size {
-                            self.flush_batch(&mut buffer).await;
+                        if buffer.len() >= self.batch_size
+                            && !self.flush_batch(&mut buffer).await
+                        {
+                            break;
                         }
                     }
                     if !buffer.is_empty() {
                         self.flush_batch(&mut buffer).await;
                     }
+                    while matches!(self.project_outbox_batch().await, Ok(projected) if projected > 0) {}
                     info!("Analytics batcher shutdown complete");
                     break;
                 }
 
-                maybe_record = self.receiver.recv() => {
+                maybe_record = self.receiver.recv(), if buffer.len() < self.batch_size => {
                     match maybe_record {
                         Some(record) => buffer.push(record),
                         None => {
-                            // Channel closed (all senders dropped)
                             info!("Analytics channel closed, shutting down batcher");
                             if !buffer.is_empty() {
                                 self.flush_batch(&mut buffer).await;
                             }
+                            while matches!(self.project_outbox_batch().await, Ok(projected) if projected > 0) {}
+                            break;
+                        }
+                    }
+                }
+
+                _ = recovery_tick.tick() => {
+                    recover = true;
+                }
+
+                _ = observation_tick.tick() => {
+                    observe = true;
+                }
+            }
+
+            while buffer.len() < self.batch_size {
+                match self.receiver.try_recv() {
+                    Ok(record) => buffer.push(record),
+                    Err(_) => break,
+                }
+            }
+
+            let had_records = !buffer.is_empty();
+            if had_records {
+                if !self.flush_batch(&mut buffer).await {
+                    tokio::time::sleep(self.retry_base_delay).await;
+                    continue;
+                }
+                // The rows just published are known to exist, so project them
+                // without waiting for the crash-recovery tick.
+                recover = true;
+            }
+
+            if recover {
+                loop {
+                    match self.project_outbox_batch().await {
+                        Ok(0) => break,
+                        Ok(projected) if projected < self.batch_size => break,
+                        Ok(_) => tokio::task::yield_now().await,
+                        Err(error) => {
+                            crate::background_error!(
+                                ANALYTICS_BATCHER,
+                                "outbox_project",
+                                Error,
+                                error = %error,
+                                "Failed to project analytics outbox batch; rows remain durable"
+                            );
+                            counter!("dwctl_analytics_outbox_projection_total", "result" => "error").increment(1);
                             break;
                         }
                     }
                 }
             }
 
-            // Step 2: Non-blocking drain of all available records (up to batch_size)
-            while buffer.len() < self.batch_size {
-                match self.receiver.try_recv() {
-                    Ok(record) => buffer.push(record),
-                    Err(_) => break, // Channel empty or closed
-                }
+            if observe {
+                self.observe_outbox().await;
             }
-
-            // Step 3: Write immediately
-            self.flush_batch(&mut buffer).await;
         }
     }
 
-    /// Flushes the buffer to the database with retry on failure.
-    ///
-    /// This performs:
-    /// 1. Batch enrichment (user lookup, pricing lookup) - no retry, data issues won't fix themselves
-    /// 2. Transactional write (analytics + credits) - retried with exponential backoff
-    /// 3. Metrics recording
-    async fn flush_batch(&self, buffer: &mut Vec<RawAnalyticsRecord>) {
+    /// Enrich and durably publish one in-memory batch. On failure the caller
+    /// retains the buffer and stops consuming, propagating bounded backpressure
+    /// instead of dropping records.
+    async fn flush_batch(&self, buffer: &mut Vec<RawAnalyticsRecord>) -> bool {
         if buffer.is_empty() {
-            return;
+            return true;
         }
 
         let batch_size = buffer.len();
@@ -371,103 +420,175 @@ where
             // Collect correlation IDs for log correlation
             let correlation_ids: Vec<i64> = buffer.iter().map(|r| r.correlation_id).collect();
 
-            // Phase 1: Batch enrich (no retry - enrichment failures are usually data issues)
-            let enriched = match self.enrich_batch(buffer).await {
-                Ok(enriched) => enriched,
-                Err(e) => {
-                    crate::background_error!(ANALYTICS_BATCHER, "enrich", Error, error = %e, batch_size = batch_size, ?correlation_ids, "Failed to enrich analytics batch");
-                    buffer.clear();
-                    return;
-                }
-            };
-
-            // Phase 2: Transactional write with retry
+            let mut enriched = None;
             let mut last_error = None;
             for attempt in 0..=self.max_retries {
-                match self.write_batch_transactional(&enriched).await {
-                    Ok(()) => {
-                        if attempt > 0 {
-                            debug!(
-                                attempt = attempt,
-                                batch_size = batch_size,
-                                ?correlation_ids,
-                                "Batch write succeeded after retry"
-                            );
-                            counter!("dwctl_analytics_batch_retries_total", "outcome" => "success").increment(1);
+                match self.enrich_batch(buffer).await {
+                    Ok(mut records) => {
+                        // Defence in depth in addition to serde(skip): secrets
+                        // cease to exist in the durable representation.
+                        for record in &mut records {
+                            record.raw.bearer_token = None;
                         }
-                        last_error = None;
-                        break;
-                    }
-                    Err(e) => {
-                        last_error = Some(e);
-                        if attempt < self.max_retries {
-                            let delay = self.retry_base_delay * 2u32.pow(attempt);
-                            warn!(
-                                error = %last_error.as_ref().unwrap(),
-                                attempt = attempt + 1,
-                                max_retries = self.max_retries,
-                                delay_ms = delay.as_millis() as u64,
-                                batch_size = batch_size,
-                                ?correlation_ids,
-                                "Batch write failed, retrying"
-                            );
-                            counter!("dwctl_analytics_batch_retries_total", "outcome" => "retry").increment(1);
-                            tokio::time::sleep(delay).await;
+                        match self.publish_outbox(&records).await {
+                            Ok(()) => {
+                                enriched = Some(records);
+                                last_error = None;
+                                break;
+                            }
+                            Err(error) => last_error = Some(error),
                         }
                     }
+                    Err(error) => last_error = Some(error.into()),
+                }
+
+                if attempt < self.max_retries {
+                    let delay = self.retry_base_delay * 2u32.pow(attempt);
+                    warn!(
+                        error = %last_error.as_ref().expect("failed attempt has an error"),
+                        attempt = attempt + 1,
+                        max_retries = self.max_retries,
+                        delay_ms = delay.as_millis() as u64,
+                        batch_size,
+                        ?correlation_ids,
+                        "Analytics outbox publish failed, retrying"
+                    );
+                    counter!("dwctl_analytics_batch_retries_total", "outcome" => "retry").increment(1);
+                    tokio::time::sleep(delay).await;
                 }
             }
 
             if let Some(e) = last_error {
                 crate::background_error!(
-                    ANALYTICS_BATCHER, "write_drop", Critical,
+                    ANALYTICS_BATCHER, "outbox_publish", Critical,
                     error = %e,
                     batch_size = batch_size,
                     attempts = self.max_retries + 1,
                     ?correlation_ids,
-                    "Failed to write analytics batch after all retries, dropping batch"
+                    "Failed to publish analytics batch; retaining it and applying backpressure"
                 );
-                buffer.clear();
-                return;
-            }
-
-            // Write succeeded: nudge the usage-refresh daemon so the just-written rows
-            // get folded into user_model_usage_daily. In-memory and essentially free;
-            // the daemon coalesces bursts and rate-limits itself.
-            if let Some(notify) = &self.usage_refresh_notify {
-                notify.notify_one();
-            }
-
-            // Phase 3: Record per-record metrics
-            let now = chrono::Utc::now();
-            for record in &enriched {
-                // Record analytics lag (time from response to now)
-                let total_ms = now.signed_duration_since(record.raw.timestamp).num_milliseconds();
-                let lag_ms = total_ms - record.raw.duration_ms;
-                histogram!("dwctl_analytics_lag_seconds").record(lag_ms as f64 / 1000.0);
-
-                // Record GenAI metrics
-                if let Some(ref recorder) = self.metrics_recorder {
-                    let row = self.enriched_to_row(record);
-                    recorder.record_from_analytics(&row).await;
-                }
+                return false;
             }
 
             let duration = start.elapsed();
             histogram!("dwctl_analytics_batch_duration_seconds").record(duration.as_secs_f64());
             counter!("dwctl_analytics_batched_records_total").increment(batch_size as u64);
+            counter!("dwctl_analytics_outbox_published_total").increment(batch_size as u64);
 
             debug!(
                 batch_size = batch_size,
                 duration_ms = duration.as_millis() as u64,
                 ?correlation_ids,
-                "Flushed analytics batch"
+                "Published analytics outbox batch"
             );
 
+            debug_assert_eq!(enriched.as_ref().map(Vec::len), Some(batch_size));
             buffer.clear();
+            true
         }
         .instrument(span)
+        .await
+    }
+
+    async fn publish_outbox(&self, records: &[EnrichedRecord]) -> anyhow::Result<()> {
+        let payloads = records.iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>()?;
+        let mut query = sqlx::QueryBuilder::<sqlx::Postgres>::new("INSERT INTO analytics_outbox (instance_id, correlation_id, payload) ");
+        query.push_values(records.iter().zip(&payloads), |mut row, (record, payload)| {
+            row.push_bind(record.raw.instance_id)
+                .push_bind(record.raw.correlation_id)
+                .push_bind(payload);
+        });
+        query.push(" ON CONFLICT (instance_id, correlation_id) DO UPDATE SET payload = EXCLUDED.payload");
+        query.build().execute(&self.pool.write()).await?;
+        Ok(())
+    }
+
+    /// Claim, apply and delete one durable batch. The row locks, analytics and
+    /// credit writes, and deletion all share the same transaction; a crash or
+    /// error rolls everything back and makes the outbox rows claimable again.
+    async fn project_outbox_batch(&self) -> anyhow::Result<usize> {
+        let mut tx = self.pool.write().begin().await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT id, payload, created_at
+            FROM analytics_outbox
+            ORDER BY id
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .bind(i64::try_from(self.batch_size).unwrap_or(i64::MAX))
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if rows.is_empty() {
+            tx.commit().await?;
+            return Ok(0);
+        }
+
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut records = Vec::with_capacity(rows.len());
+        let mut oldest = Utc::now();
+        for row in rows {
+            ids.push(row.try_get::<i64, _>("id")?);
+            let payload = row.try_get::<serde_json::Value, _>("payload")?;
+            records.push(serde_json::from_value::<EnrichedRecord>(payload)?);
+            oldest = oldest.min(row.try_get::<DateTime<Utc>, _>("created_at")?);
+        }
+
+        self.write_batch_in_transaction(&mut tx, &records).await?;
+        sqlx::query("DELETE FROM analytics_outbox WHERE id = ANY($1)")
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        if let Some(notify) = &self.usage_refresh_notify {
+            notify.notify_one();
+        }
+
+        let now = Utc::now();
+        for record in &records {
+            let total_ms = now.signed_duration_since(record.raw.timestamp).num_milliseconds();
+            let lag_ms = total_ms - record.raw.duration_ms;
+            histogram!("dwctl_analytics_lag_seconds").record(lag_ms as f64 / 1000.0);
+            if let Some(ref recorder) = self.metrics_recorder {
+                let row = self.enriched_to_row(record);
+                recorder.record_from_analytics(&row).await;
+            }
+        }
+
+        let projected = records.len();
+        counter!("dwctl_analytics_outbox_projection_total", "result" => "success").increment(projected as u64);
+        histogram!("dwctl_analytics_outbox_oldest_projected_age_seconds")
+            .record(now.signed_duration_since(oldest).num_milliseconds().max(0) as f64 / 1000.0);
+        Ok(projected)
+    }
+
+    async fn observe_outbox(&self) {
+        let observation = sqlx::query(
+            r#"
+            SELECT COUNT(*)::bigint AS depth,
+                   COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(created_at))), 0)::float8 AS oldest_age_seconds
+            FROM analytics_outbox
+            "#,
+        )
+        // The outbox is writer-owned mutable state. Reading it from a replica
+        // could report stale depth/age and create a false stalled-outbox alert.
+        .fetch_one(&self.pool.write())
         .await;
+
+        match observation {
+            Ok(row) => {
+                let depth = row.try_get::<i64, _>("depth").unwrap_or_default();
+                let age = row.try_get::<f64, _>("oldest_age_seconds").unwrap_or_default();
+                metrics::gauge!("dwctl_analytics_outbox_depth").set(depth as f64);
+                metrics::gauge!("dwctl_analytics_outbox_oldest_age_seconds").set(age);
+            }
+            Err(error) => {
+                debug!(%error, "Failed to observe analytics outbox");
+            }
+        }
     }
 
     /// Batch enrich raw records with user info and pricing.
@@ -594,15 +715,22 @@ where
                 );
             }
             let cache_mults_resolved = clamp_implicit_read_multiplier(cache_mults_resolved, raw.cache_read_source.as_deref());
-            let total_cost = charged_cost(
-                &TokenCounts::from(&raw),
-                raw.request_model.as_deref(),
-                input_price,
-                output_price,
-                cache_mults_resolved,
-                ANALYTICS_BATCHER,
-            );
-            let uncached_cost = compute_list_price(&raw, input_price, output_price);
+            let billable = (200..=299).contains(&raw.status_code);
+            let (total_cost, uncached_cost) = if billable {
+                (
+                    charged_cost(
+                        &TokenCounts::from(&raw),
+                        raw.request_model.as_deref(),
+                        input_price,
+                        output_price,
+                        cache_mults_resolved,
+                        ANALYTICS_BATCHER,
+                    ),
+                    compute_list_price(&raw, input_price, output_price),
+                )
+            } else {
+                (None, None)
+            };
 
             enriched.push(EnrichedRecord {
                 raw,
@@ -759,22 +887,22 @@ where
         Ok(map)
     }
 
-    /// Write enriched records to the database in a single transaction.
+    /// Write enriched records using the caller's outbox transaction.
     #[tracing::instrument(skip_all)]
-    async fn write_batch_transactional(&self, records: &[EnrichedRecord]) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.write().begin().await?;
-
+    async fn write_batch_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        records: &[EnrichedRecord],
+    ) -> Result<(), sqlx::Error> {
         // Phase 1: Batch INSERT http_analytics
-        let (analytics_ids, newly_inserted) = self.batch_insert_analytics(&mut tx, records).await?;
+        let (analytics_ids, newly_inserted) = self.batch_insert_analytics(tx, records).await?;
 
         // Phase 2: Batch INSERT credit_transactions (+ fold batch_aggregates)
-        let duplicates = self.batch_insert_credits(&mut tx, records, &analytics_ids, &newly_inserted).await?;
+        let duplicates = self.batch_insert_credits(tx, records, &analytics_ids, &newly_inserted).await?;
         if duplicates > 0 {
             warn!(duplicates = duplicates, "Some credit transactions were duplicates");
             counter!("dwctl_credits_duplicates_total").increment(duplicates);
         }
-
-        tx.commit().await?;
         Ok(())
     }
 
@@ -1080,6 +1208,13 @@ where
         let mut cap_scope_roots: Vec<Option<Uuid>> = Vec::new();
 
         for record in records {
+            // Billing eligibility is the shared effective HTTP outcome. Failed
+            // requests remain in analytics, but never create a debit even when
+            // the provider reported usage and a non-zero price.
+            if !(200..=299).contains(&record.raw.status_code) {
+                continue;
+            }
+
             // Skip if no user or no pricing
             let Some(user_id) = record.user_id else { continue };
 
@@ -1778,6 +1913,12 @@ mod tests {
 
         assert_eq!(record.correlation_id, 123);
         assert_eq!(record.bearer_token, Some("test-token".to_string()));
+
+        let payload = serde_json::to_value(&record).unwrap();
+        assert!(payload.get("bearer_token").is_none());
+        assert!(!payload.to_string().contains("test-token"));
+        let restored: RawAnalyticsRecord = serde_json::from_value(payload).unwrap();
+        assert_eq!(restored.bearer_token, None);
     }
 
     #[test]
@@ -2157,6 +2298,50 @@ mod integration_tests {
         let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
         assert!(usage_tx.is_some(), "Usage transaction should be created");
         assert_eq!(usage_tx.unwrap().amount, expected_cost);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn failed_response_is_analytic_but_not_billed(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "failed-response-test").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00001").unwrap(),
+            Decimal::from_str("0.00003").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+
+        let initial_balance = Decimal::from_str("10.00").unwrap();
+        let user_id = setup_user_with_balance(&pool, initial_balance).await;
+        let api_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+        let mut record = create_raw_record("failed-response-test", Some(api_key), 1000, 500);
+        record.status_code = 502;
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        let (analytics_status, total_cost): (i32, Option<Decimal>) =
+            sqlx::query_as("SELECT status_code, total_cost FROM http_analytics WHERE model = 'failed-response-test'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(analytics_status, 502);
+        assert_eq!(total_cost, None);
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        assert_eq!(credits.get_user_balance(user_id).await.unwrap(), initial_balance);
+        let transactions = credits
+            .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+            .await
+            .unwrap();
+        assert!(transactions.iter().all(|tx| tx.transaction_type != CreditTransactionType::Usage));
+
+        let outbox_depth: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM analytics_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(outbox_depth, 0, "projection must delete the durable row after committing analytics");
     }
 
     #[sqlx::test]
