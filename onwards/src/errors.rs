@@ -128,6 +128,46 @@ impl OnwardsErrorResponse {
         }
     }
 
+    /// A generic error carrying the upstream's own HTTP status.
+    ///
+    /// The fallback loop uses this as its candidate error when a provider
+    /// returns a fallback-triggering status: a later provider's success
+    /// discards it, and an exhausted fallback chain hands it to the client.
+    /// Preserving the real status keeps the fallback path consistent with the
+    /// single-provider path (which returns the upstream status untouched) and
+    /// keeps rate limiting a 429 — surfacing an upstream rate limit as a 5xx
+    /// misclassifies it as a server fault and pages the proxy-5xx alert.
+    /// Bodies stay generic: the upstream's own error body is never forwarded
+    /// from here.
+    pub fn upstream_status(status: u16) -> Self {
+        let status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            return Self::rate_limited();
+        }
+        let (message, r#type, code) = if status.is_client_error() {
+            (
+                "The upstream provider rejected the request.",
+                "invalid_request_error",
+                "upstream_error",
+            )
+        } else {
+            (
+                "An internal error occurred. Please try again later.",
+                "internal_error",
+                "internal_error",
+            )
+        };
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: message.to_string(),
+                r#type: r#type.to_string(),
+                param: None,
+                code: code.to_string(),
+            }),
+            status,
+        }
+    }
+
     pub fn payload_too_large(limit: usize) -> Self {
         OnwardsErrorResponse {
             body: Some(ErrorResponseBody {
