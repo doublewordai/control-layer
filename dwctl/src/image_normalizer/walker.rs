@@ -50,8 +50,7 @@ impl Mode {
 }
 
 fn is_http_url(s: &str) -> bool {
-    let lower = &s[..s.len().min(8)].to_ascii_lowercase();
-    lower.starts_with("http://") || lower.starts_with("https://")
+    s.get(..7).is_some_and(|p| p.eq_ignore_ascii_case("http://")) || s.get(..8).is_some_and(|p| p.eq_ignore_ascii_case("https://"))
 }
 
 /// Walks `body` and, for each image input matching `mode`, calls
@@ -287,5 +286,45 @@ mod tests {
         });
         let count = substitute_with(&mut body, Mode::HttpOnly, |u| prefix_with("X", u)).await.unwrap();
         assert_eq!(count, 1);
+    }
+
+    /// Regression for the byte-slice panic in `is_http_url`: a non-ASCII
+    /// image-URL string whose byte index 8 falls inside a multi-byte UTF-8
+    /// codepoint must be skipped (return `false`) instead of panicking.
+    #[test]
+    fn non_ascii_url_does_not_panic() {
+        assert!(!Mode::HttpOnly.applies_to("1234567é"));
+        assert!(!Mode::All.applies_to("1234567é"));
+        assert!(!is_http_url("1234567é"));
+    }
+
+    /// A real `http://` URL whose host contains a non-ASCII char within the
+    /// first 8 bytes (the original exploit string) is still recognised as an
+    /// http URL — the fix must not regress the happy path.
+    #[test]
+    fn http_url_with_non_ascii_host_is_recognised() {
+        assert!(is_http_url("http://é.example/x.png"));
+        assert!(Mode::HttpOnly.applies_to("http://é.example/x.png"));
+        assert!(Mode::All.applies_to("http://é.example/x.png"));
+    }
+
+    /// A non-http(s) URL with non-ASCII content is skipped end-to-end
+    /// through the walker, which leaves the value untouched.
+    #[tokio::test]
+    async fn non_ascii_non_http_url_passes_through_unchanged() {
+        let mut body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "1234567é" } },
+                    { "type": "image_url", "image_url": { "url": "ftp://é.example/x.png" } }
+                ]
+            }]
+        });
+        let count = substitute_with(&mut body, Mode::All, |u| prefix_with("Z", u)).await.unwrap();
+        assert_eq!(count, 0);
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["image_url"]["url"], "1234567é");
+        assert_eq!(content[1]["image_url"]["url"], "ftp://é.example/x.png");
     }
 }
