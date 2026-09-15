@@ -39,8 +39,7 @@ use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
 use crate::metrics::errors::component::ANALYTICS_BATCHER;
 use crate::pricing::{
-    CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, clamp_implicit_read_multiplier, find_best_tariff, list_price,
-    resolve_cache_multipliers,
+    CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, find_best_tariff, list_price, resolve_cache_multipliers,
 };
 use crate::request_logging::serializers::{HttpAnalyticsRow, RequestParams};
 use chrono::{DateTime, Utc};
@@ -107,10 +106,6 @@ pub struct RawAnalyticsRecord {
     /// Observational: distinct from `cache_read_input_tokens`, which is dwctl's cache layer
     /// and is what gets priced. See `serializers::extract_engine_cached_tokens`.
     pub engine_cached_tokens: Option<i64>,
-    /// Provenance of the billed cache read: "module" (dwctl's classifier) or "engine"
-    /// (upstream hit passed through as an implicit discount). `None` when the billed read
-    /// is zero. See `serializers::extract_cache_read_source`.
-    pub cache_read_source: Option<String>,
     /// Content-free request parameters (stream, max_tokens, sampling, message and tool
     /// counts). See `serializers::RequestParams`.
     pub request_params: RequestParams,
@@ -593,7 +588,6 @@ where
                     "response carried cache tokens but the model is not dwctl-cache-enabled; ignoring them and billing at list price"
                 );
             }
-            let cache_mults_resolved = clamp_implicit_read_multiplier(cache_mults_resolved, raw.cache_read_source.as_deref());
             let total_cost = charged_cost(
                 &TokenCounts::from(&raw),
                 raw.request_model.as_deref(),
@@ -835,7 +829,6 @@ where
         let mut user_agent_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut submitted_at_vec: Vec<Option<DateTime<Utc>>> = Vec::with_capacity(records.len());
         let mut engine_cached_vec: Vec<Option<i64>> = Vec::with_capacity(records.len());
-        let mut cache_read_source_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut stream_vec: Vec<Option<bool>> = Vec::with_capacity(records.len());
         let mut max_tokens_vec: Vec<Option<i64>> = Vec::with_capacity(records.len());
         let mut temperature_vec: Vec<Option<f32>> = Vec::with_capacity(records.len());
@@ -894,7 +887,6 @@ where
             // queue delay (timestamp - submitted_at) survives past this process.
             submitted_at_vec.push(record.raw.batch_created_at);
             engine_cached_vec.push(record.raw.engine_cached_tokens);
-            cache_read_source_vec.push(record.raw.cache_read_source.clone());
             let p = &record.raw.request_params;
             stream_vec.push(p.stream);
             max_tokens_vec.push(p.max_tokens);
@@ -916,8 +908,7 @@ where
                 cache_read_input_tokens, cache_creation_input_tokens,
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
                 total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at,
-                engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count,
-                cache_read_source
+                engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -929,8 +920,7 @@ where
                 $29::bigint[], $30::bigint[], $31::bigint[],
                 $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],
                 $37::timestamptz[],
-                $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[],
-                $46::text[]
+                $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[]
             )
             ON CONFLICT (instance_id, correlation_id)
             DO UPDATE SET
@@ -972,8 +962,7 @@ where
                 top_p = EXCLUDED.top_p,
                 n = EXCLUDED.n,
                 tool_count = EXCLUDED.tool_count,
-                message_count = EXCLUDED.message_count,
-                cache_read_source = EXCLUDED.cache_read_source
+                message_count = EXCLUDED.message_count
             RETURNING id, instance_id, correlation_id, (xmax = 0) AS "newly_inserted!"
             "#,
             &instance_ids,
@@ -1021,7 +1010,6 @@ where
             &n_vec as &[Option<i32>],
             &tool_count_vec as &[Option<i32>],
             &message_count_vec as &[Option<i32>],
-            &cache_read_source_vec as &[Option<String>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1724,7 +1712,6 @@ pub(crate) fn compute_billing_tier(fusillade_batch_id: Option<Uuid>, completion_
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pricing::CacheMultipliers;
 
     #[test]
     fn test_compute_billing_tier() {
@@ -1762,7 +1749,6 @@ mod tests {
             finish_reason: None,
             user_agent: None,
             engine_cached_tokens: None,
-            cache_read_source: None,
             request_params: RequestParams::default(),
             server_address: "localhost".to_string(),
             server_port: 8080,
@@ -1815,7 +1801,6 @@ mod tests {
             finish_reason: None,
             user_agent: None,
             engine_cached_tokens: None,
-            cache_read_source: None,
             request_params: RequestParams::default(),
             server_address: "x".to_string(),
             server_port: 1,
@@ -1897,7 +1882,6 @@ mod integration_tests {
     use crate::db::handlers::Repository;
     use crate::db::handlers::credits::Credits;
     use crate::db::models::credits::CreditTransactionType;
-    use crate::pricing::CacheMultipliers;
     use crate::test::utils::create_test_user;
     use rust_decimal::prelude::FromStr;
 
@@ -2086,7 +2070,6 @@ mod integration_tests {
             finish_reason: None,
             user_agent: None,
             engine_cached_tokens: None,
-            cache_read_source: None,
             request_params: RequestParams::default(),
             server_address: "api.test.com".to_string(),
             server_port: 443,
@@ -2535,67 +2518,6 @@ mod integration_tests {
             (stored - submitted).num_seconds().abs() < 1,
             "expected {submitted}, stored {stored}"
         );
-    }
-
-    #[test]
-    fn implicit_reads_clamp_the_read_multiplier_to_list_price() {
-        let mults = CacheMultipliers {
-            read: Decimal::new(15, 1), // 1.5 — misconfigured surcharge
-            write_5m: Decimal::new(125, 2),
-            write_1h: Decimal::TWO,
-            write_24h: Decimal::new(25, 1),
-        };
-        // Engine-sourced read: clamped to 1 (never above list price).
-        let clamped = clamp_implicit_read_multiplier(Some(mults), Some("engine")).unwrap();
-        assert_eq!(clamped.read, Decimal::ONE);
-        assert_eq!(clamped.write_1h, Decimal::TWO, "write premiums untouched");
-        // Module-sourced (explicit) read: configured multiplier stands.
-        assert_eq!(
-            clamp_implicit_read_multiplier(Some(mults), Some("module")).unwrap().read,
-            Decimal::new(15, 1)
-        );
-        // Sane multipliers pass through unchanged for both sources.
-        let sane = CacheMultipliers {
-            read: Decimal::new(1, 1),
-            ..mults
-        };
-        assert_eq!(
-            clamp_implicit_read_multiplier(Some(sane), Some("engine")).unwrap().read,
-            Decimal::new(1, 1)
-        );
-        assert!(clamp_implicit_read_multiplier(None, Some("engine")).is_none());
-    }
-
-    /// The same last hop for `cache_read_source`: the value rides the `CacheBilling`
-    /// extension into this struct upstream, so the only thing that can break is the
-    /// write — a dropped bind or a misordered UNNEST array would leave the column
-    /// silently NULL (or misaligned) on every row.
-    #[sqlx::test]
-    #[test_log::test]
-    async fn batcher_persists_the_cache_read_source_to_http_analytics(pool: sqlx::PgPool) {
-        create_test_model(&pool, "cache-source-test").await;
-
-        let mut record = create_raw_record("cache-source-test", None, 10, 5);
-        record.cache_read_source = Some("engine".to_string());
-        run_batcher_with_records(&pool, vec![record.clone()]).await;
-
-        let stored: Option<String> = sqlx::query_scalar("SELECT cache_read_source FROM http_analytics WHERE model = 'cache-source-test'")
-            .fetch_one(&pool)
-            .await
-            .expect("the analytics row should exist");
-        assert_eq!(stored.as_deref(), Some("engine"));
-
-        // Reprocessing the same (instance_id, correlation_id) takes the ON CONFLICT
-        // path — the EXCLUDED mapping must carry the column too.
-        record.cache_read_source = Some("module".to_string());
-        run_batcher_with_records(&pool, vec![record]).await;
-        let rows: Vec<Option<String>> =
-            sqlx::query_scalar("SELECT cache_read_source FROM http_analytics WHERE model = 'cache-source-test'")
-                .fetch_all(&pool)
-                .await
-                .expect("query should succeed");
-        assert_eq!(rows.len(), 1, "the upsert must update, not duplicate");
-        assert_eq!(rows[0].as_deref(), Some("module"), "EXCLUDED mapping on the conflict path");
     }
 
     /// Realtime work is not submitted ahead of time, so there is no distinct submission

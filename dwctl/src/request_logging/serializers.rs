@@ -165,12 +165,6 @@ pub struct UsageMetrics {
     /// `cache_read_input_tokens`, which is dwctl's own cache layer and drives billing.
     /// `None` when the upstream reported nothing. See `extract_engine_cached_tokens`.
     pub engine_cached_tokens: Option<i64>,
-    /// Which system produced the billed cache read: `"module"` (dwctl's classifier —
-    /// explicit/auto markers) or `"engine"` (the upstream's own reported hit, passed
-    /// through as an implicit discount on a tariffed model). `None` when the billed read
-    /// is zero, when no cache layer touched the response, or for rows predating the
-    /// column. From the `CacheBilling` response extension, like the token counts.
-    pub cache_read_source: Option<String>,
     /// Content-free request parameters read off the parsed request body.
     pub request_params: RequestParams,
 }
@@ -601,7 +595,6 @@ impl UsageMetrics {
             server_port: config.port,
             served_by: response_data.extensions.get::<onwards::ServedBy>().map(|s| s.url.clone()),
             engine_cached_tokens,
-            cache_read_source: extract_cache_read_source(response_data),
             request_params,
         }
     }
@@ -677,7 +670,7 @@ fn cache_tokens_from_usage(usage: &Value) -> CacheTokens {
 /// frame) — which is exactly the no-cache-billing case.
 pub(crate) fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
     if let Some(capture) = response_data.extensions.get::<CacheBilling>() {
-        let stats = capture.get().unwrap_or_default().stats;
+        let stats = capture.get().unwrap_or_default();
         let count = |value| i64::try_from(value).unwrap_or(i64::MAX);
         return CacheTokens {
             read: count(stats.read),
@@ -687,18 +680,6 @@ pub(crate) fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens 
         };
     }
     extract_from_last_usage(response_data, cache_tokens_from_usage)
-}
-
-/// The billed cache read's provenance, from the same `CacheBilling` extension the counts
-/// come from. `None` when the read is zero or no cache layer touched the response — the
-/// body carries no equivalent signal, so there is no body fallback.
-pub(crate) fn extract_cache_read_source(response_data: &ResponseData) -> Option<String> {
-    response_data
-        .extensions
-        .get::<CacheBilling>()
-        .and_then(|capture| capture.get())
-        .and_then(|billed| billed.read_source)
-        .map(|source| source.as_str().to_string())
 }
 
 /// The upstream's own cached-prompt count: `usage.prompt_tokens_details.cached_tokens`
@@ -1217,10 +1198,10 @@ impl From<&AiResponse> for TokenMetrics {
 #[cfg(test)]
 mod tests {
     use super::{
-        RequestParams, UsageMetrics, extract_cache_read_source, extract_cache_tokens, extract_engine_cached_tokens, extract_finish_reason,
-        parse_ai_request, parse_ai_response,
+        RequestParams, UsageMetrics, extract_cache_tokens, extract_engine_cached_tokens, extract_finish_reason, parse_ai_request,
+        parse_ai_response,
     };
-    use crate::prompt_cache::{BilledCache, CacheBilling, CacheReadSource, CacheStats};
+    use crate::prompt_cache::{CacheBilling, CacheStats};
     use crate::request_logging::models::{AiRequest, AiResponse};
     use axum::http::{Method, StatusCode, Uri};
     use bytes::Bytes;
@@ -2958,15 +2939,12 @@ mod tests {
             let capture = CacheBilling::default();
             response.extensions.insert(capture.clone());
             // Outlet clones extensions before a stream's usage frame is read.
-            capture.set(BilledCache {
-                stats: CacheStats {
-                    read: 1000,
-                    creation_5m: 100,
-                    creation_1h: 200,
-                    creation_24h: 300,
-                    ..Default::default()
-                },
-                read_source: Some(CacheReadSource::Module),
+            capture.set(CacheStats {
+                read: 1000,
+                creation_5m: 100,
+                creation_1h: 200,
+                creation_24h: 300,
+                ..Default::default()
             });
             let parsed = parse_ai_response(&request, &response).unwrap();
             let metrics = UsageMetrics::extract(
@@ -3002,22 +2980,13 @@ mod tests {
             (0, 0),
             "an unfilled cell must not trust provider counts"
         );
-        assert_eq!(extract_cache_read_source(&response), None, "unfilled cell → no source");
-        capture.set(BilledCache {
-            stats: CacheStats {
-                read: 10,
-                creation_1h: 20,
-                ..Default::default()
-            },
-            read_source: Some(CacheReadSource::Engine),
+        capture.set(CacheStats {
+            read: 10,
+            creation_1h: 20,
+            ..Default::default()
         });
         let captured = extract_cache_tokens(&response);
         assert_eq!((captured.read, captured.creation_1h), (10, 20));
-        assert_eq!(
-            extract_cache_read_source(&response).as_deref(),
-            Some("engine"),
-            "read provenance rides the same cell as the counts"
-        );
     }
 
     /// `prompt_tokens_details.cached_tokens` is the ENGINE's prefix-cache hit (SGLang/vLLM
