@@ -1,5 +1,17 @@
 # Changelog
 
+## [11.11.0](https://github.com/doublewordai/control-layer/compare/v11.10.2...v11.11.0) (2026-09-15)
+
+
+### Features
+
+* **onwards:** fail over streamed requests whose first token stalls ([#1780](https://github.com/doublewordai/control-layer/issues/1780)) ([2418bf8](https://github.com/doublewordai/control-layer/commit/2418bf869e9cb3734bb625ab382eae075dab5c0e))
+
+
+### Bug Fixes
+
+* **batches:** results survive input-file deletion, 410 once output/error files are deleted ([#1741](https://github.com/doublewordai/control-layer/issues/1741)) ([144c1e4](https://github.com/doublewordai/control-layer/commit/144c1e460ee563693ceba174d5144db13acd6d4f))
+
 ## [11.10.2](https://github.com/doublewordai/control-layer/compare/v11.10.1...v11.10.2) (2026-09-15)
 
 
