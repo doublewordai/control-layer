@@ -104,7 +104,9 @@
 //!   creations as reads, which under-bills, and must be labelled approximate.
 
 use crate::pricing::TokenCounts;
-use crate::request_logging::serializers::{TokenMetrics, extract_from_last_usage, parse_ai_response, raw_usage_tokens};
+use crate::request_logging::serializers::{
+    TokenMetrics, extract_engine_cached_tokens, extract_from_last_usage, parse_ai_response, raw_usage_tokens,
+};
 use outlet::{RequestData, ResponseData};
 
 pub mod cache_fields;
@@ -167,6 +169,8 @@ pub async fn recompute_corpus(
         }
     };
     let price = |row: &source::CorpusRow, usage: &RecomputedUsage, mults: Option<crate::pricing::CacheMultipliers>| {
+        // Same list-price ceiling for engine-sourced reads as the live batcher.
+        let mults = crate::pricing::clamp_implicit_read_multiplier(mults, row.cache_read_source.as_deref());
         crate::pricing::charged_cost(
             &usage.counts,
             row.model.as_deref(),
@@ -192,9 +196,22 @@ pub async fn recompute_corpus(
             continue;
         };
 
-        let replayed = exchange
-            .to_outlet_pair()
-            .and_then(|(req, resp)| recompute_from_stored_response(&req, &resp, flat_tier));
+        let replayed = exchange.to_outlet_pair().and_then(|(req, resp)| {
+            recompute_from_stored_response(&req, &resp, flat_tier).map(|mut usage| {
+                // Implicitly-billed row (`cache_read_source = 'engine'`): the raw upstream
+                // body carries no dwctl cache fields — the replay's split legitimately
+                // reads zero — so overlay the live rule (engine-reported hit, capped to
+                // the prompt, no creations). Without this every implicit row recomputes
+                // to list price and reports a phantom overcharge.
+                if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Engine.as_str())
+                    && usage.counts.cache_read == 0
+                    && let Some(engine) = extract_engine_cached_tokens(&resp)
+                {
+                    usage.counts.cache_read = engine.clamp(0, usage.counts.prompt);
+                }
+                usage
+            })
+        });
 
         let report_row = match replayed {
             Ok(usage) => {

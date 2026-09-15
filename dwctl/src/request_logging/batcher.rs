@@ -39,8 +39,8 @@ use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
 use crate::metrics::errors::component::ANALYTICS_BATCHER;
 use crate::pricing::{
-    CacheMultipliers, CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, find_best_tariff, list_price,
-    resolve_cache_multipliers,
+    CacheMultipliers, CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, clamp_implicit_read_multiplier, find_best_tariff,
+    list_price, resolve_cache_multipliers,
 };
 use crate::request_logging::serializers::{HttpAnalyticsRow, RequestParams};
 use chrono::{DateTime, Utc};
@@ -197,20 +197,6 @@ impl From<&RawAnalyticsRecord> for TokenCounts {
             cache_creation_1h: raw.cache_creation_1h_input_tokens,
             cache_creation_24h: raw.cache_creation_24h_input_tokens,
         }
-    }
-}
-
-/// An engine-sourced (implicit) cache read must never bill above list price: the customer
-/// sent no markers and never opted into cache pricing, so a read multiplier above 1 —
-/// accepted by tariff validation but a misconfiguration in practice (a surcharge for a
-/// cache hit) — clamps to 1 for these reads only. Module-sourced (explicit) reads keep
-/// the configured multiplier untouched.
-fn clamp_implicit_read_multiplier(mults: Option<CacheMultipliers>, read_source: Option<&str>) -> Option<CacheMultipliers> {
-    match (mults, read_source) {
-        (Some(m), Some(s)) if s == crate::prompt_cache::CacheReadSource::Engine.as_str() && m.read > Decimal::ONE => {
-            Some(CacheMultipliers { read: Decimal::ONE, ..m })
-        }
-        _ => mults,
     }
 }
 
