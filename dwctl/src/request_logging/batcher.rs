@@ -2533,6 +2533,38 @@ mod integration_tests {
         );
     }
 
+    /// The same last hop for `cache_read_source`: the value rides the `CacheBilling`
+    /// extension into this struct upstream, so the only thing that can break is the
+    /// write — a dropped bind or a misordered UNNEST array would leave the column
+    /// silently NULL (or misaligned) on every row.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn batcher_persists_the_cache_read_source_to_http_analytics(pool: sqlx::PgPool) {
+        create_test_model(&pool, "cache-source-test").await;
+
+        let mut record = create_raw_record("cache-source-test", None, 10, 5);
+        record.cache_read_source = Some("engine".to_string());
+        run_batcher_with_records(&pool, vec![record.clone()]).await;
+
+        let stored: Option<String> = sqlx::query_scalar("SELECT cache_read_source FROM http_analytics WHERE model = 'cache-source-test'")
+            .fetch_one(&pool)
+            .await
+            .expect("the analytics row should exist");
+        assert_eq!(stored.as_deref(), Some("engine"));
+
+        // Reprocessing the same (instance_id, correlation_id) takes the ON CONFLICT
+        // path — the EXCLUDED mapping must carry the column too.
+        record.cache_read_source = Some("module".to_string());
+        run_batcher_with_records(&pool, vec![record]).await;
+        let rows: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT cache_read_source FROM http_analytics WHERE model = 'cache-source-test'")
+                .fetch_all(&pool)
+                .await
+                .expect("query should succeed");
+        assert_eq!(rows.len(), 1, "the upsert must update, not duplicate");
+        assert_eq!(rows[0].as_deref(), Some("module"), "EXCLUDED mapping on the conflict path");
+    }
+
     /// Realtime work is not submitted ahead of time, so there is no distinct submission
     /// moment and the column must stay NULL rather than being backfilled from `timestamp`.
     /// Writing one would invent a zero-length queue for a request that never queued, and

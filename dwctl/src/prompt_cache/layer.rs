@@ -454,6 +454,7 @@ impl<T> Drop for AbortOnDrop<T> {
 /// stats there, and commits the index write on a billing-success completion. Every failure path
 /// (deadline, classify error, mid-stream error frame, no usage frame, client disconnect) degrades
 /// to no caching with the request unharmed.
+#[allow(clippy::too_many_arguments)]
 fn defer_classify_into_stream(
     response: Response,
     handle: tokio::task::JoinHandle<CacheResult<ClassifyOutcome>>,
