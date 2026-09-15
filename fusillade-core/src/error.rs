@@ -44,6 +44,25 @@ pub enum FusilladeError {
     #[error("Validation error: {0}")]
     ValidationError(String),
 
+    /// A batch retry was refused because the batch's weekly
+    /// `batch_requests_archive` partition is fenced for retirement
+    /// (`batch_archive_buckets.state = 'retiring'`). The batch's
+    /// archived rows — including retriable `failed`/`canceled` rows —
+    /// are still in the fenced week's partition, so the retry's
+    /// archive-move-back cannot run: it would un-freeze the batch out
+    /// from under the retirement and strand the partition's
+    /// `completed` archive rows when `DROP TABLE` commits. Distinct
+    /// from the "nothing to retry" `Ok(0)` (the batch DOES have
+    /// retriable rows; they are just not movable right now), so the
+    /// HTTP layer maps this to a retry-later `503` with `Retry-After`
+    /// rather than the `400` reserved for genuine no-op retries. A
+    /// retry after the retirement completes (`state = 'retired'`,
+    /// partition gone) is an ordinary no-op (`Ok(0)`): the archive
+    /// prunes to empty and the `location`-reset `WHERE` is false, so
+    /// the batch is never un-frozen and this variant is not returned.
+    #[error("Retry blocked: batch archive partition is being retired")]
+    RetryBlockedByArchiveFence,
+
     /// HTTP client error.
     #[error("HTTP request failed: {0}")]
     HttpClient(String),
