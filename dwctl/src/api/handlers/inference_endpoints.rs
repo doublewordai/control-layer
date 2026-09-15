@@ -315,7 +315,13 @@ pub async fn validate_inference_endpoint<P: PoolProvider>(
             })?;
             (parsed_url, api_key, auth_header_name, auth_header_prefix)
         }
-        InferenceEndpointValidate::Existing { endpoint_id } => {
+        InferenceEndpointValidate::Existing {
+            endpoint_id,
+            url,
+            api_key,
+            auth_header_name,
+            auth_header_prefix,
+        } => {
             // Scope the connection acquisition to release it before making HTTP request
             let endpoint = {
                 let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
@@ -327,11 +333,24 @@ pub async fn validate_inference_endpoint<P: PoolProvider>(
                 })?
             }; // Connection is released here before HTTP call
 
+            // When an override URL is supplied (the operator edited the URL in
+            // the dashboard), validate *that* URL instead of the stored one;
+            // otherwise validate the stored URL (the original behavior).
+            // Credentials are reused from the stored endpoint for any field the
+            // caller left unspecified, so a URL-only edit doesn't force the
+            // operator to re-type the API key.
+            let resolved_url = match url {
+                Some(url_str) => url_str.parse::<url::Url>().map_err(|_| Error::BadRequest {
+                    message: "Invalid URL format".to_string(),
+                })?,
+                None => endpoint.url,
+            };
+
             (
-                endpoint.url,
-                endpoint.api_key,
-                Some(endpoint.auth_header_name),
-                Some(endpoint.auth_header_prefix),
+                resolved_url,
+                api_key.or(endpoint.api_key),
+                Some(auth_header_name.unwrap_or(endpoint.auth_header_name)),
+                Some(auth_header_prefix.unwrap_or(endpoint.auth_header_prefix)),
             )
         }
     };
@@ -989,6 +1008,197 @@ mod tests {
             .await;
 
         response.assert_status_ok();
+    }
+
+    // Regression test for the "EditEndpointModal saves an untested URL" bug.
+    // The `existing` validate variant accepts an optional `url` override so an
+    // operator who edited the URL can reuse stored credentials while still
+    // testing the candidate URL. This test proves the backend tests the
+    // override URL, not the stored one.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_validate_existing_endpoint_with_url_override_tests_candidate_url(pool: PgPool) {
+        // Two upstreams with disjoint model catalogs so the response reveals
+        // which URL was actually contacted.
+        let stored_server = MockServer::start().await;
+        let override_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{
+                    "id": "stored-model",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "test"
+                }]
+            })))
+            .mount(&stored_server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{
+                    "id": "override-model",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "test"
+                }]
+            })))
+            .mount(&override_server)
+            .await;
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Create an endpoint whose STORED URL points at the stored upstream.
+        let create_request = json!({
+            "name": "Override URL Test Endpoint",
+            "url": format!("{}/v1", stored_server.uri()),
+            "api_key": "stored-key",
+            "sync": false,
+        });
+
+        let create_response = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&create_request)
+            .await;
+        create_response.assert_status(axum::http::StatusCode::CREATED);
+        let endpoint: InferenceEndpointResponse = create_response.json();
+
+        // Validate with an override URL pointing at the override upstream,
+        // reusing the stored credentials (no api_key supplied).
+        let validate_request = json!({
+            "type": "existing",
+            "endpoint_id": endpoint.id,
+            "url": format!("{}/v1", override_server.uri()),
+        });
+
+        let response = app
+            .post("/admin/api/v1/endpoints/validate")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&validate_request)
+            .await;
+
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["status"], "success");
+        let models = body["models"]["data"].as_array().expect("models data should be an array");
+        assert_eq!(models.len(), 1);
+        // The override URL's model is returned, proving the candidate URL was
+        // tested instead of the stored one.
+        assert_eq!(models[0]["id"], "override-model");
+    }
+
+    // Backward-compat regression: a bare `existing` validate request (no `url`
+    // override) must still test the stored endpoint URL.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_validate_existing_endpoint_without_url_override_tests_stored_url(pool: PgPool) {
+        let stored_server = MockServer::start().await;
+        let unused_server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{
+                    "id": "stored-model",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "test"
+                }]
+            })))
+            .mount(&stored_server)
+            .await;
+
+        // A second upstream that is never expected to be contacted. Mounting
+        // it (with a distinct model id) ensures a bare `existing` request does
+        // not accidentally route to an override URL.
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "object": "list",
+                "data": [{
+                    "id": "unused-model",
+                    "object": "model",
+                    "created": 0,
+                    "owned_by": "test"
+                }]
+            })))
+            .mount(&unused_server)
+            .await;
+
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        let create_request = json!({
+            "name": "Bare Existing Test Endpoint",
+            "url": format!("{}/v1", stored_server.uri()),
+            "api_key": "stored-key",
+            "sync": false,
+        });
+
+        let create_response = app
+            .post("/admin/api/v1/endpoints")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&create_request)
+            .await;
+        create_response.assert_status(axum::http::StatusCode::CREATED);
+        let endpoint: InferenceEndpointResponse = create_response.json();
+
+        // Bare existing request: no `url` field. Must validate the stored URL.
+        let validate_request = json!({
+            "type": "existing",
+            "endpoint_id": endpoint.id,
+        });
+
+        let response = app
+            .post("/admin/api/v1/endpoints/validate")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&validate_request)
+            .await;
+
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["status"], "success");
+        let models = body["models"]["data"].as_array().expect("models data should be an array");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["id"], "stored-model");
+    }
+
+    // The override `url` is parsed with the same format check as the `new` and
+    // update paths; an invalid override URL must yield 400 rather than silently
+    // falling back to the stored URL.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_validate_existing_endpoint_with_invalid_url_override_is_bad_request(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let test_endpoint_id = get_test_endpoint_id(&app, &admin_user).await;
+
+        let validate_request = json!({
+            "type": "existing",
+            "endpoint_id": test_endpoint_id,
+            "url": "not-a-valid-url",
+        });
+
+        let response = app
+            .post("/admin/api/v1/endpoints/validate")
+            .add_header(&add_auth_headers(&admin_user)[0].0, &add_auth_headers(&admin_user)[0].1)
+            .add_header(&add_auth_headers(&admin_user)[1].0, &add_auth_headers(&admin_user)[1].1)
+            .json(&validate_request)
+            .await;
+
+        response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
     #[sqlx::test]

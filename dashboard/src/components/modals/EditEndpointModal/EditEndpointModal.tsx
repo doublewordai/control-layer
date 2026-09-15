@@ -289,19 +289,54 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
     setValidationState("testing");
     setValidationError(null);
 
-    const validateData: EndpointValidateRequest = {
-      type: "existing",
-      endpoint_id: endpoint.id,
-    };
+    // When the URL has changed, validate the *candidate* URL (not the stored
+    // one) by sending it as an override on the `existing` request. The backend
+    // reuses the stored credentials for any field left blank, so a URL-only
+    // edit doesn't force the operator to re-type the API key. Only fall back to
+    // a bare `existing` request (stored URL + stored creds) when the URL is
+    // unchanged.
+    const validatedUrl = url.trim();
+    const apiKey = form.getValues("apiKey");
+    const authHeaderName = form.getValues("authHeaderName");
+    const authHeaderPrefix = form.getValues("authHeaderPrefix");
+
+    const validateData: EndpointValidateRequest = urlChanged
+      ? {
+          type: "existing",
+          endpoint_id: endpoint.id,
+          url: validatedUrl,
+          ...(apiKey?.trim() && { api_key: apiKey.trim() }),
+          ...(authHeaderName?.trim() && {
+            auth_header_name: authHeaderName.trim(),
+          }),
+          ...(authHeaderPrefix?.trim() && {
+            auth_header_prefix: authHeaderPrefix.trim(),
+          }),
+        }
+      : {
+          type: "existing",
+          endpoint_id: endpoint.id,
+        };
 
     try {
       const result = await validateEndpointMutation.mutateAsync(validateData);
 
       if (result.status === "success" && result.models) {
-        setCatalog(result.models.data);
-        setValidationState("success");
-        setUrlChanged(false);
-        setCurrentStep(2);
+        // Only adopt the result if the form URL hasn't drifted since we
+        // kicked off the request. If the operator typed a new URL while the
+        // request was in flight, this success is for a stale URL and must not
+        // unblock saving the untested value.
+        if (form.getValues("url").trim() === validatedUrl) {
+          setCatalog(result.models.data);
+          setValidationState("success");
+          setUrlChanged(false);
+          setCurrentStep(2);
+        } else {
+          // URL changed mid-flight; discard the stale result so the operator
+          // must re-test the current (changed) URL.
+          setCatalog([]);
+          setValidationState("idle");
+        }
       } else {
         setCatalog([]);
         setValidationError(result.error || "Unknown validation error");

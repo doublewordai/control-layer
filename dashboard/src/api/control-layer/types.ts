@@ -714,6 +714,14 @@ export type EndpointValidateRequest =
   | {
       type: "existing";
       endpoint_id: string; // UUID
+      // Optional overrides. When omitted, the backend reuses the stored
+      // values for endpoint_id. Used by EditEndpointModal when the operator
+      // edits the URL so the candidate URL is actually tested while reusing
+      // stored credentials (no re-keying required).
+      url?: string;
+      api_key?: string;
+      auth_header_name?: string;
+      auth_header_prefix?: string;
     };
 
 export interface AvailableModel {

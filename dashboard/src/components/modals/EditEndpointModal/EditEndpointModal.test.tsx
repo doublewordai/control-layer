@@ -16,7 +16,7 @@ import React from "react";
 import { MemoryRouter } from "react-router-dom";
 import { handlers } from "../../../api/control-layer/mocks/handlers";
 import { EditEndpointModal } from "./EditEndpointModal";
-import type { Endpoint } from "../../../api/control-layer/types";
+import type { Endpoint, EndpointValidateRequest } from "../../../api/control-layer/types";
 
 // Setup MSW server
 const server = setupServer(...handlers);
@@ -618,5 +618,280 @@ describe("EditEndpointModal", () => {
     await waitFor(() => {
       expect(screen.getByText(/Testing Connection.../i)).toBeInTheDocument();
     });
+  });
+
+  it("sends the changed URL as an override on the validate request", async () => {
+    // The bug: after a URL change the modal sent `{ type: "existing",
+    // endpoint_id }` (no url), so the backend validated the *stored* URL.
+    // The fix: the modal sends `{ type: "existing", endpoint_id, url }` so the
+    // backend validates the *candidate* URL while reusing stored credentials.
+    const validateBodies: EndpointValidateRequest[] = [];
+    server.use(
+      http.post("/admin/api/v1/endpoints/validate", async ({ request }) => {
+        const body = (await request.json()) as EndpointValidateRequest;
+        validateBodies.push(body);
+        return HttpResponse.json({
+          status: "success",
+          models: { object: "list", data: [] },
+        });
+      }),
+    );
+
+    render(
+      <EditEndpointModal
+        isOpen={true}
+        onClose={mockOnClose}
+        onSuccess={mockOnSuccess}
+        endpoint={mockEndpoint}
+      />,
+      { wrapper: createWrapper() },
+    );
+
+    const urlInput = screen.getByDisplayValue(mockEndpoint.url);
+    fireEvent.change(urlInput, { target: { value: "https://new-url.com/v1" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /Discover Models/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Imported models/i)).toBeInTheDocument();
+    });
+
+    expect(validateBodies).toHaveLength(1);
+    expect(validateBodies[0].type).toBe("existing");
+    if (validateBodies[0].type === "existing") {
+      expect(validateBodies[0].endpoint_id).toBe(mockEndpoint.id);
+      // The candidate URL must be carried as an override so the backend tests
+      // it instead of the stored URL.
+      expect(validateBodies[0].url).toBe("https://new-url.com/v1");
+      // Credential fields are blank → not sent so the backend reuses the
+      // stored key.
+      expect(validateBodies[0].api_key).toBeUndefined();
+      expect(validateBodies[0].auth_header_name).toBeUndefined();
+      expect(validateBodies[0].auth_header_prefix).toBeUndefined();
+    }
+  });
+
+  it("sends the new API key as an override when URL and key both change", async () => {
+    const validateBodies: EndpointValidateRequest[] = [];
+    server.use(
+      http.post("/admin/api/v1/endpoints/validate", async ({ request }) => {
+        const body = (await request.json()) as EndpointValidateRequest;
+        validateBodies.push(body);
+        return HttpResponse.json({
+          status: "success",
+          models: { object: "list", data: [] },
+        });
+      }),
+    );
+
+    render(
+      <EditEndpointModal
+        isOpen={true}
+        onClose={mockOnClose}
+        onSuccess={mockOnSuccess}
+        endpoint={mockEndpoint}
+      />,
+      { wrapper: createWrapper() },
+    );
+
+    const urlInput = screen.getByDisplayValue(mockEndpoint.url);
+    fireEvent.change(urlInput, { target: { value: "https://new-url.com/v1" } });
+
+    const apiKeyInput = screen.getByPlaceholderText("sk-...");
+    fireEvent.change(apiKeyInput, { target: { value: "sk-new-key" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /Discover Models/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Imported models/i)).toBeInTheDocument();
+    });
+
+    expect(validateBodies).toHaveLength(1);
+    expect(validateBodies[0].type).toBe("existing");
+    if (validateBodies[0].type === "existing") {
+      expect(validateBodies[0].url).toBe("https://new-url.com/v1");
+      expect(validateBodies[0].api_key).toBe("sk-new-key");
+    }
+  });
+
+  it("sends a bare existing request (no url override) when the URL is unchanged", async () => {
+    const validateBodies: EndpointValidateRequest[] = [];
+    server.use(
+      http.post("/admin/api/v1/endpoints/validate", async ({ request }) => {
+        const body = (await request.json()) as EndpointValidateRequest;
+        validateBodies.push(body);
+        return HttpResponse.json({
+          status: "success",
+          models: { object: "list", data: [] },
+        });
+      }),
+    );
+
+    render(
+      <EditEndpointModal
+        isOpen={true}
+        onClose={mockOnClose}
+        onSuccess={mockOnSuccess}
+        endpoint={mockEndpoint}
+      />,
+      { wrapper: createWrapper() },
+    );
+
+    // No URL change: click Discover directly.
+    fireEvent.click(screen.getByRole("button", { name: /Discover Models/i }));
+
+    await waitFor(() => {
+      expect(screen.getByText(/Imported models/i)).toBeInTheDocument();
+    });
+
+    expect(validateBodies).toHaveLength(1);
+    expect(validateBodies[0].type).toBe("existing");
+    if (validateBodies[0].type === "existing") {
+      expect(validateBodies[0].url).toBeUndefined();
+    }
+  });
+
+  it("persists the changed URL in the PATCH after a successful validation", async () => {
+    const updateBodies: Array<{ url?: string; alias_mapping?: Record<string, string> }> = [];
+    server.use(
+      http.post("/admin/api/v1/endpoints/validate", () =>
+        HttpResponse.json({
+          status: "success",
+          models: { object: "list", data: [] },
+        }),
+      ),
+      http.patch("/admin/api/v1/endpoints/:id", async ({ request }) => {
+        const body = (await request.json()) as {
+          url?: string;
+          alias_mapping?: Record<string, string>;
+        };
+        updateBodies.push(body);
+        return HttpResponse.json({ ...mockEndpoint, url: body.url ?? mockEndpoint.url });
+      }),
+    );
+
+    render(
+      <EditEndpointModal
+        isOpen={true}
+        onClose={mockOnClose}
+        onSuccess={mockOnSuccess}
+        endpoint={mockEndpoint}
+      />,
+      { wrapper: createWrapper() },
+    );
+
+    const urlInput = screen.getByDisplayValue(mockEndpoint.url);
+    fireEvent.change(urlInput, { target: { value: "https://new-url.com/v1" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /Discover Models/i }));
+    await waitFor(() =>
+      expect(screen.getByText(/Imported models/i)).toBeInTheDocument(),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Update Endpoint/i }));
+
+    await waitFor(() => {
+      expect(mockOnSuccess).toHaveBeenCalledOnce();
+    });
+
+    expect(updateBodies).toHaveLength(1);
+    expect(updateBodies[0].url).toBe("https://new-url.com/v1");
+    // alias_mapping is always present (possibly non-empty), matching the
+    // backend tx branch the modal's save path takes.
+    expect(updateBodies[0].alias_mapping).toBeDefined();
+    expect(typeof updateBodies[0].alias_mapping).toBe("object");
+    expect(updateBodies[0].alias_mapping).not.toBeNull();
+  });
+
+  it("rejects an unvalidated changed URL: blocks save before testing", async () => {
+    // A changed URL with no successful validation must not unblock saving.
+    server.use(
+      http.post("/admin/api/v1/endpoints/validate", () =>
+        HttpResponse.json({
+          status: "error",
+          error: "Connection timeout - unable to reach endpoint",
+        }),
+      ),
+    );
+
+    render(
+      <EditEndpointModal
+        isOpen={true}
+        onClose={mockOnClose}
+        onSuccess={mockOnSuccess}
+        endpoint={mockEndpoint}
+      />,
+      { wrapper: createWrapper() },
+    );
+
+    const urlInput = screen.getByDisplayValue(mockEndpoint.url);
+    fireEvent.change(urlInput, { target: { value: "https://invalid.example.invalid/v1" } });
+
+    fireEvent.click(screen.getByRole("button", { name: /Discover Models/i }));
+
+    await waitFor(() => {
+      expect(
+        screen.getAllByText("Connection timeout - unable to reach endpoint")
+          .length,
+      ).toBeGreaterThan(0);
+    });
+
+    // No success state → the "Imported models" step (which would unblock
+    // saving) must not be reached.
+    expect(screen.queryByText(/Imported models/i)).not.toBeInTheDocument();
+    expect(mockOnSuccess).not.toHaveBeenCalled();
+  });
+
+  it("does not bless a stale success when the URL changes during validation", async () => {
+    // Regression guard for the in-flight race: a validation succeeds for URL A
+    // but the operator typed URL B before the response arrived. The stale
+    // success must be discarded so URL B remains untested and saving stays
+    // blocked. (This complements the override-URL fix: even with the override,
+    // the in-flight result is for the URL captured at request time.)
+    server.use(
+      http.post("/admin/api/v1/endpoints/validate", async () => {
+        // Simulate a slow upstream so the operator can change the URL before
+        // the response arrives.
+        await new Promise((r) => setTimeout(r, 50));
+        return HttpResponse.json({
+          status: "success",
+          models: { object: "list", data: [] },
+        });
+      }),
+    );
+
+    render(
+      <EditEndpointModal
+        isOpen={true}
+        onClose={mockOnClose}
+        onSuccess={mockOnSuccess}
+        endpoint={mockEndpoint}
+      />,
+      { wrapper: createWrapper() },
+    );
+
+    const urlInput = screen.getByDisplayValue(mockEndpoint.url);
+    // Start validating URL A.
+    fireEvent.change(urlInput, { target: { value: "https://url-a.example.com/v1" } });
+    fireEvent.click(screen.getByRole("button", { name: /Discover Models/i }));
+
+    // While validation is in flight, change to URL B.
+    await waitFor(() => {
+      expect(screen.getByText(/Testing Connection.../i)).toBeInTheDocument();
+    });
+    fireEvent.change(urlInput, { target: { value: "https://url-b.example.com/v1" } });
+
+    // Wait long enough for the in-flight success to resolve.
+    await waitFor(
+      () => {
+        expect(screen.queryByText(/Testing Connection.../i)).not.toBeInTheDocument();
+      },
+      { timeout: 3000 },
+    );
+
+    // The stale success must not have advanced to Step 2 ("Imported models")
+    // nor cleared the change-gate; the operator must re-test URL B.
+    expect(screen.queryByText(/Imported models/i)).not.toBeInTheDocument();
+    expect(mockOnSuccess).not.toHaveBeenCalled();
   });
 });
