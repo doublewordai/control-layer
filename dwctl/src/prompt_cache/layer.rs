@@ -22,6 +22,16 @@
 //! front of dynamo must forward engine cache stats for internal capture); the scrub decision
 //! lives here, next to billing.
 //!
+//! On the ACTIVE (tariffed) path the paradigm is chosen by ARMING — `had_markers`, the
+//! pre-flight signal that the request carried cache markers (block, top-level automatic,
+//! or the `cacheBreakpoint` query param) — never by cache values. An UNARMED request
+//! bills the upstream's own reported cache hit — engine-cache passthrough (see
+//! [`super::inject`]'s `splice_cache_fields`) — so a tariff row alone buys implicit,
+//! best-effort caching for marker-less clients. An ARMED request is wholly explicit:
+//! deterministic module numbers, zeros included, engine report ignored. Strictly one
+//! paradigm per request, so a customer's cache numbers are always explainable from
+//! their own markers.
+//!
 //! Placed **inner to outlet** in the stack so the analytics/billing capture sees the
 //! injected cache fields.
 
@@ -296,6 +306,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
             state.classifier.clone(),
             upstream_cached,
             cache_billing,
+            had_markers,
         );
     }
 
@@ -307,7 +318,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         // reads as a discount we didn't give.
         return scrub_response_nonstreaming(response, &upstream_cached).await;
     }
-    let (response, billing_ok) = inject_into_response_nonstreaming(response, &outcome.stats, &upstream_cached).await;
+    let (response, billing_ok) = inject_into_response_nonstreaming(response, &outcome.stats, &upstream_cached, had_markers).await;
     if !outcome.pending.is_empty() {
         if billing_ok {
             spawn_commit(state.classifier.clone(), outcome.pending);
@@ -451,6 +462,7 @@ fn defer_classify_into_stream(
     classifier: Classifier,
     upstream_cached: UpstreamCachedTokens,
     cache_billing: CacheBilling,
+    armed: bool,
 ) -> Response {
     let (parts, body) = response.into_parts();
     let status_ok = parts.status.is_success();
@@ -502,15 +514,21 @@ fn defer_classify_into_stream(
             // `cached_tokens` on a model we bill at full price reads as a discount we didn't give.
             let out = if !edited && probe.saw_usage {
                 let scan = match outcome.as_ref() {
-                    Some(o) if o.active => scan_edit_sse(&chunk, UsageEdit::Inject(&o.stats)),
+                    Some(o) if o.active => scan_edit_sse(
+                        &chunk,
+                        UsageEdit::Inject {
+                            stats: &o.stats,
+                            armed,
+                        },
+                    ),
                     // Inactive — and `None` can't happen (the classify join above runs on the
                     // first usage frame), so it degrades to the safe edit.
                     _ => scan_edit_sse(&chunk, UsageEdit::Scrub),
                 };
                 // Only mark done once it *actually* rewrote — a (rare) reserialize failure (or a
                 // scrub with nothing to remove) shouldn't disable editing a later usage frame.
-                if let Some(stats) = scan.billing_stats {
-                    cache_billing.set(stats);
+                if let Some(billed) = scan.billing_stats {
+                    cache_billing.set(billed);
                 }
                 edited |= scan.rewritten.is_some();
                 scan.rewritten.unwrap_or(chunk)
@@ -1141,6 +1159,101 @@ mod tests {
         assert_eq!(cell.get(), Some(687), "filled at the terminal frame, after the head was cloned");
     }
 
+    // ---- engine-cache passthrough (implicit caching on tariffed models) ----
+
+    /// Insert the tariff row that cache-activates `ALIAS` for a passthrough test.
+    async fn activate_alias(pool: &PgPool, user: uuid::Uuid) {
+        let endpoint = create_test_endpoint(pool, "ep", user).await;
+        let id = create_test_model(pool, "m", ALIAS, endpoint, user).await;
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens)
+               VALUES ($1, 1.25, 2.0, 2.5, 1024)"#,
+            id
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn tariffed_model_passes_engine_cache_through_for_unmarked_requests(pool: PgPool) {
+        // A tariff row alone (no markers, tokenizer deliberately unreachable — the model
+        // needn't be onboarded to tokenizer-svc) buys implicit caching: the engine's own
+        // reported hit becomes the billed, customer-visible read. Creations stay zero —
+        // implicit caching has no write concept and no premium.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        activate_alias(&pool, user.id).await;
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream_with_provider_cache))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        let r = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({"model": ALIAS, "messages": [{"role":"user","content":"hi"}]}))
+            .await;
+        r.assert_status_ok();
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["usage"]["prompt_tokens"], 985, "token totals untouched");
+        assert_eq!(
+            v["usage"]["prompt_tokens_details"]["cached_tokens"], 687,
+            "engine hit passed through"
+        );
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 687, "billed read = engine hit");
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 0, "implicit caching never writes");
+    }
+
+    #[sqlx::test]
+    async fn tariffed_model_passes_engine_cache_through_on_streams(pool: PgPool) {
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        activate_alias(&pool, user.id).await;
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_upstream_streaming_with_provider_cache))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        let r = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({"model": ALIAS, "stream": true, "messages": [{"role":"user","content":"hi"}]}))
+            .await;
+        r.assert_status_ok();
+        let t = r.text();
+        assert!(t.contains("\"cached_tokens\":687"), "engine hit kept in terminal frame: {t}");
+        assert!(t.contains("\"cache_read_input_tokens\":687"), "billed read = engine hit: {t}");
+        assert!(t.contains("\"cache_creation_input_tokens\":0"), "no writes on implicit: {t}");
+        assert!(t.contains("\"content\":\"hi\""), "delta preserved: {t}");
+        assert!(t.contains("data: [DONE]"), "DONE preserved: {t}");
+    }
+
     // ---- `?cacheBreakpoint=lastUserMessage` (query-param automatic caching) ----
 
     /// A body with NO cache_control anywhere — the shape the proxy customer sends.
@@ -1262,6 +1375,8 @@ mod tests {
             .json(&request_body)
             .await;
         r1.assert_status_ok();
+        // The write leg is EXPLICIT caching in action (creation billed at its premium) — the
+        // upstream's 777 engine-cached tokens are deliberately ignored, one paradigm per request.
         // 490 uncached + 1510 * 2 (1h write) + 2 * 3 (output).
         assert_cache_billing(&r1.text(), observed.lock().unwrap().clone().unwrap(), 0, 1510, Decimal::from(3516));
 
@@ -1290,6 +1405,8 @@ mod tests {
             .json(&request_body)
             .await;
         r2.assert_status_ok();
+        // The read leg bills the module's smoothed 1510, not the engine's 777 — armed
+        // requests are the module's alone.
         // 490 uncached + 1510 * 0.1 (read) + 2 * 3 (output).
         assert_cache_billing(&r2.text(), observed.lock().unwrap().clone().unwrap(), 1510, 0, Decimal::from(647));
     }
