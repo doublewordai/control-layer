@@ -1897,6 +1897,7 @@ mod integration_tests {
     use crate::db::handlers::Repository;
     use crate::db::handlers::credits::Credits;
     use crate::db::models::credits::CreditTransactionType;
+    use crate::pricing::CacheMultipliers;
     use crate::test::utils::create_test_user;
     use rust_decimal::prelude::FromStr;
 
