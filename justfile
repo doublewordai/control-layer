@@ -646,13 +646,15 @@ lint target *args="":
                 --package dwctl \
                 --package fusillade \
                 --package fusillade-core \
-                --package fusillade-arsenal
+                --package fusillade-arsenal \
+                --package openai-reassembler
             echo "Running cargo clippy..."
             cargo clippy \
                 --package dwctl \
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
+                --package openai-reassembler \
                 --all-features \
                 --no-deps \
                 {{args}}
@@ -716,6 +718,7 @@ fmt target *args="":
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
+                --package openai-reassembler \
                 {{args}}
             ;;
         *)

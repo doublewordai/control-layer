@@ -46,6 +46,7 @@ use super::metrics as cache_metrics;
 use super::parse::{ParseError, validate_markers};
 use super::query::{self, Inject, InvalidBreakpointValue};
 use super::sse::SseBufferedStream;
+use super::stats::CacheBilling;
 
 /// Bound on the index commit (off the response path). A slow/hung DB can't leak the
 /// spawned task or hold a pool connection indefinitely; a miss just drops the write
@@ -267,6 +268,8 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // is when outlet clones the extensions; filled when the usage object is seen.
     let upstream_cached = UpstreamCachedTokens::default();
     response.extensions_mut().insert(upstream_cached.clone());
+    let cache_billing = CacheBilling::default();
+    response.extensions_mut().insert(cache_billing.clone());
 
     // Post-response work — resolve classify, inject the stats, commit on success — differs by
     // transport. The split is the whole point of this layer's latency profile:
@@ -292,6 +295,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
             model_label,
             state.classifier.clone(),
             upstream_cached,
+            cache_billing,
         );
     }
 
@@ -446,6 +450,7 @@ fn defer_classify_into_stream(
     model_label: String,
     classifier: Classifier,
     upstream_cached: UpstreamCachedTokens,
+    cache_billing: CacheBilling,
 ) -> Response {
     let (parts, body) = response.into_parts();
     let status_ok = parts.status.is_success();
@@ -504,6 +509,9 @@ fn defer_classify_into_stream(
                 };
                 // Only mark done once it *actually* rewrote — a (rare) reserialize failure (or a
                 // scrub with nothing to remove) shouldn't disable editing a later usage frame.
+                if let Some(stats) = scan.billing_stats {
+                    cache_billing.set(stats);
+                }
                 edited |= scan.rewritten.is_some();
                 scan.rewritten.unwrap_or(chunk)
             } else {
@@ -585,16 +593,23 @@ fn spawn_commit(classifier: Classifier, pending: super::stats::PendingWrite) {
 mod tests {
     use super::*;
     use crate::api::models::users::Role;
+    use crate::inference::translation::{TranslationRegistry, middleware::translation_middleware, responses::OpenResponses};
+    use crate::metrics::errors::component::ANALYTICS_BATCHER;
+    use crate::pricing::{CacheMultipliers, TokenCounts, charged_cost};
     use crate::prompt_cache::{
         CacheIndex, IndexScope, ModelConfigResolver, PostgresIndex, PrincipalResolver, TelemetryPolicy, TokenizerClient,
         parse_chat_completions,
     };
+    use crate::request_logging::serializers::{extract_cache_tokens, extract_from_last_usage, raw_usage_tokens};
     use crate::test::utils::{create_test_api_key_for_user, create_test_endpoint, create_test_model, create_test_user};
+    use axum::http::Extensions;
     use axum::middleware::from_fn_with_state;
     use axum::routing::post;
     use axum::{Json, Router};
+    use outlet::ResponseData;
+    use rust_decimal::Decimal;
     use sqlx::PgPool;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1161,6 +1176,37 @@ mod tests {
 
     #[sqlx::test]
     async fn query_param_end_to_end_creates_then_reads(pool: PgPool) {
+        query_param_cache_round_trip(pool, "/v1/chat/completions", false).await;
+    }
+
+    #[sqlx::test]
+    async fn responses_query_param_bills_cache_writes_and_reads(pool: PgPool) {
+        query_param_cache_round_trip(pool, "/v1/responses", false).await;
+    }
+
+    #[sqlx::test]
+    async fn responses_streaming_query_param_bills_cache_writes_and_reads(pool: PgPool) {
+        query_param_cache_round_trip(pool, "/v1/responses", true).await;
+    }
+
+    type ObservedExtensions = Arc<Mutex<Option<Extensions>>>;
+
+    async fn observe_cache_billing(State(slot): State<ObservedExtensions>, req: Request, next: Next) -> Response {
+        let response = next.run(req).await;
+        let capture = response
+            .extensions()
+            .get::<CacheBilling>()
+            .expect("billing metadata survives translation");
+        if is_streaming(&response) {
+            assert!(capture.get().is_none(), "streaming counts arrive after the response head");
+        }
+        *slot.lock().unwrap() = Some(response.extensions().clone());
+        response
+    }
+
+    /// Exercise translation -> cache -> upstream -> translation -> billing with
+    /// an actual cache-index write followed by a read of the same prefix.
+    async fn query_param_cache_round_trip(pool: PgPool, route: &str, streaming: bool) {
         // The customer's whole flow: an unmarked body + the query param behaves exactly like
         // top-level automatic caching — first request writes the full conversation prefix,
         // an identical follow-up reads it.
@@ -1190,27 +1236,34 @@ mod tests {
             TelemetryPolicy::default(),
             false,
         );
+        let observed: ObservedExtensions = Default::default();
         let app = Router::new()
-            .route("/v1/chat/completions", post(mock_upstream))
+            .route(route, post(mock_cache_billing_upstream))
             .layer(from_fn_with_state(
                 CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
                 cache_middleware,
-            ));
+            ))
+            .layer(from_fn_with_state(
+                TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]),
+                translation_middleware,
+            ))
+            .layer(from_fn_with_state(observed.clone(), observe_cache_billing));
         let server = axum_test::TestServer::new(app).unwrap();
+        let request_body = if route.ends_with("/responses") {
+            serde_json::json!({"model": ALIAS, "instructions": "static system", "input": "hi", "stream": streaming})
+        } else {
+            body_unmarked()
+        };
 
         let r1 = server
-            .post("/v1/chat/completions")
+            .post(route)
             .add_query_param("cacheBreakpoint", "lastUserMessage")
             .add_header("authorization", format!("Bearer {}", key.secret))
-            .json(&body_unmarked())
+            .json(&request_body)
             .await;
         r1.assert_status_ok();
-        let v1: serde_json::Value = r1.json();
-        assert_eq!(v1["usage"]["cache_read_input_tokens"], 0);
-        assert_eq!(
-            v1["usage"]["cache_creation_input_tokens"], 1510,
-            "the whole conversation is the written prefix"
-        );
+        // 490 uncached + 1510 * 2 (1h write) + 2 * 3 (output).
+        assert_cache_billing(&r1.text(), observed.lock().unwrap().clone().unwrap(), 0, 1510, Decimal::from(3516));
 
         // The write lands at the LAST block's cumulative hash (markers never enter the hash, so
         // the unmarked body parses to the same hashes).
@@ -1231,14 +1284,101 @@ mod tests {
         await_commit(&idx, &scope, &hash, "the query-param write should commit after a 2xx").await;
 
         let r2 = server
-            .post("/v1/chat/completions")
+            .post(route)
             .add_query_param("cacheBreakpoint", "lastUserMessage")
             .add_header("authorization", format!("Bearer {}", key.secret))
-            .json(&body_unmarked())
+            .json(&request_body)
             .await;
-        let v2: serde_json::Value = r2.json();
-        assert_eq!(v2["usage"]["cache_read_input_tokens"], 1510, "second request reads the prefix");
-        assert_eq!(v2["usage"]["cache_creation_input_tokens"], 0);
+        r2.assert_status_ok();
+        // 490 uncached + 1510 * 0.1 (read) + 2 * 3 (output).
+        assert_cache_billing(&r2.text(), observed.lock().unwrap().clone().unwrap(), 1510, 0, Decimal::from(647));
+    }
+
+    async fn mock_cache_billing_upstream(req: Request) -> Response {
+        assert_eq!(req.uri().path(), "/v1/chat/completions");
+        assert!(req.uri().query().is_none(), "cache query parameter must not reach upstream");
+        let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+        let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(request.get("cache_control").is_none());
+        assert!(request.get("input").is_none());
+        let usage = serde_json::json!({
+            "prompt_tokens": 2000, "completion_tokens": 2, "total_tokens": 2002,
+            "prompt_tokens_details": {"cached_tokens": 777}
+        });
+        if request["stream"] == true {
+            let chunk = serde_json::json!({
+                "id": "c1", "object": "chat.completion.chunk", "created": 0, "model": ALIAS,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                "usage": usage
+            });
+            (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                format!("data: {chunk}\n\ndata: [DONE]\n\n"),
+            )
+                .into_response()
+        } else {
+            Json(serde_json::json!({
+                "id": "c1", "object": "chat.completion", "created": 0, "model": ALIAS,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "hi"}, "finish_reason": "stop"}],
+                "usage": usage
+            }))
+            .into_response()
+        }
+    }
+
+    fn assert_cache_billing(body: &str, extensions: Extensions, read: i64, creation: i64, expected_cost: Decimal) {
+        assert_eq!(extensions.get::<UpstreamCachedTokens>().and_then(|c| c.get()), Some(777));
+        let response = ResponseData {
+            extensions,
+            correlation_id: 1,
+            timestamp: std::time::SystemTime::now(),
+            status: StatusCode::OK,
+            headers: Default::default(),
+            body: Some(body.to_string().into()),
+            duration: Duration::ZERO,
+            duration_to_first_byte: Duration::ZERO,
+        };
+        let cache = extract_cache_tokens(&response);
+        assert_eq!(
+            (cache.read, cache.creation_5m, cache.creation_1h, cache.creation_24h),
+            (read, 0, creation, 0)
+        );
+        let displayed = extract_from_last_usage(&response, |usage| {
+            usage
+                .pointer("/input_tokens_details/cached_tokens")
+                .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+                .and_then(serde_json::Value::as_i64)
+        });
+        assert_eq!(displayed, Some(read), "displayed reads must match billed reads");
+        extract_from_last_usage(&response, |usage| {
+            if let Some(details) = usage.get("input_tokens_details") {
+                assert_eq!(details["cache_write_tokens"], creation);
+                for field in ["cache_read_input_tokens", "cache_creation_input_tokens", "cache_creation"] {
+                    assert!(usage.get(field).is_none(), "Responses must not expose {field}");
+                }
+            } else {
+                assert_eq!(usage["cache_read_input_tokens"], read, "Chat Completions stays compatible");
+                assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], creation);
+            }
+        });
+        let tokens = extract_from_last_usage(&response, raw_usage_tokens).expect("response usage");
+        let counts = TokenCounts {
+            prompt: tokens.prompt,
+            completion: tokens.completion,
+            cache_read: cache.read,
+            cache_creation_5m: cache.creation_5m,
+            cache_creation_1h: cache.creation_1h,
+            cache_creation_24h: cache.creation_24h,
+        };
+        let cost = charged_cost(
+            &counts,
+            Some(ALIAS),
+            Some(Decimal::ONE),
+            Some(Decimal::from(3)),
+            Some(CacheMultipliers::default()),
+            ANALYTICS_BATCHER,
+        );
+        assert_eq!(cost, Some(expected_cost));
     }
 
     /// Upstream stand-in that echoes what it received (URI query + whether the body still carried

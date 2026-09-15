@@ -28,7 +28,7 @@ use std::sync::{Arc, OnceLock};
 use tracing::error;
 
 use super::parse::{TELEMETRY_ROLE, TelemetryPolicy};
-use super::stats::CacheStats;
+use super::stats::{CacheBilling, CacheStats};
 
 /// The upstream's `prompt_tokens_details.cached_tokens` exactly as it arrived, captured
 /// BEFORE this layer zeroes it (inactive model) or overwrites it with dwctl's own read
@@ -255,7 +255,7 @@ pub fn scrub_usage_json(body: &[u8]) -> Option<Bytes> {
 /// billing semantics (request_logging::batcher::compute_total_cost): drift caps the READ
 /// count to fit; write counts alone exceeding the prompt is corrupt and reports no cache
 /// activity at all — matching the list-price bill for that case.
-fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &CacheStats, model: Option<&str>) {
+fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &CacheStats, model: Option<&str>) -> CacheStats {
     // Scrub first so nothing an upstream reported (e.g. DeepSeek's `prompt_cache_hit_tokens`
     // on an unsanitized model) survives alongside the fields we're about to write.
     scrub_provider_cache_fields(usage);
@@ -300,17 +300,24 @@ fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &Cache
             "ephemeral_24h_input_tokens": c24,
         }),
     );
+    CacheStats {
+        read,
+        creation_5m: c5,
+        creation_1h: c1,
+        creation_24h: c24,
+        ..*stats
+    }
 }
 
-/// Inject the cache stats into a non-streaming chat-completion JSON body. Returns the
-/// rewritten body, or `None` if it can't be parsed or has no `usage` object.
-pub fn inject_into_usage_json(body: &[u8], stats: &CacheStats) -> Option<Bytes> {
+/// Inject the cache stats into a non-streaming chat-completion JSON body. Returns
+/// the rewritten body and capped billing counts, or `None` if there is no usage.
+pub fn inject_into_usage_json(body: &[u8], stats: &CacheStats) -> Option<(Bytes, CacheStats)> {
     let mut json: Value = serde_json::from_slice(body).ok()?;
     let obj = json.as_object_mut()?;
     let model = obj.get("model").and_then(Value::as_str).map(String::from);
     let usage = obj.get_mut("usage")?.as_object_mut()?;
-    splice_cache_fields(usage, stats, model.as_deref());
-    serde_json::to_vec(&json).ok().map(Bytes::from)
+    let billed = splice_cache_fields(usage, stats, model.as_deref());
+    serde_json::to_vec(&json).ok().map(|body| (Bytes::from(body), billed))
 }
 
 /// The outcome of scanning one SSE body chunk: the (optionally) rewritten bytes plus the
@@ -325,6 +332,8 @@ pub(crate) struct SseScan {
     pub saw_usage: bool,
     /// The upstream's `cached_tokens` from that usage frame, read before any edit.
     pub upstream_cached_tokens: Option<u64>,
+    /// Capped counts, populated only when cache usage was successfully emitted.
+    pub billing_stats: Option<CacheStats>,
 }
 
 /// How [`scan_edit_sse`] treats the (single) usage frame it finds.
@@ -360,6 +369,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
             saw_error: false,
             saw_usage: false,
             upstream_cached_tokens: None,
+            billing_stats: None,
         };
     };
 
@@ -384,6 +394,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
             saw_error,
             saw_usage,
             upstream_cached_tokens: upstream,
+            billing_stats: None,
         };
     }
 
@@ -392,6 +403,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
     let mut saw_error = false;
     let mut saw_usage = false;
     let mut upstream = None;
+    let mut billing_stats = None;
 
     let mut first = true;
     for line in body_str.split('\n') {
@@ -417,17 +429,19 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
                     // (split on '\n') ends with '\r', which the reserialized JSON drops —
                     // re-append it so we don't emit a lone '\n' amid '\r\n' framing.
                     let has_cr = line.ends_with('\r');
+                    let mut billed = None;
                     let changed = match edit {
                         // Probe returned on the fast path above; a frame can't reach here.
                         UsageEdit::Probe => false,
                         UsageEdit::Inject(stats) => {
-                            splice_cache_fields(usage_obj, stats, model.as_deref());
+                            billed = Some(splice_cache_fields(usage_obj, stats, model.as_deref()));
                             true
                         }
                         // A clean frame needs no rewrite — keep the original bytes.
                         UsageEdit::Scrub => scrub_provider_cache_fields(usage_obj),
                     };
                     if changed && let Ok(reserialized) = serde_json::to_string(&chunk) {
+                        billing_stats = billed;
                         out.push_str("data: ");
                         out.push_str(&reserialized);
                         if has_cr {
@@ -447,6 +461,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
         saw_error,
         saw_usage,
         upstream_cached_tokens: upstream,
+        billing_stats,
     }
 }
 
@@ -529,7 +544,10 @@ pub async fn inject_into_response_nonstreaming(response: Response, stats: &Cache
         capture.set(v);
     }
     match inject_into_usage_json(&body_bytes, stats) {
-        Some(rewritten) => {
+        Some((rewritten, billed)) => {
+            if let Some(capture) = parts.extensions.get::<CacheBilling>() {
+                capture.set(billed);
+            }
             let len = rewritten.len();
             parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
             // We emit plain JSON (parse succeeded), so drop any stale Content-Encoding.
@@ -853,7 +871,8 @@ mod tests {
     #[test]
     fn inject_non_streaming_adds_cache_fields() {
         let body = serde_json::json!({"usage":{"prompt_tokens":2000,"completion_tokens":5}}).to_string();
-        let out = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        assert_eq!(billed, stats());
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["prompt_tokens"], 2000, "total preserved");
         assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 1024);
@@ -868,7 +887,8 @@ mod tests {
         // the engine's prompt_tokens (1000). The customer must never see an impossible
         // split — the read is capped to fit, mirroring the billing cap exactly.
         let body = serde_json::json!({"usage":{"prompt_tokens":1000,"completion_tokens":5}}).to_string();
-        let out = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        assert_eq!(billed, CacheStats { read: 940, ..stats() });
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["prompt_tokens"], 1000, "engine total preserved");
         assert_eq!(v["usage"]["cache_read_input_tokens"], 940, "read capped to prompt - creations");
@@ -882,7 +902,8 @@ mod tests {
         // list price, so the reported usage shows no cache activity either — the two views
         // must agree.
         let body = serde_json::json!({"usage":{"prompt_tokens":50,"completion_tokens":5}}).to_string();
-        let out = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        assert_eq!(billed, CacheStats::default());
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["cache_read_input_tokens"], 0);
         assert_eq!(v["usage"]["cache_creation_input_tokens"], 0);
@@ -894,6 +915,29 @@ mod tests {
     fn inject_non_streaming_none_when_no_usage() {
         let body = serde_json::json!({"choices":[]}).to_string();
         assert!(inject_into_usage_json(body.as_bytes(), &stats()).is_none());
+    }
+
+    #[test]
+    fn streaming_billing_metadata_matches_emitted_capped_usage() {
+        for (prompt, expected) in [
+            (2000, stats()),
+            (1000, CacheStats { read: 940, ..stats() }),
+            (50, CacheStats::default()),
+        ] {
+            let sse = format!("data: {{\"usage\":{{\"prompt_tokens\":{prompt}}}}}\n\ndata: [DONE]\n\n");
+            let scan = scan_edit_sse(sse.as_bytes(), UsageEdit::Inject(&stats()));
+            assert_eq!(scan.billing_stats, Some(expected));
+            let body = String::from_utf8(scan.rewritten.unwrap().to_vec()).unwrap();
+            let usage = sse_data_json(body.lines().next().unwrap()).unwrap()["usage"].clone();
+            assert_eq!(usage["cache_read_input_tokens"], expected.read);
+            assert_eq!(usage["cache_creation_input_tokens"], expected.creation_total());
+            assert!(scan_edit_sse(sse.as_bytes(), UsageEdit::Scrub).billing_stats.is_none());
+        }
+        assert!(
+            scan_edit_sse(b"data: {\"choices\":[]}\n\n", UsageEdit::Inject(&stats()))
+                .billing_stats
+                .is_none()
+        );
     }
 
     #[test]
@@ -1034,7 +1078,7 @@ mod tests {
             "cache_discount": 0.5
         }})
         .to_string();
-        let out = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        let (out, _) = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
         let v: Value = serde_json::from_slice(&out).unwrap();
         let usage = v["usage"].as_object().unwrap();
         assert!(!usage.contains_key("prompt_cache_hit_tokens"));

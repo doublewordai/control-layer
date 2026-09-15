@@ -18,6 +18,7 @@
 
 use onwards::strict::schemas::chat_completions::{ChatCompletionChunk, ChunkChoice};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,7 +26,7 @@ use super::types::{
     ContentPart, FunctionCallItem, Item, ItemStatus, MessageContent, MessageItem, ReasoningContent, ReasoningItem, ResponseStatus,
     ResponseUsage, ResponsesRequest, ResponsesResponse, SummaryContent, TextConfig, TextFormat, TruncationStrategy,
 };
-use super::util::{chat_usage_to_response_usage, merge_reasoning_text};
+use super::util::{cache_write_tokens, chat_usage_to_response_usage, merge_reasoning_text};
 
 /// State machine for tracking streaming response state
 #[derive(Debug, Clone)]
@@ -164,6 +165,14 @@ impl StreamingState {
         }
 
         events
+    }
+
+    /// Retain the public cache-write total from the raw chunk that supplied usage,
+    /// before `response.completed` serializes the accumulated response.
+    pub(super) fn preserve_cache_write_tokens(&mut self, raw_usage: Option<&Value>) {
+        if let Some(usage) = self.usage.as_mut() {
+            usage.input_tokens_details.cache_write_tokens = cache_write_tokens(raw_usage);
+        }
     }
 
     /// Finalize the response and emit completion event

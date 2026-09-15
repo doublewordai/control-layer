@@ -1,0 +1,750 @@
+{
+  "chunks": [
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " ran"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " to"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " the"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " river"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": "."
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " The"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " dog"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": ","
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " startled"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " by"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " the"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " fox"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": "'s"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " sudden"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " appearance"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": ","
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " b"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": "arked"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " loudly"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " and"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " chased"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " after"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " it"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": "."
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " The"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " fox"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": ","
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " being"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " agile"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": ","
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " easily"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " dod"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": "ged"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " the"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " dog"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": "'s"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " attempts"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " to"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " catch"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " it"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " and"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " continued"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " running"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " towards"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " the"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " river"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": "bank"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": "."
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "index": 0,
+          "text": " As"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [
+        {
+          "finish_reason": "length",
+          "index": 0,
+          "text": " the"
+        }
+      ],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "nvext": {
+        "timing": {
+          "request_received_ms": 1775563001385,
+          "total_time_ms": 783.164197
+        }
+      },
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [],
+      "created": 1775563001,
+      "id": "cmpl-15db66e8-497d-43c8-90cc-148abd7b2cb4",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "text_completion",
+      "system_fingerprint": null,
+      "usage": {
+        "completion_tokens": 50,
+        "prompt_tokens": 11,
+        "total_tokens": 61
+      }
+    },
+    "[DONE]"
+  ],
+  "expected": {
+    "choices": [
+      {
+        "finish_reason": "length",
+        "index": 0,
+        "text": " ran to the river. The dog, startled by the fox's sudden appearance, barked loudly and chased after it. The fox, being agile, easily dodged the dog's attempts to catch it and continued running towards the riverbank. As the"
+      }
+    ],
+    "created": 1775563000,
+    "id": "cmpl-78cb8a81-0cc1-434d-af99-ea3cc381ef2d",
+    "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+    "nvext": {
+      "timing": {
+        "request_received_ms": 1775563000593,
+        "total_time_ms": 781.87411
+      }
+    },
+    "object": "text_completion",
+    "system_fingerprint": null,
+    "usage": {
+      "completion_tokens": 50,
+      "prompt_tokens": 11,
+      "total_tokens": 61
+    }
+  }
+}
