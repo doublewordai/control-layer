@@ -251,6 +251,7 @@ impl RequestHandler for AnalyticsHandler {
                 // is one, else whoever is on the wire. See `resolve_user_agent`.
                 user_agent: resolve_user_agent(&request_data),
                 engine_cached_tokens: metrics.engine_cached_tokens,
+                cache_read_source: metrics.cache_read_source.clone(),
                 request_params: metrics.request_params,
                 server_address: metrics.server_address,
                 server_port: metrics.server_port,

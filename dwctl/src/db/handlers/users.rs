@@ -119,9 +119,9 @@ struct User {
     pub verified: bool,
     pub zero_data_retention: bool,
     pub invoicing_enabled: bool,
-    /// Account setting: default serving class (migration 141).
+    /// Account setting: default serving class (migration 143).
     pub default_serving_class: Option<String>,
-    /// Account setting: never fall over to an external provider (migration 141).
+    /// Account setting: never fall over to an external provider (migration 143).
     pub self_hosted_only: bool,
     /// Organizations only: admit signups from the claimed domain without
     /// review.

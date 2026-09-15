@@ -134,7 +134,7 @@ pub struct ApiKeyDBResponse {
     /// an issued key awaiting its holder's one-off reveal; self-created keys
     /// are born revealed. Rotation never touches this.
     pub secret_revealed_at: Option<DateTime<Utc>>,
-    /// Serving class requested by default (migration 141). NULL = none.
+    /// Serving class requested by default (migration 143). NULL = none.
     pub serving_class: Option<String>,
 }
 

@@ -773,7 +773,7 @@ pub struct DeploymentDBResponse {
     pub metadata: serde_json::Value,
     /// Declarative source reapplied during startup, or None for manually managed rows.
     pub provisioning_source: Option<String>,
-    /// Elevated serving classes this model has activated (migration 141).
+    /// Elevated serving classes this model has activated (migration 143).
     pub serving_classes: Vec<String>,
 }
 
