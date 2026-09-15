@@ -1298,6 +1298,11 @@ pub(crate) struct PageShape {
     pub(crate) single_model: bool,
     pub(crate) created_after: bool,
     pub(crate) created_before: bool,
+    /// A status filter that can never match an in-flight row ('processing',
+    /// 'claimed', 'pending'). The active arm is provably empty for such
+    /// pages, so the CTE is emitted as `AND FALSE` — which the planner folds
+    /// to an empty materialization before touching the requests heap.
+    pub(crate) status_terminal: bool,
 }
 
 impl PageShape {
@@ -1311,6 +1316,10 @@ impl PageShape {
                 .is_some_and(|models| models.len() == 1),
             created_after: filter.created_after.is_some(),
             created_before: filter.created_before.is_some(),
+            status_terminal: filter
+                .status
+                .as_deref()
+                .is_some_and(|status| !matches!(status, "processing" | "claimed" | "pending")),
         }
     }
 }
@@ -1322,6 +1331,7 @@ fn list_requests_page_sql(shape: PageShape) -> String {
         single_model,
         created_after,
         created_before,
+        status_terminal,
     } = shape;
     let live_owner = if owner_scoped {
         "request.created_by = $1::text"
@@ -1432,6 +1442,17 @@ fn list_requests_page_sql(shape: PageShape) -> String {
     // an ordering the plain (owner,) created_at DESC indexes already provide.
     let terminal_order = "request.created_at DESC, request.id DESC";
     let retained_order = "object.created_at DESC, object.object_id DESC";
+    // A terminal status filter can never match the in-flight population, so
+    // the CTE is emitted as `AND FALSE`. The planner folds that before the
+    // scan runs, so status-filtered pages (the console's failed-responses
+    // view among them) stop paying a full requests scan just to materialize
+    // rows the outer state filter discards. A row keeps whatever state it
+    // carries, so this changes no page's contents — only the work behind it.
+    let active_state = if status_terminal {
+        "FALSE".to_string()
+    } else {
+        "state IN ('processing', 'claimed', 'pending')".to_string()
+    };
     format!(
         r#"
         WITH valid_buckets AS MATERIALIZED (
@@ -1486,7 +1507,7 @@ fn list_requests_page_sql(shape: PageShape) -> String {
                    completed_at, failed_at, started_at, response_status
             FROM requests
             WHERE created_by IS NOT NULL
-              AND state IN ('processing', 'claimed', 'pending')
+              AND {active_state}
               AND {active_owner_inner}
         ),
         candidates AS (
@@ -4127,7 +4148,8 @@ mod tests {
                     owner_scoped: true,
                     single_model: false,
                     created_after: false,
-                    created_before: false
+                    created_before: false,
+                    status_terminal: false,
                 })
             );
             sqlx::raw_sql(&sql).execute(&mut *tx).await.unwrap();
@@ -4280,6 +4302,7 @@ mod tests {
             single_model: false,
             created_after: true,
             created_before: false,
+            status_terminal: false,
         }))
         .bind(Option::<&str>::None)
         .bind(Option::<&str>::None)
@@ -4306,6 +4329,7 @@ mod tests {
                     single_model: false,
                     created_after: true,
                     created_before: false,
+                    status_terminal: false,
                 }),
                 true,
             ),
@@ -4740,6 +4764,7 @@ mod tests {
             single_model: false,
             created_after: true,
             created_before: true,
+            status_terminal: false,
         });
         assert!(both.contains("AND request.created_at >= $4"));
         assert!(both.contains("AND request.created_at <= $5"));
@@ -4756,6 +4781,7 @@ mod tests {
             single_model: false,
             created_after: false,
             created_before: false,
+            status_terminal: false,
         });
         assert!(!neither.contains("created_at >= $4"));
         assert!(!neither.contains("created_at <= $5"));
@@ -4769,6 +4795,7 @@ mod tests {
             single_model: false,
             created_after: true,
             created_before: false,
+            status_terminal: false,
         });
         assert!(after_only.contains("AND object.delete_on > ($4 AT TIME ZONE 'UTC')::date"));
         assert!(!after_only.contains("created_at <= $5"));
@@ -4785,9 +4812,73 @@ mod tests {
             single_model: false,
             created_after: false,
             created_before: false,
+            status_terminal: false,
         });
         assert!(sql.contains("state IN ('processing', 'claimed', 'pending')"));
         assert!(sql.contains("request.state NOT IN ('processing', 'claimed', 'pending')"));
+    }
+
+    #[test]
+    fn terminal_status_collapse_the_active_arm_before_the_scan() {
+        // A status filter that cannot match an in-flight row makes the active
+        // arm provably empty, so the CTE must fold to `AND FALSE` instead of
+        // materializing the whole non-terminal population on every page. An
+        // in-flight status keeps the full arm: the planner cannot prove
+        // anything about a bound parameter at plan time.
+        let terminal = list_requests_page_sql(PageShape {
+            active_first: true,
+            owner_scoped: false,
+            single_model: false,
+            created_after: false,
+            created_before: false,
+            status_terminal: true,
+        });
+        assert!(terminal.contains("AND FALSE"));
+        assert!(!terminal.contains("state IN ('processing', 'claimed', 'pending')"));
+
+        let in_flight = list_requests_page_sql(PageShape {
+            active_first: true,
+            owner_scoped: false,
+            single_model: false,
+            created_after: false,
+            created_before: false,
+            status_terminal: false,
+        });
+        assert!(in_flight.contains("state IN ('processing', 'claimed', 'pending')"));
+        assert!(!in_flight.contains("AND FALSE"));
+    }
+
+    #[test]
+    fn page_shape_of_maps_status_filters_to_the_active_arm_shape() {
+        // `PageShape::of` is the single place that decides whether the active
+        // arm is emitted; these are the three callers' shapes: the console's
+        // failed-responses view (terminal), the default unfiltered view, and
+        // each in-flight status.
+        let filter = ListRequestsFilter {
+            status: Some("failed".to_owned()),
+            ..Default::default()
+        };
+        assert!(PageShape::of(&filter).status_terminal);
+
+        let filter = ListRequestsFilter {
+            status: Some("processing".to_owned()),
+            ..Default::default()
+        };
+        assert!(!PageShape::of(&filter).status_terminal);
+
+        let filter = ListRequestsFilter {
+            status: Some("claimed".to_owned()),
+            ..Default::default()
+        };
+        assert!(!PageShape::of(&filter).status_terminal);
+
+        let filter = ListRequestsFilter {
+            status: Some("pending".to_owned()),
+            ..Default::default()
+        };
+        assert!(!PageShape::of(&filter).status_terminal);
+
+        assert!(!PageShape::of(&ListRequestsFilter::default()).status_terminal);
     }
 
     #[test]

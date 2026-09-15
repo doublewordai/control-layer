@@ -12,52 +12,20 @@ use chrono::{DateTime, Utc};
 
 use super::index::{CacheEntry, IndexScope, PrefixHash, TtlTier};
 
-/// Which system produced the billed cache READ for a request. `Module` = dwctl's own
-/// prefix-cache classifier (explicit markers / auto marker placement — the guaranteed,
-/// TTL-smoothed system). `Engine` = the upstream's own reported prefix-cache hit, passed
-/// through as an implicit discount on a tariffed model (engine-cache passthrough: best
-/// effort, no guarantees, whatever the engine/provider actually achieved). Recorded in
-/// `http_analytics.cache_read_source` for the achieved-vs-billed comparison; creations
-/// are always the module's, so they carry no source.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheReadSource {
-    Module,
-    Engine,
-}
-
-impl CacheReadSource {
-    /// The value stored in `http_analytics.cache_read_source`.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Module => "module",
-            Self::Engine => "engine",
-        }
-    }
-}
-
-/// The billed cache split for one request: the (capped) counts the customer was shown
-/// and billing prices, plus where the read came from.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BilledCache {
-    pub stats: CacheStats,
-    /// `None` when the billed read is zero (creations may still be non-zero).
-    pub read_source: Option<CacheReadSource>,
-}
-
 /// Internal cache accounting shared with outlet through response extensions.
 /// Inserted at response-head time and filled only when usage is emitted, so
 /// streaming billing sees the same capped counts as the customer without
 /// depending on protocol-specific fields in the public response body.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct CacheBilling(Arc<OnceLock<BilledCache>>);
+pub(crate) struct CacheBilling(Arc<OnceLock<CacheStats>>);
 
 impl CacheBilling {
-    pub(crate) fn get(&self) -> Option<BilledCache> {
+    pub(crate) fn get(&self) -> Option<CacheStats> {
         self.0.get().copied()
     }
 
-    pub(crate) fn set(&self, billed: BilledCache) {
-        let _ = self.0.set(billed);
+    pub(crate) fn set(&self, stats: CacheStats) {
+        let _ = self.0.set(stats);
     }
 }
 
