@@ -496,6 +496,13 @@ onwards:
   # When true, only known OpenAI API paths are accepted and validated.
   # Set via environment: DWCTL_ONWARDS__STRICT_MODE=true
   strict_mode: false
+  # Failover deadline (ms) for the first token of a realtime streamed response.
+  # While a model still has another provider to fail over to, an attempt that
+  # hasn't started streaming within this window is abandoned and the next
+  # provider tried. The final attempt is never cut off, and fusillade daemon
+  # traffic (batch, flex, background) is exempt. Set to 0 to disable.
+  # Set via environment: DWCTL_ONWARDS__FIRST_TOKEN_TIMEOUT_MS=10000
+  first_token_timeout_ms: 10000
 
 # Cached-input pricing (the dwctl-owned cache layer)
 cache:
