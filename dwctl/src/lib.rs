@@ -790,6 +790,26 @@ mod pooled_schema_tests {
         );
     }
 
+    /// `migrations.mode: check` must not create a missing component schema.
+    #[sqlx::test(migrations = false)]
+    async fn check_mode_reports_a_missing_schema_instead_of_creating_it(pool: PgPool) {
+        let component = serde_json::from_value(serde_json::json!({"mode": "schema", "name": "fusillade_missing"})).unwrap();
+        let main = db::PoolPair::unsplit(DbPools::new(pool.clone()));
+        let err = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'fusillade_missing')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!exists, "check mode executed DDL");
+        setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true)
+            .await
+            .unwrap();
+    }
+
     #[sqlx::test(migrations = false)]
     async fn pooled_fusillade_defaults_to_role_schema_validation(pool: PgPool) {
         let mut endpoint = pool.connect_options().to_url_lossy();
@@ -800,7 +820,7 @@ mod pooled_schema_tests {
         }))
         .unwrap();
         let main = db::PoolPair::unsplit(DbPools::new(pool));
-        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
         assert!(
             result.is_err(),
             "role_default must reject a shared login whose default schema is public"
@@ -823,7 +843,7 @@ mod pooled_schema_tests {
                     .unwrap(),
             ),
         };
-        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
         assert!(
             result.is_err(),
             "explicit direct credentials must not inherit main pooled credentials"
@@ -838,7 +858,7 @@ mod pooled_schema_tests {
         .unwrap();
         let main = db::PoolPair::unsplit(DbPools::new(pool));
         assert!(
-            setup_component_pools("outlet", &component, &main, std::time::Duration::from_secs(1))
+            setup_component_pools("outlet", &component, &main, std::time::Duration::from_secs(1), true)
                 .await
                 .is_err()
         );
@@ -856,7 +876,7 @@ mod pooled_schema_tests {
         }))
         .unwrap();
         let main = db::PoolPair::unsplit(DbPools::new(pool.clone()));
-        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
         // Clean up even on a failed assertion against the old implementation.
         let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
             .bind(&schema)
@@ -889,7 +909,7 @@ mod pooled_schema_tests {
             "mode": "schema", "name": "fusillade", "url": endpoint.as_str()
         }))
         .unwrap();
-        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
         let (identity, has_replica) = match result {
             Ok(pair) => {
                 let identity: String = sqlx::query_scalar("SELECT current_user")
@@ -941,7 +961,7 @@ mod pooled_schema_tests {
         }))
         .unwrap();
         let main = db::PoolPair::unsplit(DbPools::new(pool.clone()));
-        let pair = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1))
+        let pair = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true)
             .await
             .unwrap();
         assert!(
@@ -1056,11 +1076,15 @@ mod pooled_schema_tests {
 /// role schema; Fusillade also supports explicit transaction mode. Dedicated mode has its
 /// own `url` and optional `pooled_url`. Without a pooled endpoint, the pair is
 /// unsplit and sized by `pool`, preserving the existing connection behavior.
+///
+/// `create_schema` is false in `migrations.mode: check`, where startup must not
+/// execute DDL: a missing component schema is reported instead of created.
 async fn setup_component_pools(
     component_name: &str,
     component: &config::ComponentDb,
     main: &db::PoolPair,
     slow_threshold: std::time::Duration,
+    create_schema: bool,
 ) -> anyhow::Result<db::PoolPair> {
     component
         .validate_schema_pooling(component_name, main.is_split())
@@ -1096,6 +1120,9 @@ async fn setup_component_pools(
                 .bind(name)
                 .fetch_one(&direct)
                 .await?;
+            if !schema_exists && !create_schema {
+                anyhow::bail!("{component_name}: schema `{name}` does not exist and migrations.mode is `check`; run `dwctl migrate` first");
+            }
             if !schema_exists {
                 direct
                     .execute(&*format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", name.replace('"', "\"\"")))
@@ -1425,7 +1452,14 @@ async fn setup_database(
 
     // Fusillade batch processing pools
     info!("Setting up fusillade batch processing pool");
-    let fusillade = setup_component_pools("fusillade", config.database.fusillade(), &main, slow_threshold).await?;
+    let fusillade = setup_component_pools(
+        "fusillade",
+        config.database.fusillade(),
+        &main,
+        slow_threshold,
+        config.migrations.mode == config::MigrationsMode::Run,
+    )
+    .await?;
     // sqlx's migrator holds a session advisory lock: direct connections.
     migrations::at_startup(config.migrations.mode, &migrations::Target::fusillade(), &fusillade.direct.write()).await?;
 
@@ -1607,7 +1641,14 @@ async fn setup_database(
     // Outlet request-logging pools, if enabled
     let outlet = if config.enable_request_logging {
         info!("Setting up outlet request logging pool (logging enabled)");
-        let outlet = setup_component_pools("outlet", config.database.outlet(), &main, slow_threshold).await?;
+        let outlet = setup_component_pools(
+            "outlet",
+            config.database.outlet(),
+            &main,
+            slow_threshold,
+            config.migrations.mode == config::MigrationsMode::Run,
+        )
+        .await?;
         migrations::at_startup(config.migrations.mode, &migrations::Target::outlet(), &outlet.direct.write()).await?;
         Some(outlet)
     } else {

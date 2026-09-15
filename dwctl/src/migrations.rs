@@ -166,6 +166,18 @@ struct AppliedRow {
     success: bool,
 }
 
+/// Recorded versions this binary does not ship that are *older* than its
+/// newest migration. Newer unknown versions are a database that is ahead
+/// (a rollback); older ones mean the histories diverged.
+fn diverged_versions(target: &Target, recorded: impl Iterator<Item = i64>) -> Vec<i64> {
+    let latest_known = target.latest_version().unwrap_or(0);
+    let mut diverged: Vec<i64> = recorded
+        .filter(|v| *v < latest_known && !target.migrator.iter().any(|m| m.version == *v))
+        .collect();
+    diverged.sort_unstable();
+    diverged
+}
+
 /// Recorded migrations for the schema on the connection's search path.
 /// `None` when the migrations table does not exist.
 async fn recorded(conn: &mut sqlx::PgConnection) -> anyhow::Result<Option<HashMap<i64, AppliedRow>>> {
@@ -282,6 +294,15 @@ async fn apply_locked(target: &Target, conn: &mut sqlx::PgConnection) -> anyhow:
              Migration files are immutable once released; restore them and ship a new migration instead"
         );
     }
+    // The restricted migrators below run with `ignore_missing`, so this is the
+    // only place a diverged history is caught before new migrations land on it.
+    let diverged = diverged_versions(target, before.keys().copied());
+    if !diverged.is_empty() {
+        bail!(
+            "{name}: database records version(s) {diverged:?} that this binary does not ship and that are older \
+             than its newest; the migration histories diverged, refusing to apply on top"
+        );
+    }
 
     let pending: Vec<_> = target
         .migrator
@@ -366,7 +387,8 @@ pub async fn check(target: &Target, pool: &PgPool) -> anyhow::Result<CheckReport
         }
     }
     let latest_known = known.iter().next_back().copied().unwrap_or(0);
-    let (ahead, diverged): (Vec<i64>, Vec<i64>) = rows.keys().filter(|v| !known.contains(v)).copied().partition(|v| *v > latest_known);
+    let diverged = diverged_versions(target, rows.keys().copied());
+    let ahead: Vec<i64> = rows.keys().filter(|v| !known.contains(v) && **v > latest_known).copied().collect();
     if !missing.is_empty() || !mismatched.is_empty() || !diverged.is_empty() {
         let mut reasons = Vec::new();
         if !missing.is_empty() {
@@ -408,8 +430,15 @@ pub async fn at_startup(mode: MigrationsMode, target: &Target, pool: &PgPool) ->
 }
 
 /// Apply the `underway` task-queue migrations.
+///
+/// On a detached connection closed on every path, for the same reason as
+/// [`Target::run_to`]: SQLx's migrator (which `underway` wraps) can return from
+/// a failure still holding its session advisory lock.
 pub async fn apply_underway(pool: &PgPool) -> anyhow::Result<()> {
-    underway::run_migrations(pool).await.context("underway: applying migrations")?;
+    let mut conn = pool.acquire().await?.detach();
+    let result = underway::run_migrations(&mut conn).await;
+    let _ = conn.close().await;
+    result.context("underway: applying migrations")?;
     info!(target = "underway", "migrations applied");
     Ok(())
 }
@@ -479,7 +508,16 @@ fn describe(options: &PgConnectOptions) -> String {
 /// the serving process but without any pooled endpoint: schema mode reuses the
 /// main direct credentials (or its own `url`) with a pinned `search_path`,
 /// dedicated mode connects to its own `url`.
-async fn connect_component(name: &str, component: &ComponentDb, main: &PgPool, slow: Duration) -> anyhow::Result<PgPool> {
+///
+/// `create_schema` is false for `--check`, which must not execute DDL: a
+/// missing schema is then reported instead of created.
+async fn connect_component(
+    name: &str,
+    component: &ComponentDb,
+    main: &PgPool,
+    slow: Duration,
+    create_schema: bool,
+) -> anyhow::Result<PgPool> {
     match component {
         ComponentDb::Schema { name: schema, url, .. } => {
             let options = match url {
@@ -495,6 +533,9 @@ async fn connect_component(name: &str, component: &ComponentDb, main: &PgPool, s
                 .bind(schema)
                 .fetch_one(&pool)
                 .await?;
+            if !exists && !create_schema {
+                bail!("{name}: schema `{schema}` does not exist; run `dwctl migrate` before checking");
+            }
             if !exists {
                 info!(component = name, schema, "creating schema");
                 sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", schema.replace('"', "\"\"")))
@@ -536,10 +577,10 @@ pub async fn run_command(config: &Config, check_only: bool) -> anyhow::Result<Co
 
     let mut summary = CommandSummary::default();
     let mut targets: Vec<(Target, PgPool)> = vec![(Target::main(), main.clone())];
-    let fusillade = connect_component("fusillade", config.database.fusillade(), &main, slow).await?;
+    let fusillade = connect_component("fusillade", config.database.fusillade(), &main, slow, !check_only).await?;
     targets.push((Target::fusillade(), fusillade));
     let outlet = if config.enable_request_logging {
-        Some(connect_component("outlet", config.database.outlet(), &main, slow).await?)
+        Some(connect_component("outlet", config.database.outlet(), &main, slow, !check_only).await?)
     } else {
         info!("request logging disabled; skipping outlet");
         None
@@ -682,6 +723,9 @@ mod tests {
             .unwrap();
         let err = check(&target, &pool).await.unwrap_err().to_string();
         assert!(err.contains("diverged"), "{err}");
+        // apply must refuse too: the restricted migrators ignore unknown rows.
+        let err = apply(&target, &pool).await.unwrap_err().to_string();
+        assert!(err.contains("diverged"), "{err}");
         sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 0")
             .execute(&pool)
             .await
@@ -803,6 +847,25 @@ mod tests {
         let _ = other.close().await;
         // Fresh connection: the migrator proceeds once the lock is free.
         Target::main().run_to(1, &pool).await.unwrap();
+    }
+
+    /// `--check` must not create a missing component schema.
+    #[sqlx::test(migrations = false)]
+    async fn check_does_not_create_a_missing_schema(pool: PgPool) {
+        let component = serde_json::from_value(serde_json::json!({"mode": "schema", "name": "fusillade_missing"})).unwrap();
+        let err = connect_component("fusillade", &component, &pool, Duration::from_secs(1), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'fusillade_missing')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!exists, "check mode executed DDL");
+        connect_component("fusillade", &component, &pool, Duration::from_secs(1), true)
+            .await
+            .unwrap();
     }
 
     #[sqlx::test(migrations = false)]
