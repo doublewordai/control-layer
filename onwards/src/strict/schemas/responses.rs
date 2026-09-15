@@ -90,7 +90,14 @@ pub(crate) fn normalize_responses_response_value(value: &mut Value, fallback_mod
     };
 
     // Only coerce payloads that already look like Responses API success bodies.
-    if !object.contains_key("output") {
+    // `output` may legitimately be absent (the backfill below inserts `[]` for
+    // it), so use `object == "response"` as the primary discriminator rather
+    // than `output`. The `contains_key("output")` fallback preserves the old
+    // behavior for bodies that carry `output` without self-identifying via
+    // `object`, so no previously-accepted shape starts being skipped.
+    if object.get("object").and_then(Value::as_str) != Some("response")
+        && !object.contains_key("output")
+    {
         return;
     }
 
@@ -971,6 +978,110 @@ mod tests {
         };
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|i| matches!(i, Item::Message(_))));
+    }
+
+    #[test]
+    fn test_normalize_success_body_without_output_is_backfilled_and_parses() {
+        // A 2xx success body missing `output` — the exact case the normalizer
+        // documents it repairs and the exact field `backfill_responses_response_fields`
+        // inserts via `ensure_field(object, "output", || Value::Array(Vec::new()))`.
+        // The old `if !object.contains_key("output") { return; }` guard made that
+        // backfill unreachable and strict deserialization failed with
+        // `missing field \`output\``, surfacing as a client-visible 502.
+        let mut value: serde_json::Value = serde_json::json!({
+            "id": "resp_123",
+            "object": "response",
+            "created_at": 1234567890,
+            "status": "completed",
+            "model": "gpt-4o"
+        });
+        normalize_responses_response_value(&mut value, "gpt-4o");
+        assert_eq!(value["output"], serde_json::Value::Array(Vec::new()));
+        let result: Result<ResponsesResponse, _> = serde_json::from_value(value);
+        assert!(
+            result.is_ok(),
+            "missing `output` should be backfilled to `[]` and parse, got: {:?}",
+            result.err()
+        );
+        assert!(result.unwrap().output.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_preserves_existing_output_when_present() {
+        // An already-present `output` array must be preserved, not overwritten
+        // with `[]` by the backfill.
+        let mut value: serde_json::Value = serde_json::json!({
+            "object": "response",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "hi"}]
+            }]
+        });
+        normalize_responses_response_value(&mut value, "gpt-4o");
+        assert_eq!(value["output"][0]["content"][0]["text"], "hi");
+        let parsed: ResponsesResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.output.len(), 1);
+    }
+
+    #[test]
+    fn test_normalize_output_present_without_object_field_still_backfills() {
+        // Backwards compatibility: the old guard accepted any body carrying
+        // `output` (regardless of `object`). The discriminator change keeps that
+        // path via the `contains_key("output")` fallback so no previously-accepted
+        // shape starts being skipped, and the remaining required fields are
+        // still backfilled.
+        let mut value: serde_json::Value = serde_json::json!({
+            "id": "resp_abc",
+            "created_at": 1,
+            "model": "gpt-4o",
+            "output": []
+        });
+        normalize_responses_response_value(&mut value, "gpt-4o");
+        assert_eq!(value["object"], "response");
+        assert_eq!(value["status"], "completed");
+        let parsed: ResponsesResponse = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.object, "response");
+        assert!(parsed.output.is_empty());
+    }
+
+    #[test]
+    fn test_normalize_skips_unrelated_json_without_object_or_output() {
+        // A body that carries neither `object: "response"` nor `output` must
+        // not be coerced — this is how error envelopes and unrelated JSON shapes
+        // are left untouched. The normalizer must be a no-op here.
+        let mut value: serde_json::Value = serde_json::json!({
+            "error": {"message": "boom", "type": "server_error"}
+        });
+        let snapshot = value.clone();
+        normalize_responses_response_value(&mut value, "gpt-4o");
+        assert_eq!(value, snapshot, "unrelated payload must not be coerced");
+    }
+
+    #[test]
+    fn test_normalize_streaming_snapshot_missing_output_is_backfilled() {
+        // Parity guard: the streaming normalizer never had the `output` guard
+        // that the non-streaming path did, so a `response.created` snapshot
+        // omitting `output` is backfilled to `[]`. Lock this in so a future
+        // change does not "fix" the streaming path by adding a similar guard.
+        let mut value: serde_json::Value = serde_json::json!({
+            "type": "response.created",
+            "sequence_number": 0,
+            "response": {
+                "id": "resp_stream",
+                "created_at": 1234567890,
+                "model": "gpt-4o"
+            }
+        });
+        normalize_responses_streaming_event_value(&mut value, "gpt-4o", "resp_fallback");
+        assert_eq!(
+            value["response"]["output"],
+            serde_json::Value::Array(Vec::new())
+        );
+        assert_eq!(value["response"]["status"], "in_progress");
+        let parsed: ResponsesStreamingEvent = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.event_type, "response.created");
+        assert!(parsed.response.unwrap().output.is_empty());
     }
 
     #[test]
