@@ -852,6 +852,7 @@ pub struct ResponseUsage {
 #[serde(default)]
 pub struct InputTokensDetails {
     pub cached_tokens: u32,
+    pub cache_write_tokens: u32,
 }
 
 /// Details about output tokens
@@ -1011,7 +1012,7 @@ mod tests {
                 input_tokens: 10,
                 output_tokens: 5,
                 total_tokens: 15,
-                input_tokens_details: InputTokensDetails { cached_tokens: 0 },
+                input_tokens_details: InputTokensDetails::default(),
                 output_tokens_details: OutputTokensDetails { reasoning_tokens: 0 },
             }),
             max_output_tokens: None,

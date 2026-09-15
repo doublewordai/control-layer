@@ -963,13 +963,12 @@ const RETAINED_OBJECT_COLUMNS: &str = "object.delete_on, object.group_id, object
     object.object_id, object.request_id, object.created_by, object.service_tier, object.state, \
     object.model, object.created_at, object.terminal_at, object.schema_version, object.payload";
 
-pub(crate) async fn get_request_detail<P: PoolProvider>(
-    manager: &PostgresRequestManager<P>,
-    request_id: RequestId,
-) -> Result<RequestDetail> {
-    let mut tx = begin_primary_read(manager).await?;
-    let live = sqlx::query_as::<_, RequestDetail>(
-        r#"
+// Fence the identity lookup before ownership filtering. A sparse partial user
+// index must not become the access path for a request-ID lookup.
+const LIVE_REQUEST_DETAIL_SQL: &str = r#"
+        WITH request_by_id AS MATERIALIZED (
+            SELECT * FROM requests WHERE id = $1
+        )
         SELECT
             request.id, request.batch_id, request.model, request.state,
             request.created_at, request.completed_at, request.failed_at,
@@ -981,18 +980,24 @@ pub(crate) async fn get_request_detail<P: PoolProvider>(
                 THEN template.body ELSE NULL END AS body,
             request.response_body, request.error, request.service_tier,
             request.created_by
-        FROM requests request
+        FROM request_by_id request
         LEFT JOIN LATERAL (
             SELECT * FROM request_templates_all t WHERE t.id = request.template_id LIMIT 1
         ) template ON TRUE
         LEFT JOIN files file ON template.file_id = file.id
         WHERE request.id = $1 AND request.created_by IS NOT NULL
-        "#,
-    )
-    .bind(request_id.0)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(read_database_failure)?;
+        "#;
+
+pub(crate) async fn get_request_detail<P: PoolProvider>(
+    manager: &PostgresRequestManager<P>,
+    request_id: RequestId,
+) -> Result<RequestDetail> {
+    let mut tx = begin_primary_read(manager).await?;
+    let live = sqlx::query_as::<_, RequestDetail>(LIVE_REQUEST_DETAIL_SQL)
+        .bind(request_id.0)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(read_database_failure)?;
 
     let detail = if let Some(live) = live {
         Some(live)
@@ -1176,21 +1181,76 @@ const RETAINED_REQUEST_COUNT_SQL: &str = r#"
 
 /// Total-count budget: an exact count is worth a short wait, but an
 /// unfiltered listing over a 100M-row live table is not allowed to hold a
-/// connection for the full scan. Each arm gets `COUNT_BUDGET`; on timeout
-/// (SQLSTATE 57014) the arm falls back to the planner's row estimate, which
-/// tracks within a few percent when statistics are fresh. Runs on the read
-/// pool in its own transaction so it never pins the primary.
+/// connection for the full scan. Each arm's exact COUNT gets `COUNT_BUDGET`;
+/// on timeout (SQLSTATE 57014) the arm falls back to the planner's row
+/// estimate, which tracks within a few percent when statistics are fresh.
+/// Runs on the read pool in its own transaction so it never pins the primary.
 const COUNT_BUDGET: &str = "100ms";
+
+/// Budget for the fallback EXPLAIN, deliberately separate from
+/// `COUNT_BUDGET`. Merely planning the retained arm takes hundreds of
+/// milliseconds once it spans dozens of daily partitions joined to the
+/// catalog tables, so an estimate under the count budget failed in exactly
+/// the cases it exists to rescue (HTTP 500s on the admin request list).
+/// EXPLAIN without ANALYZE reads no rows and takes only planner locks, so it
+/// needs no scan guard; this bound only stops a request handler from waiting
+/// indefinitely behind a lock queue.
+const ESTIMATE_BUDGET: &str = "5s";
+
+/// Budget for the page query itself. Allow slower reads up to 30 seconds while
+/// bounding pathological filters -- notably a status filter whose value matches
+/// nothing, where the scan has no early exit and walks the whole history.
+/// Without a budget that query ran unbounded on the WRITE pool
+/// (`begin_primary_read`), holding a primary connection for minutes and outliving
+/// the request that started it.
+const PAGE_BUDGET: &str = "30s";
+
+/// `SET LOCAL` is transaction-scoped: it is applied once per transaction and
+/// re-applied whenever the fallback replaces the transaction.
+async fn apply_statement_budget(tx: &mut Transaction<'_, Postgres>, budget: &str) -> Result<()> {
+    sqlx::query(&format!("SET LOCAL statement_timeout = '{budget}'"))
+        .execute(&mut **tx)
+        .await
+        .map_err(read_database_failure)?;
+    Ok(())
+}
+
+/// Planner row estimate for one count arm, taken under `ESTIMATE_BUDGET`
+/// rather than `COUNT_BUDGET` (see the latter's docs for why).
+async fn estimate_arm_rows(
+    tx: &mut Transaction<'_, Postgres>,
+    arm: &str,
+    filter: &ListRequestsFilter,
+) -> Result<i64> {
+    apply_statement_budget(tx, ESTIMATE_BUDGET).await?;
+    let plan: serde_json::Value = sqlx::query_scalar(&format!(
+        "EXPLAIN (FORMAT JSON) {}",
+        arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
+    ))
+    .bind(filter.created_by.as_deref())
+    .bind(filter.status.as_deref())
+    .bind(filter.models.as_deref())
+    .bind(filter.created_after)
+    .bind(filter.created_before)
+    .bind(filter.service_tiers.as_deref())
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(read_database_failure)?;
+    Ok(plan
+        .get(0)
+        .and_then(|p| p.get("Plan"))
+        .and_then(|p| p.get("Plan Rows"))
+        .and_then(|r| r.as_f64())
+        .map(|r| r.round() as i64)
+        .unwrap_or(0))
+}
 
 async fn count_requests_with_budget<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     filter: &ListRequestsFilter,
 ) -> Result<i64> {
     let mut tx = manager.begin_read().await.map_err(read_database_failure)?;
-    sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-        .execute(&mut *tx)
-        .await
-        .map_err(read_database_failure)?;
+    apply_statement_budget(&mut tx, COUNT_BUDGET).await?;
     let mut total = 0_i64;
     for arm in [LIVE_REQUEST_COUNT_SQL, RETAINED_REQUEST_COUNT_SQL] {
         let exact: std::result::Result<i64, sqlx::Error> = sqlx::query_scalar(arm)
@@ -1206,32 +1266,13 @@ async fn count_requests_with_budget<P: PoolProvider>(
             Ok(n) => n,
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("57014") => {
                 // The failed statement aborted this transaction; estimate on a
-                // fresh one (EXPLAIN is planning only, so it is cheap).
+                // fresh one, then restore the scan guard for the next arm's
+                // exact count.
                 tx.rollback().await.map_err(read_database_failure)?;
                 tx = manager.begin_read().await.map_err(read_database_failure)?;
-                sqlx::query(&format!("SET LOCAL statement_timeout = '{COUNT_BUDGET}'"))
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(read_database_failure)?;
-                let plan: serde_json::Value = sqlx::query_scalar(&format!(
-                    "EXPLAIN (FORMAT JSON) {}",
-                    arm.replacen("SELECT COUNT(*)", "SELECT 1", 1)
-                ))
-                .bind(filter.created_by.as_deref())
-                .bind(filter.status.as_deref())
-                .bind(filter.models.as_deref())
-                .bind(filter.created_after)
-                .bind(filter.created_before)
-                .bind(filter.service_tiers.as_deref())
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(read_database_failure)?;
-                plan.get(0)
-                    .and_then(|p| p.get("Plan"))
-                    .and_then(|p| p.get("Plan Rows"))
-                    .and_then(|r| r.as_f64())
-                    .map(|r| r.round() as i64)
-                    .unwrap_or(0)
+                let estimate = estimate_arm_rows(&mut tx, arm, filter).await?;
+                apply_statement_budget(&mut tx, COUNT_BUDGET).await?;
+                estimate
             }
             Err(e) => return Err(read_database_failure(e)),
         };
@@ -1240,29 +1281,259 @@ async fn count_requests_with_budget<P: PoolProvider>(
     Ok(total)
 }
 
-fn list_requests_page_sql(active_first: bool) -> String {
+/// Which optional filters are present, and therefore which SQL shape to emit.
+///
+/// Every optional filter used to be written `($n IS NULL OR col = $n)`. A
+/// disjunction can never become an index boundary condition in a generic
+/// prepared plan, so the owner and the `created_at` range both degraded to
+/// residual filters and the scan walked the whole history. Emitting the
+/// predicate only when the caller supplied it keeps every value bound while
+/// letting the planner use it as a scan bound. Owner already worked this way;
+/// this extends it to the two `created_at` bounds, which is what made date
+/// filtering slow.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub(crate) struct PageShape {
+    pub(crate) active_first: bool,
+    pub(crate) owner_scoped: bool,
+    pub(crate) single_model: bool,
+    pub(crate) created_after: bool,
+    pub(crate) created_before: bool,
+}
+
+impl PageShape {
+    fn of(filter: &ListRequestsFilter) -> Self {
+        Self {
+            active_first: filter.active_first,
+            owner_scoped: filter.created_by.is_some(),
+            single_model: filter
+                .models
+                .as_ref()
+                .is_some_and(|models| models.len() == 1),
+            created_after: filter.created_after.is_some(),
+            created_before: filter.created_before.is_some(),
+        }
+    }
+}
+
+fn list_requests_page_sql(shape: PageShape) -> String {
+    let PageShape {
+        active_first,
+        owner_scoped,
+        single_model,
+        created_after,
+        created_before,
+    } = shape;
+    let live_owner = if owner_scoped {
+        "request.created_by = $1::text"
+    } else {
+        "$1::text IS NULL"
+    };
+    let active_owner = if owner_scoped {
+        "active.created_by = $1::text"
+    } else {
+        "$1::text IS NULL"
+    };
+    // Same predicate, qualified for inside the `active` CTE. Applying it there
+    // rather than only outside keeps an owner-scoped page from materializing
+    // every other tenant's in-flight rows first.
+    let active_owner_inner = if owner_scoped {
+        "requests.created_by = $1::text"
+    } else {
+        "$1::text IS NULL"
+    };
+    let retained_owner = if owner_scoped {
+        "object.created_by = $1::text"
+    } else {
+        "$1::text IS NULL"
+    };
+    // A singleton equality fixes the model-leading index prefix so its remaining
+    // created_at ordering can satisfy LIMIT, even with a generic prepared plan.
+    // Keep the array parameter bound and preserve ANY semantics for other sizes.
+    let model_predicate = |column: &str| {
+        if single_model {
+            format!("{column} = ($3::text[])[1]")
+        } else {
+            format!("($3::text[] IS NULL OR {column} = ANY($3))")
+        }
+    };
+    let active_model = model_predicate("active.model");
+    let live_model = model_predicate("request.model");
+    let retained_model = model_predicate("object.model");
+    let live_dates = format!(
+        "{}{}",
+        if created_after {
+            "\n              AND request.created_at >= $4"
+        } else {
+            ""
+        },
+        if created_before {
+            "\n              AND request.created_at <= $5"
+        } else {
+            ""
+        },
+    );
+    let active_dates = format!(
+        "{}{}",
+        if created_after {
+            "\n              AND active.created_at >= $4"
+        } else {
+            ""
+        },
+        if created_before {
+            "\n              AND active.created_at <= $5"
+        } else {
+            ""
+        },
+    );
+    // V1 proves created_at < delete_on, so the necessary lower bound also
+    // enables daily partition pruning.
+    let retained_dates = format!(
+        "{}{}",
+        if created_after {
+            "\n              AND object.created_at >= $4\n              AND object.delete_on > ($4 AT TIME ZONE 'UTC')::date"
+        } else {
+            ""
+        },
+        if created_before {
+            "\n              AND object.created_at <= $5"
+        } else {
+            ""
+        },
+    );
+    let rank_of = |column: &str| {
+        format!(
+            "CASE {column} WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END"
+        )
+    };
     let order_clause = if active_first {
-        "CASE sort_state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, sort_created_at DESC, sort_id DESC"
+        format!(
+            "{} ASC, sort_created_at DESC, sort_id DESC",
+            rank_of("sort_state")
+        )
     } else {
-        "sort_created_at DESC, sort_id DESC"
+        "sort_created_at DESC, sort_id DESC".to_string()
     };
-    // Each arm carries its own ORDER BY + LIMIT so the planner can satisfy
-    // the page from ordered indexes (Merge Append over two bounded arms)
-    // instead of sorting the whole union. The live arm's expressions mirror
-    // idx_requests_active_first_tier / idx_requests_created_tier exactly.
-    let live_order = if active_first {
-        "CASE request.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, request.created_at DESC, request.id DESC"
+    // The in-flight arm reads from a materialized CTE of at most a few
+    // thousand rows, so it can afford to sort by the full page ordering --
+    // including the rank -- without any index that encodes that rank. This is
+    // what lets the two ~4 GB rank-ordered indexes go away: nothing sorts a
+    // large set by state any more. Ordering it by created_at alone is a silent
+    // correctness bug once more rows are in flight than fit on one page.
+    let active_order = if active_first {
+        format!(
+            "{} ASC, active.created_at DESC, active.id DESC",
+            rank_of("active.state")
+        )
     } else {
-        "request.created_at DESC, request.id DESC"
+        "active.created_at DESC, active.id DESC".to_string()
     };
-    let retained_order = if active_first {
-        "CASE object.state WHEN 'processing' THEN 0 WHEN 'claimed' THEN 1 WHEN 'pending' THEN 2 ELSE 3 END ASC, object.created_at DESC, object.object_id DESC"
-    } else {
-        "object.created_at DESC, object.object_id DESC"
-    };
+    // Terminal live rows and retained rows all share one rank, so ordering
+    // them by created_at alone is equivalent to the page ordering -- and it is
+    // an ordering the plain (owner,) created_at DESC indexes already provide.
+    let terminal_order = "request.created_at DESC, request.id DESC";
+    let retained_order = "object.created_at DESC, object.object_id DESC";
     format!(
         r#"
-        WITH candidates AS (
+        WITH valid_buckets AS MATERIALIZED (
+            SELECT bucket.delete_on
+            FROM retained_response_buckets bucket
+            JOIN pg_namespace namespace
+              ON namespace.nspname = bucket.partition_schema
+            JOIN pg_class child
+              ON child.relnamespace = namespace.oid
+             AND child.relname = bucket.partition_table
+             AND child.oid = bucket.partition_oid
+            JOIN pg_inherits inheritance
+              ON inheritance.inhrelid = child.oid
+             AND NOT inheritance.inhdetachpending
+            WHERE bucket.state = 'active'
+              AND bucket.partition_schema = current_schema()
+              AND bucket.partition_table =
+                  'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+              AND inheritance.inhparent =
+                  to_regclass(format('%I.retained_response_objects', current_schema()))
+              AND pg_get_expr(child.relpartbound, child.oid) = format(
+                  'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+              )
+        ),
+        -- The entire non-terminal batchless population, materialized up front,
+        -- read via `idx_requests_state`. Sorting it by rank costs nothing at
+        -- the sizes seen so far, which is what lets the two ~4 GB rank-ordered
+        -- indexes go away.
+        --
+        -- Sizing caveat: `claimed` and `processing` are bounded by daemon
+        -- concurrency, but `pending` is a QUEUE, so this is bounded by backlog
+        -- depth rather than by concurrency. It is decoupled from history depth
+        -- -- the thing that actually grows without limit -- but it is not
+        -- constant, and there is no LIMIT here, so a sustained drain stall
+        -- makes this CTE proportional to the backlog.
+        --
+        -- The owner predicate is therefore applied HERE and not only in the arm
+        -- below. MATERIALIZED is a planner fence, so filtering outside would
+        -- make an owner-scoped page materialize every other tenant's in-flight
+        -- rows before discarding them -- one tenant's drain stall would slow
+        -- every other tenant's page. Scoped inside, a backlog only ever costs
+        -- the owner that caused it.
+        --
+        -- Today production holds a single non-terminal batchless row. If an
+        -- unscoped page ever needs the same protection, the fix is a partial
+        -- index on (created_by, rank, created_at DESC, id DESC) restricted to
+        -- these three states, which lets the arm become a bounded ordered scan;
+        -- it indexes only non-terminal rows, so it is sized by the backlog it
+        -- guards against rather than by the table.
+        active AS MATERIALIZED (
+            SELECT id, state, created_at, created_by, model, service_tier, batch_id,
+                   completed_at, failed_at, started_at, response_status
+            FROM requests
+            WHERE created_by IS NOT NULL
+              AND state IN ('processing', 'claimed', 'pending')
+              AND {active_owner_inner}
+        ),
+        candidates AS (
+            (SELECT
+                active.id AS sort_id,
+                active.state AS sort_state,
+                active.created_at AS sort_created_at,
+                FALSE AS retained,
+                jsonb_build_object(
+                    'id', active.id,
+                    'batch_id', active.batch_id,
+                    'model', active.model,
+                    'status', active.state,
+                    'created_at', active.created_at,
+                    'completed_at', active.completed_at,
+                    'failed_at', active.failed_at,
+                    'duration_ms', (CASE
+                        WHEN active.completed_at IS NOT NULL AND active.started_at IS NOT NULL
+                        THEN EXTRACT(EPOCH FROM (active.completed_at - active.started_at)) * 1000
+                        ELSE NULL END)::float8,
+                    'response_status', active.response_status,
+                    'service_tier', active.service_tier,
+                    'created_by', active.created_by
+                ) AS live_summary,
+                NULL::date AS delete_on,
+                NULL::uuid AS group_id,
+                NULL::text AS object_kind,
+                NULL::uuid AS object_id,
+                NULL::uuid AS request_id,
+                NULL::text AS created_by,
+                NULL::text AS service_tier,
+                NULL::text AS state,
+                NULL::text AS model,
+                NULL::timestamptz AS created_at,
+                NULL::timestamptz AS terminal_at,
+                NULL::smallint AS schema_version,
+                NULL::jsonb AS payload
+            FROM active
+            WHERE {active_owner}
+              AND ($2::text IS NULL OR active.state = $2)
+              AND {active_model}{active_dates}
+              AND ($6::text[] IS NULL OR active.service_tier = ANY($6))
+            ORDER BY {active_order}
+            LIMIT $7 + $8)
+
+            UNION ALL
+
             (SELECT
                 request.id AS sort_id,
                 request.state AS sort_state,
@@ -1299,13 +1570,14 @@ fn list_requests_page_sql(active_first: bool) -> String {
                 NULL::jsonb AS payload
             FROM requests request
             WHERE request.created_by IS NOT NULL
-              AND ($1::text IS NULL OR request.created_by = $1)
+              AND {live_owner}
+              -- Complement of the `active` CTE: together the two live arms
+              -- cover every batchless row exactly once.
+              AND request.state NOT IN ('processing', 'claimed', 'pending')
               AND ($2::text IS NULL OR request.state = $2)
-              AND ($3::text[] IS NULL OR request.model = ANY($3))
-              AND ($4::timestamptz IS NULL OR request.created_at >= $4)
-              AND ($5::timestamptz IS NULL OR request.created_at <= $5)
+              AND {live_model}{live_dates}
               AND ($6::text[] IS NULL OR request.service_tier = ANY($6))
-            ORDER BY {live_order}
+            ORDER BY {terminal_order}
             LIMIT $7 + $8)
 
             UNION ALL
@@ -1329,48 +1601,34 @@ fn list_requests_page_sql(active_first: bool) -> String {
                 object.terminal_at,
                 object.schema_version,
                 object.payload
-            FROM retained_response_buckets bucket
-            JOIN pg_namespace namespace
-              ON namespace.nspname = bucket.partition_schema
-            JOIN pg_class child
-              ON child.relnamespace = namespace.oid
-             AND child.relname = bucket.partition_table
-             AND child.oid = bucket.partition_oid
-            JOIN pg_inherits inheritance
-              ON inheritance.inhrelid = child.oid
-             AND NOT inheritance.inhdetachpending
-            JOIN retained_response_objects object
-              ON object.delete_on = bucket.delete_on
-             AND object.object_kind = 'request'
-            JOIN retained_response_request_routes route
-              ON route.request_id = object.object_id
-             AND route.group_id = object.group_id
-             AND route.delete_on = object.delete_on
-            JOIN retained_response_group_routes group_route
-              ON group_route.group_id = object.group_id
-             AND group_route.delete_on = object.delete_on
-            WHERE bucket.state = 'active'
-              AND bucket.partition_schema = current_schema()
-              AND bucket.partition_table =
-                  'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
-              AND inheritance.inhparent =
-                  to_regclass(format('%I.retained_response_objects', current_schema()))
-              AND pg_get_expr(child.relpartbound, child.oid) = format(
-                  'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+            FROM retained_response_objects object
+            WHERE object.object_kind = 'request'
+              AND object.delete_on IN (SELECT delete_on FROM valid_buckets)
+              -- Keep validation as per-candidate index probes. OFFSET 0
+              -- prevents pull-up into joins that can scan the route tables
+              -- and sort the entire retained history before applying LIMIT.
+              AND EXISTS (
+                  SELECT 1 FROM retained_response_request_routes route
+                  WHERE route.request_id = object.object_id
+                    AND route.group_id = object.group_id
+                    AND route.delete_on = object.delete_on
+                  OFFSET 0
+              )
+              AND EXISTS (
+                  SELECT 1 FROM retained_response_group_routes group_route
+                  WHERE group_route.group_id = object.group_id
+                    AND group_route.delete_on = object.delete_on
+                  OFFSET 0
               )
               AND object.created_by IS NOT NULL
-              AND ($1::text IS NULL OR object.created_by = $1)
+              AND {retained_owner}
               AND ($2::text IS NULL OR object.state = $2)
-              AND ($3::text[] IS NULL OR object.model = ANY($3))
-              AND ($4::timestamptz IS NULL OR object.created_at >= $4)
-              -- V1 proves created_at < delete_on, so this necessary lower
-              -- bound enables daily partition pruning.
-              AND ($4::timestamptz IS NULL OR object.delete_on > ($4 AT TIME ZONE 'UTC')::date)
-              AND ($5::timestamptz IS NULL OR object.created_at <= $5)
+              AND {retained_model}{retained_dates}
               AND ($6::text[] IS NULL OR object.service_tier = ANY($6))
               AND NOT EXISTS (
                   SELECT 1 FROM requests live
                   WHERE live.id = object.object_id AND live.created_by IS NOT NULL
+                  OFFSET 0
               )
             ORDER BY {retained_order}
             LIMIT $7 + $8)
@@ -1402,8 +1660,9 @@ pub(crate) async fn list_requests<P: PoolProvider>(
 
     let count = count_requests_with_budget(manager, &filter).await?;
     let mut tx = begin_primary_read(manager).await?;
+    apply_statement_budget(&mut tx, PAGE_BUDGET).await?;
 
-    let query = list_requests_page_sql(filter.active_first);
+    let query = list_requests_page_sql(PageShape::of(&filter));
     let rows = sqlx::query(&query)
         .bind(filter.created_by.as_deref())
         .bind(filter.status.as_deref())
@@ -1511,6 +1770,9 @@ pub(crate) async fn count_owner_flex_requests_since<P: PoolProvider>(
 }
 
 pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
+    WITH live_request_ids AS MATERIALIZED (
+        SELECT id FROM requests WHERE created_by IS NOT NULL
+    )
     SELECT model, service_tier, outcome, SUM(count)::BIGINT AS count
     FROM (
     SELECT
@@ -1578,36 +1840,12 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
         retained.service_tier,
         'completed'::text AS outcome,
         COUNT(*)::BIGINT AS count
-    FROM retained_response_buckets bucket
-    JOIN pg_namespace namespace
-      ON namespace.nspname = bucket.partition_schema
-    JOIN pg_class child
-      ON child.relnamespace = namespace.oid
-     AND child.relname = bucket.partition_table
-     AND child.oid = bucket.partition_oid
-    JOIN pg_inherits inheritance
-      ON inheritance.inhrelid = child.oid
-     AND NOT inheritance.inhdetachpending
-    JOIN retained_response_objects retained
-      ON retained.delete_on = bucket.delete_on
-     AND retained.object_kind = 'request'
-    JOIN retained_response_request_routes route
-      ON route.request_id = retained.object_id
-     AND route.group_id = retained.group_id
-     AND route.delete_on = retained.delete_on
-    JOIN retained_response_group_routes group_route
-      ON group_route.group_id = retained.group_id
-     AND group_route.delete_on = retained.delete_on
-    WHERE bucket.state = 'active'
-      AND bucket.partition_schema = current_schema()
-      AND bucket.partition_table =
-          'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
-      AND inheritance.inhparent =
-          to_regclass(format('%I.retained_response_objects', current_schema()))
-      AND pg_get_expr(child.relpartbound, child.oid) = format(
-          'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
-      )
+    FROM retained_response_objects retained
+    WHERE retained.object_kind = 'request'
       AND retained.state = 'completed'
+      -- Both identity columns are NOT NULL; NOT IN permits a hashed subplan
+      -- even when stale statistics underestimate the live identity count.
+      AND retained.object_id NOT IN (SELECT id FROM live_request_ids)
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
       -- Partition-prune bounds. Sweep-landed rows satisfy
@@ -1622,6 +1860,35 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       -- bound: V1 proves terminal_at < delete_on.
       AND retained.delete_on >= COALESCE($7::date, ($1 AT TIME ZONE 'UTC')::date + 1)
       AND ($8::date IS NULL OR retained.delete_on <= $8::date)
+      -- Bucket fence as a semi-join over the (small) bucket registry with
+      -- the same catalog identity checks every retained read applies:
+      -- retiring/retired buckets and any partition that no longer matches
+      -- its registered identity contribute nothing. This is a count, so the
+      -- route rows are unnecessary. Live identities are materialized once
+      -- above to preserve live-preferred reads even during repair overlaps,
+      -- without probing the broad user index for each retained object.
+      AND retained.delete_on IN (
+          SELECT bucket.delete_on
+          FROM retained_response_buckets bucket
+          JOIN pg_namespace namespace
+            ON namespace.nspname = bucket.partition_schema
+          JOIN pg_class child
+            ON child.relnamespace = namespace.oid
+           AND child.relname = bucket.partition_table
+           AND child.oid = bucket.partition_oid
+          JOIN pg_inherits inheritance
+            ON inheritance.inhrelid = child.oid
+           AND NOT inheritance.inhdetachpending
+          WHERE bucket.state = 'active'
+            AND bucket.partition_schema = current_schema()
+            AND bucket.partition_table =
+                'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+            AND inheritance.inhparent =
+                to_regclass(format('%I.retained_response_objects', current_schema()))
+            AND pg_get_expr(child.relpartbound, child.oid) = format(
+                'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+            )
+      )
       AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
       AND retained.service_tier IS DISTINCT FROM 'background'
       AND (
@@ -1634,10 +1901,6 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
               (retained.service_tier IS NULL AND NOT $5)
               OR (retained.service_tier IS NOT NULL AND retained.service_tier <> ALL($4))
           ))
-      )
-      AND NOT EXISTS (
-          SELECT 1 FROM requests live
-          WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
       )
     GROUP BY retained.model, retained.service_tier
 
@@ -1648,36 +1911,10 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
         retained.service_tier,
         'failed'::text AS outcome,
         COUNT(*)::BIGINT AS count
-    FROM retained_response_buckets bucket
-    JOIN pg_namespace namespace
-      ON namespace.nspname = bucket.partition_schema
-    JOIN pg_class child
-      ON child.relnamespace = namespace.oid
-     AND child.relname = bucket.partition_table
-     AND child.oid = bucket.partition_oid
-    JOIN pg_inherits inheritance
-      ON inheritance.inhrelid = child.oid
-     AND NOT inheritance.inhdetachpending
-    JOIN retained_response_objects retained
-      ON retained.delete_on = bucket.delete_on
-     AND retained.object_kind = 'request'
-    JOIN retained_response_request_routes route
-      ON route.request_id = retained.object_id
-     AND route.group_id = retained.group_id
-     AND route.delete_on = retained.delete_on
-    JOIN retained_response_group_routes group_route
-      ON group_route.group_id = retained.group_id
-     AND group_route.delete_on = retained.delete_on
-    WHERE bucket.state = 'active'
-      AND bucket.partition_schema = current_schema()
-      AND bucket.partition_table =
-          'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
-      AND inheritance.inhparent =
-          to_regclass(format('%I.retained_response_objects', current_schema()))
-      AND pg_get_expr(child.relpartbound, child.oid) = format(
-          'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
-      )
+    FROM retained_response_objects retained
+    WHERE retained.object_kind = 'request'
       AND retained.state = 'failed'
+      AND retained.object_id NOT IN (SELECT id FROM live_request_ids)
       AND retained.terminal_at >= $1
       AND retained.terminal_at < $2
       -- Partition-prune bounds. Sweep-landed rows satisfy
@@ -1692,6 +1929,35 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
       -- bound: V1 proves terminal_at < delete_on.
       AND retained.delete_on >= COALESCE($7::date, ($1 AT TIME ZONE 'UTC')::date + 1)
       AND ($8::date IS NULL OR retained.delete_on <= $8::date)
+      -- Bucket fence as a semi-join over the (small) bucket registry with
+      -- the same catalog identity checks every retained read applies:
+      -- retiring/retired buckets and any partition that no longer matches
+      -- its registered identity contribute nothing. This is a count, so the
+      -- route rows are unnecessary. Live identities are materialized once
+      -- above to preserve live-preferred reads even during repair overlaps,
+      -- without probing the broad user index for each retained object.
+      AND retained.delete_on IN (
+          SELECT bucket.delete_on
+          FROM retained_response_buckets bucket
+          JOIN pg_namespace namespace
+            ON namespace.nspname = bucket.partition_schema
+          JOIN pg_class child
+            ON child.relnamespace = namespace.oid
+           AND child.relname = bucket.partition_table
+           AND child.oid = bucket.partition_oid
+          JOIN pg_inherits inheritance
+            ON inheritance.inhrelid = child.oid
+           AND NOT inheritance.inhdetachpending
+          WHERE bucket.state = 'active'
+            AND bucket.partition_schema = current_schema()
+            AND bucket.partition_table =
+                'retained_response_objects_d' || to_char(bucket.delete_on, 'YYYYMMDD')
+            AND inheritance.inhparent =
+                to_regclass(format('%I.retained_response_objects', current_schema()))
+            AND pg_get_expr(child.relpartbound, child.oid) = format(
+                'FOR VALUES FROM (%L) TO (%L)', bucket.delete_on, bucket.delete_on + 1
+            )
+      )
       AND (cardinality($3::text[]) = 0 OR retained.model = ANY($3))
       AND retained.service_tier IS DISTINCT FROM 'background'
       AND (
@@ -1704,10 +1970,6 @@ pub(crate) const TRAILING_DEMAND_SQL: &str = r#"
               (retained.service_tier IS NULL AND NOT $5)
               OR (retained.service_tier IS NOT NULL AND retained.service_tier <> ALL($4))
           ))
-      )
-      AND NOT EXISTS (
-          SELECT 1 FROM requests live
-          WHERE live.id = retained.object_id AND live.created_by IS NOT NULL
       )
     GROUP BY retained.model, retained.service_tier
     ) terminal_counts
@@ -2120,12 +2382,13 @@ async fn response_write_graph_ids(
 pub(crate) async fn begin_response_write_transaction(
     pool: &PgPool,
     retry_config: &crate::DbRetryConfig,
+    query_schema: Option<&str>,
     object_ids: &[Uuid],
 ) -> Result<Transaction<'static, Postgres>> {
     const MAX_CANONICAL_LOCK_ATTEMPTS: usize = 8;
 
     for _ in 0..MAX_CANONICAL_LOCK_ATTEMPTS {
-        let mut tx = crate::db::begin_transaction(pool, retry_config)
+        let mut tx = crate::db::begin_transaction_in_schema(pool, retry_config, query_schema)
             .await
             .map_err(database_failure)?;
         let tentative_group_ids = response_write_graph_ids(&mut tx, object_ids).await?;
@@ -3305,6 +3568,14 @@ async fn move_graph<P: PoolProvider>(
 // deletion day can still be in the future. This keeps an arbitrary due legacy
 // backlog outside the bounded probe budget while the lock-time checks remain
 // authoritative. A graph is one request, so its group id is its request id.
+//
+// Discovery is paged: one probe returns up to `$5` of the oldest eligible
+// graphs, in global terminal order, instead of a single row. Each tier arm
+// still walks the validated retention-due index in order, so the per-tier
+// `LIMIT $5` is an index-range read, and the outer sort merges the (at most)
+// tier-count small arms. A serial one-row probe per candidate was the whole
+// pass's critical path once moves fanned out: 512 round trips of discovery
+// before the first mover started.
 const CANDIDATE_DISCOVERY_SQL: &str = r#"
         WITH policy(service_tier, archive_after) AS (
             SELECT * FROM UNNEST($1::text[], $2::timestamptz[])
@@ -3342,41 +3613,48 @@ const CANDIDATE_DISCOVERY_SQL: &str = r#"
                              WHEN 'canceled' THEN request.canceled_at
                          END,
                          request.id
-                LIMIT 1
+                LIMIT $5
             ) candidate
             ORDER BY candidate.terminal_at, candidate.id
-            LIMIT 1
+            LIMIT $5
         )
         SELECT candidate.request_id, candidate.group_id
         FROM candidate_seed candidate
+        ORDER BY candidate.terminal_at, candidate.request_id
         "#;
 
-async fn next_candidate<P: PoolProvider>(
+/// One discovery probe: up to `page_size` of the oldest eligible graphs not
+/// already excluded, oldest first. Fewer rows than asked for means the
+/// eligible set is exhausted beyond this page.
+async fn next_candidates<P: PoolProvider>(
     manager: &PostgresRequestManager<P>,
     tiers: &[String],
     archive_after: &[DateTime<Utc>],
     terminal_before: DateTime<Utc>,
     excluded_request_ids: &[Uuid],
-) -> MovementResult<Option<Candidate>> {
-    let row: Option<(Uuid, Uuid)> = sqlx::query_as(CANDIDATE_DISCOVERY_SQL)
+    page_size: i64,
+) -> MovementResult<Vec<Candidate>> {
+    let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(CANDIDATE_DISCOVERY_SQL)
         .bind(tiers)
         .bind(archive_after)
         .bind(terminal_before)
         .bind(excluded_request_ids)
-        .fetch_optional(manager.read_executor())
+        .bind(page_size)
+        .fetch_all(manager.read_executor())
         .await
         .map_err(database_failure)?;
-    let Some((request_id, group_id)) = row else {
-        return Ok(None);
-    };
-    if group_id != request_id {
-        return Err(incomplete_graph());
-    }
-    Ok(Some(Candidate {
-        request_id,
-        group_id,
-        discovered_topology: graph_topology(request_id),
-    }))
+    rows.into_iter()
+        .map(|(request_id, group_id)| {
+            if group_id != request_id {
+                return Err(incomplete_graph());
+            }
+            Ok(Candidate {
+                request_id,
+                group_id,
+                discovered_topology: graph_topology(request_id),
+            })
+        })
+        .collect()
 }
 
 pub(crate) async fn archive_terminal_batchless_responses<P: PoolProvider>(
@@ -3439,6 +3717,7 @@ async fn archive_batchless_responses<P: PoolProvider>(
     if policy.batchless_seconds_by_service_tier.is_empty() {
         return Ok(RetainedResponseArchiveOutcome::default());
     }
+    super::request_maintenance::before_archive(manager).await?;
     let index_ready: bool =
         sqlx::query_scalar("SELECT retained_response_archive_index_ready(current_schema())")
             .fetch_one(manager.read_executor())
@@ -3485,32 +3764,41 @@ async fn archive_batchless_responses<P: PoolProvider>(
         });
     }
     let candidate_limit = max_groups.saturating_add(1);
+    // Discovery normally completes in one probe: a page of `candidate_limit`
+    // rows. Further probes only run when a page came back full of graphs
+    // this pass had already seen (deduplicated by group), and even then the
+    // probe count stays bounded so a pathological queue cannot spin here.
     let max_probes = candidate_limit.saturating_mul(2);
-    let mut candidates = Vec::new();
+    let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen_groups = std::collections::HashSet::new();
     let mut excluded_request_ids = Vec::new();
     let mut discovery_exhausted = false;
     for _ in 0..max_probes {
-        if candidates.len() as i64 == candidate_limit {
+        let page_size = candidate_limit - candidates.len() as i64;
+        if page_size <= 0 {
             break;
         }
-        let Some(candidate) = next_candidate(
+        let page = next_candidates(
             manager,
             &tiers,
             &archive_after,
             cutoffs.terminal_before(),
             &excluded_request_ids,
+            page_size,
         )
-        .await?
-        else {
-            discovery_exhausted = true;
-            break;
-        };
-        excluded_request_ids.extend(candidate.discovered_topology.request_ids.iter().copied());
+        .await?;
+        let page_exhausted = (page.len() as i64) < page_size;
+        for candidate in page {
+            excluded_request_ids.extend(candidate.discovered_topology.request_ids.iter().copied());
+            if seen_groups.insert(candidate.group_id) {
+                candidates.push(candidate);
+            }
+        }
         excluded_request_ids.sort_unstable();
         excluded_request_ids.dedup();
-        if seen_groups.insert(candidate.group_id) {
-            candidates.push(candidate);
+        if page_exhausted {
+            discovery_exhausted = true;
+            break;
         }
     }
     let mut outcome = RetainedResponseArchiveOutcome {
@@ -3601,10 +3889,89 @@ async fn archive_batchless_responses<P: PoolProvider>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TestDbPools;
     use chrono::{DateTime, NaiveDate, Utc};
     use serde_json::json;
     use sqlx::PgPool;
     use uuid::Uuid;
+
+    #[sqlx::test]
+    async fn detail_lookup_avoids_sparse_user_index_after_mass_deletion(pool: PgPool) {
+        sqlx::query("INSERT INTO requests (model, created_by) SELECT 'test', 'owner' FROM generate_series(1, 20000)")
+            .execute(&pool).await.unwrap();
+        sqlx::query("ANALYZE requests")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let id: Uuid = sqlx::query_scalar("SELECT id FROM requests LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM requests WHERE id <> $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Reproduce the misleading partial-index estimate independently of the
+        // random ANALYZE sample. Catalog mutation is confined to this test DB.
+        sqlx::query("UPDATE pg_class SET reltuples = 0 WHERE oid = 'idx_requests_user_created_sort'::regclass")
+            .execute(&pool).await.unwrap();
+        let plan: serde_json::Value =
+            sqlx::query_scalar(&format!("EXPLAIN (FORMAT JSON) {LIVE_REQUEST_DETAIL_SQL}"))
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            plan_uses_index(&plan, "requests_pkey"),
+            "identity lookup must use the primary key: {plan}"
+        );
+        assert!(!plan_uses_index(&plan, "idx_requests_user_created_sort"));
+
+        // Cost estimates on a small fixture can still favor the primary key
+        // even with the original unfenced query. Make the competing path
+        // the only available index in this isolated test transaction, and
+        // verify that the ownership predicate cannot make it eligible.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE pg_index SET indisvalid = false WHERE indrelid = 'requests'::regclass AND indexrelid <> 'idx_requests_user_created_sort'::regclass",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("SET LOCAL enable_seqscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("SET LOCAL enable_bitmapscan = off")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let unfenced: serde_json::Value = sqlx::query_scalar(
+            "EXPLAIN (FORMAT JSON) SELECT id FROM requests WHERE id = $1 AND created_by IS NOT NULL",
+        ).bind(id).fetch_one(&mut *tx).await.unwrap();
+        assert!(
+            plan_uses_index(&unfenced, "idx_requests_user_created_sort"),
+            "control query must expose the dangerous path: {unfenced}"
+        );
+        let fenced: serde_json::Value =
+            sqlx::query_scalar(&format!("EXPLAIN (FORMAT JSON) {LIVE_REQUEST_DETAIL_SQL}"))
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        assert!(
+            !plan_uses_index(&fenced, "idx_requests_user_created_sort"),
+            "the detail lookup must keep the partial index ineligible: {fenced}"
+        );
+        tx.rollback().await.unwrap();
+        let detail = sqlx::query_as::<_, RequestDetail>(LIVE_REQUEST_DETAIL_SQL)
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(detail.id, id);
+    }
 
     fn timestamp(value: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(value)
@@ -3688,6 +4055,164 @@ mod tests {
         .expect("bounded retained-list SQL must be explainable")
     }
 
+    // Count rows visited, including rejected rows, rather than asserting a
+    // particular planner node name or a machine-dependent execution time.
+    fn retained_rows_visited(plan: &serde_json::Value) -> f64 {
+        match plan {
+            serde_json::Value::Array(values) => values.iter().map(retained_rows_visited).sum(),
+            serde_json::Value::Object(fields) => {
+                let visited = if fields.get("Relation Name").and_then(|v| v.as_str())
+                    == Some("retained_response_objects_d20260820")
+                {
+                    [
+                        "Actual Rows",
+                        "Rows Removed by Filter",
+                        "Rows Removed by Index Recheck",
+                    ]
+                    .iter()
+                    .map(|key| fields.get(*key).and_then(|v| v.as_f64()).unwrap_or(0.0))
+                    .sum::<f64>()
+                        * fields
+                            .get("Actual Loops")
+                            .and_then(|v| v.as_f64())
+                            .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                visited + fields.values().map(retained_rows_visited).sum::<f64>()
+            }
+            _ => 0.0,
+        }
+    }
+
+    #[sqlx::test]
+    async fn retained_owner_page_bounds_history_scan_with_generic_plan(pool: PgPool) {
+        sqlx::query("SELECT ensure_retained_response_partition('2026-08-20', NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO retained_response_objects (
+                delete_on, group_id, object_kind, object_id, request_id,
+                created_by, service_tier, state, model, created_at,
+                terminal_at, schema_version, payload
+            ) SELECT '2026-08-20', md5(i::text)::uuid, 'request', md5(i::text)::uuid,
+                md5(i::text)::uuid, CASE WHEN i <= 2000 THEN 'owner' ELSE 'other' END,
+                'flex', 'completed', 'model',
+                '2026-08-11'::timestamptz + i * interval '1 second',
+                '2026-08-12', 1, '{}'::jsonb
+            FROM generate_series(1, 4000) i
+        "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO retained_response_group_routes (group_id, delete_on) SELECT group_id, delete_on FROM retained_response_objects")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) SELECT object_id, group_id, delete_on FROM retained_response_objects")
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql("ANALYZE retained_response_objects; ANALYZE retained_response_objects_d20260820; ANALYZE retained_response_group_routes; ANALYZE retained_response_request_routes;")
+            .execute(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for active_first in [true, false] {
+            let sql = format!(
+                "PREPARE owner_page(text, text, text[], timestamptz, timestamptz, text[], bigint, bigint) AS {}",
+                list_requests_page_sql(PageShape {
+                    active_first,
+                    owner_scoped: true,
+                    single_model: false,
+                    created_after: false,
+                    created_before: false
+                })
+            );
+            sqlx::raw_sql(&sql).execute(&mut *tx).await.unwrap();
+            let plan: serde_json::Value = sqlx::query_scalar(
+                "EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE owner_page('owner', NULL, NULL, NULL, NULL, ARRAY['flex', 'priority'], 10, 0)"
+            )
+                .fetch_one(&mut *tx).await.unwrap();
+            sqlx::query("DEALLOCATE owner_page")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
+            let visited = retained_rows_visited(&plan);
+            assert!(
+                visited > 0.0 && visited < 100.0,
+                "a ten-row owner page must not visit its entire retained history (visited {visited}): {plan}"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn retained_single_model_page_bounds_history_scan_with_generic_plan(pool: PgPool) {
+        sqlx::query("SELECT ensure_retained_response_partition('2026-08-20', NULL)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO retained_response_objects (
+                delete_on, group_id, object_kind, object_id, request_id,
+                created_by, service_tier, state, model, created_at,
+                terminal_at, schema_version, payload
+            ) SELECT '2026-08-20', md5(i::text)::uuid, 'request', md5(i::text)::uuid,
+                md5(i::text)::uuid, CASE WHEN i % 2 = 0 THEN 'owner' ELSE 'other' END,
+                'flex', 'completed', CASE WHEN i <= 400 THEN 'target-model' ELSE 'other-model-' || (i % 200)::text END,
+                '2026-08-11'::timestamptz + i * interval '1 second',
+                '2026-08-12', 1, '{}'::jsonb
+            FROM generate_series(1, 40000) i
+        "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO retained_response_group_routes (group_id, delete_on) SELECT group_id, delete_on FROM retained_response_objects")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) SELECT object_id, group_id, delete_on FROM retained_response_objects")
+            .execute(&pool).await.unwrap();
+        sqlx::raw_sql("ANALYZE retained_response_objects; ANALYZE retained_response_objects_d20260820; ANALYZE retained_response_group_routes; ANALYZE retained_response_request_routes;")
+            .execute(&pool).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        for (active_first, owner_scoped) in
+            [(true, true), (false, true), (true, false), (false, false)]
+        {
+            let sql = format!(
+                "PREPARE owner_page(text, text, text[], timestamptz, timestamptz, text[], bigint, bigint) AS {}",
+                list_requests_page_sql(PageShape::of(&ListRequestsFilter {
+                    active_first,
+                    created_by: owner_scoped.then(|| "owner".to_owned()),
+                    models: Some(vec!["target-model".to_owned()]),
+                    ..Default::default()
+                }))
+            );
+            sqlx::raw_sql(&sql).execute(&mut *tx).await.unwrap();
+            let owner = if owner_scoped { "'owner'" } else { "NULL" };
+            let plan: serde_json::Value = sqlx::query_scalar(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE owner_page({owner}, NULL, ARRAY['target-model'], NULL, NULL, ARRAY['flex', 'priority'], 10, 5)"
+            ))
+                .fetch_one(&mut *tx).await.unwrap();
+            sqlx::query("DEALLOCATE owner_page")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
+            let visited = retained_rows_visited(&plan);
+            assert!(
+                visited > 0.0 && visited < 100.0,
+                "a ten-row model page must not visit unrelated model history (visited {visited}): {plan}"
+            );
+        }
+    }
+
     #[sqlx::test]
     async fn retained_list_and_count_plans_prune_children_before_created_after(pool: PgPool) {
         let relevant_delete_on = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
@@ -3749,25 +4274,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(list_count, 1);
-        let page_rows = sqlx::query(&list_requests_page_sql(false))
-            .bind(Option::<&str>::None)
-            .bind(Option::<&str>::None)
-            .bind(Option::<Vec<String>>::None)
-            .bind(Some(timestamp("2026-08-10T00:00:00Z")))
-            .bind(Option::<DateTime<Utc>>::None)
-            .bind(Option::<Vec<String>>::None)
-            .bind(20_i64)
-            .bind(0_i64)
-            .fetch_all(&pool)
-            .await
-            .unwrap();
+        let page_rows = sqlx::query(&list_requests_page_sql(PageShape {
+            active_first: false,
+            owner_scoped: false,
+            single_model: false,
+            created_after: true,
+            created_before: false,
+        }))
+        .bind(Option::<&str>::None)
+        .bind(Option::<&str>::None)
+        .bind(Option::<Vec<String>>::None)
+        .bind(Some(timestamp("2026-08-10T00:00:00Z")))
+        .bind(Option::<DateTime<Utc>>::None)
+        .bind(Option::<Vec<String>>::None)
+        .bind(20_i64)
+        .bind(0_i64)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert_eq!(page_rows.len(), 1);
         assert!(page_rows[0].get::<bool, _>("retained"));
         assert_eq!(page_rows[0].get::<Uuid, _>("object_id"), planner_request_id);
 
         for (label, sql, page) in [
             ("count", LIST_REQUESTS_COUNT_SQL.to_owned(), false),
-            ("page", list_requests_page_sql(false), true),
+            (
+                "page",
+                list_requests_page_sql(PageShape {
+                    active_first: false,
+                    owner_scoped: false,
+                    single_model: false,
+                    created_after: true,
+                    created_before: false,
+                }),
+                true,
+            ),
         ] {
             let plan = explain_bounded_list_query(&pool, &sql, page).await;
             assert!(
@@ -4007,6 +4548,7 @@ mod tests {
             .bind(vec![timestamp("2026-08-01T00:00:00Z")])
             .bind(timestamp("2026-08-08T00:00:00Z"))
             .bind(Vec::<Uuid>::new())
+            .bind(513_i64)
             .fetch_one(&mut *tx)
             .await
             .expect("candidate discovery must be explainable");
@@ -4014,6 +4556,81 @@ mod tests {
         assert!(
             plan_uses_index(&plan, "idx_requests_batchless_retention_due"),
             "candidate seed must use the validated retention-due index: {plan}"
+        );
+    }
+
+    #[sqlx::test]
+    async fn estimate_runs_under_its_own_budget_not_the_count_budget(pool: PgPool) {
+        let mut tx = pool.begin().await.expect("estimate transaction must begin");
+        apply_statement_budget(&mut tx, COUNT_BUDGET)
+            .await
+            .expect("count budget must apply");
+        let estimate = estimate_arm_rows(&mut tx, RETAINED_REQUEST_COUNT_SQL, &Default::default())
+            .await
+            .expect("estimate must succeed on an empty database");
+        assert!(estimate >= 0);
+        let budget: String = sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+            .fetch_one(&mut *tx)
+            .await
+            .expect("statement_timeout must be readable");
+        assert_eq!(
+            budget, ESTIMATE_BUDGET,
+            "the fallback EXPLAIN must not inherit the exact-count budget"
+        );
+    }
+
+    /// Reproduces the production failure shape: the exact count cannot finish
+    /// inside `COUNT_BUDGET`, and the fallback EXPLAIN is itself slow (here,
+    /// queued behind an exclusive lock rather than a 300 ms plan). The
+    /// estimate must still come back instead of surfacing a read failure.
+    #[sqlx::test]
+    async fn count_falls_back_to_estimate_when_exact_count_and_planning_exceed_count_budget(
+        pool: PgPool,
+    ) {
+        let manager = PostgresRequestManager::new(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Default::default(),
+        );
+        let hold_lock = tokio::time::Duration::from_millis(600);
+        let blocker = {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let mut tx = pool.begin().await.expect("blocking transaction must begin");
+                sqlx::query("LOCK TABLE requests IN ACCESS EXCLUSIVE MODE")
+                    .execute(&mut *tx)
+                    .await
+                    .expect("exclusive lock must be taken");
+                tokio::time::sleep(hold_lock).await;
+                tx.rollback()
+                    .await
+                    .expect("blocking transaction must release");
+            })
+        };
+        // Wait until the lock is held before counting.
+        loop {
+            let locked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE relation = 'requests'::regclass \
+                 AND mode = 'AccessExclusiveLock' AND granted)",
+            )
+            .fetch_one(&pool)
+            .await
+            .expect("pg_locks must be readable");
+            if locked {
+                break;
+            }
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+
+        let started = tokio::time::Instant::now();
+        let total = count_requests_with_budget(&manager, &Default::default())
+            .await
+            .expect("count must fall back to the planner estimate rather than fail");
+        blocker.await.expect("blocking task must finish");
+
+        assert!(total >= 0);
+        assert!(
+            started.elapsed() >= tokio::time::Duration::from_millis(100),
+            "the exact count should have spent its budget waiting on the lock"
         );
     }
 
@@ -4108,6 +4725,69 @@ mod tests {
             },
             request_payload(),
         )
+    }
+
+    #[test]
+    fn page_sql_emits_date_bounds_directly_or_omits_them() {
+        // A `($n IS NULL OR col >= $n)` bound can never become an index
+        // boundary condition in a generic prepared plan, so the scan walks
+        // every row newer than the requested range instead of seeking to it.
+        // Emitting the predicate only when the caller supplied it is what makes
+        // date-filtered pages fast; the value stays bound either way.
+        let both = list_requests_page_sql(PageShape {
+            active_first: true,
+            owner_scoped: true,
+            single_model: false,
+            created_after: true,
+            created_before: true,
+        });
+        assert!(both.contains("AND request.created_at >= $4"));
+        assert!(both.contains("AND request.created_at <= $5"));
+        assert!(both.contains("AND active.created_at >= $4"));
+        assert!(both.contains("AND object.created_at <= $5"));
+        assert!(!both.contains("$4::timestamptz IS NULL"));
+        assert!(!both.contains("$5::timestamptz IS NULL"));
+
+        // With neither bound the predicates vanish rather than degrading into a
+        // disjunction.
+        let neither = list_requests_page_sql(PageShape {
+            active_first: true,
+            owner_scoped: true,
+            single_model: false,
+            created_after: false,
+            created_before: false,
+        });
+        assert!(!neither.contains("created_at >= $4"));
+        assert!(!neither.contains("created_at <= $5"));
+        assert!(!neither.contains("delete_on > ($4"));
+
+        // The retained lower bound that drives daily partition pruning rides
+        // with created_after, and only with created_after.
+        let after_only = list_requests_page_sql(PageShape {
+            active_first: false,
+            owner_scoped: false,
+            single_model: false,
+            created_after: true,
+            created_before: false,
+        });
+        assert!(after_only.contains("AND object.delete_on > ($4 AT TIME ZONE 'UTC')::date"));
+        assert!(!after_only.contains("created_at <= $5"));
+    }
+
+    #[test]
+    fn live_arms_partition_the_state_space_exactly_once() {
+        // The in-flight CTE and the terminal live arm must be exact
+        // complements: any overlap duplicates rows on the page, any gap drops
+        // them silently.
+        let sql = list_requests_page_sql(PageShape {
+            active_first: true,
+            owner_scoped: true,
+            single_model: false,
+            created_after: false,
+            created_before: false,
+        });
+        assert!(sql.contains("state IN ('processing', 'claimed', 'pending')"));
+        assert!(sql.contains("request.state NOT IN ('processing', 'claimed', 'pending')"));
     }
 
     #[test]

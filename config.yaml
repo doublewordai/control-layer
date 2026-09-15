@@ -31,6 +31,25 @@ database:
   #   DWCTL_DATABASE_REPLICA_URL=postgres://postgres:password@replica:5432/dwctl (single underscore)
   # Note: DWCTL_DATABASE__REPLICA_URL (double underscore) won't work due to config structure
 
+  # Optional: transaction-pooled endpoint for query traffic. The direct URL above
+  # still serves migrations, LISTEN subscriptions, and leader election.
+  # pooled_url: postgres://postgres:password@pooler:6432/dwctl
+  # Also accepts DATABASE_POOLED_URL or DWCTL_DATABASE_POOLED_URL independently
+  # of DATABASE_URL. Without a pooled endpoint, pool settings are unchanged.
+  # direct_pool:
+  #   max_connections: 8
+  #   min_connections: 0
+  #
+  # Schema components default to pooled_schema_mode: role_default. Give each
+  # component a login whose persistent search_path selects its schema, using
+  # both url (direct migrations/session work) and pooled_url (query traffic).
+  # The direct schema URL must reach the same live database as main; startup
+  # verifies this before creating the schema or running component migrations.
+  # Recycle existing pooler backends after changing role defaults.
+  # Fusillade can instead share the main credentials with explicit
+  # pooled_schema_mode: transaction, which selects the schema in each query
+  # transaction. Outlet supports only role_default.
+
   # Main database pool settings for primary (and replica if not specified separately)
   # pool:
   #   max_connections: 10
@@ -64,6 +83,18 @@ database:
   # fusillade:
   #   mode: schema
   #   name: fusillade
+  #   # Scoped identity: use the same role for migrations, queries and maintenance.
+  #   # url: postgres://fusillade:password@localhost:5432/dwctl
+  #   # pooled_url: postgres://fusillade:password@pooler:6432/dwctl
+  #   # pooled_schema_mode: role_default # default; verify primary and replica
+  #   # replica_url: postgres://fusillade:password@replica-pooler:6432/dwctl
+  #   # An explicit url never inherits the main replica: reads fall back to this
+  #   # primary unless replica_url is set. With a main pooler, an explicit url
+  #   # also requires an explicit pooled_url to avoid changing query credentials.
+  #   # Shared main login compatibility: omit url and use
+  #   # pooled_schema_mode: transaction (Fusillade only).
+  #   # direct_pool:
+  #   #   max_connections: 2
   #   pool:
   #     max_connections: 20
   #     min_connections: 2
@@ -74,6 +105,9 @@ database:
   # Alternative: use a dedicated database for fusillade
   # fusillade:
   #   mode: dedicated
+  #   # pooled_url: postgres://postgres:password@pooler:6432/component_database
+  #   # direct_pool:
+  #   #   max_connections: 2
   #   url: postgres://postgres:password@localhost:5432/fusillade
   #   replica_url: postgres://postgres:password@replica:5432/fusillade
   #   pool:
@@ -87,6 +121,10 @@ database:
   # outlet:
   #   mode: schema
   #   name: outlet
+  #   # url: postgres://outlet_pool:password@localhost:5432/dwctl
+  #   # pooled_schema_mode: role_default
+  #   # pooled_url: postgres://outlet_pool:password@pooler:6432/dwctl
+  #   # replica_url: postgres://outlet_pool:password@replica-pooler:6432/dwctl
   #   pool:
   #     max_connections: 5
   #   # Optional: separate replica pool settings (defaults to pool settings)
@@ -96,6 +134,9 @@ database:
   # Alternative: use a dedicated database for outlet
   # outlet:
   #   mode: dedicated
+  #   # pooled_url: postgres://postgres:password@pooler:6432/component_database
+  #   # direct_pool:
+  #   #   max_connections: 2
   #   url: postgres://postgres:password@localhost:5432/outlet
   #   pool:
   #     max_connections: 5
@@ -181,6 +222,20 @@ auth:
 
     # auto_create_users: Automatically create users on first login
     auto_create_users: true
+
+  # Extra email domains to treat as personal, on top of the built-in list.
+  #
+  # A personal domain can't be claimed by a workspace and is never used to route
+  # a signup to one. The built-in list covers the major free-mail providers and
+  # consumer ISPs, but it can only ever be a snapshot: a provider it misses gets
+  # claimed by whoever signs up first, and everyone who signs up at that provider
+  # afterwards is routed into that stranger's workspace. Add a domain here to
+  # close that immediately — it also retires any existing claim, since the claim
+  # is only consulted after this check.
+  #
+  # personal_email_domains:
+  #   - "example-isp.net"
+  personal_email_domains: []
 
   # Default roles assigned to newly created non-admin users
   # Applies to both native user registration and proxy header auto-creation
@@ -441,6 +496,13 @@ onwards:
   # When true, only known OpenAI API paths are accepted and validated.
   # Set via environment: DWCTL_ONWARDS__STRICT_MODE=true
   strict_mode: false
+  # Failover deadline (ms) for the first token of a realtime streamed response.
+  # While a model still has another provider to fail over to, an attempt that
+  # hasn't started streaming within this window is abandoned and the next
+  # provider tried. The final attempt is never cut off, and fusillade daemon
+  # traffic (batch, flex, background) is exempt. Set to 0 to disable.
+  # Set via environment: DWCTL_ONWARDS__FIRST_TOKEN_TIMEOUT_MS=10000
+  first_token_timeout_ms: 10000
 
 # Cached-input pricing (the dwctl-owned cache layer)
 cache:
@@ -643,9 +705,16 @@ background_services:
     # batch_claim_size: 0            # Max rows per batch-claim iteration; 0 = inherit claim_batch_size
     # batch_claim_batch_size: 4      # Max batches selected per model per iteration (spill-over pool)
     # batch_claim_interval_ms: 0     # Batch-claim loop cadence; 0 = inherit claim_interval_ms
-    # batch_claim_require_live: false # Require an explicit `live` model_filters event to batch-claim;
+    # batch_claim_require_live: false # Require `live` for full-rate batch claims outside the deadline ramp;
     #                                 # false treats no-event models (external providers) as live
-    # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live batches become claimable within
+    # Batches on unavailable models get one immediate claim,
+    # then one per interval, per user/model/window. Positive whole seconds only.
+    # False restores the batch live gate; deadline-ramp claims still proceed.
+    # Async/flex keeps its window-based rate (24min default tier, 60s flex).
+    leak_enabled: true
+    leak_interval_seconds: 60
+    model_leak_interval_seconds: {} # Exact model aliases; e.g. {"some-large-model": 10}
+    # claim_ramp_exponent: 0.56      # Deadline-ramp curve: not-live work bypasses the leak interval within
     #                                 # window_minutes^exponent minutes of deadline (~59m/24h, ~10m/1h)
     # background_concurrency_limit: 0 # Per-model foreground in-flight threshold below which
     #                                 # background workers may send; background work does not
@@ -722,7 +791,10 @@ background_services:
     # session-capable maintenance endpoint.
     # template_retirement_enabled: false
     # template_retention_days: <positive days>
-    # retained_response_partition_maintenance_url: <direct session-capable postgres endpoint>
+    # Schema mode reuses the main direct credentials automatically. Override for
+    # dedicated databases or a different Fusillade query role. Use that role on
+    # the DIRECT host; startup attests database, role, schema, and ownership.
+    # retained_response_partition_maintenance_url: postgres://postgres:password@direct:5432/dwctl
 
     # Batch archive (fusillade phase 3): moves frozen terminal batches' rows
     # from fusillade.requests into the partitioned batch_requests_archive.

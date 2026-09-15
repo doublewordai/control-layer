@@ -37,7 +37,7 @@ type WeakJobRef<I, P> = Arc<OnceLock<Weak<Job<I, TaskState<P>>>>>;
 pub struct TaskState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
     pub request_manager: Arc<PostgresRequestManager<P>>,
     /// dwctl database pool — for querying connections, sync_operations, sync_entries.
-    pub dwctl_pool: PgPool,
+    pub dwctl_pool: sqlx_pool_router::DynPools,
     /// Shared config for capacity checks and other runtime configuration.
     pub config: crate::SharedConfig,
     /// Encryption key for decrypting connection credentials inside jobs.

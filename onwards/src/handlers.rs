@@ -81,7 +81,7 @@ fn embedded_error_status(body: &serde_json::Value) -> Option<u16> {
 enum SseEventKind {
     /// A `data:` frame carrying an embedded provider error — the contained
     /// `error.code`, per [`embedded_error_status`].
-    Error(u16),
+    Error(u16, serde_json::Value),
     /// A `data:` frame carrying normal content (or the `[DONE]` sentinel).
     Data,
     /// No `data:` field: an SSE comment / keep-alive (e.g. `: keep-alive`), which
@@ -120,13 +120,76 @@ fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
     if data.trim() == "[DONE]" {
         return SseEventKind::Data;
     }
-    match serde_json::from_str::<serde_json::Value>(data.trim())
-        .ok()
-        .as_ref()
-        .and_then(embedded_error_status)
+    if let Ok(body) = serde_json::from_str::<serde_json::Value>(data.trim())
+        && let Some(status) = embedded_error_status(&body)
     {
-        Some(status) => SseEventKind::Error(status),
-        None => SseEventKind::Data,
+        SseEventKind::Error(status, body["error"].clone())
+    } else {
+        SseEventKind::Data
+    }
+}
+
+/// Whether a request body asks for a streamed response (`"stream": true`).
+/// The substring guard skips the parse for the common non-streaming body.
+fn requests_stream(body: &[u8]) -> bool {
+    body.windows(8).any(|w| w == b"\"stream\"")
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("stream")?.as_bool())
+            .unwrap_or(false)
+}
+
+/// What reading the lead frames of a 2xx SSE stream has established so far.
+#[derive(Default)]
+struct LeadFrames {
+    /// The provider embedded an error status in the first real frame.
+    embedded: Option<(u16, serde_json::Value)>,
+    /// A real content frame arrived (definitely not empty).
+    saw_data: bool,
+    /// The stream closed (`None`) or errored (`Err`) before any content — a
+    /// *terminal* empty, safe to retry.
+    stream_ended: bool,
+}
+
+/// Pull up to `max_events` frames from `events` into `peeked`, stopping at the
+/// first decisive one: an embedded error, real content, or end of stream.
+/// Keep-alive / comment frames are buffered and skipped. `peeked` and `lead`
+/// live outside this future so a caller's timeout cancelling it loses nothing:
+/// frames consumed so far are still replayed to the client.
+async fn read_lead_frames<S, E>(
+    events: &mut S,
+    peeked: &mut Vec<Result<axum::body::Bytes, E>>,
+    lead: &mut LeadFrames,
+    max_events: usize,
+) where
+    S: futures_util::Stream<Item = Result<axum::body::Bytes, E>> + Unpin,
+{
+    use futures_util::StreamExt;
+    for _ in 0..max_events {
+        match events.next().await {
+            Some(Ok(chunk)) => match classify_sse_event(&chunk) {
+                SseEventKind::Error(status, error) => {
+                    lead.embedded = Some((status, error));
+                    peeked.push(Ok(chunk));
+                    return;
+                }
+                SseEventKind::Data => {
+                    lead.saw_data = true;
+                    peeked.push(Ok(chunk));
+                    return;
+                }
+                SseEventKind::Comment => peeked.push(Ok(chunk)),
+            },
+            Some(Err(e)) => {
+                lead.stream_ended = true;
+                peeked.push(Err(e));
+                return;
+            }
+            None => {
+                lead.stream_ended = true;
+                return;
+            }
+        }
     }
 }
 
@@ -697,9 +760,41 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
     let pool_max_attempts = pool.fallback_max_attempts();
+
+    // First-token failover: bound how long a streamed attempt may go without
+    // producing its first frame before it is abandoned for another provider.
+    // Armed only while a *different* provider is left to take over (the pool
+    // has more than one) and never on the final attempt (checked per attempt
+    // below), so it can reroute a stalled request but never fail one that
+    // would otherwise have succeeded. Non-streaming requests are exempt: their
+    // headers only arrive once the whole completion is done, so a deadline
+    // would cut off legitimately long answers. So is traffic carrying the
+    // configured exempt header (e.g. batch dispatch, which runs its own retries).
+    let first_token_timeout = pool
+        .fallback()
+        .filter(|f| f.enabled)
+        .and_then(|f| {
+            f.first_token_timeout_ms
+                .map(std::time::Duration::from_millis)
+                .or(state.first_token_timeout)
+        })
+        .filter(|timeout| {
+            !timeout.is_zero()
+                && pool.len() > 1
+                && !state
+                    .first_token_timeout_exempt_header
+                    .as_deref()
+                    .is_some_and(|header| original_headers.contains_key(header))
+                && requests_stream(&body_bytes)
+        });
+
     for (_member_idx, target, connection_guard) in pool.select_iter() {
         any_attempted = true;
         attempt_number += 1;
+        // This attempt's first-frame deadline; `None` on the final attempt.
+        let first_token_deadline = first_token_timeout
+            .filter(|_| (attempt_number as usize) < pool_max_attempts)
+            .map(|timeout| tokio::time::Instant::now() + timeout);
 
         let attempt_span = tracing::info_span!(
             "onwards.provider_attempt",
@@ -958,18 +1053,23 @@ pub async fn target_message_handler<T: HttpClient>(
             url.full = %upstream_uri,
             http.response.status_code = tracing::field::Empty,
         );
+        // The header wait ends at the earlier of the provider's request timeout
+        // and this attempt's first-token deadline.
+        let request_deadline = target
+            .request_timeout_secs
+            .map(|secs| tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
+        let header_deadline = match (request_deadline, first_token_deadline) {
+            (Some(request), Some(first_token)) => Some(request.min(first_token)),
+            (request, first_token) => request.or(first_token),
+        };
         let request_result = async {
-            if let Some(timeout_secs) = target.request_timeout_secs {
-                let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-                match tokio::time::timeout(timeout_duration, state.http_client.request(attempt_req))
+            if let Some(deadline) = header_deadline {
+                match tokio::time::timeout_at(deadline, state.http_client.request(attempt_req))
                     .await
                 {
                     Err(_) => {
                         // Timeout occurred
-                        debug!(
-                            "Request to {} timed out after {:?}",
-                            upstream_uri, timeout_duration
-                        );
+                        debug!("Request to {} timed out waiting for response headers", upstream_uri);
                         Err(UpstreamOutcome::Timeout)
                     }
                     Ok(result) => result.map_err(UpstreamOutcome::Error),
@@ -986,7 +1086,14 @@ pub async fn target_message_handler<T: HttpClient>(
         let mut response = match request_result {
             Err(UpstreamOutcome::Timeout) => {
                 upstream_span.record("http.response.status_code", 504_u16);
-                tracing::Span::current().record("onwards.fallback", "timeout");
+                // Name the deadline that fired, so first-token failovers are
+                // distinguishable from provider request timeouts in traces.
+                let reason = if header_deadline == first_token_deadline {
+                    "first_token_timeout"
+                } else {
+                    "timeout"
+                };
+                tracing::Span::current().record("onwards.fallback", reason);
                 if pool.fallback_enabled() {
                     return LoopAction::Continue(Some(OnwardsErrorResponse::gateway_timeout()));
                 } else {
@@ -1107,7 +1214,7 @@ pub async fn target_message_handler<T: HttpClient>(
             Clean,
             /// Provider embedded an error status in the 2xx body
             /// (`{"error":{"code":N}}`).
-            Embedded(u16),
+            Embedded(u16, serde_json::Value),
             /// 2xx whose body *terminated* empty before any content frame — e.g.
             /// an upstream `200 OK` with an empty body. Treated as a retryable
             /// 502. Keyed on stream termination, never a time budget, so a
@@ -1146,78 +1253,44 @@ pub async fn target_message_handler<T: HttpClient>(
 
                 let (parts, body) = response.into_parts();
                 let mut events = SseBufferedStream::new(body.into_data_stream());
-                // `peeked` / `embedded` live outside the peek future so a partial
-                // peek survives a budget timeout (consumed frames are not lost).
                 let mut peeked = Vec::new();
-                let mut embedded = None;
-                // `saw_data` = a real content frame arrived (definitely not empty).
-                // `stream_ended` = the stream closed (`None`) or errored (`Err`)
-                // before any content — a *terminal* empty, safe to retry.
-                let mut saw_data = false;
-                let mut stream_ended = false;
-                let peek = async {
-                    for _ in 0..SSE_PEEK_MAX_EVENTS {
-                        match events.next().await {
-                            Some(Ok(chunk)) => match classify_sse_event(&chunk) {
-                                SseEventKind::Error(status) => {
-                                    embedded = Some(status);
-                                    peeked.push(Ok(chunk));
-                                    break;
-                                }
-                                // First real data frame is normal content — stop.
-                                SseEventKind::Data => {
-                                    saw_data = true;
-                                    peeked.push(Ok(chunk));
-                                    break;
-                                }
-                                // Keep-alive / comment — keep looking.
-                                SseEventKind::Comment => peeked.push(Ok(chunk)),
-                            },
-                            Some(Err(e)) => {
-                                stream_ended = true;
-                                peeked.push(Err(e));
-                                break;
-                            }
-                            None => {
-                                stream_ended = true;
-                                break;
-                            }
-                        }
+                let mut lead = LeadFrames::default();
+                if let Some(deadline) = first_token_deadline {
+                    // First-token failover is armed: hold out for the first
+                    // decisive frame until this attempt's deadline. Keep-alive
+                    // comments don't count — a stalled provider may keep sending
+                    // them — so there is no event cap. Nothing has reached the
+                    // client yet, so abandoning the stream is safe.
+                    if tokio::time::timeout_at(
+                        deadline,
+                        read_lead_frames(&mut events, &mut peeked, &mut lead, usize::MAX),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        warn!(
+                            upstream = %target.url,
+                            "No first token before the failover deadline; trying the next provider"
+                        );
+                        tracing::Span::current().record("onwards.fallback", "first_token_timeout");
+                        // Dropping `events` closes the upstream stream, which is
+                        // the provider's signal to stop generating.
+                        return LoopAction::Continue(Some(OnwardsErrorResponse::gateway_timeout()));
                     }
-                };
-                if tokio::time::timeout(SSE_PEEK_BUDGET, peek).await.is_err() {
+                } else if tokio::time::timeout(
+                    SSE_PEEK_BUDGET,
+                    read_lead_frames(&mut events, &mut peeked, &mut lead, SSE_PEEK_MAX_EVENTS),
+                )
+                .await
+                .is_err()
+                {
                     debug!("Timed out peeking SSE lead frames; waiting for first terminal frame");
-                    let decisive_wait = async {
-                        for _ in 0..SSE_PEEK_MAX_EVENTS {
-                            match events.next().await {
-                                Some(Ok(chunk)) => match classify_sse_event(&chunk) {
-                                    SseEventKind::Error(status) => {
-                                        embedded = Some(status);
-                                        peeked.push(Ok(chunk));
-                                        break;
-                                    }
-                                    SseEventKind::Data => {
-                                        saw_data = true;
-                                        peeked.push(Ok(chunk));
-                                        break;
-                                    }
-                                    SseEventKind::Comment => peeked.push(Ok(chunk)),
-                                },
-                                Some(Err(e)) => {
-                                    stream_ended = true;
-                                    peeked.push(Err(e));
-                                    break;
-                                }
-                                None => {
-                                    stream_ended = true;
-                                    break;
-                                }
-                            }
-                        };
-                    };
-                    if tokio::time::timeout(SSE_DECISIVE_WAIT_BUDGET, decisive_wait)
-                        .await
-                        .is_err()
+                    if tokio::time::timeout(
+                        SSE_DECISIVE_WAIT_BUDGET,
+                        read_lead_frames(&mut events, &mut peeked, &mut lead, SSE_PEEK_MAX_EVENTS),
+                    )
+                    .await
+                    .is_err()
                     {
                         debug!(
                             "Timed out waiting for decisive SSE frame; forwarding stream unmodified"
@@ -1229,9 +1302,9 @@ pub async fn target_message_handler<T: HttpClient>(
                 // is dropped when we return.
                 let rest = futures_util::stream::iter(peeked).chain(events);
                 response = Response::from_parts(parts, axum::body::Body::from_stream(rest));
-                if let Some(status) = embedded {
-                    Scan2xx::Embedded(status)
-                } else if stream_ended && !saw_data {
+                if let Some((status, error)) = lead.embedded {
+                    Scan2xx::Embedded(status, error)
+                } else if lead.stream_ended && !lead.saw_data {
                     // Stream closed/errored before any content frame: nothing was
                     // forwarded, so retrying is safe. A valid-but-slow stream that
                     // eventually produces content falls through to `Clean` with the
@@ -1263,8 +1336,10 @@ pub async fn target_message_handler<T: HttpClient>(
                     let embedded = if buffered.windows(ERROR_KEY.len()).any(|w| w == ERROR_KEY) {
                         serde_json::from_slice::<serde_json::Value>(&buffered)
                             .ok()
-                            .as_ref()
-                            .and_then(embedded_error_status)
+                            .and_then(|body| {
+                                embedded_error_status(&body)
+                                    .map(|status| (status, body["error"].clone()))
+                            })
                     } else {
                         None
                     };
@@ -1276,7 +1351,7 @@ pub async fn target_message_handler<T: HttpClient>(
                         .headers_mut()
                         .insert(CONTENT_LENGTH, HeaderValue::from(len));
                     match embedded {
-                        Some(status) => Scan2xx::Embedded(status),
+                        Some((status, error)) => Scan2xx::Embedded(status, error),
                         None => Scan2xx::Clean,
                     }
                 }
@@ -1286,7 +1361,7 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         match scan {
-            Scan2xx::Embedded(embedded) => {
+            Scan2xx::Embedded(embedded, provider_error) => {
                 warn!(
                     http_status = status,
                     embedded_status = embedded,
@@ -1314,17 +1389,34 @@ pub async fn target_message_handler<T: HttpClient>(
                 // non-retryable ones like 501/505 — collapses to a generic 503. This is
                 // deliberately more opaque than the non-embedded error path: a
                 // 200-with-error body is already anomalous, so we hide the specifics.
-                // Genuine client errors (other 4xx) are surfaced, sanitized, so the
-                // caller can fix the request.
+                // For trusted providers, retain the standard client-error fields
+                // so the caller can fix the request. Never log the body: even
+                // validation errors can echo request content.
+                let trusted = target.trusted.unwrap_or_else(|| pool.is_trusted());
                 let err = if embedded == 429 || embedded >= 500 {
                     OnwardsErrorResponse::service_unavailable()
                 } else {
                     OnwardsErrorResponse::builder()
                         .body(ErrorResponseBody {
-                            message: "The upstream provider rejected the request.".to_string(),
-                            r#type: "invalid_request_error".to_string(),
-                            param: None,
-                            code: "upstream_error".to_string(),
+                            message: trusted
+                                .then(|| provider_error["message"].as_str())
+                                .flatten()
+                                .unwrap_or("The upstream provider rejected the request.")
+                                .to_string(),
+                            r#type: trusted
+                                .then(|| provider_error["type"].as_str())
+                                .flatten()
+                                .unwrap_or("invalid_request_error")
+                                .to_string(),
+                            param: trusted
+                                .then(|| provider_error["param"].as_str())
+                                .flatten()
+                                .map(str::to_string),
+                            code: if trusted {
+                                embedded.to_string()
+                            } else {
+                                "upstream_error".to_string()
+                            },
                         })
                         .status(StatusCode::from_u16(embedded).unwrap_or(StatusCode::BAD_REQUEST))
                         .build()
@@ -1762,24 +1854,24 @@ mod tests {
         // A provider's first-frame error on a 200 stream.
         assert_eq!(
             classify_sse_event(b"data: {\"error\":{\"code\":429,\"message\":\"x\"}}\n\n"),
-            Error(429)
+            Error(429, serde_json::json!({"code":429,"message":"x"}))
         );
         // Error alongside otherwise-valid chunk fields (provider shape).
         assert_eq!(
             classify_sse_event(b"data: {\"id\":\"g\",\"choices\":[],\"error\":{\"code\":502}}\n\n"),
-            Error(502)
+            Error(502, serde_json::json!({"code":502}))
         );
         // Tolerant of `data:` with no space after the colon.
         assert_eq!(
             classify_sse_event(b"data:{\"error\":{\"code\":503}}\n\n"),
-            Error(503)
+            Error(503, serde_json::json!({"code":503}))
         );
         // Multi-line `data:` fields are concatenated with `\n` before parsing
         // (SSE spec): the two `data:` lines here join to the valid JSON
         // `{"error":{"code":429}}` (the embedded `\n` is JSON whitespace).
         assert_eq!(
             classify_sse_event(b"data: {\"error\":\ndata: {\"code\":429}}\n\n"),
-            Error(429)
+            Error(429, serde_json::json!({"code":429}))
         );
 
         // Normal content and the [DONE] sentinel are data frames, not errors.
@@ -2541,6 +2633,8 @@ mod tests {
             response_transform_fn: None,
             response_id_header: None,
             body_limit: crate::DEFAULT_BODY_LIMIT,
+            first_token_timeout: None,
+            first_token_timeout_exempt_header: None,
         };
 
         // Create a simple POST request

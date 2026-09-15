@@ -1,9 +1,45 @@
 //! Shared daemon configuration.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::http::HttpResponse;
+
+/// Optional leaking for queued batches on unavailable models.
+/// Async/flex claims retain `DaemonConfig::leaks_per_window`.
+/// Kept separate from `DaemonConfig` to preserve downstream struct literals.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LeakConfig {
+    /// Enable batch leaking outside the deadline ramp. False restores the live gate.
+    pub leak_enabled: bool,
+    /// Seconds between claims per user/model/window. Must be positive.
+    pub leak_interval_seconds: NonZeroU32,
+    /// Exact model aliases overriding the default interval.
+    pub model_leak_interval_seconds: HashMap<String, NonZeroU32>,
+}
+
+impl Default for LeakConfig {
+    fn default() -> Self {
+        Self {
+            leak_enabled: true,
+            leak_interval_seconds: NonZeroU32::new(60).unwrap(),
+            model_leak_interval_seconds: HashMap::new(),
+        }
+    }
+}
+
+impl LeakConfig {
+    pub(crate) fn interval(&self, model: &str) -> Duration {
+        let seconds = self
+            .model_leak_interval_seconds
+            .get(model)
+            .unwrap_or(&self.leak_interval_seconds);
+        Duration::from_secs(u64::from(seconds.get()))
+    }
+}
 
 /// Predicate function to determine if a response should be retried.
 pub type ShouldRetryFn = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
@@ -839,6 +875,29 @@ mod tests {
             status,
             body: body.to_string(),
         }
+    }
+
+    #[test]
+    fn fixed_leak_intervals_resolve_exact_model_overrides() {
+        let config: LeakConfig = serde_json::from_value(serde_json::json!({
+            "model_leak_interval_seconds": {"large/model": 10}
+        }))
+        .unwrap();
+        assert_eq!(config.interval("large/model").as_secs(), 10);
+        assert_eq!(config.interval("other/model").as_secs(), 60);
+        assert_eq!(config.interval("large/model-suffix").as_secs(), 60);
+        assert!(
+            serde_json::from_value::<LeakConfig>(serde_json::json!({
+                "leak_interval_seconds": 0
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<LeakConfig>(serde_json::json!({
+                "model_leak_interval_seconds": {"large/model": 0}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

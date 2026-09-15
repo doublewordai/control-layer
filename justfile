@@ -646,13 +646,15 @@ lint target *args="":
                 --package dwctl \
                 --package fusillade \
                 --package fusillade-core \
-                --package fusillade-arsenal
+                --package fusillade-arsenal \
+                --package openai-reassembler
             echo "Running cargo clippy..."
             cargo clippy \
                 --package dwctl \
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
+                --package openai-reassembler \
                 --all-features \
                 --no-deps \
                 {{args}}
@@ -662,6 +664,9 @@ lint target *args="":
                 fusillade/src \
                 fusillade-core/src \
                 fusillade-arsenal/src
+            echo "Checking stable SQL result projections..."
+            python3 scripts/tests/schema_migrations/test_projection_guard.py
+            python3 scripts/check_query_projections.py
             echo "Checking SQLx prepared queries..."
             cargo sqlx prepare --check --workspace
             echo "Checking local Rust workspace topology..."
@@ -713,6 +718,7 @@ fmt target *args="":
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
+                --package openai-reassembler \
                 {{args}}
             ;;
         *)

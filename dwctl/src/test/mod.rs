@@ -1246,8 +1246,8 @@ async fn test_request_logging_enabled(pool: PgPool) {
 
     // Get outlet_db from app_state to query logs
     let outlet_pool = app.app_state.outlet_db.clone().expect("outlet_db should exist");
-    let repository: outlet_postgres::RequestRepository<DbPools, AiRequest, AiResponse> =
-        outlet_postgres::RequestRepository::new(outlet_pool);
+    let repository: outlet_postgres::RequestRepository<sqlx::PgPool, AiRequest, AiResponse> =
+        outlet_postgres::RequestRepository::new(outlet_pool.write().into_inner());
 
     let (server, _drop_guard) = app.into_test_server();
 
@@ -1300,10 +1300,9 @@ async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     }
 
     // Real analytics handler wrapped in the scrubber, mirroring lib.rs wiring.
-    let handler =
-        outlet_postgres::PostgresHandler::<DbPools, serde_json::Value, serde_json::Value>::from_pool_provider(DbPools::new(pool.clone()))
-            .await
-            .expect("build PostgresHandler");
+    let handler = outlet_postgres::PostgresHandler::<sqlx::PgPool, serde_json::Value, serde_json::Value>::from_pool_provider(pool.clone())
+        .await
+        .expect("build PostgresHandler");
     let handler = crate::inference::engine::outlet_handler::ZdrBodyScrubber::new(handler);
 
     fn request(correlation_id: u64, zdr: bool) -> RequestData {
@@ -1381,7 +1380,7 @@ async fn test_request_logging_disabled(pool: PgPool) {
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -1462,11 +1461,15 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
 
     // Configure fusillade to use dedicated database
     config.database = crate::config::DatabaseConfig::External {
+        pooled_url: None,
+        direct_pool: crate::config::default_direct_pool(),
         url: "ignored".to_string(), // Will be overridden by pool
         replica_url: None,
         pool: PoolSettings::default(),
         replica_pool: None,
         fusillade: ComponentDb::Dedicated {
+            pooled_url: None,
+            direct_pool: crate::config::default_direct_pool(),
             url: test_dbs.fusillade_url.clone(),
             replica_url: None,
             pool: PoolSettings {
@@ -1477,6 +1480,8 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
             replica_pool: None,
         },
         outlet: ComponentDb::Dedicated {
+            pooled_url: None,
+            direct_pool: crate::config::default_direct_pool(),
             url: test_dbs.outlet_url.clone(),
             replica_url: None,
             pool: PoolSettings {
@@ -1541,8 +1546,8 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
     );
 
     // Make a request and verify it gets logged to the dedicated outlet database
-    let repository: outlet_postgres::RequestRepository<DbPools, AiRequest, AiResponse> =
-        outlet_postgres::RequestRepository::new(outlet_pool);
+    let repository: outlet_postgres::RequestRepository<sqlx::PgPool, AiRequest, AiResponse> =
+        outlet_postgres::RequestRepository::new(outlet_pool.write().into_inner());
 
     let (server, bg_services) = app.into_test_server();
 
@@ -2044,7 +2049,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = crate::tasks::TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),
@@ -2106,7 +2111,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     underway::run_migrations(&pool).await.expect("Failed to run underway migrations");
     let task_state = TaskState {
         request_manager: request_manager.clone(),
-        dwctl_pool: pool.clone(),
+        dwctl_pool: sqlx_pool_router::DynPools::new(pool.clone()),
         config: shared_config.clone(),
         encryption_key: None,
         ingest_file_job: std::sync::Arc::new(std::sync::OnceLock::new()),

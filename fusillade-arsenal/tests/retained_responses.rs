@@ -55,13 +55,13 @@ struct WriteSignalingPools {
 }
 
 impl PoolProvider for WriteSignalingPools {
-    fn read(&self) -> &PgPool {
-        &self.read
+    fn read(&self) -> sqlx_pool_router::PoolHandle {
+        self.read.clone().into()
     }
 
-    fn write(&self) -> &PgPool {
+    fn write(&self) -> sqlx_pool_router::PoolHandle {
         self.write_requested.store(true, Ordering::Release);
-        &self.write
+        self.write.clone().into()
     }
 }
 
@@ -2839,6 +2839,68 @@ async fn deferred_oldest_group_does_not_consume_the_movement_budget(pool: PgPool
 }
 
 #[sqlx::test]
+async fn one_pass_discovers_a_page_of_the_oldest_graphs_across_tiers(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    // Interleave tiers so oldest-first across the whole queue differs from
+    // oldest-first within any one tier: a paged probe must merge the tier
+    // arms, not drain one tier before looking at the next.
+    let mut graphs = Vec::new();
+    for (index, (tier, hour)) in [
+        ("flex", 8),
+        ("priority", 9),
+        ("flex", 10),
+        ("priority", 11),
+        ("flex", 12),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        graphs.push(
+            singleton(
+                &pool,
+                tier,
+                TerminalState::Completed,
+                timestamp(&format!("2026-08-01T{hour:02}:00:00Z")),
+                &format!("paged-{index}"),
+            )
+            .await,
+        );
+    }
+    let manager = manager(&pool).await;
+    let retention_policy = policy(&[("flex", 86_400), ("priority", 86_400)]);
+
+    let first = archive(&manager, &retention_policy, 3, i64::MAX)
+        .await
+        .expect("a paged pass must archive up to its graph budget");
+
+    assert_eq!(first.groups_archived, 3);
+    assert!(
+        first.may_have_more,
+        "the spare discovered candidate proves more work"
+    );
+    for graph in &graphs[..3] {
+        assert_wholly_retained(&pool, graph).await;
+    }
+    for graph in &graphs[3..] {
+        assert_wholly_live(&pool, graph).await;
+    }
+
+    let second = archive(&manager, &retention_policy, 3, i64::MAX)
+        .await
+        .expect("the remainder must archive on the next pass");
+
+    assert_eq!(second.groups_archived, 2);
+    assert!(
+        !second.may_have_more,
+        "a short page proves the eligible set is exhausted"
+    );
+    for graph in &graphs {
+        assert_wholly_retained(&pool, graph).await;
+    }
+}
+
+#[sqlx::test]
 async fn archives_singleton_request_template_as_one_group(pool: PgPool) {
     install_candidate_index(&pool).await;
     ensure_partition(&pool, archive_date("2026-08-03")).await;
@@ -3660,6 +3722,322 @@ async fn read_apis_preserve_exact_values_filters_pages_and_counts_after_move(poo
 }
 
 #[sqlx::test]
+async fn model_filter_pages_preserve_live_retained_order_and_owner_scope(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let base = timestamp("2026-08-01T10:00:00Z");
+    let mut ids = Vec::new();
+    for (index, (tier, state, model, owner)) in [
+        ("flex", TerminalState::Completed, MODEL, OWNER),
+        ("flex", TerminalState::Completed, "other-model", OWNER),
+        ("priority", TerminalState::Completed, MODEL, OWNER),
+        ("priority", TerminalState::Completed, "other-model", OWNER),
+        ("priority", TerminalState::Pending, MODEL, OWNER),
+        ("priority", TerminalState::Pending, "other-model", OWNER),
+        ("flex", TerminalState::Completed, MODEL, "other-owner"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let graph = singleton(&pool, tier, state, base, &format!("model-page-{index}")).await;
+        let id = graph.request_ids[0];
+        sqlx::query(
+            "UPDATE requests SET model = $2, created_by = $3, created_at = $4 WHERE id = $1",
+        )
+        .bind(id)
+        .bind(model)
+        .bind(owner)
+        .bind(
+            base - TimeDelta::minutes(if index == 4 || index == 5 {
+                20 - index as i64
+            } else {
+                10 - index as i64
+            }),
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    let request_manager = manager(&pool).await;
+    let outcome = archive(&request_manager, &policy(&[("flex", 86_400)]), 3, i64::MAX)
+        .await
+        .unwrap();
+    assert_eq!(outcome.groups_archived, 3);
+
+    // The two pending requests outrank the live/retained terminal rows, and the
+    // other owner's newest retained row must never enter this owner's page.
+    for (models, ranked, recent) in [
+        (None, vec![5, 4, 3, 2, 1, 0], vec![3, 2, 1, 0, 5, 4]),
+        (Some(vec![]), vec![], vec![]),
+        (Some(vec![MODEL]), vec![4, 2, 0], vec![2, 0, 4]),
+        (Some(vec!["other-model"]), vec![5, 3, 1], vec![3, 1, 5]),
+        (
+            Some(vec![MODEL, "other-model"]),
+            vec![5, 4, 3, 2, 1, 0],
+            vec![3, 2, 1, 0, 5, 4],
+        ),
+        (Some(vec![MODEL, MODEL]), vec![4, 2, 0], vec![2, 0, 4]),
+        (Some(vec!["missing-model"]), vec![], vec![]),
+    ] {
+        for active_first in [true, false] {
+            let expected = if active_first { &ranked } else { &recent };
+            for (limit, skip) in [(10, 0), (2, 1)] {
+                let page = request_manager
+                    .list_requests(ListRequestsFilter {
+                        created_by: Some(OWNER.to_owned()),
+                        models: models
+                            .as_ref()
+                            .map(|values| values.iter().map(|value| (*value).to_owned()).collect()),
+                        active_first,
+                        limit,
+                        skip,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let expected_ids: Vec<_> = expected
+                    .iter()
+                    .skip(skip as usize)
+                    .take(limit as usize)
+                    .map(|index| ids[*index])
+                    .collect();
+                assert_eq!(
+                    page.data.iter().map(|row| row.id).collect::<Vec<_>>(),
+                    expected_ids,
+                    "models={models:?}, active_first={active_first}, skip={skip}"
+                );
+                assert_eq!(page.total_count, expected.len() as i64);
+            }
+        }
+    }
+}
+
+#[sqlx::test]
+async fn active_first_page_ranks_in_flight_rows_before_newer_ones(pool: PgPool) {
+    // The in-flight arm reads from a materialized CTE and must apply the full
+    // page ordering itself, rank included. Ordering it by created_at alone is
+    // invisible until more rows are in flight than fit on one page: the arm
+    // then returns the NEWEST in-flight rows, and a lower-ranked but older row
+    // that belongs on page one is silently dropped off the end.
+    let base = timestamp("2026-08-01T12:00:00Z");
+    let mut ids = Vec::new();
+    for (index, suffix) in ["rank-oldest", "rank-second", "rank-third", "rank-newest"]
+        .iter()
+        .enumerate()
+    {
+        let graph = singleton(&pool, "priority", TerminalState::Pending, base, suffix).await;
+        ids.push(graph.request_ids[0]);
+        // created_at strictly ascending across ids[0..4].
+        sqlx::query("UPDATE requests SET created_at = $2 WHERE id = $1")
+            .bind(graph.request_ids[0])
+            .bind(base - TimeDelta::minutes(40 - 10 * index as i64))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    // Ranks deliberately disagree with recency. claimed/processing carry the
+    // daemon and timestamp fields their CHECK constraints require.
+    for (id, state) in [
+        (ids[0], "processing"),
+        (ids[1], "pending"),
+        (ids[2], "claimed"),
+        (ids[3], "pending"),
+    ] {
+        sqlx::query(
+            "UPDATE requests
+                SET state = $2,
+                    daemon_id = CASE WHEN $2 = 'pending' THEN NULL ELSE $3 END,
+                    claimed_at = CASE WHEN $2 = 'pending' THEN NULL ELSE $4 END,
+                    started_at = CASE WHEN $2 = 'processing' THEN $4 ELSE NULL END
+              WHERE id = $1",
+        )
+        .bind(id)
+        .bind(state)
+        .bind(Uuid::nil())
+        .bind(base)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let request_manager = manager(&pool).await;
+
+    // processing, then claimed, then the two pending newest-first.
+    let expected = [ids[0], ids[2], ids[3], ids[1]];
+    for (skip, expected_id) in expected.iter().enumerate() {
+        let page = request_manager
+            .list_requests(ListRequestsFilter {
+                created_by: Some(OWNER.to_owned()),
+                active_first: true,
+                limit: 1,
+                skip: skip as i64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            page.data.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![*expected_id],
+            "active-first page at skip={skip} must rank in-flight rows before newer ones"
+        );
+    }
+
+    // A page smaller than the in-flight set is where a created_at-only in-flight
+    // arm regresses: it would surface the two newest rows instead of the two
+    // lowest-ranked ones.
+    let first_page = request_manager
+        .list_requests(ListRequestsFilter {
+            created_by: Some(OWNER.to_owned()),
+            active_first: true,
+            limit: 2,
+            skip: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        first_page.data.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![ids[0], ids[2]]
+    );
+
+    // active_first=false is a pure recency ordering over the same rows.
+    let recency = request_manager
+        .list_requests(ListRequestsFilter {
+            created_by: Some(OWNER.to_owned()),
+            active_first: false,
+            limit: 4,
+            skip: 0,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        recency.data.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![ids[3], ids[2], ids[1], ids[0]]
+    );
+}
+
+#[sqlx::test]
+async fn retained_pages_validate_routes_before_limit_and_merge_terminal_ties(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    let delete_on = archive_date("2026-08-03");
+    ensure_partition(&pool, delete_on).await;
+    let mut terminal_ids = Vec::new();
+    for (state, label) in [
+        (TerminalState::Completed, "page-completed"),
+        (TerminalState::Failed, "page-failed"),
+        (
+            TerminalState::Canceled { dispatched: false },
+            "page-canceled",
+        ),
+    ] {
+        let graph = singleton(
+            &pool,
+            "flex",
+            state,
+            timestamp("2026-08-01T10:00:00Z"),
+            label,
+        )
+        .await;
+        terminal_ids.push(graph.request_ids[0]);
+    }
+    let invalid = singleton(
+        &pool,
+        "flex",
+        TerminalState::Completed,
+        timestamp("2026-08-01T11:00:00Z"),
+        "page-invalid-newest",
+    )
+    .await;
+    let request_manager = manager(&pool).await;
+    assert_eq!(
+        archive(&request_manager, &policy(&[("flex", 86_400)]), 4, i64::MAX)
+            .await
+            .unwrap()
+            .groups_archived,
+        4
+    );
+    let pending = singleton(
+        &pool,
+        "priority",
+        TerminalState::Pending,
+        timestamp("2026-07-31T10:00:00Z"),
+        "page-old-pending",
+    )
+    .await;
+    let other = singleton(
+        &pool,
+        "priority",
+        TerminalState::Pending,
+        timestamp("2026-08-02T10:00:00Z"),
+        "page-other-owner",
+    )
+    .await;
+    sqlx::query("UPDATE requests SET created_by = 'other-owner' WHERE id = $1")
+        .bind(other.request_ids[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    terminal_ids.sort_by(|a, b| b.cmp(a));
+
+    // The newest retained candidate is invalid in three distinct ways. It
+    // must never consume a LIMIT slot or hide a valid row on a later page.
+    for invalidation in [
+        "UPDATE retained_response_request_routes SET group_id = gen_random_uuid() WHERE request_id = $1",
+        "DELETE FROM retained_response_request_routes WHERE request_id = $1",
+        "DELETE FROM retained_response_group_routes WHERE group_id = $1",
+    ] {
+        sqlx::query(invalidation)
+            .bind(invalid.request_ids[0])
+            .execute(&pool)
+            .await
+            .unwrap();
+        for owner in [Some(OWNER.to_owned()), None] {
+            for active_first in [true, false] {
+                let mut expected = terminal_ids.clone();
+                if active_first {
+                    expected.insert(0, pending.request_ids[0]);
+                } else {
+                    expected.push(pending.request_ids[0]);
+                }
+                if owner.is_none() {
+                    expected.insert(0, other.request_ids[0]);
+                }
+                for (skip, expected_id) in expected.iter().enumerate() {
+                    let result = request_manager
+                        .list_requests(ListRequestsFilter {
+                            created_by: owner.clone(),
+                            active_first,
+                            limit: 1,
+                            skip: skip as i64,
+                            ..Default::default()
+                        })
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        result.data.iter().map(|r| r.id).collect::<Vec<_>>(),
+                        vec![*expected_id]
+                    );
+                }
+                let empty = request_manager
+                    .list_requests(ListRequestsFilter {
+                        created_by: owner.clone(),
+                        active_first,
+                        limit: 1,
+                        skip: expected.len() as i64,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert!(empty.data.is_empty());
+            }
+        }
+        sqlx::query("INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) VALUES ($1, $1, $2) ON CONFLICT (request_id) DO UPDATE SET group_id = EXCLUDED.group_id")
+            .bind(invalid.request_ids[0]).bind(delete_on).execute(&pool).await.unwrap();
+    }
+}
+
+#[sqlx::test]
 async fn anomalous_request_chronology_uses_later_created_at_for_safe_deadline(pool: PgPool) {
     install_candidate_index(&pool).await;
     let expected_delete_on = archive_date("2026-08-07");
@@ -4132,6 +4510,14 @@ async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool:
     .await;
     let request_manager = manager(&pool).await;
     let before = capture_public_reads(&request_manager, &graph).await;
+    let terminal_before = serde_json::to_value(
+        request_manager
+            .get_terminal_request_detail(RequestId(graph.request_ids[0]))
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
 
     sqlx::query(
         r#"
@@ -4185,6 +4571,17 @@ async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool:
     // uncommitted archive.
     let during = capture_public_reads(&request_manager, &graph).await;
     assert_eq!(during, before);
+    assert_eq!(
+        serde_json::to_value(
+            request_manager
+                .get_terminal_request_detail(RequestId(graph.request_ids[0]))
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        terminal_before
+    );
 
     let unlocked: bool = sqlx::query_scalar("SELECT pg_advisory_unlock($1)")
         .bind(MOVEMENT_GATE_KEY)
@@ -4200,6 +4597,17 @@ async fn read_point_apis_never_observe_partial_data_during_atomic_movement(pool:
 
     let after = capture_public_reads(&request_manager, &graph).await;
     assert_eq!(after, before);
+    assert_eq!(
+        serde_json::to_value(
+            request_manager
+                .get_terminal_request_detail(RequestId(graph.request_ids[0]))
+                .await
+                .unwrap()
+                .unwrap()
+        )
+        .unwrap(),
+        terminal_before
+    );
 }
 
 async fn set_bucket_state(pool: &PgPool, delete_on: NaiveDate, state: &str) {
@@ -4512,6 +4920,70 @@ async fn read_mixed_live_and_retained_rows_do_not_double_count_or_split_demand(p
     assert_eq!(after_list.data.len(), 2);
     assert_eq!(after_flex, 2);
     assert_eq!(after_trailing, before_trailing);
+}
+
+#[sqlx::test]
+async fn trailing_live_identity_suppresses_retained_even_outside_filters(pool: PgPool) {
+    install_candidate_index(&pool).await;
+    ensure_partition(&pool, archive_date("2026-08-03")).await;
+    let request_manager = manager(&pool).await;
+    for state in [TerminalState::Completed, TerminalState::Failed] {
+        let graph = singleton(
+            &pool,
+            "flex",
+            state,
+            timestamp("2026-08-01T10:00:00Z"),
+            "overlap-filter",
+        )
+        .await;
+        archive(&request_manager, &policy(&[("flex", 86_400)]), 1, i64::MAX)
+            .await
+            .unwrap();
+        let windows = [("retained".to_owned(), -31_536_000, 0)];
+        let models = [MODEL.to_owned()];
+        let filter = ServiceTierFilter::Include(vec![Some("flex".to_owned())]);
+        let before = request_manager
+            .get_completed_request_counts_by_model_and_window(&windows, &models, &filter)
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].count, 1);
+        // A pending live row with a different model and tier still owns this
+        // identity. Filtering the live-ID set by demand would leak its archive.
+        sqlx::query("INSERT INTO requests (id, model, service_tier, created_by) VALUES ($1, 'other-model', 'background', $2)")
+            .bind(graph.request_ids[0]).bind(OWNER).execute(&pool).await.unwrap();
+        let suppressed = request_manager
+            .get_completed_request_counts_by_model_and_window(&windows, &models, &filter)
+            .await
+            .unwrap();
+        assert!(suppressed.is_empty());
+
+        // An unattributed batched live identity does not suppress the retained
+        // owner-visible identity: preserve the existing created_by boundary.
+        let batch_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO batches (expires_at) VALUES (now() + interval '1 day') RETURNING id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE requests SET created_by = NULL, batch_id = $2 WHERE id = $1")
+            .bind(graph.request_ids[0])
+            .bind(batch_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let unattributed = request_manager
+            .get_completed_request_counts_by_model_and_window(&windows, &models, &filter)
+            .await
+            .unwrap();
+        assert_eq!(unattributed, before);
+        // Fence this iteration's archive so the next outcome is independent.
+        sqlx::query("DELETE FROM retained_response_objects WHERE group_id = $1")
+            .bind(graph.group_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
 }
 
 async fn assert_graph_reads_not_found(

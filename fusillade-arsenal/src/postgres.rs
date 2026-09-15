@@ -5,7 +5,7 @@
 
 use crate::request::AnyRequest;
 use futures::StreamExt;
-pub use sqlx_pool_router::{PoolProvider, TestDbPools};
+pub use sqlx_pool_router::{DynPools, PoolHandle, PoolProvider, TestDbPools};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -46,8 +46,8 @@ use crate::manager::{
 use crate::request::{
     Canceled, CascadeTargetState, Claimed, Completed, CreateBackgroundInput, CreateFlexInput,
     CreateRealtimeInput, DaemonId, Failed, FailureReason, LeakStamp, Pending,
-    PersistCompletedRealtimeInput, Processing, Request, RequestData, RequestId, RequestState,
-    ServiceTierFilter,
+    PersistCompletedRealtimeInput, Processing, Request, RequestData, RequestDetail, RequestId,
+    RequestState, ServiceTierFilter,
 };
 
 // Retained graph representation and movement stay isolated from the main
@@ -55,7 +55,9 @@ use crate::request::{
 // later rollout step.
 #[allow(dead_code)]
 pub(crate) mod batch_archive_retirement;
+mod batch_list;
 pub(crate) mod partition_retirement;
+mod request_maintenance;
 pub(crate) mod retained_response;
 pub(crate) mod retained_response_retirement;
 pub(crate) mod template_retirement;
@@ -155,6 +157,7 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     partition_maintenance_lease_owner: Uuid,
     state_write_limiter: StateWriteLimiter,
     db_retry_config: crate::DbRetryConfig,
+    query_schema: Option<Arc<str>>,
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
     /// TRANSITIONAL ZDR hook - see [`crate::transform`]. Transforms response/
@@ -389,10 +392,35 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             partition_maintenance_lease_owner: Uuid::new_v4(),
             state_write_limiter,
             db_retry_config: crate::DbRetryConfig::default(),
+            query_schema: None,
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             response_transformer: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Read only status while a response is running, loading its payload once terminal.
+    /// Missing live rows use the retained-response reader, so movement between
+    /// the status probe and detail fetch remains safe. Reads use the primary.
+    pub async fn get_terminal_request_detail(
+        &self,
+        request_id: RequestId,
+    ) -> Result<Option<RequestDetail>> {
+        let status: Option<String> = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(request_id.0)
+            .fetch_optional(self.write_executor())
+            .await
+            .map_err(|error| {
+                FusilladeError::Other(anyhow!("Failed to read request status: {error}"))
+            })?;
+        if status
+            .as_deref()
+            .is_some_and(|state| !matches!(state, "completed" | "failed" | "canceled"))
+        {
+            return Ok(None);
+        }
+        let detail = retained_response::get_request_detail(self, request_id).await?;
+        Ok(matches!(detail.status.as_str(), "completed" | "failed" | "canceled").then_some(detail))
     }
 
     /// Compatibility constructor for callers that still build storage beside an
@@ -511,7 +539,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             WHERE namespace.nspname = current_schema()
         "#;
         let ordinary: Option<MaintenanceTarget> = sqlx::query_as(target_sql)
-            .fetch_optional(self.pools.write())
+            .fetch_optional(self.write_executor())
             .await
             .map_err(|_| {
                 FusilladeError::ValidationError(
@@ -600,6 +628,16 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         Ok(self)
     }
 
+    /// Select this schema within every query transaction instead of relying on
+    /// connection session state. This permits sharing transaction-pooler roles
+    /// and endpoints with other components. Dedicated session maintenance pools
+    /// must still have their own connection-level schema setting.
+    pub fn with_query_schema(mut self, schema: impl Into<String>) -> Self {
+        self.query_schema = Some(Arc::from(schema.into()));
+        self.partition_maintenance_attested = false;
+        self
+    }
+
     /// Set the retry cadence for transient database failures.
     ///
     /// The manager retries errors that look like SQLx pool-acquire timeouts,
@@ -618,23 +656,36 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     }
 
     fn read_executor(&self) -> crate::db::RetryingPgPool {
-        crate::db::RetryingPgPool::new(self.pools.read(), &self.db_retry_config)
+        crate::db::RetryingPgPool::new(&self.pools.read(), &self.db_retry_config)
+            .with_schema(self.query_schema.clone())
     }
 
     fn write_executor(&self) -> crate::db::RetryingPgPool {
-        crate::db::RetryingPgPool::new(self.pools.write(), &self.db_retry_config)
+        crate::db::RetryingPgPool::new(&self.pools.write(), &self.db_retry_config)
+            .with_schema(self.query_schema.clone())
     }
 
     async fn begin_read(
         &self,
     ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
-        crate::db::begin_transaction(self.pools.read(), &self.db_retry_config).await
+        crate::db::begin_transaction_in_schema(
+            &self.pools.read(),
+            &self.db_retry_config,
+            self.query_schema.as_deref(),
+        )
+        .await
     }
 
-    async fn begin_write(
+    /// Begin a primary transaction with the configured component schema.
+    pub async fn begin_write(
         &self,
     ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
-        crate::db::begin_transaction(self.pools.write(), &self.db_retry_config).await
+        crate::db::begin_transaction_in_schema(
+            &self.pools.write(),
+            &self.db_retry_config,
+            self.query_schema.as_deref(),
+        )
+        .await
     }
 
     async fn begin_response_write(
@@ -642,8 +693,9 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         object_ids: &[Uuid],
     ) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
         retained_response::begin_response_write_transaction(
-            self.pools.write(),
+            &self.pools.write(),
             &self.db_retry_config,
+            self.query_schema.as_deref(),
             object_ids,
         )
         .await
@@ -1041,8 +1093,17 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// For backward compatibility, this returns the write pool (primary).
     /// Use the pool provider's `.read()` and `.write()` methods directly
     /// for explicit read/write routing.
-    pub fn pool(&self) -> &PgPool {
+    ///
+    /// Returns an owned handle to the pool that is active *now*; do not
+    /// cache it (the provider may replace its pools at runtime).
+    pub fn pool(&self) -> sqlx_pool_router::PoolHandle {
         self.pools.write()
+    }
+
+    /// The pool provider itself, for components that must stay live across
+    /// runtime pool swaps (hold this, not a `PoolHandle`).
+    pub fn pools(&self) -> &P {
+        &self.pools
     }
 
     /// Create a listener for real-time request updates.
@@ -1050,7 +1111,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// This returns a PgListener that can be used to receive notifications
     /// when requests are updated. Uses the write pool (primary) for consistency.
     pub async fn create_listener(&self) -> Result<PgListener> {
-        crate::db::connect_listener(self.pools.write(), &self.db_retry_config)
+        crate::db::connect_listener(&self.pools.write(), &self.db_retry_config)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to create listener: {}", e)))
     }
@@ -1310,13 +1371,17 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     async fn finalize_file_size(
         pool: &PgPool,
         retry_config: &crate::DbRetryConfig,
+        query_schema: Option<&str>,
         file_id: FileId,
         estimated_size: i64,
     ) -> Result<bool> {
         let lock_key = Self::file_lock_key(file_id);
-        let mut transaction = crate::db::begin_transaction(pool, retry_config)
-            .await
-            .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+        let mut transaction =
+            crate::db::begin_transaction_in_schema(pool, retry_config, query_schema)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+                })?;
 
         // A transaction-scoped lock keeps lock ownership, the guarded update,
         // and lock release on one server transaction. This remains correct
@@ -1404,13 +1469,19 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
             if is_complete {
                 // Spawn background finalization - don't block listing
-                let pool = self.pools.write().clone();
+                let pools = self.pools.clone();
                 let retry_config = self.db_retry_config.clone();
+                let query_schema = self.query_schema.clone();
 
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        Self::finalize_file_size(&pool, &retry_config, file_id, estimated_size)
-                            .await
+                    if let Err(e) = Self::finalize_file_size(
+                        &pools.write(),
+                        &retry_config,
+                        query_schema.as_deref(),
+                        file_id,
+                        estimated_size,
+                    )
+                    .await
                     {
                         tracing::warn!("Failed to finalize file size for {}: {}", file_id, e);
                     }
@@ -1471,8 +1542,9 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
         // Batch is complete - try to finalize this file
         let finalized = Self::finalize_file_size(
-            self.pools.write(),
+            &self.pools.write(),
             &self.db_retry_config,
+            self.query_schema.as_deref(),
             file.id,
             estimated_size,
         )
@@ -2495,274 +2567,35 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         available_capacity: &std::collections::HashMap<String, usize>,
         user_active_counts: &std::collections::HashMap<String, usize>,
     ) -> Result<Vec<Request<Claimed>>> {
-        // NOTE: stale-request reclamation deliberately does NOT run here. The
-        // request daemon's `claim_batchless_requests` already runs
-        // `unclaim_stale_requests` every cycle (and reclaims batched rows too);
-        // repeating it here would double the serialized DB round-trips under
-        // the shared claim mutex for no additional coverage.
-
-        let now = Utc::now();
-        let mut model_capacity_pairs: Vec<(String, i64)> = available_capacity
-            .iter()
-            .filter(|(_, cap)| **cap > 0)
-            .map(|(model, cap)| (model.clone(), *cap as i64))
-            .collect();
-        {
-            use rand::seq::SliceRandom;
-            let mut rng = rand::rng();
-            model_capacity_pairs.shuffle(&mut rng);
-        }
-
-        let models_arr: Vec<String> = model_capacity_pairs
-            .iter()
-            .map(|(model, _)| model.clone())
-            .collect();
-        let capacities_arr: Vec<i64> = model_capacity_pairs
-            .iter()
-            .map(|(_, capacity)| *capacity)
-            .collect();
-
-        if models_arr.is_empty() {
-            tracing::debug!("No models with available capacity, skipping batch claim");
-            return Ok(Vec::new());
-        }
-
-        let user_ids_arr: Vec<String> = user_active_counts.keys().cloned().collect();
-        let user_counts_arr: Vec<i64> = user_ids_arr
-            .iter()
-            .map(|u| *user_active_counts.get(u).unwrap_or(&0) as i64)
-            .collect();
-        let batch_limit = batch_limit.max(1) as i64;
-
-        let rows = sqlx::query_as!(
-            ClaimedRequestRow,
-            r#"
-            WITH RECURSIVE all_models AS (
-                SELECT model, capacity
-                FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
-            ),
-            user_priority AS (
-                SELECT * FROM unnest($7::TEXT[], $8::BIGINT[]) AS u(user_id, active_count)
-            ),
-            latest_model_filters AS (
-                -- Scoped to the capacity-eligible models: DISTINCT ON over the
-                -- whole event log would grow with the table for no benefit.
-                SELECT DISTINCT ON (model) model, state
-                FROM model_filters
-                WHERE model = ANY($4::TEXT[])
-                ORDER BY model, created_at DESC, id DESC
-            ),
-            -- Distinct batch_ids that still have pending rows for each
-            -- capacity-eligible model, via an index-only "loose index scan"
-            -- (hop to the next batch_id > the current one) so enumeration costs
-            -- O(pairs · log N) — bounded by batches-with-pending-work per
-            -- model, never by total pending rows (a naive DISTINCT would scan
-            -- every pending index entry) nor by total open batches (the
-            -- previous models × batches join). Relies on idx_requests_pending
-            -- (model, batch_id).
-            batch_groups AS (
-                SELECT m.model, m.capacity,
-                       (SELECT r.batch_id FROM requests r
-                        WHERE r.state = 'pending' AND r.model = m.model
-                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
-                          AND r.service_tier IS DISTINCT FROM 'background'
-                        ORDER BY r.batch_id LIMIT 1) AS batch_id
-                FROM all_models m
-              UNION ALL
-                SELECT g.model, g.capacity,
-                       (SELECT r.batch_id FROM requests r
-                        WHERE r.state = 'pending' AND r.model = g.model
-                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
-                          AND r.service_tier IS DISTINCT FROM 'background'
-                          AND r.batch_id > g.batch_id
-                        ORDER BY r.batch_id LIMIT 1) AS batch_id
-                FROM batch_groups g WHERE g.batch_id IS NOT NULL
-            ),
-            selected_batches AS (
-                SELECT *
-                FROM (
-                    SELECT g.model, g.capacity, b.id AS batch_id,
-                           b.expires_at, b.created_at, b.created_by,
-                           COALESCE(b.completion_window, '24h') AS window_class,
-                           calc.pr,
-                           row_number() OVER (
-                               PARTITION BY g.model
-                               ORDER BY calc.pr ASC, b.expires_at ASC, b.id ASC
-                           ) AS batch_rank
-                    FROM batch_groups g
-                    JOIN batches b
-                      ON b.id = g.batch_id
-                     AND b.cancelling_at IS NULL
-                     AND b.deleted_at IS NULL
-                     AND b.completed_at IS NULL
-                     AND b.failed_at IS NULL
-                     AND b.cancelled_at IS NULL
-                     AND b.service_tier IS DISTINCT FROM 'background'
-                    -- Liveness gate: models whose latest filter event is `live`
-                    -- are always eligible. Models with NO filter event (external /
-                    -- always-on providers that scouter does not manage) are only
-                    -- eligible when `batch_claim_require_live` is false (default),
-                    -- matching the historical NULL-is-live claim behaviour. Models
-                    -- whose latest event is `coming`/`absent` are only eligible
-                    -- via the deadline-ramp escape hatch (see WHERE below).
-                    LEFT JOIN latest_model_filters mf
-                      ON mf.model = g.model
-                    LEFT JOIN user_priority up ON b.created_by = up.user_id
-                    CROSS JOIN LATERAL (
-                        SELECT
-                            (1.0 - $9::DOUBLE PRECISION)
-                                * COALESCE(up.active_count, 0)::DOUBLE PRECISION
-                                / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($8::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
-                            + $9::DOUBLE PRECISION
-                                * LEAST(GREATEST(EXTRACT(EPOCH FROM b.expires_at - $3), 0.0) / 86400.0, 1.0) AS pr
-                    ) calc
-                    WHERE (
-                            mf.state = 'live'
-                            OR (NOT $10::BOOLEAN AND mf.state IS NULL)
-                            -- SLA escape hatch (deadline ramp): regardless of
-                            -- liveness, once a batch is within ramp(W) of its
-                            -- deadline it becomes claimable at full capacity so
-                            -- it can overflow to fallback providers instead of
-                            -- missing SLA waiting for the model. Same formula
-                            -- as the batchless claim: ramp = (W_minutes ^ $11)
-                            -- minutes (~59min for 24h windows, ~10min for 1h).
-                            OR (EXTRACT(EPOCH FROM (b.expires_at - $3))
-                                    <= power(GREATEST(EXTRACT(EPOCH FROM (b.expires_at - b.created_at)), 0.0) / 60.0,
-                                             $11::DOUBLE PRECISION) * 60.0)
-                          )
-                      -- Claimable-NOW probe (per enumerated pair, so bounded):
-                      -- the loose scan proves pending rows exist, but rows all
-                      -- backing off on not_before shouldn't burn a rank slot.
-                      AND EXISTS (
-                        SELECT 1
-                        FROM requests r
-                        WHERE r.state = 'pending'
-                          AND r.model = g.model
-                          AND r.batch_id = g.batch_id
-                          AND r.template_id IS NOT NULL
-                          AND r.service_tier IS DISTINCT FROM 'background'
-                          AND (r.not_before IS NULL OR r.not_before <= $3)
-                    )
-                ) ranked
-                WHERE batch_rank <= $6
-            ),
-            candidate_rows AS (
-                SELECT sb.model, sb.capacity, sb.batch_id, sb.expires_at,
-                       sb.window_class, sb.pr, r.id, r.template_id, r.created_at,
-                       GREATEST(EXTRACT(EPOCH FROM (sb.expires_at - sb.created_at)), 0.0)::DOUBLE PRECISION AS window_secs
-                FROM selected_batches sb
-                CROSS JOIN LATERAL (
-                    SELECT r.id, r.template_id, r.created_at
-                    FROM requests r
-                    WHERE r.state = 'pending'
-                      AND r.model = sb.model
-                      AND r.batch_id = sb.batch_id
-                      AND r.template_id IS NOT NULL
-                      AND r.service_tier IS DISTINCT FROM 'background'
-                      AND (r.not_before IS NULL OR r.not_before <= $3)
-                    ORDER BY r.created_at ASC
-                    LIMIT sb.capacity
-                    FOR UPDATE OF r SKIP LOCKED
-                ) r
-            ),
-            to_claim AS (
-                SELECT id, template_id, batch_id, expires_at AS effective_expires_at,
-                       FALSE AS leaked, window_class, window_secs
-                FROM (
-                    SELECT c.*,
-                           row_number() OVER (
-                               PARTITION BY c.model
-                               ORDER BY c.pr ASC, c.expires_at ASC, c.batch_id ASC, c.created_at ASC
-                           ) AS model_rank
-                    FROM candidate_rows c
-                ) ranked
-                WHERE model_rank <= capacity
-                ORDER BY pr ASC, expires_at ASC, batch_id ASC, created_at ASC
-                LIMIT $2::BIGINT
-            ),
-            -- A pending row whose template is gone (its file soft-deleted, its
-            -- weekly partition retired, or the row purged) can never be claimed.
-            -- Fail it here, bounded to the rows this tick actually picked, so it
-            -- burns a claim slot exactly once instead of on every tick; the
-            -- claim update below skips it via its CROSS JOIN on the template.
-            stranded AS (
-                UPDATE requests r
-                   SET state = 'failed',
-                       error = 'request template no longer exists',
-                       failed_at = $3
-                  FROM to_claim tc
-                  -- Per-row lookup by primary key, like the claim join below:
-                  -- a bare NOT EXISTS on the generation-transparent view gets
-                  -- flattened into an anti-join that hashes the whole legacy
-                  -- template table; LIMIT 1 keeps it a probe per picked row.
-                  LEFT JOIN LATERAL (
-                      SELECT 1 AS present FROM active_request_templates t
-                      WHERE t.id = tc.template_id LIMIT 1
-                  ) t ON true
-                 WHERE r.id = tc.id
-                   AND t.present IS NULL
-                RETURNING r.id
-            )
-            UPDATE requests r
-            SET
-                state = 'claimed',
-                daemon_id = $1,
-                claimed_at = $3
-            FROM to_claim tc
-            CROSS JOIN LATERAL (
-                -- Per-row lookup by primary key. A plain join on the
-                -- generation-transparent view lets the planner hash the whole
-                -- legacy template table against the handful of claimed rows;
-                -- LIMIT 1 keeps this subquery from being flattened into that join.
-                SELECT * FROM active_request_templates t WHERE t.id = tc.template_id LIMIT 1
-            ) t
-            JOIN batches b ON tc.batch_id = b.id
-            WHERE r.id = tc.id
-            RETURNING r.id,
-                      r.batch_id,
-                      r.template_id as "template_id!", r.retry_attempt,
-                      t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
-                      t.body as "body!", t.model as "model!", COALESCE(b.api_key, t.api_key) as "api_key!",
-                      tc.effective_expires_at as "batch_expires_at?",
-                      b.id::TEXT as "batch_id_str!",
-                      COALESCE(b.file_id::TEXT, '') as "batch_file_id!",
-                      b.endpoint as "batch_endpoint!",
-                      b.completion_window as "batch_completion_window?",
-                      b.metadata::TEXT as "batch_metadata",
-                      b.output_file_id::TEXT as "batch_output_file_id",
-                      b.error_file_id::TEXT as "batch_error_file_id",
-                      COALESCE(b.created_by, '') as "batch_created_by!",
-                      to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_created_at!",
-                      to_char(tc.effective_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_expires_at_str",
-                      to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_cancelling_at",
-                      b.errors::TEXT as "batch_errors",
-                      COALESCE(b.total_requests::TEXT, '1') as "batch_total_requests!",
-                      tc.leaked as "leaked!",
-                      tc.window_class as "window_class!",
-                      tc.window_secs as "window_secs!"
-            "#,
-            *daemon_id as Uuid,
-            limit as i64,
-            now,
-            &models_arr,
-            &capacities_arr,
+        self.claim_batch_requests_inner(
+            limit,
             batch_limit,
-            &user_ids_arr,
-            &user_counts_arr,
-            self.config.urgency_weight,
-            self.config.batch_claim_require_live,
-            self.config.claim_ramp_exponent,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+            None,
         )
-        .fetch_all(self.write_executor())
         .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to claim batch requests: {}", e)))?;
+    }
 
-        let claimed_count = rows.len();
-        if claimed_count > 0 {
-            tracing::debug!(claimed = claimed_count, "Claimed batched requests");
-        }
-
-        Ok(self.claimed_rows_to_requests(rows, daemon_id, now))
+    async fn claim_batch_requests_with_cooldown(
+        &self,
+        limit: usize,
+        batch_limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+        leak_cooldown: &std::collections::HashSet<(String, String, String)>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        self.claim_batch_requests_inner(
+            limit,
+            batch_limit,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+            Some(leak_cooldown),
+        )
+        .await
     }
 
     #[tracing::instrument(
@@ -4223,8 +4056,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         offset: usize,
         search: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<FileContentItem>> + Send>> {
-        let pool = self.pools.read().clone();
+        // A live provider, not a pool snapshot: this task can outlive a
+        // connection-budget re-division and must follow the swap.
+        let pools = self.pools.clone();
         let retry_config = self.db_retry_config.clone();
+        let query_schema = self.query_schema.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
@@ -4238,7 +4074,10 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 "#,
                 *file_id as Uuid,
             )
-            .fetch_one(crate::db::RetryingPgPool::new(&pool, &retry_config))
+            .fetch_one(
+                crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                    .with_schema(query_schema.clone()),
+            )
             .await;
 
             let purpose = match file_result {
@@ -4257,16 +4096,41 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             // Route to appropriate streaming logic based on purpose
             match purpose.as_deref() {
                 Some("batch_output") => {
-                    Self::stream_batch_output(pool, retry_config, file_id, offset, search, tx)
-                        .await;
+                    Self::stream_batch_output(
+                        pools,
+                        retry_config,
+                        query_schema,
+                        file_id,
+                        offset,
+                        search,
+                        tx,
+                    )
+                    .await;
                 }
                 Some("batch_error") => {
-                    Self::stream_batch_error(pool, retry_config, file_id, offset, search, tx).await;
+                    Self::stream_batch_error(
+                        pools,
+                        retry_config,
+                        query_schema,
+                        file_id,
+                        offset,
+                        search,
+                        tx,
+                    )
+                    .await;
                 }
                 _ => {
                     // Regular file or purpose='batch': stream request templates
-                    Self::stream_request_templates(pool, retry_config, file_id, offset, search, tx)
-                        .await;
+                    Self::stream_request_templates(
+                        pools,
+                        retry_config,
+                        query_schema,
+                        file_id,
+                        offset,
+                        search,
+                        tx,
+                    )
+                    .await;
                 }
             }
         });
@@ -5007,350 +4871,52 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
     #[tracing::instrument(skip(self), fields(created_by = ?filter.created_by, limit = filter.limit))]
     async fn list_batches(&self, filter: ListBatchesFilter) -> Result<Vec<Batch>> {
-        let ListBatchesFilter {
-            created_by,
-            search,
-            after,
-            limit,
-            api_key_ids,
-            status,
-            created_after,
-            created_before,
-            active_first,
-            completion_windows,
-            service_tiers,
-        } = filter;
-        let limit = limit.unwrap_or(100);
-
-        // Single source of truth for active/terminal classification.
-        // 0 = active (no terminal or cancellation timestamp set), 1 = terminal.
-        // cancelling_at is included because cancel_batch sets both cancelling_at and
-        // cancelled_at atomically — a cancelling batch is effectively terminal.
-        // This matches the "in_progress" status filter which also excludes cancelling_at.
-        //
-        // This expression is used in the cursor lookup query and the CTE below.
-        // The CTE computes it as a column so ORDER BY clauses can reference
-        // `priority` without repeating the CASE expression. The cursor WHERE
-        // still uses priority_expr directly (SQL doesn't allow aliases in WHERE).
-        let priority_expr = "CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL \
-            AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL THEN 0 ELSE 1 END";
-
-        // If after is provided, get the cursor batch's created_at (and priority when
-        // active_first is enabled) for cursor-based pagination.
-        let (after_created_at, after_id, after_priority) = if let Some(after_id) = after {
-            if active_first {
-                // Need priority for 3-tuple cursor comparison.
-                // Table aliased as `b` so the CASE expression matches priority_expr exactly.
-                let row = sqlx::query!(
-                    r#"
-                    SELECT b.created_at,
-                           CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL
-                                     AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL
-                                THEN 0 ELSE 1 END as "priority!: i32"
-                    FROM batches b
-                    WHERE b.id = $1
-                    "#,
-                    *after_id as Uuid,
-                )
-                .fetch_optional(self.read_executor())
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e))
-                })?;
-
-                match row {
-                    Some(r) => (
-                        Some(r.created_at),
-                        Some(*after_id as Uuid),
-                        Some(r.priority),
-                    ),
-                    None => (None, Some(*after_id as Uuid), None),
-                }
-            } else {
-                let row = sqlx::query!(
-                    r#"
-                    SELECT created_at
-                    FROM batches
-                    WHERE id = $1
-                    "#,
-                    *after_id as Uuid,
-                )
-                .fetch_optional(self.read_executor())
-                .await
-                .map_err(|e| {
-                    FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e))
-                })?;
-
-                (row.map(|r| r.created_at), Some(*after_id as Uuid), None)
-            }
-        } else {
-            (None, None, None)
-        };
-
-        // Two-phase query: first filter and paginate batches (cheap), then attach
-        // request counts only to the result page (expensive LATERAL runs on ≤limit rows).
-        //
-        // The CTE computes `priority` once via priority_expr so that ORDER BY
-        // clauses can reference the column name instead of repeating the CASE
-        // expression. (The cursor WHERE still uses priority_expr directly since
-        // SQL doesn't allow aliases in WHERE.)
-        let search_pattern = search.as_ref().map(|s| format!("%{}%", s.to_lowercase()));
-
-        let mut query_builder = QueryBuilder::new(
-            r#"
-            WITH filtered AS (
-                SELECT b.*, ("#,
-        );
-        query_builder.push(priority_expr);
-        query_builder.push(
-            r#") AS priority
+        // Resolve the cursor batch's sort keys with one primary-key lookup. A
+        // missing cursor batch falls back to the first page. The priority
+        // classification must match batch_list::ACTIVE; chronological listings
+        // simply ignore it.
+        let cursor = match filter.after {
+            Some(after_id) => sqlx::query!(
+                r#"
+                SELECT b.created_at,
+                       CASE WHEN b.completed_at IS NULL AND b.failed_at IS NULL
+                                 AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL
+                            THEN 0 ELSE 1 END as "priority!: i32"
                 FROM batches b
-                LEFT JOIN files f ON b.file_id = f.id
-                WHERE b.deleted_at IS NULL
-                  AND ("#,
-        );
-        query_builder.push_bind(&created_by);
-        query_builder.push("::TEXT IS NULL OR b.created_by = ");
-        query_builder.push_bind(&created_by);
-        query_builder.push(")");
-
-        // Cursor pagination: when active_first is enabled, we use a 3-tuple
-        // (priority, created_at, id) comparison. Otherwise, the classic 2-tuple.
-        // The `priority` column is computed in the CTE SELECT above.
-        if active_first {
-            // 3-tuple cursor: (priority ASC, created_at DESC, id DESC)
-            // Row comes after cursor when:
-            //   priority > cursor_priority  (lower priority group)
-            //   OR (priority = cursor_priority AND created_at < cursor_created_at)
-            //   OR (priority = cursor_priority AND created_at = cursor_created_at AND id < cursor_id)
-            query_builder.push(" AND (");
-            query_builder.push_bind(after_priority);
-            query_builder.push("::INT IS NULL OR (");
-            query_builder.push(priority_expr);
-            query_builder.push(") > ");
-            query_builder.push_bind(after_priority);
-            query_builder.push(" OR ((");
-            query_builder.push(priority_expr);
-            query_builder.push(") = ");
-            query_builder.push_bind(after_priority);
-            query_builder.push(" AND b.created_at < ");
-            query_builder.push_bind(after_created_at);
-            query_builder.push(") OR ((");
-            query_builder.push(priority_expr);
-            query_builder.push(") = ");
-            query_builder.push_bind(after_priority);
-            query_builder.push(" AND b.created_at = ");
-            query_builder.push_bind(after_created_at);
-            query_builder.push(" AND b.id < ");
-            query_builder.push_bind(after_id);
-            query_builder.push("))");
-        } else {
-            // Classic 2-tuple cursor: (created_at DESC, id DESC)
-            query_builder.push(" AND (");
-            query_builder.push_bind(after_created_at);
-            query_builder.push("::TIMESTAMPTZ IS NULL OR b.created_at < ");
-            query_builder.push_bind(after_created_at);
-            query_builder.push(" OR (b.created_at = ");
-            query_builder.push_bind(after_created_at);
-            query_builder.push(" AND b.id < ");
-            query_builder.push_bind(after_id);
-            query_builder.push("))");
-        }
-
-        query_builder.push(" AND (");
-        query_builder.push_bind(&search_pattern);
-        query_builder.push("::TEXT IS NULL OR LOWER(b.metadata::text) LIKE ");
-        query_builder.push_bind(&search_pattern);
-        query_builder.push(" OR LOWER(f.name) LIKE ");
-        query_builder.push_bind(&search_pattern);
-        query_builder.push(" OR b.id::text LIKE ");
-        query_builder.push_bind(&search_pattern);
-        query_builder.push(")");
-
-        if let Some(api_key_ids) = &api_key_ids {
-            query_builder.push(" AND b.api_key_id = ANY(");
-            query_builder.push_bind(api_key_ids.as_slice());
-            query_builder.push(")");
-        }
-
-        if let Some(created_after) = &created_after {
-            query_builder.push(" AND b.created_at >= ");
-            query_builder.push_bind(*created_after);
-        }
-
-        if let Some(created_before) = &created_before {
-            query_builder.push(" AND b.created_at <= ");
-            query_builder.push_bind(*created_before);
-        }
-
-        // Status filtering: map status names to DB column conditions.
-        // All filters use persisted batch columns only — no dependency on request counts.
-        // Derived sub-statuses (validating, finalizing) are resolved by the frontend
-        // from the count data attached in the second phase of this query.
-        if let Some(ref status) = status {
-            match status.as_str() {
-                "in_progress" => {
-                    // All non-terminal batches: covers validating, in_progress, and finalizing
-                    query_builder.push(" AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL");
-                }
-                "completed" => {
-                    query_builder.push(" AND b.completed_at IS NOT NULL");
-                }
-                "failed" => {
-                    query_builder.push(" AND b.failed_at IS NOT NULL AND b.completed_at IS NULL");
-                }
-                "cancelled" => {
-                    // Includes both cancelling and fully cancelled batches
-                    query_builder
-                        .push(" AND (b.cancelled_at IS NOT NULL OR b.cancelling_at IS NOT NULL)");
-                }
-                "expired" => {
-                    // Matches batches with SLA issues: either still in-progress past deadline,
-                    // or terminal batches that finished after their deadline.
-                    query_builder.push(
-                        " AND b.expires_at IS NOT NULL AND (\
-                            (b.expires_at < NOW() AND b.completed_at IS NULL AND b.failed_at IS NULL AND b.cancelled_at IS NULL AND b.cancelling_at IS NULL) \
-                            OR (b.completed_at IS NOT NULL AND b.completed_at > b.expires_at) \
-                            OR (b.failed_at IS NOT NULL AND b.failed_at > b.expires_at) \
-                            OR (b.cancelled_at IS NOT NULL AND b.cancelled_at > b.expires_at)\
-                        )",
-                    );
-                }
-                unknown => {
-                    // Invalid client-supplied filter value - a bad request, not a server
-                    // fault. ValidationError so dwctl maps it to 400, not 500 (which pages).
-                    return Err(FusilladeError::ValidationError(format!(
-                        "Unknown batch status filter: '{}'. Valid values: in_progress, completed, failed, cancelled, expired",
-                        unknown
-                    )));
-                }
-            }
-        }
-
-        if let Some(ref tiers) = service_tiers
-            && let Some(unknown) = tiers.iter().find(|tier| tier.as_str() != "background")
-        {
-            return Err(FusilladeError::ValidationError(format!(
-                "Unknown batch service tier filter: '{unknown}'. Valid value: background"
-            )));
-        }
-
-        // Completion windows and service tiers are two representations of the
-        // same user-facing batch class filter. Combine them as a union when
-        // both are present so callers can request regular and background
-        // batches together.
-        match (&completion_windows, &service_tiers) {
-            (Some(windows), Some(tiers)) => {
-                query_builder.push(" AND (b.completion_window = ANY(");
-                query_builder.push_bind(windows.as_slice());
-                query_builder.push(") OR b.service_tier = ANY(");
-                query_builder.push_bind(tiers.as_slice());
-                query_builder.push("))");
-            }
-            (Some(windows), None) => {
-                query_builder.push(" AND b.completion_window = ANY(");
-                query_builder.push_bind(windows.as_slice());
-                query_builder.push(")");
-            }
-            (None, Some(tiers)) => {
-                query_builder.push(" AND b.service_tier = ANY(");
-                query_builder.push_bind(tiers.as_slice());
-                query_builder.push(")");
-            }
-            (None, None) => {}
-        }
-
-        // ORDER BY: when active_first is enabled, sort by the `priority` column
-        // computed in the CTE SELECT (0=active first, 1=terminal), then by
-        // created_at DESC within each group. Otherwise, pure chronological.
-        if active_first {
-            query_builder.push(" ORDER BY priority ASC, b.created_at DESC, b.id DESC LIMIT ");
-        } else {
-            query_builder.push(" ORDER BY b.created_at DESC, b.id DESC LIMIT ");
-        }
-        query_builder.push_bind(limit);
-
-        // Phase 2: attach request counts only to the filtered page of results.
-        // References the `priority` column from the CTE output.
-        let phase2_order = if active_first {
-            "ORDER BY b.priority ASC, b.created_at DESC, b.id DESC"
-        } else {
-            "ORDER BY b.created_at DESC, b.id DESC"
+                WHERE b.id = $1
+                "#,
+                *after_id as Uuid,
+            )
+            .fetch_optional(self.read_executor())
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to fetch after batch: {}", e)))?
+            .map(|row| batch_list::BatchCursor {
+                created_at: row.created_at,
+                id: *after_id as Uuid,
+                priority: row.priority,
+            }),
+            None => None,
         };
 
-        query_builder.push(
-            r#"
-            )
-            SELECT
-                b.id, b.file_id, b.endpoint, b.service_tier, b.completion_window, b.metadata,
-                b.output_file_id, b.error_file_id, b.created_by, b.created_at,
-                b.expires_at, b.cancelling_at, b.errors,
-                b.total_requests,
-                b.requests_started_at,
-                b.finalizing_at,
-                b.completed_at,
-                b.failed_at,
-                b.cancelled_at,
-                b.deleted_at,
-                b.notification_sent_at,
-                b.api_key_id,
-                CASE WHEN b.counts_frozen_at IS NOT NULL THEN 0
-                     ELSE COALESCE(counts.pending, 0) END::BIGINT as pending_requests,
-                CASE WHEN b.counts_frozen_at IS NOT NULL THEN 0
-                     ELSE COALESCE(counts.in_progress, 0) END::BIGINT as in_progress_requests,
-                -- Frozen batches serve the persisted counters. For live
-                -- batches, `total_requests` is conserved once population
-                -- finishes (rows inserted at batch creation, never deleted),
-                -- so completed is derivable. Skipping the 'completed' scan
-                -- in the LATERAL saves the bulk of the work on terminal
-                -- batches, which can have millions of completed rows.
-                --
-                -- The `requests_started_at IS NULL` guard handles the
-                -- validating window: `total_requests` is set at batch
-                -- creation but request rows haven't been inserted yet,
-                -- so all the LATERAL counts are zero. Without the guard,
-                -- `total - 0 - 0 - 0 - 0` would report the missing rows
-                -- as completed instead of 0.
-                CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.completed_requests
-                     WHEN b.requests_started_at IS NULL THEN 0
-                     ELSE GREATEST(b.total_requests
-                         - COALESCE(counts.pending, 0)
-                         - COALESCE(counts.in_progress, 0)
-                         - COALESCE(counts.failed, 0)
-                         - COALESCE(counts.canceled, 0), 0)
-                END::BIGINT as completed_requests,
-                CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.failed_requests
-                     ELSE COALESCE(counts.failed, 0) END::BIGINT as failed_requests,
-                CASE WHEN b.counts_frozen_at IS NOT NULL THEN b.canceled_requests
-                     ELSE COALESCE(counts.canceled, 0) END::BIGINT as canceled_requests
-            FROM filtered b
-            LEFT JOIN LATERAL (
-                SELECT
-                    COUNT(*) FILTER (WHERE state = 'pending' AND b.cancelling_at IS NULL) as pending,
-                    COUNT(*) FILTER (WHERE state IN ('claimed', 'processing') AND b.cancelling_at IS NULL) as in_progress,
-                    COUNT(*) FILTER (WHERE state = 'failed') as failed,
-                    COUNT(*) FILTER (WHERE state = 'canceled' OR (state IN ('pending', 'claimed', 'processing') AND b.cancelling_at IS NOT NULL)) as canceled
-                FROM requests
-                WHERE batch_id = b.id
-                  -- Frozen batches serve persisted counters; one-time filter
-                  -- skips the requests scan entirely.
-                  AND b.counts_frozen_at IS NULL
-                  -- Skip the 'completed' slice — it's typically the bulk
-                  -- of the index for terminal batches and we derive
-                  -- the count arithmetically above. Enumerated states
-                  -- let `idx_requests_batch_state` do narrow range
-                  -- probes instead of a full scan.
-                  AND state = ANY(ARRAY['pending', 'claimed', 'processing', 'failed', 'canceled'])
-            ) counts ON TRUE
-            "#,
-        );
-        query_builder.push(phase2_order);
+        let mut query_builder = QueryBuilder::new("");
+        batch_list::push_query(&mut query_builder, &filter, cursor)?;
 
+        // SET LOCAL keeps the budget from leaking to the next caller on this
+        // pooled connection.
+        let mut tx = self.begin_read().await.map_err(anyhow::Error::from)?;
+        sqlx::query(&format!(
+            "SET LOCAL statement_timeout = '{}'",
+            batch_list::PAGE_BUDGET
+        ))
+        .execute(&mut *tx)
+        .await
+        .map_err(anyhow::Error::from)?;
         let rows = query_builder
             .build()
-            .fetch_all(self.read_executor())
+            .fetch_all(&mut *tx)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to list batches: {}", e)))?;
+        tx.commit().await.map_err(anyhow::Error::from)?;
 
         Ok(rows
             .into_iter()
@@ -6535,14 +6101,24 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         search: Option<String>,
         status: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<crate::batch::BatchResultItem>> + Send>> {
-        let pool = self.pools.read().clone();
+        // Live provider (see get_file_content_stream).
+        let pools = self.pools.clone();
         let retry_config = self.db_retry_config.clone();
+        let query_schema = self.query_schema.clone();
         let (tx, rx) = mpsc::channel(self.download_buffer_size);
         let offset = offset as i64;
 
         tokio::spawn(async move {
-            Self::stream_batch_results(pool, retry_config, batch_id, offset, search, status, tx)
-                .await;
+            Self::stream_batch_results(
+                pools,
+                retry_config,
+                query_schema,
+                batch_id,
+                offset,
+                (search, status),
+                tx,
+            )
+            .await;
         });
 
         Box::pin(ReceiverStream::new(rx))
@@ -7112,6 +6688,309 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
 // Helper methods for file streaming and virtual file creation
 impl<P: PoolProvider> PostgresRequestManager<P> {
+    async fn claim_batch_requests_inner(
+        &self,
+        limit: usize,
+        batch_limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+        leak_cooldown: Option<&std::collections::HashSet<(String, String, String)>>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        // NOTE: stale-request reclamation deliberately does NOT run here. The
+        // request daemon's `claim_batchless_requests` already runs
+        // `unclaim_stale_requests` every cycle (and reclaims batched rows too);
+        // repeating it here would double the serialized DB round-trips under
+        // the shared claim mutex for no additional coverage.
+
+        let now = Utc::now();
+        let mut model_capacity_pairs: Vec<(String, i64)> = available_capacity
+            .iter()
+            .filter(|(_, cap)| **cap > 0)
+            .map(|(model, cap)| (model.clone(), *cap as i64))
+            .collect();
+        {
+            use rand::seq::SliceRandom;
+            let mut rng = rand::rng();
+            model_capacity_pairs.shuffle(&mut rng);
+        }
+
+        let models_arr: Vec<String> = model_capacity_pairs
+            .iter()
+            .map(|(model, _)| model.clone())
+            .collect();
+        let capacities_arr: Vec<i64> = model_capacity_pairs
+            .iter()
+            .map(|(_, capacity)| *capacity)
+            .collect();
+
+        if models_arr.is_empty() {
+            tracing::debug!("No models with available capacity, skipping batch claim");
+            return Ok(Vec::new());
+        }
+
+        let user_ids_arr: Vec<String> = user_active_counts.keys().cloned().collect();
+        let user_counts_arr: Vec<i64> = user_ids_arr
+            .iter()
+            .map(|u| *user_active_counts.get(u).unwrap_or(&0) as i64)
+            .collect();
+        let batch_limit = batch_limit.max(1) as i64;
+
+        let leak_enabled = leak_cooldown.is_some();
+        let empty_cooldown = std::collections::HashSet::new();
+        let leak_cooldown = leak_cooldown.unwrap_or(&empty_cooldown);
+
+        // Keep the arrays positionally aligned: HashSet iteration order is not
+        // an API contract across independent passes.
+        let mut cooldown_users = Vec::with_capacity(leak_cooldown.len());
+        let mut cooldown_windows = Vec::with_capacity(leak_cooldown.len());
+        let mut cooldown_models = Vec::with_capacity(leak_cooldown.len());
+        for (user, window, model) in leak_cooldown {
+            cooldown_users.push(user.clone());
+            cooldown_windows.push(window.clone());
+            cooldown_models.push(model.clone());
+        }
+
+        let rows = sqlx::query_as!(
+            ClaimedRequestRow,
+            r#"
+            WITH RECURSIVE all_models AS (
+                SELECT model, capacity
+                FROM unnest($4::TEXT[], $5::BIGINT[]) AS m(model, capacity)
+            ),
+            user_priority AS (
+                SELECT * FROM unnest($7::TEXT[], $8::BIGINT[]) AS u(user_id, active_count)
+            ),
+            latest_model_filters AS (
+                -- Scoped to the capacity-eligible models: DISTINCT ON over the
+                -- whole event log would grow with the table for no benefit.
+                SELECT DISTINCT ON (model) model, state
+                FROM model_filters
+                WHERE model = ANY($4::TEXT[])
+                ORDER BY model, created_at DESC, id DESC
+            ),
+            -- Distinct batch_ids that still have pending rows for each
+            -- capacity-eligible model, via an index-only "loose index scan"
+            -- (hop to the next batch_id > the current one) so enumeration costs
+            -- O(pairs · log N) — bounded by batches-with-pending-work per
+            -- model, never by total pending rows (a naive DISTINCT would scan
+            -- every pending index entry) nor by total open batches (the
+            -- previous models × batches join). Relies on idx_requests_pending
+            -- (model, batch_id).
+            batch_groups AS (
+                SELECT m.model, m.capacity,
+                       (SELECT r.batch_id FROM requests r
+                        WHERE r.state = 'pending' AND r.model = m.model
+                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
+                          AND r.service_tier IS DISTINCT FROM 'background'
+                        ORDER BY r.batch_id LIMIT 1) AS batch_id
+                FROM all_models m
+              UNION ALL
+                SELECT g.model, g.capacity,
+                       (SELECT r.batch_id FROM requests r
+                        WHERE r.state = 'pending' AND r.model = g.model
+                          AND r.template_id IS NOT NULL AND r.batch_id IS NOT NULL
+                          AND r.service_tier IS DISTINCT FROM 'background'
+                          AND r.batch_id > g.batch_id
+                        ORDER BY r.batch_id LIMIT 1) AS batch_id
+                FROM batch_groups g WHERE g.batch_id IS NOT NULL
+            ),
+            ranked_batches AS (
+                SELECT *
+                FROM (
+                    SELECT g.model, g.capacity, b.id AS batch_id,
+                           b.expires_at, b.created_at, b.created_by,
+                           COALESCE(b.completion_window, '24h') AS window_class,
+                           calc.pr, gate.claim_full,
+                           row_number() OVER (
+                               PARTITION BY g.model, COALESCE(b.created_by, ''),
+                                            COALESCE(b.completion_window, '24h'), gate.claim_full
+                               ORDER BY calc.pr ASC, b.expires_at ASC, b.id ASC
+                           ) AS leak_rank
+                    FROM batch_groups g
+                    JOIN batches b
+                      ON b.id = g.batch_id
+                     AND b.cancelling_at IS NULL
+                     AND b.deleted_at IS NULL
+                     AND b.completed_at IS NULL
+                     AND b.failed_at IS NULL
+                     AND b.cancelled_at IS NULL
+                     AND b.service_tier IS DISTINCT FROM 'background'
+                    -- Live/unmanaged and near-deadline batches claim normally.
+                    -- Other batches share the async one-row-per-bucket trickle.
+                    LEFT JOIN latest_model_filters mf
+                      ON mf.model = g.model
+                    LEFT JOIN user_priority up ON b.created_by = up.user_id
+                    CROSS JOIN LATERAL (
+                        SELECT
+                            (1.0 - $9::DOUBLE PRECISION)
+                                * COALESCE(up.active_count, 0)::DOUBLE PRECISION
+                                / GREATEST(NULLIF((SELECT MAX(v) FROM unnest($8::BIGINT[]) v), 0), 1)::DOUBLE PRECISION
+                            + $9::DOUBLE PRECISION
+                                * LEAST(GREATEST(EXTRACT(EPOCH FROM b.expires_at - $3), 0.0) / 86400.0, 1.0) AS pr
+                    ) calc
+                    CROSS JOIN LATERAL (
+                        SELECT (
+                            COALESCE(mf.state = 'live', NOT $10::BOOLEAN)
+                            OR (EXTRACT(EPOCH FROM (b.expires_at - $3))
+                                <= power(GREATEST(EXTRACT(EPOCH FROM (b.expires_at - b.created_at)), 0.0) / 60.0,
+                                         $11::DOUBLE PRECISION) * 60.0)
+                        ) AS claim_full
+                    ) gate
+                    WHERE (gate.claim_full OR ($15::BOOLEAN AND NOT EXISTS (
+                        SELECT 1 FROM unnest($12::TEXT[], $13::TEXT[], $14::TEXT[]) AS cd(u, w, mdl)
+                        WHERE cd.u = COALESCE(b.created_by, '')
+                          AND cd.w = COALESCE(b.completion_window, '24h')
+                          AND cd.mdl = g.model
+                    )))
+                      -- Claimable-NOW probe (per enumerated pair, so bounded):
+                      -- the loose scan proves pending rows exist, but rows all
+                      -- backing off on not_before shouldn't burn a rank slot.
+                      AND EXISTS (
+                        SELECT 1
+                        FROM requests r
+                        WHERE r.state = 'pending'
+                          AND r.model = g.model
+                          AND r.batch_id = g.batch_id
+                          AND r.template_id IS NOT NULL
+                          AND r.service_tier IS DISTINCT FROM 'background'
+                          AND (r.not_before IS NULL OR r.not_before <= $3)
+                    )
+                ) ranked
+                WHERE claim_full OR leak_rank = 1
+            ),
+            selected_batches AS (
+                SELECT * FROM (
+                    SELECT rb.*, row_number() OVER (
+                        PARTITION BY model ORDER BY claim_full DESC, pr ASC, expires_at ASC, batch_id ASC
+                    ) AS batch_rank
+                    FROM ranked_batches rb
+                ) ranked
+                WHERE batch_rank <= $6
+            ),
+            candidate_rows AS (
+                SELECT sb.model, sb.capacity, sb.batch_id, sb.expires_at,
+                       sb.window_class, sb.pr, NOT sb.claim_full AS leaked, r.id, r.template_id, r.created_at,
+                       GREATEST(EXTRACT(EPOCH FROM (sb.expires_at - sb.created_at)), 0.0)::DOUBLE PRECISION AS window_secs
+                FROM selected_batches sb
+                CROSS JOIN LATERAL (
+                    SELECT r.id, r.template_id, r.created_at
+                    FROM requests r
+                    WHERE r.state = 'pending'
+                      AND r.model = sb.model
+                      AND r.batch_id = sb.batch_id
+                      AND r.template_id IS NOT NULL
+                      AND r.service_tier IS DISTINCT FROM 'background'
+                      AND (r.not_before IS NULL OR r.not_before <= $3)
+                    ORDER BY r.created_at ASC
+                    LIMIT CASE WHEN sb.claim_full THEN sb.capacity ELSE 1 END
+                    FOR UPDATE OF r SKIP LOCKED
+                ) r
+            ),
+            to_claim AS (
+                SELECT id, template_id, batch_id, expires_at AS effective_expires_at,
+                       leaked, window_class, window_secs
+                FROM (
+                    SELECT c.*,
+                           row_number() OVER (
+                               PARTITION BY c.model
+                               ORDER BY c.leaked ASC, c.pr ASC, c.expires_at ASC, c.batch_id ASC, c.created_at ASC
+                           ) AS model_rank
+                    FROM candidate_rows c
+                ) ranked
+                WHERE model_rank <= capacity
+                ORDER BY leaked ASC, pr ASC, expires_at ASC, batch_id ASC, created_at ASC
+                LIMIT $2::BIGINT
+            ),
+            -- A pending row whose template is gone (its file soft-deleted, its
+            -- weekly partition retired, or the row purged) can never be claimed.
+            -- Fail it here, bounded to the rows this tick actually picked, so it
+            -- burns a claim slot exactly once instead of on every tick; the
+            -- claim update below skips it via its CROSS JOIN on the template.
+            stranded AS (
+                UPDATE requests r
+                   SET state = 'failed',
+                       error = 'request template no longer exists',
+                       failed_at = $3
+                  FROM to_claim tc
+                  -- Per-row lookup by primary key, like the claim join below:
+                  -- a bare NOT EXISTS on the generation-transparent view gets
+                  -- flattened into an anti-join that hashes the whole legacy
+                  -- template table; LIMIT 1 keeps it a probe per picked row.
+                  LEFT JOIN LATERAL (
+                      SELECT 1 AS present FROM active_request_templates t
+                      WHERE t.id = tc.template_id LIMIT 1
+                  ) t ON true
+                 WHERE r.id = tc.id
+                   AND t.present IS NULL
+                RETURNING r.id
+            )
+            UPDATE requests r
+            SET
+                state = 'claimed',
+                daemon_id = $1,
+                claimed_at = $3
+            FROM to_claim tc
+            CROSS JOIN LATERAL (
+                -- Per-row lookup by primary key. A plain join on the
+                -- generation-transparent view lets the planner hash the whole
+                -- legacy template table against the handful of claimed rows;
+                -- LIMIT 1 keeps this subquery from being flattened into that join.
+                SELECT * FROM active_request_templates t WHERE t.id = tc.template_id LIMIT 1
+            ) t
+            JOIN batches b ON tc.batch_id = b.id
+            WHERE r.id = tc.id
+            RETURNING r.id,
+                      r.batch_id,
+                      r.template_id as "template_id!", r.retry_attempt,
+                      t.custom_id, t.endpoint as "endpoint!", t.method as "method!", t.path as "path!",
+                      t.body as "body!", t.model as "model!", COALESCE(b.api_key, t.api_key) as "api_key!",
+                      tc.effective_expires_at as "batch_expires_at?",
+                      b.id::TEXT as "batch_id_str!",
+                      COALESCE(b.file_id::TEXT, '') as "batch_file_id!",
+                      b.endpoint as "batch_endpoint!",
+                      b.completion_window as "batch_completion_window?",
+                      b.metadata::TEXT as "batch_metadata",
+                      b.output_file_id::TEXT as "batch_output_file_id",
+                      b.error_file_id::TEXT as "batch_error_file_id",
+                      COALESCE(b.created_by, '') as "batch_created_by!",
+                      to_char(b.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_created_at!",
+                      to_char(tc.effective_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_expires_at_str",
+                      to_char(b.cancelling_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') as "batch_cancelling_at",
+                      b.errors::TEXT as "batch_errors",
+                      COALESCE(b.total_requests::TEXT, '1') as "batch_total_requests!",
+                      tc.leaked as "leaked!",
+                      tc.window_class as "window_class!",
+                      tc.window_secs as "window_secs!"
+            "#,
+            *daemon_id as Uuid,
+            limit as i64,
+            now,
+            &models_arr,
+            &capacities_arr,
+            batch_limit,
+            &user_ids_arr,
+            &user_counts_arr,
+            self.config.urgency_weight,
+            self.config.batch_claim_require_live,
+            self.config.claim_ramp_exponent,
+            &cooldown_users,
+            &cooldown_windows,
+            &cooldown_models,
+            leak_enabled,
+        )
+        .fetch_all(self.write_executor())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to claim batch requests: {}", e)))?;
+
+        let claimed_count = rows.len();
+        if claimed_count > 0 {
+            tracing::debug!(claimed = claimed_count, "Claimed batched requests");
+        }
+
+        Ok(self.claimed_rows_to_requests(rows, daemon_id, now))
+    }
+
     /// Internal helper to fetch a batch from a specific executor.
     ///
     /// This is used when we require read-after-write consistency and must query
@@ -7661,8 +7540,9 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
     /// Stream request templates from a regular file
     async fn stream_request_templates(
-        pool: sqlx::PgPool,
+        pools: P,
         retry_config: crate::DbRetryConfig,
+        query_schema: Option<Arc<str>>,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -7705,7 +7585,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 BATCH_SIZE,
                 search_pattern.as_deref(),
             )
-            .fetch_all(crate::db::RetryingPgPool::new(&pool, &retry_config))
+            .fetch_all(
+                crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                    .with_schema(query_schema.clone()),
+            )
             .await;
 
             match template_batch {
@@ -7757,8 +7640,9 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
     /// Stream batch output (completed requests) for a virtual output file
     async fn stream_batch_output(
-        pool: sqlx::PgPool,
+        pools: P,
         retry_config: crate::DbRetryConfig,
+        query_schema: Option<Arc<str>>,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -7786,7 +7670,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             "#,
             *file_id as Uuid,
         )
-        .fetch_one(crate::db::RetryingPgPool::new(&pool, &retry_config))
+        .fetch_one(
+            crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                .with_schema(query_schema.clone()),
+        )
         .await;
 
         let (batch_id, bucket) = match batch_result {
@@ -7853,7 +7740,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                 search_pattern.as_deref(),
                 bucket,
             )
-            .fetch_all(crate::db::RetryingPgPool::new(&pool, &retry_config))
+            .fetch_all(crate::db::RetryingPgPool::new(&pools.read(), &retry_config).with_schema(query_schema.clone()))
             .await;
 
             match request_batch {
@@ -7921,8 +7808,9 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
     /// Stream batch errors (failed requests) for a virtual error file
     async fn stream_batch_error(
-        pool: sqlx::PgPool,
+        pools: P,
         retry_config: crate::DbRetryConfig,
+        query_schema: Option<Arc<str>>,
         file_id: FileId,
         offset: i64,
         search: Option<String>,
@@ -7945,7 +7833,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             "#,
             *file_id as Uuid,
         )
-        .fetch_one(crate::db::RetryingPgPool::new(&pool, &retry_config))
+        .fetch_one(
+            crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                .with_schema(query_schema.clone()),
+        )
         .await;
 
         let (batch_id, bucket, _expires_at) = match batch_result {
@@ -8022,7 +7913,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
             let request_batch = query_builder
                 .build()
-                .fetch_all(crate::db::RetryingPgPool::new(&pool, &retry_config))
+                .fetch_all(
+                    crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                        .with_schema(query_schema.clone()),
+                )
                 .await;
 
             match request_batch {
@@ -8077,38 +7971,38 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// Stream batch results with merged input/output data for the Results view.
     /// This joins requests with their templates to provide input body alongside response/error.
     async fn stream_batch_results(
-        pool: sqlx::PgPool,
+        pools: P,
         retry_config: crate::DbRetryConfig,
+        query_schema: Option<Arc<str>>,
         batch_id: BatchId,
         offset: i64,
-        search: Option<String>,
-        status: Option<String>,
+        filters: (Option<String>, Option<String>),
         tx: mpsc::Sender<Result<crate::batch::BatchResultItem>>,
     ) {
         use crate::batch::{BatchResultItem, BatchResultStatus};
+        let (search, status) = filters;
 
-        // First, get the file_id and expires_at from the batch
-        // This allows us to query by file_id to avoid duplicates from SLA escalation
-        // and to check if we should filter retriable errors
-        let (file_id, _expires_at, archive_bucket) = match sqlx::query!(
-            r#"SELECT file_id, expires_at, archive_bucket FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
+        // First, get the file_id and archive bucket from the batch.
+        //
+        // file_id is None once the input file has been deleted: delete_file
+        // unlinks the batch and the orphan-purge daemon later removes the
+        // templates. The requests themselves are self-contained (custom_id,
+        // model, state, response_body, error all live on the request row), so
+        // results stay downloadable; only the input body and the file's line
+        // ordering are lost. With a file we walk templates in line order and
+        // join each to its request; without one we walk requests in creation
+        // order and left-join whatever template still exists.
+        let (file_id, archive_bucket) = match sqlx::query!(
+            r#"SELECT file_id, archive_bucket FROM batches WHERE id = $1 AND deleted_at IS NULL"#,
             *batch_id as Uuid,
         )
-        .fetch_optional(crate::db::RetryingPgPool::new(&pool, &retry_config))
+        .fetch_optional(
+            crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                .with_schema(query_schema.clone()),
+        )
         .await
         {
-            Ok(Some(row)) => {
-                if let Some(fid) = row.file_id {
-                    (fid, row.expires_at, row.archive_bucket)
-                } else {
-                    let _ = tx
-                        .send(Err(FusilladeError::Other(anyhow!(
-                            "Batch has no associated file_id"
-                        ))))
-                        .await;
-                    return;
-                }
-            }
+            Ok(Some(row)) => (row.file_id, row.archive_bucket),
             Ok(None) => {
                 let _ = tx
                     .send(Err(FusilladeError::Other(anyhow!("Batch not found"))))
@@ -8138,23 +8032,51 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             other => vec![other.to_string()],
         });
 
+        let mut last_created_at: Option<DateTime<Utc>> = None;
+        let mut last_id: Uuid = Uuid::nil();
+
         loop {
-            // Use OFFSET only on first batch, then use cursor pagination by line_number
-            let (line_filter, offset_val) = if is_first_batch {
-                (-1i32, offset)
+            // Use OFFSET only on the first page, then keyset pagination:
+            // by line_number when walking templates, by (created_at, id)
+            // when walking requests.
+            let (line_filter, cursor_time, cursor_id, offset_val) = if is_first_batch {
+                (-1i32, None, Uuid::nil(), offset)
             } else {
-                (last_line_number, 0i64)
+                (last_line_number, last_created_at, last_id, 0i64)
             };
             is_first_batch = false;
 
-            // Build dynamic query with error filter
-            // The error filter only applies to failed requests
             // The requests side is a union of the live table and the
             // batch archive: a frozen batch's rows may have been moved (or
             // be mid-move — the move txn is atomic, so under one snapshot
             // every row is in exactly one arm and the union is exact). The
             // archive arm is NULL-gated on the stamped bucket so unarchived
             // batches pay nothing and archived ones prune to one partition.
+            let push_requests_union = |qb: &mut QueryBuilder<'_, sqlx::Postgres>| {
+                qb.push(
+                    r#"
+                    SELECT id, custom_id, model, state, response_body, error, template_id, created_at
+                    FROM requests
+                    WHERE batch_id = "#,
+                );
+                qb.push_bind(*batch_id as Uuid);
+                qb.push(
+                    r#"
+                    UNION ALL
+                    SELECT id, custom_id, model, state, response_body, error, template_id, created_at
+                    FROM batch_requests_archive
+                    WHERE "#,
+                );
+                qb.push_bind(archive_bucket);
+                qb.push(
+                    r#"::date IS NOT NULL
+                      AND archive_bucket = "#,
+                );
+                qb.push_bind(archive_bucket);
+                qb.push(" AND batch_id = ");
+                qb.push_bind(*batch_id as Uuid);
+            };
+
             let mut query_builder = QueryBuilder::new(
                 r#"
                 SELECT
@@ -8165,40 +8087,46 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     t.body as input_body,
                     r.response_body,
                     r.error,
-                    t.line_number
-                FROM request_templates_all t
-                JOIN (
-                    SELECT id, custom_id, model, state, response_body, error, template_id
-                    FROM requests
-                    WHERE batch_id = "#,
+                    t.line_number,
+                    r.created_at
+                FROM "#,
             );
-            query_builder.push_bind(*batch_id as Uuid);
-            query_builder.push(
-                r#"
-                    UNION ALL
-                    SELECT id, custom_id, model, state, response_body, error, template_id
-                    FROM batch_requests_archive
-                    WHERE "#,
-            );
-            query_builder.push_bind(archive_bucket);
-            query_builder.push(
-                r#"::date IS NOT NULL
-                      AND archive_bucket = "#,
-            );
-            query_builder.push_bind(archive_bucket);
-            query_builder.push(" AND batch_id = ");
-            query_builder.push_bind(*batch_id as Uuid);
-            query_builder.push(
-                r#"
-                ) r ON r.template_id = t.id"#,
-            );
-            query_builder.push(" WHERE t.file_id = ");
-            query_builder.push_bind(file_id);
+            if let Some(file_id) = file_id {
+                // Input file present: walk templates in file line order and
+                // join each to its request for this batch.
+                query_builder.push("request_templates_all t JOIN (");
+                push_requests_union(&mut query_builder);
+                query_builder.push(") r ON r.template_id = t.id WHERE t.file_id = ");
+                query_builder.push_bind(file_id);
+                query_builder.push(" AND (");
+                query_builder.push_bind(line_filter);
+                query_builder.push(" = -1 OR t.line_number > ");
+                query_builder.push_bind(line_filter);
+                query_builder.push(")");
+            } else {
+                // Input file deleted: walk the batch's requests in creation
+                // order and attach whatever template still exists. The
+                // LATERAL ... LIMIT 1 probe mirrors get_request_detail so a
+                // template present in both generations cannot fan out.
+                query_builder.push("(");
+                push_requests_union(&mut query_builder);
+                query_builder.push(
+                    r#") r
+                LEFT JOIN LATERAL (
+                    SELECT body, line_number FROM request_templates_all t WHERE t.id = r.template_id LIMIT 1
+                ) t ON TRUE
+                WHERE ("#,
+                );
+                query_builder.push_bind(cursor_time);
+                query_builder.push("::timestamptz IS NULL OR r.created_at > ");
+                query_builder.push_bind(cursor_time);
+                query_builder.push(" OR (r.created_at = ");
+                query_builder.push_bind(cursor_time);
+                query_builder.push(" AND r.id > ");
+                query_builder.push_bind(cursor_id);
+                query_builder.push("))");
+            }
             query_builder.push(" AND (");
-            query_builder.push_bind(line_filter);
-            query_builder.push(" = -1 OR t.line_number > ");
-            query_builder.push_bind(line_filter);
-            query_builder.push(") AND (");
             query_builder.push_bind(search_pattern.as_deref());
             query_builder.push("::text IS NULL OR LOWER(r.custom_id) LIKE ");
             query_builder.push_bind(search_pattern.as_deref());
@@ -8207,7 +8135,11 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             query_builder.push("::text[] IS NULL OR r.state = ANY(");
             query_builder.push_bind(state_filter.as_deref());
             query_builder.push("))");
-            query_builder.push(" ORDER BY t.line_number ASC OFFSET ");
+            if file_id.is_some() {
+                query_builder.push(" ORDER BY t.line_number ASC OFFSET ");
+            } else {
+                query_builder.push(" ORDER BY r.created_at ASC, r.id ASC OFFSET ");
+            }
             query_builder.push_bind(offset_val);
             query_builder.push(" LIMIT ");
             query_builder.push_bind(BATCH_SIZE);
@@ -8216,7 +8148,10 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             // For each template, we find the matching request for this batch.
             let request_batch = query_builder
                 .build()
-                .fetch_all(crate::db::RetryingPgPool::new(&pool, &retry_config))
+                .fetch_all(
+                    crate::db::RetryingPgPool::new(&pools.read(), &retry_config)
+                        .with_schema(query_schema.clone()),
+                )
                 .await;
 
             match request_batch {
@@ -8228,20 +8163,28 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
                     tracing::debug!("Fetched batch of {} results", requests.len());
 
                     for row in requests {
-                        let line_number: i32 = row.get("line_number");
-                        last_line_number = line_number;
+                        let line_number: Option<i32> = row.get("line_number");
+                        let created_at: DateTime<Utc> = row.get("created_at");
+                        let id: Uuid = row.get("id");
+                        last_line_number = line_number.unwrap_or(last_line_number);
+                        last_created_at = Some(created_at);
+                        last_id = id;
 
-                        let input_body_str: String = row.get("input_body");
+                        let input_body_str: Option<String> = row.get("input_body");
                         let response_body_opt: Option<String> = row.get("response_body");
                         let state: String = row.get("state");
-                        let id: Uuid = row.get("id");
                         let custom_id: Option<String> = row.get("custom_id");
                         let model: String = row.get("model");
                         let error: Option<String> = row.get("error");
 
-                        // Parse input body as JSON
-                        let input_body: serde_json::Value = serde_json::from_str(&input_body_str)
-                            .unwrap_or_else(|_| serde_json::Value::String(input_body_str.clone()));
+                        // Parse input body as JSON. None when the input file (and so the
+                        // template) has been deleted; the request itself is still returned.
+                        let input_body: serde_json::Value = match input_body_str {
+                            Some(s) => {
+                                serde_json::from_str(&s).unwrap_or(serde_json::Value::String(s))
+                            }
+                            None => serde_json::Value::Null,
+                        };
 
                         // Parse response body as JSON if present
                         let response_body: Option<serde_json::Value> =
@@ -8987,6 +8930,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
     }
 
     async fn archive_batch(&self, batch_id: BatchId) -> Result<ArchiveOutcome> {
+        request_maintenance::before_archive(self).await?;
         let mut tx = self
             .begin_write()
             .await
@@ -11737,7 +11681,227 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_claim_batch_requests_only_uses_live_batches(pool: sqlx::PgPool) {
+    async fn test_claim_batch_requests_leaks_one_per_bucket(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        // Current schemas reject NULL foreground windows. Emulate an older
+        // backend schema to exercise the query's documented 24h normalization.
+        sqlx::query("ALTER TABLE batches DROP CONSTRAINT batches_background_deadline_check")
+            .execute(&pool)
+            .await
+            .unwrap();
+        // Two batches in one bucket must not double the allowance. Other users,
+        // models and windows retain their own allowance.
+        for (user, model, window) in [
+            ("alice", "large-a", "24h"),
+            ("alice", "large-a", ""),
+            ("bob", "large-a", "24h"),
+            ("alice", "large-b", "24h"),
+            ("alice", "large-a", "1h"),
+        ] {
+            let file = manager
+                .create_file(
+                    "tiny-batch".into(),
+                    Some(user.into()),
+                    (0..3)
+                        .map(|n| RequestTemplateInput {
+                            custom_id: Some(n.to_string()),
+                            endpoint: "https://api.example.com".into(),
+                            method: "POST".into(),
+                            path: "/test".into(),
+                            body: "{}".into(),
+                            model: model.into(),
+                            api_key: "key".into(),
+                        })
+                        .collect(),
+                )
+                .await
+                .unwrap();
+            manager
+                .create_batch(crate::batch::BatchInput {
+                    file_id: file,
+                    endpoint: "/v1/chat/completions".into(),
+                    completion_window: if window.is_empty() { "24h" } else { window }.into(),
+                    metadata: None,
+                    created_by: Some(user.into()),
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+            if window.is_empty() {
+                sqlx::query("UPDATE batches SET completion_window = NULL WHERE file_id = $1")
+                    .bind(*file)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+        }
+        for model in ["large-a", "large-b"] {
+            mark_not_live(&manager, model).await;
+        }
+        let capacity = HashMap::from([("large-a".into(), 100), ("large-b".into(), 100)]);
+        let daemon = DaemonId::from(Uuid::new_v4());
+        for _ in 0..2 {
+            let legacy = manager
+                .claim_batch_requests(100, 100, daemon, &capacity, &HashMap::new())
+                .await
+                .unwrap();
+            assert!(
+                legacy.is_empty(),
+                "the legacy method must not leak on any call"
+            );
+        }
+        let first = manager
+            .claim_batch_requests_with_cooldown(
+                100,
+                100,
+                daemon,
+                &capacity,
+                &HashMap::new(),
+                &std::collections::HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.len(),
+            4,
+            "one immediate request per bucket, not per batch"
+        );
+        let cooldown: std::collections::HashSet<_> = first
+            .iter()
+            .map(|r| {
+                let stamp = r
+                    .state
+                    .leak
+                    .as_ref()
+                    .expect("unavailable batches must stamp cooldown");
+                (
+                    r.data.created_by.clone(),
+                    stamp.window_class.clone(),
+                    r.data.model.clone(),
+                )
+            })
+            .collect();
+        assert_eq!(cooldown.len(), 4);
+        let blocked = manager
+            .claim_batch_requests_with_cooldown(
+                100,
+                100,
+                daemon,
+                &capacity,
+                &HashMap::new(),
+                &cooldown,
+            )
+            .await
+            .unwrap();
+        assert!(
+            blocked.is_empty(),
+            "no further claims before the interval elapses"
+        );
+        // The daemon removes refilled buckets; the next cycle then advances each
+        // tiny batch again. No wall-clock sleeps are necessary to test the gate.
+        let next = manager
+            .claim_batch_requests_with_cooldown(
+                100,
+                100,
+                daemon,
+                &capacity,
+                &HashMap::new(),
+                &std::collections::HashSet::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.len(), 4);
+        assert!(next.iter().all(|r| r.state.leak.is_some()));
+    }
+
+    #[sqlx::test]
+    async fn test_claim_batch_requests_ramp_precedes_leaks_at_every_limit(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_config(DaemonConfig {
+            urgency_weight: 0.5,
+            ..Default::default()
+        });
+        for user in ["busy", "idle-1", "idle-2", "idle-3", "idle-4"] {
+            let file_id = manager
+                .create_file(
+                    user.into(),
+                    Some(user.into()),
+                    (0..3)
+                        .map(|n| RequestTemplateInput {
+                            custom_id: Some(n.to_string()),
+                            endpoint: "https://api.example.com".into(),
+                            method: "POST".into(),
+                            path: "/test".into(),
+                            body: "{}".into(),
+                            model: "large".into(),
+                            api_key: "key".into(),
+                        })
+                        .collect(),
+                )
+                .await
+                .unwrap();
+            manager
+                .create_batch(crate::batch::BatchInput {
+                    file_id,
+                    endpoint: "/v1/chat/completions".into(),
+                    completion_window: "24h".into(),
+                    metadata: None,
+                    created_by: Some(user.into()),
+                    api_key_id: None,
+                    api_key: None,
+                    total_requests: None,
+                })
+                .await
+                .unwrap();
+        }
+        mark_not_live(&manager, "large").await;
+        // Idle users have lower pr (~0.417) than the busy user's ramp batch
+        // (~0.502). Full claims must still win at all three limiting stages.
+        sqlx::query("UPDATE batches SET created_at = NOW() - INTERVAL '4 hours', expires_at = NOW() + INTERVAL '20 hours'")
+            .execute(&pool).await.unwrap();
+        sqlx::query("UPDATE batches SET created_at = NOW() - INTERVAL '23 hours', expires_at = NOW() + INTERVAL '5 minutes' WHERE created_by = 'busy'")
+            .execute(&pool).await.unwrap();
+        for (batch_limit, capacity, limit) in [(4, 100, 100), (5, 1, 100), (5, 100, 1)] {
+            let claimed = manager
+                .claim_batch_requests_with_cooldown(
+                    limit,
+                    batch_limit,
+                    DaemonId::from(Uuid::new_v4()),
+                    &HashMap::from([("large".into(), capacity)]),
+                    &HashMap::from([("busy".into(), 100)]),
+                    &HashSet::new(),
+                )
+                .await
+                .unwrap();
+            let rescued: Vec<_> = claimed
+                .iter()
+                .filter(|r| r.data.created_by == "busy")
+                .collect();
+            assert_eq!(
+                rescued.len(),
+                3.min(capacity).min(limit),
+                "ramp claims must survive batch_limit={batch_limit}, capacity={capacity}, limit={limit}"
+            );
+            assert!(rescued.iter().all(|r| r.state.leak.is_none()));
+            sqlx::query(
+                "UPDATE requests SET state = 'pending', daemon_id = NULL, claimed_at = NULL",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_claim_batch_requests_live_and_unmanaged_bypass_cooldown(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -11798,6 +11962,11 @@ mod tests {
             ("unmanaged-model".to_string(), 10),
         ]);
 
+        let cooldown = ["live-model", "coming-model", "unmanaged-model"]
+            .into_iter()
+            .map(|model| (String::new(), "24h".to_string(), model.to_string()))
+            .collect();
+
         // Strict mode (`batch_claim_require_live = true`): only models whose
         // latest filter event is `live` are eligible — the unmanaged
         // (no-event) model is excluded alongside `coming`.
@@ -11810,7 +11979,14 @@ mod tests {
             ..Default::default()
         });
         let claimed = strict_manager
-            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests_with_cooldown(
+                10,
+                1,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &cooldown,
+            )
             .await
             .expect("Failed to claim batch requests");
         assert_eq!(claimed.len(), 1);
@@ -11823,7 +11999,14 @@ mod tests {
         // live-model's only row was claimed above, so this picks up exactly
         // the unmanaged model; `coming` stays excluded in either mode.
         let claimed = manager
-            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests_with_cooldown(
+                10,
+                1,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &cooldown,
+            )
             .await
             .expect("Failed to claim batch requests");
         assert_eq!(claimed.len(), 1);
@@ -11881,10 +12064,23 @@ mod tests {
         let daemon_id = DaemonId::from(Uuid::new_v4());
         let capacity = HashMap::from([("ramp-model".to_string(), 10)]);
 
+        let cooldown = std::collections::HashSet::from([(
+            String::new(),
+            "1h".to_string(),
+            "ramp-model".to_string(),
+        )]);
+
         // Far from the deadline (1h window → ramp opens ~10 minutes out):
-        // a not-live model's batch is NOT claimable.
+        // a not-live model's batch in cooldown is NOT claimable.
         let claimed = manager
-            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests_with_cooldown(
+                10,
+                1,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &cooldown,
+            )
             .await
             .expect("Failed to claim batch requests");
         assert!(
@@ -11907,7 +12103,14 @@ mod tests {
         .unwrap();
 
         let claimed = manager
-            .claim_batch_requests(10, 1, daemon_id, &capacity, &HashMap::new())
+            .claim_batch_requests_with_cooldown(
+                10,
+                1,
+                daemon_id,
+                &capacity,
+                &HashMap::new(),
+                &cooldown,
+            )
             .await
             .expect("Failed to claim batch requests");
         assert_eq!(
@@ -11916,6 +12119,7 @@ mod tests {
             "within-ramp batch must be claimable despite not-live model"
         );
         assert_eq!(claimed[0].data.model, "ramp-model");
+        assert!(claimed[0].state.leak.is_none());
     }
 
     #[sqlx::test]
@@ -23907,6 +24111,58 @@ mod tests {
         assert_eq!(detail.status, "processing");
         assert_eq!(detail.created_by, "test-user-id");
         assert!(detail.body.as_deref().unwrap().contains("gpt-4"));
+    }
+
+    #[sqlx::test]
+    async fn test_terminal_poll_does_not_read_pending_template(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::new(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            PostgresStorageConfig::default(),
+        );
+        let id = Uuid::new_v4();
+        manager
+            .create_realtime(crate::request::CreateRealtimeInput {
+                request_id: id,
+                body: "{}".into(),
+                model: "test".into(),
+                endpoint: "http://localhost".into(),
+                method: "POST".into(),
+                path: "/".into(),
+                api_key: String::new(),
+                created_by: "owner".into(),
+            })
+            .await
+            .unwrap();
+        let mut blocker = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE request_templates IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *blocker)
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            manager.get_terminal_request_detail(crate::request::RequestId(id)),
+        )
+        .await;
+        blocker.rollback().await.unwrap();
+        assert!(
+            result
+                .expect("pending polls must not wait for template access")
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query(
+            "UPDATE requests SET state = 'completed', response_body = 'done', response_status = 200, completed_at = now() WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let detail = manager
+            .get_terminal_request_detail(crate::request::RequestId(id))
+            .await
+            .unwrap()
+            .expect("completed request must return its payload");
+        assert_eq!(detail.response_body.as_deref(), Some("done"));
     }
 
     #[sqlx::test]

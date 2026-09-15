@@ -42,7 +42,6 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::Value;
-use sqlx::PgPool;
 use tracing::{debug, warn};
 
 use crate::config::ContinuationConfig;
@@ -89,16 +88,16 @@ impl ContinuationState {
     pub async fn build(
         cfg: &ContinuationConfig,
         cache_tokenizer_url: &str,
-        pool: PgPool,
+        pools: sqlx_pool_router::DynPools,
         resume_target: Router,
         body_limit: usize,
     ) -> anyhow::Result<Self> {
-        let key_secret = super::provision_global_key(&pool).await?;
+        let key_secret = super::provision_global_key(&pools.write()).await?;
         let tokenizer_url = cfg.tokenizer_url.clone().unwrap_or_else(|| cache_tokenizer_url.to_string());
         let routes = Arc::new(ContinuationRoutes::new());
         // Seed synchronously so the first request after boot sees the real set
         // rather than waiting up to one poll interval.
-        if let Err(e) = routes.refresh(&pool).await {
+        if let Err(e) = routes.refresh(&pools.write()).await {
             crate::background_error!(
                 crate::metrics::errors::component::CONTINUATION,
                 "route_seed",
@@ -107,7 +106,7 @@ impl ContinuationState {
                 "Initial continuation route load failed; the poller will retry"
             );
         }
-        Arc::clone(&routes).spawn_poller(pool.clone());
+        Arc::clone(&routes).spawn_poller(pools.clone());
 
         Ok(Self {
             cfg: Arc::new(cfg.clone()),
@@ -115,7 +114,7 @@ impl ContinuationState {
             tokenizer: RenderClient::new(tokenizer_url, Duration::from_secs(cfg.resume_deadline_secs)),
             resume_target,
             routes,
-            purposes: PurposeResolver::new(pool),
+            purposes: PurposeResolver::new(pools),
             inflight: Arc::new(InflightLimiter::new(cfg.max_inflight_per_model)),
             body_limit,
         })
