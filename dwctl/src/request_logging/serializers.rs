@@ -40,6 +40,7 @@
 //! [outlet]: https://github.com/doublewordai/outlet
 
 use crate::config::Config;
+use crate::prompt_cache::CacheBilling;
 use crate::request_logging::models::{AiRequest, AiResponse, ChatCompletionChunk, CompletionChunk, ParsedAIRequest, ResponsesRequest};
 use outlet::{RequestData, ResponseData};
 use outlet_postgres::SerializationError;
@@ -553,9 +554,8 @@ impl UsageMetrics {
             metrics.total_tokens = raw.total;
         }
 
-        // The cache split lives in extension fields the typed parse drops, so read it from
-        // the raw `usage` object. It only exists on a successful response that carried a
-        // usage frame, so an errored/partial stream naturally extracts zero (no cache bill).
+        // Prefer the cache layer's internal accounting, which survives protocol
+        // translation. Legacy/direct responses fall back to raw usage extensions.
         let cache_tokens = extract_cache_tokens(response_data);
         // The cache layer (inside outlet) rewrites `prompt_tokens_details.cached_tokens`
         // before this body is read, so prefer the value it stashed on the way through.
@@ -680,12 +680,23 @@ fn cache_tokens_from_usage(usage: &Value) -> CacheTokens {
     }
 }
 
-/// Extract the cache split from a response body, handling both shapes: a non-streaming
+/// Prefer internal cache accounting; an unfilled cell means no cache usage was emitted.
+/// Without a cell (historical/direct responses), extract from the body: a non-streaming
 /// JSON body carries `usage` at the top level; a streaming SSE body carries it in the
 /// terminal `data:` frame (take the last one seen). Returns all-zero when there is no
 /// usage object (non-cache request, error body, or a stream that died before its usage
 /// frame) — which is exactly the no-cache-billing case.
 pub(crate) fn extract_cache_tokens(response_data: &ResponseData) -> CacheTokens {
+    if let Some(capture) = response_data.extensions.get::<CacheBilling>() {
+        let stats = capture.get().unwrap_or_default();
+        let count = |value| i64::try_from(value).unwrap_or(i64::MAX);
+        return CacheTokens {
+            read: count(stats.read),
+            creation_5m: count(stats.creation_5m),
+            creation_1h: count(stats.creation_1h),
+            creation_24h: count(stats.creation_24h),
+        };
+    }
     extract_from_last_usage(response_data, cache_tokens_from_usage)
 }
 
@@ -709,8 +720,8 @@ pub(crate) fn extract_engine_cached_tokens(response_data: &ResponseData) -> Opti
 
 /// Token counts read straight from a raw `usage` JSON object, for bodies the typed parse
 /// cannot represent. Field semantics mirror [`TokenMetrics`]'s arms exactly: an OpenAI
-/// `prompt_tokens` is already the total input; an Anthropic `input_tokens` excludes the
-/// cache buckets, which are added back — reading it verbatim is the August incident.
+/// `prompt_tokens` and Responses `input_tokens` already include cached input; an Anthropic
+/// `input_tokens` excludes the cache buckets, which are added back.
 ///
 /// Shared by the live path's raw-usage fallback and [`crate::recompute`]'s replay of stored
 /// fusillade bodies, so the two can never read the same unrepresentable body differently.
@@ -727,6 +738,9 @@ pub(crate) fn raw_usage_tokens(usage: &Value) -> Option<RawUsageTokens> {
     let get = |k: &str| usage.get(k).and_then(Value::as_i64);
     let prompt = match get("prompt_tokens") {
         Some(p) => p,
+        // Responses always emits this detail object, including when its cache
+        // billing extensions are present. Its input count already includes them.
+        None if usage.get("input_tokens_details").is_some() => get("input_tokens")?,
         None => {
             get("input_tokens")?
                 + get("cache_read_input_tokens").unwrap_or(0).max(0)
@@ -736,6 +750,7 @@ pub(crate) fn raw_usage_tokens(usage: &Value) -> Option<RawUsageTokens> {
     let completion = get("completion_tokens").or_else(|| get("output_tokens")).unwrap_or(0);
     let reasoning = usage
         .pointer("/completion_tokens_details/reasoning_tokens")
+        .or_else(|| usage.pointer("/output_tokens_details/reasoning_tokens"))
         .and_then(Value::as_i64)
         .unwrap_or(0);
     // Floor everything at 0 (malformed bodies must not reach the cost maths), and derive the
@@ -752,6 +767,7 @@ pub(crate) fn raw_usage_tokens(usage: &Value) -> Option<RawUsageTokens> {
 }
 
 /// Locate the response's final `usage` object and map it with `from_usage`.
+/// Responses SSE terminal events nest this object under `response.usage`.
 ///
 /// Factored out of [`extract_cache_tokens`] so that a caller reading a *raw upstream* body
 /// can apply different field semantics without duplicating the body handling — the
@@ -792,7 +808,13 @@ pub(crate) fn extract_from_last_usage<T: Default>(response_data: &ResponseData, 
             let trimmed = data.trim();
             if trimmed != "[DONE]"
                 && let Ok(value) = serde_json::from_str::<Value>(trimmed)
-                && let Some(usage) = value.get("usage").filter(|u| u.is_object())
+                && let Some(usage) = value
+                    .get("usage")
+                    .or_else(|| match value.get("type").and_then(Value::as_str) {
+                        Some("response.completed" | "response.incomplete" | "response.failed") => value.pointer("/response/usage"),
+                        _ => None,
+                    })
+                    .filter(|u| u.is_object())
             {
                 last = from_usage(usage);
             }
@@ -1197,6 +1219,7 @@ mod tests {
         RequestParams, UsageMetrics, extract_cache_tokens, extract_engine_cached_tokens, extract_finish_reason, parse_ai_request,
         parse_ai_response,
     };
+    use crate::prompt_cache::{CacheBilling, CacheStats};
     use crate::request_logging::models::{AiRequest, AiResponse};
     use axum::http::{Method, StatusCode, Uri};
     use bytes::Bytes;
@@ -1204,6 +1227,7 @@ mod tests {
     use onwards::strict::schemas::completions::CompletionResponse;
     use onwards::strict::schemas::embeddings::{Embedding, EmbeddingData, EmbeddingsResponse, EmbeddingsUsage};
     use outlet::{RequestData, ResponseData};
+    use serde_json::Value;
     use std::{
         collections::HashMap,
         time::{Duration, SystemTime},
@@ -2887,6 +2911,100 @@ mod tests {
         assert_eq!(c.read, 1500);
         assert_eq!(c.creation_24h, 1500);
         assert_eq!(c.creation_1h, 0);
+    }
+
+    #[test]
+    fn responses_terminal_usage_preserves_cache_split_and_total_input() {
+        let usage = serde_json::json!({
+            "input_tokens": 2000, "output_tokens": 5, "total_tokens": 2005,
+            "input_tokens_details": {"cached_tokens": 1000},
+            "output_tokens_details": {"reasoning_tokens": 2},
+            "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 600,
+            "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200, "ephemeral_24h_input_tokens": 300}
+        });
+        for event_type in ["response.completed", "response.incomplete", "response.failed"] {
+            let event = serde_json::json!({"type": event_type, "response": {"usage": usage}});
+            let body = format!("event: {event_type}\ndata: {event}\n\ndata: [DONE]\n\n");
+            let response = response_with_body(body);
+            let cache = extract_cache_tokens(&response);
+            assert_eq!(
+                (cache.read, cache.creation_5m, cache.creation_1h, cache.creation_24h),
+                (1000, 100, 200, 300)
+            );
+            let tokens = super::extract_from_last_usage(&response, super::raw_usage_tokens).unwrap();
+            assert_eq!(tokens.prompt, 2000, "Responses input already includes cached tokens");
+            assert_eq!(tokens.completion, 5);
+            assert_eq!(tokens.reasoning, 2);
+        }
+    }
+
+    #[test]
+    fn responses_standard_usage_bills_from_internal_metadata() {
+        for streaming in [false, true] {
+            let mut body: Value = serde_json::from_str(&responses_api_body(true)).unwrap();
+            body["usage"] = serde_json::json!({
+                "input_tokens": 2000, "output_tokens": 5, "total_tokens": 2005,
+                "input_tokens_details": {"cached_tokens": 1000, "cache_write_tokens": 600},
+                "output_tokens_details": {"reasoning_tokens": 2}
+            });
+            let body = if streaming {
+                format!("data: {{\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{body}}}\n\n")
+            } else {
+                body.to_string()
+            };
+            let request = responses_request_data(Some(streaming));
+            let mut response = responses_response_data(body);
+            let capture = CacheBilling::default();
+            response.extensions.insert(capture.clone());
+            // Outlet clones extensions before a stream's usage frame is read.
+            capture.set(CacheStats {
+                read: 1000,
+                creation_5m: 100,
+                creation_1h: 200,
+                creation_24h: 300,
+                ..Default::default()
+            });
+            let parsed = parse_ai_response(&request, &response).unwrap();
+            let metrics = UsageMetrics::extract(
+                Uuid::new_v4(),
+                &request,
+                &response,
+                &parsed,
+                &crate::test::utils::create_test_config(),
+            );
+            assert_eq!(metrics.prompt_tokens, 2000);
+            assert_eq!(metrics.completion_tokens, 5);
+            assert_eq!(metrics.reasoning_tokens, 2);
+            assert_eq!(metrics.cache_read_input_tokens, 1000);
+            assert_eq!(metrics.cache_creation_5m_input_tokens, 100);
+            assert_eq!(metrics.cache_creation_1h_input_tokens, 200);
+            assert_eq!(metrics.cache_creation_24h_input_tokens, 300);
+        }
+    }
+
+    #[test]
+    fn internal_cache_accounting_takes_precedence_over_public_usage() {
+        let mut response = response_with_body(
+            serde_json::json!({
+                "usage": {"cache_read_input_tokens": 999, "cache_creation": {"ephemeral_1h_input_tokens": 999}}
+            })
+            .to_string(),
+        );
+        let capture = CacheBilling::default();
+        response.extensions.insert(capture.clone());
+        let absent = extract_cache_tokens(&response);
+        assert_eq!(
+            (absent.read, absent.creation_1h),
+            (0, 0),
+            "an unfilled cell must not trust provider counts"
+        );
+        capture.set(CacheStats {
+            read: 10,
+            creation_1h: 20,
+            ..Default::default()
+        });
+        let captured = extract_cache_tokens(&response);
+        assert_eq!((captured.read, captured.creation_1h), (10, 20));
     }
 
     /// `prompt_tokens_details.cached_tokens` is the ENGINE's prefix-cache hit (SGLang/vLLM

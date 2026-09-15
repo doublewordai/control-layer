@@ -1,6 +1,6 @@
 [package]
 name = "dwctl"
-version = "11.10.0" # x-release-please-version
+version = "11.10.1" # x-release-please-version
 edition = "2024"
 publish = false
 description = "The Doubleword Control Layer - A self-hostable observability and analytics platform for LLM applications"
@@ -66,7 +66,7 @@ tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "trace"]
 async-trait = "0.1"
 async-stream = "0.3"
 eventsource-stream = "0.2"
-openai-reassembler = "0.4.0"
+openai-reassembler = { path = "../openai-reassembler" }
 url = { version = "2.4", features = ["serde"] }
 clap = { version = "4.4", features = ["derive", "env"] }
 reqwest = { version = "0.13", default-features = false, features = [

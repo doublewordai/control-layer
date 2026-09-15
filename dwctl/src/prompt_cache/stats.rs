@@ -6,9 +6,28 @@
 //! mutation the cache layer commits **locally** on a 2xx response — no
 //! correlation id, because classify and commit share one dwctl scope.
 
+use std::sync::{Arc, OnceLock};
+
 use chrono::{DateTime, Utc};
 
 use super::index::{CacheEntry, IndexScope, PrefixHash, TtlTier};
+
+/// Internal cache accounting shared with outlet through response extensions.
+/// Inserted at response-head time and filled only when usage is emitted, so
+/// streaming billing sees the same capped counts as the customer without
+/// depending on protocol-specific fields in the public response body.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct CacheBilling(Arc<OnceLock<CacheStats>>);
+
+impl CacheBilling {
+    pub(crate) fn get(&self) -> Option<CacheStats> {
+        self.0.get().copied()
+    }
+
+    pub(crate) fn set(&self, stats: CacheStats) {
+        let _ = self.0.set(stats);
+    }
+}
 
 /// The neutral read/write token split for one request. All-zero means "no caching"
 /// (the dormant/below-floor/disabled cases all return this).

@@ -1,5 +1,24 @@
 # Changelog
 
+## [11.10.1](https://github.com/doublewordai/control-layer/compare/v11.10.0...v11.10.1) (2026-09-14)
+
+
+### Bug Fixes
+
+* preserve database result shapes and detect cached plan regressions ([#1759](https://github.com/doublewordai/control-layer/issues/1759)) ([92a4ee4](https://github.com/doublewordai/control-layer/commit/92a4ee45808f793c4018257226ba5d52d959c791))
+* preserve internal cache usage for Responses billing ([#1777](https://github.com/doublewordai/control-layer/issues/1777)) ([b62f94c](https://github.com/doublewordai/control-layer/commit/b62f94c1599d9dbf385ef05e83f439c38555d8fe))
+* preserve model query results across additive schema migrations ([#1758](https://github.com/doublewordai/control-layer/issues/1758)) ([90ae91d](https://github.com/doublewordai/control-layer/commit/90ae91d0364e89040429e9c59a50f14478658122))
+
+
+### Code Refactoring
+
+* bring response reassembly into the Rust workspace ([#1775](https://github.com/doublewordai/control-layer/issues/1775)) ([d75c262](https://github.com/doublewordai/control-layer/commit/d75c26220fbd2660bf19c3e7df11fec4eceed14a))
+
+
+### Documentation
+
+* Add repo-skill for DB migrations ([#1755](https://github.com/doublewordai/control-layer/issues/1755)) ([c28c352](https://github.com/doublewordai/control-layer/commit/c28c3529b5a575d5509f730e7be0d7910d15754c))
+
 ## [11.10.0](https://github.com/doublewordai/control-layer/compare/v11.9.1...v11.10.0) (2026-09-11)
 
 

@@ -78,7 +78,20 @@ pub(crate) fn chat_usage_to_response_usage(u: &Usage) -> ResponseUsage {
         input_tokens: u.prompt_tokens,
         output_tokens: u.completion_tokens,
         total_tokens: u.total_tokens,
-        input_tokens_details: InputTokensDetails { cached_tokens },
+        input_tokens_details: InputTokensDetails {
+            cached_tokens,
+            cache_write_tokens: 0,
+        },
         output_tokens_details: OutputTokensDetails { reasoning_tokens },
     }
+}
+
+/// Map the cache layer's write total to the standard Responses usage field.
+/// The per-TTL billing split travels separately in internal response metadata.
+pub(super) fn cache_write_tokens(usage: Option<&Value>) -> u32 {
+    usage
+        .and_then(|u| u.get("cache_creation_input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(u32::MAX as u64) as u32
 }
