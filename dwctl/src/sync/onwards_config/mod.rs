@@ -342,12 +342,7 @@ impl OnwardsConfigSync {
                                 if let Some(tx) = &config.status_tx {
                                     tx.send(SyncStatus::Reconnecting).await?;
                                 }
-
-                                // Check if this is a fatal error that should propagate
-                                if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
-                                    error!("Database connection closed, exiting sync task");
-                                    return Err(e.into());
-                                }
+                                // Recoverable, including `PoolClosed` from a runtime pool swap + old.close(): break to reconnect via `listener_db.write()` (the live pool), mirroring `notifications.rs`.
                                 break;
                             }
                         }
