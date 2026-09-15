@@ -1,5 +1,12 @@
 # Changelog
 
+## [11.10.2](https://github.com/doublewordai/control-layer/compare/v11.10.1...v11.10.2) (2026-09-15)
+
+
+### Bug Fixes
+
+* bound retained history reads for single-model response lists ([#1778](https://github.com/doublewordai/control-layer/issues/1778)) ([28a4746](https://github.com/doublewordai/control-layer/commit/28a474683c3c459907531d24e753f7c277d5ceb4))
+
 ## [11.10.1](https://github.com/doublewordai/control-layer/compare/v11.10.0...v11.10.1) (2026-09-14)
 
 

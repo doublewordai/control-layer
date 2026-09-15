@@ -4326,10 +4326,21 @@ impl Application {
         // No classifier is injected here.
         // Request-body edits (id-scrub, streaming usage flags) now live in dwctl's own
         // `outbound_request` middleware, so onwards needs no BodyTransformFn.
-        let onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
+        let mut onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_response_id_header("x-fusillade-request-id")
-            .with_body_limit(onwards_body_limit);
+            .with_body_limit(onwards_body_limit)
+            // The fusillade daemon stamps every request it dispatches (file
+            // batches, flex, background) with its batch metadata headers, and
+            // `created_at` is always among them, even for batchless rows.
+            // Realtime traffic never carries it (the realtime path only adds
+            // `x-fusillade-request-id`), so it exempts exactly the daemon
+            // traffic, which tolerates latency and runs its own retries.
+            .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at");
+        if config.onwards.first_token_timeout_ms > 0 {
+            onwards_app_state =
+                onwards_app_state.with_first_token_timeout(std::time::Duration::from_millis(config.onwards.first_token_timeout_ms));
+        }
 
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");
