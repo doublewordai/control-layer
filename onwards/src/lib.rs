@@ -1842,6 +1842,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_done_sentinel_is_not_a_first_token_but_is_not_empty() {
+        // `[DONE]` is a data frame carrying no token. It must not count as a
+        // first token — and it must not be mistaken for an empty body either,
+        // since `saw_data` is what suppresses the retryable `EmptyBody` verdict.
+        // So: one attempt, forwarded to the client, no failover.
+        let mock =
+            MockHttpClient::new_streaming(StatusCode::OK, vec!["data: [DONE]\n\n".to_string()]);
+        let server = TestServer::new(build_router(first_token_app(mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "a [DONE]-only stream is not empty, so it must not be retried"
+        );
+    }
+
+    #[tokio::test]
     async fn test_first_token_timeout_needs_a_different_provider() {
         // A single-provider pool with a retry budget has attempts left but no
         // other provider: re-running a slow prefill on the same backend would
