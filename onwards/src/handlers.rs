@@ -810,7 +810,7 @@ pub async fn target_message_handler<T: HttpClient>(
         });
 
     // Unsupported traffic keeps ordinary routing and contributes no observations.
-    let aimd_eligible = pool.fallback().is_some_and(|f| f.aimd.is_some())
+    let aimd_eligible = pool.aimd_enabled()
         && state.targets.strict_mode && requests_stream(&body_bytes)
         && !state.first_token_timeout_exempt_header.as_deref()
             .is_some_and(|header| original_headers.contains_key(header));

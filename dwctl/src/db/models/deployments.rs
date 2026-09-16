@@ -338,10 +338,11 @@ fn default_fallback_status_codes() -> Vec<i32> {
     vec![429, 499, 500, 502, 503, 504]
 }
 
-/// Per-model opt-in to priority-only load-aware routing. Missing/null disables it.
+/// Priority-only load-aware routing overrides. Missing/null inherits defaults.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct AimdConfig {
+    pub enabled: bool,
     pub latency_budget_ms: u64,
     pub breach_rate_target: f64,
     pub window_samples: usize,
@@ -354,6 +355,24 @@ pub struct AimdConfig {
 impl From<AimdConfig> for OnwardsAimdConfig {
     fn from(c: AimdConfig) -> Self {
         Self {
+            enabled: c.enabled,
+            latency_budget_ms: c.latency_budget_ms,
+            breach_rate_target: c.breach_rate_target,
+            window_samples: c.window_samples,
+            min_samples: c.min_samples,
+            share_step: c.share_step,
+            share_decay: c.share_decay,
+            share_floor: c.share_floor,
+            dwell_ms: c.dwell_ms,
+        }
+    }
+}
+
+impl Default for AimdConfig {
+    fn default() -> Self {
+        let c = OnwardsAimdConfig::default();
+        Self {
+            enabled: c.enabled,
             latency_budget_ms: c.latency_budget_ms,
             breach_rate_target: c.breach_rate_target,
             window_samples: c.window_samples,

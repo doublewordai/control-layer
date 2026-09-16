@@ -6,10 +6,11 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use tokio::time::Instant;
 
-/// Explicit opt-in: absent configuration preserves ordinary provider selection.
+/// Priority-pool defaults; set enabled=false to retain ordinary selection.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(default, deny_unknown_fields)]
 pub struct AimdConfig {
+    pub enabled: bool,
     pub latency_budget_ms: u64,
     pub breach_rate_target: f64,
     pub window_samples: usize,
@@ -18,6 +19,22 @@ pub struct AimdConfig {
     pub share_decay: f64,
     pub share_floor: f64,
     pub dwell_ms: u64,
+}
+
+impl Default for AimdConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            latency_budget_ms: 10_000,
+            breach_rate_target: 0.05,
+            window_samples: 200,
+            min_samples: 50,
+            share_step: 0.02,
+            share_decay: 0.8,
+            share_floor: 0.05,
+            dwell_ms: 30_000,
+        }
+    }
 }
 
 impl AimdConfig {
@@ -228,7 +245,16 @@ impl Observation {
         attempt.finish(outcome);
     }
     pub(crate) fn deadline(&self) {
-        self.0.lock().unwrap().finish(Outcome::Breach);
+        let mut attempt = self.0.lock().unwrap();
+        let budget = attempt.controller.lock().unwrap().config.latency_budget_ms;
+        // A shorter inherited failover deadline is censored below the budget,
+        // so it cannot establish a budget breach.
+        let outcome = if attempt.start.elapsed() >= Duration::from_millis(budget) {
+            Outcome::Breach
+        } else {
+            Outcome::Unknown
+        };
+        attempt.finish(outcome);
     }
     pub(crate) fn unknown(&self) {
         self.0.lock().unwrap().finish(Outcome::Unknown);
@@ -260,6 +286,7 @@ mod tests {
     use super::*;
     pub(super) fn config() -> AimdConfig {
         AimdConfig {
+            enabled: true,
             latency_budget_ms: 100,
             breach_rate_target: 0.2,
             window_samples: 10,
@@ -274,6 +301,91 @@ mod tests {
         let (generation, id) = c.begin().unwrap();
         c.finish(generation, id, outcome, now)
     }
+    // Synthetic per-replica scenarios exercise low/high breach rates, sparse
+    // traffic, and bounded healthy windows. Successful frames are within budget.
+    #[test]
+    fn synthetic_count_scenarios_are_evaluated_per_replica() {
+        for (healthy, breaches, expected) in [
+            (800, 12, 1.0),
+            (850, 17, 1.0), // below 5% in each window
+            (90, 22, 0.64),
+            (90, 19, 0.64), // two fresh 50-sample windows
+            (8, 3, 1.0),
+            (11, 4, 1.0), // insufficient local samples
+            (14000, 0, 1.0),
+            (15000, 0, 1.0),
+            (0, 0, 1.0),
+        ] {
+            let start = Instant::now();
+            let mut controller = Controller::new(AimdConfig::default(), start);
+            let total = healthy + breaches;
+            for index in 0..total {
+                let breach = (index + 1) * breaches / total > index * breaches / total;
+                sample(
+                    &mut controller,
+                    if breach {
+                        Outcome::Breach
+                    } else {
+                        Outcome::Healthy
+                    },
+                    start + Duration::from_secs(index as u64 + 1),
+                );
+                assert!(controller.window.len() <= 200);
+            }
+            assert!(
+                (controller.share() - expected).abs() < 1e-10,
+                "{healthy} healthy, {breaches} breaches: {}",
+                controller.share()
+            );
+        }
+    }
+
+    #[test]
+    fn deployment_counts_do_not_hide_unknown_coverage() {
+        let start = Instant::now();
+        let mut controller = Controller::new(AimdConfig::default(), start);
+        sample(&mut controller, Outcome::Unknown, start);
+        for index in 0..114 {
+            let outcome = if (index + 1) * 22 / 114 > index * 22 / 114 {
+                Outcome::Breach
+            } else {
+                Outcome::Healthy
+            };
+            sample(
+                &mut controller,
+                outcome,
+                start + Duration::from_secs(index + 1),
+            );
+        }
+        assert_eq!(controller.share(), 1.0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn inherited_short_deadline_is_unknown_and_completion_is_idempotent() {
+        let controller = Arc::new(Mutex::new(Controller::new(
+            AimdConfig::default(),
+            Instant::now(),
+        )));
+        let early =
+            Observation::new(controller.clone(), "model", "default", Instant::now()).unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        early.deadline();
+        assert_eq!(controller.lock().unwrap().unknown, 1);
+        assert_eq!(controller.lock().unwrap().breaches, 0);
+        let late =
+            Observation::new(controller.clone(), "model", "default", Instant::now()).unwrap();
+        tokio::time::advance(Duration::from_secs(10)).await;
+        late.deadline();
+        late.frame();
+        late.unknown();
+        drop(late);
+        drop(early);
+        let c = controller.lock().unwrap();
+        assert_eq!(c.unknown, 1);
+        assert_eq!(c.breaches, 1);
+        assert_eq!(c.pending, 0);
+    }
+
     #[test]
     fn concurrent_cohorts_can_recover_without_ignoring_pending_samples() {
         let start = Instant::now();

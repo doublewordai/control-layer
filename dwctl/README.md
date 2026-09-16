@@ -278,11 +278,11 @@ providers. Provider selection is unchanged; load-aware control is not enabled.
 
 ### Load-aware priority routing (AIMD)
 
-Priority composite models can opt into a preferred-first traffic share controller
-through the model API's `aimd` object and explicit `first_token_timeout_ms`.
-Existing models remain unchanged. The controller applies only to strict-mode
+Priority composite models with fallback enabled use an AIMD preferred-first
+traffic share controller by default, including existing models. Override its
+settings through the model API's `aimd` object and explicit `first_token_timeout_ms`. The controller applies only to strict-mode
 streaming traffic and preserves ordinary retries; it is not a binary outage breaker.
-`PATCH {"aimd": null}` disables it. Model responses expose settings under `fallback`.
+`PATCH {"aimd": {"enabled": false}}` disables it; null restores defaults. Model responses expose settings under `fallback`.
 
 `onwards_provider_share{model,pool}` reports the configured preferred-first share;
 `onwards_share_adjustments_total{model,pool,direction}` counts increases/decreases.

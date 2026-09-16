@@ -113,7 +113,7 @@ def verify_models_schema_change(app, direct):
 
     def aimd_settings():
         alias = "schema-aimd-" + uuid.uuid4().hex
-        settings = {"latency_budget_ms": 100, "breach_rate_target": 0.1,
+        settings = {"enabled": True, "latency_budget_ms": 100, "breach_rate_target": 0.1,
                     "window_samples": 20, "min_samples": 5, "share_step": 0.05,
                     "share_decay": 0.5, "share_floor": 0.1, "dwell_ms": 1000}
         response = session.post(base + "/admin/api/v1/models", json={

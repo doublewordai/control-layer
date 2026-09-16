@@ -54,6 +54,9 @@ fn validate_aimd(timeout: Option<i64>, config: Option<&AimdConfig>, composite: b
     if let Some(config) = config {
         let config: OnwardsAimdConfig = config.clone().into();
         config.validate().map_err(|message| Error::BadRequest { message: message.into() })?;
+        if !config.enabled {
+            return Ok(());
+        }
         if !composite || !priority || !fallback {
             return Err(Error::BadRequest {
                 message: "AIMD requires a priority composite model with fallback enabled".into(),
@@ -1518,6 +1521,22 @@ mod tests {
         let fallback = model.fallback.unwrap();
         assert!(fallback.aimd.is_none());
         assert!(fallback.first_token_timeout_ms.is_none());
+        // Explicit opt-out survives persistence; null restores inheritance.
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"aimd":{"enabled":false}}))
+            .await;
+        response.assert_status_ok();
+        let disabled: DeployedModelResponse = response.json();
+        assert!(!disabled.fallback.unwrap().aimd.unwrap().enabled);
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"aimd":null}))
+            .await
+            .assert_status_ok();
         let mut conn = pool.acquire().await.unwrap();
         let stored = Deployments::new(&mut conn).get_by_id(model.id).await.unwrap().unwrap();
         assert!(stored.aimd.is_none());

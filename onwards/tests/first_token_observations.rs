@@ -620,3 +620,25 @@ fn aimd_rejects_unsupported_strategy_and_ambiguous_deadline() {
         assert!(Targets::from_config(serde_json::from_value(cfg).unwrap()).is_err());
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn default_controller_handles_slow_frames_without_explicit_enablement() {
+    LazyLock::force(&METRICS);
+    let alias = "aimd-default-on";
+    let mut cfg = config(alias, true);
+    cfg["targets"][alias]["fallback"]["first_token_timeout_ms"] = json!(0);
+    let targets = Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap();
+    let mock = MockHttpClient::new_delayed_streaming_sequence(
+        StatusCode::OK,
+        vec![(Duration::from_secs(11), vec![CONTENT.to_string()]); 50],
+    );
+    let server = TestServer::new(build_router(AppState::with_client(targets, mock))).unwrap();
+    for _ in 0..50 {
+        server
+            .post("/v1/chat/completions")
+            .json(&json!({"model":alias,"stream":true}))
+            .await
+            .assert_status_ok();
+    }
+    assert_eq!(share(alias), Some(0.8));
+}

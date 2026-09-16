@@ -231,7 +231,7 @@ pub struct FallbackConfig {
     /// provider starts cleanly.
     #[serde(default)]
     pub first_token_timeout_ms: Option<u64>,
-    /// Optional priority-only preferred-first share controller.
+    /// Priority-only share controller overrides. None uses defaults; enabled=false opts out.
     #[serde(default)]
     pub aimd: Option<AimdConfig>,
 }
@@ -1284,6 +1284,7 @@ fn build_pool(
 ) -> Result<ProviderPool, anyhow::Error> {
     if let Some(fallback) = &pool_config.fallback
         && let Some(config) = &fallback.aimd
+        && config.enabled
     {
         config.validate().map_err(|e| anyhow!(e))?;
         if !fallback.enabled || pool_config.strategy != LoadBalanceStrategy::Priority {

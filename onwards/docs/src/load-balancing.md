@@ -212,9 +212,10 @@ Single-provider configs still work unchanged:
 
 ## Load-aware priority share
 
-Priority pools may opt into `fallback.aimd` to decrease their preferred-first
+Priority pools with enabled fallback and multiple providers automatically decrease their preferred-first
 share when first-frame budget breaches exceed a configured rate, and increase
-it gradually after healthy observations. It is disabled by default and applies
+it gradually after healthy observations. Set `fallback.aimd.enabled: false` to
+opt out, or override the default parameters. The controller applies
 only to eligible strict-mode streams. It preserves the preferred provider in
 subsequent failover attempts. See [load-aware failover](load-aware-failover.md)
 for configuration, eligibility, sampling limits, reload behavior and rollout.

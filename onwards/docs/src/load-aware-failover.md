@@ -1,18 +1,17 @@
 # Load-Aware Failover
 
-> Status: priority-only AIMD and per-model configuration are implemented, disabled
-> by default. Enable explicitly per pool/model after selecting budgets from real
-> traffic. Nonstrict and nonstreaming traffic retain ordinary routing.
+> Status: AIMD is enabled by default for priority pools with fallback enabled
+> and at least two providers. Nonstrict, nonstreaming and exempt requests retain
+> ordinary routing. Set `aimd.enabled: false` to opt a pool/model out.
 
 ## Operating the controller
 
-Set `fallback.aimd` on a native onwards priority pool, or the top-level `aimd`
-field when creating/updating a dwctl priority composite model. The example below
-illustrates the shape; these are not recommended production tuning values:
+Existing eligible pools immediately use these defaults without a database backfill:
 
 ```json
 {
-  "latency_budget_ms": 1000,
+  "enabled": true,
+  "latency_budget_ms": 10000,
   "breach_rate_target": 0.05,
   "window_samples": 200,
   "min_samples": 50,
@@ -23,22 +22,29 @@ illustrates the shape; these are not recommended production tuning values:
 }
 ```
 
-Fallback must be enabled. Set an explicit `first_token_timeout_ms` alongside
-AIMD: either `0` to disable that deadline, or a value at least as large as the
-latency budget. Inheriting the proxy default is rejected for AIMD, because a
-shorter default could otherwise produce false budget breaches. The per-model
-deadline overrides the global default for standard and composite models.
+The default 10-second budget matches the application's default first-token
+failover deadline. Controllers and sample minima are per process, not aggregated
+across replicas. A 5% rate allows ordinary tail events; overload decreases share
+by 20%, and healthy recovery adds two percentage points per fresh healthy dwell.
 
-Dwctl PATCH semantics: omitted fields are unchanged, `aimd: null` disables the
-controller, and `first_token_timeout_ms: null` restores deadline inheritance.
-Settings appear under `fallback` in model responses. Clear AIMD before, or in
-the same update as, disabling fallback or changing to weighted selection.
-There is deliberately no proxy-wide AIMD enable switch: budgets are model-specific.
-The dashboard has no AIMD editor; configure it through the model API.
+Override `fallback.aimd` on a native onwards priority pool, or the top-level
+`aimd` field when creating/updating a dwctl priority composite. An override object
+replaces the prior object; omitted object members use the defaults above. For an
+enabled override, set an explicit `first_token_timeout_ms`: either `0` to disable
+that deadline, or at least the latency budget. An absent AIMD override inherits
+the controller defaults and permits an inherited deadline. If that inherited
+deadline is shorter than the budget, its censored result is **unknown**, not a
+budget breach. The controller never silently lengthens a configured deadline.
+
+Dwctl PATCH semantics: omitted fields are unchanged; `aimd: null` restores the
+default controller; `aimd: {"enabled": false}` disables it. A null
+`first_token_timeout_ms` restores deadline inheritance. Overrides appear under
+`fallback` in model responses; null means inherited defaults, not disabled.
+The dashboard has no AIMD editor; use the model API for overrides and opt-out.
 
 Only strict-mode `stream: true` requests without the configured timeout-exempt
-header use the share or contribute observations. Single-provider pools are
-inert. Eligible preferred attempts at any position in the retry cascade,
+header use the share or contribute observations. Single-provider and weighted-selection pools, and pools without enabled fallback,
+are inert. Eligible preferred attempts at any position in the retry cascade,
 including the final attempt, can contribute; alternate attempts never do.
 Nonstrict/nonstreaming/exempt traffic uses ordinary selection even when the
 pool has a demoted share. Non-SSE responses, provider request timeouts, network
@@ -82,11 +88,10 @@ Validation bounds: budget 1–3,600,000 ms; dwell 1–86,400,000 ms;
 `(0,1)`; step and floor in `(0,1]`. Choose windows/dwell for sample volume across
 individual gateway replicas, including traffic remaining at the floor.
 
-Roll out with the feature absent first, then staging simulations, then a deliberately
-chosen alias canary. Monitor client latency, errors, preferred-first share, adjustment
-rate and alternate spend. A low share is an indicator of capacity shortfall, not proof.
-Disable with `aimd: null` to restore ordinary priority selection for new requests
-after the routing configuration reloads.
+Monitor client latency, errors, preferred-first share, adjustment rate and alternate
+spend after deployment. A low share is an indicator of capacity shortfall, not proof.
+Disable with `aimd: {"enabled": false}` to restore ordinary priority selection for
+new requests after the routing configuration reloads.
 
 ## Problem
 
@@ -313,8 +318,7 @@ controller that resets faster than it converges is worse than no controller.
 
 ## Configuration
 
-Configure `FallbackConfig.aimd` alongside `first_token_timeout_ms`. AIMD is
-explicitly per-model/pool; unlike the deadline there is no global default:
+Configure `FallbackConfig.aimd` alongside `first_token_timeout_ms`. AIMD defaults are applied to eligible pools; model/pool overrides use these fields:
 
 | Option | Meaning |
 |---|---|
@@ -338,7 +342,8 @@ share floor protects.
 Dwctl stores `first_token_timeout_ms` and nullable JSONB `aimd` on deployed
 models. Create/update/read and both standard/composite sync paths carry them.
 AIMD is accepted by the API only on priority composites with fallback enabled.
-Existing rows have null values, preserving global deadlines and ordinary selection.
+Existing rows have null overrides, preserving global deadlines while enabling the
+default controller on eligible priority pools.
 
 ## Observability
 

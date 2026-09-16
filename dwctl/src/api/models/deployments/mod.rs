@@ -260,7 +260,8 @@ pub struct StandardModelCreate {
     /// Stream first-frame deadline; null inherits the global default, 0 disables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_token_timeout_ms: Option<i64>,
-    /// Priority-only share controller; absent/null disables. Requires explicit deadline.
+    /// Priority-only share controller overrides; absent/null inherits defaults.
+    /// Set enabled=false to disable. Explicit enabled overrides require a compatible deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aimd: Option<AimdConfig>,
     /// Traffic routing rules evaluated against API key labels.
@@ -347,7 +348,8 @@ pub struct CompositeModelCreate {
     /// Stream first-frame deadline; null inherits the global default, 0 disables.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_token_timeout_ms: Option<i64>,
-    /// Priority-only share controller; absent/null disables. Requires explicit deadline.
+    /// Priority-only share controller overrides; absent/null inherits defaults.
+    /// Set enabled=false to disable. Explicit enabled overrides require a compatible deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aimd: Option<AimdConfig>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false, used when strict_mode=false)
@@ -460,7 +462,8 @@ pub struct DeployedModelUpdate {
     /// Omitted = unchanged; null = inherit proxy default; 0 = disable deadline.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub first_token_timeout_ms: Option<Option<i64>>,
-    /// Omitted = unchanged; null = disable; object = replace controller configuration.
+    /// Omitted = unchanged; null = inherit defaults; object = replace overrides.
+    /// Use {"enabled":false} to disable.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub aimd: Option<Option<AimdConfig>>,
     /// Whether to sanitize/filter sensitive data from model responses (null = no change, used when strict_mode=false)

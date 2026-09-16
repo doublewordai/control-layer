@@ -111,21 +111,15 @@ impl ProviderPool {
     ) -> Self {
         let controller = fallback
             .as_ref()
-            .filter(|f| {
-                f.enabled
-                    && f.aimd.as_ref().is_some_and(|c| {
-                        f.first_token_timeout_ms.is_some_and(|ms| {
-                            ms == 0 || (ms >= c.latency_budget_ms && ms <= 3_600_000)
-                        })
-                    })
-            })
-            .and_then(|f| f.aimd.as_ref())
+            .filter(|f| f.enabled)
+            .map(|f| f.aimd.clone().unwrap_or_default())
             .filter(|c| {
-                c.validate().is_ok()
+                c.enabled
+                    && c.validate().is_ok()
                     && strategy == LoadBalanceStrategy::Priority
                     && providers.len() > 1
             })
-            .map(|c| Arc::new(Mutex::new(Controller::new(c.clone(), Instant::now()))));
+            .map(|c| Arc::new(Mutex::new(Controller::new(c, Instant::now()))));
         Self {
             controller,
             providers,
@@ -187,6 +181,10 @@ impl ProviderPool {
             with_replacement,
             alternate_first: false,
         }
+    }
+
+    pub(crate) fn aimd_enabled(&self) -> bool {
+        self.controller.is_some()
     }
 
     pub(crate) fn select_iter_aimd(
@@ -559,6 +557,7 @@ mod tests {
 
     fn aimd_pool() -> ProviderPool {
         let config = crate::aimd::AimdConfig {
+            enabled: true,
             latency_budget_ms: 100,
             breach_rate_target: 0.2,
             window_samples: 10,
@@ -591,6 +590,63 @@ mod tests {
             false,
             vec![],
         )
+    }
+
+    #[test]
+    fn aimd_is_default_on_only_for_eligible_pools_and_has_explicit_opt_out() {
+        let make = |strategy, providers, fallback| {
+            ProviderPool::with_config(
+                providers,
+                None,
+                None,
+                None,
+                Some(fallback),
+                strategy,
+                false,
+                vec![],
+            )
+        };
+        let providers = aimd_pool().providers;
+        let default_fallback = FallbackConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            make(
+                LoadBalanceStrategy::Priority,
+                providers.clone(),
+                default_fallback.clone()
+            )
+            .aimd_enabled()
+        );
+        assert!(
+            !make(
+                LoadBalanceStrategy::WeightedRandom,
+                providers.clone(),
+                default_fallback.clone()
+            )
+            .aimd_enabled()
+        );
+        assert!(
+            !make(
+                LoadBalanceStrategy::Priority,
+                vec![providers[0].clone()],
+                default_fallback
+            )
+            .aimd_enabled()
+        );
+        assert!(
+            !make(
+                LoadBalanceStrategy::Priority,
+                providers.clone(),
+                FallbackConfig::default()
+            )
+            .aimd_enabled()
+        );
+        let disabled =
+            serde_json::from_value(serde_json::json!({"enabled":true,"aimd":{"enabled":false}}))
+                .unwrap();
+        assert!(!make(LoadBalanceStrategy::Priority, providers, disabled).aimd_enabled());
     }
 
     #[test]

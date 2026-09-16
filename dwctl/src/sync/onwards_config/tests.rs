@@ -1950,7 +1950,7 @@ async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn aimd_and_first_token_deadline_survive_database_sync(pool: sqlx::PgPool) {
-    let config = serde_json::json!({"latency_budget_ms":100,"breach_rate_target":0.1,"window_samples":20,
+    let config = serde_json::json!({"enabled":true,"latency_budget_ms":100,"breach_rate_target":0.1,"window_samples":20,
         "min_samples":5,"share_step":0.05,"share_decay":0.5,"share_floor":0.1,"dwell_ms":1000});
     sqlx::query(
         "UPDATE deployed_models SET aimd = $1, first_token_timeout_ms = 200, fallback_enabled = true WHERE alias = 'composite-priority'",
