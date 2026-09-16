@@ -604,6 +604,8 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             backoff_factor: 2.0,
                             backoff_jitter: Default::default(),
                             backoff_max_total_ms: None,
+                            first_token_timeout_ms: None,
+                            aimd: None,
                             traffic_routing_rules: None,
                             allowed_batch_completion_windows: None,
                             metadata: None,

@@ -45,6 +45,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
+pub mod aimd;
 pub mod auth;
 pub mod client;
 pub mod config;
@@ -1915,6 +1916,7 @@ mod tests {
                     enabled: true,
                     on_status: vec![502],
                     first_token_timeout_ms: Some(ms),
+                    aimd: None,
                     ..Default::default()
                 },
             )

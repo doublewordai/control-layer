@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT\n            id as composite_model_id,\n            alias,\n            requests_per_second,\n            burst_size,\n            capacity,\n            lb_strategy,\n            fallback_enabled,\n            fallback_on_rate_limit,\n            fallback_on_status,\n            fallback_with_replacement,\n            fallback_max_attempts,\n            backoff_enabled,\n            backoff_initial_ms,\n            backoff_max_ms,\n            backoff_factor,\n            backoff_jitter,\n            backoff_max_total_ms,\n            sanitize_responses,\n            trusted\n        FROM deployed_models\n        WHERE is_composite = TRUE\n          AND deleted = FALSE\n        ",
+  "query": "\n        SELECT\n            id as composite_model_id,\n            alias,\n            requests_per_second,\n            burst_size,\n            capacity,\n            lb_strategy,\n            fallback_enabled,\n            fallback_on_rate_limit,\n            fallback_on_status,\n            fallback_with_replacement,\n            fallback_max_attempts,\n            backoff_enabled,\n            backoff_initial_ms,\n            backoff_max_ms,\n            backoff_factor,\n            backoff_jitter,\n            backoff_max_total_ms,\n            first_token_timeout_ms,\n            aimd,\n            sanitize_responses,\n            trusted\n        FROM deployed_models\n        WHERE is_composite = TRUE\n          AND deleted = FALSE\n        ",
   "describe": {
     "columns": [
       {
@@ -90,11 +90,21 @@
       },
       {
         "ordinal": 17,
+        "name": "first_token_timeout_ms",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 18,
+        "name": "aimd",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 19,
         "name": "sanitize_responses",
         "type_info": "Bool"
       },
       {
-        "ordinal": 18,
+        "ordinal": 20,
         "name": "trusted",
         "type_info": "Bool"
       }
@@ -120,9 +130,11 @@
       false,
       false,
       true,
+      true,
+      true,
       false,
       false
     ]
   },
-  "hash": "d1b71adc9f4508f46e8dc8aa21bc46708b7b63d26cfa4504b324a6c7854b42f6"
+  "hash": "f99f659755278f8b3c233ac6f2360c7649e85b596d445d50b769699264d25235"
 }

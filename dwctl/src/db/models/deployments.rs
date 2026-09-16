@@ -9,6 +9,7 @@ use crate::reasoning::ReasoningTranslationOverrides;
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
 use bon::Builder;
 use chrono::{DateTime, NaiveDate, Utc};
+use onwards::aimd::AimdConfig as OnwardsAimdConfig;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_with::rust::double_option;
@@ -337,6 +338,53 @@ fn default_fallback_status_codes() -> Vec<i32> {
     vec![429, 499, 500, 502, 503, 504]
 }
 
+/// Priority-only load-aware routing overrides. Missing/null inherits defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+#[serde(default, deny_unknown_fields)]
+pub struct AimdConfig {
+    pub enabled: bool,
+    pub latency_budget_ms: u64,
+    pub breach_rate_target: f64,
+    pub window_samples: usize,
+    pub min_samples: usize,
+    pub share_step: f64,
+    pub share_decay: f64,
+    pub share_floor: f64,
+    pub dwell_ms: u64,
+}
+impl From<AimdConfig> for OnwardsAimdConfig {
+    fn from(c: AimdConfig) -> Self {
+        Self {
+            enabled: c.enabled,
+            latency_budget_ms: c.latency_budget_ms,
+            breach_rate_target: c.breach_rate_target,
+            window_samples: c.window_samples,
+            min_samples: c.min_samples,
+            share_step: c.share_step,
+            share_decay: c.share_decay,
+            share_floor: c.share_floor,
+            dwell_ms: c.dwell_ms,
+        }
+    }
+}
+
+impl Default for AimdConfig {
+    fn default() -> Self {
+        let c = OnwardsAimdConfig::default();
+        Self {
+            enabled: c.enabled,
+            latency_budget_ms: c.latency_budget_ms,
+            breach_rate_target: c.breach_rate_target,
+            window_samples: c.window_samples,
+            min_samples: c.min_samples,
+            share_step: c.share_step,
+            share_decay: c.share_decay,
+            share_floor: c.share_floor,
+            dwell_ms: c.dwell_ms,
+        }
+    }
+}
+
 /// Fallback configuration for composite models
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct FallbackConfig {
@@ -363,6 +411,10 @@ pub struct FallbackConfig {
     /// Only consulted when `backoff` is Some. None = no budget cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_total_backoff_ms: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_timeout_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aimd: Option<AimdConfig>,
 }
 
 impl FallbackConfig {
@@ -375,6 +427,8 @@ impl FallbackConfig {
             max_attempts: None,
             backoff: None,
             max_total_backoff_ms: None,
+            first_token_timeout_ms: None,
+            aimd: None,
         }
     }
 }
@@ -519,6 +573,8 @@ pub struct DeploymentCreateDBRequest {
     #[builder(default = "full".to_string())]
     pub backoff_jitter: String,
     pub backoff_max_total_ms: Option<i32>,
+    pub first_token_timeout_ms: Option<i64>,
+    pub aimd: Option<AimdConfig>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false)
     #[builder(default = false)]
     pub sanitize_responses: bool,
@@ -574,6 +630,8 @@ impl DeploymentCreateDBRequest {
                     .backoff_factor(standard.backoff_factor)
                     .backoff_jitter(standard.backoff_jitter.as_db_str().to_string())
                     .maybe_backoff_max_total_ms(standard.backoff_max_total_ms)
+                    .maybe_first_token_timeout_ms(standard.first_token_timeout_ms)
+                    .maybe_aimd(standard.aimd)
                     .sanitize_responses(standard.sanitize_responses.unwrap_or(false))
                     .trusted(standard.trusted.unwrap_or(false))
                     .maybe_reasoning_translation_overrides(standard.reasoning_translation_overrides)
@@ -607,6 +665,8 @@ impl DeploymentCreateDBRequest {
                 .backoff_factor(composite.backoff_factor)
                 .backoff_jitter(composite.backoff_jitter.as_db_str().to_string())
                 .maybe_backoff_max_total_ms(composite.backoff_max_total_ms)
+                .maybe_first_token_timeout_ms(composite.first_token_timeout_ms)
+                .maybe_aimd(composite.aimd)
                 .sanitize_responses(composite.sanitize_responses)
                 .trusted(composite.trusted.unwrap_or(false))
                 .maybe_allowed_batch_completion_windows(composite.allowed_batch_completion_windows)
@@ -652,6 +712,8 @@ pub struct DeploymentUpdateDBRequest {
     /// Cumulative inter-attempt sleep budget
     /// (None = no change, Some(None) = clear cap, Some(Some(n)) = set).
     pub backoff_max_total_ms: Option<Option<i32>>,
+    pub first_token_timeout_ms: Option<Option<i64>>,
+    pub aimd: Option<Option<AimdConfig>>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: Option<bool>,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)
@@ -690,6 +752,8 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_backoff_factor(update.backoff_factor)
             .maybe_backoff_jitter(update.backoff_jitter.map(|j| j.as_db_str().to_string()))
             .maybe_backoff_max_total_ms(update.backoff_max_total_ms)
+            .maybe_first_token_timeout_ms(update.first_token_timeout_ms)
+            .maybe_aimd(update.aimd)
             .maybe_sanitize_responses(update.sanitize_responses)
             .maybe_trusted(update.trusted)
             .maybe_reasoning_translation_overrides(update.reasoning_translation_overrides)
@@ -762,6 +826,8 @@ pub struct DeploymentDBResponse {
     pub backoff_factor: f64,
     pub backoff_jitter: String,
     pub backoff_max_total_ms: Option<i32>,
+    pub first_token_timeout_ms: Option<i64>,
+    pub aimd: Option<AimdConfig>,
     /// Whether to sanitize/filter sensitive data from model responses
     pub sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode (bypasses sanitization)

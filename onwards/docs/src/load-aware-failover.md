@@ -1,9 +1,97 @@
-# Load-Aware Failover (design)
+# Load-Aware Failover
 
-> Status: observation metrics implemented; controller and per-model plumbing
-> remain planned. See [First-token observations](load-balancing.md#first-token-observations)
-> for the implemented metrics and their coverage limits. The rest of this page
-> describes the intended successor to per-request first-token failover.
+> Status: AIMD is enabled by default for priority pools with fallback enabled
+> and at least two providers. Nonstrict, nonstreaming and exempt requests retain
+> ordinary routing. Set `aimd.enabled: false` to opt a pool/model out.
+
+## Operating the controller
+
+Existing eligible pools immediately use these defaults without a database backfill:
+
+```json
+{
+  "enabled": true,
+  "latency_budget_ms": 10000,
+  "breach_rate_target": 0.05,
+  "window_samples": 200,
+  "min_samples": 50,
+  "share_step": 0.02,
+  "share_decay": 0.8,
+  "share_floor": 0.05,
+  "dwell_ms": 30000
+}
+```
+
+The default 10-second budget matches the application's default first-token
+failover deadline. Controllers and sample minima are per process, not aggregated
+across replicas. A 5% rate allows ordinary tail events; overload decreases share
+by 20%, and healthy recovery adds two percentage points per fresh healthy dwell.
+
+Override `fallback.aimd` on a native onwards priority pool, or the top-level
+`aimd` field when creating/updating a dwctl priority composite. An override object
+replaces the prior object; omitted object members use the defaults above. For an
+enabled override, set an explicit `first_token_timeout_ms`: either `0` to disable
+that deadline, or at least the latency budget. An absent AIMD override inherits
+the controller defaults and permits an inherited deadline. If that inherited
+deadline is shorter than the budget, its censored result is **unknown**, not a
+budget breach. The controller never silently lengthens a configured deadline.
+
+Dwctl PATCH semantics: omitted fields are unchanged; `aimd: null` restores the
+default controller; `aimd: {"enabled": false}` disables it. A null
+`first_token_timeout_ms` restores deadline inheritance. Overrides appear under
+`fallback` in model responses; null means inherited defaults, not disabled.
+The dashboard has no AIMD editor; use the model API for overrides and opt-out.
+
+Only strict-mode `stream: true` requests without the configured timeout-exempt
+header use the share or contribute observations. Single-provider and weighted-selection pools, and pools without enabled fallback,
+are inert. Eligible preferred attempts at any position in the retry cascade,
+including the final attempt, can contribute; alternate attempts never do.
+Nonstrict/nonstreaming/exempt traffic uses ordinary selection even when the
+pool has a demoted share. Non-SSE responses, provider request timeouts, network
+and upstream errors, cancellation, empty streams and DONE-only streams are
+unknown outcomes, not healthy samples or capacity breaches.
+
+Controller observations inspect the already parsed strict SSE stream, including
+content arriving after the lead peek's event/time caps. They do not add buffering,
+change bytes, or move the failover deadline. The existing exported first-token
+histogram still has its documented lead-peek coverage; it is not the controller's
+denominator. No token-content parsing is added: the first non-sentinel data frame
+can still be metadata. A stream that never produces data and has no armed failover
+deadline remains unknown until it ends or is cancelled. Latency is measured when
+the gateway polls the frame, so gateway scheduling or downstream backpressure
+can contribute; it is not a measurement of backend execution time alone.
+
+The bounded window is ordered by attempt start, with at least `min_samples`
+required. Pending and unknown outcomes inhibit adjustments. At capacity, admission
+pauses while any sampled attempt remains pending; slow samples are never evicted
+in favor of newer fast completions. After resolution, new admissions displace the
+oldest outcomes. Unknowns must age out before adjustment resumes. This conservative
+policy can freeze the share during incomplete coverage or outages, leaving ordinary
+failover to handle errors. It is not an outage circuit breaker.
+
+A healthy dwell begins with a sufficiently sampled, fully resolved healthy window.
+An unknown or overloaded window observed on completion resets that dwell; pending
+work blocks decisions without restarting the last established healthy dwell.
+No traffic means no adjustments. Every adjustment clears the window and advances a
+generation; late completions from older generations are ignored. Fresh samples and
+a new dwell are needed for recovery. Updates are constant-time under a shared pool
+mutex, and each process controls its own share independently.
+
+Reloads preserve state only when both pools have an active controller, preferred
+identity (URL, key, upstream model), AIMD parameters and explicit deadline are
+unchanged. Replacing/reordering the preferred provider, enabling a previously
+inert controller, or changing its settings starts at share 1.0. Cloned request
+pools share state. Process restarts also reset the share.
+
+Validation bounds: budget 1–3,600,000 ms; dwell 1–86,400,000 ms;
+`2 <= min_samples <= window_samples <= 100000`; target in `[0,1)`; decay in
+`(0,1)`; step and floor in `(0,1]`. Choose windows/dwell for sample volume across
+individual gateway replicas, including traffic remaining at the floor.
+
+Monitor client latency, errors, preferred-first share, adjustment rate and alternate
+spend after deployment. A low share is an indicator of capacity shortfall, not proof.
+Disable with `aimd: {"enabled": false}` to restore ordinary priority selection for
+new requests after the routing configuration reloads.
 
 ## Problem
 
@@ -72,9 +160,8 @@ which is a statement of intent that can actually be met:
 - If it exceeds `breach_rate_target`, decrease: `f *= share_decay`.
 - If it stays at or below target for `dwell_ms`, increase: `f += share_step`.
 
-Decrease fast, increase slowly. The asymmetry stops the hunt, and the
-controller converges on the largest share whose breach rate still meets the
-target — a defined service level, not an artefact of volume.
+Decrease fast, increase slowly. The asymmetry is intended to reduce oscillation and approach the largest
+share whose breach rate still meets the target — a defined service level, not an artefact of volume.
 
 Because each increase is one increment followed by re-measurement *at that
 share*, the controller never infers full-load behaviour from a trickle sample,
@@ -120,11 +207,11 @@ require any armed failover deadline to be at least the latency budget. A slow
 observed frame can establish a budget breach without firing the failover
 deadline. Neither outcome may count twice in the controller's denominator.
 
-The current observation metrics are not yet sufficient controller input: even
+The exported observation metrics are not sufficient controller input: even
 strict streams can outlast the existing peek's event or time limits and be
-forwarded unobserved. Controller implementation must cover those eligible
-streams or explicitly treat their outcomes as unknown, rather than count them
-as healthy or estimate a breach rate from a selectively observed histogram.
+forwarded unobserved. The controller therefore observes eligible frames after the peek and tracks
+unknown outcomes explicitly, rather than counting them as healthy or estimating
+a rate from the exported histogram.
 
 ### Only the preferred provider's attempts are control input
 
@@ -150,7 +237,7 @@ providers, but they are inert as control input.
 Header arrival is **not** a first-token sample. For a streamed response the
 headers can arrive long before the first token, so it cannot stand in for one.
 
-The lead-frame read is the only place a real first token is observed today, and
+The lead-frame read is where the exported histogram observes first frames, and
 it is gated: the enclosing branch requires `(200..300).contains(&status) &&
 state.targets.strict_mode`. Non-strict SSE is forwarded without a lead-frame
 peek, deliberately — the pass-through path avoids forcing buffering and SSE
@@ -231,8 +318,7 @@ controller that resets faster than it converges is worse than no controller.
 
 ## Configuration
 
-Extend `FallbackConfig` alongside `first_token_timeout_ms`, with a proxy-wide
-default on `AppState` mirroring `with_first_token_timeout`:
+Configure `FallbackConfig.aimd` alongside `first_token_timeout_ms`. AIMD defaults are applied to eligible pools; model/pool overrides use these fields:
 
 | Option | Meaning |
 |---|---|
@@ -251,13 +337,13 @@ lag the traffic that caused them. And because only preferred-provider attempts
 are control input, a low share yields observations slowly — which is what the
 share floor protects.
 
-### Per-model values are a prerequisite
+### Per-model values
 
-`first_token_timeout_ms` is currently hardcoded to `None` in both
-`OnwardsFallbackConfig` literals in dwctl's onwards-config sync — the composite
-arm and the single-model arm — so only the proxy-wide default is reachable. The
-correct budget is model-specific, so this plumbing is a prerequisite for the
-controller, not a follow-up.
+Dwctl stores `first_token_timeout_ms` and nullable JSONB `aimd` on deployed
+models. Create/update/read and both standard/composite sync paths carry them.
+AIMD is accepted by the API only on priority composites with fallback enabled.
+Existing rows have null overrides, preserving global deadlines while enabling the
+default controller on eligible priority pools.
 
 ## Observability
 
@@ -301,64 +387,20 @@ With that classification in place, a persistently low `f` is meaningful evidence
 that the preferred upstream cannot carry its own demand within budget, measured
 from served traffic. Without it, the number conflates slowness with failure.
 
-## Implementation order
+Named continuation pools keep their deterministic failover order and explicitly opt out of AIMD.
+Catalog provisioning preserves API overrides while routing remains compatible, and clears enabled
+AIMD overrides when the catalog changes to weighted routing or disables fallback.
 
-1. Plumb per-model fallback values through the onwards-config sync so a budget
-   can be set per alias. Behaviour unchanged.
-2. **Implemented:** record observations and export them, with no control attached: the
-   uncensored histogram (strict-mode SSE, excluding `[DONE]`) and the breach
-   counter, both labelled by role so preferred and alternate are separable.
-3. Add the controller and its state, with identity-checked adoption across
-   reloads, consuming only preferred-provider observations. Default disabled.
-4. Bias the first attempt via an explicit provider override, `Priority` pools
-   only, behind the same switch.
-5. Enable per alias, starting with one whose upstream latency is known to be
-   load-dependent.
+The share gauge is updated by eligible requests and observations. Replaced or removed
+controllers are retired so their in-flight observations cannot publish stale metrics. As with the
+other non-evicting metrics, a disabled or idle pool can retain its last published
+value; consult configuration and recent adjustment activity when interpreting it.
 
-Each step is independently shippable. Step 2 now exposes observed first-frame
-latencies per role and failover-deadline expiries, subject to the coverage
-limits above. Step 1 remains planned and will make the failover deadline
-configurable per alias through dwctl.
+## Validation
 
-## Testing
-
-- **Sampling** — a data frame that is not `[DONE]` produces a sample; a stream
-  whose first decisive frame is `[DONE]` does not, and is still not treated as
-  an empty body; keep-alive comments do not.
-- **Censoring** — a breach increments the breach counter and never enters the
-  latency histogram.
-- **Attribution** — observations from alternates do not move the share.
-- **Coverage** — non-strict SSE produces no uncensored samples; assert this
-  rather than letting it surprise someone later.
-- **Controller** — converges to a stable share against a simulated
-  load-dependent upstream; an isolated slow request does not move the share;
-  a sustained breach rate above target does; decrease outpaces increase.
-- **Classification** — connection errors and upstream error responses do not
-  count as latency breaches.
-- **Reload** — the share survives a reload when the preferred provider is
-  unchanged, and resets when it is replaced or reordered.
-- **Selection** — the first-attempt override biases only the first attempt,
-  leaves the preferred provider reachable on later attempts, and does not
-  change the attempt budget or cascade restart.
-- **Disabled default** — with the controller off, selection and failover are
-  byte-for-byte today's behaviour.
-
-## Open questions
-
-- **`WeightedRandom` support.** Whether the first-attempt override should carry
-  a provider identity into a freshly initialised iterator so weighted pools can
-  use the controller, or whether `Priority`-only is sufficient in practice.
-- **Non-strict coverage.** Whether a pass-through-safe first-frame observer is
-  worth building, or whether the controller should simply be unavailable for
-  non-strict traffic.
-- **Per-process state.** Each gateway process runs its own controller, so with
-  N processes there are N independent controllers converging separately. Shared
-  state would be consistent but adds coordination; per-process is simpler and
-  probably adequate, but the multiplier should be a conscious choice.
-- **Interaction with the existing deadline.** The per-request deadline should
-  remain as a hang detector once the controller handles systematic slowness,
-  which argues for a longer deadline. The right value depends on how much of
-  the tail the controller absorbs in practice.
-- **Cost asymmetry.** When providers differ in cost, the budget is really a
-  latency-versus-cost knob rather than a pure latency control. Making that
-  explicit may be worthwhile.
+Deterministic controller tests cover rate thresholds, dwell, fresh generations,
+unknown/pending outcomes, bounded sampling, share limits and a load-dependent
+capacity simulation. Selection tests cover alternate-first cascades, concurrency
+guards and reload adoption. HTTP tests cover late frames, censored deadlines,
+exempt/nonstrict traffic, byte preservation and upstream errors. Database/API tests
+cover round trips, merged PATCH validation, clearing and onwards sync.

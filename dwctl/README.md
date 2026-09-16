@@ -274,4 +274,19 @@ records first-token failover deadlines, including waits for response headers.
 Timeouts never enter the latency histogram. See
 [First-token observations](../onwards/docs/src/load-balancing.md#first-token-observations)
 for sampling limits and label semantics before using these series to compare
-providers. Provider selection is unchanged; load-aware control is not enabled.
+providers. Eligible priority pools also use the AIMD controller described below.
+
+### Load-aware priority routing (AIMD)
+
+Priority composite models with fallback enabled use an AIMD preferred-first
+traffic share controller by default, including existing models. Override its
+settings through the model API's `aimd` object and explicit `first_token_timeout_ms`. The controller applies only to strict-mode
+streaming traffic and preserves ordinary retries; it is not a binary outage breaker.
+`PATCH {"aimd": {"enabled": false}}` disables it; null restores defaults. Model responses expose settings under `fallback`.
+
+`onwards_provider_share{model,pool}` reports the configured preferred-first share;
+`onwards_share_adjustments_total{model,pool,direction}` counts increases/decreases.
+The share is per gateway process, and capacity/concurrency constraints can change
+the realized split. Missing samples and hard errors never count as healthy capacity.
+See [configuration, observation coverage and rollout](../onwards/docs/src/load-aware-failover.md)
+before enabling a model. The existing histogram is not the controller denominator.

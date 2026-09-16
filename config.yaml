@@ -503,6 +503,10 @@ onwards:
   # traffic (batch, flex, background) is exempt. Set to 0 to disable.
   # Set via environment: DWCTL_ONWARDS__FIRST_TOKEN_TIMEOUT_MS=10000
   first_token_timeout_ms: 10000
+  # Models may override the deadline via first_token_timeout_ms in the model API.
+  # Priority composites with fallback enabled use AIMD by default in strict mode.
+  # Override through the model API's aimd object, or set aimd.enabled=false to opt out.
+  # See onwards/docs/src/load-aware-failover.md for coverage and tuning.
 
 # Cached-input pricing (the dwctl-owned cache layer)
 cache:

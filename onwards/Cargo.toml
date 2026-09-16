@@ -67,4 +67,4 @@ rstest = "0.26.1"
 tower = "0.5"
 wiremock = "0.6"
 reqwest = { version = "0.13", features = ["json", "stream"] }
-tokio = { version = "1.45.1", features = ["process", "io-util"] }
+tokio = { version = "1.45.1", features = ["process", "io-util", "test-util"] }
