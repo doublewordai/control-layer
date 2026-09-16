@@ -571,26 +571,24 @@ pub async fn target_message_handler<T: HttpClient>(
         );
     }
 
-    let authenticated_api_key_id = bearer_token.and_then(|token| {
-        let authenticated = state.targets.targets.iter().any(|entry| {
-            entry
-                .value()
-                .default_pool()
-                .keys()
+    let bearer_token = bearer_token.map(str::to_owned);
+    let authenticated_api_key_id = bearer_token
+        .as_deref()
+        .filter(|token| {
+            pool.keys()
                 .is_some_and(|keys| auth::validate_bearer_token(keys, token))
-        });
-        authenticated
-            .then(|| state.targets.key_labels.get(token))
-            .flatten()
+        })
+        .and_then(|token| state.targets.key_labels.get(token))
             .and_then(|labels| labels.get("api_key_id").cloned())
-            .and_then(|id| id.parse::<Uuid>().ok())
-    });
+        .and_then(|id| id.parse::<Uuid>().ok());
+
+    let result = async move {
 
     // Evaluate routing rules against key labels (after auth, before rate limiting).
     // Rules on the pool are matched against the authenticated key's labels.
     // Note: routing rules are NOT re-evaluated on the redirect target pool.
     if !pool.routing_rules().is_empty()
-        && let Some(token) = bearer_token
+        && let Some(token) = bearer_token.as_deref()
     {
             let labels = state
                 .targets
@@ -705,7 +703,7 @@ pub async fn target_message_handler<T: HttpClient>(
         }
 
         // Check per-key rate limits if bearer token is present
-        if let Some(token) = bearer_token
+        if let Some(token) = bearer_token.as_deref()
             && let Some(limiter) = state.targets.key_rate_limiters.get(token)
             && limiter.check().is_err()
         {
@@ -734,7 +732,7 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         // Acquire per-key concurrency permit
-        let key_guard = if let Some(token) = bearer_token {
+        let key_guard = if let Some(token) = bearer_token.as_deref() {
             if let Some(limiter) = state.targets.key_concurrency_limiters.get(token) {
                 match limiter.try_acquire() {
                     Some(guard) => Some(guard),
@@ -1768,6 +1766,10 @@ pub async fn target_message_handler<T: HttpClient>(
         record_response_status(status);
         Err(err)
     }
+    }
+    .await;
+
+    result.map_err(|error| error.with_authenticated_api_key_id(authenticated_api_key_id))
     }
     .instrument(span)
     .await

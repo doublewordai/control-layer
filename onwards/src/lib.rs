@@ -1138,8 +1138,18 @@ mod tests {
     #[tokio::test]
     async fn test_authenticated_api_key_id_survives_models_and_strict_error() {
         use crate::auth::ConstantTimeString;
+        use crate::target::{RateLimitExceeded, RateLimiter};
         use std::collections::{HashMap, HashSet};
         use tower::ServiceExt;
+
+        #[derive(Debug)]
+        struct BlockingRateLimiter;
+
+        impl RateLimiter for BlockingRateLimiter {
+            fn check(&self) -> Result<(), RateLimitExceeded> {
+                Err(RateLimitExceeded)
+            }
+        }
 
         let api_key_id = uuid::Uuid::new_v4();
         let api_key = "test-api-key";
@@ -1151,7 +1161,17 @@ mod tests {
             pool(
                 target::Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
+                    .keys(keys.clone())
+                    .build(),
+            ),
+        );
+        targets_map.insert(
+            "blocked-model".to_string(),
+            pool(
+                target::Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
                     .keys(keys)
+                    .limiter(Arc::new(BlockingRateLimiter) as Arc<dyn RateLimiter>)
                     .build(),
             ),
         );
@@ -1201,10 +1221,32 @@ mod tests {
                 .to_string(),
             ))
             .unwrap();
-        let chat_response = router.oneshot(chat_request).await.unwrap();
+        let chat_response = router.clone().oneshot(chat_request).await.unwrap();
         assert_eq!(chat_response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
             chat_response
+                .extensions()
+                .get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
+
+        let rejected_request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {api_key}"))
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "blocked-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let rejected_response = router.oneshot(rejected_request).await.unwrap();
+        assert_eq!(rejected_response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            rejected_response
                 .extensions()
                 .get::<crate::AuthenticatedApiKeyId>(),
             Some(&crate::AuthenticatedApiKeyId(api_key_id))

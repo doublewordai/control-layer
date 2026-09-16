@@ -643,16 +643,17 @@ where
             cap_scope_root: Option<Uuid>,
         }
 
-        let rows: Vec<UserRow> = sqlx::query_as(
+        let rows: Vec<UserRow> = sqlx::query_as!(
+            UserRow,
             r#"
             SELECT ak.user_id, ak.id as api_key_id, ak.purpose,
-                   CASE WHEN root.spend_limit IS NOT NULL THEN root.id END AS cap_scope_root
+                   CASE WHEN root.spend_limit IS NOT NULL THEN root.id END AS "cap_scope_root?"
             FROM api_keys ak
             JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)
             WHERE ak.id = ANY($1)
             "#,
+            key_ids
         )
-        .bind(key_ids)
         .fetch_all(&mut **tx)
         .await?;
 

@@ -10,6 +10,7 @@ use axum::{
 use bon::Builder;
 use hyper::StatusCode;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::reasoning::ReasoningError;
 
@@ -25,6 +26,7 @@ pub struct ErrorResponseBody {
 pub struct OnwardsErrorResponse {
     pub body: Option<ErrorResponseBody>,
     pub status: StatusCode,
+    pub(crate) authenticated_api_key_id: Option<Uuid>,
 }
 
 impl OnwardsErrorResponse {
@@ -38,6 +40,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::from_u16(error.status_code())
                 .expect("reasoning errors use valid HTTP status codes"),
+            authenticated_api_key_id: None,
         }
     }
 
@@ -52,6 +55,7 @@ impl OnwardsErrorResponse {
                 code: "model_not_found".to_string(),
             }),
             status: StatusCode::NOT_FOUND,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -64,6 +68,7 @@ impl OnwardsErrorResponse {
                 code: "rate_limit".to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -76,6 +81,7 @@ impl OnwardsErrorResponse {
                 code: "concurrency_limit_exceeded".to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -88,6 +94,7 @@ impl OnwardsErrorResponse {
                 code: "internal_error".to_string(),
             }),
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -100,6 +107,7 @@ impl OnwardsErrorResponse {
                 code: "internal_error".to_string(),
             }),
             status: StatusCode::BAD_GATEWAY,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -112,6 +120,7 @@ impl OnwardsErrorResponse {
                 code: "service_unavailable".to_string(),
             }),
             status: StatusCode::SERVICE_UNAVAILABLE,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -125,6 +134,7 @@ impl OnwardsErrorResponse {
                 code: "gateway_timeout".to_string(),
             }),
             status: StatusCode::GATEWAY_TIMEOUT,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -139,6 +149,7 @@ impl OnwardsErrorResponse {
                 code: "payload_too_large".to_string(),
             }),
             status: StatusCode::PAYLOAD_TOO_LARGE,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -151,6 +162,7 @@ impl OnwardsErrorResponse {
                 code: "unprocessable_request".to_string(),
             }),
             status: StatusCode::UNPROCESSABLE_ENTITY,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -167,6 +179,7 @@ impl OnwardsErrorResponse {
                 code: code.to_string(),
             }),
             status: StatusCode::BAD_REQUEST,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -179,6 +192,7 @@ impl OnwardsErrorResponse {
                 code: "forbidden".to_string(),
             }),
             status: StatusCode::FORBIDDEN,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -192,7 +206,13 @@ impl OnwardsErrorResponse {
                 code: "unauthenticated".to_string(),
             }),
             status: StatusCode::UNAUTHORIZED,
+            authenticated_api_key_id: None,
         }
+    }
+
+    pub(crate) fn with_authenticated_api_key_id(mut self, api_key_id: Option<Uuid>) -> Self {
+        self.authenticated_api_key_id = api_key_id;
+        self
     }
 }
 
@@ -204,10 +224,16 @@ struct ErrorEnvelope<'a> {
 
 impl IntoResponse for OnwardsErrorResponse {
     fn into_response(self) -> Response {
-        match self.body {
+        let mut response = match self.body {
             Some(ref body) => (self.status, Json(ErrorEnvelope { error: body })).into_response(),
             None => self.status.into_response(), // No body, just status
+        };
+        if let Some(api_key_id) = self.authenticated_api_key_id {
+            response
+                .extensions_mut()
+                .insert(crate::AuthenticatedApiKeyId(api_key_id));
         }
+        response
     }
 }
 
