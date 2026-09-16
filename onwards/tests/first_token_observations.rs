@@ -606,6 +606,55 @@ async fn aimd_unknown_and_exempt_outcomes_cannot_demote() {
     }
 }
 
+#[tokio::test(start_paused = true)]
+async fn aimd_incomplete_frames_are_unknown_even_when_delayed() {
+    LazyLock::force(&METRICS);
+    let alias = "aimd-partial";
+    let mut cfg = config(alias, true);
+    cfg["targets"][alias]["fallback"]["aimd"] = aimd_config();
+    cfg["targets"][alias]["fallback"]["first_token_timeout_ms"] = json!(0);
+    let targets = Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap();
+    let mock = MockHttpClient::new_delayed_streaming_sequence(
+        StatusCode::OK,
+        vec![
+            (
+                Duration::from_secs(1),
+                vec!["data: {\"partial\":".to_string()]
+            );
+            3
+        ],
+    );
+    let server = TestServer::new(build_router(AppState::with_client(targets, mock))).unwrap();
+    for _ in 0..3 {
+        let _ = server
+            .post("/v1/chat/completions")
+            .json(&json!({"model":alias,"stream":true}))
+            .await;
+    }
+    assert_eq!(share(alias), Some(1.0));
+}
+
+#[test]
+fn native_continuation_pools_disable_aimd() {
+    let mut cfg = config("named", true);
+    let pool = cfg["targets"]["named"].take();
+    cfg["targets"]["named"] = json!({"pools":{"default":pool.clone(),"completions":pool}});
+    let targets = Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap();
+    let pools = targets.targets.get("named").unwrap();
+    assert!(
+        !pools
+            .get("completions")
+            .unwrap()
+            .fallback()
+            .unwrap()
+            .aimd
+            .as_ref()
+            .unwrap()
+            .enabled
+    );
+    assert!(pools.default_pool().fallback().unwrap().aimd.is_none());
+}
+
 #[test]
 fn aimd_rejects_unsupported_strategy_and_ambiguous_deadline() {
     for (strategy, deadline) in [

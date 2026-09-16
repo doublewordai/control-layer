@@ -1482,6 +1482,14 @@ mod tests {
         assert_eq!(model.fallback.as_ref().unwrap().first_token_timeout_ms, Some(200));
         assert!(model.fallback.unwrap().aimd.is_some());
         let path = format!("/admin/api/v1/models/{}", model.id);
+        // Malformed overrides are rejected by typed deserialization before persistence.
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"first_token_timeout_ms":0,"aimd":{"enabled":true,"latency_budget_ms":null}}))
+            .await
+            .assert_status_unprocessable_entity();
+
         for patch in [
             json!({"first_token_timeout_ms":50}),
             json!({"first_token_timeout_ms":null}),
@@ -1508,7 +1516,7 @@ mod tests {
         app.patch(&path)
             .add_header(&headers[0].0, &headers[0].1)
             .add_header(&headers[1].0, &headers[1].1)
-            .json(&json!({"aimd":null,"first_token_timeout_ms":null}))
+            .json(&json!({"aimd":null,"first_token_timeout_ms":null,"lb_strategy":"weighted_random"}))
             .await
             .assert_status_ok();
         let response = app

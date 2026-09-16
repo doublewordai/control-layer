@@ -831,7 +831,7 @@ pub async fn target_message_handler<T: HttpClient>(
         // This attempt's first-frame deadline; `None` on the final attempt.
         let first_token_deadline = first_token_timeout
             .filter(|_| (attempt_number as usize) < pool_max_attempts)
-            .map(|timeout| tokio::time::Instant::now() + timeout);
+            .map(|timeout| attempt_start + timeout);
 
         let attempt_span = tracing::info_span!(
             "onwards.provider_attempt",
@@ -1307,7 +1307,12 @@ pub async fn target_message_handler<T: HttpClient>(
                 let mut stream_observation = observation.clone();
                 let mut events = SseBufferedStream::new(body.into_data_stream()).inspect(move |event| {
                     if stream_observation.is_none() { return; }
-                    let kind = match event { Ok(bytes) => classify_sse_event(bytes), Err(_) => SseEventKind::Done };
+                    let kind = match event {
+                        Ok(bytes) if bytes.ends_with(b"\n\n") => classify_sse_event(bytes),
+                        // The buffer flushes an incomplete final event at EOF.
+                        // Preserve its bytes, but do not count it as a first frame.
+                        _ => SseEventKind::Done,
+                    };
                     if matches!(kind, SseEventKind::Comment) { return; }
                     if let Some(observation) = stream_observation.take() {
                         if matches!(kind, SseEventKind::Data) { observation.frame(); }

@@ -1284,9 +1284,17 @@ impl TargetsStream for WatchTargetsStream {
 fn build_pool(
     alias: &str,
     pool_name: &str,
-    pool_config: PoolConfig,
+    mut pool_config: PoolConfig,
     global_keys: &KeySet,
 ) -> Result<ProviderPool, anyhow::Error> {
+    if pool_name != DEFAULT_POOL
+        && let Some(fallback) = &mut pool_config.fallback
+    {
+        fallback.aimd = Some(crate::aimd::AimdConfig {
+            enabled: false,
+            ..crate::aimd::AimdConfig::default()
+        });
+    }
     if let Some(fallback) = &pool_config.fallback
         && let Some(config) = &fallback.aimd
         && config.enabled

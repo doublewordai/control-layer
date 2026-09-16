@@ -456,8 +456,16 @@ impl ProviderPool {
                     && a.target.onwards_key == b.target.onwards_key
                     && a.target.onwards_model == b.target.onwards_model
             });
-        let same_config = self.fallback.as_ref().and_then(|f| f.aimd.as_ref())
-            == old.fallback.as_ref().and_then(|f| f.aimd.as_ref())
+        let same_config = self
+            .fallback
+            .as_ref()
+            .and_then(|f| f.aimd.clone())
+            .unwrap_or_default()
+            == old
+                .fallback
+                .as_ref()
+                .and_then(|f| f.aimd.clone())
+                .unwrap_or_default()
             && self
                 .fallback
                 .as_ref()
@@ -674,6 +682,20 @@ mod tests {
         iter.alternate_first = true;
         assert_eq!(iter.next().unwrap().0, 0); // unavailable alternate falls back to preferred
         drop(held);
+    }
+
+    #[test]
+    fn aimd_reload_preserves_inherited_and_explicit_default_equivalence() {
+        let mut old = aimd_pool();
+        old.fallback.as_mut().unwrap().aimd = None;
+        let mut new = old.clone();
+        new.fallback.as_mut().unwrap().aimd = Some(crate::aimd::AimdConfig::default());
+        new.adopt_provider_state(&old);
+        assert!(Arc::ptr_eq(
+            new.controller.as_ref().unwrap(),
+            old.controller.as_ref().unwrap()
+        ));
+        assert!(old.controller.as_ref().unwrap().lock().unwrap().active());
     }
 
     #[test]
