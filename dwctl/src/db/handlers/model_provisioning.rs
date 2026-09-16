@@ -260,6 +260,11 @@ impl<'c> ModelProvisioning<'c> {
                    downstream_output_price_per_token = EXCLUDED.downstream_output_price_per_token,
                    downstream_hourly_rate = EXCLUDED.downstream_hourly_rate,
                    downstream_input_token_cost_ratio = EXCLUDED.downstream_input_token_cost_ratio,
+                   -- Preserve API overrides only while the catalog routing remains compatible.
+                   aimd = CASE WHEN EXCLUDED.is_composite
+                       AND (EXCLUDED.lb_strategy <> 'priority' OR NOT EXCLUDED.fallback_enabled)
+                       AND COALESCE(deployed_models.aimd->'enabled' = 'false'::JSONB, FALSE) IS FALSE
+                       THEN NULL ELSE deployed_models.aimd END,
                    lb_strategy = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.lb_strategy ELSE deployed_models.lb_strategy END,
                    fallback_enabled = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_enabled ELSE deployed_models.fallback_enabled END,
                    fallback_on_rate_limit = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_on_rate_limit ELSE deployed_models.fallback_on_rate_limit END,

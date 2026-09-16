@@ -1074,7 +1074,16 @@ fn convert_composite_to_target_spec(
         keys: keys.clone(),
         rate_limit: rate_limit.clone(),
         concurrency_limit: concurrency_limit.clone(),
-        fallback: fallback.clone(),
+        fallback: fallback.clone().map(|mut config| {
+            if pool_name != DEFAULT_COMPONENT_POOL {
+                // Continuation pools must preserve their validated first hop.
+                config.aimd = Some(AimdConfig {
+                    enabled: false,
+                    ..AimdConfig::default()
+                });
+            }
+            config
+        }),
         // A named pool's ordering is a validated failover list (dynamo first,
         // the harness-validated continuation target behind it), never a
         // load-balancing surface: under the composite's own strategy (DB

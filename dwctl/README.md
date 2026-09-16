@@ -274,7 +274,7 @@ records first-token failover deadlines, including waits for response headers.
 Timeouts never enter the latency histogram. See
 [First-token observations](../onwards/docs/src/load-balancing.md#first-token-observations)
 for sampling limits and label semantics before using these series to compare
-providers. Provider selection is unchanged; load-aware control is not enabled.
+providers. Eligible priority pools also use the AIMD controller described below.
 
 ### Load-aware priority routing (AIMD)
 

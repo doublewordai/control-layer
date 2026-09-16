@@ -387,7 +387,12 @@ With that classification in place, a persistently low `f` is meaningful evidence
 that the preferred upstream cannot carry its own demand within budget, measured
 from served traffic. Without it, the number conflates slowness with failure.
 
-The share gauge is updated by eligible requests and observations. As with the
+Named continuation pools keep their deterministic failover order and explicitly opt out of AIMD.
+Catalog provisioning preserves API overrides while routing remains compatible, and clears enabled
+AIMD overrides when the catalog changes to weighted routing or disables fallback.
+
+The share gauge is updated by eligible requests and observations. Replaced or removed
+controllers are retired so their in-flight observations cannot publish stale metrics. As with the
 other non-evicting metrics, a disabled or idle pool can retain its last published
 value; consult configuration and recent adjustment activity when interpreting it.
 

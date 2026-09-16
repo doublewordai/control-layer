@@ -183,6 +183,12 @@ impl ProviderPool {
         }
     }
 
+    pub(crate) fn retire_aimd(&self) {
+        if let Some(controller) = &self.controller {
+            controller.lock().unwrap().retire();
+        }
+    }
+
     pub(crate) fn aimd_enabled(&self) -> bool {
         self.controller.is_some()
     }
@@ -195,7 +201,11 @@ impl ProviderPool {
     ) -> SelectIter<'_> {
         let mut iter = self.select_iter();
         if eligible && let Some(controller) = &self.controller {
-            let share = controller.lock().unwrap().share();
+            let controller = controller.lock().unwrap();
+            if !controller.active() {
+                return iter;
+            }
+            let share = controller.share();
             metrics::gauge!("onwards_provider_share", "model" => model.to_string(), "pool" => pool.to_string()).set(share);
             iter.alternate_first = rand::rng().random::<f64>() >= share;
         }
@@ -455,6 +465,8 @@ impl ProviderPool {
                 == old.fallback.as_ref().and_then(|f| f.first_token_timeout_ms);
         if self.controller.is_some() && old.controller.is_some() && same_preferred && same_config {
             self.controller = old.controller.clone();
+        } else {
+            old.retire_aimd();
         }
         for new_provider in &mut self.providers {
             if let Some(old_provider) = old.providers.iter().find(|old_p| {
@@ -680,6 +692,20 @@ mod tests {
             reordered.controller.as_ref().unwrap(),
             old.controller.as_ref().unwrap()
         ));
+        assert!(!old.controller.as_ref().unwrap().lock().unwrap().active());
+        assert!(
+            reordered
+                .controller
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .active()
+        );
+        assert!(
+            old.observe(true, 0, "model", "default", Instant::now())
+                .is_none()
+        );
         let mut changed = aimd_pool();
         changed
             .fallback

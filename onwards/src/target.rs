@@ -1067,6 +1067,11 @@ impl TargetPools {
     /// A pool that did not exist before starts at zero, as a new pool should.
     pub fn adopt_provider_state(&mut self, old: &TargetPools) {
         self.default.adopt_provider_state(&old.default);
+        for (name, pool) in &old.extra {
+            if !self.extra.contains_key(name) {
+                pool.retire_aimd();
+            }
+        }
         for (name, pool) in self.extra.iter_mut() {
             if let Some(old_pool) = old.extra.get(name) {
                 pool.adopt_provider_state(old_pool);
@@ -1519,7 +1524,11 @@ impl Targets {
                         // Remove deleted targets
                         for key in current_target_keys {
                             if !new_targets.targets.contains_key(&key) {
-                                targets.remove(&key);
+                                if let Some((_, removed)) = targets.remove(&key) {
+                                    for (_, pool) in removed.iter() {
+                                        pool.retire_aimd();
+                                    }
+                                }
                             }
                         }
 

@@ -82,6 +82,7 @@ pub(crate) enum Outcome {
 #[derive(Debug)]
 pub(crate) struct Controller {
     config: AimdConfig,
+    active: bool,
     share: f64,
     generation: u64,
     next_id: u64,
@@ -97,6 +98,7 @@ impl Controller {
     pub(crate) fn new(config: AimdConfig, now: Instant) -> Self {
         Self {
             config,
+            active: true,
             share: 1.0,
             generation: 0,
             next_id: 0,
@@ -111,7 +113,16 @@ impl Controller {
     pub(crate) fn share(&self) -> f64 {
         self.share
     }
+    pub(crate) fn retire(&mut self) {
+        self.active = false;
+    }
+    pub(crate) fn active(&self) -> bool {
+        self.active
+    }
     fn begin(&mut self) -> Option<(u64, u64)> {
+        if !self.active {
+            return None;
+        }
         // Never evict an unfinished sample in favor of a newer, faster one.
         // At capacity stop admitting samples until the cohort has resolved.
         if self.window.len() == self.config.window_samples && self.pending > 0 {
@@ -139,7 +150,7 @@ impl Controller {
         outcome: Outcome,
         now: Instant,
     ) -> Option<&'static str> {
-        if generation != self.generation {
+        if !self.active || generation != self.generation {
             return None;
         }
         let first_id = self.window.front()?.0;
@@ -267,6 +278,9 @@ impl Attempt {
         }
         self.completed = true;
         let mut controller = self.controller.lock().unwrap();
+        if !controller.active() {
+            return;
+        }
         if let Some(direction) =
             controller.finish(self.generation, self.id, outcome, Instant::now())
         {
@@ -301,6 +315,20 @@ mod tests {
         let (generation, id) = c.begin().unwrap();
         c.finish(generation, id, outcome, now)
     }
+    #[test]
+    fn retired_controller_rejects_pending_and_new_observations() {
+        let start = Instant::now();
+        let mut controller = Controller::new(AimdConfig::default(), start);
+        let (generation, id) = controller.begin().unwrap();
+        controller.retire();
+        assert_eq!(
+            controller.finish(generation, id, Outcome::Breach, start),
+            None
+        );
+        assert_eq!(controller.breaches, 0);
+        assert_eq!(controller.begin(), None);
+    }
+
     // Synthetic per-replica scenarios exercise low/high breach rates, sparse
     // traffic, and bounded healthy windows. Successful frames are within budget.
     #[test]

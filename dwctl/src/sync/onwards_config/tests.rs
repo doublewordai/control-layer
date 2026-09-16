@@ -802,10 +802,9 @@ async fn test_completions_pool_forces_priority_strategy(pool: sqlx::PgPool) {
         .unwrap();
     sqlx::query(
         "INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, pool)
-         SELECT composite_model_id, deployed_model_id, 1, true, 0, 'completions'
+         SELECT composite_model_id, deployed_model_id, 1, true, sort_order, 'completions'
          FROM deployed_model_components
-         WHERE composite_model_id = '50000000-0000-0000-0000-000000000001' AND pool = 'default'
-         LIMIT 1",
+         WHERE composite_model_id = '50000000-0000-0000-0000-000000000001' AND pool = 'default'",
     )
     .execute(&pool)
     .await
@@ -825,6 +824,10 @@ async fn test_completions_pool_forces_priority_strategy(pool: sqlx::PgPool) {
         OnwardsLoadBalanceStrategy::Priority,
         "the completions pool is a failover list regardless of the composite's strategy"
     );
+    let named = composite.value().resolve(RequestClass::Completions);
+    assert_eq!(named.len(), 2);
+    assert!(!named.fallback().unwrap().aimd.as_ref().unwrap().enabled);
+    assert!(composite.value().default_pool().fallback().unwrap().aimd.is_none());
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
