@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0](https://github.com/doublewordai/control-layer/compare/onwards-v1.1.0...onwards-v1.2.0) (2026-09-16)
+
+
+### Features
+
+* **onwards:** add default-on AIMD provider share control ([#1793](https://github.com/doublewordai/control-layer/issues/1793)) ([5e848a5](https://github.com/doublewordai/control-layer/commit/5e848a547c8f22218e3fcdd8335b3fcd7a982a1e))
+
 ## [1.1.0](https://github.com/doublewordai/control-layer/compare/onwards-v1.0.1...onwards-v1.1.0) (2026-09-16)
 
 
