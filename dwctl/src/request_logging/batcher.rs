@@ -291,7 +291,8 @@ where
     /// A tuple of (projector, writer) where the writer is used by AnalyticsHandler.
     pub fn new(pool: impl sqlx_pool_router::PoolProvider, config: Config, metrics_recorder: Option<M>) -> (Self, AnalyticsOutboxWriter) {
         let pool = sqlx_pool_router::DynPools::new(pool);
-        let batch_size = config.analytics.batch_size;
+        // A zero limit would leave every durable row unprojected forever.
+        let batch_size = config.analytics.batch_size.max(1);
         let projector_notify = Arc::new(Notify::new());
 
         let batcher = Self {
