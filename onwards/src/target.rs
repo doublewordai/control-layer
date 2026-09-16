@@ -13,6 +13,7 @@
 //!
 //! Pool-level configuration (keys, rate_limit) applies to all providers in the pool.
 //! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
+use crate::aimd::AimdConfig;
 use crate::auth::KeySet;
 use crate::load_balancer::{Provider, ProviderPool};
 use crate::reasoning::ReasoningTranslationConfig;
@@ -230,6 +231,9 @@ pub struct FallbackConfig {
     /// provider starts cleanly.
     #[serde(default)]
     pub first_token_timeout_ms: Option<u64>,
+    /// Optional priority-only preferred-first share controller.
+    #[serde(default)]
+    pub aimd: Option<AimdConfig>,
 }
 
 impl FallbackConfig {
@@ -1278,6 +1282,26 @@ fn build_pool(
     pool_config: PoolConfig,
     global_keys: &KeySet,
 ) -> Result<ProviderPool, anyhow::Error> {
+    if let Some(fallback) = &pool_config.fallback
+        && let Some(config) = &fallback.aimd
+    {
+        config.validate().map_err(|e| anyhow!(e))?;
+        if !fallback.enabled || pool_config.strategy != LoadBalanceStrategy::Priority {
+            return Err(anyhow!(
+                "AIMD requires enabled fallback and priority strategy"
+            ));
+        }
+        // Explicit override prevents a shorter proxy-wide deadline from
+        // turning a censored observation into a false budget breach.
+        if !fallback
+            .first_token_timeout_ms
+            .is_some_and(|ms| ms == 0 || (ms >= config.latency_budget_ms && ms <= 3_600_000))
+        {
+            return Err(anyhow!(
+                "AIMD requires an explicit first_token_timeout_ms of 0 or at least latency_budget_ms"
+            ));
+        }
+    }
     for (index, provider) in pool_config.providers.iter().enumerate() {
         if let Some(config) = provider.reasoning_translation.as_ref() {
             config.validate().map_err(|error| {

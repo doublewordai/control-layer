@@ -481,3 +481,142 @@ async fn strict_stream_beyond_peek_limit_is_forwarded_without_a_sample() {
         None
     );
 }
+
+fn aimd_config() -> serde_json::Value {
+    json!({"latency_budget_ms": 10, "breach_rate_target": 0.1, "window_samples": 10,
+        "min_samples": 2, "share_step": 0.1, "share_decay": 0.5, "share_floor": 0.1, "dwell_ms": 1})
+}
+
+fn share(alias: &str) -> Option<f64> {
+    METRICS
+        .render()
+        .lines()
+        .find(|line| {
+            line.starts_with("onwards_provider_share{")
+                && line.contains(&format!("model=\"{alias}\""))
+        })
+        .map(|line| line.split_whitespace().last().unwrap().parse().unwrap())
+}
+
+#[tokio::test(start_paused = true)]
+async fn aimd_observes_content_after_peek_cap_and_changes_share() {
+    LazyLock::force(&METRICS);
+    let alias = "aimd-peek-cap";
+    let mut cfg = config(alias, true);
+    cfg["targets"][alias]["fallback"]["first_token_timeout_ms"] = json!(0);
+    cfg["targets"][alias]["fallback"]["aimd"] = aimd_config();
+    let targets = Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap();
+    // More comments than the lead reader allows: the controller must still
+    // see the first content frame, through the response body's observer.
+    let body = format!("{}{CONTENT}data: [DONE]\n\n", ": keep-alive\n\n".repeat(8));
+    let mock = MockHttpClient::new_delayed_streaming_sequence(
+        StatusCode::OK,
+        vec![
+            (Duration::from_millis(20), vec![body.clone()]),
+            (Duration::from_millis(20), vec![body.clone()]),
+        ],
+    );
+    let server = TestServer::new(build_router(AppState::with_client(targets, mock))).unwrap();
+    for _ in 0..2 {
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({"model":alias,"stream":true}))
+            .await;
+        response.assert_status_ok();
+        assert_eq!(response.text(), body);
+    }
+    assert_eq!(share(alias), Some(0.5));
+    assert_eq!(
+        value(
+            "onwards_first_token_seconds_count",
+            alias,
+            "default",
+            "preferred"
+        ),
+        None
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn aimd_header_deadlines_are_censored_once_and_alternates_are_inert() {
+    LazyLock::force(&METRICS);
+    let alias = "aimd-header-deadline";
+    let mut cfg = config(alias, true);
+    cfg["targets"][alias]["fallback"]["aimd"] = aimd_config();
+    let targets = Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap();
+    let client = HeaderClient {
+        mock: MockHttpClient::new_streaming(StatusCode::OK, vec![CONTENT.into()]),
+        network_error: false,
+        header_delay: Some(Duration::from_millis(200)),
+    };
+    let server = TestServer::new(build_router(AppState::with_client(targets, client))).unwrap();
+    for _ in 0..2 {
+        server
+            .post("/v1/chat/completions")
+            .json(&json!({"model":alias,"stream":true}))
+            .await
+            .assert_status_ok();
+    }
+    assert_eq!(share(alias), Some(0.5));
+    assert_eq!(
+        value(
+            "onwards_first_token_breaches_total",
+            alias,
+            "default",
+            "preferred"
+        ),
+        Some(2.0)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn aimd_unknown_and_exempt_outcomes_cannot_demote() {
+    LazyLock::force(&METRICS);
+    for (alias, strict, exempt, body, expected) in [
+        ("aimd-done", true, false, "data: [DONE]\n\n", Some(1.0)),
+        (
+            "aimd-embedded",
+            true,
+            false,
+            "data: {\"error\":{\"code\":502}}\n\n",
+            Some(1.0),
+        ),
+        ("aimd-exempt", true, true, CONTENT, None),
+        ("aimd-nonstrict", false, false, CONTENT, None),
+    ] {
+        let mut cfg = config(alias, strict);
+        cfg["targets"][alias]["fallback"]["aimd"] = aimd_config();
+        let targets = Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap();
+        let mock = MockHttpClient::new_streaming(StatusCode::OK, vec![body.into()]);
+        let state =
+            AppState::with_client(targets, mock).with_first_token_timeout_exempt_header("x-batch");
+        let server = TestServer::new(build_router(state)).unwrap();
+        for _ in 0..3 {
+            let request = server
+                .post("/v1/chat/completions")
+                .json(&json!({"model":alias,"stream":true}));
+            let request = if exempt {
+                request.add_header("x-batch", "true")
+            } else {
+                request
+            };
+            let _ = request.await;
+        }
+        assert_eq!(share(alias), expected, "{alias}");
+    }
+}
+
+#[test]
+fn aimd_rejects_unsupported_strategy_and_ambiguous_deadline() {
+    for (strategy, deadline) in [
+        ("weighted_random", json!(100)),
+        ("priority", json!(5)),
+        ("priority", json!(null)),
+    ] {
+        let mut cfg = config("invalid-aimd", true);
+        cfg["targets"]["invalid-aimd"]["strategy"] = json!(strategy);
+        cfg["targets"]["invalid-aimd"]["fallback"]["aimd"] = aimd_config();
+        cfg["targets"]["invalid-aimd"]["fallback"]["first_token_timeout_ms"] = deadline;
+        assert!(Targets::from_config(serde_json::from_value(cfg).unwrap()).is_err());
+    }
+}

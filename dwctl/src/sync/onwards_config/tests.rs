@@ -49,6 +49,8 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         backoff_factor: 2.0,
         backoff_jitter: "full".to_string(),
         backoff_max_total_ms: None,
+        first_token_timeout_ms: None,
+        aimd: None,
         endpoint_api_key: None,
         auth_header_name: "Authorization".to_string(),
         auth_header_prefix: "Bearer ".to_string(),
@@ -1328,6 +1330,8 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             backoff_factor: 2.0,
             backoff_jitter: "full".to_string(),
             backoff_max_total_ms: None,
+            first_token_timeout_ms: None,
+            aimd: None,
             sanitize_responses: true,
             trusted: false,
             reasoning_translation_overrides: None,
@@ -1550,6 +1554,8 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             backoff_factor: 2.0,
             backoff_jitter: "full".to_string(),
             backoff_max_total_ms: None,
+            first_token_timeout_ms: None,
+            aimd: None,
             allowed_batch_completion_windows: None,
             metadata: None,
             sanitize_responses: true,
@@ -1594,6 +1600,8 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             backoff_factor: 2.0,
             backoff_jitter: "full".to_string(),
             backoff_max_total_ms: None,
+            first_token_timeout_ms: None,
+            aimd: None,
             metadata: None,
             sanitize_responses: true,
             trusted: false,
@@ -1938,4 +1946,33 @@ async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool
     let regular = targets.targets.get("regular-public").expect("regular-public should exist");
     assert_eq!(regular.value().pool_count(), 1);
     assert!(regular.value().resolved_name(onwards::target::RequestClass::Completions).is_none());
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn aimd_and_first_token_deadline_survive_database_sync(pool: sqlx::PgPool) {
+    let config = serde_json::json!({"latency_budget_ms":100,"breach_rate_target":0.1,"window_samples":20,
+        "min_samples":5,"share_step":0.05,"share_decay":0.5,"share_floor":0.1,"dwell_ms":1000});
+    sqlx::query(
+        "UPDATE deployed_models SET aimd = $1, first_token_timeout_ms = 200, fallback_enabled = true WHERE alias = 'composite-priority'",
+    )
+    .bind(config.clone())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE deployed_models SET first_token_timeout_ms = 300, fallback_enabled = true WHERE alias = 'regular-public'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], true, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").unwrap();
+    let fallback = composite.value().default_pool().fallback().unwrap();
+    assert_eq!(fallback.first_token_timeout_ms, Some(200));
+    assert_eq!(serde_json::to_value(fallback.aimd.as_ref().unwrap()).unwrap(), config);
+    let standard = targets.targets.get("regular-public").unwrap();
+    assert_eq!(
+        standard.value().default_pool().fallback().unwrap().first_token_timeout_ms,
+        Some(300)
+    );
 }

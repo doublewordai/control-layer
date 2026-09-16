@@ -7,8 +7,8 @@ use crate::api::models::cache_pricing::CachePricingResponse;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::models::deployments::{
-    BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy, ModelCatalogMetadata, ModelType,
-    ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
+    AimdConfig, BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy, ModelCatalogMetadata,
+    ModelType, ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
 };
 use crate::reasoning::{ReasoningTranslationOverrides, SupportedReasoningEfforts};
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
@@ -257,6 +257,12 @@ pub struct StandardModelCreate {
     pub backoff_jitter: JitterStrategy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_max_total_ms: Option<i32>,
+    /// Stream first-frame deadline; null inherits the global default, 0 disables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_timeout_ms: Option<i64>,
+    /// Priority-only share controller; absent/null disables. Requires explicit deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aimd: Option<AimdConfig>,
     /// Traffic routing rules evaluated against API key labels.
     /// Each rule matches on key labels (e.g., purpose) and either denies or redirects traffic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -338,6 +344,12 @@ pub struct CompositeModelCreate {
     /// (null = no budget cap).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_max_total_ms: Option<i32>,
+    /// Stream first-frame deadline; null inherits the global default, 0 disables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_timeout_ms: Option<i64>,
+    /// Priority-only share controller; absent/null disables. Requires explicit deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aimd: Option<AimdConfig>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false, used when strict_mode=false)
     #[serde(default)]
     pub sanitize_responses: bool,
@@ -445,6 +457,12 @@ pub struct DeployedModelUpdate {
     /// (null = no change, Some(None) = clear cap, Some(Some(n)) = set).
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub backoff_max_total_ms: Option<Option<i32>>,
+    /// Omitted = unchanged; null = inherit proxy default; 0 = disable deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub first_token_timeout_ms: Option<Option<i64>>,
+    /// Omitted = unchanged; null = disable; object = replace controller configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub aimd: Option<Option<AimdConfig>>,
     /// Whether to sanitize/filter sensitive data from model responses (null = no change, used when strict_mode=false)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
@@ -608,6 +626,8 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             max_attempts: db.fallback_max_attempts,
             backoff,
             max_total_backoff_ms: db.backoff_max_total_ms,
+            first_token_timeout_ms: db.first_token_timeout_ms,
+            aimd: db.aimd,
         });
 
         Self {
