@@ -168,17 +168,14 @@ Consequences to accept explicitly:
 
 ### What counts as a first token
 
-`classify_sse_event` maps a frame whose payload is `[DONE]` to `Data`, and
-`read_lead_frames` sets `saw_data` on any `Data` frame. So the first decisive
-frame of a zero-token stream can be `[DONE]`, which would otherwise be recorded
-as a first-token success.
+`classify_sse_event` distinguishes `Data` from the `[DONE]` sentinel's `Done`
+variant. `read_lead_frames` sets `saw_data` for both, preserving the existing
+non-empty verdict, but sets `saw_content` only for `Data`. The histogram uses
+`saw_content`, so `[DONE]`-only streams neither produce samples nor become
+retryable empty responses. Keep-alive comments do not set either flag.
 
-A first-token sample must therefore require a data frame that is **not**
-`[DONE]`. Keep-alive comment frames already do not count.
-
-Note that `saw_data` cannot simply be withheld for `[DONE]`: it currently
-suppresses the `EmptyBody` classification, so withholding it would make a
-`[DONE]`-only stream newly retryable. The distinction needs its own flag.
+A sample measures the first non-sentinel data frame, which may contain metadata
+rather than generated text. Observing literal token content is not implemented.
 
 ### Decision: scoped to the priority strategy
 
@@ -308,7 +305,7 @@ from served traffic. Without it, the number conflates slowness with failure.
 
 1. Plumb per-model fallback values through the onwards-config sync so a budget
    can be set per alias. Behaviour unchanged.
-2. Record observations and export them, with no control attached: the
+2. **Implemented:** record observations and export them, with no control attached: the
    uncensored histogram (strict-mode SSE, excluding `[DONE]`) and the breach
    counter, both labelled by role so preferred and alternate are separable.
 3. Add the controller and its state, with identity-checked adoption across
@@ -318,9 +315,10 @@ from served traffic. Without it, the number conflates slowness with failure.
 5. Enable per alias, starting with one whose upstream latency is known to be
    load-dependent.
 
-Each step is independently shippable, and steps 1–2 are useful on their own:
-they answer what the first-token latency distribution actually is per role, and
-how often the deadline fires, neither of which is measured today.
+Each step is independently shippable. Step 2 now exposes observed first-frame
+latencies per role and failover-deadline expiries, subject to the coverage
+limits above. Step 1 remains planned and will make the failover deadline
+configurable per alias through dwctl.
 
 ## Testing
 
