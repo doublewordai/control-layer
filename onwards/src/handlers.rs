@@ -82,8 +82,13 @@ enum SseEventKind {
     /// A `data:` frame carrying an embedded provider error — the contained
     /// `error.code`, per [`embedded_error_status`].
     Error(u16, serde_json::Value),
-    /// A `data:` frame carrying normal content (or the `[DONE]` sentinel).
+    /// A `data:` frame carrying normal content — an actual token.
     Data,
+    /// The `[DONE]` sentinel. A `data:` frame, but not a token: it ends a
+    /// stream rather than carrying content. Decisive like [`SseEventKind::Data`]
+    /// and equally proof the stream was not empty, but it must never be counted
+    /// as a first token.
+    Done,
     /// No `data:` field: an SSE comment / keep-alive (e.g. `: keep-alive`), which
     /// the caller peeks past to reach the first real frame.
     Comment,
@@ -118,7 +123,7 @@ fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
         return SseEventKind::Comment;
     }
     if data.trim() == "[DONE]" {
-        return SseEventKind::Data;
+        return SseEventKind::Done;
     }
     if let Ok(body) = serde_json::from_str::<serde_json::Value>(data.trim())
         && let Some(status) = embedded_error_status(&body)
@@ -144,8 +149,15 @@ fn requests_stream(body: &[u8]) -> bool {
 struct LeadFrames {
     /// The provider embedded an error status in the first real frame.
     embedded: Option<(u16, serde_json::Value)>,
-    /// A real content frame arrived (definitely not empty).
+    /// A `data:` frame arrived, so the stream is definitely not empty. Set for
+    /// the `[DONE]` sentinel too: it proves non-emptiness even though it carries
+    /// no token. This is what suppresses the retryable `EmptyBody` verdict, so
+    /// it must stay set for `[DONE]`.
     saw_data: bool,
+    /// A data frame carrying actual content arrived — `[DONE]` excluded. This,
+    /// not `saw_data`, is the first-token signal: a zero-token stream can open
+    /// with `[DONE]`.
+    saw_content: bool,
     /// The stream closed (`None`) or errored (`Err`) before any content — a
     /// *terminal* empty, safe to retry.
     stream_ended: bool,
@@ -174,6 +186,15 @@ async fn read_lead_frames<S, E>(
                     return;
                 }
                 SseEventKind::Data => {
+                    lead.saw_data = true;
+                    lead.saw_content = true;
+                    peeked.push(Ok(chunk));
+                    return;
+                }
+                // Decisive exactly as `Data` is — it ends the peek and marks the
+                // stream non-empty — but it is not a first token, so it leaves
+                // `saw_content` alone.
+                SseEventKind::Done => {
                     lead.saw_data = true;
                     peeked.push(Ok(chunk));
                     return;
@@ -788,9 +809,19 @@ pub async fn target_message_handler<T: HttpClient>(
                 && requests_stream(&body_bytes)
         });
 
-    for (_member_idx, target, connection_guard) in pool.select_iter() {
+    for (member_idx, target, connection_guard) in pool.select_iter() {
         any_attempted = true;
         attempt_number += 1;
+        // First-token observations are attributed to the provider actually
+        // tried: `preferred` is the pool's first provider in definition order,
+        // anything else is an alternate. Two values, so the label stays bounded
+        // on a recorder that deliberately never evicts series.
+        let provider_role = if member_idx == 0 {
+            "preferred"
+        } else {
+            "alternate"
+        };
+        let attempt_start = tokio::time::Instant::now();
         // This attempt's first-frame deadline; `None` on the final attempt.
         let first_token_deadline = first_token_timeout
             .filter(|_| (attempt_number as usize) < pool_max_attempts)
@@ -1273,6 +1304,17 @@ pub async fn target_message_handler<T: HttpClient>(
                             "No first token before the failover deadline; trying the next provider"
                         );
                         tracing::Span::current().record("onwards.fallback", "first_token_timeout");
+                        // A breach is a CENSORED observation: it establishes only
+                        // that the first token took longer than the deadline, not
+                        // how long it would have taken. Counted separately so the
+                        // deadline value never contaminates the latency histogram.
+                        metrics::counter!(
+                            "onwards_first_token_breaches_total",
+                            "model" => model_name.to_string(),
+                            "pool" => resolved_pool_name.unwrap_or("default"),
+                            "role" => provider_role,
+                        )
+                        .increment(1);
                         // Dropping `events` closes the upstream stream, which is
                         // the provider's signal to stop generating.
                         return LoopAction::Continue(Some(OnwardsErrorResponse::gateway_timeout()));
@@ -1296,6 +1338,20 @@ pub async fn target_message_handler<T: HttpClient>(
                             "Timed out waiting for decisive SSE frame; forwarding stream unmodified"
                         );
                     }
+                }
+                // An actual first token arrived: record the uncensored latency.
+                // `saw_content` excludes the `[DONE]` sentinel, which is a data
+                // frame but carries no token. Only reached on the success paths —
+                // a breach returns above — so this histogram holds observed
+                // latencies only, never censored ones.
+                if lead.saw_content {
+                    metrics::histogram!(
+                        "onwards_first_token_seconds",
+                        "model" => model_name.to_string(),
+                        "pool" => resolved_pool_name.unwrap_or("default"),
+                        "role" => provider_role,
+                    )
+                    .record(attempt_start.elapsed().as_secs_f64());
                 }
                 // Forward the consumed frames followed by the remainder, so a clean
                 // (or slow) stream is intact; on a retry path below this `response`
@@ -1849,7 +1905,7 @@ mod tests {
 
     #[test]
     fn classify_sse_event_distinguishes_error_data_and_comment() {
-        use SseEventKind::{Comment, Data, Error};
+        use SseEventKind::{Comment, Data, Done, Error};
 
         // A provider's first-frame error on a 200 stream.
         assert_eq!(
@@ -1874,12 +1930,14 @@ mod tests {
             Error(429, serde_json::json!({"code":429}))
         );
 
-        // Normal content and the [DONE] sentinel are data frames, not errors.
+        // Normal content is a data frame, not an error.
         assert_eq!(
             classify_sse_event(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
             Data
         );
-        assert_eq!(classify_sse_event(b"data: [DONE]\n\n"), Data);
+        // The [DONE] sentinel is a data frame but NOT content: it closes a stream
+        // without carrying a token, so it must not count as a first token.
+        assert_eq!(classify_sse_event(b"data: [DONE]\n\n"), Done);
 
         // Comment / keep-alive frames carry no `data:` field.
         assert_eq!(classify_sse_event(b": keep-alive\n\n"), Comment);
