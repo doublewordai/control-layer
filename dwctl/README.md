@@ -265,3 +265,13 @@ Migrations are stored in the `migrations/` directory, and run automatically on s
 - Management API requests are served under `/admin/api/v1/*`
 - Provider display configs (operator-set logos / display names for inference providers) live under `/admin/api/v1/provider-display-configs`, with `GET .../{provider_key}/icon` serving as a same-origin proxy for operator-set icon URLs so the dashboard can keep a tight `img-src` CSP regardless of which CDN an admin pastes
 
+## First-token metrics
+
+The embedded onwards proxy records `onwards_first_token_seconds` and
+`onwards_first_token_breaches_total` with `model`, `pool`, and `role` labels.
+The histogram measures observed strict-mode SSE data frames; the counter
+records first-token failover deadlines, including waits for response headers.
+Timeouts never enter the latency histogram. See
+[First-token observations](../onwards/docs/src/load-balancing.md#first-token-observations)
+for sampling limits and label semantics before using these series to compare
+providers. Provider selection is unchanged; load-aware control is not enabled.

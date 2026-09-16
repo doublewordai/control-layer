@@ -1,5 +1,31 @@
 # Changelog
 
+## [11.13.0](https://github.com/doublewordai/control-layer/compare/v11.12.0...v11.13.0) (2026-09-16)
+
+
+### Features
+
+* **onwards:** measure first-token latency per provider role ([#1790](https://github.com/doublewordai/control-layer/issues/1790)) ([adc080b](https://github.com/doublewordai/control-layer/commit/adc080b07f6b190876bf75f034297a8a21b4961b))
+
+## [11.12.0](https://github.com/doublewordai/control-layer/compare/v11.11.0...v11.12.0) (2026-09-16)
+
+
+### Features
+
+* implicit caching using engine / upstream stats ([#1781](https://github.com/doublewordai/control-layer/issues/1781)) ([7f2adb4](https://github.com/doublewordai/control-layer/commit/7f2adb4557a29c6fcc4f4ad5f1860550a1369395))
+
+
+### Bug Fixes
+
+* **analytics:** persist billing writes through outbox ([#1787](https://github.com/doublewordai/control-layer/issues/1787)) ([7896933](https://github.com/doublewordai/control-layer/commit/7896933111c4084706884bbf11972279cb83ec6d))
+* **ci:** track the fusillade-arsenal 4.1.0 and fusillade-core 6.0.0 release baselines ([#1784](https://github.com/doublewordai/control-layer/issues/1784)) ([b644c6f](https://github.com/doublewordai/control-layer/commit/b644c6fbb7727309761f64ea0dae9e4ce2c8c1f9))
+* **retention:** use indexed probes for startup and purge route queries ([#1783](https://github.com/doublewordai/control-layer/issues/1783)) ([364cf42](https://github.com/doublewordai/control-layer/commit/364cf42636935d8d3c1ad1799f3225e392d48d3c))
+
+
+### Miscellaneous
+
+* remove unused TranslationRegistry::default and is_empty ([#1695](https://github.com/doublewordai/control-layer/issues/1695)) ([2358272](https://github.com/doublewordai/control-layer/commit/23582720503bbea35e96597ba439977b37d936f2))
+
 ## [11.11.0](https://github.com/doublewordai/control-layer/compare/v11.10.2...v11.11.0) (2026-09-15)
 
 

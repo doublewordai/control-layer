@@ -59,6 +59,43 @@ The deadline is only armed when all of these hold, so it can reroute a stalled r
 
 It bounds the wait for response headers and, in strict mode, the wait for the first real SSE frame. Keep-alive comments don't count. Nothing has reached the client at that point, so the next provider starts cleanly.
 
+### First-token observations
+
+Two metrics expose the existing first-token checks without changing provider
+selection or failover:
+
+| Metric | Type | Meaning |
+|--------|------|---------|
+| `onwards_first_token_seconds` | Histogram | Time from the start of an attempt to its first observed non-`[DONE]` SSE data frame |
+| `onwards_first_token_breaches_total` | Counter | First-token failover deadlines that expired, while waiting for headers or an SSE frame |
+
+Both have `model`, `pool`, and `role` labels. `model` is the requested, validated
+alias, as for `onwards_model_inflight`; `pool` is the resolved pool name
+(`default` or a named pool such as `completions`, including after a routing
+redirect). `role` is `preferred` for the first provider in definition order
+and `alternate` for every other provider, regardless of attempt order or
+selection strategy. Alternate providers are aggregated; provider URLs are
+never labels.
+
+Samples come only from the existing strict-mode 2xx SSE lead-frame check.
+They include the wait for headers and skip keep-alive comments, embedded
+errors, and `[DONE]`. A `[DONE]`-only stream remains valid and does not become
+retryable. The measurement is time to a data frame, which can contain metadata
+such as a role delta; it does not require generated text.
+
+This histogram has partial coverage: non-strict streams and non-SSE responses
+produce no samples. Without an armed first-token deadline, the existing peek
+has time and event limits; a first frame arriving after those limits is also
+unobserved. Observing those streams would require additional instrumentation.
+Do not interpret the histogram as the full latency distribution or combine its
+count with the breach counter to estimate an overall breach rate.
+
+A deadline expiry is a censored observation, so it increments only the breach
+counter, never the histogram. The counter measures the configured **failover
+deadline**, not a separate latency budget. Network errors, HTTP or embedded
+upstream errors, and the provider's independent request timeout do not increment
+it. Non-strict requests can still increment it while waiting for headers.
+
 ## Pool-level options
 
 Settings that apply to the entire alias:
