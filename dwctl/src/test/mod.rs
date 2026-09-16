@@ -1,6 +1,7 @@
 pub mod anthropic;
 pub mod cache_classifier;
 pub mod databases;
+pub mod request_params;
 pub mod responses;
 pub mod sigterm_drain;
 pub mod sla;
@@ -33,15 +34,32 @@ struct StreamingFixture {
     regular_user_id: Uuid,
     api_key: String,
     group_id: Uuid,
+    /// The mock endpoint the fixture's deployment is hosted on. Tests that need a second
+    /// deployment should reuse this rather than creating another endpoint: endpoint creation
+    /// runs model auto-discovery, which conflicts on aliases already claimed by this one.
+    endpoint_id: Uuid,
 }
 
 async fn setup_streaming_fixture(pool: &PgPool, mock_endpoint_url: String, model_name: &str, alias: &str) -> StreamingFixture {
+    setup_streaming_fixture_with_config(pool, mock_endpoint_url, model_name, alias, |_| {}).await
+}
+
+/// [`setup_streaming_fixture`] with a hook to adjust the config before the app is built, for
+/// tests that need a non-default toggle (e.g. `request_params.model_suffix`).
+async fn setup_streaming_fixture_with_config(
+    pool: &PgPool,
+    mock_endpoint_url: String,
+    model_name: &str,
+    alias: &str,
+    customise: impl FnOnce(&mut crate::config::Config),
+) -> StreamingFixture {
     let mut config = crate::test::utils::create_test_config();
     config.background_services.onwards_sync.enabled = true;
     config.enable_request_logging = true;
     // Batch traffic to these paths is forced to stream and reassembled on the way
     // back, which is what these fixtures exercise.
     config.background_services.batch_daemon.streamable_endpoints = vec!["/v1/chat/completions".to_string(), "/v1/completions".to_string()];
+    customise(&mut config);
 
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
         .await
@@ -151,6 +169,7 @@ async fn setup_streaming_fixture(pool: &PgPool, mock_endpoint_url: String, model
         regular_user_id: regular_user.id,
         api_key: api_key.key,
         group_id: group.id,
+        endpoint_id: endpoint.id,
     }
 }
 
