@@ -326,8 +326,24 @@ where
         loop {
             let observe = tokio::select! {
                 _ = shutdown_token.cancelled() => {
-                    while matches!(self.project_outbox_batch().await, Ok(projected) if projected > 0) {}
-                    info!("Analytics outbox projector shutdown complete");
+                    let drained = loop {
+                        match self.project_outbox_batch().await {
+                            Ok(0) => break true,
+                            Ok(_) => {}
+                            Err(error) => {
+                                crate::background_error!(
+                                    ANALYTICS_BATCHER,
+                                    "outbox_project",
+                                    Error,
+                                    error = %error,
+                                    "Failed to drain analytics outbox during shutdown; rows remain durable"
+                                );
+                                counter!("dwctl_analytics_outbox_projection_total", "result" => "error").increment(1);
+                                break false;
+                            }
+                        }
+                    };
+                    info!(drained, "Analytics outbox projector shutdown complete");
                     break;
                 }
                 _ = outbox_tick.tick() => {

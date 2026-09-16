@@ -571,10 +571,20 @@ pub async fn target_message_handler<T: HttpClient>(
         );
     }
 
-    let authenticated_api_key_id = bearer_token
-        .and_then(|token| state.targets.key_labels.get(token))
-        .and_then(|labels| labels.get("api_key_id").cloned())
-        .and_then(|id| id.parse::<Uuid>().ok());
+    let authenticated_api_key_id = bearer_token.and_then(|token| {
+        let authenticated = state.targets.targets.iter().any(|entry| {
+            entry
+                .value()
+                .default_pool()
+                .keys()
+                .is_some_and(|keys| auth::validate_bearer_token(keys, token))
+        });
+        authenticated
+            .then(|| state.targets.key_labels.get(token))
+            .flatten()
+            .and_then(|labels| labels.get("api_key_id").cloned())
+            .and_then(|id| id.parse::<Uuid>().ok())
+    });
 
     // Evaluate routing rules against key labels (after auth, before rate limiting).
     // Rules on the pool are matched against the authenticated key's labels.
@@ -1764,10 +1774,7 @@ pub async fn target_message_handler<T: HttpClient>(
 }
 
 #[instrument(skip(state, req))]
-pub async fn models<T: HttpClient>(
-    State(state): State<AppState<T>>,
-    req: Request,
-) -> impl IntoResponse {
+pub async fn models<T: HttpClient>(State(state): State<AppState<T>>, req: Request) -> Response {
     // Extract bearer token from Authorization header
     let bearer_token = req
         .headers()
@@ -1802,8 +1809,21 @@ pub async fn models<T: HttpClient>(
         .map(|entry| entry.key().clone())
         .collect();
 
-    // Create filtered response
-    Json(ListModelResponse::from_model_names(&accessible_models))
+    let authenticated_api_key_id = bearer_token
+        .and_then(|token| state.targets.key_labels.get(token))
+        .and_then(|labels| labels.get("api_key_id").cloned())
+        .and_then(|id| id.parse::<Uuid>().ok());
+
+    // Create filtered response and retain the authenticated identity for
+    // in-process analytics. Response extensions are never sent to the client.
+    let mut response =
+        Json(ListModelResponse::from_model_names(&accessible_models)).into_response();
+    if let Some(api_key_id) = authenticated_api_key_id {
+        response
+            .extensions_mut()
+            .insert(AuthenticatedApiKeyId(api_key_id));
+    }
+    response
 }
 
 #[cfg(test)]
