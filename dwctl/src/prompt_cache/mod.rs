@@ -33,5 +33,5 @@ pub use parse::{Block, Breakpoint, ParseError, ParsedPrompt, TelemetryPolicy, pa
 pub use postgres::PostgresIndex;
 pub use principal::PrincipalResolver;
 pub(crate) use stats::CacheBilling;
-pub use stats::{CacheStats, PendingWrite};
+pub use stats::{BilledCache, CacheReadSource, CacheStats, PendingWrite};
 pub use tokenizer::{ModelInfo, TokenizeResponse, TokenizerClient, TokenizerError, TokenizerResult};
