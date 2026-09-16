@@ -44,12 +44,17 @@
 //! let layer = RequestLoggerLayer::new(outlet_config, handler);
 //! ```
 
+use std::collections::HashMap;
+
 use crate::config::Config;
 use crate::metrics::errors::component::ANALYTICS;
 use crate::request_logging::batcher::{AnalyticsSender, RawAnalyticsRecord};
-use crate::request_logging::models::AiResponse;
+use crate::request_logging::models::{AiResponse, ChatCompletionChunk};
 use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
+use axum::http::StatusCode;
+use onwards::strict::schemas::chat_completions::MessageContent;
+use openai_reassembler::CompletionEvidence;
 use outlet::{RequestData, RequestHandler, ResponseData};
 use tracing::{Instrument, info_span};
 use uuid::Uuid;
@@ -64,6 +69,59 @@ fn zdr_safe_parse_error(err: &(dyn std::error::Error + Send + Sync + 'static)) -
     match err.downcast_ref::<serde_json::Error>() {
         Some(e) => format!("json parse error ({:?}) at line {} column {}", e.classify(), e.line(), e.column()),
         None => "parse error".to_string(),
+    }
+}
+
+/// Uses the shared reassembler classifier on the response Analytics already
+/// parsed for usage, rather than deserializing the body again.
+fn is_reasoning_without_answer(response: &AiResponse) -> bool {
+    match response {
+        AiResponse::ChatCompletions(response) => response.choices.iter().any(|choice| {
+            let message = &choice.message;
+            let has_reasoning = [message.reasoning_content.as_deref(), message.reasoning.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|text| !text.is_empty());
+            let has_answer = match &message.content {
+                Some(MessageContent::Text(text)) => !text.is_empty(),
+                Some(MessageContent::Parts(_)) => true,
+                None => false,
+            };
+            let has_tool_call = message.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty())
+                || message
+                    .extra
+                    .as_ref()
+                    .and_then(|extra| extra.get("function_call"))
+                    .is_some_and(|call| !call.is_null());
+
+            let mut evidence = CompletionEvidence::default();
+            evidence.observe(choice.finish_reason.as_deref(), has_reasoning, has_answer, has_tool_call);
+            evidence.is_reasoning_without_answer()
+        }),
+        AiResponse::ChatCompletionsStream(chunks) => {
+            let mut choices: HashMap<u32, CompletionEvidence> = HashMap::new();
+            for chunk in chunks {
+                let ChatCompletionChunk::Chunk(chunk) = chunk else {
+                    continue;
+                };
+                for choice in &chunk.choices {
+                    let has_reasoning = [choice.delta.reasoning_content.as_deref(), choice.delta.reasoning.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|text| !text.is_empty());
+                    let has_answer = choice.delta.content.as_deref().is_some_and(|text| !text.is_empty());
+                    let has_tool_call = choice.delta.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
+                    choices.entry(choice.index).or_default().observe(
+                        choice.finish_reason.as_deref(),
+                        has_reasoning,
+                        has_answer,
+                        has_tool_call,
+                    );
+                }
+            }
+            choices.values().any(CompletionEvidence::is_reasoning_without_answer)
+        }
+        _ => false,
     }
 }
 
@@ -146,7 +204,7 @@ impl RequestHandler for AnalyticsHandler {
     /// 3. Sends `RawAnalyticsRecord` to batcher via channel
     ///
     /// All database work (enrichment, writes, credit deduction) happens in the batcher.
-    async fn handle_response(&self, request_data: RequestData, response_data: ResponseData) {
+    async fn handle_response(&self, request_data: RequestData, mut response_data: ResponseData) {
         let correlation_id = request_data.correlation_id;
         let span = info_span!(
             "dwctl.analytics_handler",
@@ -185,12 +243,19 @@ impl RequestHandler for AnalyticsHandler {
             // no-usage path did; keep going so the row (status, duration) still lands.
             let parsed = parsed.unwrap_or(AiResponse::Other(serde_json::Value::Null));
 
+            // The reassembler turns this shape into a 502 for queued requests.
+            // Apply its shared decision to Analytics' private response copy so
+            // realtime requests are not billed either. This does not alter the
+            // response on the wire or parse the body again.
+            if response_data.status.is_success() && is_reasoning_without_answer(&parsed) {
+                response_data.status = StatusCode::BAD_GATEWAY;
+            }
+
             // Extract basic metrics - captures status_code, duration, model from request, tokens, etc.
             let metrics = UsageMetrics::extract(self.instance_id, &request_data, &response_data, &parsed, &self.config);
 
-            // Gate on the (possibly reclassified) status from metrics, not the raw upstream
-            // status — streams that opened 200 but ended with an embedded error frame have
-            // already been rewritten to 500 by UsageMetrics::extract and shouldn't trip this.
+            // Gate on the effective status from metrics: it also reclassifies a
+            // 2xx stream that ended with an embedded error frame.
             if (200..300).contains(&metrics.status_code) && metrics.total_tokens == 0 && usage_bearing {
                 crate::background_error!(
                     ANALYTICS, "missing_usage", Error,
@@ -251,6 +316,7 @@ impl RequestHandler for AnalyticsHandler {
                 // is one, else whoever is on the wire. See `resolve_user_agent`.
                 user_agent: resolve_user_agent(&request_data),
                 engine_cached_tokens: metrics.engine_cached_tokens,
+                cache_read_source: metrics.cache_read_source.clone(),
                 request_params: metrics.request_params,
                 server_address: metrics.server_address,
                 server_port: metrics.server_port,
@@ -265,13 +331,14 @@ impl RequestHandler for AnalyticsHandler {
                 trace_id: request_data.trace_id.clone(),
             };
 
-            // Send to batcher (non-blocking, just puts in channel)
+            // Hand off to the bounded batcher channel. A full channel applies
+            // async backpressure; an error here therefore means it is closed.
             if let Err(e) = self.sender.send(record).await {
                 crate::background_error!(
                     ANALYTICS, "send_failed", Error,
                     correlation_id = correlation_id,
                     error = %e,
-                    "Failed to send analytics record to batcher - channel may be full or closed"
+                    "Failed to send analytics record to batcher - channel is closed"
                 );
             }
         }
@@ -397,6 +464,78 @@ mod tests {
         let data = create_test_response_data();
         assert_eq!(data.correlation_id, 123);
         assert_eq!(data.status, StatusCode::OK);
+    }
+
+    #[test]
+    fn detects_reasoning_without_an_answer_in_a_blocking_response() {
+        let response: AiResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "thinking"
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+
+        assert!(is_reasoning_without_answer(&response));
+    }
+
+    #[test]
+    fn detects_reasoning_without_an_answer_in_an_already_parsed_stream() {
+        let response = AiResponse::ChatCompletionsStream(
+            [
+                serde_json::json!({
+                    "id": "chatcmpl-1", "object": "chat.completion.chunk",
+                    "created": 1, "model": "model",
+                    "choices": [{"index": 0, "delta": {"reasoning_content": "thinking"}}]
+                }),
+                serde_json::json!({
+                    "id": "chatcmpl-1", "object": "chat.completion.chunk",
+                    "created": 1, "model": "model",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                }),
+            ]
+            .into_iter()
+            .map(|value| ChatCompletionChunk::Chunk(serde_json::from_value(value).unwrap()))
+            .collect(),
+        );
+
+        assert!(is_reasoning_without_answer(&response));
+    }
+
+    #[test]
+    fn reasoning_with_a_tool_call_is_a_valid_completion() {
+        let response: AiResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "thinking",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+
+        assert!(!is_reasoning_without_answer(&response));
     }
 
     #[tokio::test]

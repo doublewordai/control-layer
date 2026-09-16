@@ -167,15 +167,6 @@ pub struct TranslationRegistry {
     max_body_size: usize,
 }
 
-impl Default for TranslationRegistry {
-    fn default() -> Self {
-        Self {
-            translators: Vec::new(),
-            max_body_size: usize::MAX,
-        }
-    }
-}
-
 impl TranslationRegistry {
     pub fn new(translators: Vec<Arc<dyn ProtocolTranslator>>) -> Self {
         Self {
@@ -197,9 +188,5 @@ impl TranslationRegistry {
     /// Return the first translator that claims this request, if any.
     pub fn detect(&self, path: &str, headers: &HeaderMap) -> Option<Arc<dyn ProtocolTranslator>> {
         self.translators.iter().find(|t| t.detect(path, headers)).cloned()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.translators.is_empty()
     }
 }
