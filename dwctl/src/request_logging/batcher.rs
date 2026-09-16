@@ -302,33 +302,26 @@ where
         );
 
         let mut buffer: Vec<RawAnalyticsRecord> = Vec::with_capacity(self.batch_size);
-        // A successful publish projects immediately. This slower tick only
-        // recovers rows left behind by a crash or another instance, avoiding
-        // empty database transactions four times a second while idle.
-        let mut recovery_tick = tokio::time::interval(std::time::Duration::from_secs(30));
-        recovery_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut observation_tick = tokio::time::interval(std::time::Duration::from_secs(10));
-        observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The tick recovers durable rows left by a crash/projector failure and
+        // records outbox health while the service is otherwise idle.
+        let mut outbox_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        outbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             let mut observe = false;
-            let mut recover = false;
+            let mut project = false;
             tokio::select! {
-                biased;
-
                 _ = shutdown_token.cancelled() => {
                     info!("Shutdown signal received, draining analytics channel");
                     self.receiver.close();
                     while let Some(record) = self.receiver.recv().await {
                         buffer.push(record);
-                        if buffer.len() >= self.batch_size
-                            && !self.flush_batch(&mut buffer).await
-                        {
-                            break;
+                        if buffer.len() >= self.batch_size {
+                            self.flush_until_published(&mut buffer).await;
                         }
                     }
                     if !buffer.is_empty() {
-                        self.flush_batch(&mut buffer).await;
+                        self.flush_until_published(&mut buffer).await;
                     }
                     while matches!(self.project_outbox_batch().await, Ok(projected) if projected > 0) {}
                     info!("Analytics batcher shutdown complete");
@@ -341,7 +334,7 @@ where
                         None => {
                             info!("Analytics channel closed, shutting down batcher");
                             if !buffer.is_empty() {
-                                self.flush_batch(&mut buffer).await;
+                                self.flush_until_published(&mut buffer).await;
                             }
                             while matches!(self.project_outbox_batch().await, Ok(projected) if projected > 0) {}
                             break;
@@ -349,11 +342,8 @@ where
                     }
                 }
 
-                _ = recovery_tick.tick() => {
-                    recover = true;
-                }
-
-                _ = observation_tick.tick() => {
+                _ = outbox_tick.tick() => {
+                    project = true;
                     observe = true;
                 }
             }
@@ -367,16 +357,13 @@ where
 
             let had_records = !buffer.is_empty();
             if had_records {
-                if !self.flush_batch(&mut buffer).await {
-                    tokio::time::sleep(self.retry_base_delay).await;
-                    continue;
-                }
+                self.flush_until_published(&mut buffer).await;
                 // The rows just published are known to exist, so project them
                 // without waiting for the crash-recovery tick.
-                recover = true;
+                project = true;
             }
 
-            if recover {
+            if project {
                 loop {
                     match self.project_outbox_batch().await {
                         Ok(0) => break,
@@ -488,6 +475,15 @@ where
         }
         .instrument(span)
         .await
+    }
+
+    /// Do not resume intake or acknowledge shutdown while a batch exists only
+    /// in memory. Keep retrying until the durable checkpoint succeeds; process
+    /// termination may still impose an external deadline.
+    async fn flush_until_published(&self, buffer: &mut Vec<RawAnalyticsRecord>) {
+        while !self.flush_batch(buffer).await {
+            tokio::time::sleep(self.retry_base_delay).await;
+        }
     }
 
     async fn publish_outbox(&self, records: &[EnrichedRecord]) -> anyhow::Result<()> {
