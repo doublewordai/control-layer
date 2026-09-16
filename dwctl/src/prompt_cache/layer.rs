@@ -93,10 +93,21 @@ impl CacheLayerState {
     }
 }
 
-/// v1: only chat-completions (the parser handles that body shape). Responses + others
-/// pass straight through (tool-Responses per-step caching is a fast-follow).
+/// Chat completions AND plain completions (`/chat/completions` ends with `/completions`,
+/// so one suffix covers both). Responses + others pass straight through — Responses
+/// arrives here already translated to chat-completions, so it is covered upstream of
+/// this check.
+///
+/// Plain `/completions` is **implicit-only by construction**: its `prompt` is one string,
+/// so there are no content blocks for markers to bind to, and the parser finds zero
+/// breakpoints (a top-level automatic marker no-ops on a blockless body per the
+/// Anthropic rule — no 400). Unmarked requests on a tariffed model therefore take the
+/// engine-cache passthrough, and the scrub applies either way — before this, the layer
+/// skipped `/completions` entirely and the upstream's own `cached_tokens` leaked to
+/// customers unbilled. A marker or `cacheBreakpoint` param on a completions body still
+/// arms the request (deterministic zeros — the one-paradigm rule), it just cannot cache.
 fn is_cacheable(req: &Request) -> bool {
-    req.method() == Method::POST && req.uri().path().ends_with("/chat/completions")
+    req.method() == Method::POST && req.uri().path().ends_with("/completions")
 }
 
 /// Turn a synchronous marker-validation failure into the structured 400 the rest of the stack
@@ -1257,6 +1268,112 @@ mod tests {
         assert!(t.contains("\"cache_creation_input_tokens\":0"), "no writes on implicit: {t}");
         assert!(t.contains("\"content\":\"hi\""), "delta preserved: {t}");
         assert!(t.contains("data: [DONE]"), "DONE preserved: {t}");
+    }
+
+    // ---- plain /completions (implicit-only by construction) ----
+
+    /// Completions-shaped upstream reporting ITS OWN cache hit — the leak shape observed
+    /// in prod on /completions before the layer covered the endpoint.
+    async fn mock_upstream_completions_with_provider_cache() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "id": "cmpl-1", "object": "text_completion",
+            "model": "m",
+            "choices": [{"index":0,"text":" pong","finish_reason":"stop"}],
+            "usage": {
+                "prompt_tokens": 2008, "completion_tokens": 8, "total_tokens": 2016,
+                "prompt_tokens_details": {"cached_tokens": 1792}
+            }
+        }))
+    }
+
+    fn completions_app(pool: &PgPool) -> axum_test::TestServer {
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/completions", post(mock_upstream_completions_with_provider_cache))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        axum_test::TestServer::new(app).unwrap()
+    }
+
+    #[sqlx::test]
+    async fn tariffed_model_passes_engine_cache_through_on_plain_completions(pool: PgPool) {
+        // A string prompt has no blocks for markers to bind to — /completions is
+        // implicit-only, and a tariff row alone activates it.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        activate_alias(&pool, user.id).await;
+        let server = completions_app(&pool);
+
+        let r = server
+            .post("/v1/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({"model": ALIAS, "prompt": "continue this"}))
+            .await;
+        r.assert_status_ok();
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["usage"]["prompt_tokens"], 2008, "token totals untouched");
+        assert_eq!(
+            v["usage"]["prompt_tokens_details"]["cached_tokens"], 1792,
+            "engine hit passed through"
+        );
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 1792, "billed read = engine hit");
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 0, "implicit never writes");
+    }
+
+    #[sqlx::test]
+    async fn marked_plain_completions_stay_deterministically_zero(pool: PgPool) {
+        // A top-level cache_control on a blockless body arms the request (one paradigm)
+        // but the automatic marker no-ops with nothing to bind to — deterministic zeros,
+        // engine hit ignored, no 400.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        activate_alias(&pool, user.id).await;
+        let server = completions_app(&pool);
+
+        let r = server
+            .post("/v1/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({
+                "model": ALIAS, "prompt": "continue this",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }))
+            .await;
+        r.assert_status_ok();
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0, "armed → explicit zeros");
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 0, "engine hit not billed when armed");
+    }
+
+    #[sqlx::test]
+    async fn untariffed_plain_completions_scrub_provider_cache_fields(pool: PgPool) {
+        // The prod leak this closes: no tariff → inactive → the upstream's own
+        // cached_tokens must be zeroed, not shown to a customer billed at full price.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        let server = completions_app(&pool);
+
+        let r = server
+            .post("/v1/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({"model": ALIAS, "prompt": "continue this"}))
+            .await;
+        r.assert_status_ok();
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0, "provider hit zeroed");
+        assert!(
+            v["usage"].get("cache_read_input_tokens").is_none(),
+            "no injected fields when inactive"
+        );
     }
 
     // ---- `?cacheBreakpoint=lastUserMessage` (query-param automatic caching) ----
