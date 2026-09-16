@@ -77,18 +77,55 @@ which is the specific failure the binary design cannot avoid.
 
 ## Where it hooks into the code
 
-### Observation
+### Two kinds of observation
 
-First-token latency is already bounded in two places; both need to record a
-sample rather than only detect the failure case.
+The controller needs two distinct inputs, and conflating them would corrupt it:
 
-| Site | Today | Needed |
+- An **uncensored sample** — an observed first-token latency.
+- A **breach** — the deadline expired. This establishes only that first-token
+  latency exceeded the deadline, a censored lower bound. It is *not* a latency
+  measurement and must never be recorded as one; feeding the deadline value
+  into a latency histogram would bias every statistic drawn from it.
+
+Increase requires uncensored samples within budget. Decrease is driven by
+breaches and by uncensored samples that exceed budget.
+
+### Where an uncensored sample can be taken
+
+| Site | What it establishes | Available for |
 |---|---|---|
-| `handlers.rs` (header deadline) | `header_deadline` is the min of the request deadline and the first-token deadline; a breach records reason `first_token_timeout` | also record elapsed time on the success path |
-| `handlers.rs` (lead frames) | when armed, `timeout_at(deadline, read_lead_frames(..))`; the error arm records `onwards.fallback = "first_token_timeout"` and returns `LoopAction::Continue` | the `Ok` arm is the first-token success — currently untimed, and the only source of good samples |
+| Response headers arrive | Headers only — not a first token | All responses |
+| Lead-frame read (`read_lead_frames`) | First decisive SSE frame | Strict-mode 2xx SSE only |
+| Deadline expiry | Breach (censored) | Wherever the deadline is armed |
 
-Sampling only the timeout path would feed the controller failures alone, so it
-could never ramp back up. The success arm is load-bearing.
+Header arrival is **not** a first-token sample. For a streamed response the
+headers can arrive long before the first token, so it cannot stand in for one.
+
+The lead-frame read is the only place a real first token is observed today, and
+it is gated: the enclosing branch requires `(200..300).contains(&status) &&
+state.targets.strict_mode`. Non-strict SSE is forwarded without a lead-frame
+peek, deliberately — the pass-through path avoids forcing buffering and SSE
+re-framing onto streams that would otherwise stream straight through.
+
+Consequences to accept explicitly:
+
+- The first-token histogram is populated **only for strict-mode SSE traffic**.
+  For non-strict traffic there are no uncensored samples, so a controller there
+  would have breaches and nothing else, and could never ramp back up.
+- Extending coverage to non-strict traffic needs a pass-through-safe observer
+  that timestamps the first `data:` frame **without** re-framing or buffering
+  the stream, and that ignores keep-alive comments. That is a separate opt-in
+  step, not a free extension.
+
+### What counts as a first token
+
+`classify_sse_event` maps a frame whose payload is `[DONE]` to `Data`, and
+`read_lead_frames` sets `saw_data` on any `Data` frame. So the first decisive
+frame of a zero-token stream can be `[DONE]`, which would otherwise be recorded
+as a first-token success.
+
+A first-token sample must therefore require a data frame that is **not**
+`[DONE]`. Keep-alive comment frames already do not count.
 
 ### Decision
 
@@ -97,15 +134,23 @@ lazily, and `select_excluding` dispatches to `select_priority` (definition
 order, first available) or `select_least_connections` (lowest `active/weight`,
 weighted-random tiebreak).
 
-The share should bias *ordering*, not add a strategy:
+**Preferred provider** is defined as the first provider in definition order.
+The controller holds a single share for "preferred versus the rest"; per-provider
+shares in pools of more than two providers are out of scope.
 
-- **Priority** — with probability `1 - f`, skip the preferred provider on the
-  first attempt and start at the next one. Failover order is otherwise intact.
-- **Weighted random** — fold `f` into the existing weight arithmetic, which
-  already expresses proportional split.
+The mechanism is uniform across both strategies: **before the first attempt,
+with probability `1 - f`, seed the exclusion set with the preferred provider**,
+so selection begins among the alternates. Subsequent attempts use the exclusion
+set exactly as they do today.
 
-Keeping this inside the existing selection path means the attempt budget,
-exclusion set, and cascade-restart behaviour all continue to work unchanged.
+Note that folding `f` into provider weights would *not* work.
+`LoadBalanceStrategy::WeightedRandom` dispatches to `select_least_connections`,
+which picks the lowest `active/weight` score and consults weights only to break
+ties. Weights there are a least-connections normaliser, not a proportional
+splitter, so biasing them would not yield share `f` under load.
+
+Seeding the exclusion set keeps the attempt budget, the exclusion mechanics and
+the cascade-restart behaviour working unchanged.
 
 ### State and lifetime
 
@@ -134,7 +179,7 @@ default on `AppState` mirroring `with_first_token_timeout`:
 | `share_decay` | Multiplicative decrease on breach |
 | `share_floor` | Minimum share retained for measurement |
 | `dwell_ms` | Minimum time between adjustments |
-| `min_samples` | Samples required before a decision |
+| `min_samples` | Uncensored samples required before an increase |
 
 Dwell and minimum-sample count matter more than they look: a first-token sample
 only exists once the request produces its first token, so decisions lag the
@@ -150,50 +195,84 @@ controller, not a follow-up.
 
 ## Observability
 
-Following existing naming (`onwards_*_total` counters, `onwards_*_inflight`
-gauges):
+The metrics recorder deliberately runs with idle-timeout and eviction
+**disabled**, because the autoscaler reads an absent `onwards_model_inflight`
+series as "genuinely zero in-flight" and evicting a long-lived stream's gauge
+would tear a worker down mid-stream. Every label combination therefore persists
+for the lifetime of the process.
 
-- `onwards_provider_share` — gauge, per alias and provider. The controller's
-  current `f`.
-- `onwards_first_token_seconds` — histogram, per alias and provider. The
-  samples the controller acts on.
-- `onwards_share_adjustments_total` — counter, labelled by direction.
+That rules out provider URLs as labels: targets are rebuilt on config reload, so
+URL-labelled series would accumulate indefinitely across target churn. Alias
+labels follow existing precedent (`onwards_model_inflight{model}`) and stay
+bounded by configuration size.
 
-A share that settles well below 1.0 is a capacity signal: it is direct evidence
-the preferred upstream cannot carry its own demand within budget, measured from
-served traffic rather than inferred.
+| Metric | Type | Labels |
+|---|---|---|
+| `onwards_provider_share` | gauge | alias |
+| `onwards_first_token_seconds` | histogram | alias — uncensored samples only |
+| `onwards_first_token_breaches_total` | counter | alias — censored breaches |
+| `onwards_share_adjustments_total` | counter | alias, direction |
+
+If per-provider detail proves necessary, use a bounded role label (preferred
+versus alternate) rather than a provider identity.
+
+### Reading the share
+
+A share that settles well below 1.0 is an **indicator** of capacity shortfall,
+not proof of it. Whether it means that depends on classifying what caused the
+decay:
+
+- Connection errors, non-2xx responses and embedded upstream errors are
+  failures. They already drive the existing failover path and should **not**
+  decay `f`, or they will make an outage look like a capacity limit.
+- Only latency breaches and slow uncensored samples should adjust `f`.
+
+With that classification in place, a persistently low `f` is meaningful evidence
+that the preferred upstream cannot carry its own demand within budget, measured
+from served traffic. Without it, the number conflates slowness with failure.
 
 ## Implementation order
 
 1. Plumb per-model fallback values through the onwards-config sync so a budget
    can be set per alias. Behaviour unchanged.
-2. Record first-token samples on both success paths, and export the histogram.
-   Observation only, no control.
-3. Add the controller and its state, adopted across reloads. Default disabled.
-4. Bias selection by share, behind the same switch.
+2. Record observations and export them, with no control attached: the
+   uncensored histogram (strict-mode SSE, excluding `[DONE]`) and the breach
+   counter.
+3. Add the controller and its state, adopted across reloads, consuming both
+   inputs. Default disabled.
+4. Bias selection by seeding the exclusion set, behind the same switch.
 5. Enable per alias, starting with one whose upstream latency is known to be
    load-dependent.
 
 Each step is independently shippable, and steps 1–2 are useful on their own:
-they answer what the latency distribution actually is per provider, which is
-currently not measured.
+they answer what the first-token latency distribution actually is, and how often
+the deadline fires, neither of which is measured today.
 
 ## Testing
 
-- **Controller unit tests** — convergence to a stable share under a simulated
-  load-dependent upstream; no oscillation when fast-at-idle and slow-at-load;
-  decrease outpaces increase.
-- **Reload** — share survives a config reload via the adopt path, and a new
+- **Sampling** — a data frame that is not `[DONE]` produces a sample; a stream
+  whose first decisive frame is `[DONE]` does not; keep-alive comments do not.
+- **Censoring** — a breach increments the breach counter and never enters the
+  latency histogram.
+- **Coverage** — non-strict SSE produces no uncensored samples; assert this
+  rather than letting it surprise someone later.
+- **Controller** — converges to a stable share against a simulated
+  load-dependent upstream; does not oscillate when fast-at-idle and
+  slow-at-load; decrease outpaces increase.
+- **Classification** — connection errors and upstream error responses do not
+  decay the share.
+- **Reload** — the share survives a config reload via the adopt path, and a new
   budget from new config takes effect.
-- **Selection** — share biases first-attempt ordering without changing the
-  attempt budget, exclusion set, or cascade restart.
+- **Selection** — exclusion seeding biases the first attempt without changing
+  the attempt budget, exclusion mechanics or cascade restart.
 - **Disabled default** — with the controller off, selection and failover are
   byte-for-byte today's behaviour.
-- **Sampling** — success and timeout paths both produce samples; keep-alive
-  comments do not count as a first token.
 
 ## Open questions
 
+- **Non-strict coverage.** Whether a pass-through-safe first-frame observer is
+  worth building, or whether the controller should simply be unavailable for
+  non-strict traffic.
 - **Per-process state.** Each gateway process runs its own controller, so with
   N processes there are N independent controllers converging separately. Shared
   state would be consistent but adds coordination; per-process is simpler and
