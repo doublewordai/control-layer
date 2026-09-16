@@ -1,8 +1,9 @@
 # Load-Aware Failover (design)
 
-> Status: design, not implemented. This page describes the intended successor to
-> the per-request first-token deadline documented in
-> [Load Balancing](load-balancing.md#first-token-failover).
+> Status: observation metrics implemented; controller and per-model plumbing
+> remain planned. See [First-token observations](load-balancing.md#first-token-observations)
+> for the implemented metrics and their coverage limits. The rest of this page
+> describes the intended successor to per-request first-token failover.
 
 ## Problem
 
@@ -79,6 +80,12 @@ Because each increase is one increment followed by re-measurement *at that
 share*, the controller never infers full-load behaviour from a trickle sample,
 which is the specific failure the binary design cannot avoid.
 
+After each adjustment, require `min_samples` fresh observations from attempts
+started at the new share before adjusting again. Old-window observations and
+late completions from earlier shares must not trigger repeated decreases or
+establish a healthy dwell at the new share. Dwell is a minimum interval between
+adjustments, including decreases, rather than a per-request decision trigger.
+
 ### Properties worth preserving
 
 - **Never remove a provider from the pool.** `f` biases which provider is tried
@@ -105,6 +112,19 @@ The controller needs two distinct inputs, and conflating them would corrupt it:
 
 Both feed the breach-rate calculation. Only uncensored samples feed the latency
 histogram.
+
+The implemented breach counter counts **failover deadline** expiries. The
+controller's latency budget is a separate threshold: a timeout earlier than the
+budget cannot establish a budget breach. Controller configuration must therefore
+require any armed failover deadline to be at least the latency budget. A slow
+observed frame can establish a budget breach without firing the failover
+deadline. Neither outcome may count twice in the controller's denominator.
+
+The current observation metrics are not yet sufficient controller input: even
+strict streams can outlast the existing peek's event or time limits and be
+forwarded unobserved. Controller implementation must cover those eligible
+streams or explicitly treat their outcomes as unknown, rather than count them
+as healthy or estimate a breach rate from a selectively observed histogram.
 
 ### Only the preferred provider's attempts are control input
 

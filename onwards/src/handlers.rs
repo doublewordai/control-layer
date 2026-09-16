@@ -82,7 +82,7 @@ enum SseEventKind {
     /// A `data:` frame carrying an embedded provider error — the contained
     /// `error.code`, per [`embedded_error_status`].
     Error(u16, serde_json::Value),
-    /// A `data:` frame carrying normal content — an actual token.
+    /// A non-sentinel `data:` frame (possibly metadata rather than generated text).
     Data,
     /// The `[DONE]` sentinel. A `data:` frame, but not a token: it ends a
     /// stream rather than carrying content. Decisive like [`SseEventKind::Data`]
@@ -1120,6 +1120,16 @@ pub async fn target_message_handler<T: HttpClient>(
                 // Name the deadline that fired, so first-token failovers are
                 // distinguishable from provider request timeouts in traces.
                 let reason = if header_deadline == first_token_deadline {
+                    // Header waits are part of the same first-token deadline.
+                    // A provider request timeout that fires earlier is not a
+                    // first-token breach.
+                    metrics::counter!(
+                        "onwards_first_token_breaches_total",
+                        "model" => model_name.to_string(),
+                        "pool" => resolved_pool_name.unwrap_or("default"),
+                        "role" => provider_role,
+                    )
+                    .increment(1);
                     "first_token_timeout"
                 } else {
                     "timeout"
