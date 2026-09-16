@@ -47,22 +47,36 @@ is usually a *split* — the upstream serves the share it can serve within
 budget, and the remainder goes elsewhere — and a two-position control cannot
 express a split.
 
-## Design: additive-increase / multiplicative-decrease
+## Design: a controlled share
 
 Replace the binary open/closed state with a **share** `f ∈ [0, 1]`: the
 fraction of eligible requests for which the preferred provider is tried first.
 
-- **Increase** additively (`f += step`) after a dwell period in which observed
-  first-token latency stayed within budget.
-- **Decrease** multiplicatively (`f *= factor`, factor < 1) as soon as it does
-  not.
+### The control signal is a rate, not an event
 
-Decrease fast, increase slowly. The asymmetry is what stops the hunt, and the
-controller converges on the largest share the upstream can carry within the
-latency budget rather than flapping between none and all.
+A single slow request must not move the share. Any realistic first-token
+distribution has a tail, so at *every* sustainable share some requests exceed
+any fixed budget. If each breach triggered a decrease, the share would decay to
+its floor regardless of actual capacity, and it would decay faster at higher
+request volumes — making the control a function of traffic rather than of
+service quality.
+
+The controller therefore targets a **breach rate against a latency budget**,
+which is a statement of intent that can actually be met:
+
+- A **breach** is an attempt whose first token did not arrive within
+  `latency_budget_ms`.
+- Over a sliding window of at least `min_samples` observations, compute the
+  observed breach rate.
+- If it exceeds `breach_rate_target`, decrease: `f *= share_decay`.
+- If it stays at or below target for `dwell_ms`, increase: `f += share_step`.
+
+Decrease fast, increase slowly. The asymmetry stops the hunt, and the
+controller converges on the largest share whose breach rate still meets the
+target — a defined service level, not an artefact of volume.
 
 Because each increase is one increment followed by re-measurement *at that
-share*, the controller never infers full-load behaviour from a trickle sample —
+share*, the controller never infers full-load behaviour from a trickle sample,
 which is the specific failure the binary design cannot avoid.
 
 ### Properties worth preserving
@@ -70,8 +84,10 @@ which is the specific failure the binary design cannot avoid.
 - **Never remove a provider from the pool.** `f` biases which provider is tried
   *first*. A demoted provider is still reachable, and existing failover
   semantics are untouched.
-- **Keep a floor on `f`.** A small non-zero share preserves a live measurement,
-  so recovery is observed from real traffic rather than synthetic probes.
+- **Keep a floor on `f`.** A small non-zero share preserves a live measurement
+  of the preferred provider, so recovery is observed from real traffic rather
+  than synthetic probes. This matters more than it looks — see the scoping rule
+  below, which makes preferred-provider samples the *only* control input.
 - **Disabled means today's behaviour.** With the controller off, selection and
   failover behave exactly as they do now.
 
@@ -87,8 +103,21 @@ The controller needs two distinct inputs, and conflating them would corrupt it:
   measurement and must never be recorded as one; feeding the deadline value
   into a latency histogram would bias every statistic drawn from it.
 
-Increase requires uncensored samples within budget. Decrease is driven by
-breaches and by uncensored samples that exceed budget.
+Both feed the breach-rate calculation. Only uncensored samples feed the latency
+histogram.
+
+### Only the preferred provider's attempts are control input
+
+Once `1 - f` of traffic is being sent to alternates, those alternates are also
+producing first-token observations. They must **not** update `f`. A slow
+alternate would otherwise demote a healthy preferred provider, and a fast
+alternate would ramp up a struggling one — in both cases the controller would
+be steering on a signal from the wrong upstream.
+
+Observations are therefore attributed to the provider actually attempted, and
+only attempts against the preferred provider adjust the share. Observations
+from alternates are still exported, because they are useful for comparing
+providers, but they are inert as control input.
 
 ### Where an uncensored sample can be taken
 
@@ -127,30 +156,40 @@ as a first-token success.
 A first-token sample must therefore require a data frame that is **not**
 `[DONE]`. Keep-alive comment frames already do not count.
 
-### Decision
+Note that `saw_data` cannot simply be withheld for `[DONE]`: it currently
+suppresses the `EmptyBody` classification, so withholding it would make a
+`[DONE]`-only stream newly retryable. The distinction needs its own flag.
+
+### Decision: scoped to the priority strategy
 
 Provider selection lives in `load_balancer.rs`: `select_iter` yields providers
 lazily, and `select_excluding` dispatches to `select_priority` (definition
 order, first available) or `select_least_connections` (lowest `active/weight`,
 weighted-random tiebreak).
 
-**Preferred provider** is defined as the first provider in definition order.
-The controller holds a single share for "preferred versus the rest"; per-provider
-shares in pools of more than two providers are out of scope.
+**The controller is defined for `LoadBalanceStrategy::Priority` only.** Under
+`Priority` the preferred provider is unambiguous — first in definition order —
+and skipping it genuinely hands the first attempt to the next provider.
 
-The mechanism is uniform across both strategies: **before the first attempt,
-with probability `1 - f`, seed the exclusion set with the preferred provider**,
-so selection begins among the alternates. Subsequent attempts use the exclusion
-set exactly as they do today.
+`WeightedRandom` is out of scope, for two concrete reasons:
 
-Note that folding `f` into provider weights would *not* work.
-`LoadBalanceStrategy::WeightedRandom` dispatches to `select_least_connections`,
-which picks the lowest `active/weight` score and consults weights only to break
-ties. Weights there are a least-connections normaliser, not a proportional
-splitter, so biasing them would not yield share `f` under load.
+- Leaving the preferred provider *eligible* does not make it *first*.
+  `select_least_connections` ranks by lowest `active/weight` and consults
+  weights only to break ties, so the realised preferred-first rate would sit
+  below `f` by an amount that varies with load. Folding `f` into weights does
+  not fix this — weights there are a least-connections normaliser, not a
+  proportional splitter.
+- Seeding the shared exclusion set is unsafe. `SelectIter::next` only clears
+  exclusions when `select_excluding` returns `None`, so while any alternate
+  remains selectable a seeded exclusion persists and the preferred provider is
+  unreachable for the rest of that request.
 
-Seeding the exclusion set keeps the attempt budget, the exclusion mechanics and
-the cascade-restart behaviour working unchanged.
+The bias must therefore be a **first-attempt-only choice**, expressed as an
+explicit override of the first provider rather than by mutating the exclusion
+set: with probability `1 - f`, begin at the next provider, then let subsequent
+attempts proceed exactly as they do today, with the preferred provider still
+reachable. Supporting `WeightedRandom` would require that override to carry a
+provider identity into a freshly initialised iterator, and is deferred.
 
 ### State and lifetime
 
@@ -163,9 +202,15 @@ live state across a reload: the watcher calls `adopt_provider_state` on the new
 pool before inserting it, which delegates to `adopt_active_counter` — sharing
 the previous `Arc` while taking limits from the *new* config.
 
-Controller state must be adopted the same way. Without it the share resets on
-every configuration change, and a controller that resets faster than it
-converges is worse than no controller at all.
+Controller state must be adopted the same way, but **not unconditionally**.
+`adopt_active_counter` is safe because it matches counters per provider
+identity; a single pool-level share has no such matching, so adopting blindly
+would apply a share learned about one upstream to whatever now sits first in
+definition order. Adoption must therefore be conditional on the preferred
+provider's identity being unchanged, and reset the controller otherwise.
+
+Without adoption at all, the share resets on every configuration change, and a
+controller that resets faster than it converges is worse than no controller.
 
 ## Configuration
 
@@ -174,16 +219,20 @@ default on `AppState` mirroring `with_first_token_timeout`:
 
 | Option | Meaning |
 |---|---|
-| `latency_budget_ms` | First-token latency the controller targets |
+| `latency_budget_ms` | First-token latency defining a breach |
+| `breach_rate_target` | Breach rate the controller holds the share to |
+| `window_samples` | Sliding window over which the rate is measured |
+| `min_samples` | Observations required before any adjustment |
 | `share_step` | Additive increase per healthy dwell |
-| `share_decay` | Multiplicative decrease on breach |
+| `share_decay` | Multiplicative decrease when the rate is exceeded |
 | `share_floor` | Minimum share retained for measurement |
 | `dwell_ms` | Minimum time between adjustments |
-| `min_samples` | Uncensored samples required before an increase |
 
-Dwell and minimum-sample count matter more than they look: a first-token sample
-only exists once the request produces its first token, so decisions lag the
-traffic that caused them.
+Dwell and window size matter more than they look: a first-token observation
+only exists once the attempt produces its first token or breaches, so decisions
+lag the traffic that caused them. And because only preferred-provider attempts
+are control input, a low share yields observations slowly — which is what the
+share floor protects.
 
 ### Per-model values are a prerequisite
 
@@ -199,22 +248,26 @@ The metrics recorder deliberately runs with idle-timeout and eviction
 **disabled**, because the autoscaler reads an absent `onwards_model_inflight`
 series as "genuinely zero in-flight" and evicting a long-lived stream's gauge
 would tear a worker down mid-stream. Every label combination therefore persists
-for the lifetime of the process.
+for the lifetime of the process, so every label must be bounded by
+configuration rather than by traffic.
 
-That rules out provider URLs as labels: targets are rebuilt on config reload, so
-URL-labelled series would accumulate indefinitely across target churn. Alias
-labels follow existing precedent (`onwards_model_inflight{model}`) and stay
-bounded by configuration size.
+That rules out provider URLs as labels. It does **not** allow alias-only labels
+either: a composite alias can carry several named `ProviderPool`s, whose
+independent controllers would otherwise write the same series and aggregate
+unrelated observations.
 
 | Metric | Type | Labels |
 |---|---|---|
-| `onwards_provider_share` | gauge | alias |
-| `onwards_first_token_seconds` | histogram | alias — uncensored samples only |
-| `onwards_first_token_breaches_total` | counter | alias — censored breaches |
-| `onwards_share_adjustments_total` | counter | alias, direction |
+| `onwards_provider_share` | gauge | model, pool |
+| `onwards_first_token_seconds` | histogram | model, pool, role |
+| `onwards_first_token_breaches_total` | counter | model, pool, role |
+| `onwards_share_adjustments_total` | counter | model, pool, direction |
 
-If per-provider detail proves necessary, use a bounded role label (preferred
-versus alternate) rather than a provider identity.
+`model` is the alias, matching the existing `onwards_model_inflight{model}`
+convention. `pool` is the resolved pool name, bounded by configuration. `role`
+is `preferred` or `alternate` — two values, which is what makes per-provider
+comparison possible without unbounded provider identities. The share gauge
+carries no `role`, since one controller governs one pool.
 
 ### Reading the share
 
@@ -224,7 +277,7 @@ decay:
 
 - Connection errors, non-2xx responses and embedded upstream errors are
   failures. They already drive the existing failover path and should **not**
-  decay `f`, or they will make an outage look like a capacity limit.
+  count as latency breaches, or an outage will look like a capacity limit.
 - Only latency breaches and slow uncensored samples should adjust `f`.
 
 With that classification in place, a persistently low `f` is meaningful evidence
@@ -237,39 +290,46 @@ from served traffic. Without it, the number conflates slowness with failure.
    can be set per alias. Behaviour unchanged.
 2. Record observations and export them, with no control attached: the
    uncensored histogram (strict-mode SSE, excluding `[DONE]`) and the breach
-   counter.
-3. Add the controller and its state, adopted across reloads, consuming both
-   inputs. Default disabled.
-4. Bias selection by seeding the exclusion set, behind the same switch.
+   counter, both labelled by role so preferred and alternate are separable.
+3. Add the controller and its state, with identity-checked adoption across
+   reloads, consuming only preferred-provider observations. Default disabled.
+4. Bias the first attempt via an explicit provider override, `Priority` pools
+   only, behind the same switch.
 5. Enable per alias, starting with one whose upstream latency is known to be
    load-dependent.
 
 Each step is independently shippable, and steps 1–2 are useful on their own:
-they answer what the first-token latency distribution actually is, and how often
-the deadline fires, neither of which is measured today.
+they answer what the first-token latency distribution actually is per role, and
+how often the deadline fires, neither of which is measured today.
 
 ## Testing
 
 - **Sampling** — a data frame that is not `[DONE]` produces a sample; a stream
-  whose first decisive frame is `[DONE]` does not; keep-alive comments do not.
+  whose first decisive frame is `[DONE]` does not, and is still not treated as
+  an empty body; keep-alive comments do not.
 - **Censoring** — a breach increments the breach counter and never enters the
   latency histogram.
+- **Attribution** — observations from alternates do not move the share.
 - **Coverage** — non-strict SSE produces no uncensored samples; assert this
   rather than letting it surprise someone later.
 - **Controller** — converges to a stable share against a simulated
-  load-dependent upstream; does not oscillate when fast-at-idle and
-  slow-at-load; decrease outpaces increase.
+  load-dependent upstream; an isolated slow request does not move the share;
+  a sustained breach rate above target does; decrease outpaces increase.
 - **Classification** — connection errors and upstream error responses do not
-  decay the share.
-- **Reload** — the share survives a config reload via the adopt path, and a new
-  budget from new config takes effect.
-- **Selection** — exclusion seeding biases the first attempt without changing
-  the attempt budget, exclusion mechanics or cascade restart.
+  count as latency breaches.
+- **Reload** — the share survives a reload when the preferred provider is
+  unchanged, and resets when it is replaced or reordered.
+- **Selection** — the first-attempt override biases only the first attempt,
+  leaves the preferred provider reachable on later attempts, and does not
+  change the attempt budget or cascade restart.
 - **Disabled default** — with the controller off, selection and failover are
   byte-for-byte today's behaviour.
 
 ## Open questions
 
+- **`WeightedRandom` support.** Whether the first-attempt override should carry
+  a provider identity into a freshly initialised iterator so weighted pools can
+  use the controller, or whether `Priority`-only is sufficient in practice.
 - **Non-strict coverage.** Whether a pass-through-safe first-frame observer is
   worth building, or whether the controller should simply be unavailable for
   non-strict traffic.
