@@ -61,7 +61,7 @@ pub mod target;
 pub mod telemetry;
 
 use client::{HttpClient, HyperClient};
-pub use handlers::ServedBy;
+pub use handlers::{AuthenticatedApiKeyId, ServedBy};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
 
@@ -1068,23 +1068,35 @@ mod tests {
     /// exactly why the extension (not a header) carries this.
     #[tokio::test]
     async fn test_served_by_extension_set_on_success() {
+        use crate::auth::ConstantTimeString;
+        use std::collections::{HashMap, HashSet};
         use tower::ServiceExt;
 
+        let api_key_id = uuid::Uuid::new_v4();
+        let api_key = "test-api-key";
+        let mut keys = HashSet::new();
+        keys.insert(ConstantTimeString::from(api_key.to_string()));
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "gpt-4".to_string(),
             pool(
                 target::Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
+                    .keys(keys)
                     .onwards_model("gpt-4-upstream".to_string())
                     .build(),
             ),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            api_key.to_string(),
+            HashMap::from([("api_key_id".to_string(), api_key_id.to_string())]),
         );
         let targets = target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
+            key_labels,
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1099,6 +1111,7 @@ mod tests {
             .method("POST")
             .uri("/v1/chat/completions")
             .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {api_key}"))
             .body(axum::body::Body::from(
                 json!({
                     "model": "gpt-4",
@@ -1116,6 +1129,10 @@ mod tests {
             .expect("success response must carry ServedBy");
         assert_eq!(served_by.url, "https://api.openai.com/");
         assert_eq!(served_by.onwards_model.as_deref(), Some("gpt-4-upstream"));
+        assert_eq!(
+            response.extensions().get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
     }
 
     /// Strict-mode `Targets` with one alias backed by a fallback pool of `n`

@@ -23,6 +23,7 @@ use axum::{
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
 use tracing::{Instrument, debug, error, instrument, trace, warn};
+use uuid::Uuid;
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
 struct HeaderExtractor<'a>(&'a HeaderMap);
@@ -305,6 +306,11 @@ pub struct ServedBy {
     pub onwards_model: Option<String>,
 }
 
+/// Stable identity of the API key accepted for this request. This is carried
+/// only in the in-process response extensions and is never sent to the client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedApiKeyId(pub Uuid);
+
 /// Resolve whether W3C trace context headers should be propagated to an
 /// upstream provider. The per-provider `propagate_trace_context` overrides;
 /// when unset, defaults to the resolved trusted value (per-provider `trusted`
@@ -564,6 +570,11 @@ pub async fn target_message_handler<T: HttpClient>(
             model_name
         );
     }
+
+    let authenticated_api_key_id = bearer_token
+        .and_then(|token| state.targets.key_labels.get(token))
+        .and_then(|labels| labels.get("api_key_id").cloned())
+        .and_then(|id| id.parse::<Uuid>().ok());
 
     // Evaluate routing rules against key labels (after auth, before rate limiting).
     // Rules on the pool are matched against the authenticated key's labels.
@@ -1631,6 +1642,11 @@ pub async fn target_message_handler<T: HttpClient>(
             url: target.url.to_string(),
             onwards_model: target.onwards_model.clone(),
         });
+        if let Some(api_key_id) = authenticated_api_key_id {
+            response
+                .extensions_mut()
+                .insert(AuthenticatedApiKeyId(api_key_id));
+        }
 
         // Attach the connection guard and inflight guard to the response body so both
         // are decremented when the body stream completes, not when the handler returns.

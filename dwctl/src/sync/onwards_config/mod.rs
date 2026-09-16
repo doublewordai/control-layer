@@ -875,6 +875,7 @@ fn convert_composite_to_target_spec(
         };
 
         let mut labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
+        labels.insert("api_key_id".to_string(), api_key.id.to_string());
         // Surface the account's zero-data-retention flag to onwards as a label.
         // Always emitted ("true"/"false"); onwards does not act on it yet.
         labels.insert("zdr".to_string(), api_key.zero_data_retention.to_string());
@@ -1166,6 +1167,7 @@ fn convert_to_config_file(
 
                 // Build labels from API key purpose
                 let mut labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
+                labels.insert("api_key_id".to_string(), api_key.id.to_string());
                 // Surface the account's zero-data-retention flag as a label.
                 // Always emitted ("true"/"false"); onwards does not act on it yet.
                 labels.insert("zdr".to_string(), api_key.zero_data_retention.to_string());

@@ -1819,7 +1819,7 @@ fn security_header_pairs(cfg: &crate::config::SecurityHeadersConfig) -> anyhow::
 ///
 /// - `state`: Mutable application state (metrics recorder may be initialized here)
 /// - `onwards_router`: Pre-configured router for AI request proxying
-/// - `analytics_sender`: Optional sender for analytics records (from background services)
+/// - `analytics_writer`: Optional durable outbox writer (from background services)
 /// - `metrics_recorder`: Optional GenAI metrics recorder (created before background services)
 ///
 /// # Returns
@@ -1835,7 +1835,7 @@ fn security_header_pairs(cfg: &crate::config::SecurityHeadersConfig) -> anyhow::
 pub async fn build_router(
     state: &mut AppState,
     onwards_router: Router,
-    analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
+    analytics_writer: Option<request_logging::batcher::AnalyticsOutboxWriter>,
     requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
@@ -1884,12 +1884,12 @@ pub async fn build_router(
 
         // Add AnalyticsHandler for analytics/billing if enabled
         // The batcher is spawned in setup_background_services and managed by BackgroundServices
-        if let Some(sender) = analytics_sender {
+        if let Some(writer) = analytics_writer {
             // Billing reads usage from the single `parse_ai_response -> AiResponse`
             // parse (the same value request logging stores), via `TokenMetrics::from`.
             // The outlet sits outer to translation, so it captures the foreign
             // response body; `AiResponse` covers each protocol's own shape.
-            let analytics_handler = request_logging::AnalyticsHandler::new(sender, instance_id, config.as_ref().clone());
+            let analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone());
             multi_handler = multi_handler.with(analytics_handler);
         }
 
@@ -2905,8 +2905,8 @@ pub struct BackgroundServices {
     onwards_sender: Option<tokio::sync::watch::Sender<onwards::target::Targets>>,
     #[allow(dead_code)] // Used in sync_onwards_config method
     strict_mode: bool,
-    /// Sender for analytics records (if analytics is enabled)
-    analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
+    /// Durable analytics outbox writer (if analytics is enabled)
+    analytics_writer: Option<request_logging::batcher::AnalyticsOutboxWriter>,
     /// Prefix-chain recorder (workload profiling), when `prefix_chain.enabled`.
     prefix_chain: Option<Arc<crate::prefix_chain::PrefixChainRecorder>>,
     /// Sender for completed-response records consumed by the in-process
@@ -3871,8 +3871,8 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     }
 
     // Start analytics batcher if enabled
-    let analytics_sender = if config.enable_analytics {
-        let (batcher, sender) = request_logging::AnalyticsBatcher::new(dyn_pools.clone(), config.clone(), metrics_recorder);
+    let analytics_writer = if config.enable_analytics {
+        let (batcher, writer) = request_logging::AnalyticsBatcher::new(dyn_pools.clone(), config.clone(), metrics_recorder);
         let batcher = batcher.with_usage_refresh_notify(usage_refresh_notify.clone());
 
         let batcher_shutdown = shutdown_token.clone();
@@ -3881,7 +3881,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             Ok(())
         });
 
-        Some(sender)
+        Some(writer)
     } else {
         None
     };
@@ -3980,7 +3980,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         zdr_key_cache,
         onwards_sender,
         strict_mode: config.onwards.strict_mode,
-        analytics_sender,
+        analytics_writer,
         prefix_chain,
         requests_writer_sender,
         background_tasks,
@@ -4377,7 +4377,7 @@ impl Application {
         let router = build_router(
             &mut app_state,
             onwards_router,
-            bg_services.analytics_sender.clone(),
+            bg_services.analytics_writer.clone(),
             bg_services.requests_writer_sender.clone(),
             metrics_recorder,
             bg_services.onwards_targets.strict_mode,

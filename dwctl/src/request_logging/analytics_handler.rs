@@ -14,12 +14,13 @@
 //!
 //! # Architecture
 //!
-//! The handler does minimal work per-request - it extracts raw metrics and sends them to a
-//! background batcher via a channel. The batcher handles:
+//! The handler extracts raw metrics and inserts them directly into the durable
+//! analytics outbox. The background projector handles:
 //! - Batch enrichment (user lookup, model/tariff lookup)
 //! - Transactional writes (analytics + credits in single transaction)
 //!
-//! This design keeps the hot path fast while ensuring data consistency.
+//! Outlet invokes the handler from its detached capture task, so the client response
+//! does not wait for the outbox insert.
 //!
 //! # Example
 //!
@@ -27,14 +28,14 @@
 //! use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 //! use dwctl::request_logging::{AnalyticsHandler, AnalyticsBatcher};
 //!
-//! // Create batcher and get sender
-//! let (batcher, sender) = AnalyticsBatcher::new(pool, config.analytics.clone());
+//! // Create projector and direct outbox writer
+//! let (batcher, writer) = AnalyticsBatcher::new(pool, config.analytics.clone());
 //!
 //! // Spawn batcher background task
 //! tokio::spawn(batcher.run(cancellation_token));
 //!
-//! // Create handler with sender
-//! let analytics = AnalyticsHandler::new(sender, instance_id, config, metrics_recorder);
+//! // Create handler with writer
+//! let analytics = AnalyticsHandler::new(writer, instance_id, config, metrics_recorder);
 //!
 //! // Use with MultiHandler for composition
 //! let handler = MultiHandler::new()
@@ -48,11 +49,12 @@ use std::collections::HashMap;
 
 use crate::config::Config;
 use crate::metrics::errors::component::ANALYTICS;
-use crate::request_logging::batcher::{AnalyticsSender, RawAnalyticsRecord};
+use crate::request_logging::batcher::{AnalyticsOutboxWriter, RawAnalyticsRecord};
 use crate::request_logging::models::{AiResponse, ChatCompletionChunk};
-use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
+use crate::request_logging::serializers::{UsageMetrics, parse_ai_response};
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
 use axum::http::StatusCode;
+use onwards::AuthenticatedApiKeyId;
 use onwards::strict::schemas::chat_completions::MessageContent;
 use openai_reassembler::CompletionEvidence;
 use outlet::{RequestData, RequestHandler, ResponseData};
@@ -156,19 +158,19 @@ fn resolve_user_agent(request_data: &RequestData) -> Option<String> {
         .map(|ua| ua.chars().take(256).collect())
 }
 
-/// A request handler that sends analytics data to a background batcher.
+/// A request handler that writes analytics data to the durable outbox.
 ///
 /// This handler implements [`outlet::RequestHandler`] and can be used standalone or composed
 /// with other handlers using [`outlet::MultiHandler`].
 ///
 /// The handler does minimal work per-request:
 /// 1. Parses the AI response to extract token usage
-/// 2. Extracts raw data from request headers (bearer token, fusillade metadata)
-/// 3. Sends `RawAnalyticsRecord` to the batcher via channel
+/// 2. Extracts raw data from response extensions and request headers
+/// 3. Inserts `RawAnalyticsRecord` into `analytics_outbox`
 ///
-/// All database operations (enrichment, writes) happen in the background batcher.
+/// Enrichment and final analytics/billing writes happen in the background projector.
 pub struct AnalyticsHandler {
-    sender: AnalyticsSender,
+    outbox_writer: AnalyticsOutboxWriter,
     instance_id: Uuid,
     config: Config,
 }
@@ -178,12 +180,12 @@ impl AnalyticsHandler {
     ///
     /// # Arguments
     ///
-    /// * `sender` - Channel sender to the analytics batcher
+    /// * `outbox_writer` - Direct writer for the analytics outbox
     /// * `instance_id` - Unique identifier for this service instance
     /// * `config` - Application configuration
-    pub fn new(sender: AnalyticsSender, instance_id: Uuid, config: Config) -> Self {
+    pub fn new(outbox_writer: AnalyticsOutboxWriter, instance_id: Uuid, config: Config) -> Self {
         Self {
-            sender,
+            outbox_writer,
             instance_id,
             config,
         }
@@ -200,10 +202,10 @@ impl RequestHandler for AnalyticsHandler {
     ///
     /// This method does minimal work per-request:
     /// 1. Parses the AI response to extract token usage
-    /// 2. Extracts raw data from headers (bearer token, fusillade metadata)
-    /// 3. Sends `RawAnalyticsRecord` to batcher via channel
+    /// 2. Extracts raw data from response extensions and request headers
+    /// 3. Inserts `RawAnalyticsRecord` into the durable outbox
     ///
-    /// All database work (enrichment, writes, credit deduction) happens in the batcher.
+    /// Enrichment and credit deduction happen later in the projector.
     async fn handle_response(&self, request_data: RequestData, mut response_data: ResponseData) {
         let correlation_id = request_data.correlation_id;
         let span = info_span!(
@@ -268,9 +270,6 @@ impl RequestHandler for AnalyticsHandler {
                 );
             }
 
-            // Extract auth information from headers
-            let auth = Auth::from_request(&request_data, &self.config);
-
             // Extract fusillade batch metadata from headers
             let fusillade_batch_id = extract_header_as_uuid(&request_data, "x-fusillade-batch-id");
             let fusillade_request_id = extract_header_as_uuid(&request_data, "x-fusillade-request-id");
@@ -283,11 +282,7 @@ impl RequestHandler for AnalyticsHandler {
             let batch_created_at = extract_header_as_string(&request_data, "x-fusillade-batch-created-at")
                 .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
 
-            // Extract bearer token from auth
-            let bearer_token = match &auth {
-                Auth::ApiKey { bearer_token } => Some(bearer_token.clone()),
-                Auth::None => None,
-            };
+            let api_key_id = response_data.extensions.get::<AuthenticatedApiKeyId>().map(|id| id.0);
 
             // Build the raw record (no DB enrichment)
             // Note: request_origin is computed in the batcher after api_key_purpose is resolved
@@ -321,7 +316,7 @@ impl RequestHandler for AnalyticsHandler {
                 server_address: metrics.server_address,
                 server_port: metrics.server_port,
                 served_by: metrics.served_by,
-                bearer_token,
+                api_key_id,
                 fusillade_batch_id,
                 fusillade_request_id,
                 custom_id,
@@ -331,15 +326,16 @@ impl RequestHandler for AnalyticsHandler {
                 trace_id: request_data.trace_id.clone(),
             };
 
-            // Hand off to the bounded batcher channel. A full channel applies
-            // async backpressure; an error here therefore means it is closed.
-            if let Err(e) = self.sender.send(record).await {
+            // The first handoff is durable: write the raw record directly to
+            // the outbox. Enrichment and final writes happen in the projector.
+            if let Err(e) = self.outbox_writer.publish(record).await {
                 crate::background_error!(
-                    ANALYTICS, "send_failed", Error,
+                    ANALYTICS, "outbox_publish", Error,
                     correlation_id = correlation_id,
                     error = %e,
-                    "Failed to send analytics record to batcher - channel is closed"
+                    "Failed to publish analytics record to the durable outbox"
                 );
+                metrics::counter!("dwctl_analytics_outbox_publish_failures_total").increment(1);
             }
         }
         .instrument(span)
@@ -449,7 +445,7 @@ mod tests {
         let config = Config::default();
 
         // Verify the handler can be constructed
-        let _handler = AnalyticsHandler::new(tx, Uuid::new_v4(), config);
+        let _handler = AnalyticsHandler::new(AnalyticsOutboxWriter::for_test(tx), Uuid::new_v4(), config);
     }
 
     #[test]
@@ -542,11 +538,13 @@ mod tests {
     async fn test_handler_sends_to_channel() {
         let (tx, mut rx) = mpsc::channel::<RawAnalyticsRecord>(100);
         let config = Config::default();
-        let handler = AnalyticsHandler::new(tx, Uuid::new_v4(), config);
+        let handler = AnalyticsHandler::new(AnalyticsOutboxWriter::for_test(tx), Uuid::new_v4(), config);
+        let api_key_id = Uuid::new_v4();
 
         // Call handle_response
         let request_data = create_test_request_data();
-        let response_data = create_test_response_data();
+        let mut response_data = create_test_response_data();
+        response_data.extensions.insert(AuthenticatedApiKeyId(api_key_id));
         handler.handle_response(request_data, response_data).await;
 
         // Verify record was sent to channel
@@ -554,6 +552,7 @@ mod tests {
         assert_eq!(record.correlation_id, 123);
         assert_eq!(record.method, "POST");
         assert!(record.uri.contains("chat/completions"));
+        assert_eq!(record.api_key_id, Some(api_key_id));
     }
 
     /// `resolve_user_agent` being correct is not the same as it being CALLED. This drives
@@ -563,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn a_dispatched_batch_request_reports_the_batchs_creator_as_its_client() {
         let (tx, mut rx) = mpsc::channel::<RawAnalyticsRecord>(100);
-        let handler = AnalyticsHandler::new(tx, Uuid::new_v4(), Config::default());
+        let handler = AnalyticsHandler::new(AnalyticsOutboxWriter::for_test(tx), Uuid::new_v4(), Config::default());
 
         handler
             .handle_response(
