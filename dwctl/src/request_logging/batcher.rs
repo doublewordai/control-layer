@@ -20,6 +20,8 @@
 //!
 //! - **Durable first hand-off**: The handler writes an unenriched, content-free
 //!   `RawAnalyticsRecord` directly to PostgreSQL. Bearer tokens are excluded.
+//!   The projector also accepts the enriched payload written by release 11.12.0
+//!   so rolling upgrades can drain rows created by either version.
 //! - **Batch enrichment**: Key and pricing lookups happen only after the row is durable.
 //! - **Transactional projection**: Analytics, credit inserts and outbox deletion happen in
 //!   a single transaction. Either all succeed or the durable row remains for retry.
@@ -132,7 +134,7 @@ pub struct RawAnalyticsRecord {
 }
 
 /// Enriched data resolved during batch processing
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EnrichedRecord {
     raw: RawAnalyticsRecord,
     user_id: Option<Uuid>,
@@ -404,15 +406,27 @@ where
 
         let mut ids = Vec::with_capacity(rows.len());
         let mut raw_records = Vec::with_capacity(rows.len());
+        let mut records = Vec::with_capacity(rows.len());
         let mut oldest = Utc::now();
         for row in rows {
             ids.push(row.try_get::<i64, _>("id")?);
-            let payload = row.try_get::<serde_json::Value, _>("payload")?;
-            raw_records.push(serde_json::from_value::<RawAnalyticsRecord>(payload)?);
+            let mut payload = row.try_get::<serde_json::Value, _>("payload")?;
+            if payload.get("raw").is_some() {
+                // Release 11.12.0 wrote EnrichedRecord. Its nested raw record
+                // predates api_key_id, so copy the already-resolved top-level
+                // value into the new field before deserializing it.
+                let api_key_id = payload.get("api_key_id").cloned().unwrap_or(serde_json::Value::Null);
+                if let Some(raw) = payload.get_mut("raw").and_then(serde_json::Value::as_object_mut) {
+                    raw.entry("api_key_id").or_insert(api_key_id);
+                }
+                records.push(serde_json::from_value::<EnrichedRecord>(payload)?);
+            } else {
+                raw_records.push(serde_json::from_value::<RawAnalyticsRecord>(payload)?);
+            }
             oldest = oldest.min(row.try_get::<DateTime<Utc>, _>("created_at")?);
         }
 
-        let records = self.enrich_batch(&mut tx, &raw_records).await?;
+        records.extend(self.enrich_batch(&mut tx, &raw_records).await?);
 
         self.write_batch_in_transaction(&mut tx, &records).await?;
         sqlx::query("DELETE FROM analytics_outbox WHERE id = ANY($1)")
@@ -2153,6 +2167,76 @@ mod integration_tests {
         assert_eq!(payload["api_key_id"], api_key_id.to_string());
         assert!(payload.get("user_id").is_none());
         assert!(payload.get("total_cost").is_none());
+    }
+
+    #[sqlx::test]
+    async fn test_projector_accepts_deployed_and_raw_outbox_payloads(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "mixed-outbox-payload-test").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00001").unwrap(),
+            Decimal::from_str("0.00003").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from(10)).await;
+        let api_key_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+
+        let config = crate::test::utils::create_test_config();
+        let (batcher, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+
+        let deployed_raw = create_raw_record("mixed-outbox-payload-test", Some(api_key_id), 10, 5);
+        let mut tx = pool.begin().await.unwrap();
+        let deployed_enriched = batcher
+            .enrich_batch(&mut tx, std::slice::from_ref(&deployed_raw))
+            .await
+            .unwrap()
+            .remove(0);
+        tx.rollback().await.unwrap();
+
+        // Match the payload emitted by release 11.12.0: EnrichedRecord at the
+        // top level and no api_key_id field inside its nested raw record.
+        let mut deployed_payload = serde_json::to_value(deployed_enriched).unwrap();
+        deployed_payload
+            .get_mut("raw")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("api_key_id");
+        sqlx::query("INSERT INTO analytics_outbox (instance_id, correlation_id, payload) VALUES ($1, $2, $3)")
+            .bind(deployed_raw.instance_id)
+            .bind(deployed_raw.correlation_id)
+            .bind(deployed_payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let raw = create_raw_record("mixed-outbox-payload-test", Some(api_key_id), 20, 10);
+        writer.publish(raw).await.unwrap();
+
+        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 2);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM analytics_outbox")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM http_analytics WHERE model = 'mixed-outbox-payload-test'",)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM credits_transactions WHERE transaction_type = 'usage' AND api_key_id = $1",)
+                .bind(api_key_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
     }
 
     #[sqlx::test]

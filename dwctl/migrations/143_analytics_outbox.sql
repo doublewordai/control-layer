@@ -1,7 +1,6 @@
--- Durable hand-off between response capture and analytics/billing projection.
--- payload contains a content-free RawAnalyticsRecord. It identifies an
--- authenticated request by api_key_id; API-key bearer credentials are never
--- stored in this table.
+-- Durable hand-off between response capture/enrichment and analytics/billing.
+-- payload contains only EnrichedRecord scalar data; RawAnalyticsRecord's
+-- bearer_token is serde-skipped so API-key secrets never enter this table.
 CREATE TABLE analytics_outbox (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     instance_id UUID NOT NULL,
