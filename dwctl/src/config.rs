@@ -1205,10 +1205,10 @@ pub struct OnwardsConfig {
     /// to, an attempt that hasn't produced response headers and (in strict
     /// mode) a first SSE frame within this window is abandoned and the next
     /// provider tried. The final attempt is never cut off, and fusillade daemon
-    /// traffic (batch, flex, background) is exempt. Default: 20000, twice the
-    /// AIMD latency budget, so a first token between 10 and 20 seconds still
-    /// streams from the preferred provider while counting as a breach that
-    /// shifts later requests to the alternates. Set to 0 to disable.
+    /// traffic (batch, flex, background) is exempt. Default: 20000. AIMD's
+    /// separate 10-second latency budget records a later first token as a
+    /// breach without cutting it off; once breaches exceed the controller's
+    /// target rate, later requests shift to the alternates. Set to 0 to disable.
     pub first_token_timeout_ms: u64,
 }
 

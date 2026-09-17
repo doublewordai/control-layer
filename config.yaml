@@ -526,9 +526,9 @@ onwards:
   # hasn't started streaming within this window is abandoned and the next
   # provider tried. The final attempt is never cut off, and fusillade daemon
   # traffic (batch, flex, background) is exempt. Set to 0 to disable.
-  # AIMD judges a first token later than its 10-second latency budget as a breach
-  # without cutting the attempt off, so slow providers keep streaming until this
-  # deadline while later requests shift to the alternates.
+  # AIMD records a first token later than its separate 10-second latency budget as
+  # a breach without cutting the attempt off; once breaches exceed its target rate,
+  # later requests shift to the alternates.
   # Set via environment: DWCTL_ONWARDS__FIRST_TOKEN_TIMEOUT_MS=20000
   first_token_timeout_ms: 20000
   # Models may override the deadline via first_token_timeout_ms in the model API.
