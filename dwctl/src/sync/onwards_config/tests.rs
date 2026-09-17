@@ -1972,7 +1972,12 @@ async fn aimd_and_first_token_deadline_survive_database_sync(pool: sqlx::PgPool)
     let composite = targets.targets.get("composite-priority").unwrap();
     let fallback = composite.value().default_pool().fallback().unwrap();
     assert_eq!(fallback.first_token_timeout_ms, Some(200));
-    assert_eq!(serde_json::to_value(fallback.aimd.as_ref().unwrap()).unwrap(), config);
+    // A stored override written before newer AIMD members existed still loads:
+    // the members it omits take their defaults.
+    assert_eq!(
+        fallback.aimd.as_ref().unwrap(),
+        &serde_json::from_value::<onwards::aimd::AimdConfig>(config).unwrap()
+    );
     let standard = targets.targets.get("regular-public").unwrap();
     assert_eq!(
         standard.value().default_pool().fallback().unwrap().first_token_timeout_ms,
