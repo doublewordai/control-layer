@@ -348,6 +348,11 @@ enum BatchNormalizeError {
     /// The content store itself failed (GCS unreachable, IAM error).
     /// Surface as "service unavailable".
     StoreFailed(String),
+    /// The image-access database (the grant written for every ingested image,
+    /// which later authorises signing its token) could not be reached. The
+    /// content store already succeeded, so this names the right dependency.
+    /// Retryable.
+    AccessUnavailable,
 }
 
 async fn normalize_template_body_in_place(
@@ -401,7 +406,7 @@ async fn normalize_template_body_in_place(
                             if let Ok(mut g) = err_cell.lock()
                                 && g.is_none()
                             {
-                                *g = Some(BatchNormalizeError::StoreFailed("image_access bookkeeping failed".to_string()));
+                                *g = Some(BatchNormalizeError::AccessUnavailable);
                             }
                             return Err(());
                         }
@@ -423,9 +428,7 @@ async fn normalize_template_body_in_place(
                         crate::image_normalizer::NormalizeError::Forbidden => {
                             BatchNormalizeError::BadInput("image token is not accessible to this caller".to_string())
                         }
-                        crate::image_normalizer::NormalizeError::AccessUnavailable => {
-                            BatchNormalizeError::StoreFailed("image access store unavailable".to_string())
-                        }
+                        crate::image_normalizer::NormalizeError::AccessUnavailable => BatchNormalizeError::AccessUnavailable,
                     };
                     if let Ok(mut g) = err_cell.lock()
                         && g.is_none()
@@ -488,6 +491,9 @@ enum FileUploadError {
     /// Image normaliser content-store backend failed (GCS unreachable,
     /// IAM error). 502/503 territory; not the user's fault.
     ImageStoreFailed { line: u64, message: String },
+    /// The image-access database was unreachable while recording the grant
+    /// for an ingested image. Retryable; distinct from the content store.
+    ImageAccessUnavailable { line: u64 },
     /// A referenced image's origin returned a non-408/429 4xx (forbidden, gated,
     /// missing; 408/429 are transient and surface as `ImageTransient`). The file
     /// references an image the user cannot grant us access to — their bad input,
@@ -517,6 +523,7 @@ fn map_batch_normalize_error(e: BatchNormalizeError, line: u64) -> FileUploadErr
         BatchNormalizeError::FetchFailed(message) => FileUploadError::ImageFetchFailed { line, message },
         BatchNormalizeError::Transient(message) => FileUploadError::ImageTransient { line, message },
         BatchNormalizeError::StoreFailed(message) => FileUploadError::ImageStoreFailed { line, message },
+        BatchNormalizeError::AccessUnavailable => FileUploadError::ImageAccessUnavailable { line },
     }
 }
 
@@ -581,6 +588,9 @@ impl FileUploadError {
             },
             FileUploadError::ImageStoreFailed { line, message } => Error::ServiceUnavailable {
                 message: format!("Line {}: image content store temporarily unavailable: {}", line, message),
+            },
+            FileUploadError::ImageAccessUnavailable { line } => Error::ServiceUnavailable {
+                message: format!("Line {}: image access store temporarily unavailable, please retry", line),
             },
             FileUploadError::ImageUnfetchable { line, message } => Error::UnprocessableEntity {
                 message: format!(
