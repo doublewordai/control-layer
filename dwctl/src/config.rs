@@ -1205,8 +1205,10 @@ pub struct OnwardsConfig {
     /// to, an attempt that hasn't produced response headers and (in strict
     /// mode) a first SSE frame within this window is abandoned and the next
     /// provider tried. The final attempt is never cut off, and fusillade daemon
-    /// traffic (batch, flex, background) is exempt. Default: 10000. Set to 0 to
-    /// disable.
+    /// traffic (batch, flex, background) is exempt. Default: 20000. AIMD's
+    /// separate 10-second latency budget records a later first token as a
+    /// breach without cutting it off; once breaches exceed the controller's
+    /// target rate, later requests shift to the alternates. Set to 0 to disable.
     pub first_token_timeout_ms: u64,
 }
 
@@ -1217,7 +1219,7 @@ impl Default for OnwardsConfig {
             upstream_rate_limit_message:
                 "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
                     .to_string(),
-            first_token_timeout_ms: 10_000,
+            first_token_timeout_ms: 20_000,
         }
     }
 }
