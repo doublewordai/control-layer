@@ -41,6 +41,52 @@ are additive and remain compatible with older workers. Concurrent builds
 still require temporary disk space and I/O; allow the migration job to finish
 before rolling the new release.
 
+#### Underway index upgrade prerequisites
+
+Before applying the Underway extension migrations, configure **all existing
+serving replicas** with `migrations.mode: check` and finish that rollout. Run
+one migration Job, and prevent older migration Jobs or manual migrators from
+starting until it finishes. For a single-instance installation using `run`,
+stop the old process before starting the upgrade.
+
+The new Underway wrapper polls for the advisory lock outside a transaction,
+but cannot change the behavior of an older binary. An older runner blocked
+inside SQLx's advisory-lock statement can retain a snapshot that a concurrent
+index build needs, causing a deadlock. Keeping the lock across both migration
+phases does not prevent an older runner from becoming such a waiter. Mixed
+old/new migration runners are therefore unsupported during these builds;
+older serving replicas in `check` mode remain compatible. If runners cannot
+be excluded, deploy the polling change separately before enabling the index
+builds. The recoverable migration sequence is still required for interrupted
+builds; it does not replace this rollout prerequisite.
+
+Main migration 146 also creates `underway_extensions`. The migration role
+must have database-level `CREATE`, or an administrator must pre-provision
+that schema owned by the migration role before the upgrade:
+
+```sql
+CREATE SCHEMA underway_extensions AUTHORIZATION migration_role;
+```
+
+Replace `migration_role` with the actual role used by the migration Job.
+Check the prerequisite using that role's connection before deployment:
+
+```sql
+SELECT has_database_privilege(current_user, current_database(), 'CREATE')
+    OR EXISTS (
+        SELECT 1 FROM pg_namespace
+        WHERE nspname = 'underway_extensions'
+          AND has_schema_privilege(current_user, oid, 'USAGE')
+          AND has_schema_privilege(current_user, oid, 'CREATE')
+    ) AS can_prepare_underway_extensions;
+```
+
+This must return `true`. PostgreSQL enforces the required privileges when
+creating the schema and its migration-history table; schema-scoped grants on
+the existing application schemas alone are insufficient. The migration role
+also needs ownership of the Underway task table/indexes, as required by the
+index creation and reindex steps.
+
 The implementation is `dwctl/src/migrations.rs` (runner, compatibility check,
 command). It deliberately contains no schema knowledge of its own: every
 statement that changes the database lives in a migration file.

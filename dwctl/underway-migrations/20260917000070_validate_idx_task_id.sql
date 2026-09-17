@@ -17,3 +17,6 @@ BEGIN
     END IF;
 END
 $$;
+
+COMMENT ON INDEX underway.idx_task_id IS
+    'Supports Underway task completion lookups by task ID without requiring created_at.';

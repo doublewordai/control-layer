@@ -18,3 +18,6 @@ BEGIN
     END IF;
 END
 $$;
+
+COMMENT ON INDEX underway.idx_task_queue_state IS
+    'Supports Underway task claims by queue and state without scanning completed task history.';
