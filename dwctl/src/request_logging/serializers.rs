@@ -173,14 +173,15 @@ pub struct UsageMetrics {
     pub cache_read_source: Option<String>,
     /// Content-free request parameters read off the parsed request body.
     pub request_params: RequestParams,
-    /// Serving class the request asked for (suffix > key > overlay default >
+    /// Serving class the request asked for (suffix > overlay default >
     /// account default), from the onwards `ServingClassOutcome` response
     /// extension. `None` when nothing named a class, or when the request
     /// never reached onwards' resolver.
     pub requested_serving_class: Option<String>,
     /// Serving class the request was dispatched under (interactive |
-    /// throughput | standard) after entitlement. `None` only when the request
-    /// never reached the resolver.
+    /// throughput | standard, or custom for an overlay's explicit targets)
+    /// after entitlement. `None` only when the request never reached the
+    /// resolver.
     pub resolved_serving_class: Option<String>,
 }
 

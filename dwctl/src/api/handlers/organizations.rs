@@ -619,11 +619,20 @@ pub async fn update_organization<P: PoolProvider>(
             resource: format!("zero data retention for organization {id}"),
         });
     }
-    // The serving account settings change how the organisation's traffic is
-    // routed and prioritised fleet-wide; same gate as ZDR.
-    if !can_all
-        && (data.granted_serving_classes.is_some() || data.default_serving_class.is_some() || data.self_hosted_only.is_some())
-        && caller_org_role.as_deref() != Some("owner")
+    // SECURITY: granted serving classes are an entitlement to elevated,
+    // fleet-wide priority. Only a platform operator grants them, never the
+    // organisation itself (same rule as the users endpoint).
+    if !can_all && data.granted_serving_classes.is_some() {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Organizations, Operation::UpdateAll),
+            action: Operation::UpdateAll,
+            resource: format!("granted serving classes for organization {id}"),
+        });
+    }
+    // The default class (only effective within the classes held) and the
+    // routing preference are the organisation's own choices; owner-only, like
+    // ZDR.
+    if !can_all && (data.default_serving_class.is_some() || data.self_hosted_only.is_some()) && caller_org_role.as_deref() != Some("owner")
     {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
@@ -3570,6 +3579,61 @@ mod tests {
             .await;
         resp.assert_status(axum::http::StatusCode::OK);
         assert_eq!(resp.json::<serde_json::Value>()["zero_data_retention"].as_bool(), Some(true));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_organization_owner_sets_serving_preferences_but_cannot_self_grant_classes(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let pm_headers = add_auth_headers(&pm);
+        let owner = create_test_user(&pool, Role::StandardUser).await;
+        let owner_headers = add_auth_headers(&owner);
+
+        let resp = server
+            .post("/admin/api/v1/organizations")
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "name": "owner-serving-org", "email": "contact@example.com" }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::CREATED);
+        let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
+
+        // Granted classes are an entitlement: the owner cannot hand them to
+        // their own organisation, even alongside an allowed field.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "granted_serving_classes": ["interactive"], "self_hosted_only": true }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+
+        // The default class and routing preference are the owner's own choices.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&owner_headers[0].0, &owner_headers[0].1)
+            .add_header(&owner_headers[1].0, &owner_headers[1].1)
+            .json(&json!({ "default_serving_class": "throughput", "self_hosted_only": true }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["default_serving_class"].as_str(), Some("throughput"));
+        assert_eq!(body["self_hosted_only"].as_bool(), Some(true));
+        assert_eq!(body["granted_serving_classes"].as_array().map(Vec::len), Some(0));
+
+        // A platform manager grants.
+        let resp = server
+            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .add_header(&pm_headers[0].0, &pm_headers[0].1)
+            .add_header(&pm_headers[1].0, &pm_headers[1].1)
+            .json(&json!({ "granted_serving_classes": ["interactive", "throughput"] }))
+            .await;
+        resp.assert_status(axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.json::<serde_json::Value>()["granted_serving_classes"],
+            json!(["interactive", "throughput"])
+        );
     }
 
     #[sqlx::test]

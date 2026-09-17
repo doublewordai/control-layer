@@ -110,8 +110,10 @@ pub enum PresetClass {
 #[serde(deny_unknown_fields)]
 pub struct ServingPreset {
     /// Time-to-first-token target, milliseconds.
+    #[schemars(range(min = 1))]
     pub ttft_ms: u32,
     /// Inter-token-latency target, milliseconds.
+    #[schemars(range(min = 1))]
     pub itl_ms: u32,
     /// Scheduling priority; omit for 0.
     #[serde(default)]

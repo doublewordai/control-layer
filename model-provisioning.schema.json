@@ -621,7 +621,7 @@
           "description": "Inter-token-latency target, milliseconds.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0
+          "minimum": 1
         },
         "priority": {
           "description": "Scheduling priority; omit for 0.",
@@ -633,7 +633,7 @@
           "description": "Time-to-first-token target, milliseconds.",
           "type": "integer",
           "format": "uint32",
-          "minimum": 0
+          "minimum": 1
         }
       },
       "additionalProperties": false,

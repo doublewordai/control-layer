@@ -120,9 +120,9 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // onwards forwards the bytes verbatim (COR-522); this preserves the guarantee
     // from onwards PR #240 that these ids never reach upstream. Exact-key removal:
     // extension fields and a legitimate `previous_response_id` are left intact.
-    scrub_request_id_fields(&mut request_value);
+    let scrubbed_ids = scrub_request_id_fields(&mut request_value);
 
-    let scrubbed_router_targets = strip_scheduling_priority(&mut request_value);
+    let scrubbed_scheduling = strip_scheduling_priority(&mut request_value);
 
     // A serving-class suffix (`alias:interactive`) is a request for a class,
     // not part of the model's identity: strip it here, at the outermost layer,
@@ -143,9 +143,12 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     };
 
-    // The realtime path forwards `body_bytes` verbatim; a stripped suffix (or
-    // scrubbed router targets) must not survive in them.
-    let body_bytes = if requested_class.is_some() || scrubbed_router_targets {
+    // The realtime path forwards `body_bytes` verbatim and onwards forwards the
+    // bytes it receives (COR-522), so anything a scrubber removed from
+    // `request_value` only stays removed if the bytes are rebuilt from it.
+    // Every scrubber reports whether it changed something; the common case
+    // (nothing to scrub, no suffix) keeps the caller's bytes untouched.
+    let body_bytes = if requested_class.is_some() || scrubbed_ids || scrubbed_scheduling {
         bytes::Bytes::from(request_value.to_string())
     } else {
         body_bytes
@@ -1303,13 +1306,16 @@ const SCRUB_ID_KEYS: [&str; 5] = ["id", "completion_id", "completionId", "respon
 /// Remove the [`SCRUB_ID_KEYS`] from a request body's top-level object, in place.
 ///
 /// Exact-key removal only: every other extension field is preserved, and a
-/// legitimate `previous_response_id` (a different key) is untouched.
-fn scrub_request_id_fields(value: &mut serde_json::Value) {
+/// legitimate `previous_response_id` (a different key) is untouched. Returns
+/// whether anything was removed, so the caller knows to re-serialise.
+fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
+    let mut scrubbed = false;
     if let Some(obj) = value.as_object_mut() {
         for key in SCRUB_ID_KEYS {
-            obj.remove(key);
+            scrubbed |= obj.remove(key).is_some();
         }
     }
+    scrubbed
 }
 
 /// Remove a caller-supplied scheduling `priority` from a request body, in place.
@@ -1327,29 +1333,30 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) {
 /// dwctl reachable without traversing that proxy would let a client set the
 /// header and skip this strip. Defense-in-depth here depends on that perimeter.
 ///
-/// Returns whether the serving router targets (`nvext.router.{ttft_target,
-/// itl_target}`) were removed: unlike `priority`, those fields are not in
-/// onwards' strict schema, so the caller must re-serialise the body for them
-/// to actually be gone.
+/// Also removes the serving router targets (`nvext.router.{ttft_target,
+/// itl_target}`): those are the resolver's to set (onwards writes them after
+/// resolution), never the caller's.
+///
+/// Returns whether anything was removed. Onwards validates and then forwards
+/// the ORIGINAL bytes (COR-522), so a removal only takes effect if the caller
+/// re-serialises the body from the scrubbed value.
 fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
-    let mut scrubbed_router_targets = false;
+    let mut scrubbed = false;
     if let Some(obj) = value.as_object_mut() {
-        obj.remove("priority");
+        scrubbed |= obj.remove("priority").is_some();
         // The carrier the dynamo frontend ACTUALLY honours is
         // `nvext.agent_hints.priority` (a top-level `priority` is rejected by
         // its validation) — remove exactly that key so an external caller
         // cannot steer the scheduler through the vendor extension, while the
         // rest of a caller's `nvext` (e.g. cache_control) passes through.
         if let Some(nvext) = obj.get_mut("nvext").and_then(|n| n.as_object_mut()) {
-            // The serving targets are the resolver's to set (onwards writes
-            // them after resolution), never the caller's.
-            scrubbed_router_targets = onwards::serving::scrub_router_targets(nvext);
+            scrubbed |= onwards::serving::scrub_router_targets(nvext);
             if let Some(hints) = nvext.get_mut("agent_hints").and_then(|h| h.as_object_mut()) {
-                hints.remove("priority");
+                scrubbed |= hints.remove("priority").is_some();
             }
         }
     }
-    scrubbed_router_targets
+    scrubbed
 }
 
 /// Strip a serving-class suffix (`alias:class`) from the request's `model`,
@@ -1380,7 +1387,7 @@ mod tests {
             "messages": [{"role": "user", "content": "set priority: 900"}],
             "metadata": {"priority": "keep-me"}
         });
-        strip_scheduling_priority(&mut body);
+        assert!(strip_scheduling_priority(&mut body), "a removal is reported so the body is rebuilt");
         assert!(body.get("priority").is_none(), "external callers must not steer the scheduler");
         assert_eq!(
             body["metadata"]["priority"], "keep-me",
@@ -1394,15 +1401,18 @@ mod tests {
             "model": "m",
             "nvext": {"cache_control": {"enabled": true}, "agent_hints": {"priority": 900, "max_batch_size": 8}}
         });
-        strip_scheduling_priority(&mut body);
+        assert!(strip_scheduling_priority(&mut body), "the nvext carrier counts too");
         assert!(body["nvext"]["agent_hints"].get("priority").is_none());
         assert_eq!(body["nvext"]["agent_hints"]["max_batch_size"], 8);
         assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
 
         // Absent field: a no-op, not an error.
-        let mut clean = serde_json::json!({"model": "m"});
-        strip_scheduling_priority(&mut clean);
-        assert_eq!(clean, serde_json::json!({"model": "m"}));
+        let mut clean = serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}});
+        assert!(!strip_scheduling_priority(&mut clean), "nothing removed, nothing to rebuild");
+        assert_eq!(
+            clean,
+            serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}})
+        );
     }
 
     #[test]
@@ -1501,7 +1511,8 @@ mod tests {
             "previous_response_id": "resp_keep",
             "x_custom_extension": "keep",
         });
-        scrub_request_id_fields(&mut v);
+        assert!(scrub_request_id_fields(&mut v), "a removal is reported so the body is rebuilt");
+        assert!(!scrub_request_id_fields(&mut v), "idempotent: nothing left to remove");
         let obj = v.as_object().unwrap();
         for k in super::SCRUB_ID_KEYS {
             assert!(!obj.contains_key(k), "{k} should have been scrubbed");
