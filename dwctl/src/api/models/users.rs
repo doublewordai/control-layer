@@ -86,9 +86,15 @@ pub struct UserUpdate {
     /// account; callers with UpdateAll on users may set it for any account.
     /// Omit to leave unchanged.
     pub zero_data_retention: Option<bool>,
+    /// Account setting: elevated serving classes this account holds
+    /// (`interactive`, `throughput`). A request naming a class the account
+    /// does not hold is refused. Settable only by callers with UpdateAll on
+    /// users. Omit to leave unchanged; an empty list revokes all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_serving_classes: Option<Vec<String>>,
     /// Account setting: serving class this account's realtime requests ask
-    /// for when neither the request nor the key names one (`interactive` or
-    /// `throughput`). Still gated per model by the account's grant. Settable
+    /// for when the request names none (`interactive` or `throughput`).
+    /// Applies where the account holds it and the model offers it. Settable
     /// only by callers with UpdateAll on users. Omit to leave unchanged; null
     /// clears it.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
@@ -184,6 +190,8 @@ pub struct UserResponse {
     /// immediate card charge. Enabled by Doubleword after approval, not
     /// self-service - it extends credit on payment terms.
     pub invoicing_enabled: bool,
+    /// Account setting: elevated serving classes this account holds.
+    pub granted_serving_classes: Vec<String>,
     /// Account setting: serving class this account's requests ask for by default.
     pub default_serving_class: Option<String>,
     /// Account setting: never fall over to an external provider.
@@ -302,6 +310,7 @@ impl From<UserDBResponse> for UserResponse {
             verified: db.verified,
             zero_data_retention: db.zero_data_retention,
             invoicing_enabled: db.invoicing_enabled,
+            granted_serving_classes: db.granted_serving_classes,
             default_serving_class: db.default_serving_class,
             self_hosted_only: db.self_hosted_only,
             organizations: None,

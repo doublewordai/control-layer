@@ -75,15 +75,11 @@ pub struct ClayModel {
     pub access_groups: Vec<String>,
     #[serde(default)]
     pub traffic_rules: Vec<TrafficRule>,
-    /// Elevated serving classes this model has activated. Empty = standard
-    /// only. Activate once the serving side has pools for the model.
+    /// Elevated serving classes this model offers. Empty = standard only.
+    /// Declare once the serving side has pools for the model; an
+    /// organisation that holds a class gets it on every model that offers it.
     #[serde(default)]
     pub serving_classes: Vec<ServingClassName>,
-    /// One organisation's modifiers on this model: its tariff, the classes it
-    /// may use, a default class, a routing override. Resolved by API-key
-    /// owner, never addressed by name in a request.
-    #[serde(default)]
-    pub overlays: Vec<Overlay>,
 }
 
 /// The two elevated serving classes a model can activate and an org can be
@@ -102,30 +98,6 @@ impl ServingClassName {
             Self::Throughput => "throughput",
         }
     }
-}
-
-/// An organisation's overlay on the enclosing model.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct Overlay {
-    /// The organisation, by its account username.
-    pub org: String,
-    /// Name of one of this model's `tariffs` the org is charged under. Omit
-    /// for the model's general tariff.
-    #[serde(default)]
-    pub tariff: Option<String>,
-    /// Elevated classes the org may use on this model (each must be in the
-    /// model's `serving_classes`).
-    #[serde(default)]
-    pub classes: Vec<ServingClassName>,
-    /// Class the org's requests to this model ask for when neither the
-    /// request nor the key names one. Must be one of `classes`.
-    #[serde(default)]
-    pub default_class: Option<ServingClassName>,
-    /// Per-model override of the account's `self_hosted_only` setting. Omit
-    /// to inherit.
-    #[serde(default)]
-    pub self_hosted_only: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
@@ -548,52 +520,6 @@ impl Catalog {
                     class.as_db_str()
                 );
             }
-            let tariff_names: HashSet<&str> = model.clay.tariffs.iter().map(|t| t.name.as_str()).collect();
-            let mut overlay_orgs = HashSet::new();
-            for overlay in &model.clay.overlays {
-                ensure_nonempty(&overlay.org, &model.source, "overlay.org")?;
-                ensure!(
-                    overlay_orgs.insert(overlay.org.to_lowercase()),
-                    "{}: duplicate overlay for org {:?}",
-                    model.source,
-                    overlay.org
-                );
-                if let Some(tariff) = &overlay.tariff {
-                    ensure!(
-                        tariff_names.contains(tariff.as_str()),
-                        "{}: overlay for org {:?} names tariff {:?}, which the model does not declare",
-                        model.source,
-                        overlay.org,
-                        tariff
-                    );
-                }
-                let mut granted = HashSet::new();
-                for class in &overlay.classes {
-                    ensure!(
-                        classes.contains(class),
-                        "{}: overlay for org {:?} grants {:?}, which the model has not activated",
-                        model.source,
-                        overlay.org,
-                        class.as_db_str()
-                    );
-                    ensure!(
-                        granted.insert(*class),
-                        "{}: overlay for org {:?} grants {:?} twice",
-                        model.source,
-                        overlay.org,
-                        class.as_db_str()
-                    );
-                }
-                if let Some(default) = overlay.default_class {
-                    ensure!(
-                        granted.contains(&default),
-                        "{}: overlay for org {:?} defaults to {:?}, which it does not grant",
-                        model.source,
-                        overlay.org,
-                        default.as_db_str()
-                    );
-                }
-            }
 
             let mut purposes = HashSet::new();
             for rule in &model.clay.traffic_rules {
@@ -833,7 +759,7 @@ clay:
         );
     }
 
-    fn overlay_catalog_yaml(serving_classes: &str, overlays: &str) -> String {
+    fn classes_catalog_yaml(serving_classes: &str) -> String {
         format!(
             r#"
 model: org/model
@@ -852,155 +778,59 @@ clay:
       purpose: realtime
       input_per_million_tokens: "0.50"
       output_per_million_tokens: "1.50"
-    - name: bespoke
-      purpose: batch
-      completion_window: 24h
-      input_per_million_tokens: "0.10"
-      output_per_million_tokens: "0.20"
   serving_classes: {serving_classes}
-  overlays: {overlays}
 "#
         )
     }
 
     #[test]
-    fn overlays_are_validated_against_the_model_they_sit_on() {
-        let cases: [(&str, &str, &str); 5] = [
-            ("[interactive, interactive]", "[]", "duplicate serving class"),
-            ("[interactive]", "[{org: acme, tariff: missing}]", "names tariff \"missing\""),
-            (
-                "[interactive]",
-                "[{org: acme, classes: [throughput]}]",
-                "which the model has not activated",
-            ),
-            (
-                "[interactive, throughput]",
-                "[{org: acme, classes: [interactive], default_class: throughput}]",
-                "which it does not grant",
-            ),
-            (
-                "[interactive]",
-                "[{org: acme, classes: [interactive]}, {org: ACME, classes: [interactive]}]",
-                "duplicate overlay for org",
-            ),
-        ];
-        for (classes, overlays, expected) in cases {
-            let directory = tempdir().unwrap();
-            write(directory.path(), "model.yaml", &overlay_catalog_yaml(classes, overlays));
-            let err = Catalog::load(directory.path()).unwrap_err().to_string();
-            assert!(err.contains(expected), "classes {classes} overlays {overlays}: {err}");
-        }
-
+    fn serving_classes_are_validated() {
         let directory = tempdir().unwrap();
-        write(
-            directory.path(),
-            "model.yaml",
-            &overlay_catalog_yaml(
-                "[interactive, throughput]",
-                "[{org: acme, tariff: bespoke, classes: [interactive, throughput], default_class: throughput, self_hosted_only: true}]",
-            ),
+        write(directory.path(), "model.yaml", &classes_catalog_yaml("[interactive, interactive]"));
+        let err = Catalog::load(directory.path()).unwrap_err().to_string();
+        assert!(err.contains("duplicate serving class"), "{err}");
+
+        write(directory.path(), "model.yaml", &classes_catalog_yaml("[fast]"));
+        assert!(
+            Catalog::load(directory.path()).is_err(),
+            "unknown class names are rejected by the schema"
         );
+
+        write(directory.path(), "model.yaml", &classes_catalog_yaml("[interactive, throughput]"));
         let catalog = Catalog::load(directory.path()).unwrap();
-        let overlay = &catalog.models[0].clay.overlays[0];
-        assert_eq!(overlay.org, "acme");
-        assert_eq!(overlay.default_class, Some(ServingClassName::Throughput));
-        assert_eq!(overlay.self_hosted_only, Some(true));
+        assert_eq!(
+            catalog.models[0].clay.serving_classes,
+            vec![ServingClassName::Interactive, ServingClassName::Throughput]
+        );
     }
 
     #[sqlx::test]
-    async fn apply_materialises_active_classes_and_overlays(pool: PgPool) {
+    async fn apply_materialises_offered_classes(pool: PgPool) {
         sqlx::query(
             "INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')",
         )
         .execute(&pool)
         .await
         .unwrap();
-        let org_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO users (username, email, display_name, auth_source, user_type) VALUES ('acme', 'acme@example.com', 'Acme', 'test', 'organization') RETURNING id",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-
-        // An unknown org is a preflight failure: nothing is written.
         let directory = tempdir().unwrap();
-        write(
-            directory.path(),
-            "model.yaml",
-            &overlay_catalog_yaml("[interactive]", "[{org: nobody, classes: [interactive]}]"),
-        );
-        let err = apply(&pool, &Catalog::load(directory.path()).unwrap())
-            .await
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unknown overlay organisation(s): nobody"), "{err}");
-
-        write(
-            directory.path(),
-            "model.yaml",
-            &overlay_catalog_yaml(
-                "[interactive, throughput]",
-                "[{org: acme, tariff: bespoke, classes: [interactive], default_class: interactive, self_hosted_only: true}]",
-            ),
-        );
+        write(directory.path(), "model.yaml", &classes_catalog_yaml("[interactive, throughput]"));
         apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
 
-        let (model_id, classes): (Uuid, Vec<String>) =
-            sqlx::query_as("SELECT id, serving_classes FROM deployed_models WHERE alias = 'org/model'")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        let classes: Vec<String> = sqlx::query_scalar("SELECT serving_classes FROM deployed_models WHERE alias = 'org/model'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(classes, vec!["interactive".to_string(), "throughput".to_string()]);
         let physical_classes: Vec<String> =
             sqlx::query_scalar("SELECT serving_classes FROM deployed_models WHERE alias = 'provider-org-model'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert!(physical_classes.is_empty(), "a physical member never activates classes of its own");
+        assert!(physical_classes.is_empty(), "a physical member never offers classes of its own");
 
-        let row = sqlx::query(
-            "SELECT tariff_name, granted_classes, default_serving_class, self_hosted_only, provisioning_source FROM model_overlays WHERE user_id = $1 AND deployed_model_id = $2",
-        )
-        .bind(org_id)
-        .bind(model_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(row.try_get::<Option<String>, _>("tariff_name").unwrap().as_deref(), Some("bespoke"));
-        assert_eq!(
-            row.try_get::<Vec<String>, _>("granted_classes").unwrap(),
-            vec!["interactive".to_string()]
-        );
-        assert_eq!(
-            row.try_get::<Option<String>, _>("default_serving_class").unwrap().as_deref(),
-            Some("interactive")
-        );
-        assert_eq!(row.try_get::<Option<bool>, _>("self_hosted_only").unwrap(), Some(true));
-        assert_eq!(
-            row.try_get::<Option<String>, _>("provisioning_source").unwrap().as_deref(),
-            Some("model-catalog:model.yaml")
-        );
-
-        // Dropping the overlay from the catalog removes the row it owned; a
-        // hand-managed row for another org survives.
-        sqlx::query(
-            "INSERT INTO model_overlays (user_id, deployed_model_id, granted_classes) SELECT id, $1, '{throughput}' FROM users WHERE id = '00000000-0000-0000-0000-000000000000'",
-        )
-        .bind(model_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        write(directory.path(), "model.yaml", &overlay_catalog_yaml("[interactive]", "[]"));
+        // The file is the source: dropping a class removes it on the next apply.
+        write(directory.path(), "model.yaml", &classes_catalog_yaml("[interactive]"));
         apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
-        let remaining: Vec<(Uuid, Option<String>)> =
-            sqlx::query_as("SELECT user_id, provisioning_source FROM model_overlays WHERE deployed_model_id = $1")
-                .bind(model_id)
-                .fetch_all(&pool)
-                .await
-                .unwrap();
-        assert_eq!(remaining.len(), 1);
-        assert_ne!(remaining[0].0, org_id);
-        assert_eq!(remaining[0].1, None);
         let classes: Vec<String> = sqlx::query_scalar("SELECT serving_classes FROM deployed_models WHERE alias = 'org/model'")
             .fetch_one(&pool)
             .await

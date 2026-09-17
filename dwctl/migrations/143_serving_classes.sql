@@ -1,24 +1,29 @@
 -- Serving classes v1.
 --
 -- A serving class is the dispatch mode a request is served under:
--- `interactive` and `throughput` are elevated classes a model activates and
--- an organisation is granted; `standard` is the absence of a choice and is
--- never stored. Onwards resolves the class per request (suffix > key >
--- overlay default > account default), gated by the model's active classes
--- and the org's overlay, and stamps the dynamo pool tag and priority band.
+-- `interactive` and `throughput` are elevated classes; `standard` is the
+-- absence of a choice and is never stored. Onwards resolves the class per
+-- request (request suffix > the org's per-model overlay default > the org's
+-- account default), and an elevated class applies only when the ORGANISATION
+-- holds it and the MODEL offers it. The resolved class is stamped on the
+-- dynamo member as a pool tag and priority band.
 --
--- Three levels of declared state:
---   * the model: which elevated classes are active (`deployed_models.serving_classes`);
---   * the org, per model: an OVERLAY (`model_overlays`) — granted classes, a
---     default class for that model, and a per-model override of the account's
---     routing preference. Declared in the model catalog, materialised here;
---   * the org, for every model: ACCOUNT SETTINGS on the users row, next to
---     zero_data_retention — a default class and "never fall over to an
---     external provider".
--- Plus the key: an optional class a specific API key requests by default.
+-- Declared state, by where it lives:
+--   * the model: which elevated classes it offers (`deployed_models.serving_classes`),
+--     declared in the model catalog next to the model's pools;
+--   * the organisation, org-wide: ACCOUNT SETTINGS on the users row, next to
+--     zero_data_retention: the classes it holds, a default class, and "never
+--     fall over to an external provider". Operational settings, toggled in the
+--     console like ZDR;
+--   * the organisation, per model: an OVERLAY (`model_overlays`) — a per-model
+--     override of the account default class or routing preference. Declared in
+--     the per-organisation catalog files and materialised here;
+--   * the endpoint: what kind of server it is (`inference_endpoints.kind`), so
+--     the envelope is only ever sent to the dynamo frontend and a "no external
+--     provider" restriction knows which members are external.
 
 -- ---------------------------------------------------------------------------
--- The model: active elevated classes.
+-- The model: elevated classes it offers.
 ALTER TABLE deployed_models
     ADD COLUMN serving_classes TEXT[] NOT NULL DEFAULT '{}';
 
@@ -27,112 +32,61 @@ ALTER TABLE deployed_models
     CHECK (serving_classes <@ ARRAY['interactive', 'throughput']::text[]);
 
 COMMENT ON COLUMN deployed_models.serving_classes IS
-  'Elevated serving classes this model has activated (subset of interactive, throughput). Empty = standard only; a requested elevated class resolves to standard.';
-
--- ---------------------------------------------------------------------------
--- The key: a class this key requests by default (still gated by the org's
--- grant and the model's active classes at resolution time).
-ALTER TABLE api_keys
-    ADD COLUMN serving_class TEXT;
-
-ALTER TABLE api_keys
-    ADD CONSTRAINT chk_api_keys_serving_class
-    CHECK (serving_class IS NULL OR serving_class IN ('interactive', 'throughput'));
-
-COMMENT ON COLUMN api_keys.serving_class IS
-  'Serving class requested by default for this key (interactive | throughput). NULL = no key-level preference. A request suffix outranks it.';
-
--- The api_keys NOTIFY is scoped to the columns the onwards sync reads
--- (migration 101); the key class is now one of them.
-CREATE OR REPLACE FUNCTION notify_api_keys_config_change() RETURNS trigger AS $$
-DECLARE
-    relevant_change boolean := false;
-BEGIN
-    IF TG_OP = 'INSERT' THEN
-        relevant_change := EXISTS (SELECT 1 FROM new_rows);
-    ELSIF TG_OP = 'DELETE' THEN
-        relevant_change := EXISTS (SELECT 1 FROM old_rows);
-    ELSIF TG_OP = 'UPDATE' THEN
-        relevant_change := EXISTS (
-            SELECT 1
-            FROM new_rows n
-            JOIN old_rows o ON o.id = n.id
-            WHERE o.secret              IS DISTINCT FROM n.secret
-               OR o.purpose             IS DISTINCT FROM n.purpose
-               OR o.user_id             IS DISTINCT FROM n.user_id
-               OR o.requests_per_second IS DISTINCT FROM n.requests_per_second
-               OR o.burst_size          IS DISTINCT FROM n.burst_size
-               OR o.is_deleted          IS DISTINCT FROM n.is_deleted
-               OR o.hidden              IS DISTINCT FROM n.hidden
-               OR o.serving_class       IS DISTINCT FROM n.serving_class
-        );
-    END IF;
-
-    IF relevant_change THEN
-        PERFORM pg_notify('auth_config_changed',
-            'api_keys:' || (extract(epoch FROM clock_timestamp()) * 1000000)::bigint::text);
-    END IF;
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql;
+  'Elevated serving classes this model offers (subset of interactive, throughput), declared in the model catalog once its pools exist. Empty = standard only.';
 
 -- ---------------------------------------------------------------------------
 -- Account settings: org-wide, every model the org calls. Same shape and sync
--- path as zero_data_retention (migration 109): read by the onwards sync when
--- building per-key config, so every key owned by the account inherits them.
+-- path as zero_data_retention (migration 109).
 ALTER TABLE users
+    ADD COLUMN granted_serving_classes TEXT[] NOT NULL DEFAULT '{}',
     ADD COLUMN default_serving_class TEXT,
     ADD COLUMN self_hosted_only BOOLEAN NOT NULL DEFAULT false;
 
 ALTER TABLE users
+    ADD CONSTRAINT chk_users_granted_serving_classes
+    CHECK (granted_serving_classes <@ ARRAY['interactive', 'throughput']::text[]),
     ADD CONSTRAINT chk_users_default_serving_class
     CHECK (default_serving_class IS NULL OR default_serving_class IN ('interactive', 'throughput'));
 
+COMMENT ON COLUMN users.granted_serving_classes IS
+  'Account setting: elevated serving classes this organisation holds. An explicit request for a class not held is rejected; a class held applies wherever the model offers it.';
 COMMENT ON COLUMN users.default_serving_class IS
-  'Account setting: serving class this account''s realtime requests ask for when neither the request nor the key names one. Still gated by the org''s per-model grant.';
+  'Account setting: serving class this organisation''s realtime requests ask for when the request names none. Silently resolves to standard on models that do not offer it.';
 COMMENT ON COLUMN users.self_hosted_only IS
-  'Account setting: never fall over to an external (untrusted) provider; onwards restricts the composite to its self-hosted members for this account''s requests. An overlay can override it per model.';
+  'Account setting: never fall over to an external provider; onwards restricts the composite to its non-external members for this organisation''s requests. An overlay can override it per model.';
 
 CREATE TRIGGER users_serving_settings_notify
-    AFTER UPDATE OF default_serving_class, self_hosted_only ON users
+    AFTER UPDATE OF granted_serving_classes, default_serving_class, self_hosted_only ON users
     FOR EACH ROW
-    WHEN (OLD.default_serving_class IS DISTINCT FROM NEW.default_serving_class
+    WHEN (OLD.granted_serving_classes IS DISTINCT FROM NEW.granted_serving_classes
+          OR OLD.default_serving_class IS DISTINCT FROM NEW.default_serving_class
           OR OLD.self_hosted_only IS DISTINCT FROM NEW.self_hosted_only)
     EXECUTE FUNCTION notify_config_change();
 
 -- ---------------------------------------------------------------------------
--- Overlays: one org's modifiers on one model. Authored in the model catalog
--- (Josh's provisioning YAML, `clay.overlays`), materialised here by the
--- provisioner; the console renders them and never authors them.
+-- Overlays: one organisation's per-model overrides. Authored in the
+-- per-organisation catalog files, materialised here by the provisioner; the
+-- console renders them and never authors them.
 CREATE TABLE model_overlays (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     deployed_model_id UUID NOT NULL REFERENCES deployed_models(id) ON DELETE CASCADE,
-    -- Name of the tariff on this model the org is charged under. NULL = the
-    -- model's general tariff. Resolved by the tariff assigner in a later step;
-    -- stored now so the catalog can declare the whole deal in one place.
-    tariff_name TEXT,
-    -- Elevated classes the org may use on this model.
-    granted_classes TEXT[] NOT NULL DEFAULT '{}',
-    -- Class the org's requests to this model ask for when neither the request
-    -- nor the key names one. Outranks the account's default_serving_class.
+    -- Overrides the account's default_serving_class on this model. NULL = inherit.
     default_serving_class TEXT,
-    -- Per-model override of the account's self_hosted_only. NULL = inherit.
+    -- Overrides the account's self_hosted_only on this model. NULL = inherit.
     self_hosted_only BOOLEAN,
-    -- Set when the row is owned by the model catalog (same marker format as
+    -- Set when the row is owned by the catalog (same marker format as
     -- deployed_models.provisioning_source); NULL = managed by hand.
     provisioning_source TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT model_overlays_one_per_org_model UNIQUE (user_id, deployed_model_id),
-    CONSTRAINT chk_model_overlays_granted_classes
-        CHECK (granted_classes <@ ARRAY['interactive', 'throughput']::text[]),
     CONSTRAINT chk_model_overlays_default_serving_class
         CHECK (default_serving_class IS NULL OR default_serving_class IN ('interactive', 'throughput'))
 );
 
 COMMENT ON TABLE model_overlays IS
-  'One organisation''s modifiers on one model: tariff name, granted serving classes, per-model default class, per-model routing override. Declared in the model catalog; applied by API-key owner, never addressed by name.';
+  'One organisation''s per-model overrides of its account settings (default serving class, routing preference). Declared in the per-organisation catalog; applied by API-key owner, never addressed by name.';
 
 CREATE INDEX idx_model_overlays_deployed_model_id ON model_overlays (deployed_model_id);
 
@@ -141,14 +95,33 @@ CREATE TRIGGER model_overlays_notify
     EXECUTE FUNCTION notify_config_change();
 
 -- ---------------------------------------------------------------------------
+-- The endpoint: what kind of server it is. `dynamo` is the self-hosted fleet
+-- behind the dynamo frontend (the only kind that receives the serving-class
+-- envelope); `hosted` is self-hosted but not behind dynamo; `external` is a
+-- third-party provider. Backfilled from the scheduling-priority capability,
+-- which only the dynamo frontend endpoint carries today; independent of it
+-- from here on, and set explicitly when an endpoint is created.
+ALTER TABLE inference_endpoints
+    ADD COLUMN kind TEXT NOT NULL DEFAULT 'external';
+
+ALTER TABLE inference_endpoints
+    ADD CONSTRAINT chk_inference_endpoints_kind
+    CHECK (kind IN ('dynamo', 'hosted', 'external'));
+
+UPDATE inference_endpoints SET kind = 'dynamo' WHERE accepts_scheduling_priority;
+
+COMMENT ON COLUMN inference_endpoints.kind IS
+  'What kind of server this is: dynamo (self-hosted behind the dynamo frontend; receives the serving-class envelope), hosted (self-hosted, not dynamo), external (third-party provider; excluded for self_hosted_only organisations).';
+
+-- ---------------------------------------------------------------------------
 -- Analytics: what the request asked for and what it was served as. `resolved`
--- is always set on rows that reached onwards' resolver; `requested` is NULL
--- when nothing named a class. Aggregates key on the resolved class.
+-- is set on every row that reached onwards' resolver; `requested` is NULL when
+-- nothing named a class. Aggregates key on the resolved class.
 ALTER TABLE http_analytics
     ADD COLUMN requested_serving_class TEXT,
     ADD COLUMN resolved_serving_class TEXT;
 
 COMMENT ON COLUMN http_analytics.requested_serving_class IS
-  'Serving class the request asked for (suffix > key > overlay default > account default) before entitlement; NULL when nothing named one.';
+  'Serving class the request asked for (suffix > overlay default > account default); NULL when nothing named one.';
 COMMENT ON COLUMN http_analytics.resolved_serving_class IS
-  'Serving class the request was dispatched under after the model''s active classes and the org''s grant were applied (interactive | throughput | standard).';
+  'Serving class the request was dispatched under (interactive | throughput | standard).';

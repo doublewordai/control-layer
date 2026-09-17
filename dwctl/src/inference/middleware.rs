@@ -1541,7 +1541,6 @@ mod tests {
                     member_id: None,
                     spend_limit: None,
                     spend_limit_interval: None,
-                    serving_class: None,
                 },
             ))
             .await
@@ -1605,7 +1604,6 @@ mod tests {
                         member_id: None,
                         spend_limit: None,
                         spend_limit_interval: None,
-                        serving_class: None,
                     },
                 ))
                 .await
@@ -1656,7 +1654,6 @@ mod tests {
                         member_id: None,
                         spend_limit: None,
                         spend_limit_interval: None,
-                        serving_class: None,
                     },
                 ))
                 .await

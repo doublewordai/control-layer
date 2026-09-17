@@ -162,6 +162,7 @@ mod metrics;
 pub mod model_provisioning;
 mod notifications;
 mod openapi;
+pub mod org_overlays;
 mod payment_providers;
 pub mod prefix_chain;
 pub mod pricing;
@@ -1643,6 +1644,10 @@ async fn setup_database(
     if config.model_provisioning.enabled {
         let catalog = model_provisioning::Catalog::load(&config.model_provisioning.directory)?;
         model_provisioning::apply(&main.pooled.write(), &catalog).await?;
+        // Organisation overlays reference the model catalog's aliases, so
+        // they are applied after it.
+        let overlays = org_overlays::OrgCatalog::load(&config.model_provisioning.org_overlays_directory)?;
+        org_overlays::apply(&main.pooled.write(), &overlays).await?;
     }
 
     Ok((
@@ -3498,6 +3503,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             auth: None,
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
         (onwards::target::Targets::from_config(empty_config)?, None)
     };

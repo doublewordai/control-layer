@@ -9,8 +9,8 @@ use sqlx::{PgConnection, Row};
 use uuid::Uuid;
 
 use crate::model_provisioning::{
-    CacheTariff, Catalog, CatalogModel, ClayModel, Component, Overlay, PhysicalDeployment, ProviderPricing, Tariff, TrafficRule,
-    parse_decimal, parse_per_million,
+    CacheTariff, Catalog, CatalogModel, ClayModel, Component, PhysicalDeployment, ProviderPricing, Tariff, TrafficRule, parse_decimal,
+    parse_per_million,
 };
 
 /// A fixed application-level lock ID. Transaction scope makes a crashed startup
@@ -47,7 +47,6 @@ impl<'c> ModelProvisioning<'c> {
             .context("read model provisioning effective timestamp")?;
 
         let (endpoints, groups) = self.preflight_named_references(catalog).await?;
-        let orgs = self.preflight_overlay_orgs(catalog).await?;
         self.preflight_existing_model_types(catalog).await?;
         self.preflight_future_tariffs(catalog, effective_at).await?;
 
@@ -94,8 +93,6 @@ impl<'c> ModelProvisioning<'c> {
             self.reconcile_groups(model_id, &model.clay.access_groups, &groups).await?;
             self.reconcile_traffic_rules(model_id, &model.clay.traffic_rules, &redirect_ids)
                 .await?;
-            self.reconcile_overlays(model_id, &model.source, &model.clay.overlays, &orgs)
-                .await?;
         }
 
         tracing::info!(models = catalog.models.len(), %effective_at, "Applied declarative model catalog");
@@ -117,32 +114,6 @@ impl<'c> ModelProvisioning<'c> {
         let endpoints = resolve_names(self.db, "inference_endpoints", endpoint_names).await?;
         let groups = resolve_names(self.db, "groups", group_names).await?;
         Ok((endpoints, groups))
-    }
-
-    /// Overlays name their organisation by account username; every one must
-    /// exist before anything is written.
-    async fn preflight_overlay_orgs(&mut self, catalog: &Catalog) -> Result<HashMap<String, Uuid>> {
-        let usernames: HashSet<String> = catalog
-            .models
-            .iter()
-            .flat_map(|model| model.clay.overlays.iter().map(|overlay| overlay.org.clone()))
-            .collect();
-        if usernames.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let requested: Vec<String> = usernames.iter().cloned().collect();
-        let rows = sqlx::query("SELECT id, username FROM users WHERE username = ANY($1) AND is_deleted = FALSE")
-            .bind(&requested)
-            .fetch_all(&mut *self.db)
-            .await
-            .context("resolve overlay organisations")?;
-        let resolved: HashMap<String, Uuid> = rows
-            .into_iter()
-            .map(|row| Ok((row.try_get("username")?, row.try_get("id")?)))
-            .collect::<Result<_, sqlx::Error>>()?;
-        let missing: Vec<String> = usernames.into_iter().filter(|name| !resolved.contains_key(name)).collect();
-        ensure!(missing.is_empty(), "unknown overlay organisation(s): {}", missing.join(", "));
-        Ok(resolved)
     }
 
     async fn preflight_existing_model_types(&mut self, catalog: &Catalog) -> Result<()> {
@@ -716,57 +687,6 @@ impl<'c> ModelProvisioning<'c> {
             .execute(&mut *self.db)
             .await
             .context("remove omitted provisioned traffic rules")?;
-        Ok(())
-    }
-
-    /// Materialise the model's overlays. Rows the catalog owns for this model
-    /// but no longer declares are removed; hand-managed rows (NULL
-    /// `provisioning_source`) for orgs the catalog does not mention are left
-    /// alone, so the two can coexist during a migration.
-    async fn reconcile_overlays(&mut self, model_id: Uuid, source: &str, desired: &[Overlay], orgs: &HashMap<String, Uuid>) -> Result<()> {
-        let provisioning_source = format!("model-catalog:{source}");
-        let mut desired_org_ids = Vec::with_capacity(desired.len());
-        for overlay in desired {
-            let org_id = orgs[&overlay.org];
-            desired_org_ids.push(org_id);
-            let granted: Vec<&str> = overlay.classes.iter().map(|class| class.as_db_str()).collect();
-            sqlx::query(
-                r#"INSERT INTO model_overlays (
-                       user_id, deployed_model_id, tariff_name, granted_classes, default_serving_class,
-                       self_hosted_only, provisioning_source
-                   ) VALUES ($1,$2,$3,$4,$5,$6,$7)
-                   ON CONFLICT (user_id, deployed_model_id) DO UPDATE SET
-                       tariff_name = EXCLUDED.tariff_name,
-                       granted_classes = EXCLUDED.granted_classes,
-                       default_serving_class = EXCLUDED.default_serving_class,
-                       self_hosted_only = EXCLUDED.self_hosted_only,
-                       provisioning_source = EXCLUDED.provisioning_source,
-                       updated_at = NOW()
-                   WHERE model_overlays.tariff_name IS DISTINCT FROM EXCLUDED.tariff_name
-                      OR model_overlays.granted_classes IS DISTINCT FROM EXCLUDED.granted_classes
-                      OR model_overlays.default_serving_class IS DISTINCT FROM EXCLUDED.default_serving_class
-                      OR model_overlays.self_hosted_only IS DISTINCT FROM EXCLUDED.self_hosted_only
-                      OR model_overlays.provisioning_source IS DISTINCT FROM EXCLUDED.provisioning_source"#,
-            )
-            .bind(org_id)
-            .bind(model_id)
-            .bind(overlay.tariff.as_deref())
-            .bind(&granted)
-            .bind(overlay.default_class.map(|class| class.as_db_str()))
-            .bind(overlay.self_hosted_only)
-            .bind(&provisioning_source)
-            .execute(&mut *self.db)
-            .await
-            .with_context(|| format!("upsert provisioned overlay for org {:?}", overlay.org))?;
-        }
-        sqlx::query(
-            "DELETE FROM model_overlays WHERE deployed_model_id = $1 AND provisioning_source IS NOT NULL AND NOT (user_id = ANY($2))",
-        )
-        .bind(model_id)
-        .bind(&desired_org_ids)
-        .execute(&mut *self.db)
-        .await
-        .context("remove omitted provisioned overlays")?;
         Ok(())
     }
 }

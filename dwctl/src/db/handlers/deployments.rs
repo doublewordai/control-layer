@@ -3324,6 +3324,7 @@ mod tests {
             reasoning_translation: None,
             accepts_scheduling_priority: false,
             created_by: user.id,
+            kind: Default::default(),
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
         let test_endpoint_id = endpoint.id;
@@ -3372,6 +3373,7 @@ mod tests {
             reasoning_translation: None,
             accepts_scheduling_priority: false,
             created_by: user.id,
+            kind: Default::default(),
         };
         let endpoint = endpoints_repo.create(&endpoint_create).await.unwrap();
         let test_endpoint_id = endpoint.id;

@@ -1818,7 +1818,6 @@ mod openapi_access_control {
                 member_id: None,
                 spend_limit: None,
                 spend_limit_interval: None,
-                serving_class: None,
             },
         ))
         .await

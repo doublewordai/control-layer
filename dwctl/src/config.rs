@@ -3088,6 +3088,9 @@ pub struct ModelProvisioningConfig {
     pub enabled: bool,
     /// Directory containing rendered model catalog YAML documents.
     pub directory: PathBuf,
+    /// Directory containing per-organisation overlay YAML documents (see
+    /// `org_overlays`). A missing directory is an empty catalog.
+    pub org_overlays_directory: PathBuf,
 }
 
 impl Default for ModelProvisioningConfig {
@@ -3095,6 +3098,7 @@ impl Default for ModelProvisioningConfig {
         Self {
             enabled: false,
             directory: PathBuf::from("/app/model-provisioning.d"),
+            org_overlays_directory: PathBuf::from("/app/org-overlays.d"),
         }
     }
 }

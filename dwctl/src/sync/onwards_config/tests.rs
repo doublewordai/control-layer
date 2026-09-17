@@ -55,6 +55,7 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         auth_header_prefix: "Bearer ".to_string(),
         endpoint_accepts_scheduling_priority: false,
         api_keys: Vec::new(),
+        endpoint_kind: Default::default(),
     }
 }
 
@@ -82,7 +83,14 @@ fn test_convert_to_config_file() {
     let target2 = create_test_target("claude-3", "claude-alias", "https://api.anthropic.com");
 
     let targets = vec![target1, target2];
-    let config = convert_to_config_file(targets, vec![], false, &RateLimitTiersConfig::default(), &Default::default());
+    let config = convert_to_config_file(
+        targets,
+        vec![],
+        false,
+        &RateLimitTiersConfig::default(),
+        &Default::default(),
+        Default::default(),
+    );
 
     // Verify the config
     assert_eq!(config.targets.len(), 2);
@@ -117,7 +125,14 @@ fn test_convert_to_config_file_with_single_target() {
     let target = create_test_target("valid-model", "valid-alias", "https://api.valid.com");
 
     let targets = vec![target];
-    let config = convert_to_config_file(targets, vec![], false, &RateLimitTiersConfig::default(), &Default::default());
+    let config = convert_to_config_file(
+        targets,
+        vec![],
+        false,
+        &RateLimitTiersConfig::default(),
+        &Default::default(),
+        Default::default(),
+    );
 
     // Should have exactly one target
     assert_eq!(config.targets.len(), 1);
@@ -1291,6 +1306,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             auth_header_prefix: Some("Bearer ".to_string()),
             reasoning_translation: None,
             accepts_scheduling_priority: false,
+            kind: Default::default(),
         })
         .await
         .unwrap();
@@ -1514,6 +1530,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             auth_header_prefix: Some("Bearer ".to_string()),
             reasoning_translation: None,
             accepts_scheduling_priority: false,
+            kind: Default::default(),
         })
         .await
         .unwrap();
@@ -1631,7 +1648,6 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             created_by: test_user.id,
             spend_limit: None,
             spend_limit_interval: None,
-            serving_class: None,
         })
         .await
         .unwrap();
@@ -1943,79 +1959,103 @@ async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
-async fn test_cache_shape_serving_policy_and_active_classes(pool: sqlx::PgPool) {
-    use onwards::{KeyServing, ServingClass, ServingOverlay};
+async fn test_cache_shape_serving_accounts_overlays_and_offered_classes(pool: sqlx::PgPool) {
+    use onwards::{AccountServing, ProviderKind, ServingClass, ServingOverlay};
 
-    // The model activates both elevated classes; user A holds a key-level
-    // class, account settings, and an overlay on the model; user B has none.
+    // The model offers both elevated classes; user A holds account settings and
+    // an overlay on the model; user B has nothing set. The default endpoint is
+    // marked dynamo, the custom one stays external.
     sqlx::query!("UPDATE deployed_models SET serving_classes = '{interactive,throughput}' WHERE alias = 'regular-public'")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!("UPDATE api_keys SET serving_class = 'interactive' WHERE secret = $1", KEY_A_SECRET)
+    sqlx::query!(
+        "UPDATE users SET granted_serving_classes = '{interactive}', default_serving_class = 'throughput', self_hosted_only = true WHERE id = '00000000-0000-0000-0000-0000000000a1'"
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query!(
+        r#"INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, self_hosted_only)
+           VALUES ('00000000-0000-0000-0000-0000000000a1', '40000000-0000-0000-0000-000000000001', 'interactive', false)"#
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query!("UPDATE inference_endpoints SET kind = 'dynamo' WHERE id = '30000000-0000-0000-0000-000000000001'")
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query!(
-        "UPDATE users SET default_serving_class = 'throughput', self_hosted_only = true WHERE id = '00000000-0000-0000-0000-0000000000a1'"
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
-    sqlx::query!(
-        r#"INSERT INTO model_overlays (user_id, deployed_model_id, tariff_name, granted_classes, default_serving_class, self_hosted_only)
-           VALUES ('00000000-0000-0000-0000-0000000000a1', '40000000-0000-0000-0000-000000000001', 'bespoke', '{interactive}', NULL, false)"#
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
 
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
         .await
         .unwrap();
 
-    let policy = targets
-        .key_serving
-        .get(KEY_A_SECRET)
-        .expect("user A's key carries a serving policy");
+    // Every key carries its account; only accounts with settings are synced.
+    let key_a_labels = targets.key_labels.get(KEY_A_SECRET).unwrap();
     assert_eq!(
-        *policy.value(),
-        KeyServing {
-            class: Some(ServingClass::Interactive),
+        key_a_labels.get(onwards::serving::ACCOUNT_LABEL).map(String::as_str),
+        Some("00000000-0000-0000-0000-0000000000a1")
+    );
+    let key_b_labels = targets.key_labels.get(KEY_B_SECRET).unwrap();
+    assert_eq!(
+        key_b_labels.get(onwards::serving::ACCOUNT_LABEL).map(String::as_str),
+        Some("00000000-0000-0000-0000-0000000000b1")
+    );
+    let account_a = targets
+        .accounts
+        .get("00000000-0000-0000-0000-0000000000a1")
+        .expect("user A has settings");
+    assert_eq!(
+        *account_a.value(),
+        AccountServing {
+            granted: vec![ServingClass::Interactive],
             default_class: Some(ServingClass::Throughput),
             self_hosted_only: true,
-            overlays: std::collections::HashMap::from([(
-                "regular-public".to_string(),
-                ServingOverlay {
-                    granted: vec![ServingClass::Interactive],
-                    default_class: None,
-                    self_hosted_only: Some(false),
-                },
-            )]),
         }
     );
     assert!(
-        targets.key_serving.get(KEY_B_SECRET).is_none(),
-        "a key with nothing set carries no policy, so its definition is byte-identical to before"
+        targets.accounts.get("00000000-0000-0000-0000-0000000000b1").is_none(),
+        "an account with nothing set is not synced, so its config is byte-identical to before"
     );
-    assert!(targets.key_serving.get(KEY_BATCH_SECRET).is_none());
 
+    // Offered classes and the overlay sit on the alias's default pool.
     let public = targets.targets.get("regular-public").unwrap();
     assert_eq!(
         public.value().active_serving_classes(),
         &[ServingClass::Interactive, ServingClass::Throughput]
     );
+    let overlay = public
+        .value()
+        .default_pool()
+        .overlays()
+        .get("00000000-0000-0000-0000-0000000000a1")
+        .expect("user A's overlay on regular-public");
+    assert_eq!(
+        *overlay,
+        ServingOverlay {
+            default_class: Some(ServingClass::Interactive),
+            self_hosted_only: Some(false),
+        }
+    );
     let private = targets.targets.get("regular-private").unwrap();
     assert!(private.value().active_serving_classes().is_empty());
-    let composite = targets.targets.get("composite-priority").unwrap();
-    assert!(composite.value().active_serving_classes().is_empty());
+    assert!(private.value().default_pool().overlays().is_empty());
+
+    // Provider kind follows the endpoint.
+    assert_eq!(public.value().default_pool().providers()[0].target.kind, ProviderKind::Dynamo);
+    assert_eq!(private.value().default_pool().providers()[0].target.kind, ProviderKind::External);
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
-async fn test_cache_shape_composite_active_classes_sit_on_the_default_pool(pool: sqlx::PgPool) {
-    use onwards::ServingClass;
+async fn test_cache_shape_composite_offered_classes_and_kinds_sit_on_the_default_pool(pool: sqlx::PgPool) {
+    use onwards::{ProviderKind, ServingClass};
 
     sqlx::query!("UPDATE deployed_models SET serving_classes = '{throughput}' WHERE alias = 'composite-priority'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query!("UPDATE inference_endpoints SET kind = 'dynamo' WHERE id = '30000000-0000-0000-0000-000000000002'")
         .execute(&pool)
         .await
         .unwrap();
@@ -2024,4 +2064,9 @@ async fn test_cache_shape_composite_active_classes_sit_on_the_default_pool(pool:
         .unwrap();
     let composite = targets.targets.get("composite-priority").unwrap();
     assert_eq!(composite.value().active_serving_classes(), &[ServingClass::Throughput]);
+    let kinds: Vec<ProviderKind> = composite.value().default_pool().providers().iter().map(|p| p.target.kind).collect();
+    assert!(
+        kinds.contains(&ProviderKind::Dynamo) && kinds.contains(&ProviderKind::External),
+        "{kinds:?}"
+    );
 }

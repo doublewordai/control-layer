@@ -681,6 +681,7 @@ mod tests {
                 created_by: Uuid::new_v4(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                kind: Default::default(),
             },
         );
 

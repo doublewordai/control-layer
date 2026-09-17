@@ -152,6 +152,7 @@ mod tests {
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -209,6 +210,7 @@ mod tests {
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -378,6 +380,7 @@ mod tests {
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -448,6 +451,7 @@ mod tests {
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -561,6 +565,7 @@ mod tests {
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
                 created_by: jwt_user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -678,6 +683,7 @@ mod tests {
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -793,6 +799,7 @@ mod tests {
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
                 created_by: Uuid::nil(), // Use nil for system creation
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -878,6 +885,7 @@ mod tests {
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");
@@ -978,6 +986,7 @@ mod tests {
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
                 created_by: user.id,
+                kind: Default::default(),
             })
             .await
             .expect("Failed to create test inference endpoint");

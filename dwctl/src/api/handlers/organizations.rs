@@ -621,7 +621,9 @@ pub async fn update_organization<P: PoolProvider>(
     }
     // The serving account settings change how the organisation's traffic is
     // routed and prioritised fleet-wide; same gate as ZDR.
-    if !can_all && (data.default_serving_class.is_some() || data.self_hosted_only.is_some()) && caller_org_role.as_deref() != Some("owner")
+    if !can_all
+        && (data.granted_serving_classes.is_some() || data.default_serving_class.is_some() || data.self_hosted_only.is_some())
+        && caller_org_role.as_deref() != Some("owner")
     {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
@@ -631,6 +633,11 @@ pub async fn update_organization<P: PoolProvider>(
     }
     if let Some(Some(class)) = &data.default_serving_class {
         validate_elevated_serving_class(class)?;
+    }
+    if let Some(classes) = &data.granted_serving_classes {
+        for class in classes {
+            validate_elevated_serving_class(class)?;
+        }
     }
 
     // SECURITY: same owner-only gate, for the same kind of reason. Auto-join
@@ -812,6 +819,7 @@ pub async fn update_organization<P: PoolProvider>(
         zero_data_retention: data.zero_data_retention,
         default_serving_class: data.default_serving_class,
         self_hosted_only: data.self_hosted_only,
+        granted_serving_classes: data.granted_serving_classes,
     };
     debug_assert!(
         db_request.email.is_none(),
@@ -2909,6 +2917,7 @@ pub async fn confirm_email_change<P: PoolProvider>(
             zero_data_retention: None,
             default_serving_class: None,
             self_hosted_only: None,
+            granted_serving_classes: Default::default(),
         };
         org_repo.update(pending.organization_id, &update).await?;
         // The `confirm_*_email_side` UPDATE above already locked this row, so

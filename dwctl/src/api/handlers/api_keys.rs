@@ -208,9 +208,6 @@ pub async fn create_user_api_key<P: PoolProvider>(
     drop(pool_conn);
 
     let has_cap = data.spend_limit.is_some();
-    if let Some(class) = data.serving_class.as_deref() {
-        super::validate_elevated_serving_class(class)?;
-    }
     let db_request = ApiKeyCreateDBRequest::new(target_user_id, created_by, data);
 
     // One transaction for the whole create sequence (insert → reveal-pending
@@ -619,9 +616,6 @@ pub async fn update_user_api_key<P: PoolProvider>(
         Some(v) => v,
     };
     validate_cap_fields(new_limit.as_ref(), new_interval.as_deref())?;
-    if let Some(Some(class)) = data.serving_class.as_ref() {
-        super::validate_elevated_serving_class(class)?;
-    }
 
     let reset_window = data.reset_window.unwrap_or(false);
     if reset_window && new_limit.is_none() {
@@ -646,7 +640,6 @@ pub async fn update_user_api_key<P: PoolProvider>(
                 description: data.description.clone(),
                 requests_per_second: data.requests_per_second,
                 burst_size: data.burst_size,
-                serving_class: data.serving_class.clone(),
             },
         )
         .await?;

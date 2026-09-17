@@ -8,7 +8,7 @@
 //! Pool-level configuration (keys, rate limits) is shared across all providers.
 
 use crate::auth::KeySet;
-use crate::serving::ServingClass;
+use crate::serving::{ServingClass, ServingOverlay};
 use crate::target::{
     ConcurrencyGuard, ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter,
     RoutingAction, RoutingRule, Target,
@@ -41,8 +41,10 @@ pub struct ProviderPool {
     trusted: bool,
     /// Routing rules evaluated against key labels before processing
     routing_rules: Vec<RoutingRule>,
-    /// Elevated serving classes the alias has activated (default pool only).
+    /// Elevated serving classes the alias offers (default pool only).
     serving_classes: Vec<ServingClass>,
+    /// Per-account overrides on this alias, keyed by account id.
+    overlays: HashMap<String, ServingOverlay>,
 }
 
 /// A single provider within a pool
@@ -94,6 +96,7 @@ impl ProviderPool {
             trusted: false,
             routing_rules: Vec::new(),
             serving_classes: Vec::new(),
+            overlays: HashMap::new(),
         }
     }
 
@@ -119,18 +122,26 @@ impl ProviderPool {
             trusted,
             routing_rules,
             serving_classes: Vec::new(),
+            overlays: HashMap::new(),
         }
     }
 
-    /// Attach the alias's active serving classes (see [`crate::serving`]).
-    pub fn with_serving_classes(mut self, serving_classes: Vec<ServingClass>) -> Self {
+    /// Attach the alias's offered serving classes and per-account overlays
+    /// (see [`crate::serving`]).
+    pub fn with_serving(mut self, serving_classes: Vec<ServingClass>, overlays: HashMap<String, ServingOverlay>) -> Self {
         self.serving_classes = serving_classes;
+        self.overlays = overlays;
         self
     }
 
-    /// Elevated serving classes the alias has activated.
+    /// Elevated serving classes the alias offers.
     pub fn serving_classes(&self) -> &[ServingClass] {
         &self.serving_classes
+    }
+
+    /// Per-account overrides on this alias, keyed by account id.
+    pub fn overlays(&self) -> &HashMap<String, ServingOverlay> {
+        &self.overlays
     }
 
     /// Create a pool with a single provider

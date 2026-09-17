@@ -117,7 +117,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
-            key_serving: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -298,7 +298,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
-            key_serving: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -453,7 +453,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
-            key_serving: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -539,7 +539,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
-            key_serving: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -703,7 +703,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
-            key_serving: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: true,
             http_pool_config: None,
         };
@@ -780,7 +780,7 @@ mod tests {
             key_labels,
             strict_mode: true,
             http_pool_config: None,
-            key_serving: std::sync::Arc::new(dashmap::DashMap::new()),
+            accounts: std::sync::Arc::new(dashmap::DashMap::new()),
         };
         let mock_client = MockHttpClient::new(
             StatusCode::OK,

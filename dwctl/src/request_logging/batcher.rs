@@ -1940,6 +1940,7 @@ mod integration_tests {
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
+                kind: Default::default(),
             })
             .await
             .unwrap();
@@ -2069,7 +2070,6 @@ mod integration_tests {
                 created_by: user_id,
                 spend_limit: None,
                 spend_limit_interval: None,
-                serving_class: None,
             })
             .await
             .unwrap();

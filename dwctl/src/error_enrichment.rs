@@ -616,7 +616,6 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
-                serving_class: None,
             })
             .await
             .unwrap();
@@ -746,7 +745,6 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
-                serving_class: None,
             })
             .await
             .unwrap();
@@ -950,7 +948,6 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
-                serving_class: None,
             })
             .await
             .unwrap();
@@ -1100,7 +1097,6 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
-                serving_class: None,
             })
             .await
             .unwrap();
@@ -1196,7 +1192,6 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
-                serving_class: None,
             })
             .await
             .unwrap();
@@ -1256,7 +1251,6 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
-                serving_class: None,
             })
             .await
             .unwrap();
@@ -1305,7 +1299,6 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
-                serving_class: None,
             })
             .await
             .unwrap();
@@ -1353,7 +1346,6 @@ mod tests {
                 created_by: user.id,
                 spend_limit: None,
                 spend_limit_interval: None,
-                serving_class: None,
             })
             .await
             .unwrap();
@@ -1384,7 +1376,6 @@ mod tests {
                 created_by: uuid::Uuid::nil(),
                 spend_limit: None,
                 spend_limit_interval: None,
-                serving_class: None,
             })
             .await
             .unwrap();

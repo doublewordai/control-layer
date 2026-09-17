@@ -16,7 +16,7 @@ use onwards::target::{
     ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
     inheritable_routing_rules,
 };
-use onwards::{KeyServing, ServingClass, ServingOverlay};
+use onwards::{AccountServing, ProviderKind, ServingClass, ServingOverlay};
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -98,6 +98,10 @@ struct OnwardsTarget {
     /// body field (dynamo). Onwards strips the field from named-pool attempts
     /// to members without it, regardless of position.
     endpoint_accepts_scheduling_priority: bool,
+    /// What kind of server the endpoint is (`inference_endpoints.kind`): only
+    /// `dynamo` receives the serving-class envelope; `external` is skipped for
+    /// self-hosted-only accounts.
+    endpoint_kind: ProviderKind,
 
     // API keys that have access to this deployment
     api_keys: Vec<OnwardsApiKey>,
@@ -118,20 +122,18 @@ struct OnwardsApiKey {
     /// Account-wide zero-data-retention flag on the api_key's owning user.
     /// Surfaced to onwards as a "zdr" key label; onwards does not act on it yet.
     zero_data_retention: bool,
-    /// The owning account (`api_keys.user_id`): the org for org keys. Keys the
-    /// account's overlays and account settings.
+    /// The owning account (`api_keys.user_id`): the org for org keys. Emitted
+    /// as the key's `account` label, through which onwards finds the
+    /// account's serving settings and an alias's overlay for it.
     user_id: UserId,
-    /// Serving class this key requests by default (`api_keys.serving_class`).
-    serving_class: Option<ServingClass>,
-    /// Account setting: default serving class (`users.default_serving_class`).
-    user_default_serving_class: Option<ServingClass>,
-    /// Account setting: never fall over to an external provider (`users.self_hosted_only`).
-    user_self_hosted_only: bool,
 }
 
-/// An org's overlays across models, keyed by model alias, as read from
-/// `model_overlays`. Shared by every key the org owns.
-type OverlaysByOwner = HashMap<UserId, HashMap<String, ServingOverlay>>;
+/// Every alias's overlays, keyed by alias then by account id (as a string,
+/// the value of the key's `account` label), as read from `model_overlays`.
+type OverlaysByAlias = HashMap<String, HashMap<String, ServingOverlay>>;
+
+/// Serving account settings per account id, for accounts that have any.
+type AccountsById = HashMap<String, AccountServing>;
 
 /// Parse a stored class name; the CHECK constraints guarantee the set, so an
 /// unknown value is a schema drift worth a warning rather than a crash.
@@ -146,15 +148,23 @@ fn parse_stored_class(value: Option<&str>) -> Option<ServingClass> {
     }
 }
 
+/// Parse a stored endpoint kind; the CHECK constraint guarantees the set.
+fn parse_provider_kind(value: &str) -> ProviderKind {
+    value.parse().unwrap_or_else(|err: String| {
+        warn!(%err, "ignoring unknown endpoint kind stored in the database; treating as external");
+        ProviderKind::External
+    })
+}
+
 fn parse_stored_classes(values: &[String]) -> Vec<ServingClass> {
     values.iter().filter_map(|v| parse_stored_class(Some(v))).collect()
 }
 
-/// Loads every org's overlays, keyed by owner then alias.
-async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByOwner, anyhow::Error> {
+/// Loads every alias's overlays, keyed by alias then account id.
+async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::Error> {
     let rows = sqlx::query!(
         r#"
-        SELECT mo.user_id, dm.alias, mo.granted_classes, mo.default_serving_class, mo.self_hosted_only
+        SELECT mo.user_id, dm.alias, mo.default_serving_class, mo.self_hosted_only
         FROM model_overlays mo
         INNER JOIN deployed_models dm ON dm.id = mo.deployed_model_id
         WHERE dm.deleted = FALSE
@@ -163,12 +173,11 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByOwner, anyhow::E
     .fetch_all(db)
     .await?;
 
-    let mut overlays: OverlaysByOwner = HashMap::new();
+    let mut overlays: OverlaysByAlias = HashMap::new();
     for row in rows {
-        overlays.entry(row.user_id).or_default().insert(
-            row.alias,
+        overlays.entry(row.alias).or_default().insert(
+            row.user_id.to_string(),
             ServingOverlay {
-                granted: parse_stored_classes(&row.granted_classes),
                 default_class: parse_stored_class(row.default_serving_class.as_deref()),
                 self_hosted_only: row.self_hosted_only,
             },
@@ -177,18 +186,47 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByOwner, anyhow::E
     Ok(overlays)
 }
 
-/// The serving policy onwards attaches to a key: the key's own class, the
-/// owning account's settings and every overlay the account holds. `None`
-/// when nothing is set, so an unaffected key's definition is byte-identical
-/// to before serving classes existed.
-fn key_serving_policy(api_key: &OnwardsApiKey, overlays: &OverlaysByOwner) -> Option<KeyServing> {
-    let policy = KeyServing {
-        class: api_key.serving_class,
-        default_class: api_key.user_default_serving_class,
-        self_hosted_only: api_key.user_self_hosted_only,
-        overlays: overlays.get(&api_key.user_id).cloned().unwrap_or_default(),
-    };
-    (!policy.is_empty()).then_some(policy)
+/// Loads the serving account settings of every account that has any. An
+/// account with nothing set is absent, so the config for everyone else is
+/// byte-identical to before serving classes existed.
+async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, granted_serving_classes, default_serving_class, self_hosted_only
+        FROM users
+        WHERE is_deleted = FALSE
+          AND (granted_serving_classes <> '{}' OR default_serving_class IS NOT NULL OR self_hosted_only)
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.id.to_string(),
+                AccountServing {
+                    granted: parse_stored_classes(&row.granted_serving_classes),
+                    default_class: parse_stored_class(row.default_serving_class.as_deref()),
+                    self_hosted_only: row.self_hosted_only,
+                },
+            )
+        })
+        .collect())
+}
+
+/// The labels every key carries: its purpose, the account's ZDR flag, and the
+/// account itself so onwards can find the account's serving settings and an
+/// alias's overlay for it.
+fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
+    HashMap::from([
+        ("purpose".to_string(), api_key.purpose.clone()),
+        // Surface the account's zero-data-retention flag to onwards as a label.
+        // Always emitted ("true"/"false"); onwards does not act on it yet.
+        ("zdr".to_string(), api_key.zero_data_retention.to_string()),
+        (onwards::serving::ACCOUNT_LABEL.to_string(), api_key.user_id.to_string()),
+    ])
 }
 
 /// Manages the integration between onwards-pilot and the onwards proxy
@@ -636,7 +674,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ie.api_key as endpoint_api_key,
             ie.auth_header_name,
             ie.auth_header_prefix,
-            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority
+            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,
+            ie.kind as endpoint_kind
         FROM deployed_models cm
         INNER JOIN deployed_model_components dmc ON cm.id = dmc.composite_model_id
         INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id
@@ -668,10 +707,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ak.burst_size,
             ak.user_verified,
             ak.user_zero_data_retention,
-            ak.user_id,
-            ak.serving_class,
-            ak.user_default_serving_class,
-            ak.user_self_hosted_only
+            ak.user_id
         FROM deployed_models cm
         CROSS JOIN LATERAL (
             SELECT DISTINCT
@@ -681,11 +717,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 ak.requests_per_second,
                 ak.burst_size,
                 ak.user_id,
-                ak.serving_class,
                 u.verified as user_verified,
-                u.zero_data_retention as user_zero_data_retention,
-                u.default_serving_class as user_default_serving_class,
-                u.self_hosted_only as user_self_hosted_only
+                u.zero_data_retention as user_zero_data_retention
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
             WHERE (
@@ -905,6 +938,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     auth_header_name: row.auth_header_name.clone(),
                     auth_header_prefix: row.auth_header_prefix.clone(),
                     endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
+                    endpoint_kind: parse_provider_kind(&row.endpoint_kind),
                     api_keys: Vec::new(),
                 },
             });
@@ -925,9 +959,6 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     user_verified: row.user_verified,
                     zero_data_retention: row.user_zero_data_retention,
                     user_id: row.user_id,
-                    serving_class: parse_stored_class(row.serving_class.as_deref()),
-                    user_default_serving_class: parse_stored_class(row.user_default_serving_class.as_deref()),
-                    user_self_hosted_only: row.user_self_hosted_only,
                 });
             }
         }
@@ -951,7 +982,7 @@ fn convert_composite_to_target_spec(
     composite: &OnwardsCompositeModel,
     key_definitions: &mut HashMap<String, KeyDefinition>,
     rate_limit_tiers: &RateLimitTiersConfig,
-    overlays: &OverlaysByOwner,
+    overlays: &OverlaysByAlias,
 ) -> (String, TargetSpecOrList) {
     // Add this composite model's API keys to key_definitions
     for api_key in &composite.api_keys {
@@ -967,19 +998,13 @@ fn convert_composite_to_target_spec(
             )
         };
 
-        let mut labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
-        // Surface the account's zero-data-retention flag to onwards as a label.
-        // Always emitted ("true"/"false"); onwards does not act on it yet.
-        labels.insert("zdr".to_string(), api_key.zero_data_retention.to_string());
-
         key_definitions.insert(
             api_key.id.to_string(),
             KeyDefinition {
                 key: api_key.secret.clone(),
                 rate_limit,
                 concurrency_limit: None,
-                labels,
-                serving: key_serving_policy(api_key, overlays),
+                labels: key_labels(api_key),
             },
         );
     }
@@ -1123,6 +1148,7 @@ fn convert_composite_to_target_spec(
                     propagate_trace_context: None,
                     reasoning_translation: target.reasoning_translation.clone().map(Into::into),
                     accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
+                    kind: target.endpoint_kind,
                 }
             }
         };
@@ -1178,11 +1204,17 @@ fn convert_composite_to_target_spec(
         } else {
             inheritable_routing_rules(&composite.routing_rules)
         },
-        // Activation is a property of the alias, declared on its default pool.
+        // Offered classes and per-account overlays are properties of the
+        // alias, declared on its default pool.
         serving_classes: if pool_name == DEFAULT_COMPONENT_POOL {
             composite.serving_classes.clone()
         } else {
             Vec::new()
+        },
+        overlays: if pool_name == DEFAULT_COMPONENT_POOL {
+            overlays.get(&composite.alias).cloned().unwrap_or_default()
+        } else {
+            HashMap::new()
         },
     };
 
@@ -1243,7 +1275,8 @@ fn convert_to_config_file(
     composites: Vec<OnwardsCompositeModel>,
     strict_mode: bool,
     rate_limit_tiers: &RateLimitTiersConfig,
-    overlays: &OverlaysByOwner,
+    overlays: &OverlaysByAlias,
+    accounts: AccountsById,
 ) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
@@ -1265,20 +1298,13 @@ fn convert_to_config_file(
                     )
                 };
 
-                // Build labels from API key purpose
-                let mut labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
-                // Surface the account's zero-data-retention flag as a label.
-                // Always emitted ("true"/"false"); onwards does not act on it yet.
-                labels.insert("zdr".to_string(), api_key.zero_data_retention.to_string());
-
                 key_definitions.insert(
                     api_key.id.to_string(),
                     KeyDefinition {
                         key: api_key.secret.clone(),
                         rate_limit,
                         concurrency_limit: None,
-                        labels,
-                        serving: key_serving_policy(api_key, overlays),
+                        labels: key_labels(api_key),
                     },
                 );
             }
@@ -1336,6 +1362,7 @@ fn convert_to_config_file(
                 propagate_trace_context: None,
                 reasoning_translation: target.reasoning_translation.clone().map(Into::into),
                 accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
+                kind: target.endpoint_kind,
             };
 
             // Build fallback configuration. For single-provider (standard)
@@ -1384,6 +1411,7 @@ fn convert_to_config_file(
                 trusted: false,
                 routing_rules: target.routing_rules,
                 serving_classes: target.serving_classes,
+                overlays: overlays.get(&target.alias).cloned().unwrap_or_default(),
             };
 
             (target.alias, TargetSpecOrList::Pool(pool_spec))
@@ -1422,6 +1450,7 @@ fn convert_to_config_file(
         auth,
         strict_mode,
         http_pool: None,
+        accounts,
     }
 }
 
@@ -1474,6 +1503,7 @@ pub async fn load_targets_from_db(
             ie.auth_header_name,
             ie.auth_header_prefix,
             ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,
+            ie.kind as endpoint_kind,
             ak.id as "api_key_id?",
             ak.secret as "api_key_secret?",
             ak.purpose as "api_key_purpose?",
@@ -1482,9 +1512,6 @@ pub async fn load_targets_from_db(
             ak.user_verified as "api_key_user_verified?",
             ak.user_zero_data_retention as "api_key_user_zero_data_retention?",
             ak.user_id as "api_key_user_id?",
-            ak.serving_class as api_key_serving_class,
-            ak.user_default_serving_class as api_key_user_default_serving_class,
-            ak.user_self_hosted_only as "api_key_user_self_hosted_only?",
             dm.serving_classes
         FROM deployed_models dm
         INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
@@ -1496,11 +1523,8 @@ pub async fn load_targets_from_db(
                 ak.requests_per_second,
                 ak.burst_size,
                 ak.user_id,
-                ak.serving_class,
                 u.verified as user_verified,
-                u.zero_data_retention as user_zero_data_retention,
-                u.default_serving_class as user_default_serving_class,
-                u.self_hosted_only as user_self_hosted_only
+                u.zero_data_retention as user_zero_data_retention
             FROM api_keys ak
             JOIN users u ON u.id = ak.user_id
             WHERE (
@@ -1637,6 +1661,7 @@ pub async fn load_targets_from_db(
                 auth_header_name: row.auth_header_name.clone(),
                 auth_header_prefix: row.auth_header_prefix.clone(),
                 endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
+                endpoint_kind: parse_provider_kind(&row.endpoint_kind),
                 api_keys: Vec::new(),
             }
         });
@@ -1653,7 +1678,6 @@ pub async fn load_targets_from_db(
             Some(user_verified),
             Some(zero_data_retention),
             Some(user_id),
-            Some(user_self_hosted_only),
         ) = (
             row.api_key_id,
             row.api_key_secret,
@@ -1661,7 +1685,6 @@ pub async fn load_targets_from_db(
             row.api_key_user_verified,
             row.api_key_user_zero_data_retention,
             row.api_key_user_id,
-            row.api_key_user_self_hosted_only,
         ) {
             target.api_keys.push(OnwardsApiKey {
                 id: api_key_id,
@@ -1672,9 +1695,6 @@ pub async fn load_targets_from_db(
                 user_verified,
                 zero_data_retention,
                 user_id,
-                serving_class: parse_stored_class(row.api_key_serving_class.as_deref()),
-                user_default_serving_class: parse_stored_class(row.api_key_user_default_serving_class.as_deref()),
-                user_self_hosted_only,
             });
         }
     }
@@ -1737,10 +1757,11 @@ pub async fn load_targets_from_db(
         .collect();
 
     // Convert to ConfigFile format
-    // Overlays are per org, shared by every key the org owns; load them once.
+    // Per-alias overlays and per-account serving settings, each loaded once.
     let overlays = load_overlays_from_db(db).await?;
+    let accounts = load_accounts_from_db(db).await?;
 
-    let config = convert_to_config_file(targets, composites, strict_mode, rate_limit_tiers, &overlays);
+    let config = convert_to_config_file(targets, composites, strict_mode, rate_limit_tiers, &overlays, accounts);
 
     // Convert ConfigFile to Targets
     Targets::from_config(config)

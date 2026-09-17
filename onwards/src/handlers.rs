@@ -9,7 +9,7 @@ use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::models::ListModelResponse;
 use crate::sse::SseBufferedStream;
-use crate::serving::{self, RequestedServingClass, ServingClassOutcome, ServingResolution};
+use crate::serving::{self, ProviderKind, RequestedServingClass, ServingClassOutcome, ServingResolution};
 use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
 use axum::{
     Json,
@@ -666,24 +666,57 @@ pub async fn target_message_handler<T: HttpClient>(
         // If no bearer token, no labels to match — rules are skipped (allow by default)
     }
 
-    // Resolve the serving class: one flat field from the request's suffix, the
-    // key's policy (its own class, the account's settings, the account's
-    // overlay for THIS alias) and the alias's active classes. Done after
-    // routing rules so a redirected request is resolved against the pool
-    // that will serve it; the overlay is still looked up by the alias the
-    // customer called, which is the name the deal was made against.
+    // Resolve the serving class: one flat field from the request's suffix,
+    // the owning account's settings (found through the key's `account`
+    // label), the account's overlay on THIS alias and the classes the alias
+    // offers. Done after routing rules so a redirected request is resolved
+    // against the pool that will serve it. Strict: a class named on the
+    // request that the account does not hold, or the alias does not offer,
+    // is refused rather than quietly downgraded.
     let serving_resolution: ServingResolution = {
-        let key_serving = bearer_token.and_then(|token| state.targets.key_serving.get(token).map(|r| r.value().clone()));
-        let key_purpose = bearer_token
+        let (account_id, key_purpose) = bearer_token
             .and_then(|token| state.targets.key_labels.get(token))
-            .and_then(|labels| labels.get("purpose").cloned());
-        let resolution = serving::resolve(
+            .map(|labels| {
+                (
+                    labels.get(serving::ACCOUNT_LABEL).cloned(),
+                    labels.get("purpose").cloned(),
+                )
+            })
+            .unwrap_or((None, None));
+        let account = account_id
+            .as_deref()
+            .and_then(|id| state.targets.accounts.get(id).map(|r| r.value().clone()));
+        let overlay = account_id
+            .as_deref()
+            .and_then(|id| pool.overlays().get(id).cloned());
+        let resolution = match serving::resolve(
             suffix_class,
-            key_serving.as_ref(),
+            account.as_ref(),
+            overlay.as_ref(),
             &model_name,
             pool.serving_classes(),
             key_purpose.as_deref(),
-        );
+        ) {
+            Ok(resolution) => resolution,
+            Err(rejection) => {
+                debug!("Serving class refused for model '{}': {}", model_name, rejection);
+                metrics::counter!(
+                    "onwards_serving_class_rejections_total",
+                    "model" => model_name.to_string(),
+                )
+                .increment(1);
+                record_response_status(403);
+                return Err(OnwardsErrorResponse::builder()
+                    .body(ErrorResponseBody {
+                        message: rejection.to_string(),
+                        r#type: "invalid_request_error".to_string(),
+                        param: Some("model".to_string()),
+                        code: "serving_class_unavailable".to_string(),
+                    })
+                    .status(StatusCode::FORBIDDEN)
+                    .build());
+            }
+        };
         let span = tracing::Span::current();
         if let Some(requested) = resolution.requested {
             span.record("onwards.serving.requested", requested.as_str());
@@ -865,12 +898,12 @@ pub async fn target_message_handler<T: HttpClient>(
 
     for (_member_idx, target, connection_guard) in pool.select_iter() {
         // A self-hosted-only account never reaches an external member: the
-        // composite's eligible set is narrowed to its trusted (self-hosted)
-        // providers for this request, whatever the alias's own failover list
-        // says. The skipped member still consumes an attempt from the budget,
-        // so a pool of [dynamo, openrouter] ends with the dynamo outcome
-        // rather than an external one.
-        if serving_resolution.self_hosted_only && !target.trusted.unwrap_or_else(|| pool.is_trusted()) {
+        // composite's eligible set is narrowed to its non-external providers
+        // for this request, whatever the alias's own failover list says. The
+        // skipped member still consumes an attempt from the budget, so a pool
+        // of [dynamo, external] ends with the dynamo outcome rather than an
+        // external one.
+        if serving_resolution.self_hosted_only && target.kind == ProviderKind::External {
             debug!(
                 "Skipping external provider {} for a self-hosted-only account",
                 target.url
@@ -1097,8 +1130,8 @@ pub async fn target_message_handler<T: HttpClient>(
         filter_headers_for_upstream(&mut attempt_headers, target);
 
         // Stamp the v1 envelope — pool tag plus priority band — on a member
-        // whose serving stack understands scheduling fields (the dynamo
-        // frontend). Only elevated classes carry anything: `standard` and the
+        // of kind `dynamo`, the only serving stack that reads it. Only
+        // elevated classes carry anything: `standard` and the
         // daemon legs travel untagged, byte-identical to today, so a partial
         // rollout is safe. Headers already present are overwritten, never
         // removed: this same crate runs again as the hop inside the serving
@@ -1106,7 +1139,7 @@ pub async fn target_message_handler<T: HttpClient>(
         // first hop stamped. Client-supplied values are scrubbed at dwctl's
         // ingress, alongside the body priority (the same perimeter the
         // priority strip relies on).
-        if target.accepts_scheduling_priority
+        if target.kind == ProviderKind::Dynamo
             && let Some(tag) = serving_resolution.resolved.pool_tag()
         {
             attempt_headers.insert(serving::POOL_TAG_HEADER, HeaderValue::from_static(tag));
@@ -2742,7 +2775,7 @@ mod tests {
                 key_rate_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
                 key_concurrency_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
                 key_labels: std::sync::Arc::new(dashmap::DashMap::new()),
-                key_serving: std::sync::Arc::new(dashmap::DashMap::new()),
+                accounts: std::sync::Arc::new(dashmap::DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             },
@@ -2835,6 +2868,7 @@ mod tests {
             propagate_trace_context,
             reasoning_translation: None,
             accepts_scheduling_priority: false,
+            kind: Default::default(),
         }
     }
 

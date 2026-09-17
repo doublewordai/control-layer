@@ -61,6 +61,9 @@ pub struct UserUpdateDBRequest {
     pub default_serving_class: Option<Option<String>>,
     /// Account setting: never fall over to an external provider. `None` = don't change.
     pub self_hosted_only: Option<bool>,
+    /// Account setting: elevated serving classes held. `None` = don't change;
+    /// `Some(vec![])` = revoke all.
+    pub granted_serving_classes: Option<Vec<String>>,
 }
 
 impl UserUpdateDBRequest {
@@ -78,6 +81,7 @@ impl UserUpdateDBRequest {
             zero_data_retention: update.zero_data_retention,
             default_serving_class: update.default_serving_class,
             self_hosted_only: update.self_hosted_only,
+            granted_serving_classes: update.granted_serving_classes,
         }
     }
 }
@@ -120,6 +124,8 @@ pub struct UserDBResponse {
     pub zero_data_retention: bool,
     /// Bill this account by emailed invoice rather than an immediate card charge.
     pub invoicing_enabled: bool,
+    /// Account setting: elevated serving classes this account holds.
+    pub granted_serving_classes: Vec<String>,
     /// Account setting: serving class the account's requests ask for by default.
     pub default_serving_class: Option<String>,
     /// Account setting: never fall over to an external provider.
