@@ -2041,7 +2041,9 @@ pub async fn delete_file<P: PoolProvider>(
         });
     }
 
-    // Perform the deletion (hard delete - cascades to batches and requests)
+    // Soft-delete the file: cancels non-terminal batches and unlinks them
+    // (file_id = NULL), NULLs output_file_id/error_file_id, and marks the file
+    // deleted (retained for audit). Existing batch results survive file deletion.
     state
         .request_manager
         .delete_file(fusillade::FileId(file_id))

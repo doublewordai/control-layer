@@ -72,6 +72,12 @@ pub struct CorpusRow {
     pub input_price_per_token: Option<Decimal>,
     pub output_price_per_token: Option<Decimal>,
 
+    /// Provenance of the billed cache read ('module' | 'engine' | NULL) — see migration
+    /// 142. An 'engine' row was billed implicitly: its raw upstream body carries no dwctl
+    /// cache fields, so the replay overlays the engine-reported hit (and pricing clamps
+    /// the read multiplier) to reproduce live semantics.
+    pub cache_read_source: Option<String>,
+
     /// The payload, when fusillade still holds it. `None` means not replayable — a ZDR row,
     /// a row with no fusillade link, or one whose bodies have been purged.
     pub exchange: Option<StoredExchange>,
@@ -120,6 +126,7 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
             ha.total_cost,
             ha.input_price_per_token,
             ha.output_price_per_token,
+            ha.cache_read_source,
             -- `?` overrides sqlx's nullability inference: rt.body is NOT NULL in its own
             -- table, but this is a LEFT JOIN, so it is absent for any row with no fusillade
             -- link. Without the override sqlx types it as String and the None case vanishes.
@@ -195,6 +202,7 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
                 stored_total_cost: r.total_cost,
                 input_price_per_token: r.input_price_per_token,
                 output_price_per_token: r.output_price_per_token,
+                cache_read_source: r.cache_read_source,
                 exchange,
             }
         })

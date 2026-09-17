@@ -496,6 +496,17 @@ onwards:
   # When true, only known OpenAI API paths are accepted and validated.
   # Set via environment: DWCTL_ONWARDS__STRICT_MODE=true
   strict_mode: false
+  # Failover deadline (ms) for the first token of a realtime streamed response.
+  # While a model still has another provider to fail over to, an attempt that
+  # hasn't started streaming within this window is abandoned and the next
+  # provider tried. The final attempt is never cut off, and fusillade daemon
+  # traffic (batch, flex, background) is exempt. Set to 0 to disable.
+  # Set via environment: DWCTL_ONWARDS__FIRST_TOKEN_TIMEOUT_MS=10000
+  first_token_timeout_ms: 10000
+  # Models may override the deadline via first_token_timeout_ms in the model API.
+  # Priority composites with fallback enabled use AIMD by default in strict mode.
+  # Override through the model API's aimd object, or set aimd.enabled=false to opt out.
+  # See onwards/docs/src/load-aware-failover.md for coverage and tuning.
 
 # Cached-input pricing (the dwctl-owned cache layer)
 cache:
@@ -758,6 +769,11 @@ background_services:
     #                                            # one-off drain lever (sweep stays sequential). Needs
     #                                            # this many spare fusillade write connections.
     # retained_response_partitions_days_ahead: <positive runway>
+    # With retention configured for "priority", terminal realtime responses
+    # are written directly into these partitions. Missing/unavailable partitions
+    # fall back to live storage for later archival; monitor
+    # fusillade_realtime_retained_fallback_total (normally zero) alongside
+    # fusillade_realtime_retained_total.
     # Daily partition retirement irreversibly drops whole expired
     # retained-response partitions. It is independently disabled and needs a
     # session-capable direct primary connection: in schema mode the primary

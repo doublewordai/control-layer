@@ -9,6 +9,7 @@ use std::{
 };
 
 use metrics::histogram;
+use onwards::aimd::AimdConfig;
 use onwards::target::{
     Auth, BackoffConfig as OnwardsBackoffConfig, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
     JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, PoolsSpec,
@@ -84,6 +85,8 @@ struct OnwardsTarget {
     backoff_factor: f64,
     backoff_jitter: String,
     backoff_max_total_ms: Option<i32>,
+    first_token_timeout_ms: Option<i64>,
+    aimd: Option<AimdConfig>,
 
     // Endpoint info
     endpoint_url: url::Url,
@@ -503,6 +506,8 @@ struct OnwardsCompositeModel {
     /// Independent of `backoff_enabled` semantics; only consulted when
     /// backoff is enabled.
     backoff_max_total_ms: Option<i32>,
+    first_token_timeout_ms: Option<i64>,
+    aimd: Option<AimdConfig>,
     /// Whether to sanitize/filter sensitive data from model responses
     sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode
@@ -718,6 +723,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             backoff_factor,
             backoff_jitter,
             backoff_max_total_ms,
+            first_token_timeout_ms,
+            aimd,
             sanitize_responses,
             trusted
         FROM deployed_models
@@ -757,6 +764,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 backoff_factor: row.backoff_factor,
                 backoff_jitter: row.backoff_jitter,
                 backoff_max_total_ms: row.backoff_max_total_ms,
+                first_token_timeout_ms: row.first_token_timeout_ms,
+                aimd: row.aimd.map(serde_json::from_value).transpose()?,
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
                 routing_rules: Vec::new(), // Populated from separate query below
@@ -812,6 +821,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     backoff_factor: 2.0,
                     backoff_jitter: "full".to_string(),
                     backoff_max_total_ms: None,
+                    first_token_timeout_ms: None,
+                    aimd: None,
                     endpoint_url,
                     endpoint_api_key: row.endpoint_api_key.clone(),
                     auth_header_name: row.auth_header_name.clone(),
@@ -957,6 +968,8 @@ fn convert_composite_to_target_spec(
                 .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
             backoff,
             max_total_backoff_ms,
+            first_token_timeout_ms: composite.first_token_timeout_ms.map(|ms| ms as u64),
+            aimd: composite.aimd.clone(),
         })
     } else {
         None
@@ -1061,7 +1074,16 @@ fn convert_composite_to_target_spec(
         keys: keys.clone(),
         rate_limit: rate_limit.clone(),
         concurrency_limit: concurrency_limit.clone(),
-        fallback: fallback.clone(),
+        fallback: fallback.clone().map(|mut config| {
+            if pool_name != DEFAULT_COMPONENT_POOL {
+                // Continuation pools must preserve their validated first hop.
+                config.aimd = Some(AimdConfig {
+                    enabled: false,
+                    ..AimdConfig::default()
+                });
+            }
+            config
+        }),
         // A named pool's ordering is a validated failover list (dynamo first,
         // the harness-validated continuation target behind it), never a
         // load-balancing surface: under the composite's own strategy (DB
@@ -1258,6 +1280,10 @@ fn convert_to_config_file(
                         .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
                     backoff,
                     max_total_backoff_ms,
+                    // A single-provider pool never arms first-token failover
+                    // (there is no other provider to fail over to).
+                    first_token_timeout_ms: target.first_token_timeout_ms.map(|ms| ms as u64),
+                    aimd: target.aimd.clone(),
                 })
             } else {
                 None
@@ -1359,6 +1385,8 @@ pub async fn load_targets_from_db(
             dm.backoff_factor,
             dm.backoff_jitter,
             dm.backoff_max_total_ms,
+            dm.first_token_timeout_ms,
+            dm.aimd,
             ie.id as endpoint_id,
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -1487,6 +1515,7 @@ pub async fn load_targets_from_db(
     let mut targets_map: HashMap<DeploymentId, OnwardsTarget> = HashMap::new();
     for row in rows {
         let deployment_id = row.deployment_id;
+        let aimd = row.aimd.map(serde_json::from_value).transpose()?;
         let target = targets_map.entry(deployment_id).or_insert_with(|| {
             OnwardsTarget {
                 model_name: row.model_name.clone(),
@@ -1513,6 +1542,8 @@ pub async fn load_targets_from_db(
                 backoff_factor: row.backoff_factor,
                 backoff_jitter: row.backoff_jitter.clone(),
                 backoff_max_total_ms: row.backoff_max_total_ms,
+                first_token_timeout_ms: row.first_token_timeout_ms,
+                aimd,
                 endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),

@@ -2432,14 +2432,30 @@ mod batch_results_stream {
     }
 
     #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
-    async fn test_batch_results_deleted_file_returns_error(pool: sqlx::PgPool) {
-        // Test: When batch's file is deleted, stream returns error
+    async fn test_batch_results_streamable_after_input_file_deleted(pool: sqlx::PgPool) {
+        // Test: Results remain streamable after the batch's input file is deleted
+        // (file_id cleared on the batch). Requests and results were already
+        // materialized while the file existed, so streaming must still succeed.
         let http_client = Arc::new(MockHttpClient::new());
+        http_client.add_response(
+            "POST /v1/test",
+            Ok(HttpResponse {
+                status: 200,
+                body: r#"{"result":"success"}"#.to_string(),
+            }),
+        );
 
-        let manager = Arc::new(PostgresStore::with_client(
-            TestDbPools::new(pool.clone()).await.unwrap(),
-            http_client,
-        ));
+        let model_concurrency_limits = Arc::new(dashmap::DashMap::new());
+        model_concurrency_limits.insert("gpt-4".to_string(), 10);
+
+        let config = DaemonConfig {
+            claim_batch_size: 10,
+            claim_interval_ms: 10,
+            model_concurrency_limits,
+            ..Default::default()
+        };
+
+        let manager = postgres_store(pool.clone(), &config).await;
 
         let file_id = manager
             .create_file(
@@ -2471,8 +2487,47 @@ mod batch_results_stream {
             })
             .await
             .expect("Failed to create batch");
+        mark_models_live_for_test(manager.as_ref(), &["gpt-4"]).await;
 
-        // Delete the file (set file_id to NULL on batch)
+        // Run daemon to materialize requests and complete them
+        let shutdown_token = CancellationToken::new();
+        postgres_daemon(manager.clone(), http_client.clone(), config)
+            .run(shutdown_token.clone())
+            .expect("Failed to start daemon");
+
+        // Wait for requests to complete
+        let start = tokio::time::Instant::now();
+        while start.elapsed() < Duration::from_secs(5) {
+            let requests = manager
+                .get_batch_requests(batch.id)
+                .await
+                .expect("Failed to get requests");
+            if requests.iter().all(|r| r.is_terminal()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        shutdown_token.cancel();
+
+        // Results should be streamable while the input file still exists
+        let stream = manager.get_batch_results_stream(batch.id, 0, None, None);
+        let results: Vec<_> = stream.collect().await;
+        assert_eq!(
+            results.len(),
+            1,
+            "Should have 1 result before file deletion"
+        );
+        let result = results[0]
+            .as_ref()
+            .expect("Result should be Ok before file deletion");
+        assert_eq!(
+            result.status,
+            fusillade::batch::BatchResultStatus::Completed
+        );
+        assert!(result.response_body.is_some());
+
+        // Delete the input file (set file_id to NULL on batch)
         sqlx::query!(
             "UPDATE batches SET file_id = NULL WHERE id = $1",
             *batch.id as uuid::Uuid
@@ -2481,23 +2536,19 @@ mod batch_results_stream {
         .await
         .expect("Failed to clear file_id");
 
-        // Try to get results - should get an error
+        // Results should still be streamable after the input file is deleted
         let stream = manager.get_batch_results_stream(batch.id, 0, None, None);
         let results: Vec<_> = stream.collect().await;
-
-        // Should have one error result
-        assert_eq!(results.len(), 1, "Should have one result (the error)");
-        assert!(
-            results[0].is_err(),
-            "Result should be an error when file_id is NULL"
+        assert_eq!(results.len(), 1, "Should have 1 result after file deletion");
+        let result = results[0]
+            .as_ref()
+            .expect("Result should be Ok after input file deletion");
+        assert_eq!(
+            result.status,
+            fusillade::batch::BatchResultStatus::Completed
         );
-
-        let err = results[0].as_ref().unwrap_err();
-        assert!(
-            err.to_string().contains("file_id"),
-            "Error should mention file_id: {}",
-            err
-        );
+        assert!(result.response_body.is_some());
+        assert_eq!(result.custom_id.as_deref(), Some("test"));
     }
 
     #[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]

@@ -289,6 +289,16 @@ async fn reassemble_stream(response: Response, timeouts: StreamTimeouts) -> Resp
         return json_body_response(parts, status, data.clone());
     }
 
+    // The reassembler accumulated this outcome from the same JSON parse it used
+    // to build the response. Turn it into a real failure before the response
+    // returns to fusillade, so retry and billing share one HTTP outcome.
+    let status = if status.is_success() && sink.is_reasoning_without_answer() {
+        warn!("upstream completed reasoning without an answer, reclassifying");
+        StatusCode::BAD_GATEWAY
+    } else {
+        status
+    };
+
     match sink.finish() {
         Ok(body) => json_body_response(parts, status, body),
         Err(e) => {
@@ -357,6 +367,10 @@ impl Sink {
 
     fn finish(self) -> anyhow::Result<String> {
         if self.reassemble { self.reassembler.finish() } else { Ok(self.raw) }
+    }
+
+    fn is_reasoning_without_answer(&self) -> bool {
+        self.reassemble && self.reassembler.is_reasoning_without_answer()
     }
 }
 
@@ -505,6 +519,23 @@ mod tests {
         );
         let body: serde_json::Value = serde_json::from_str(&body_string(out).await).unwrap();
         assert_eq!(body["choices"][0]["message"]["content"], "Hello world");
+    }
+
+    #[tokio::test]
+    async fn reasoning_without_answer_is_reclassified_after_reassembly() {
+        let frames = [
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{"reasoning_content":"thinking"}}]}"#,
+            r#"{"id":"chatcmpl-1","object":"chat.completion.chunk","created":1,"model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ];
+
+        for upstream_status in [StatusCode::OK, StatusCode::CREATED] {
+            let out = reassemble_stream(sse_response(upstream_status, &frames), timeouts(1000, 1000, 5000)).await;
+
+            assert_eq!(out.status(), StatusCode::BAD_GATEWAY);
+            let body: serde_json::Value = serde_json::from_str(&body_string(out).await).unwrap();
+            assert_eq!(body["choices"][0]["message"]["reasoning_content"], "thinking");
+        }
     }
 
     /// Content-free keepalive frames are what make a stream's wire size unrelated

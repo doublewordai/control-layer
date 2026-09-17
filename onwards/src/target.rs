@@ -13,6 +13,7 @@
 //!
 //! Pool-level configuration (keys, rate_limit) applies to all providers in the pool.
 //! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
+use crate::aimd::AimdConfig;
 use crate::auth::KeySet;
 use crate::load_balancer::{Provider, ProviderPool};
 use crate::reasoning::ReasoningTranslationConfig;
@@ -215,6 +216,24 @@ pub struct FallbackConfig {
     /// Bounds only the inter-attempt sleeps, not upstream request time.
     #[serde(default)]
     pub max_total_backoff_ms: Option<u64>,
+
+    /// Failover deadline for the first token of a streamed response, in
+    /// milliseconds. Overrides the proxy-wide default
+    /// ([`AppState::with_first_token_timeout`](crate::AppState::with_first_token_timeout));
+    /// `0` disables it for this pool.
+    ///
+    /// Only armed for `"stream": true` requests, when the pool has another
+    /// provider to fail over to and the attempt is not the last one the budget
+    /// allows — so it can reroute a stalled request but never fail one that
+    /// would otherwise have succeeded. It bounds the wait for response headers
+    /// and, in strict mode, for the first real SSE frame (keep-alive comments
+    /// don't count). Nothing has reached the client by then, so the next
+    /// provider starts cleanly.
+    #[serde(default)]
+    pub first_token_timeout_ms: Option<u64>,
+    /// Priority-only share controller overrides. None uses defaults; enabled=false opts out.
+    #[serde(default)]
+    pub aimd: Option<AimdConfig>,
 }
 
 impl FallbackConfig {
@@ -1048,6 +1067,11 @@ impl TargetPools {
     /// A pool that did not exist before starts at zero, as a new pool should.
     pub fn adopt_provider_state(&mut self, old: &TargetPools) {
         self.default.adopt_provider_state(&old.default);
+        for (name, pool) in &old.extra {
+            if !self.extra.contains_key(name) {
+                pool.retire_aimd();
+            }
+        }
         for (name, pool) in self.extra.iter_mut() {
             if let Some(old_pool) = old.extra.get(name) {
                 pool.adopt_provider_state(old_pool);
@@ -1260,9 +1284,38 @@ impl TargetsStream for WatchTargetsStream {
 fn build_pool(
     alias: &str,
     pool_name: &str,
-    pool_config: PoolConfig,
+    mut pool_config: PoolConfig,
     global_keys: &KeySet,
 ) -> Result<ProviderPool, anyhow::Error> {
+    if pool_name != DEFAULT_POOL
+        && let Some(fallback) = &mut pool_config.fallback
+    {
+        fallback.aimd = Some(crate::aimd::AimdConfig {
+            enabled: false,
+            ..crate::aimd::AimdConfig::default()
+        });
+    }
+    if let Some(fallback) = &pool_config.fallback
+        && let Some(config) = &fallback.aimd
+        && config.enabled
+    {
+        config.validate().map_err(|e| anyhow!(e))?;
+        if !fallback.enabled || pool_config.strategy != LoadBalanceStrategy::Priority {
+            return Err(anyhow!(
+                "AIMD requires enabled fallback and priority strategy"
+            ));
+        }
+        // Explicit override prevents a shorter proxy-wide deadline from
+        // turning a censored observation into a false budget breach.
+        if !fallback
+            .first_token_timeout_ms
+            .is_some_and(|ms| ms == 0 || (ms >= config.latency_budget_ms && ms <= 3_600_000))
+        {
+            return Err(anyhow!(
+                "AIMD requires an explicit first_token_timeout_ms of 0 or at least latency_budget_ms"
+            ));
+        }
+    }
     for (index, provider) in pool_config.providers.iter().enumerate() {
         if let Some(config) = provider.reasoning_translation.as_ref() {
             config.validate().map_err(|error| {
@@ -1479,7 +1532,11 @@ impl Targets {
                         // Remove deleted targets
                         for key in current_target_keys {
                             if !new_targets.targets.contains_key(&key) {
-                                targets.remove(&key);
+                                if let Some((_, removed)) = targets.remove(&key) {
+                                    for (_, pool) in removed.iter() {
+                                        pool.retire_aimd();
+                                    }
+                                }
                             }
                         }
 

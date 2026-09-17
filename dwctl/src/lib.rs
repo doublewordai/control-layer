@@ -197,6 +197,7 @@ use crate::{
 };
 use sqlx_pool_router::{DbPools, PoolProvider};
 
+use crate::db::errors::initialize_database_error_metrics;
 use anyhow::Context;
 use auth::middleware::admin_ai_proxy_middleware;
 use axum::extract::{DefaultBodyLimit, Request, State};
@@ -368,7 +369,7 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             // compliance ratios are only exact at a bucket edge.
             const SUBMISSION_LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0, 1800.0, 3600.0];
 
-            PrometheusBuilder::new()
+            let handle = PrometheusBuilder::new()
                 .set_buckets_for_metric(Matcher::Full("dwctl_analytics_lag_seconds".to_string()), ANALYTICS_LAG_BUCKETS)
                 .expect("Failed to set custom buckets for dwctl_analytics_lag_seconds")
                 .set_buckets_for_metric(Matcher::Full("dwctl_cache_sync_lag_seconds".to_string()), CACHE_SYNC_LAG_BUCKETS)
@@ -414,7 +415,9 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                 )
                 .expect("Failed to set custom buckets for fusillade_request_pickup_delay_seconds")
                 .install_recorder()
-                .expect("Failed to install Prometheus recorder")
+                .expect("Failed to install Prometheus recorder");
+            initialize_database_error_metrics();
+            handle
         })
         .clone()
 }
@@ -601,6 +604,8 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             backoff_factor: 2.0,
                             backoff_jitter: Default::default(),
                             backoff_max_total_ms: None,
+                            first_token_timeout_ms: None,
+                            aimd: None,
                             traffic_routing_rules: None,
                             allowed_batch_completion_windows: None,
                             metadata: None,
@@ -1430,124 +1435,11 @@ async fn setup_database(
     let daemon = &config.background_services.batch_daemon;
     let batch_capable = !matches!(daemon.mode, config::DaemonMode::RequestOnly);
     let partition_maintenance_pool = if batch_capable {
-        let (unfinished_retirements, identity_mismatch, retired_routes_exist): (i64, bool, bool) = sqlx::query_as(
-            r#"
-            SELECT
-                (SELECT COUNT(*)::bigint
-                 FROM retention_partition_retirements
-                 WHERE completed_at IS NULL),
-                EXISTS (
-                    SELECT 1
-                    FROM retained_response_buckets bucket
-                    WHERE bucket.state IN ('retiring', 'retired')
-                      AND NOT (
-                        (bucket.state = 'retiring' AND EXISTS (
-                            SELECT 1
-                            FROM retention_partition_retirements journal
-                            JOIN pg_namespace namespace
-                              ON namespace.nspname = bucket.partition_schema
-                             AND namespace.oid = journal.partition_schema_oid
-                            JOIN pg_class parent
-                              ON parent.relnamespace = namespace.oid
-                             AND parent.relname = 'retained_response_objects'
-                             AND parent.oid = journal.parent_oid
-                            JOIN pg_class child
-                              ON child.relnamespace = namespace.oid
-                             AND child.relname = bucket.partition_table
-                             AND child.oid = bucket.partition_oid
-                            WHERE journal.parent_table = 'retained_response_objects'
-                              AND journal.partition_schema = bucket.partition_schema
-                              AND journal.partition_table = bucket.partition_table
-                              AND journal.partition_oid = bucket.partition_oid
-                              AND journal.lower_bound = bucket.delete_on
-                              AND journal.upper_bound = bucket.delete_on + 1
-                              AND journal.completed_at IS NULL
-                              AND bucket.partition_schema = current_schema()
-                              AND bucket.partition_table =
-                                  'retained_response_objects_d'
-                                  || to_char(bucket.delete_on, 'YYYYMMDD')
-                        )) OR (bucket.state = 'retired' AND EXISTS (
-                            SELECT 1
-                            FROM retention_partition_retirements journal
-                            JOIN pg_namespace namespace
-                              ON namespace.nspname = bucket.partition_schema
-                             AND namespace.oid = journal.partition_schema_oid
-                            JOIN pg_class parent
-                              ON parent.relnamespace = namespace.oid
-                             AND parent.relname = 'retained_response_objects'
-                             AND parent.oid = journal.parent_oid
-                            WHERE journal.parent_table = 'retained_response_objects'
-                              AND journal.partition_schema = bucket.partition_schema
-                              AND journal.partition_table = bucket.partition_table
-                              AND journal.partition_oid = bucket.partition_oid
-                              AND journal.lower_bound = bucket.delete_on
-                              AND journal.upper_bound = bucket.delete_on + 1
-                              AND journal.completed_at = bucket.state_changed_at
-                              AND bucket.partition_schema = current_schema()
-                              AND bucket.partition_table =
-                                  'retained_response_objects_d'
-                                  || to_char(bucket.delete_on, 'YYYYMMDD')
-                              AND NOT EXISTS (
-                                  SELECT 1 FROM pg_class child
-                                  WHERE child.oid = bucket.partition_oid
-                              )
-                        ))
-                      )
-                ) OR EXISTS (
-                    SELECT 1
-                    FROM retention_partition_retirements journal
-                    WHERE journal.parent_table = 'retained_response_objects'
-                      AND journal.completed_at IS NULL
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM retained_response_buckets bucket
-                          JOIN pg_namespace namespace
-                            ON namespace.nspname = bucket.partition_schema
-                           AND namespace.oid = journal.partition_schema_oid
-                          JOIN pg_class parent
-                            ON parent.relnamespace = namespace.oid
-                           AND parent.relname = 'retained_response_objects'
-                           AND parent.oid = journal.parent_oid
-                          JOIN pg_class child
-                            ON child.relnamespace = namespace.oid
-                           AND child.relname = bucket.partition_table
-                           AND child.oid = bucket.partition_oid
-                          WHERE bucket.state = 'retiring'
-                            AND bucket.partition_schema = journal.partition_schema
-                            AND bucket.partition_table = journal.partition_table
-                            AND bucket.partition_oid = journal.partition_oid
-                            AND bucket.delete_on = journal.lower_bound
-                            AND journal.upper_bound = journal.lower_bound + 1
-                            AND bucket.partition_schema = current_schema()
-                            AND bucket.partition_table =
-                                'retained_response_objects_d'
-                                || to_char(bucket.delete_on, 'YYYYMMDD')
-                      )
-                ),
-                EXISTS (
-                    SELECT 1 FROM retained_response_buckets bucket
-                    JOIN retention_partition_retirements journal
-                      ON journal.parent_table = 'retained_response_objects'
-                     AND journal.partition_schema = bucket.partition_schema
-                     AND journal.partition_table = bucket.partition_table
-                     AND journal.partition_oid = bucket.partition_oid
-                     AND journal.lower_bound = bucket.delete_on
-                     AND journal.upper_bound = bucket.delete_on + 1
-                     AND journal.completed_at = bucket.state_changed_at
-                    WHERE bucket.state = 'retired'
-                      AND journal.completed_at IS NOT NULL
-                      AND (
-                          EXISTS (SELECT 1 FROM retained_response_group_routes route
-                                  WHERE route.delete_on = bucket.delete_on)
-                          OR EXISTS (SELECT 1 FROM retained_response_request_routes route
-                                     WHERE route.delete_on = bucket.delete_on)
-                      )
-                )
-            "#,
-        )
-        .fetch_one(fusillade.direct.write())
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to inspect retained-response retirement recovery state: {error}"))?;
+        let (unfinished_retirements, identity_mismatch, retired_routes_exist): (i64, bool, bool) =
+            sqlx::query_as(include_str!("retention_preflight.sql"))
+                .fetch_one(fusillade.direct.write())
+                .await
+                .map_err(|error| anyhow::anyhow!("failed to inspect retained-response retirement recovery state: {error}"))?;
         let required = partition_maintenance_required(
             daemon,
             RetainedResponseMaintenanceState {
@@ -4126,6 +4018,15 @@ impl Application {
             fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
         )
         .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
+        .with_realtime_retention_seconds(
+            config
+                .background_services
+                .batch_daemon
+                .retention
+                .batchless_seconds_by_service_tier
+                .get("priority")
+                .copied(),
+        )
         .with_retained_response_retention_bounds_seconds(
             config
                 .background_services
@@ -4324,10 +4225,21 @@ impl Application {
         // No classifier is injected here.
         // Request-body edits (id-scrub, streaming usage flags) now live in dwctl's own
         // `outbound_request` middleware, so onwards needs no BodyTransformFn.
-        let onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
+        let mut onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
             .with_response_id_header("x-fusillade-request-id")
-            .with_body_limit(onwards_body_limit);
+            .with_body_limit(onwards_body_limit)
+            // The fusillade daemon stamps every request it dispatches (file
+            // batches, flex, background) with its batch metadata headers, and
+            // `created_at` is always among them, even for batchless rows.
+            // Realtime traffic never carries it (the realtime path only adds
+            // `x-fusillade-request-id`), so it exempts exactly the daemon
+            // traffic, which tolerates latency and runs its own retries.
+            .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at");
+        if config.onwards.first_token_timeout_ms > 0 {
+            onwards_app_state =
+                onwards_app_state.with_first_token_timeout(std::time::Duration::from_millis(config.onwards.first_token_timeout_ms));
+        }
 
         let onwards_router = if bg_services.onwards_targets.strict_mode {
             tracing::info!("Strict mode enabled - using typed request validation");

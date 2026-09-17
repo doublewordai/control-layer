@@ -6,7 +6,7 @@ use crate::db::{
     errors::{DbError, Result},
     handlers::repository::Repository,
     models::deployments::{
-        DEFAULT_COMPONENT_POOL, DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse, DeploymentCreateDBRequest,
+        AimdConfig, DEFAULT_COMPONENT_POOL, DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse, DeploymentCreateDBRequest,
         DeploymentDBResponse, DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus, ModelType, ProviderPricing,
         ProviderPricingFields, TrafficRuleAction, TrafficRuleDBRow,
     },
@@ -16,6 +16,7 @@ use crate::types::{DeploymentId, InferenceEndpointId, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlx::types::Json;
 use sqlx::{FromRow, PgConnection, Row, query_builder::QueryBuilder};
 use std::collections::HashMap;
 use tracing::instrument;
@@ -190,6 +191,8 @@ struct DeployedModel {
     pub backoff_factor: f64,
     pub backoff_jitter: String,
     pub backoff_max_total_ms: Option<i32>,
+    pub first_token_timeout_ms: Option<i64>,
+    pub aimd: Option<Json<AimdConfig>>,
     pub sanitize_responses: bool,
     pub trusted: bool,
     pub reasoning_translation_overrides: Option<serde_json::Value>,
@@ -256,6 +259,8 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             backoff_factor: m.backoff_factor,
             backoff_jitter: m.backoff_jitter,
             backoff_max_total_ms: m.backoff_max_total_ms,
+            first_token_timeout_ms: m.first_token_timeout_ms,
+            aimd: m.aimd.map(|v| v.0),
             sanitize_responses: m.sanitize_responses,
             trusted: m.trusted,
             reasoning_translation_overrides: m.reasoning_translation_overrides.and_then(|value| {
@@ -322,10 +327,18 @@ impl<'c> Repository for Deployments<'c> {
                 sanitize_responses, trusted, allowed_batch_completion_windows,
                 metadata,
                 backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
-                reasoning_translation_overrides
+                reasoning_translation_overrides, first_token_timeout_ms, aimd
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38)
-            RETURNING *
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)
+            RETURNING id, model_name, alias, display_name, description,
+                type, capabilities, created_by, hosted_on, status,
+                last_sync, deleted, created_at, updated_at, requests_per_second,
+                burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode,
+                downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
+                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement,
+                fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
+                backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, reasoning_translation_overrides,
+                allowed_batch_completion_windows, metadata, provisioning_source
             "#,
         )
         .bind(request.model_name.trim())
@@ -372,6 +385,8 @@ impl<'c> Repository for Deployments<'c> {
         .bind(request.backoff_jitter.as_str())
         .bind(request.backoff_max_total_ms)
         .bind(reasoning_translation_overrides)
+        .bind(request.first_token_timeout_ms)
+        .bind(request.aimd.as_ref().map(Json))
         .fetch_one(&mut *self.db)
         .await?;
 
@@ -388,7 +403,7 @@ impl<'c> Repository for Deployments<'c> {
     #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as::<_, DeployedModel>(
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = $1",
         )
             .bind(id)
             .fetch_optional(&mut *self.db)
@@ -413,7 +428,7 @@ impl<'c> Repository for Deployments<'c> {
         }
 
         let deployments = sqlx::query_as::<_, DeployedModel>(
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = ANY($1)",
         )
             .bind(ids.as_slice())
             .fetch_all(&mut *self.db)
@@ -612,9 +627,19 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE reasoning_translation_overrides
             END,
 
+            first_token_timeout_ms = CASE WHEN $57 THEN $58 ELSE first_token_timeout_ms END,
+            aimd = CASE WHEN $59 THEN $60 ELSE aimd END,
             updated_at = NOW()
         WHERE id = $1
-        RETURNING *
+        RETURNING id, model_name, alias, display_name, description,
+                type, capabilities, created_by, hosted_on, status,
+                last_sync, deleted, created_at, updated_at, requests_per_second,
+                burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode,
+                downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
+                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement,
+                fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
+                backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, reasoning_translation_overrides,
+                allowed_batch_completion_windows, metadata, provisioning_source
         "#,
         )
         .bind(id)
@@ -679,6 +704,10 @@ impl<'c> Repository for Deployments<'c> {
         .bind(request.backoff_max_total_ms.as_ref().and_then(Option::as_ref))
         .bind(request.reasoning_translation_overrides.is_some())
         .bind(reasoning_translation_overrides)
+        .bind(request.first_token_timeout_ms.is_some())
+        .bind(request.first_token_timeout_ms.flatten())
+        .bind(request.aimd.is_some())
+        .bind(request.aimd.as_ref().and_then(Option::as_ref).map(Json))
         .fetch_one(&mut *self.db)
         .await?;
 
@@ -695,9 +724,21 @@ impl<'c> Repository for Deployments<'c> {
 
     #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
-        // Use LEFT JOIN with inference_endpoints to enable searching by endpoint name
-        let mut query =
-            QueryBuilder::new("SELECT dm.* FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1");
+        // Explicit results keep prepared statements compatible with additive migrations,
+        // including server statements retained by a transaction pooler across clients.
+        // Use LEFT JOIN with inference_endpoints to enable searching by endpoint name.
+        let mut query = QueryBuilder::new(
+            "SELECT dm.id, dm.model_name, dm.alias, dm.display_name, dm.description,
+                dm.type, dm.capabilities, dm.created_by, dm.hosted_on, dm.status,
+                dm.last_sync, dm.deleted, dm.created_at, dm.updated_at, dm.requests_per_second,
+                dm.burst_size, dm.capacity, dm.batch_capacity, dm.throughput, dm.downstream_pricing_mode,
+                dm.downstream_input_price_per_token, dm.downstream_output_price_per_token, dm.downstream_hourly_rate, dm.downstream_input_token_cost_ratio, dm.is_composite,
+                dm.lb_strategy, dm.fallback_enabled, dm.fallback_on_rate_limit, dm.fallback_on_status, dm.fallback_with_replacement,
+                dm.fallback_max_attempts, dm.backoff_enabled, dm.backoff_initial_ms, dm.backoff_max_ms, dm.backoff_factor,
+                dm.backoff_jitter, dm.backoff_max_total_ms, dm.first_token_timeout_ms, dm.aimd, dm.sanitize_responses, dm.trusted, dm.reasoning_translation_overrides,
+                dm.allowed_batch_completion_windows, dm.metadata, dm.provisioning_source
+             FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
+        );
 
         Self::apply_filters(&mut query, filter);
 
@@ -873,7 +914,7 @@ impl<'c> Deployments<'c> {
         // Build a CTE that selects the filtered model set (ignoring pagination,
         // sort, and search so facets reflect the full universe visible to this user).
         let mut query = QueryBuilder::new(
-            "WITH visible AS (SELECT dm.* FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
+            "WITH visible AS (SELECT dm.metadata, dm.capabilities, dm.type FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
         );
 
         let facets_filter = DeploymentFilter {

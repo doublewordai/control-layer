@@ -32,5 +32,6 @@ pub use model_config::{ModelCacheConfig, ModelConfigResolver};
 pub use parse::{Block, Breakpoint, ParseError, ParsedPrompt, TelemetryPolicy, parse_chat_completions, validate_markers};
 pub use postgres::PostgresIndex;
 pub use principal::PrincipalResolver;
-pub use stats::{CacheStats, PendingWrite};
+pub(crate) use stats::CacheBilling;
+pub use stats::{BilledCache, CacheReadSource, CacheStats, PendingWrite};
 pub use tokenizer::{ModelInfo, TokenizeResponse, TokenizerClient, TokenizerError, TokenizerResult};

@@ -134,7 +134,7 @@ impl<'c> Repository for ApiKeys<'c> {
             r#"
             INSERT INTO api_keys (name, description, secret, purpose, user_id, created_by, requests_per_second, burst_size, hidden, spend_limit, spend_limit_interval)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, $9, $10)
-            RETURNING *
+            RETURNING id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
             "#,
             request.name,
             request.description,
@@ -262,7 +262,7 @@ impl<'c> Repository for ApiKeys<'c> {
                     ELSE burst_size
                 END
             WHERE id = $1
-            RETURNING *
+            RETURNING id, name, description, secret, user_id, created_at, last_used, requests_per_second, burst_size, purpose, hidden, is_deleted, created_by, spend_limit, spend_limit_interval, parent_api_key_id, secret_revealed_at
             "#,
             id,
             request.name,
