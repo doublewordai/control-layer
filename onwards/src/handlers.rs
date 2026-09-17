@@ -811,13 +811,22 @@ pub async fn target_message_handler<T: HttpClient>(
             !timeout.is_zero() && pool.len() > 1 && is_realtime && requests_stream(&body_bytes)
         });
     // A status triggers failover when the pool lists it, or when it is one of
-    // the pool's realtime-only fallback statuses and this request is realtime.
-    let fails_over_on = |status: u16| {
-        if is_realtime {
-            pool.should_fallback_on_realtime_status(status)
-        } else {
-            pool.should_fallback_on_status(status)
-        }
+    // the pool's realtime-only fallback statuses, this request is realtime and
+    // another provider is left to try. A realtime-only status on the final
+    // attempt (or in a single-provider pool) is returned to the caller as the
+    // upstream sent it, exactly as without the setting, rather than collapsing
+    // into a generic gateway error.
+    let realtime_failover_attempts = if pool.fallback().is_some_and(|f| f.with_replacement) {
+        pool_max_attempts
+    } else {
+        pool_max_attempts.min(pool.len())
+    };
+    let fails_over_on = |status: u16, attempt_number: u32| {
+        pool.should_fallback_on_status(status)
+            || (is_realtime
+                && pool.len() > 1
+                && (attempt_number as usize) < realtime_failover_attempts
+                && pool.should_fallback_on_realtime_status(status))
     };
 
     // Unsupported traffic keeps ordinary routing and contributes no observations.
@@ -1190,7 +1199,7 @@ pub async fn target_message_handler<T: HttpClient>(
         }
 
         // Check if we should fallback based on status code
-        if fails_over_on(status) {
+        if fails_over_on(status, attempt_number) {
             debug!(
                 "Provider returned fallback status {}, trying next: {:?}",
                 status, target.url
@@ -1504,7 +1513,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 // purposes, so it overrides the 200 recorded above.
                 last_upstream_status = Some(embedded);
 
-                let retryable = fails_over_on(embedded)
+                let retryable = fails_over_on(embedded, attempt_number)
                     || (embedded == 429 && pool.should_fallback_on_rate_limit());
                 if retryable {
                     tracing::Span::current().record("onwards.fallback", "embedded_error");
