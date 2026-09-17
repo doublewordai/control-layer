@@ -107,7 +107,11 @@ impl CacheLayerState {
 /// customers unbilled. A marker or `cacheBreakpoint` param on a completions body still
 /// arms the request (deterministic zeros — the one-paradigm rule), it just cannot cache.
 fn is_cacheable(req: &Request) -> bool {
-    req.method() == Method::POST && req.uri().path().ends_with("/completions")
+    // Mirrors `onwards::RequestClass::from_path`: trailing slashes trimmed, and the same
+    // deliberate suffix breadth. The scrub is a leak-guard, so this layer must cover
+    // every path shape onwards can serve a completions-style response on — matching
+    // narrower than the serving surface would reopen the provider-stat leak there.
+    req.method() == Method::POST && req.uri().path().trim_end_matches('/').ends_with("/completions")
 }
 
 /// Turn a synchronous marker-validation failure into the structured 400 the rest of the stack
@@ -202,31 +206,42 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // extra cost, and only on param-carrying requests (whose marker means the outbound sanitiser
     // was going to rewrite the body anyway).
     let mut body_bytes = body_bytes;
-    match query::breakpoint_marker(parts.uri.query()) {
-        Ok(None) => {}
-        Ok(Some(marker)) => {
+    // The param is a Chat Completions feature (`super::query`'s contract): on any other
+    // cacheable path — plain /completions has no blocks for the marker to bind to — it is
+    // stripped from the URI (it must never leak upstream) and otherwise ignored, so it
+    // cannot arm the request and suppress implicit billing.
+    if !parts.uri.path().trim_end_matches('/').ends_with("/chat/completions") {
+        if query::breakpoint_marker(parts.uri.query()).is_ok_and(|m| m.is_some()) || query::breakpoint_marker(parts.uri.query()).is_err() {
             parts.uri = query::strip_param(&parts.uri);
-            let outcome = match parsed_body.as_mut() {
-                Some(body) => match query::inject_marker(body, marker) {
-                    Inject::Applied => match serde_json::to_vec(body) {
-                        Ok(b) => {
-                            body_bytes = b.into();
-                            "applied"
-                        }
-                        // Serializing a `Value` we just parsed can't realistically fail; if it
-                        // ever does, forward the original body un-injected (no caching) rather
-                        // than failing the request.
-                        Err(_) => "reserialize_failed",
-                    },
-                    Inject::BodyFieldWins => "body_field_wins",
-                    Inject::NotAnObject => "not_an_object",
-                },
-                // Unparseable JSON: nothing to inject into; onwards will 400 the body itself.
-                None => "not_json",
-            };
-            cache_metrics::record_query_breakpoint(outcome);
+            cache_metrics::record_query_breakpoint("non_chat_ignored");
         }
-        Err(e) => return query_rejection_response(&e),
+    } else {
+        match query::breakpoint_marker(parts.uri.query()) {
+            Ok(None) => {}
+            Ok(Some(marker)) => {
+                parts.uri = query::strip_param(&parts.uri);
+                let outcome = match parsed_body.as_mut() {
+                    Some(body) => match query::inject_marker(body, marker) {
+                        Inject::Applied => match serde_json::to_vec(body) {
+                            Ok(b) => {
+                                body_bytes = b.into();
+                                "applied"
+                            }
+                            // Serializing a `Value` we just parsed can't realistically fail; if
+                            // it ever does, forward the original body un-injected (no caching)
+                            // rather than failing the request.
+                            Err(_) => "reserialize_failed",
+                        },
+                        Inject::BodyFieldWins => "body_field_wins",
+                        Inject::NotAnObject => "not_an_object",
+                    },
+                    // Unparseable JSON: nothing to inject into; onwards will 400 the body itself.
+                    None => "not_json",
+                };
+                cache_metrics::record_query_breakpoint(outcome);
+            }
+            Err(e) => return query_rejection_response(&e),
+        }
     }
 
     // Reject disallowed/malformed cache_control markers synchronously, before forking + forwarding
@@ -1374,6 +1389,65 @@ mod tests {
             v["usage"].get("cache_read_input_tokens").is_none(),
             "no injected fields when inactive"
         );
+    }
+
+    #[test]
+    fn is_cacheable_matches_the_onwards_completions_surface() {
+        let req = |method: Method, path: &str| {
+            let mut r = Request::new(Body::empty());
+            *r.method_mut() = method;
+            *r.uri_mut() = path.parse().unwrap();
+            r
+        };
+        assert!(is_cacheable(&req(Method::POST, "/v1/chat/completions")));
+        assert!(is_cacheable(&req(Method::POST, "/v1/completions")));
+        // Trailing slash: onwards normalizes it as the same route, so must we.
+        assert!(is_cacheable(&req(Method::POST, "/v1/completions/")));
+        assert!(is_cacheable(&req(Method::POST, "/v1/chat/completions/")));
+        assert!(!is_cacheable(&req(Method::GET, "/v1/completions")));
+        assert!(!is_cacheable(&req(Method::POST, "/v1/embeddings")));
+    }
+
+    /// Completions upstream that also proves the query param never leaks upstream.
+    async fn mock_upstream_completions_asserting_no_query(req: Request) -> Json<serde_json::Value> {
+        assert!(req.uri().query().is_none(), "cacheBreakpoint must be stripped before forwarding");
+        mock_upstream_completions_with_provider_cache().await
+    }
+
+    #[sqlx::test]
+    async fn cache_breakpoint_param_is_ignored_on_plain_completions(pool: PgPool) {
+        // The param is a Chat Completions feature: on /completions it must be stripped
+        // (never forwarded) WITHOUT arming the request, so implicit billing still applies.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        activate_alias(&pool, user.id).await;
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/completions", post(mock_upstream_completions_asserting_no_query))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        let r = server
+            .post("/v1/completions")
+            .add_query_param("cacheBreakpoint", "lastUserMessage")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({"model": ALIAS, "prompt": "continue this"}))
+            .await;
+        r.assert_status_ok();
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 1792, "param must not suppress implicit");
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 1792);
     }
 
     // ---- `?cacheBreakpoint=lastUserMessage` (query-param automatic caching) ----

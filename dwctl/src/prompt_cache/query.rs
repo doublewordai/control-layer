@@ -7,6 +7,10 @@
 //! before anything else looks at the body, so validation, classification, and outbound marker
 //! stripping all see exactly what they'd see had the client sent the field itself — one code path.
 //!
+//! Chat Completions ONLY: on other cacheable paths (plain `/completions` has no blocks for a
+//! marker to bind to) the layer strips the param from the URI — it must never leak upstream —
+//! and otherwise ignores it, so it cannot arm the request and suppress implicit billing.
+//!
 //! Rules:
 //! - The param name and values are matched byte-exact — no percent-decoding is performed, so
 //!   encoded forms (e.g. `last%55serMessage`) are treated as distinct and therefore unsupported.
