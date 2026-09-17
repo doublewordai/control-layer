@@ -1,5 +1,12 @@
 # Changelog
 
+## [11.17.1](https://github.com/doublewordai/control-layer/compare/v11.17.0...v11.17.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* **onwards:** return realtime-only failover statuses as sent when no provider is left ([#1811](https://github.com/doublewordai/control-layer/issues/1811)) ([2b954b9](https://github.com/doublewordai/control-layer/commit/2b954b9b22620e4764fffc5793c9e65303170e37))
+
 ## [11.17.0](https://github.com/doublewordai/control-layer/compare/v11.16.0...v11.17.0) (2026-09-17)
 
 
