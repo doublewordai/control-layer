@@ -7,7 +7,7 @@
 //!
 //! Pool-level configuration (keys, rate limits) is shared across all providers.
 
-use crate::aimd::{Controller, Observation};
+use crate::aimd::{AimdConfig, Controller, Observation};
 use crate::auth::KeySet;
 use crate::target::{
     ConcurrencyGuard, ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter,
@@ -17,6 +17,37 @@ use rand::Rng;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::time::Instant;
+
+/// The AIMD configuration a pool would run with, independent of how many
+/// providers it currently has: fallback enabled, priority strategy, and an
+/// enabled, valid controller config (defaults when unset).
+fn configured_aimd(
+    fallback: Option<&FallbackConfig>,
+    strategy: LoadBalanceStrategy,
+) -> Option<AimdConfig> {
+    fallback
+        .filter(|f| f.enabled)
+        .map(|f| f.aimd.clone().unwrap_or_default())
+        .filter(|c| c.enabled && c.validate().is_ok() && strategy == LoadBalanceStrategy::Priority)
+}
+
+/// What a controller's learning is about: the preferred provider it measured.
+fn provider_identity(target: &Target) -> (&url::Url, Option<&str>, Option<&str>) {
+    (
+        &target.url,
+        target.onwards_key.as_deref(),
+        target.onwards_model.as_deref(),
+    )
+}
+
+/// A controller carried across reloads while its pool cannot use it, with
+/// what it needs to decide whether a later pool may resume it.
+#[derive(Debug, Clone)]
+struct ParkedController {
+    controller: Arc<Mutex<Controller>>,
+    preferred: Target,
+    first_token_timeout_ms: Option<u64>,
+}
 
 /// A pool of providers that share an alias, with load balancing support
 #[derive(Debug, Clone)]
@@ -34,6 +65,11 @@ pub struct ProviderPool {
     /// Load balancing strategy
     strategy: LoadBalanceStrategy,
     controller: Option<Arc<Mutex<Controller>>>,
+    /// A controller kept while this pool is configured for AIMD but has too
+    /// few providers to use it (e.g. its preferred provider is disabled), so a
+    /// later reload that restores the same preferred provider resumes it
+    /// rather than starting over.
+    parked: Option<ParkedController>,
     /// Mark this pool as trusted to bypass strict mode error sanitization.
     /// When strict_mode is enabled globally AND trusted is true for a pool,
     /// error response sanitization is skipped, but success responses are still sanitized.
@@ -92,6 +128,7 @@ impl ProviderPool {
             fallback: None,
             strategy: LoadBalanceStrategy::default(),
             controller: None,
+            parked: None,
             trusted: false,
             routing_rules: Vec::new(),
         }
@@ -109,19 +146,12 @@ impl ProviderPool {
         trusted: bool,
         routing_rules: Vec<RoutingRule>,
     ) -> Self {
-        let controller = fallback
-            .as_ref()
-            .filter(|f| f.enabled)
-            .map(|f| f.aimd.clone().unwrap_or_default())
-            .filter(|c| {
-                c.enabled
-                    && c.validate().is_ok()
-                    && strategy == LoadBalanceStrategy::Priority
-                    && providers.len() > 1
-            })
+        let controller = configured_aimd(fallback.as_ref(), strategy)
+            .filter(|_| providers.len() > 1)
             .map(|c| Arc::new(Mutex::new(Controller::new(c, Instant::now()))));
         Self {
             controller,
+            parked: None,
             providers,
             keys,
             pool_limiter,
@@ -187,10 +217,62 @@ impl ProviderPool {
         if let Some(controller) = &self.controller {
             controller.lock().unwrap().retire();
         }
+        if let Some(parked) = &self.parked {
+            parked.controller.lock().unwrap().retire();
+        }
     }
 
     pub(crate) fn aimd_enabled(&self) -> bool {
         self.controller.is_some()
+    }
+
+    /// Carry the old pool's controller (active or parked) into this pool.
+    ///
+    /// - Same configuration and the same preferred provider: adopt it, resuming
+    ///   it if it was parked.
+    /// - Same configuration but this pool has too few providers to use it:
+    ///   park it here, so the preferred provider returning later resumes it.
+    ///   This is the common case of an autoscaler disabling and re-enabling a
+    ///   self-hosted preferred provider.
+    /// - Anything else changed what the controller learned about: retire it.
+    fn adopt_aimd(&mut self, old: &ProviderPool) {
+        let candidate = old
+            .controller
+            .as_ref()
+            .zip(old.providers.first())
+            .map(|(controller, preferred)| ParkedController {
+                controller: controller.clone(),
+                preferred: preferred.target.clone(),
+                first_token_timeout_ms: old
+                    .fallback
+                    .as_ref()
+                    .and_then(|f| f.first_token_timeout_ms),
+            })
+            .or_else(|| old.parked.clone());
+        let Some(candidate) = candidate else {
+            return;
+        };
+        let compatible = configured_aimd(self.fallback.as_ref(), self.strategy)
+            .is_some_and(|config| *candidate.controller.lock().unwrap().config() == config)
+            && candidate.first_token_timeout_ms
+                == self
+                    .fallback
+                    .as_ref()
+                    .and_then(|f| f.first_token_timeout_ms);
+        let same_preferred = self.providers.first().is_some_and(|p| {
+            provider_identity(&p.target) == provider_identity(&candidate.preferred)
+        });
+        match (self.controller.is_some(), compatible, same_preferred) {
+            (true, true, true) => {
+                candidate.controller.lock().unwrap().resume();
+                self.controller = Some(candidate.controller);
+            }
+            (false, true, _) => {
+                candidate.controller.lock().unwrap().park();
+                self.parked = Some(candidate);
+            }
+            _ => candidate.controller.lock().unwrap().retire(),
+        }
     }
 
     pub(crate) fn select_iter_aimd(
@@ -201,13 +283,18 @@ impl ProviderPool {
     ) -> SelectIter<'_> {
         let mut iter = self.select_iter();
         if eligible && let Some(controller) = &self.controller {
-            let controller = controller.lock().unwrap();
+            let mut controller = controller.lock().unwrap();
             if !controller.active() {
                 return iter;
             }
-            let share = controller.share();
-            metrics::gauge!("onwards_provider_share", "model" => model.to_string(), "pool" => pool.to_string()).set(share);
-            iter.alternate_first = rand::rng().random::<f64>() >= share;
+            controller.remember_labels(model, pool);
+            // Idle recovery runs on the request path, so a pool that sees
+            // traffic but too little to judge still climbs back to full share.
+            if let Some(direction) = controller.tick(Instant::now()) {
+                metrics::counter!("onwards_share_adjustments_total", "model" => model.to_string(), "pool" => pool.to_string(), "direction" => direction).increment(1);
+            }
+            controller.publish();
+            iter.alternate_first = rand::rng().random::<f64>() >= controller.share();
         }
         iter
     }
@@ -381,6 +468,14 @@ impl ProviderPool {
             .is_some_and(|f| f.should_fallback_on_status(status_code))
     }
 
+    /// Check if a status code should trigger fallback for a realtime request,
+    /// including the pool's realtime-only fallback statuses.
+    pub fn should_fallback_on_realtime_status(&self, status_code: u16) -> bool {
+        self.fallback
+            .as_ref()
+            .is_some_and(|f| f.should_fallback_on_realtime_status(status_code))
+    }
+
     /// Check if local rate limits should trigger fallback
     pub fn should_fallback_on_rate_limit(&self) -> bool {
         self.fallback
@@ -447,35 +542,7 @@ impl ProviderPool {
     /// Removed providers (not in the new pool) are simply dropped.
     /// The pool-level concurrency limiter is also preserved if present in both.
     pub fn adopt_provider_state(&mut self, old: &ProviderPool) {
-        let same_preferred = self
-            .providers
-            .first()
-            .zip(old.providers.first())
-            .is_some_and(|(a, b)| {
-                a.target.url == b.target.url
-                    && a.target.onwards_key == b.target.onwards_key
-                    && a.target.onwards_model == b.target.onwards_model
-            });
-        let same_config = self
-            .fallback
-            .as_ref()
-            .and_then(|f| f.aimd.clone())
-            .unwrap_or_default()
-            == old
-                .fallback
-                .as_ref()
-                .and_then(|f| f.aimd.clone())
-                .unwrap_or_default()
-            && self
-                .fallback
-                .as_ref()
-                .and_then(|f| f.first_token_timeout_ms)
-                == old.fallback.as_ref().and_then(|f| f.first_token_timeout_ms);
-        if self.controller.is_some() && old.controller.is_some() && same_preferred && same_config {
-            self.controller = old.controller.clone();
-        } else {
-            old.retire_aimd();
-        }
+        self.adopt_aimd(old);
         for new_provider in &mut self.providers {
             if let Some(old_provider) = old.providers.iter().find(|old_p| {
                 old_p.target.url == new_provider.target.url
@@ -575,34 +642,42 @@ mod tests {
         Target::builder().url(url.parse().unwrap()).build()
     }
 
-    fn aimd_pool() -> ProviderPool {
-        let config = crate::aimd::AimdConfig {
-            enabled: true,
+    fn aimd_test_config() -> crate::aimd::AimdConfig {
+        crate::aimd::AimdConfig {
             latency_budget_ms: 100,
             breach_rate_target: 0.2,
+            recovery_breach_rate: 0.1,
             window_samples: 10,
             min_samples: 2,
             share_step: 0.1,
             share_decay: 0.5,
             share_floor: 0.1,
             dwell_ms: 1,
-        };
+            ..crate::aimd::AimdConfig::default()
+        }
+    }
+
+    fn aimd_pool_from(urls: &[&str], aimd: Option<crate::aimd::AimdConfig>) -> ProviderPool {
+        let providers = urls
+            .iter()
+            .enumerate()
+            .map(|(index, url)| {
+                if index == 1 {
+                    Provider::with_concurrency_limit(create_test_target(url), 1, 1)
+                } else {
+                    Provider::new(create_test_target(url), 1)
+                }
+            })
+            .collect();
         ProviderPool::with_config(
-            vec![
-                Provider::new(create_test_target("https://preferred.example"), 1),
-                Provider::with_concurrency_limit(
-                    create_test_target("https://alternate.example"),
-                    1,
-                    1,
-                ),
-            ],
+            providers,
             None,
             None,
             None,
             Some(FallbackConfig {
                 enabled: true,
                 first_token_timeout_ms: Some(0),
-                aimd: Some(config),
+                aimd,
                 max_attempts: Some(4),
                 ..Default::default()
             }),
@@ -610,6 +685,92 @@ mod tests {
             false,
             vec![],
         )
+    }
+
+    fn aimd_pool() -> ProviderPool {
+        aimd_pool_from(
+            &["https://preferred.example", "https://alternate.example"],
+            Some(aimd_test_config()),
+        )
+    }
+
+    /// Drive the pool's controller down one step with overload breaches.
+    fn demote(pool: &ProviderPool) {
+        let controller = pool.controller.as_ref().unwrap();
+        for _ in 0..2 {
+            Observation::new(controller.clone(), "model", "default", Instant::now())
+                .unwrap()
+                .status(529);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aimd_parks_while_the_preferred_provider_is_disabled_and_resumes_on_return() {
+        let active = aimd_pool();
+        tokio::time::advance(std::time::Duration::from_millis(5)).await;
+        demote(&active);
+        let share = active.controller.as_ref().unwrap().lock().unwrap().share();
+        assert!((share - 0.5).abs() < 1e-9);
+
+        // The preferred provider is disabled: only the alternate remains.
+        let mut single = aimd_pool_from(&["https://alternate.example"], Some(aimd_test_config()));
+        single.adopt_provider_state(&active);
+        assert!(!single.aimd_enabled());
+        let parked = single.parked.as_ref().unwrap().controller.clone();
+        assert!(!parked.lock().unwrap().active());
+
+        // Further reloads while it is still disabled carry the parked controller.
+        let mut still_single =
+            aimd_pool_from(&["https://alternate.example"], Some(aimd_test_config()));
+        still_single.adopt_provider_state(&single);
+        assert!(Arc::ptr_eq(
+            &still_single.parked.as_ref().unwrap().controller,
+            &parked
+        ));
+
+        // The same preferred provider returns: resume with the learned share.
+        let mut restored = aimd_pool();
+        restored.adopt_provider_state(&still_single);
+        let resumed = restored.controller.as_ref().unwrap();
+        assert!(Arc::ptr_eq(resumed, &parked));
+        assert!(resumed.lock().unwrap().active());
+        assert!((resumed.lock().unwrap().share() - 0.5).abs() < 1e-9);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aimd_parked_controller_is_retired_when_a_different_preferred_returns() {
+        let active = aimd_pool();
+        let mut single = aimd_pool_from(&["https://alternate.example"], Some(aimd_test_config()));
+        single.adopt_provider_state(&active);
+        let parked = single.parked.as_ref().unwrap().controller.clone();
+
+        let mut different = aimd_pool_from(
+            &["https://other.example", "https://alternate.example"],
+            Some(aimd_test_config()),
+        );
+        different.adopt_provider_state(&single);
+        assert!(!Arc::ptr_eq(
+            different.controller.as_ref().unwrap(),
+            &parked
+        ));
+        assert!(!parked.lock().unwrap().active());
+        assert!(!parked.lock().unwrap().resume(), "retired, not parked");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn aimd_opt_out_retires_rather_than_parks() {
+        let active = aimd_pool();
+        let controller = active.controller.clone().unwrap();
+        let mut disabled = aimd_pool_from(
+            &["https://alternate.example"],
+            Some(crate::aimd::AimdConfig {
+                enabled: false,
+                ..aimd_test_config()
+            }),
+        );
+        disabled.adopt_provider_state(&active);
+        assert!(disabled.parked.is_none());
+        assert!(!controller.lock().unwrap().resume(), "retired, not parked");
     }
 
     #[test]
@@ -686,10 +847,9 @@ mod tests {
 
     #[test]
     fn aimd_reload_preserves_inherited_and_explicit_default_equivalence() {
-        let mut old = aimd_pool();
-        old.fallback.as_mut().unwrap().aimd = None;
-        let mut new = old.clone();
-        new.fallback.as_mut().unwrap().aimd = Some(crate::aimd::AimdConfig::default());
+        let urls = ["https://preferred.example", "https://alternate.example"];
+        let old = aimd_pool_from(&urls, None);
+        let mut new = aimd_pool_from(&urls, Some(crate::aimd::AimdConfig::default()));
         new.adopt_provider_state(&old);
         assert!(Arc::ptr_eq(
             new.controller.as_ref().unwrap(),

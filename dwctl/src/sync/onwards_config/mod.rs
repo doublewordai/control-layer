@@ -77,6 +77,7 @@ struct OnwardsTarget {
     fallback_enabled: bool,
     fallback_on_rate_limit: bool,
     fallback_on_status: Vec<i32>,
+    fallback_realtime_on_status: Vec<i32>,
     fallback_with_replacement: bool,
     fallback_max_attempts: Option<i32>,
     backoff_enabled: bool,
@@ -491,6 +492,7 @@ struct OnwardsCompositeModel {
     fallback_on_rate_limit: bool,
     /// HTTP status codes that trigger fallback
     fallback_on_status: Vec<i32>,
+    fallback_realtime_on_status: Vec<i32>,
     /// Sample with replacement during weighted random failover
     fallback_with_replacement: bool,
     /// Maximum number of failover attempts
@@ -715,6 +717,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             fallback_enabled,
             fallback_on_rate_limit,
             fallback_on_status,
+            fallback_realtime_on_status,
             fallback_with_replacement,
             fallback_max_attempts,
             backoff_enabled,
@@ -756,6 +759,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
                 fallback_on_status: row.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
+                fallback_realtime_on_status: row.fallback_realtime_on_status,
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 backoff_enabled: row.backoff_enabled,
@@ -813,6 +817,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     fallback_enabled: false,
                     fallback_on_rate_limit: false,
                     fallback_on_status: Vec::new(),
+                    fallback_realtime_on_status: Vec::new(),
                     fallback_with_replacement: false,
                     fallback_max_attempts: None,
                     backoff_enabled: false,
@@ -962,6 +967,7 @@ fn convert_composite_to_target_spec(
             on_rate_limit: composite.fallback_on_rate_limit,
             // Convert i32 status codes to u16 for onwards
             on_status: composite.fallback_on_status.iter().map(|&s| s as u16).collect(),
+            realtime_on_status: composite.fallback_realtime_on_status.iter().map(|&s| s as u16).collect(),
             with_replacement: composite.fallback_with_replacement,
             max_attempts: composite
                 .fallback_max_attempts
@@ -1274,6 +1280,7 @@ fn convert_to_config_file(
                     enabled: true,
                     on_rate_limit: target.fallback_on_rate_limit,
                     on_status: target.fallback_on_status.iter().map(|&s| s as u16).collect(),
+                    realtime_on_status: target.fallback_realtime_on_status.iter().map(|&s| s as u16).collect(),
                     with_replacement: target.fallback_with_replacement,
                     max_attempts: target
                         .fallback_max_attempts
@@ -1377,6 +1384,7 @@ pub async fn load_targets_from_db(
             dm.fallback_enabled,
             dm.fallback_on_rate_limit,
             dm.fallback_on_status,
+            dm.fallback_realtime_on_status,
             dm.fallback_with_replacement,
             dm.fallback_max_attempts,
             dm.backoff_enabled,
@@ -1534,6 +1542,7 @@ pub async fn load_targets_from_db(
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
                 fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
+                fallback_realtime_on_status: row.fallback_realtime_on_status.clone(),
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 backoff_enabled: row.backoff_enabled,

@@ -318,6 +318,11 @@ pub struct CompositeModelCreate {
     /// which defaults to true.
     #[serde(default = "default_fallback_statuses")]
     pub fallback_on_status: Vec<i32>,
+    /// Extra HTTP status codes that trigger fallback for realtime traffic only
+    /// (defaults to [529], so realtime requests reroute when a provider sheds
+    /// load). Batch, flex and background requests run their own retries.
+    #[serde(default = "default_realtime_fallback_statuses")]
+    pub fallback_realtime_on_status: Vec<i32>,
     /// Sample with replacement during weighted random failover (defaults to false)
     #[serde(default)]
     pub fallback_with_replacement: bool,
@@ -379,6 +384,10 @@ fn default_fallback_statuses() -> Vec<i32> {
     vec![499, 500, 502, 503, 504]
 }
 
+fn default_realtime_fallback_statuses() -> Vec<i32> {
+    vec![529]
+}
+
 fn default_backoff_initial_ms() -> i32 {
     100
 }
@@ -434,6 +443,9 @@ pub struct DeployedModelUpdate {
     /// HTTP status codes that trigger fallback (null = no change)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_on_status: Option<Vec<i32>>,
+    /// Extra HTTP status codes that trigger fallback for realtime traffic only (null = no change)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_realtime_on_status: Option<Vec<i32>>,
     /// Sample with replacement during weighted random failover (null = no change)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_with_replacement: Option<bool>,
@@ -625,6 +637,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             enabled: db.fallback_enabled,
             on_rate_limit: db.fallback_on_rate_limit,
             on_status: db.fallback_on_status,
+            realtime_on_status: db.fallback_realtime_on_status,
             with_replacement: db.fallback_with_replacement,
             max_attempts: db.fallback_max_attempts,
             backoff,

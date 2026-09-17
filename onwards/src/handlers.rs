@@ -791,6 +791,14 @@ pub async fn target_message_handler<T: HttpClient>(
     // headers only arrive once the whole completion is done, so a deadline
     // would cut off legitimately long answers. So is traffic carrying the
     // configured exempt header (e.g. batch dispatch, which runs its own retries).
+    // Realtime traffic is everything the batch dispatcher did not stamp with
+    // the exempt header. Only realtime gets the first-token deadline, AIMD
+    // observation and the realtime-only fallback statuses: dispatched traffic
+    // tolerates latency and runs its own retries.
+    let is_realtime = !state
+        .first_token_timeout_exempt_header
+        .as_deref()
+        .is_some_and(|header| original_headers.contains_key(header));
     let first_token_timeout = pool
         .fallback()
         .filter(|f| f.enabled)
@@ -800,20 +808,23 @@ pub async fn target_message_handler<T: HttpClient>(
                 .or(state.first_token_timeout)
         })
         .filter(|timeout| {
-            !timeout.is_zero()
-                && pool.len() > 1
-                && !state
-                    .first_token_timeout_exempt_header
-                    .as_deref()
-                    .is_some_and(|header| original_headers.contains_key(header))
-                && requests_stream(&body_bytes)
+            !timeout.is_zero() && pool.len() > 1 && is_realtime && requests_stream(&body_bytes)
         });
+    // A status triggers failover when the pool lists it, or when it is one of
+    // the pool's realtime-only fallback statuses and this request is realtime.
+    let fails_over_on = |status: u16| {
+        if is_realtime {
+            pool.should_fallback_on_realtime_status(status)
+        } else {
+            pool.should_fallback_on_status(status)
+        }
+    };
 
     // Unsupported traffic keeps ordinary routing and contributes no observations.
     let aimd_eligible = pool.aimd_enabled()
-        && state.targets.strict_mode && requests_stream(&body_bytes)
-        && !state.first_token_timeout_exempt_header.as_deref()
-            .is_some_and(|header| original_headers.contains_key(header));
+        && state.targets.strict_mode
+        && requests_stream(&body_bytes)
+        && is_realtime;
     for (member_idx, target, connection_guard) in pool.select_iter_aimd(aimd_eligible, &model_name, resolved_pool_name.unwrap_or("default")) {
         any_attempted = true;
         attempt_number += 1;
@@ -1169,9 +1180,17 @@ pub async fn target_message_handler<T: HttpClient>(
         last_upstream_status = Some(status);
         upstream_span.record("http.response.status_code", status);
         tracing::Span::current().record("http.response.status_code", status);
+        // An error status settles the attempt's observation now: overload
+        // statuses are breaches, anything else is unknown. Left to drop, an
+        // error would only ever read as unknown.
+        if !(200..300).contains(&status)
+            && let Some(observation) = &observation
+        {
+            observation.status(status);
+        }
 
         // Check if we should fallback based on status code
-        if pool.should_fallback_on_status(status) {
+        if fails_over_on(status) {
             debug!(
                 "Provider returned fallback status {}, trying next: {:?}",
                 status, target.url
@@ -1329,8 +1348,13 @@ pub async fn target_message_handler<T: HttpClient>(
                     };
                     if matches!(kind, SseEventKind::Comment) { return; }
                     if let Some(observation) = stream_observation.take() {
-                        if matches!(kind, SseEventKind::Data) { observation.frame(); }
-                        else { observation.unknown(); }
+                        match kind {
+                            SseEventKind::Data => observation.frame(),
+                            // An error status embedded in a 2xx stream is judged
+                            // like the same status on the response line.
+                            SseEventKind::Error(status, _) => observation.status(status),
+                            _ => observation.unknown(),
+                        }
                     }
                 });
                 let mut peeked = Vec::new();
@@ -1480,7 +1504,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 // purposes, so it overrides the 200 recorded above.
                 last_upstream_status = Some(embedded);
 
-                let retryable = pool.should_fallback_on_status(embedded)
+                let retryable = fails_over_on(embedded)
                     || (embedded == 429 && pool.should_fallback_on_rate_limit());
                 if retryable {
                     tracing::Span::current().record("onwards.fallback", "embedded_error");

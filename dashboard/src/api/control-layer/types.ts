@@ -61,6 +61,8 @@ export interface FallbackConfig {
   enabled: boolean;
   on_rate_limit: boolean;
   on_status: number[];
+  /** Extra statuses that fail over realtime traffic only; batch traffic runs its own retries. */
+  realtime_on_status?: number[];
   with_replacement: boolean;
   max_attempts: number | null;
   /** Inter-attempt exponential backoff. `null` (or omitted) = no delay between retries. */
@@ -379,6 +381,7 @@ export interface VirtualModelCreate {
   fallback_enabled?: boolean;
   fallback_on_rate_limit?: boolean;
   fallback_on_status?: number[];
+  fallback_realtime_on_status?: number[];
   fallback_with_replacement?: boolean;
   fallback_max_attempts?: number | null;
   /** Inter-attempt backoff toggle; defaults to false (legacy zero-delay retry). */
@@ -658,6 +661,7 @@ export interface ModelUpdateRequest {
   fallback_enabled?: boolean | null;
   fallback_on_rate_limit?: boolean | null;
   fallback_on_status?: number[] | null;
+  fallback_realtime_on_status?: number[] | null;
   fallback_with_replacement?: boolean | null;
   fallback_max_attempts?: number | null;
   /** Inter-attempt backoff toggle. `null` (or omitted) = no change. */
