@@ -1205,6 +1205,12 @@ pub struct OnwardsConfig {
     /// traffic (batch, flex, background) is exempt. Default: 10000. Set to 0 to
     /// disable.
     pub first_token_timeout_ms: u64,
+    /// Upstream statuses that fail a realtime request over to the model's next
+    /// provider, in addition to each model's own fallback statuses. Fusillade
+    /// daemon traffic (batch, flex, background) is never affected: it runs its
+    /// own retries. Default: [529], so a self-hosted provider shedding load
+    /// reroutes realtime traffic instead of returning the rejection.
+    pub realtime_fallback_on_status: Vec<u16>,
 }
 
 impl Default for OnwardsConfig {
@@ -1212,6 +1218,7 @@ impl Default for OnwardsConfig {
         Self {
             strict_mode: false,
             first_token_timeout_ms: 10_000,
+            realtime_fallback_on_status: vec![529],
         }
     }
 }

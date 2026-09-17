@@ -344,13 +344,20 @@ fn default_fallback_status_codes() -> Vec<i32> {
 pub struct AimdConfig {
     pub enabled: bool,
     pub latency_budget_ms: u64,
+    /// Decrease the preferred-first share when the breach rate exceeds this.
     pub breach_rate_target: f64,
+    /// Increase the share only while the breach rate is at or below this.
+    pub recovery_breach_rate: f64,
     pub window_samples: usize,
     pub min_samples: usize,
     pub share_step: f64,
     pub share_decay: f64,
     pub share_floor: f64,
     pub dwell_ms: u64,
+    /// Step the share up after this long without enough samples; 0 disables.
+    pub idle_recovery_ms: u64,
+    /// Upstream error statuses from the preferred provider counted as breaches.
+    pub overload_statuses: Vec<u16>,
 }
 impl From<AimdConfig> for OnwardsAimdConfig {
     fn from(c: AimdConfig) -> Self {
@@ -358,12 +365,15 @@ impl From<AimdConfig> for OnwardsAimdConfig {
             enabled: c.enabled,
             latency_budget_ms: c.latency_budget_ms,
             breach_rate_target: c.breach_rate_target,
+            recovery_breach_rate: c.recovery_breach_rate,
             window_samples: c.window_samples,
             min_samples: c.min_samples,
             share_step: c.share_step,
             share_decay: c.share_decay,
             share_floor: c.share_floor,
             dwell_ms: c.dwell_ms,
+            idle_recovery_ms: c.idle_recovery_ms,
+            overload_statuses: c.overload_statuses,
         }
     }
 }
@@ -375,12 +385,15 @@ impl Default for AimdConfig {
             enabled: c.enabled,
             latency_budget_ms: c.latency_budget_ms,
             breach_rate_target: c.breach_rate_target,
+            recovery_breach_rate: c.recovery_breach_rate,
             window_samples: c.window_samples,
             min_samples: c.min_samples,
             share_step: c.share_step,
             share_decay: c.share_decay,
             share_floor: c.share_floor,
             dwell_ms: c.dwell_ms,
+            idle_recovery_ms: c.idle_recovery_ms,
+            overload_statuses: c.overload_statuses,
         }
     }
 }

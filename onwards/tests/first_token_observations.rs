@@ -677,12 +677,16 @@ async fn default_controller_handles_slow_frames_without_explicit_enablement() {
     let mut cfg = config(alias, true);
     cfg["targets"][alias]["fallback"]["first_token_timeout_ms"] = json!(0);
     let targets = Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap();
+    // Default thresholds: 20 samples above the 10% breach target, and the
+    // 30s dwell has long passed after 20 slow frames. Stop at the first
+    // decrease: past it, a share below 1.0 routes a random fraction of
+    // requests to the alternate first.
     let mock = MockHttpClient::new_delayed_streaming_sequence(
         StatusCode::OK,
-        vec![(Duration::from_secs(11), vec![CONTENT.to_string()]); 50],
+        vec![(Duration::from_secs(11), vec![CONTENT.to_string()]); 20],
     );
     let server = TestServer::new(build_router(AppState::with_client(targets, mock))).unwrap();
-    for _ in 0..50 {
+    for _ in 0..20 {
         server
             .post("/v1/chat/completions")
             .json(&json!({"model":alias,"stream":true}))
@@ -690,4 +694,168 @@ async fn default_controller_handles_slow_frames_without_explicit_enablement() {
             .assert_status_ok();
     }
     assert_eq!(share(alias), Some(0.8));
+}
+
+/// The preferred provider answers with the scripted `(status, header delay)`
+/// responses in call order (the last repeats); every other host streams
+/// content immediately.
+#[derive(Debug, Clone)]
+struct ScriptedClient {
+    preferred: std::sync::Arc<Vec<(StatusCode, Duration)>>,
+    calls: std::sync::Arc<std::sync::Mutex<HashMap<String, usize>>>,
+}
+
+impl ScriptedClient {
+    fn new(preferred: Vec<(StatusCode, Duration)>) -> Self {
+        Self {
+            preferred: std::sync::Arc::new(preferred),
+            calls: Default::default(),
+        }
+    }
+
+    fn calls(&self, host: &str) -> usize {
+        self.calls.lock().unwrap().get(host).copied().unwrap_or(0)
+    }
+}
+
+#[async_trait::async_trait]
+impl onwards::client::HttpClient for ScriptedClient {
+    async fn request(
+        &self,
+        req: axum::extract::Request,
+    ) -> Result<axum::response::Response, Box<dyn std::error::Error + Send + Sync>> {
+        let host = req.uri().host().unwrap_or_default().to_string();
+        let index = {
+            let mut calls = self.calls.lock().unwrap();
+            let count = calls.entry(host.clone()).or_default();
+            *count += 1;
+            *count - 1
+        };
+        let (status, delay) = if host == "preferred.example.com" {
+            self.preferred[index.min(self.preferred.len() - 1)]
+        } else {
+            (StatusCode::OK, Duration::ZERO)
+        };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let response = if status.is_success() {
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "text/event-stream")
+                .body(axum::body::Body::from(CONTENT))
+        } else {
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    "{\"error\":{\"message\":\"service over capacity\"}}",
+                ))
+        };
+        Ok(response.unwrap())
+    }
+}
+
+fn aimd_scripted_server(
+    alias: &str,
+    client: ScriptedClient,
+    first_token_timeout_ms: u64,
+) -> TestServer {
+    let mut cfg = config(alias, true);
+    cfg["targets"][alias]["fallback"]["aimd"] = aimd_config();
+    cfg["targets"][alias]["fallback"]["first_token_timeout_ms"] = json!(first_token_timeout_ms);
+    let targets = Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap();
+    let state = AppState::with_client(targets, client)
+        .with_first_token_timeout_exempt_header("x-batch")
+        .with_realtime_fallback_statuses([529]);
+    TestServer::new(build_router(state)).unwrap()
+}
+
+#[tokio::test]
+async fn realtime_fallback_statuses_reroute_realtime_but_not_dispatched_traffic() {
+    LazyLock::force(&METRICS);
+    let client = ScriptedClient::new(vec![(StatusCode::from_u16(529).unwrap(), Duration::ZERO)]);
+    let server = aimd_scripted_server("realtime-529", client.clone(), 100);
+
+    // Realtime: 529 is not in the pool's on_status, but it is a realtime
+    // fallback status, so the request is rerouted and succeeds.
+    let realtime = server
+        .post("/v1/chat/completions")
+        .json(&json!({"model":"realtime-529","stream":true}))
+        .await;
+    realtime.assert_status_ok();
+    assert_eq!(client.calls("preferred.example.com"), 1);
+    assert_eq!(client.calls("alternate.example.com"), 1);
+
+    // Dispatched: the same 529 is returned to the dispatcher, which retries
+    // on its own terms.
+    let dispatched = server
+        .post("/v1/chat/completions")
+        .add_header("x-batch", "true")
+        .json(&json!({"model":"realtime-529","stream":true}))
+        .await;
+    assert_eq!(dispatched.status_code().as_u16(), 529);
+    assert_eq!(client.calls("preferred.example.com"), 2);
+    assert_eq!(client.calls("alternate.example.com"), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn aimd_counts_preferred_overload_statuses_as_breaches() {
+    LazyLock::force(&METRICS);
+    let alias = "aimd-overload-status";
+    let client = ScriptedClient::new(vec![(StatusCode::from_u16(529).unwrap(), Duration::ZERO)]);
+    let server = aimd_scripted_server(alias, client.clone(), 100);
+    // Let the dwell since the controller's creation elapse.
+    tokio::time::advance(Duration::from_millis(5)).await;
+    for _ in 0..2 {
+        server
+            .post("/v1/chat/completions")
+            .json(&json!({"model":alias,"stream":true}))
+            .await
+            .assert_status_ok();
+    }
+    assert_eq!(share(alias), Some(0.5));
+    let overload_breaches = METRICS
+        .render()
+        .lines()
+        .find(|line| {
+            line.starts_with("onwards_aimd_overload_breaches_total{")
+                && line.contains(&format!("model=\"{alias}\""))
+                && line.contains("status=\"529\"")
+        })
+        .map(|line| {
+            line.split_whitespace()
+                .last()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap()
+        });
+    assert_eq!(overload_breaches, Some(2.0));
+}
+
+#[tokio::test(start_paused = true)]
+async fn aimd_unknown_outcomes_no_longer_block_later_decisions() {
+    LazyLock::force(&METRICS);
+    let alias = "aimd-unknown-then-slow";
+    // A non-overload error (unknown), then two slow first frames (breaches:
+    // the test budget is 10ms). An unknown used to veto every decision until
+    // it aged out of the window.
+    let client = ScriptedClient::new(vec![
+        (StatusCode::INTERNAL_SERVER_ERROR, Duration::ZERO),
+        (StatusCode::OK, Duration::from_millis(20)),
+    ]);
+    let server = aimd_scripted_server(alias, client, 0);
+    let error = server
+        .post("/v1/chat/completions")
+        .json(&json!({"model":alias,"stream":true}))
+        .await;
+    assert!(!error.status_code().is_success());
+    for _ in 0..2 {
+        server
+            .post("/v1/chat/completions")
+            .json(&json!({"model":alias,"stream":true}))
+            .await
+            .assert_status_ok();
+    }
+    assert_eq!(share(alias), Some(0.5));
 }

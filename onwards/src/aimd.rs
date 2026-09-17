@@ -1,4 +1,24 @@
 //! Per-process, priority-pool preferred-first share control.
+//!
+//! A pool's controller holds a share `f`: the probability that an eligible
+//! request tries the preferred provider (the first in definition order) first.
+//! It watches completed first-token outcomes of preferred attempts and moves
+//! `f` with additive increase / multiplicative decrease:
+//!
+//! - **Decrease** when the window's breach rate exceeds `breach_rate_target`.
+//! - **Increase** once the breach rate has stayed at or below
+//!   `recovery_breach_rate` for a dwell. Rates in between hold the share, so
+//!   noise around a single threshold cannot make it hunt.
+//! - **Idle recovery** steps the share up when a pool goes `idle_recovery_ms`
+//!   without enough samples to judge, so a low-traffic pool is not left
+//!   degraded indefinitely after an incident.
+//!
+//! Decisions use completed samples only. Unknown outcomes (cancelled attempts,
+//! non-overload upstream errors, censored short deadlines) are excluded from
+//! the rate rather than blocking decisions, and in-flight attempts never hold a
+//! decision back: under sustained concurrency something is always in flight.
+//! Upstream statuses listed in `overload_statuses` count as breaches, because
+//! a provider shedding load is the strongest overload signal there is.
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,14 +31,34 @@ use tokio::time::Instant;
 #[serde(default, deny_unknown_fields)]
 pub struct AimdConfig {
     pub enabled: bool,
+    /// First-frame latency, in milliseconds, beyond which an attempt breaches.
     pub latency_budget_ms: u64,
+    /// Decrease the share when the window's breach rate exceeds this.
     pub breach_rate_target: f64,
+    /// Increase the share only while the breach rate is at or below this.
+    /// Rates between this and `breach_rate_target` hold the share steady.
+    pub recovery_breach_rate: f64,
+    /// Completed samples kept for the rate.
     pub window_samples: usize,
+    /// Completed samples required before any latency-driven decision.
     pub min_samples: usize,
+    /// Additive increase per recovery step.
     pub share_step: f64,
+    /// Multiplicative decrease on overload.
     pub share_decay: f64,
+    /// The share never drops below this, so real traffic keeps measuring the
+    /// preferred provider and recovery needs no synthetic probes.
     pub share_floor: f64,
+    /// Minimum interval between adjustments, and how long a healthy rate must
+    /// hold before an increase.
     pub dwell_ms: u64,
+    /// Step the share up after this long without enough samples to judge.
+    /// `0` disables idle recovery.
+    pub idle_recovery_ms: u64,
+    /// Upstream error statuses from the preferred provider that count as
+    /// breaches (e.g. over-capacity or rate-limited). Other error statuses are
+    /// unknown outcomes.
+    pub overload_statuses: Vec<u16>,
 }
 
 impl Default for AimdConfig {
@@ -26,13 +66,16 @@ impl Default for AimdConfig {
         Self {
             enabled: true,
             latency_budget_ms: 10_000,
-            breach_rate_target: 0.05,
-            window_samples: 200,
-            min_samples: 50,
-            share_step: 0.02,
+            breach_rate_target: 0.10,
+            recovery_breach_rate: 0.03,
+            window_samples: 100,
+            min_samples: 20,
+            share_step: 0.05,
             share_decay: 0.8,
             share_floor: 0.05,
             dwell_ms: 30_000,
+            idle_recovery_ms: 300_000,
+            overload_statuses: vec![429, 503, 529],
         }
     }
 }
@@ -45,6 +88,9 @@ impl AimdConfig {
             || self.dwell_ms > 86_400_000
         {
             return Err("AIMD budget must be 1..=3600000 ms and dwell 1..=86400000 ms");
+        }
+        if self.idle_recovery_ms > 86_400_000 {
+            return Err("AIMD idle_recovery_ms must be at most 86400000 (0 disables it)");
         }
         if self.min_samples < 2
             || self.min_samples > self.window_samples
@@ -66,162 +112,253 @@ impl AimdConfig {
         {
             return Err("AIMD requires target in [0,1), decay in (0,1), and step/floor in (0,1]");
         }
+        if !self.recovery_breach_rate.is_finite()
+            || self.recovery_breach_rate < 0.0
+            || self.recovery_breach_rate > self.breach_rate_target
+        {
+            return Err("AIMD requires 0 <= recovery_breach_rate <= breach_rate_target");
+        }
+        if self.overload_statuses.len() > 32
+            || self
+                .overload_statuses
+                .iter()
+                .any(|status| !(400..=599).contains(status))
+        {
+            return Err("AIMD overload_statuses must be at most 32 HTTP error statuses (400-599)");
+        }
         Ok(())
     }
 }
 
-/// Unknown and unfinished attempts stay in the start-ordered window. They
-/// inhibit adjustment until displaced, rather than biasing the rate downward.
+/// How one preferred attempt ended, as far as the controller is concerned.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Outcome {
     Healthy,
     Breach,
+    /// Excluded from the rate: says nothing about the provider's capacity.
     Unknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum State {
+    Active,
+    /// Kept across reloads while the pool is temporarily ineligible (for
+    /// example its preferred provider was disabled), so it can resume if the
+    /// same preferred provider returns.
+    Parked,
+    Retired,
 }
 
 #[derive(Debug)]
 pub(crate) struct Controller {
     config: AimdConfig,
-    active: bool,
+    state: State,
     share: f64,
+    /// Bumped on every decrease and on resume: attempts that started under an
+    /// older generation report on a share that no longer applies.
     generation: u64,
-    next_id: u64,
-    window: VecDeque<(u64, Option<Outcome>)>,
-    pending: usize,
-    unknown: usize,
+    /// Completed outcomes of the current generation; `true` is a breach.
+    window: VecDeque<bool>,
     breaches: usize,
+    /// Attempts begun and not yet finished, across generations. Observability
+    /// only: in-flight work never holds a decision back.
+    in_flight: usize,
     last_adjustment: Instant,
     healthy_since: Option<Instant>,
+    /// `(model, pool)` metric labels, learned from the request path so state
+    /// transitions made during reloads can still be published.
+    labels: Option<(String, String)>,
 }
 
 impl Controller {
     pub(crate) fn new(config: AimdConfig, now: Instant) -> Self {
         Self {
             config,
-            active: true,
+            state: State::Active,
             share: 1.0,
             generation: 0,
-            next_id: 0,
             window: VecDeque::new(),
-            pending: 0,
-            unknown: 0,
             breaches: 0,
+            in_flight: 0,
             last_adjustment: now,
             healthy_since: None,
+            labels: None,
         }
     }
+
+    pub(crate) fn config(&self) -> &AimdConfig {
+        &self.config
+    }
+
     pub(crate) fn share(&self) -> f64 {
         self.share
     }
-    pub(crate) fn retire(&mut self) {
-        self.active = false;
-    }
+
     pub(crate) fn active(&self) -> bool {
-        self.active
+        self.state == State::Active
     }
-    fn begin(&mut self) -> Option<(u64, u64)> {
-        if !self.active {
-            return None;
-        }
-        // Never evict an unfinished sample in favor of a newer, faster one.
-        // At capacity stop admitting samples until the cohort has resolved.
-        if self.window.len() == self.config.window_samples && self.pending > 0 {
-            return None;
-        }
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        self.window.push_back((id, None));
-        self.pending += 1;
-        if self.window.len() > self.config.window_samples
-            && let Some((_, Some(outcome))) = self.window.pop_front()
-        {
-            match outcome {
-                Outcome::Breach => self.breaches -= 1,
-                Outcome::Unknown => self.unknown -= 1,
-                Outcome::Healthy => {}
-            }
-        }
-        Some((self.generation, id))
+
+    /// Stop permanently: the pool's AIMD configuration or preferred provider
+    /// changed, so what this controller learned no longer applies.
+    pub(crate) fn retire(&mut self) {
+        self.state = State::Retired;
+        self.publish();
     }
-    fn finish(
-        &mut self,
-        generation: u64,
-        id: u64,
-        outcome: Outcome,
-        now: Instant,
-    ) -> Option<&'static str> {
-        if !self.active || generation != self.generation {
-            return None;
+
+    /// Stop while keeping the learned share, for a pool that is temporarily
+    /// ineligible. A retired controller stays retired.
+    pub(crate) fn park(&mut self) {
+        if self.state == State::Active {
+            self.state = State::Parked;
+            self.publish();
         }
-        let first_id = self.window.front()?.0;
-        let offset = usize::try_from(id.wrapping_sub(first_id)).ok()?;
-        let entry = self.window.get_mut(offset)?;
-        if entry.0 != id || entry.1.is_some() {
-            return None;
+    }
+
+    /// Resume a parked controller. The share is kept (and idle recovery
+    /// credits the time spent parked), but samples and in-flight attempts from
+    /// before parking are discarded. Returns whether the controller resumed.
+    pub(crate) fn resume(&mut self) -> bool {
+        if self.state != State::Parked {
+            return false;
         }
-        entry.1 = Some(outcome);
-        self.pending -= 1;
-        match outcome {
-            Outcome::Breach => self.breaches += 1,
-            Outcome::Unknown => self.unknown += 1,
-            Outcome::Healthy => {}
-        }
-        if self.unknown > 0 {
-            self.healthy_since = None;
-            return None;
-        }
-        // In-flight work is not evidence that the last healthy window became
-        // unhealthy. Block decisions while pending without restarting dwell
-        // on every completion of a concurrent cohort.
-        if self.window.len() < self.config.min_samples || self.pending > 0 {
-            return None;
-        }
-        let overloaded =
-            self.breaches as f64 / self.window.len() as f64 > self.config.breach_rate_target;
-        let dwell = Duration::from_millis(self.config.dwell_ms);
-        if overloaded {
-            self.healthy_since = None;
-        } else {
-            self.healthy_since.get_or_insert(now);
-        }
-        if now.duration_since(self.last_adjustment) < dwell {
-            return None;
-        }
-        let next = if overloaded {
-            (self.share * self.config.share_decay).max(self.config.share_floor)
-        } else if now.duration_since(self.healthy_since.unwrap()) >= dwell {
-            (self.share + self.config.share_step).min(1.0)
-        } else {
-            return None;
-        };
-        if next == self.share {
-            return None;
-        }
-        let direction = if next < self.share {
-            "decrease"
-        } else {
-            "increase"
-        };
-        self.share = next;
+        self.state = State::Active;
         self.generation = self.generation.wrapping_add(1);
         self.window.clear();
-        self.pending = 0;
-        self.unknown = 0;
         self.breaches = 0;
-        self.last_adjustment = now;
         self.healthy_since = None;
-        Some(direction)
+        true
+    }
+
+    pub(crate) fn remember_labels(&mut self, model: &str, pool: &str) {
+        if self.labels.is_none() {
+            self.labels = Some((model.to_string(), pool.to_string()));
+        }
+    }
+
+    fn begin(&mut self) -> Option<u64> {
+        if !self.active() {
+            return None;
+        }
+        self.in_flight += 1;
+        Some(self.generation)
+    }
+
+    /// Idle recovery: step the share up for each `idle_recovery_ms` elapsed
+    /// since the last adjustment while the window lacks enough samples to
+    /// judge. Returns `"increase"` when the share moved.
+    pub(crate) fn tick(&mut self, now: Instant) -> Option<&'static str> {
+        if !self.active()
+            || self.config.idle_recovery_ms == 0
+            || self.share >= 1.0
+            || self.window.len() >= self.config.min_samples
+        {
+            return None;
+        }
+        let interval = Duration::from_millis(self.config.idle_recovery_ms);
+        let elapsed = now.saturating_duration_since(self.last_adjustment);
+        let steps = u32::try_from(elapsed.as_millis() / interval.as_millis()).unwrap_or(u32::MAX);
+        if steps == 0 {
+            return None;
+        }
+        self.share = (self.share + self.config.share_step * f64::from(steps)).min(1.0);
+        self.last_adjustment += interval * steps;
+        self.healthy_since = None;
+        Some("increase")
+    }
+
+    fn finish(&mut self, generation: u64, outcome: Outcome, now: Instant) -> Option<&'static str> {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if !self.active() || generation != self.generation {
+            return None;
+        }
+        let breach = match outcome {
+            Outcome::Unknown => return None,
+            Outcome::Healthy => false,
+            Outcome::Breach => true,
+        };
+        self.window.push_back(breach);
+        self.breaches += usize::from(breach);
+        if self.window.len() > self.config.window_samples && self.window.pop_front() == Some(true) {
+            self.breaches -= 1;
+        }
+        self.decide(now)
+    }
+
+    fn decide(&mut self, now: Instant) -> Option<&'static str> {
+        let samples = self.window.len();
+        if samples < self.config.min_samples {
+            return None;
+        }
+        let rate = self.breaches as f64 / samples as f64;
+        let settled = now.saturating_duration_since(self.last_adjustment)
+            >= Duration::from_millis(self.config.dwell_ms);
+        if rate > self.config.breach_rate_target {
+            self.healthy_since = None;
+            let next = (self.share * self.config.share_decay).max(self.config.share_floor);
+            if !settled || next >= self.share {
+                return None;
+            }
+            self.share = next;
+            // Samples taken at the old share say nothing about the new one.
+            self.generation = self.generation.wrapping_add(1);
+            self.window.clear();
+            self.breaches = 0;
+            self.last_adjustment = now;
+            return Some("decrease");
+        }
+        if rate > self.config.recovery_breach_rate {
+            // Inside the hysteresis band: hold.
+            self.healthy_since = None;
+            return None;
+        }
+        let healthy_since = *self.healthy_since.get_or_insert(now);
+        if self.share >= 1.0
+            || !settled
+            || now.saturating_duration_since(healthy_since)
+                < Duration::from_millis(self.config.dwell_ms)
+        {
+            return None;
+        }
+        // Keep the window: a still-healthy window is evidence for the next
+        // step too, which is what makes recovery take minutes, not hours.
+        self.share = (self.share + self.config.share_step).min(1.0);
+        self.last_adjustment = now;
+        self.healthy_since = Some(now);
+        Some("increase")
+    }
+
+    /// Export the controller's state under its learned labels.
+    pub(crate) fn publish(&self) {
+        let Some((model, pool)) = &self.labels else {
+            return;
+        };
+        let samples = self.window.len();
+        let rate = if samples == 0 {
+            0.0
+        } else {
+            self.breaches as f64 / samples as f64
+        };
+        metrics::gauge!("onwards_provider_share", "model" => model.clone(), "pool" => pool.clone())
+            .set(self.share);
+        metrics::gauge!("onwards_aimd_active", "model" => model.clone(), "pool" => pool.clone())
+            .set(if self.active() { 1.0 } else { 0.0 });
+        metrics::gauge!("onwards_aimd_window_samples", "model" => model.clone(), "pool" => pool.clone())
+            .set(samples as f64);
+        metrics::gauge!("onwards_aimd_window_breach_rate", "model" => model.clone(), "pool" => pool.clone())
+            .set(rate);
+        metrics::gauge!("onwards_aimd_in_flight", "model" => model.clone(), "pool" => pool.clone())
+            .set(self.in_flight as f64);
     }
 }
 
 /// A single eligible preferred attempt. Clones share completion state so a
-/// timeout, a frame, and dropping the response cannot count the attempt twice.
+/// timeout, a frame, a status and dropping the response cannot count the
+/// attempt twice.
 #[derive(Clone)]
 pub(crate) struct Observation(Arc<Mutex<Attempt>>);
 struct Attempt {
     controller: Arc<Mutex<Controller>>,
     generation: u64,
-    id: u64,
     start: Instant,
     completed: bool,
     model: String,
@@ -234,11 +371,14 @@ impl Observation {
         pool: &str,
         start: Instant,
     ) -> Option<Self> {
-        let (generation, id) = controller.lock().unwrap().begin()?;
+        let generation = {
+            let mut guard = controller.lock().unwrap();
+            guard.remember_labels(model, pool);
+            guard.begin()?
+        };
         Some(Self(Arc::new(Mutex::new(Attempt {
             controller,
             generation,
-            id,
             start,
             completed: false,
             model: model.into(),
@@ -267,6 +407,33 @@ impl Observation {
         };
         attempt.finish(outcome);
     }
+    /// The preferred provider answered with an error status, either as the
+    /// HTTP status or embedded in a 2xx stream. Configured overload statuses
+    /// are breaches; any other error is unknown.
+    pub(crate) fn status(&self, status: u16) {
+        let mut attempt = self.0.lock().unwrap();
+        let overload = attempt
+            .controller
+            .lock()
+            .unwrap()
+            .config
+            .overload_statuses
+            .contains(&status);
+        if overload && !attempt.completed {
+            metrics::counter!(
+                "onwards_aimd_overload_breaches_total",
+                "model" => attempt.model.clone(),
+                "pool" => attempt.pool.clone(),
+                "status" => status.to_string(),
+            )
+            .increment(1);
+        }
+        attempt.finish(if overload {
+            Outcome::Breach
+        } else {
+            Outcome::Unknown
+        });
+    }
     pub(crate) fn unknown(&self) {
         self.0.lock().unwrap().finish(Outcome::Unknown);
     }
@@ -278,15 +445,19 @@ impl Attempt {
         }
         self.completed = true;
         let mut controller = self.controller.lock().unwrap();
-        if !controller.active() {
+        let was_active = controller.active();
+        let direction = controller.finish(self.generation, outcome, Instant::now());
+        if !was_active {
             return;
         }
-        if let Some(direction) =
-            controller.finish(self.generation, self.id, outcome, Instant::now())
-        {
+        if outcome == Outcome::Unknown {
+            metrics::counter!("onwards_aimd_unknown_total", "model" => self.model.clone(), "pool" => self.pool.clone())
+                .increment(1);
+        }
+        if let Some(direction) = direction {
             metrics::counter!("onwards_share_adjustments_total", "model" => self.model.clone(), "pool" => self.pool.clone(), "direction" => direction).increment(1);
         }
-        metrics::gauge!("onwards_provider_share", "model" => self.model.clone(), "pool" => self.pool.clone()).set(controller.share());
+        controller.publish();
     }
 }
 impl Drop for Attempt {
@@ -298,94 +469,281 @@ impl Drop for Attempt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     pub(super) fn config() -> AimdConfig {
         AimdConfig {
             enabled: true,
             latency_budget_ms: 100,
             breach_rate_target: 0.2,
+            recovery_breach_rate: 0.1,
             window_samples: 10,
             min_samples: 5,
             share_step: 0.1,
             share_decay: 0.5,
             share_floor: 0.1,
             dwell_ms: 1000,
+            idle_recovery_ms: 10_000,
+            overload_statuses: vec![429, 503, 529],
         }
     }
+
     fn sample(c: &mut Controller, outcome: Outcome, now: Instant) -> Option<&'static str> {
-        let (generation, id) = c.begin().unwrap();
-        c.finish(generation, id, outcome, now)
+        let generation = c.begin().unwrap();
+        c.finish(generation, outcome, now)
     }
+
+    fn at(start: Instant, millis: u64) -> Instant {
+        start + Duration::from_millis(millis)
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
     #[test]
     fn retired_controller_rejects_pending_and_new_observations() {
         let start = Instant::now();
-        let mut controller = Controller::new(AimdConfig::default(), start);
-        let (generation, id) = controller.begin().unwrap();
-        controller.retire();
-        assert_eq!(
-            controller.finish(generation, id, Outcome::Breach, start),
-            None
-        );
-        assert_eq!(controller.breaches, 0);
-        assert_eq!(controller.begin(), None);
-    }
-
-    // Synthetic per-replica scenarios exercise low/high breach rates, sparse
-    // traffic, and bounded healthy windows. Successful frames are within budget.
-    #[test]
-    fn synthetic_count_scenarios_are_evaluated_per_replica() {
-        for (healthy, breaches, expected) in [
-            (800, 12, 1.0),
-            (850, 17, 1.0), // below 5% in each window
-            (90, 22, 0.64),
-            (90, 19, 0.64), // two fresh 50-sample windows
-            (8, 3, 1.0),
-            (11, 4, 1.0), // insufficient local samples
-            (14000, 0, 1.0),
-            (15000, 0, 1.0),
-            (0, 0, 1.0),
-        ] {
-            let start = Instant::now();
-            let mut controller = Controller::new(AimdConfig::default(), start);
-            let total = healthy + breaches;
-            for index in 0..total {
-                let breach = (index + 1) * breaches / total > index * breaches / total;
-                sample(
-                    &mut controller,
-                    if breach {
-                        Outcome::Breach
-                    } else {
-                        Outcome::Healthy
-                    },
-                    start + Duration::from_secs(index as u64 + 1),
-                );
-                assert!(controller.window.len() <= 200);
-            }
-            assert!(
-                (controller.share() - expected).abs() < 1e-10,
-                "{healthy} healthy, {breaches} breaches: {}",
-                controller.share()
-            );
-        }
+        let mut c = Controller::new(config(), start);
+        let generation = c.begin().unwrap();
+        c.retire();
+        assert_eq!(c.finish(generation, Outcome::Breach, at(start, 5000)), None);
+        assert_eq!(c.breaches, 0);
+        assert_eq!(c.in_flight, 0);
+        assert_eq!(c.begin(), None);
+        assert!(!c.resume(), "a retired controller never resumes");
     }
 
     #[test]
-    fn deployment_counts_do_not_hide_unknown_coverage() {
+    fn unknown_outcomes_are_excluded_rather_than_vetoing_decisions() {
         let start = Instant::now();
-        let mut controller = Controller::new(AimdConfig::default(), start);
-        sample(&mut controller, Outcome::Unknown, start);
-        for index in 0..114 {
-            let outcome = if (index + 1) * 22 / 114 > index * 22 / 114 {
+        let mut c = Controller::new(config(), start);
+        sample(&mut c, Outcome::Unknown, at(start, 2000));
+        for _ in 0..4 {
+            sample(&mut c, Outcome::Breach, at(start, 2000));
+        }
+        // Four completed samples: the unknown did not count towards min_samples.
+        assert_eq!(c.window.len(), 4);
+        assert!(close(c.share(), 1.0));
+        assert_eq!(
+            sample(&mut c, Outcome::Breach, at(start, 2000)),
+            Some("decrease")
+        );
+        assert!(close(c.share(), 0.5));
+    }
+
+    #[test]
+    fn in_flight_attempts_never_hold_a_decision_back() {
+        let start = Instant::now();
+        let mut c = Controller::new(config(), start);
+        let _still_running: Vec<_> = (0..20).map(|_| c.begin().unwrap()).collect();
+        for _ in 0..5 {
+            sample(&mut c, Outcome::Breach, at(start, 2000));
+        }
+        assert!(close(c.share(), 0.5));
+        assert_eq!(c.in_flight, 20);
+    }
+
+    #[test]
+    fn a_full_window_keeps_admitting_samples_while_attempts_are_pending() {
+        let start = Instant::now();
+        let mut c = Controller::new(config(), start);
+        let _pending = c.begin().unwrap();
+        for _ in 0..25 {
+            sample(&mut c, Outcome::Healthy, at(start, 500));
+        }
+        assert_eq!(c.window.len(), 10, "bounded by window_samples");
+        assert!(c.begin().is_some(), "never refuses a new sample");
+    }
+
+    #[test]
+    fn a_breach_rate_inside_the_hysteresis_band_holds_the_share() {
+        let start = Instant::now();
+        let mut c = Controller::new(config(), start);
+        for _ in 0..5 {
+            sample(&mut c, Outcome::Breach, at(start, 2000));
+        }
+        assert!(close(c.share(), 0.5));
+        // One breach in every 5 samples keeps every window of 5..=10 samples
+        // above recovery (10%) and at or below the decrease target (20%).
+        // Hold, however long it lasts.
+        for index in 0..60u64 {
+            let outcome = if index % 5 == 4 {
                 Outcome::Breach
             } else {
                 Outcome::Healthy
             };
-            sample(
-                &mut controller,
-                outcome,
-                start + Duration::from_secs(index + 1),
+            sample(&mut c, outcome, at(start, 4000 + index * 1000));
+        }
+        assert!(close(c.share(), 0.5), "share {}", c.share());
+    }
+
+    #[test]
+    fn a_decrease_discards_samples_that_started_at_the_old_share() {
+        let start = Instant::now();
+        let mut c = Controller::new(config(), start);
+        let old = c.begin().unwrap();
+        for _ in 0..5 {
+            sample(&mut c, Outcome::Breach, at(start, 2000));
+        }
+        assert!(close(c.share(), 0.5));
+        assert_eq!(c.finish(old, Outcome::Breach, at(start, 2100)), None);
+        assert_eq!(c.window.len(), 0);
+        assert_eq!(c.in_flight, 0);
+    }
+
+    #[test]
+    fn repeated_decreases_respect_dwell_and_the_floor() {
+        let start = Instant::now();
+        let mut c = Controller::new(config(), start);
+        for _ in 0..5 {
+            sample(&mut c, Outcome::Breach, at(start, 2000));
+        }
+        assert!(close(c.share(), 0.5));
+        for _ in 0..5 {
+            sample(&mut c, Outcome::Breach, at(start, 2500));
+        }
+        assert!(close(c.share(), 0.5), "within dwell");
+        sample(&mut c, Outcome::Breach, at(start, 3100));
+        assert!(close(c.share(), 0.25));
+        let mut now = 3100;
+        for _ in 0..20 {
+            now += 1100;
+            for _ in 0..5 {
+                sample(&mut c, Outcome::Breach, at(start, now));
+            }
+        }
+        assert!(close(c.share(), 0.1));
+        assert_eq!(sample(&mut c, Outcome::Breach, at(start, now + 5000)), None);
+    }
+
+    #[test]
+    fn recovery_keeps_the_window_so_each_step_needs_only_a_dwell() {
+        let start = Instant::now();
+        let mut c = Controller::new(config(), start);
+        for _ in 0..5 {
+            sample(&mut c, Outcome::Breach, at(start, 2000));
+        }
+        assert!(close(c.share(), 0.5));
+        // Healthy samples: the first evaluation starts the healthy dwell; the
+        // increase lands once both the dwell and the adjustment interval pass.
+        for _ in 0..5 {
+            sample(&mut c, Outcome::Healthy, at(start, 3000));
+        }
+        assert!(close(c.share(), 0.5));
+        assert_eq!(
+            sample(&mut c, Outcome::Healthy, at(start, 4000)),
+            Some("increase")
+        );
+        assert!(close(c.share(), 0.6));
+        assert_eq!(c.window.len(), 6, "an increase keeps the window");
+        // One more healthy sample per dwell is enough for the next step.
+        assert_eq!(
+            sample(&mut c, Outcome::Healthy, at(start, 5000)),
+            Some("increase")
+        );
+        assert!(close(c.share(), 0.7));
+    }
+
+    #[test]
+    fn idle_recovery_credits_elapsed_intervals_without_enough_samples() {
+        let start = Instant::now();
+        let mut c = Controller::new(config(), start);
+        for _ in 0..5 {
+            sample(&mut c, Outcome::Breach, at(start, 2000));
+        }
+        assert!(close(c.share(), 0.5));
+        assert_eq!(c.tick(at(start, 11_999)), None);
+        assert_eq!(c.tick(at(start, 12_000)), Some("increase"));
+        assert!(close(c.share(), 0.6));
+        // Two more whole intervals elapse: two steps, and the cadence is kept.
+        assert_eq!(c.tick(at(start, 32_500)), Some("increase"));
+        assert!(close(c.share(), 0.8));
+        assert_eq!(c.last_adjustment, at(start, 32_000));
+        // With enough samples to judge, latency evidence decides instead.
+        for _ in 0..5 {
+            sample(&mut c, Outcome::Breach, at(start, 33_000));
+        }
+        assert!(close(c.share(), 0.4));
+        for _ in 0..5 {
+            sample(&mut c, Outcome::Breach, at(start, 33_500));
+        }
+        assert_eq!(c.tick(at(start, 90_000)), None);
+
+        let mut disabled = config();
+        disabled.idle_recovery_ms = 0;
+        let mut c = Controller::new(disabled, start);
+        for _ in 0..5 {
+            sample(&mut c, Outcome::Breach, at(start, 2000));
+        }
+        assert_eq!(c.tick(at(start, 10_000_000)), None);
+    }
+
+    #[test]
+    fn parked_controllers_keep_their_share_and_resume_fresh() {
+        let start = Instant::now();
+        let mut c = Controller::new(config(), start);
+        for _ in 0..5 {
+            sample(&mut c, Outcome::Breach, at(start, 2000));
+        }
+        let in_flight = c.begin().unwrap();
+        c.park();
+        assert!(!c.active());
+        assert_eq!(c.begin(), None);
+        assert!(c.resume());
+        assert!(c.active());
+        assert!(close(c.share(), 0.5));
+        assert_eq!(c.finish(in_flight, Outcome::Breach, at(start, 3000)), None);
+        assert!(!c.resume(), "resume is a no-op for an active controller");
+    }
+
+    #[test]
+    fn default_thresholds_ignore_noise_at_the_old_target_and_act_on_real_overload() {
+        for (every, expect_decrease) in [(20u64, false), (5, true)] {
+            let start = Instant::now();
+            let mut c = Controller::new(AimdConfig::default(), start);
+            for index in 0..300u64 {
+                let outcome = if index % every == 0 {
+                    Outcome::Breach
+                } else {
+                    Outcome::Healthy
+                };
+                sample(&mut c, outcome, at(start, (index + 1) * 1000));
+            }
+            assert_eq!(
+                c.share() < 1.0,
+                expect_decrease,
+                "1 in {every}: {}",
+                c.share()
             );
         }
-        assert_eq!(controller.share(), 1.0);
+    }
+
+    #[test]
+    fn load_dependent_latency_converges_and_recovers_after_capacity_step() {
+        let start = Instant::now();
+        let mut c = Controller::new(config(), start);
+        let mut now = 0;
+        for _ in 0..400 {
+            now += 200;
+            // Deterministic service with capacity for 60% of offered load.
+            let outcome = if c.share() > 0.6 {
+                Outcome::Breach
+            } else {
+                Outcome::Healthy
+            };
+            sample(&mut c, outcome, at(start, now));
+        }
+        assert!((0.25..=0.7).contains(&c.share()), "share {}", c.share());
+        for _ in 0..200 {
+            now += 200;
+            sample(&mut c, Outcome::Healthy, at(start, now));
+        }
+        assert!(close(c.share(), 1.0));
+        for _ in 0..200 {
+            now += 200;
+            sample(&mut c, Outcome::Breach, at(start, now));
+        }
+        assert!(close(c.share(), c.config.share_floor));
     }
 
     #[tokio::test(start_paused = true)]
@@ -398,165 +756,44 @@ mod tests {
             Observation::new(controller.clone(), "model", "default", Instant::now()).unwrap();
         tokio::time::advance(Duration::from_secs(5)).await;
         early.deadline();
-        assert_eq!(controller.lock().unwrap().unknown, 1);
-        assert_eq!(controller.lock().unwrap().breaches, 0);
+        assert_eq!(controller.lock().unwrap().window.len(), 0);
         let late =
             Observation::new(controller.clone(), "model", "default", Instant::now()).unwrap();
         tokio::time::advance(Duration::from_secs(10)).await;
         late.deadline();
         late.frame();
+        late.status(529);
         late.unknown();
         drop(late);
         drop(early);
         let c = controller.lock().unwrap();
-        assert_eq!(c.unknown, 1);
+        assert_eq!(c.window.len(), 1);
         assert_eq!(c.breaches, 1);
-        assert_eq!(c.pending, 0);
+        assert_eq!(c.in_flight, 0);
     }
 
-    #[test]
-    fn concurrent_cohorts_can_recover_without_ignoring_pending_samples() {
-        let start = Instant::now();
-        let mut c = Controller::new(config(), start);
-        for _ in 0..5 {
-            sample(&mut c, Outcome::Breach, start + Duration::from_secs(1));
+    #[tokio::test(start_paused = true)]
+    async fn overload_statuses_are_breaches_and_other_errors_are_unknown() {
+        let controller = Arc::new(Mutex::new(Controller::new(config(), Instant::now())));
+        for status in [529, 429, 503] {
+            Observation::new(controller.clone(), "model", "default", Instant::now())
+                .unwrap()
+                .status(status);
         }
-        let cohort: Vec<_> = (0..5).map(|_| c.begin().unwrap()).collect();
-        for (g, id) in cohort {
-            c.finish(g, id, Outcome::Healthy, start + Duration::from_secs(2));
+        for status in [500, 404] {
+            Observation::new(controller.clone(), "model", "default", Instant::now())
+                .unwrap()
+                .status(status);
         }
-        assert_eq!(c.share(), 0.5);
-        let cohort: Vec<_> = (0..5).map(|_| c.begin().unwrap()).collect();
-        for &(g, id) in &cohort[..4] {
-            c.finish(g, id, Outcome::Healthy, start + Duration::from_secs(4));
-        }
-        assert_eq!(c.share(), 0.5);
-        let (g, id) = cohort[4];
-        c.finish(g, id, Outcome::Healthy, start + Duration::from_secs(4));
-        assert_eq!(c.share(), 0.6);
+        let c = controller.lock().unwrap();
+        assert_eq!(c.window.len(), 3);
+        assert_eq!(c.breaches, 3);
     }
 
-    #[test]
-    fn saturated_window_keeps_pending_attempts_and_bounds_memory() {
-        let now = Instant::now();
-        let mut c = Controller::new(config(), now);
-        let pending: Vec<_> = (0..10).map(|_| c.begin().unwrap()).collect();
-        assert!(c.begin().is_none());
-        for &(generation, id) in &pending[1..] {
-            c.finish(generation, id, Outcome::Healthy, now);
-        }
-        assert!(c.begin().is_none());
-        c.finish(pending[0].0, pending[0].1, Outcome::Breach, now);
-        assert!(c.begin().is_some());
-        assert_eq!(c.window.len(), 10);
-    }
-
-    #[test]
-    fn load_dependent_latency_converges_and_recovers_after_capacity_step() {
-        let start = Instant::now();
-        let mut c = Controller::new(config(), start);
-        let mut now = start;
-        for _ in 0..200 {
-            now += Duration::from_millis(200);
-            // Deterministic service with capacity for 60% of offered load.
-            let outcome = if c.share() > 0.6 {
-                Outcome::Breach
-            } else {
-                Outcome::Healthy
-            };
-            sample(&mut c, outcome, now);
-        }
-        assert!((0.25..=0.7).contains(&c.share()), "share {}", c.share());
-        for _ in 0..200 {
-            now += Duration::from_millis(200);
-            sample(&mut c, Outcome::Healthy, now);
-        }
-        assert_eq!(c.share(), 1.0);
-        for _ in 0..200 {
-            now += Duration::from_millis(200);
-            sample(&mut c, Outcome::Breach, now);
-        }
-        assert_eq!(c.share(), c.config.share_floor);
-    }
-
-    #[test]
-    fn tail_rate_overload_and_fresh_generations() {
-        let now = Instant::now();
-        let mut c = Controller::new(config(), now);
-        sample(&mut c, Outcome::Breach, now);
-        for _ in 0..4 {
-            sample(&mut c, Outcome::Healthy, now + Duration::from_secs(2));
-        }
-        assert_eq!(c.share(), 1.0); // One tail outlier is exactly the target.
-        let stale = c.begin().unwrap();
-        c.finish(
-            stale.0,
-            stale.1,
-            Outcome::Breach,
-            now + Duration::from_secs(2),
-        );
-        assert_eq!(c.share(), 0.5);
-        c.finish(
-            stale.0,
-            stale.1,
-            Outcome::Breach,
-            now + Duration::from_secs(5),
-        );
-        for _ in 0..4 {
-            sample(&mut c, Outcome::Breach, now + Duration::from_secs(5));
-        }
-        assert_eq!(c.share(), 0.5);
-        sample(&mut c, Outcome::Breach, now + Duration::from_secs(5));
-        assert_eq!(c.share(), 0.25);
-    }
-    #[test]
-    fn recovery_dwell_and_unknowns() {
-        let now = Instant::now();
-        let mut c = Controller::new(config(), now);
-        for _ in 0..5 {
-            sample(&mut c, Outcome::Breach, now + Duration::from_secs(1));
-        }
-        assert_eq!(c.share(), 0.5);
-        for _ in 0..5 {
-            sample(&mut c, Outcome::Healthy, now + Duration::from_secs(2));
-        }
-        assert_eq!(c.share(), 0.5);
-        sample(&mut c, Outcome::Healthy, now + Duration::from_secs(3));
-        assert_eq!(c.share(), 0.6);
-        sample(&mut c, Outcome::Unknown, now + Duration::from_secs(4));
-        for _ in 0..9 {
-            sample(&mut c, Outcome::Breach, now + Duration::from_secs(10));
-        }
-        assert_eq!(c.share(), 0.6);
-        sample(&mut c, Outcome::Breach, now + Duration::from_secs(10));
-        assert_eq!(c.share(), 0.3);
-    }
-    #[test]
-    fn pending_attempts_and_dwell_block_repeated_decreases() {
-        let now = Instant::now();
-        let mut c = Controller::new(config(), now);
-        let pending = c.begin().unwrap();
-        for _ in 0..5 {
-            sample(&mut c, Outcome::Breach, now + Duration::from_secs(2));
-        }
-        assert_eq!(c.share(), 1.0);
-        c.finish(
-            pending.0,
-            pending.1,
-            Outcome::Breach,
-            now + Duration::from_secs(2),
-        );
-        assert_eq!(c.share(), 0.5);
-        for _ in 0..5 {
-            sample(&mut c, Outcome::Breach, now + Duration::from_millis(2500));
-        }
-        assert_eq!(c.share(), 0.5);
-        sample(&mut c, Outcome::Breach, now + Duration::from_secs(3));
-        assert_eq!(c.share(), 0.25);
-    }
     #[test]
     fn validates_bounds() {
         assert!(config().validate().is_ok());
+        assert!(AimdConfig::default().validate().is_ok());
         let mut c = config();
         c.min_samples = 1;
         assert!(c.validate().is_err());
@@ -566,5 +803,26 @@ mod tests {
         let mut c = config();
         c.share_floor = 0.0;
         assert!(c.validate().is_err());
+        let mut c = config();
+        c.recovery_breach_rate = c.breach_rate_target + 0.01;
+        assert!(c.validate().is_err());
+        let mut c = config();
+        c.overload_statuses = vec![200];
+        assert!(c.validate().is_err());
+        let mut c = config();
+        c.idle_recovery_ms = 86_400_001;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn older_overrides_without_new_fields_still_parse() {
+        let parsed: AimdConfig = serde_json::from_value(serde_json::json!({
+            "enabled": true, "latency_budget_ms": 100, "breach_rate_target": 0.1,
+            "window_samples": 20, "min_samples": 5, "share_step": 0.1,
+            "share_decay": 0.5, "share_floor": 0.1, "dwell_ms": 1000
+        }))
+        .unwrap();
+        assert_eq!(parsed.overload_statuses, vec![429, 503, 529]);
+        assert!(parsed.validate().is_ok());
     }
 }
