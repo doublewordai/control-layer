@@ -38,8 +38,10 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderMap;
 use axum::routing::{any, get};
 use axum_prometheus::{
-    GenericMetricLayer, Handle, PrometheusMetricLayerBuilder,
-    metrics_exporter_prometheus::PrometheusHandle,
+    AXUM_HTTP_REQUESTS_DURATION_SECONDS, GenericMetricLayer, Handle,
+    PREFIXED_HTTP_REQUESTS_DURATION_SECONDS, PrometheusMetricLayerBuilder,
+    metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle},
+    utils::SECONDS_DURATION_BUCKETS,
 };
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -450,6 +452,16 @@ pub fn build_metrics_router(handle: PrometheusHandle) -> Router {
     )
 }
 
+/// Histogram buckets for `onwards_first_token_seconds`, in seconds.
+///
+/// 10 is an exact edge because it is the default first-token deadline and AIMD
+/// latency budget: the share of first tokens beyond it is only exact at a
+/// bucket edge. Exported so embedders installing their own recorder can use
+/// the same buckets.
+pub const FIRST_TOKEN_SECONDS_BUCKETS: &[f64] = &[
+    0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0,
+];
+
 type MetricsLayerAndHandle = (
     GenericMetricLayer<'static, PrometheusHandle, Handle>,
     PrometheusHandle,
@@ -519,7 +531,38 @@ pub fn build_metrics_layer_and_handle(
         .with_prefix(prefix)
         .enable_response_body_size(true)
         .with_endpoint_label_type(axum_prometheus::EndpointLabel::Exact)
-        .with_default_metrics()
+        // Same as `with_default_metrics`, plus real histogram buckets for the
+        // first-token latency: without them it renders as a per-process
+        // summary, whose quantiles cannot be aggregated across replicas.
+        .with_metrics_from_fn(|| {
+            let recorder = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Full(
+                        PREFIXED_HTTP_REQUESTS_DURATION_SECONDS
+                            .get()
+                            .map_or(AXUM_HTTP_REQUESTS_DURATION_SECONDS, |s| s.as_str())
+                            .to_string(),
+                    ),
+                    SECONDS_DURATION_BUCKETS,
+                )
+                .expect("valid HTTP duration buckets")
+                .set_buckets_for_metric(
+                    Matcher::Full("onwards_first_token_seconds".to_string()),
+                    FIRST_TOKEN_SECONDS_BUCKETS,
+                )
+                .expect("valid first-token buckets")
+                .build_recorder();
+            let handle = recorder.handle();
+            let upkeep = handle.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    upkeep.run_upkeep();
+                }
+            });
+            metrics::set_global_recorder(recorder).expect("Failed to set global recorder");
+            handle
+        })
         .build_pair()
 }
 

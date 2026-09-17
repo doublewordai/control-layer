@@ -415,6 +415,13 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                     SUBMISSION_LATENCY_BUCKETS,
                 )
                 .expect("Failed to set custom buckets for fusillade_request_pickup_delay_seconds")
+                // Without buckets the first-token latency renders as a per-process
+                // summary, whose quantiles cannot be aggregated across replicas.
+                .set_buckets_for_metric(
+                    Matcher::Full("onwards_first_token_seconds".to_string()),
+                    onwards::FIRST_TOKEN_SECONDS_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for onwards_first_token_seconds")
                 .install_recorder()
                 .expect("Failed to install Prometheus recorder");
             initialize_database_error_metrics();

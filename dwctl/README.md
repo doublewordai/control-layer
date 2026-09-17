@@ -288,9 +288,25 @@ settings through the model API's `aimd` object and explicit `first_token_timeout
 streaming traffic and preserves ordinary retries; it is not a binary outage breaker.
 `PATCH {"aimd": {"enabled": false}}` disables it; null restores defaults. Model responses expose settings under `fallback`.
 
+By default the share decreases by 20% when more than 10% of the preferred
+provider's recent completed attempts breach — a first frame later than 10 seconds,
+or an overload status (429, 503, 529) — holds between 3% and 10%, and recovers by
+five percentage points per healthy 30-second dwell. Pools with too few samples to
+judge recover a step every five minutes. Other errors and cancellations are
+excluded rather than counted either way.
+
 `onwards_provider_share{model,pool}` reports the configured preferred-first share;
 `onwards_share_adjustments_total{model,pool,direction}` counts increases/decreases.
-The share is per gateway process, and capacity/concurrency constraints can change
-the realized split. Missing samples and hard errors never count as healthy capacity.
+`onwards_aimd_active`, `onwards_aimd_window_samples`, `onwards_aimd_window_breach_rate`
+and `onwards_aimd_in_flight` expose controller state, and
+`onwards_aimd_unknown_total` / `onwards_aimd_overload_breaches_total{status}` count
+excluded and overload outcomes. The share is per gateway process, and
+capacity/concurrency constraints can change the realized split.
+
+`fallback_realtime_on_status` on a model (default `[529]` for new composite models;
+the dashboard's "Overloaded (529, realtime only)" failover switch) lists upstream
+statuses that fail a realtime request over to the next provider, in addition to
+`fallback_on_status`. Fusillade daemon traffic is never affected. Catalog files set
+it as `routing.fallback.realtime_on_status`; omitting it keeps the stored value.
 See [configuration, observation coverage and rollout](../onwards/docs/src/load-aware-failover.md)
 before enabling a model. The existing histogram is not the controller denominator.

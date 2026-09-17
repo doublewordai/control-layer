@@ -41,6 +41,7 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         fallback_enabled: false,
         fallback_on_rate_limit: false,
         fallback_on_status: Vec::new(),
+        fallback_realtime_on_status: Vec::new(),
         fallback_with_replacement: false,
         fallback_max_attempts: None,
         backoff_enabled: false,
@@ -853,6 +854,23 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
         vec![429, 503],
         "explicit stored statuses must remain authoritative"
     );
+    assert!(!composite_pool.default_pool().should_fallback_on_realtime_status(529));
+
+    sqlx::query("UPDATE deployed_models SET fallback_realtime_on_status = '{529}' WHERE alias = 'composite-priority'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let reloaded = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let reloaded = reloaded.targets.get("composite-priority").unwrap();
+    let reloaded_pool = reloaded.value().default_pool();
+    assert!(reloaded_pool.should_fallback_on_realtime_status(529));
+    assert!(reloaded_pool.should_fallback_on_realtime_status(503));
+    assert!(
+        !reloaded_pool.should_fallback_on_status(529),
+        "dispatched traffic ignores realtime-only statuses"
+    );
 
     // Composite model has no tariff in this fixture, so it's free.
     // Free models allow group-authorized keys regardless of balance.
@@ -1325,6 +1343,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             fallback_enabled: None,
             fallback_on_rate_limit: None,
             fallback_on_status: None,
+            fallback_realtime_on_status: None,
             fallback_with_replacement: None,
             fallback_max_attempts: None,
             backoff_enabled: false,
@@ -1549,6 +1568,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             fallback_enabled: None,
             fallback_on_rate_limit: None,
             fallback_on_status: None,
+            fallback_realtime_on_status: None,
             fallback_with_replacement: None,
             fallback_max_attempts: None,
             backoff_enabled: false,
@@ -1594,6 +1614,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             fallback_enabled: Some(true),
             fallback_on_rate_limit: Some(true),
             fallback_on_status: Some(vec![429, 499, 500, 502, 503, 504]),
+            fallback_realtime_on_status: None,
             fallback_with_replacement: None,
             allowed_batch_completion_windows: None,
             fallback_max_attempts: None,
@@ -1972,7 +1993,12 @@ async fn aimd_and_first_token_deadline_survive_database_sync(pool: sqlx::PgPool)
     let composite = targets.targets.get("composite-priority").unwrap();
     let fallback = composite.value().default_pool().fallback().unwrap();
     assert_eq!(fallback.first_token_timeout_ms, Some(200));
-    assert_eq!(serde_json::to_value(fallback.aimd.as_ref().unwrap()).unwrap(), config);
+    // A stored override written before newer AIMD members existed still loads:
+    // the members it omits take their defaults.
+    assert_eq!(
+        fallback.aimd.as_ref().unwrap(),
+        &serde_json::from_value::<onwards::aimd::AimdConfig>(config).unwrap()
+    );
     let standard = targets.targets.get("regular-public").unwrap();
     assert_eq!(
         standard.value().default_pool().fallback().unwrap().first_token_timeout_ms,
