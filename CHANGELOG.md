@@ -1,5 +1,12 @@
 # Changelog
 
+## [11.16.0](https://github.com/doublewordai/control-layer/compare/v11.15.1...v11.16.0) (2026-09-17)
+
+
+### Features
+
+* **onwards:** make AIMD share control decide under overload and recover ([#1803](https://github.com/doublewordai/control-layer/issues/1803)) ([8bb4a6f](https://github.com/doublewordai/control-layer/commit/8bb4a6fc3a865993d810bcd671165e13fe7c7ce7))
+
 ## [11.15.1](https://github.com/doublewordai/control-layer/compare/v11.15.0...v11.15.1) (2026-09-17)
 
 
