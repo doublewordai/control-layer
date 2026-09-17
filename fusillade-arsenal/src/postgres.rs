@@ -3167,7 +3167,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 let mut tx = self.begin_response_write(&[request.data.id.0]).await?;
                 match any_request {
                     AnyRequest::Pending(req) => {
-                        // DELIBERATELY no terminal-state guard on this arm
+                        // DELIBERATELY no state guard on this arm
                         // (unlike every arm below): the manual retry path
                         // uses persist(Pending) to intentionally move a
                         // terminal `failed` row back to pending (see the
@@ -3210,7 +3210,6 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 started_at = NULL,
                                 not_before = NULL
                             WHERE id = $1
-                              AND state = 'pending'
                             "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
@@ -3223,11 +3222,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .rows_affected();
 
                         if rows_affected == 0 {
-                            return Self::lost_ownership_or_missing_in_transaction(
-                                &mut tx,
-                                req.data.id,
-                            )
-                            .await;
+                            return Self::dropped_or_missing_in_transaction(&mut tx, req.data.id)
+                                .await;
                         }
                     }
                     AnyRequest::Processing(req) => {
@@ -3319,7 +3315,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     canceled_at = NULL
                                 FROM prev
                                 WHERE r.id = prev.id
-                                  AND r.state IN ('processing', 'canceled')
+                                  AND r.state IN ('claimed', 'processing', 'canceled')
                                   AND r.claimed_at = $4
                                 RETURNING prev.old_state, prev.batch_id
                             ),
@@ -3462,10 +3458,18 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 state = 'canceled',
                                 canceled_at = $2
                             WHERE id = $1
-                              AND state NOT IN ('completed', 'failed')
+                              AND (
+                                  ($3::timestamptz IS NOT NULL
+                                   AND state IN ('claimed', 'processing', 'canceled')
+                                   AND claimed_at = $3)
+                                  OR
+                                  ($3::timestamptz IS NULL
+                                   AND state NOT IN ('completed', 'failed'))
+                              )
                             "#,
                             *req.data.id as Uuid,
                             req.state.canceled_at,
+                            req.state.claimed_at,
                         )
                         .execute(&mut *tx)
                         .await
@@ -3473,6 +3477,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .rows_affected();
 
                         if rows_affected == 0 {
+                            if req.state.claimed_at.is_some() {
+                                return Self::lost_ownership_or_missing_in_transaction(
+                                    &mut tx,
+                                    req.data.id,
+                                )
+                                .await;
+                            }
                             return Self::dropped_or_missing_in_transaction(&mut tx, req.data.id)
                                 .await;
                         }
@@ -3531,7 +3542,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         let mut tx = self.begin_response_write(&[request_id.0]).await?;
 
         // Fenced retry: only re-pend the row if it is still the in-flight claim
-        // held by `owner`. The `state = 'processing' AND daemon_id = $2` guard is
+        // held by `owner`. The in-flight state plus daemon/generation guard is
         // what distinguishes this from the manual retry path (which uses persist()
         // to intentionally move a terminal `failed` row back to pending). If
         // another writer has already terminalized this row — and a finalizer has
@@ -3547,7 +3558,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 claimed_at = NULL,
                 started_at = NULL
             WHERE id = $1
-              AND state = 'processing'
+              AND state IN ('claimed', 'processing')
               AND daemon_id = $2
               AND claimed_at = $5
             "#,
@@ -3801,6 +3812,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 "Missing canceled_at for canceled request"
                             ))
                         })?,
+                        claimed_at: row.claimed_at,
                     },
                     data,
                 })),
@@ -6212,6 +6224,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 "Missing canceled_at for canceled execution"
                             ))
                         })?,
+                        claimed_at: row.claimed_at,
                     },
                     data,
                 }),
@@ -13052,6 +13065,64 @@ mod tests {
         );
     }
 
+    /// Custom processors are allowed to finish directly from Claimed without
+    /// first persisting Processing. The claim generation still fences the
+    /// terminal write.
+    #[sqlx::test]
+    async fn persist_completed_accepts_current_claimed_generation(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        sqlx::query("UPDATE requests SET state = 'claimed', started_at = NULL WHERE id = $1")
+            .bind(*req.data.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        manager
+            .persist(&completed_from(&req, "direct completion"))
+            .await
+            .unwrap();
+
+        let state: String = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(*req.data.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "completed");
+    }
+
+    /// A cancellation read by an old attempt must not cancel a newer claim of
+    /// the same request, including when the daemon id is reused.
+    #[sqlx::test]
+    async fn persist_canceled_stale_generation_loses_ownership(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        let new_claimed_at = req.state.claimed_at + chrono::Duration::seconds(1);
+        sqlx::query("UPDATE requests SET claimed_at = $2 WHERE id = $1")
+            .bind(*req.data.id)
+            .bind(new_claimed_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let canceled = Request {
+            data: req.data.clone(),
+            state: Canceled {
+                canceled_at: chrono::Utc::now(),
+                claimed_at: Some(req.state.claimed_at),
+            },
+        };
+        let error = manager
+            .persist(&canceled)
+            .await
+            .expect_err("stale cancellation must be fenced out");
+        assert!(matches!(
+            error,
+            FusilladeError::LostOwnership(id) if id == req.data.id
+        ));
+
+        let (state, _) = read_request_row(&pool, req.data.id).await;
+        assert_eq!(state, "processing");
+    }
+
     async fn stored_response_body(pool: &sqlx::PgPool, id: RequestId) -> Option<String> {
         sqlx::query_scalar::<_, Option<String>>("SELECT response_body FROM requests WHERE id = $1")
             .bind(*id)
@@ -13240,6 +13311,29 @@ mod tests {
         let (state, retry) = read_request_row(&pool, request_id).await;
         assert_eq!(state, "pending");
         assert_eq!(retry, 1);
+    }
+
+    /// Pre-dispatch processors can fail transiently before the durable
+    /// Claimed -> Processing transition. Their retry must still re-pend the
+    /// currently owned claim.
+    #[sqlx::test]
+    async fn test_reschedule_for_retry_accepts_claimed_state(pool: sqlx::PgPool) {
+        let daemon_id = DaemonId::from(Uuid::new_v4());
+        let (manager, request_id, claimed_at) = setup_processing_request(&pool, daemon_id).await;
+        sqlx::query("UPDATE requests SET state = 'claimed', started_at = NULL WHERE id = $1")
+            .bind(*request_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let rescheduled = manager
+            .reschedule_for_retry(request_id, daemon_id, claimed_at, 1, None)
+            .await
+            .unwrap();
+
+        assert!(rescheduled);
+        let (state, retry) = read_request_row(&pool, request_id).await;
+        assert_eq!((state.as_str(), retry), ("pending", 1));
     }
 
     /// Regression: a late retry must NOT resurrect a row another writer has

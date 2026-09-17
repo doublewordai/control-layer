@@ -348,6 +348,10 @@ impl RequestState for Failed {}
 #[derive(Debug, Clone, Serialize)]
 pub struct Canceled {
     pub canceled_at: DateTime<Utc>,
+    /// Claim-generation fence for daemon-owned cancellation. Pending requests
+    /// have no owner and leave this unset.
+    #[serde(skip)]
+    pub claimed_at: Option<DateTime<Utc>>,
 }
 
 impl RequestState for Canceled {}

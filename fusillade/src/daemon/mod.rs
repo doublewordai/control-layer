@@ -1540,6 +1540,21 @@ fn validate_daemon_intervals(config: &DaemonConfig) -> Result<()> {
             )));
         }
     }
+    if config.stale_daemon_threshold_ms == 0 {
+        return Err(FusilladeError::ValidationError(
+            "stale_daemon_threshold_ms must be positive".to_string(),
+        ));
+    }
+    // Keep at least one full heartbeat interval available for the database
+    // query after a scheduled tick. Merely requiring a positive remainder
+    // permits configurations such as 4_999ms/5_000ms, which guarantee a
+    // near-zero query timeout and make a healthy daemon self-fence.
+    if config.heartbeat_interval_ms > config.stale_daemon_threshold_ms / 2 {
+        return Err(FusilladeError::ValidationError(format!(
+            "heartbeat_interval_ms ({}) must be at most half of stale_daemon_threshold_ms ({})",
+            config.heartbeat_interval_ms, config.stale_daemon_threshold_ms
+        )));
+    }
     Ok(())
 }
 
@@ -3002,8 +3017,15 @@ where
         let requests_failed = self.requests_failed.clone();
         let daemon_id = self.daemon_id;
         let heartbeat_interval_ms = self.config.heartbeat_interval_ms;
-        let heartbeat_query_timeout =
-            Duration::from_millis(heartbeat_interval_ms.saturating_mul(4));
+        // Leave enough of the lease after each scheduled tick for the query to
+        // finish. The startup invariant guarantees at least one full heartbeat
+        // interval of query budget; the deadline check below remains the final
+        // authority at the boundary.
+        let heartbeat_query_timeout = Duration::from_millis(
+            heartbeat_interval_ms
+                .saturating_mul(4)
+                .min(self.config.stale_daemon_threshold_ms - heartbeat_interval_ms),
+        );
         let heartbeat_lease_duration = Duration::from_millis(self.config.stale_daemon_threshold_ms);
         let shutdown_signal = self.shutdown_token.clone();
 
@@ -3056,10 +3078,15 @@ where
                                 break;
                             }
                             Some(Ok(updated)) => {
+                                let completed_at = std::time::Instant::now();
+                                if completed_at >= last_success + heartbeat_lease_duration {
+                                    handle_lease_loss();
+                                    break;
+                                }
                                 histogram!("fusillade_heartbeat_duration_seconds")
                                     .record(heartbeat_start.elapsed().as_secs_f64());
                                 daemon_record = updated;
-                                last_success = std::time::Instant::now();
+                                last_success = completed_at;
                                 tracing::trace!(
                                     daemon_id = %daemon_id,
                                     "Heartbeat sent"
@@ -5701,6 +5728,25 @@ mod tests {
             throughput_log_interval_ms: None,
             ..Default::default()
         };
+        assert!(validate_daemon_intervals(&config).is_ok());
+    }
+
+    #[test]
+    fn heartbeat_cadence_must_fit_inside_lease() {
+        let mut config = DaemonConfig {
+            stale_daemon_threshold_ms: 0,
+            ..Default::default()
+        };
+        assert!(validate_daemon_intervals(&config).is_err());
+
+        config.stale_daemon_threshold_ms = 5_000;
+        config.heartbeat_interval_ms = 5_000;
+        assert!(validate_daemon_intervals(&config).is_err());
+
+        config.heartbeat_interval_ms = 4_999;
+        assert!(validate_daemon_intervals(&config).is_err());
+
+        config.heartbeat_interval_ms = 2_500;
         assert!(validate_daemon_intervals(&config).is_ok());
     }
 

@@ -538,6 +538,10 @@ async fn custom_processor_can_synthesize_terminal_failure(pool: sqlx::PgPool) {
     let AnyRequest::Failed(req) = fetch_any_request(&manager, request_id).await else {
         panic!("expected Failed variant");
     };
+    assert!(
+        req.state.claimed_at.is_some(),
+        "daemon-owned failure must persist the claim-generation fence"
+    );
 
     // The synthesized failure reason still carries the upstream body (it is
     // persisted), proving the custom processor's terminal outcome propagated.

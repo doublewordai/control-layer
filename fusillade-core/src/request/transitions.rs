@@ -149,6 +149,7 @@ impl Request<Pending> {
             data: self.data,
             state: Canceled {
                 canceled_at: chrono::Utc::now(),
+                claimed_at: None,
             },
         };
         storage.persist(&request).await?;
@@ -175,6 +176,7 @@ impl Request<Claimed> {
             data: self.data,
             state: Canceled {
                 canceled_at: chrono::Utc::now(),
+                claimed_at: Some(self.state.claimed_at),
             },
         };
         storage.persist(&request).await?;
@@ -382,6 +384,7 @@ impl Request<Processing> {
                     data: self.data,
                     state: Canceled {
                         canceled_at: chrono::Utc::now(),
+                        claimed_at: Some(self.state.claimed_at),
                     },
                 };
                 return Ok(RequestCompletionResult::Canceled(canceled));
@@ -517,6 +520,7 @@ impl Request<Processing> {
             data: self.data,
             state: Canceled {
                 canceled_at: chrono::Utc::now(),
+                claimed_at: Some(self.state.claimed_at),
             },
         };
         storage.persist(&request).await?;
