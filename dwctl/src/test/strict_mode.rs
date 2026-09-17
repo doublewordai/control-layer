@@ -1154,10 +1154,10 @@ async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
     assert!(body["error"].is_object(), "Should have error object");
 }
 
-/// Test that trusted providers bypass sanitization in strict mode
+/// Upstream 429s keep their status and use the public message, even for trusted providers.
 #[sqlx::test]
 #[test_log::test]
-async fn test_strict_mode_trusted_flag_bypasses_sanitization(pool: PgPool) {
+async fn test_strict_mode_upstream_rate_limit_uses_custom_message(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
 
     // Mock provider returns error with internal details
@@ -1300,25 +1300,14 @@ async fn test_strict_mode_trusted_flag_bypasses_sanitization(pool: PgPool) {
     let body_text = response.text();
     let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response should be valid JSON");
 
-    // Trusted provider errors should pass through unsanitized
-    assert_eq!(response.status_code(), 429, "Should receive 429 from trusted provider");
-
-    // Verify all details are present (not sanitized)
+    assert_eq!(response.status_code(), 429, "Should preserve the upstream rate limit");
     assert_eq!(
-        body["error"]["message"].as_str(),
-        Some("Rate limit exceeded for organization org-123"),
-        "Trusted provider error message should pass through"
+        body["error"]["message"],
+        "Our realtime API is not intended for production use cases. For a dedicated deployment, contact support@doubleword.ai."
     );
-    assert_eq!(
-        body["error"]["details"]["organization_id"].as_str(),
-        Some("org-123"),
-        "Trusted provider should include organization details"
-    );
-    assert_eq!(
-        body["error"]["details"]["current_usage"].as_i64(),
-        Some(1000),
-        "Trusted provider should include usage details"
-    );
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+    assert_eq!(body["error"]["code"], "upstream_rate_limit");
+    assert!(body["error"].get("details").is_none(), "Provider details should remain private");
 }
 
 /// Test various upstream error scenarios are handled correctly

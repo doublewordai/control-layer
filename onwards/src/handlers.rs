@@ -1177,7 +1177,21 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            let error = if status == 429 {
+                OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+            } else {
+                OnwardsErrorResponse::bad_gateway()
+            };
+            return LoopAction::Continue(Some(error));
+        }
+
+        if status == 429
+            && (target.sanitize_response || state.upstream_rate_limit_message.is_some())
+        {
+            record_response_status(429);
+            return LoopAction::Done(Err(OnwardsErrorResponse::upstream_rate_limited(
+                state.upstream_rate_limit_message.as_deref(),
+            )));
         }
 
         // Sanitize error responses when sanitize_response is enabled.
@@ -1470,22 +1484,25 @@ pub async fn target_message_handler<T: HttpClient>(
                     || (embedded == 429 && pool.should_fallback_on_rate_limit());
                 if retryable {
                     tracing::Span::current().record("onwards.fallback", "embedded_error");
-                    // Retry internally. If every attempt / provider fallback is
-                    // exhausted the caller gets a sanitized 503 — never the
-                    // upstream's rate limit (see the non-retryable arm below).
-                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
+                    // Retain rate-limit semantics if all attempts are exhausted.
+                    let error = if embedded == 429 {
+                        OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+                    } else {
+                        OnwardsErrorResponse::service_unavailable()
+                    };
+                    return LoopAction::Continue(Some(error));
                 }
 
                 record_response_status(embedded);
-                // Don't leak an upstream rate limit: a 429 — and *any* 5xx, including
-                // non-retryable ones like 501/505 — collapses to a generic 503. This is
-                // deliberately more opaque than the non-embedded error path: a
-                // 200-with-error body is already anomalous, so we hide the specifics.
+                // Keep upstream details private while preserving rate-limit semantics.
+                // Embedded server errors still collapse to a generic 503.
                 // For trusted providers, retain the standard client-error fields
                 // so the caller can fix the request. Never log the body: even
                 // validation errors can echo request content.
                 let trusted = target.trusted.unwrap_or_else(|| pool.is_trusted());
-                let err = if embedded == 429 || embedded >= 500 {
+                let err = if embedded == 429 {
+                    OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+                } else if embedded >= 500 {
                     OnwardsErrorResponse::service_unavailable()
                 } else {
                     OnwardsErrorResponse::builder()
@@ -2725,6 +2742,7 @@ mod tests {
             },
             http_client: mock_client,
             response_transform_fn: None,
+            upstream_rate_limit_message: None,
             response_id_header: None,
             body_limit: crate::DEFAULT_BODY_LIMIT,
             first_token_timeout: None,
