@@ -517,6 +517,10 @@ onwards:
   # When true, only known OpenAI API paths are accepted and validated.
   # Set via environment: DWCTL_ONWARDS__STRICT_MODE=true
   strict_mode: false
+  # Public message for upstream 429 responses, including exhausted retries.
+  # Local request and concurrency limits keep their existing messages.
+  # Set via environment: DWCTL_ONWARDS__UPSTREAM_RATE_LIMIT_MESSAGE
+  upstream_rate_limit_message: "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
   # Failover deadline (ms) for the first token of a realtime streamed response.
   # While a model still has another provider to fail over to, an attempt that
   # hasn't started streaming within this window is abandoned and the next

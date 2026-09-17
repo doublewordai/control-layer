@@ -133,6 +133,8 @@ pub struct AppState<T: HttpClient> {
     pub http_client: T,
     pub targets: target::Targets,
     pub response_transform_fn: Option<ResponseTransformFn>,
+    /// Optional public message for upstream 429 responses; local limits are unaffected.
+    pub upstream_rate_limit_message: Option<String>,
     /// Header name whose value overrides the generated `id` in Responses API
     /// responses. When set, the handler reads this header from the incoming
     /// request and uses its value (prefixed with `resp_` if not already) as the
@@ -172,6 +174,10 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
                 "response_transform_fn",
                 &self.response_transform_fn.as_ref().map(|_| "<function>"),
             )
+            .field(
+                "upstream_rate_limit_message",
+                &self.upstream_rate_limit_message,
+            )
             .field("response_id_header", &self.response_id_header)
             .field("body_limit", &self.body_limit)
             .field("first_token_timeout", &self.first_token_timeout)
@@ -197,6 +203,7 @@ impl AppState<HyperClient> {
             http_client,
             targets,
             response_transform_fn: None,
+            upstream_rate_limit_message: None,
             response_id_header: None,
             body_limit: DEFAULT_BODY_LIMIT,
             first_token_timeout: None,
@@ -212,11 +219,18 @@ impl<T: HttpClient> AppState<T> {
             http_client,
             targets,
             response_transform_fn: None,
+            upstream_rate_limit_message: None,
             response_id_header: None,
             body_limit: DEFAULT_BODY_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
         }
+    }
+
+    /// Customize upstream rate-limit errors without exposing provider error bodies.
+    pub fn with_upstream_rate_limit_message(mut self, message: impl Into<String>) -> Self {
+        self.upstream_rate_limit_message = Some(message.into());
+        self
     }
 
     /// Set the header name whose value overrides the Responses API `id` field.
@@ -1439,6 +1453,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_upstream_rate_limit_preserves_status_and_custom_message() {
+        for strict in [false, true] {
+            for embedded in [false, true] {
+                for streaming in [false, true] {
+                    for retry in [false, true] {
+                        let body = r#"{"error":{"code":429,"message":"private upstream details"}}"#;
+                        let status = if embedded {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::TOO_MANY_REQUESTS
+                        };
+                        let mock = if streaming {
+                            MockHttpClient::new_streaming(status, vec![format!("data: {body}\n\n")])
+                        } else {
+                            MockHttpClient::new(status, body)
+                        };
+                        let targets =
+                            fallback_targets("gpt-4", 2, if retry { vec![429] } else { vec![] });
+                        let state = AppState::with_client(targets, mock.clone())
+                            .with_upstream_rate_limit_message(
+                                "Contact support for a dedicated deployment.",
+                            );
+                        let router = if strict {
+                            crate::strict::build_strict_router(state)
+                        } else {
+                            build_router(state)
+                        };
+                        let server = TestServer::new(router).unwrap();
+                        let response = server
+                            .post(if strict {
+                                "/chat/completions"
+                            } else {
+                                "/v1/chat/completions"
+                            })
+                            .json(&json!({
+                                "model": "gpt-4", "stream": streaming,
+                                "messages": [{"role": "user", "content": "Hello"}]
+                            }))
+                            .await;
+                        assert_eq!(
+                            response.status_code(),
+                            429,
+                            "strict={strict}, embedded={embedded}, streaming={streaming}, retry={retry}"
+                        );
+                        let error = response.json::<serde_json::Value>();
+                        assert_eq!(error["error"]["type"], "rate_limit_error");
+                        assert_eq!(error["error"]["code"], "upstream_rate_limit");
+                        assert_eq!(
+                            error["error"]["message"],
+                            "Contact support for a dedicated deployment."
+                        );
+                        assert!(!response.text().contains("private upstream details"));
+                        assert_eq!(mock.get_requests().len(), if retry { 2 } else { 1 });
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_trusted_embedded_error_keeps_server_and_rate_limit_details_private() {
         for code in [429, 500, 501, 503] {
             for streaming in [false, true] {
@@ -1468,17 +1542,16 @@ mod tests {
                         "messages":[{"role":"user","content":"hello"}]
                     }))
                     .await;
-                assert_eq!(response.status_code(), 503);
+                assert_eq!(response.status_code(), if code == 429 { 429 } else { 503 });
                 assert!(!response.text().contains("private upstream failure"));
             }
         }
     }
 
     #[tokio::test]
-    async fn test_streaming_embedded_error_retries_then_exhausts_to_503() {
+    async fn test_streaming_embedded_error_retries_then_exhausts_to_429() {
         // 200 stream whose first frame is a `429` error envelope. onwards must
-        // retry across providers and, when exhausted, return a sanitized 503 —
-        // never the upstream 429.
+        // retry across providers and, when exhausted, return a sanitized 429.
         let error_frame =
             "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
                 .to_string();
@@ -1496,8 +1569,8 @@ mod tests {
 
         assert_eq!(
             response.status_code(),
-            503,
-            "exhausted retries must surface a sanitized 503, not the upstream 429"
+            429,
+            "exhausted retries must preserve the upstream 429"
         );
         assert_eq!(
             mock.get_requests().len(),
@@ -1543,8 +1616,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unary_embedded_error_collapses_to_503() {
-        // The same envelope on a non-streaming 200 body collapses to a 503.
+    async fn test_unary_embedded_rate_limit_preserves_429() {
+        // The same envelope on a non-streaming 200 body surfaces as a 429.
         let body = r#"{"error":{"code":429,"message":"Provider returned error"}}"#;
         let mock = MockHttpClient::new(StatusCode::OK, body);
         let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
@@ -1558,7 +1631,7 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(response.status_code(), 503);
+        assert_eq!(response.status_code(), 429);
         assert_eq!(
             mock.get_requests().len(),
             2,
@@ -1569,7 +1642,7 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_keepalive_before_error_is_still_detected() {
         // A keep-alive comment precedes the error frame; the peek must skip it
-        // and still detect the 429, retry, and exhaust to 503.
+        // and still detect the 429, retry, and exhaust to 429.
         let keepalive = ": keep-alive\n\n".to_string();
         let error_frame =
             "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
@@ -1588,7 +1661,7 @@ mod tests {
 
         assert_eq!(
             response.status_code(),
-            503,
+            429,
             "an error after a keep-alive frame must still be detected"
         );
         assert_eq!(mock.get_requests().len(), 2);

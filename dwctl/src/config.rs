@@ -1197,6 +1197,9 @@ pub struct OnwardsConfig {
     /// When false (default), all requests are passed through transparently.
     /// When true, only known OpenAI API paths are accepted and validated.
     pub strict_mode: bool,
+    /// Public message returned for upstream 429 responses, including exhausted
+    /// retries. Does not affect local request or concurrency limit messages.
+    pub upstream_rate_limit_message: String,
     /// Failover deadline for the first token of a realtime streamed response,
     /// in milliseconds. While a model still has another provider to fail over
     /// to, an attempt that hasn't produced response headers and (in strict
@@ -1211,6 +1214,9 @@ impl Default for OnwardsConfig {
     fn default() -> Self {
         Self {
             strict_mode: false,
+            upstream_rate_limit_message:
+                "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
+                    .to_string(),
             first_token_timeout_ms: 10_000,
         }
     }
