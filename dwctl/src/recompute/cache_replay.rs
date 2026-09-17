@@ -272,6 +272,10 @@ pub async fn reconstruct_split(
             body: request_body,
             api_key: None,
             principal: Some(principal),
+            // Replay verifies MODULE splits, which exist only on chat routes (blockless
+            // routes classify to zero breakpoints on the serving path, and engine-sourced
+            // rows are excluded from replay upstream of this call).
+            route_has_blocks: true,
         })
         .await?;
 

@@ -98,15 +98,16 @@ impl CacheLayerState {
 /// arrives here already translated to chat-completions, so it is covered upstream of
 /// this check.
 ///
-/// Plain `/completions` cannot create module cache entries because the chat parser does
-/// not interpret its `prompt` field (string, string-array, or token-array alike), so it
-/// finds zero breakpoints (a top-level automatic marker no-ops on a blockless body per
-/// the Anthropic rule — no 400). Unmarked requests on a tariffed model therefore take
-/// the engine-cache passthrough, and the scrub applies either way: before this layer
-/// covered `/completions`, the upstream's own `cached_tokens` leaked to customers
-/// unbilled. A body `cache_control` marker still arms the request (deterministic zeros —
-/// the one-paradigm rule); `cacheBreakpoint` is stripped and ignored on this route, so
-/// it cannot suppress implicit billing.
+/// Plain `/completions` can never touch the module cache: classification is route-gated
+/// ([`ClassifyRequest::route_has_blocks`]) to resolve tariff eligibility but always yield
+/// zero breakpoints, so even a body smuggling chat-shaped `messages`/`tools` past the
+/// router cannot create or read module entries keyed to fields the completions engine
+/// ignores. Unmarked requests on a tariffed model therefore take the engine-cache
+/// passthrough, and the scrub applies either way: before this layer covered
+/// `/completions`, the upstream's own `cached_tokens` leaked to customers unbilled. A
+/// body `cache_control` marker still arms the request (deterministic zeros — the
+/// one-paradigm rule); `cacheBreakpoint` is stripped and ignored on this route, so it
+/// cannot suppress implicit billing.
 fn is_cacheable(req: &Request) -> bool {
     // Mirrors `onwards::RequestClass::from_path`: trailing slashes trimmed, and the same
     // deliberate suffix breadth. The scrub is a leak-guard, so this layer must cover
@@ -207,11 +208,14 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // extra cost, and only on param-carrying requests (whose marker means the outbound sanitiser
     // was going to rewrite the body anyway).
     let mut body_bytes = body_bytes;
+    // Chat Completions vs the other cacheable shapes, decided once: the query param and
+    // module-cache classification are both chat-route features.
+    let chat_route = parts.uri.path().trim_end_matches('/').ends_with("/chat/completions");
     // The param is a Chat Completions feature (`super::query`'s contract): on any other
     // cacheable path — plain /completions has no blocks for the marker to bind to — it is
     // stripped from the URI (it must never leak upstream) and otherwise ignored, so it
     // cannot arm the request and suppress implicit billing.
-    if !parts.uri.path().trim_end_matches('/').ends_with("/chat/completions") {
+    if !chat_route {
         if query::breakpoint_marker(parts.uri.query()).is_ok_and(|m| m.is_some()) || query::breakpoint_marker(parts.uri.query()).is_err() {
             parts.uri = query::strip_param(&parts.uri);
             cache_metrics::record_query_breakpoint("non_chat_ignored");
@@ -284,6 +288,10 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
                     api_key: api_key.as_deref(),
                     // Serving always has the bearer token; only historical replay pre-resolves.
                     principal: None,
+                    // Module breakpoints exist only on chat routes: a /completions body
+                    // carrying chat-shaped `messages` must not create or read module
+                    // entries keyed to fields its engine ignores.
+                    route_has_blocks: chat_route,
                 })
                 .await
         })
@@ -1368,6 +1376,50 @@ mod tests {
         let v: serde_json::Value = r.json();
         assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0, "armed → explicit zeros");
         assert_eq!(v["usage"]["cache_read_input_tokens"], 0, "engine hit not billed when armed");
+    }
+
+    #[sqlx::test]
+    async fn chat_shaped_fields_in_completions_bodies_cannot_touch_the_module_cache(pool: PgPool) {
+        // The router forwards arbitrary JSON, so a /completions body can carry chat-shaped
+        // marked `messages` its engine ignores. The markers arm the request (one paradigm →
+        // deterministic zeros, engine hit not billed) and the route-gated classifier
+        // (`blockless_route_never_reaches_the_chat_parser` proves the mechanism) keeps them
+        // out of the module index — no entries to discount later requests against.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        activate_alias(&pool, user.id).await;
+        let server = completions_app(&pool);
+
+        let body = serde_json::json!({
+            "model": ALIAS, "prompt": "continue this",
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "a long static prefix the completions engine never reads",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ]}]
+        });
+        for _ in 0..2 {
+            let r = server
+                .post("/v1/completions")
+                .add_header("authorization", format!("Bearer {}", key.secret))
+                .json(&body)
+                .await;
+            r.assert_status_ok();
+            let v: serde_json::Value = r.json();
+            assert_eq!(
+                v["usage"]["cache_creation_input_tokens"], 0,
+                "no module creation from smuggled messages"
+            );
+            assert_eq!(v["usage"]["cache_read_input_tokens"], 0, "no module or engine read billed (armed)");
+            assert_eq!(
+                v["usage"]["prompt_tokens_details"]["cached_tokens"], 0,
+                "engine hit not shown when armed"
+            );
+        }
+        let entries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM prompt_cache_entries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(entries, 0, "nothing committed to the module index");
     }
 
     #[sqlx::test]
