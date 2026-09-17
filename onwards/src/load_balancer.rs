@@ -7,6 +7,7 @@
 //!
 //! Pool-level configuration (keys, rate limits) is shared across all providers.
 
+use crate::aimd::{Controller, Observation};
 use crate::auth::KeySet;
 use crate::target::{
     ConcurrencyGuard, ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter,
@@ -14,7 +15,8 @@ use crate::target::{
 };
 use rand::Rng;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::time::Instant;
 
 /// A pool of providers that share an alias, with load balancing support
 #[derive(Debug, Clone)]
@@ -31,6 +33,7 @@ pub struct ProviderPool {
     fallback: Option<FallbackConfig>,
     /// Load balancing strategy
     strategy: LoadBalanceStrategy,
+    controller: Option<Arc<Mutex<Controller>>>,
     /// Mark this pool as trusted to bypass strict mode error sanitization.
     /// When strict_mode is enabled globally AND trusted is true for a pool,
     /// error response sanitization is skipped, but success responses are still sanitized.
@@ -88,6 +91,7 @@ impl ProviderPool {
             pool_concurrency_limiter: None,
             fallback: None,
             strategy: LoadBalanceStrategy::default(),
+            controller: None,
             trusted: false,
             routing_rules: Vec::new(),
         }
@@ -105,7 +109,19 @@ impl ProviderPool {
         trusted: bool,
         routing_rules: Vec<RoutingRule>,
     ) -> Self {
+        let controller = fallback
+            .as_ref()
+            .filter(|f| f.enabled)
+            .map(|f| f.aimd.clone().unwrap_or_default())
+            .filter(|c| {
+                c.enabled
+                    && c.validate().is_ok()
+                    && strategy == LoadBalanceStrategy::Priority
+                    && providers.len() > 1
+            })
+            .map(|c| Arc::new(Mutex::new(Controller::new(c, Instant::now()))));
         Self {
+            controller,
             providers,
             keys,
             pool_limiter,
@@ -163,7 +179,53 @@ impl ProviderPool {
             max_attempts,
             attempts: 0,
             with_replacement,
+            alternate_first: false,
         }
+    }
+
+    pub(crate) fn retire_aimd(&self) {
+        if let Some(controller) = &self.controller {
+            controller.lock().unwrap().retire();
+        }
+    }
+
+    pub(crate) fn aimd_enabled(&self) -> bool {
+        self.controller.is_some()
+    }
+
+    pub(crate) fn select_iter_aimd(
+        &self,
+        eligible: bool,
+        model: &str,
+        pool: &str,
+    ) -> SelectIter<'_> {
+        let mut iter = self.select_iter();
+        if eligible && let Some(controller) = &self.controller {
+            let controller = controller.lock().unwrap();
+            if !controller.active() {
+                return iter;
+            }
+            let share = controller.share();
+            metrics::gauge!("onwards_provider_share", "model" => model.to_string(), "pool" => pool.to_string()).set(share);
+            iter.alternate_first = rand::rng().random::<f64>() >= share;
+        }
+        iter
+    }
+
+    pub(crate) fn observe(
+        &self,
+        eligible: bool,
+        member: usize,
+        model: &str,
+        pool: &str,
+        start: Instant,
+    ) -> Option<Observation> {
+        if !eligible || member != 0 {
+            return None;
+        }
+        self.controller
+            .as_ref()
+            .and_then(|c| Observation::new(c.clone(), model, pool, start))
     }
 
     /// Internal: select excluding specific provider indices
@@ -385,6 +447,35 @@ impl ProviderPool {
     /// Removed providers (not in the new pool) are simply dropped.
     /// The pool-level concurrency limiter is also preserved if present in both.
     pub fn adopt_provider_state(&mut self, old: &ProviderPool) {
+        let same_preferred = self
+            .providers
+            .first()
+            .zip(old.providers.first())
+            .is_some_and(|(a, b)| {
+                a.target.url == b.target.url
+                    && a.target.onwards_key == b.target.onwards_key
+                    && a.target.onwards_model == b.target.onwards_model
+            });
+        let same_config = self
+            .fallback
+            .as_ref()
+            .and_then(|f| f.aimd.clone())
+            .unwrap_or_default()
+            == old
+                .fallback
+                .as_ref()
+                .and_then(|f| f.aimd.clone())
+                .unwrap_or_default()
+            && self
+                .fallback
+                .as_ref()
+                .and_then(|f| f.first_token_timeout_ms)
+                == old.fallback.as_ref().and_then(|f| f.first_token_timeout_ms);
+        if self.controller.is_some() && old.controller.is_some() && same_preferred && same_config {
+            self.controller = old.controller.clone();
+        } else {
+            old.retire_aimd();
+        }
         for new_provider in &mut self.providers {
             if let Some(old_provider) = old.providers.iter().find(|old_p| {
                 old_p.target.url == new_provider.target.url
@@ -417,6 +508,7 @@ pub struct SelectIter<'a> {
     max_attempts: usize,
     attempts: usize,
     with_replacement: bool,
+    alternate_first: bool,
 }
 
 impl<'a> Iterator for SelectIter<'a> {
@@ -443,7 +535,12 @@ impl<'a> Iterator for SelectIter<'a> {
         // When `excluded` is already empty there is nothing to re-include, so a
         // `None` there means an empty pool or every provider at capacity: end the
         // iterator rather than re-running the same scan.
-        let result = match self.pool.select_excluding(&self.excluded) {
+        let first_override = if self.attempts == 1 && self.alternate_first {
+            self.pool.select_priority(&HashSet::from([0]))
+        } else {
+            None
+        };
+        let result = match first_override.or_else(|| self.pool.select_excluding(&self.excluded)) {
             Some(result) => result,
             None if self.excluded.is_empty() => return None,
             None => {
@@ -476,6 +573,194 @@ mod tests {
 
     fn create_test_target(url: &str) -> Target {
         Target::builder().url(url.parse().unwrap()).build()
+    }
+
+    fn aimd_pool() -> ProviderPool {
+        let config = crate::aimd::AimdConfig {
+            enabled: true,
+            latency_budget_ms: 100,
+            breach_rate_target: 0.2,
+            window_samples: 10,
+            min_samples: 2,
+            share_step: 0.1,
+            share_decay: 0.5,
+            share_floor: 0.1,
+            dwell_ms: 1,
+        };
+        ProviderPool::with_config(
+            vec![
+                Provider::new(create_test_target("https://preferred.example"), 1),
+                Provider::with_concurrency_limit(
+                    create_test_target("https://alternate.example"),
+                    1,
+                    1,
+                ),
+            ],
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                first_token_timeout_ms: Some(0),
+                aimd: Some(config),
+                max_attempts: Some(4),
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::Priority,
+            false,
+            vec![],
+        )
+    }
+
+    #[test]
+    fn aimd_is_default_on_only_for_eligible_pools_and_has_explicit_opt_out() {
+        let make = |strategy, providers, fallback| {
+            ProviderPool::with_config(
+                providers,
+                None,
+                None,
+                None,
+                Some(fallback),
+                strategy,
+                false,
+                vec![],
+            )
+        };
+        let providers = aimd_pool().providers;
+        let default_fallback = FallbackConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(
+            make(
+                LoadBalanceStrategy::Priority,
+                providers.clone(),
+                default_fallback.clone()
+            )
+            .aimd_enabled()
+        );
+        assert!(
+            !make(
+                LoadBalanceStrategy::WeightedRandom,
+                providers.clone(),
+                default_fallback.clone()
+            )
+            .aimd_enabled()
+        );
+        assert!(
+            !make(
+                LoadBalanceStrategy::Priority,
+                vec![providers[0].clone()],
+                default_fallback
+            )
+            .aimd_enabled()
+        );
+        assert!(
+            !make(
+                LoadBalanceStrategy::Priority,
+                providers.clone(),
+                FallbackConfig::default()
+            )
+            .aimd_enabled()
+        );
+        let disabled =
+            serde_json::from_value(serde_json::json!({"enabled":true,"aimd":{"enabled":false}}))
+                .unwrap();
+        assert!(!make(LoadBalanceStrategy::Priority, providers, disabled).aimd_enabled());
+    }
+
+    #[test]
+    fn aimd_first_override_preserves_cascade_and_guards() {
+        let pool = aimd_pool();
+        let mut iter = pool.select_iter();
+        iter.alternate_first = true;
+        let indices: Vec<_> = iter.map(|(index, _, _guard)| index).collect();
+        assert_eq!(indices, [1, 0, 0, 1]);
+        assert!(pool.providers.iter().all(|p| p.active_connections() == 0));
+        let held = pool.providers[1].limiter.try_acquire().unwrap();
+        let mut iter = pool.select_iter();
+        iter.alternate_first = true;
+        assert_eq!(iter.next().unwrap().0, 0); // unavailable alternate falls back to preferred
+        drop(held);
+    }
+
+    #[test]
+    fn aimd_reload_preserves_inherited_and_explicit_default_equivalence() {
+        let mut old = aimd_pool();
+        old.fallback.as_mut().unwrap().aimd = None;
+        let mut new = old.clone();
+        new.fallback.as_mut().unwrap().aimd = Some(crate::aimd::AimdConfig::default());
+        new.adopt_provider_state(&old);
+        assert!(Arc::ptr_eq(
+            new.controller.as_ref().unwrap(),
+            old.controller.as_ref().unwrap()
+        ));
+        assert!(old.controller.as_ref().unwrap().lock().unwrap().active());
+    }
+
+    #[test]
+    fn aimd_reload_adopts_only_same_preferred_and_configuration() {
+        let old = aimd_pool();
+        let mut new = aimd_pool();
+        new.adopt_provider_state(&old);
+        assert!(Arc::ptr_eq(
+            new.controller.as_ref().unwrap(),
+            old.controller.as_ref().unwrap()
+        ));
+        let mut reordered = aimd_pool();
+        reordered.providers.swap(0, 1);
+        reordered.adopt_provider_state(&old);
+        assert!(!Arc::ptr_eq(
+            reordered.controller.as_ref().unwrap(),
+            old.controller.as_ref().unwrap()
+        ));
+        assert!(!old.controller.as_ref().unwrap().lock().unwrap().active());
+        assert!(
+            reordered
+                .controller
+                .as_ref()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .active()
+        );
+        assert!(
+            old.observe(true, 0, "model", "default", Instant::now())
+                .is_none()
+        );
+        let mut changed = aimd_pool();
+        changed
+            .fallback
+            .as_mut()
+            .unwrap()
+            .aimd
+            .as_mut()
+            .unwrap()
+            .dwell_ms = 2;
+        changed.adopt_provider_state(&old);
+        assert!(!Arc::ptr_eq(
+            changed.controller.as_ref().unwrap(),
+            old.controller.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            old.clone().controller.as_ref().unwrap(),
+            old.controller.as_ref().unwrap()
+        ));
+        assert!(
+            old.observe(true, 1, "model", "default", Instant::now())
+                .is_none()
+        );
+        assert!(
+            old.observe(false, 0, "model", "default", Instant::now())
+                .is_none()
+        );
+        assert_eq!(
+            old.select_iter_aimd(false, "model", "default")
+                .next()
+                .unwrap()
+                .0,
+            0
+        );
     }
 
     #[test]

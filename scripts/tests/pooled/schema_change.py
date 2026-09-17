@@ -111,6 +111,27 @@ def verify_models_schema_change(app, direct):
             ), f"model update failed: {response.status_code} {response.text[:300]}"
             assert response.json()["description"] == "schema compatibility"
 
+    def aimd_settings():
+        alias = "schema-aimd-" + uuid.uuid4().hex
+        settings = {"enabled": True, "latency_budget_ms": 100, "breach_rate_target": 0.1,
+                    "window_samples": 20, "min_samples": 5, "share_step": 0.05,
+                    "share_decay": 0.5, "share_floor": 0.1, "dwell_ms": 1000}
+        response = session.post(base + "/admin/api/v1/models", json={
+            "type": "composite", "model_name": alias, "alias": alias,
+            "lb_strategy": "priority", "fallback_enabled": True,
+            "first_token_timeout_ms": 200, "aimd": settings}, timeout=20)
+        response.raise_for_status()
+        model = response.json()
+        assert model["fallback"]["aimd"] == settings
+        path = base + "/admin/api/v1/models/" + model["id"]
+        response = session.patch(path, json={"aimd": None, "first_token_timeout_ms": None}, timeout=20)
+        response.raise_for_status()
+        response = session.get(path, timeout=20)
+        response.raise_for_status()
+        assert response.json()["fallback"].get("aimd") is None
+        assert response.json()["fallback"].get("first_token_timeout_ms") is None
+
+    aimd_settings()
     writes()
     before = listings()
     direct.execute(
@@ -119,6 +140,7 @@ def verify_models_schema_change(app, direct):
     try:
         assert listings() == before, "additive DDL changed the models API response"
         writes()
+        aimd_settings()
         before_restart = listings()
         app.stop(strict=True)
         # Keep PgBouncer and its PostgreSQL connections running across the restart.
@@ -127,6 +149,7 @@ def verify_models_schema_change(app, direct):
             listings() == before_restart
         ), "new application client failed after additive DDL"
         writes()
+        aimd_settings()
     finally:
         app.stop()
         direct.execute(

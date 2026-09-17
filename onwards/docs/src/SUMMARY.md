@@ -24,3 +24,4 @@
 # Development
 
 - [Contributing](contributing.md)
+- [Load-Aware Failover (design)](load-aware-failover.md)

@@ -798,6 +798,45 @@ clay:
     }
 
     #[sqlx::test]
+    async fn catalog_reconciles_incompatible_aimd_overrides(pool: PgPool) {
+        sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
+            .execute(&pool).await.unwrap();
+        let directory = tempdir().unwrap();
+        let weighted = catalog_yaml("0.50", false, "0.1");
+        let priority = weighted.replace("  routing:\n", "  routing:\n    strategy: priority\n");
+        write(directory.path(), "model.yaml", &priority);
+        let catalog = Catalog::load(directory.path()).unwrap();
+        apply(&pool, &catalog).await.unwrap();
+        let config = serde_json::to_value(crate::db::models::deployments::AimdConfig::default()).unwrap();
+        sqlx::query("UPDATE deployed_models SET aimd = $1, first_token_timeout_ms = 10000, lb_strategy = 'priority', fallback_enabled = true WHERE alias = 'org/model'")
+            .bind(&config).execute(&pool).await.unwrap();
+        apply(&pool, &catalog).await.unwrap();
+        let preserved: Option<serde_json::Value> = sqlx::query_scalar("SELECT aimd FROM deployed_models WHERE alias = 'org/model'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(preserved, Some(config));
+        write(directory.path(), "model.yaml", &weighted);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        let cleared: (Option<serde_json::Value>, Option<i64>) =
+            sqlx::query_as("SELECT aimd, first_token_timeout_ms FROM deployed_models WHERE alias = 'org/model'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cleared, (None, Some(10000)));
+        sqlx::query("UPDATE deployed_models SET aimd = '{\"enabled\":false}'::jsonb WHERE alias = 'org/model'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        let disabled: Option<serde_json::Value> = sqlx::query_scalar("SELECT aimd FROM deployed_models WHERE alias = 'org/model'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(disabled, Some(serde_json::json!({"enabled":false})));
+    }
+
+    #[sqlx::test]
     async fn startup_apply_is_idempotent_and_versions_tariffs(pool: PgPool) {
         sqlx::query(
             "INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')",
