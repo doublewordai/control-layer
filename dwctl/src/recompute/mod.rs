@@ -321,8 +321,12 @@ pub async fn recompute_corpus(
                 continue;
             }
 
+            // The stored endpoint is the caller's pre-translation path, so the rule is
+            // "not plain completions" (a /v1/messages or /v1/responses row DID have
+            // module blocks — it reached the cache layer as chat completions).
+            let route_has_blocks = !crate::prompt_cache::path_is_plain_completions(&exchange.endpoint);
             let historical = base.with_index(std::sync::Arc::new(cache_replay::HistoricalIndex::new(pool.clone(), row.timestamp)));
-            match cache_replay::reconstruct_split(&historical, model, body, principal, row.timestamp).await {
+            match cache_replay::reconstruct_split(&historical, model, body, principal, row.timestamp, route_has_blocks).await {
                 Ok(Some(split)) => {
                     report_row.reconstructed_cache = Some(report::ReconstructedCache::compare(&split, row));
                 }

@@ -159,6 +159,7 @@ pub mod keystore;
 mod leader_election;
 pub mod limits;
 mod metrics;
+pub mod migrations;
 pub mod model_provisioning;
 mod notifications;
 mod openapi;
@@ -415,6 +416,13 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                     SUBMISSION_LATENCY_BUCKETS,
                 )
                 .expect("Failed to set custom buckets for fusillade_request_pickup_delay_seconds")
+                // Without buckets the first-token latency renders as a per-process
+                // summary, whose quantiles cannot be aggregated across replicas.
+                .set_buckets_for_metric(
+                    Matcher::Full("onwards_first_token_seconds".to_string()),
+                    onwards::FIRST_TOKEN_SECONDS_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for onwards_first_token_seconds")
                 .install_recorder()
                 .expect("Failed to install Prometheus recorder");
             initialize_database_error_metrics();
@@ -605,6 +613,8 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             backoff_factor: 2.0,
                             backoff_jitter: Default::default(),
                             backoff_max_total_ms: None,
+                            first_token_timeout_ms: None,
+                            aimd: None,
                             traffic_routing_rules: None,
                             allowed_batch_completion_windows: None,
                             metadata: None,
@@ -659,7 +669,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
 /// set at the connection level (via `PgConnectOptions::options`) rather than
 /// with an `after_connect` hook, so it cannot be unset and works with replicas.
 /// Eager connection (`connect_with`) so `min_connections` is honoured at boot.
-async fn create_schema_pool(
+pub(crate) async fn create_schema_pool(
     schema: &str,
     opts: sqlx::postgres::PgConnectOptions,
     settings: &config::PoolSettings,
@@ -669,7 +679,7 @@ async fn create_schema_pool(
     db::pool_options(settings).connect_with(opts_with_schema).await
 }
 
-fn connect_options(url: &str, slow_threshold: std::time::Duration) -> anyhow::Result<PgConnectOptions> {
+pub(crate) fn connect_options(url: &str, slow_threshold: std::time::Duration) -> anyhow::Result<PgConnectOptions> {
     Ok(PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold))
 }
 
@@ -704,7 +714,7 @@ async fn verify_schema_on_default_search_path(component_name: &str, schema: &str
 /// creating schemas or migrating. Names, catalog OIDs and system identifiers can
 /// survive cloning; contention on a fresh database-scoped lock cannot. Both locks
 /// are transaction scoped so errors and cancellation cannot leak session locks.
-async fn verify_same_live_database(component_name: &str, main: &PgPool, component: &PgPool) -> anyhow::Result<()> {
+pub(crate) async fn verify_same_live_database(component_name: &str, main: &PgPool, component: &PgPool) -> anyhow::Result<()> {
     let challenge = Uuid::new_v4().as_u128() as i64;
     let mut main_transaction = main.begin().await?;
     let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
@@ -790,6 +800,26 @@ mod pooled_schema_tests {
         );
     }
 
+    /// `migrations.mode: check` must not create a missing component schema.
+    #[sqlx::test(migrations = false)]
+    async fn check_mode_reports_a_missing_schema_instead_of_creating_it(pool: PgPool) {
+        let component = serde_json::from_value(serde_json::json!({"mode": "schema", "name": "fusillade_missing"})).unwrap();
+        let main = db::PoolPair::unsplit(DbPools::new(pool.clone()));
+        let err = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'fusillade_missing')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!exists, "check mode executed DDL");
+        setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true)
+            .await
+            .unwrap();
+    }
+
     #[sqlx::test(migrations = false)]
     async fn pooled_fusillade_defaults_to_role_schema_validation(pool: PgPool) {
         let mut endpoint = pool.connect_options().to_url_lossy();
@@ -800,7 +830,7 @@ mod pooled_schema_tests {
         }))
         .unwrap();
         let main = db::PoolPair::unsplit(DbPools::new(pool));
-        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
         assert!(
             result.is_err(),
             "role_default must reject a shared login whose default schema is public"
@@ -823,7 +853,7 @@ mod pooled_schema_tests {
                     .unwrap(),
             ),
         };
-        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
         assert!(
             result.is_err(),
             "explicit direct credentials must not inherit main pooled credentials"
@@ -838,7 +868,7 @@ mod pooled_schema_tests {
         .unwrap();
         let main = db::PoolPair::unsplit(DbPools::new(pool));
         assert!(
-            setup_component_pools("outlet", &component, &main, std::time::Duration::from_secs(1))
+            setup_component_pools("outlet", &component, &main, std::time::Duration::from_secs(1), true)
                 .await
                 .is_err()
         );
@@ -856,7 +886,7 @@ mod pooled_schema_tests {
         }))
         .unwrap();
         let main = db::PoolPair::unsplit(DbPools::new(pool.clone()));
-        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
         // Clean up even on a failed assertion against the old implementation.
         let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
             .bind(&schema)
@@ -889,7 +919,7 @@ mod pooled_schema_tests {
             "mode": "schema", "name": "fusillade", "url": endpoint.as_str()
         }))
         .unwrap();
-        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
         let (identity, has_replica) = match result {
             Ok(pair) => {
                 let identity: String = sqlx::query_scalar("SELECT current_user")
@@ -941,7 +971,7 @@ mod pooled_schema_tests {
         }))
         .unwrap();
         let main = db::PoolPair::unsplit(DbPools::new(pool.clone()));
-        let pair = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1))
+        let pair = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true)
             .await
             .unwrap();
         assert!(
@@ -1056,11 +1086,15 @@ mod pooled_schema_tests {
 /// role schema; Fusillade also supports explicit transaction mode. Dedicated mode has its
 /// own `url` and optional `pooled_url`. Without a pooled endpoint, the pair is
 /// unsplit and sized by `pool`, preserving the existing connection behavior.
+///
+/// `create_schema` is false in `migrations.mode: check`, where startup must not
+/// execute DDL: a missing component schema is reported instead of created.
 async fn setup_component_pools(
     component_name: &str,
     component: &config::ComponentDb,
     main: &db::PoolPair,
     slow_threshold: std::time::Duration,
+    create_schema: bool,
 ) -> anyhow::Result<db::PoolPair> {
     component
         .validate_schema_pooling(component_name, main.is_split())
@@ -1096,6 +1130,9 @@ async fn setup_component_pools(
                 .bind(name)
                 .fetch_one(&direct)
                 .await?;
+            if !schema_exists && !create_schema {
+                anyhow::bail!("{component_name}: schema `{name}` does not exist and migrations.mode is `check`; run `dwctl migrate` first");
+            }
             if !schema_exists {
                 direct
                     .execute(&*format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", name.replace('"', "\"\"")))
@@ -1325,7 +1362,7 @@ async fn setup_database(
             .await
             .expect("Failed to create TestDbPools");
         let replica_pool = test_pools.read().into_inner();
-        migrator().run(&existing_pool).await?;
+        migrations::at_startup(config.migrations.mode, &migrations::Target::main(), &existing_pool).await?;
         (None, db::PoolPair::unsplit(DbPools::with_replica(existing_pool, replica_pool)))
     } else {
         // Database connection - handle both embedded and external
@@ -1369,8 +1406,10 @@ async fn setup_database(
             .connect_with(connect_options(&database_url, slow_threshold)?)
             .await?;
 
-        // Migrations take a session-level advisory lock: always a direct connection.
-        migrator().run(&direct).await?;
+        // Migrations take a session-level advisory lock: always a direct
+        // connection. `migrations.mode` decides whether this process applies
+        // them or only verifies the schema is compatible.
+        migrations::at_startup(config.migrations.mode, &migrations::Target::main(), &direct).await?;
 
         let replica = match config.database.external_replica_url() {
             Some(replica_url) => {
@@ -1423,9 +1462,16 @@ async fn setup_database(
 
     // Fusillade batch processing pools
     info!("Setting up fusillade batch processing pool");
-    let fusillade = setup_component_pools("fusillade", config.database.fusillade(), &main, slow_threshold).await?;
+    let fusillade = setup_component_pools(
+        "fusillade",
+        config.database.fusillade(),
+        &main,
+        slow_threshold,
+        config.migrations.mode == config::MigrationsMode::Run,
+    )
+    .await?;
     // sqlx's migrator holds a session advisory lock: direct connections.
-    fusillade_arsenal::migrator().run(&*fusillade.direct.write()).await?;
+    migrations::at_startup(config.migrations.mode, &migrations::Target::fusillade(), &fusillade.direct.write()).await?;
 
     // Every batch-capable process performs the content-free preflight, even
     // when its daemon is disabled. That makes disabling the last archive
@@ -1434,124 +1480,11 @@ async fn setup_database(
     let daemon = &config.background_services.batch_daemon;
     let batch_capable = !matches!(daemon.mode, config::DaemonMode::RequestOnly);
     let partition_maintenance_pool = if batch_capable {
-        let (unfinished_retirements, identity_mismatch, retired_routes_exist): (i64, bool, bool) = sqlx::query_as(
-            r#"
-            SELECT
-                (SELECT COUNT(*)::bigint
-                 FROM retention_partition_retirements
-                 WHERE completed_at IS NULL),
-                EXISTS (
-                    SELECT 1
-                    FROM retained_response_buckets bucket
-                    WHERE bucket.state IN ('retiring', 'retired')
-                      AND NOT (
-                        (bucket.state = 'retiring' AND EXISTS (
-                            SELECT 1
-                            FROM retention_partition_retirements journal
-                            JOIN pg_namespace namespace
-                              ON namespace.nspname = bucket.partition_schema
-                             AND namespace.oid = journal.partition_schema_oid
-                            JOIN pg_class parent
-                              ON parent.relnamespace = namespace.oid
-                             AND parent.relname = 'retained_response_objects'
-                             AND parent.oid = journal.parent_oid
-                            JOIN pg_class child
-                              ON child.relnamespace = namespace.oid
-                             AND child.relname = bucket.partition_table
-                             AND child.oid = bucket.partition_oid
-                            WHERE journal.parent_table = 'retained_response_objects'
-                              AND journal.partition_schema = bucket.partition_schema
-                              AND journal.partition_table = bucket.partition_table
-                              AND journal.partition_oid = bucket.partition_oid
-                              AND journal.lower_bound = bucket.delete_on
-                              AND journal.upper_bound = bucket.delete_on + 1
-                              AND journal.completed_at IS NULL
-                              AND bucket.partition_schema = current_schema()
-                              AND bucket.partition_table =
-                                  'retained_response_objects_d'
-                                  || to_char(bucket.delete_on, 'YYYYMMDD')
-                        )) OR (bucket.state = 'retired' AND EXISTS (
-                            SELECT 1
-                            FROM retention_partition_retirements journal
-                            JOIN pg_namespace namespace
-                              ON namespace.nspname = bucket.partition_schema
-                             AND namespace.oid = journal.partition_schema_oid
-                            JOIN pg_class parent
-                              ON parent.relnamespace = namespace.oid
-                             AND parent.relname = 'retained_response_objects'
-                             AND parent.oid = journal.parent_oid
-                            WHERE journal.parent_table = 'retained_response_objects'
-                              AND journal.partition_schema = bucket.partition_schema
-                              AND journal.partition_table = bucket.partition_table
-                              AND journal.partition_oid = bucket.partition_oid
-                              AND journal.lower_bound = bucket.delete_on
-                              AND journal.upper_bound = bucket.delete_on + 1
-                              AND journal.completed_at = bucket.state_changed_at
-                              AND bucket.partition_schema = current_schema()
-                              AND bucket.partition_table =
-                                  'retained_response_objects_d'
-                                  || to_char(bucket.delete_on, 'YYYYMMDD')
-                              AND NOT EXISTS (
-                                  SELECT 1 FROM pg_class child
-                                  WHERE child.oid = bucket.partition_oid
-                              )
-                        ))
-                      )
-                ) OR EXISTS (
-                    SELECT 1
-                    FROM retention_partition_retirements journal
-                    WHERE journal.parent_table = 'retained_response_objects'
-                      AND journal.completed_at IS NULL
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM retained_response_buckets bucket
-                          JOIN pg_namespace namespace
-                            ON namespace.nspname = bucket.partition_schema
-                           AND namespace.oid = journal.partition_schema_oid
-                          JOIN pg_class parent
-                            ON parent.relnamespace = namespace.oid
-                           AND parent.relname = 'retained_response_objects'
-                           AND parent.oid = journal.parent_oid
-                          JOIN pg_class child
-                            ON child.relnamespace = namespace.oid
-                           AND child.relname = bucket.partition_table
-                           AND child.oid = bucket.partition_oid
-                          WHERE bucket.state = 'retiring'
-                            AND bucket.partition_schema = journal.partition_schema
-                            AND bucket.partition_table = journal.partition_table
-                            AND bucket.partition_oid = journal.partition_oid
-                            AND bucket.delete_on = journal.lower_bound
-                            AND journal.upper_bound = journal.lower_bound + 1
-                            AND bucket.partition_schema = current_schema()
-                            AND bucket.partition_table =
-                                'retained_response_objects_d'
-                                || to_char(bucket.delete_on, 'YYYYMMDD')
-                      )
-                ),
-                EXISTS (
-                    SELECT 1 FROM retained_response_buckets bucket
-                    JOIN retention_partition_retirements journal
-                      ON journal.parent_table = 'retained_response_objects'
-                     AND journal.partition_schema = bucket.partition_schema
-                     AND journal.partition_table = bucket.partition_table
-                     AND journal.partition_oid = bucket.partition_oid
-                     AND journal.lower_bound = bucket.delete_on
-                     AND journal.upper_bound = bucket.delete_on + 1
-                     AND journal.completed_at = bucket.state_changed_at
-                    WHERE bucket.state = 'retired'
-                      AND journal.completed_at IS NOT NULL
-                      AND (
-                          EXISTS (SELECT 1 FROM retained_response_group_routes route
-                                  WHERE route.delete_on = bucket.delete_on)
-                          OR EXISTS (SELECT 1 FROM retained_response_request_routes route
-                                     WHERE route.delete_on = bucket.delete_on)
-                      )
-                )
-            "#,
-        )
-        .fetch_one(fusillade.direct.write())
-        .await
-        .map_err(|error| anyhow::anyhow!("failed to inspect retained-response retirement recovery state: {error}"))?;
+        let (unfinished_retirements, identity_mismatch, retired_routes_exist): (i64, bool, bool) =
+            sqlx::query_as(include_str!("retention_preflight.sql"))
+                .fetch_one(fusillade.direct.write())
+                .await
+                .map_err(|error| anyhow::anyhow!("failed to inspect retained-response retirement recovery state: {error}"))?;
         let required = partition_maintenance_required(
             daemon,
             RetainedResponseMaintenanceState {
@@ -1600,13 +1533,20 @@ async fn setup_database(
 
     // Underway migrations (background task queue) — one transaction, but keep
     // them on the direct connection like every other migration.
-    underway::run_migrations(&*main.direct.write()).await?;
+    migrations::underway_at_startup(config.migrations.mode, &main.direct.write()).await?;
 
     // Outlet request-logging pools, if enabled
     let outlet = if config.enable_request_logging {
         info!("Setting up outlet request logging pool (logging enabled)");
-        let outlet = setup_component_pools("outlet", config.database.outlet(), &main, slow_threshold).await?;
-        outlet_postgres::migrator().run(&*outlet.direct.write()).await?;
+        let outlet = setup_component_pools(
+            "outlet",
+            config.database.outlet(),
+            &main,
+            slow_threshold,
+            config.migrations.mode == config::MigrationsMode::Run,
+        )
+        .await?;
+        migrations::at_startup(config.migrations.mode, &migrations::Target::outlet(), &outlet.direct.write()).await?;
         Some(outlet)
     } else {
         info!("Skipping outlet pool setup (logging disabled)");
@@ -4128,6 +4068,15 @@ impl Application {
             fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
         )
         .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
+        .with_realtime_retention_seconds(
+            config
+                .background_services
+                .batch_daemon
+                .retention
+                .batchless_seconds_by_service_tier
+                .get("priority")
+                .copied(),
+        )
         .with_retained_response_retention_bounds_seconds(
             config
                 .background_services
@@ -4334,6 +4283,7 @@ impl Application {
         // `outbound_request` middleware, so onwards needs no BodyTransformFn.
         let mut onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
+            .with_upstream_rate_limit_message(config.onwards.upstream_rate_limit_message.clone())
             .with_response_id_header("x-fusillade-request-id")
             .with_body_limit(onwards_body_limit)
             // The fusillade daemon stamps every request it dispatches (file

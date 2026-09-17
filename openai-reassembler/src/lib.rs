@@ -29,6 +29,44 @@
 
 use serde_json::{Map, Value};
 
+/// Protocol-independent evidence used to decide whether a chat completion
+/// stopped after producing reasoning but before producing a usable answer.
+///
+/// Callers feed this from whatever representation they already have. The
+/// reassembler derives it from its already-merged response values; downstream
+/// consumers can update it from typed values without parsing bodies again.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompletionEvidence {
+    stopped: bool,
+    has_reasoning: bool,
+    has_answer: bool,
+    has_tool_call: bool,
+}
+
+impl CompletionEvidence {
+    /// Fold one observation into the completion's accumulated evidence.
+    pub fn observe(
+        &mut self,
+        finish_reason: Option<&str>,
+        has_reasoning: bool,
+        has_answer: bool,
+        has_tool_call: bool,
+    ) {
+        if let Some(reason) = finish_reason {
+            self.stopped = reason == "stop";
+        }
+        self.has_reasoning |= has_reasoning;
+        self.has_answer |= has_answer;
+        self.has_tool_call |= has_tool_call;
+    }
+
+    /// Whether this is the premature end-of-sequence shape that should not be
+    /// treated as a successful, billable completion.
+    pub fn is_reasoning_without_answer(&self) -> bool {
+        self.stopped && self.has_reasoning && !self.has_answer && !self.has_tool_call
+    }
+}
+
 /// Incremental accumulator for an OpenAI-compatible SSE stream.
 ///
 /// Folds each event into the assembled response as it arrives, so the caller
@@ -191,6 +229,45 @@ impl Reassembler {
                 }
             }
         }
+    }
+
+    /// Whether any reassembled chat choice ended after reasoning without an
+    /// answer or tool call. This reads state collected during `push`; it does
+    /// not parse the assembled response.
+    pub fn is_reasoning_without_answer(&self) -> bool {
+        !self.is_responses_api
+            && self.choices.values().any(|choice| {
+                let Some(message) = choice.get("message").and_then(Value::as_object) else {
+                    return false;
+                };
+                let has_reasoning = ["reasoning_content", "reasoning"].iter().any(|key| {
+                    message
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                });
+                let has_answer = message.get("content").is_some_and(|content| match content {
+                    Value::Null => false,
+                    Value::String(text) => !text.is_empty(),
+                    _ => true,
+                });
+                let has_tool_call = message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| !calls.is_empty())
+                    || message
+                        .get("function_call")
+                        .is_some_and(|call| !call.is_null());
+
+                let mut evidence = CompletionEvidence::default();
+                evidence.observe(
+                    choice.get("finish_reason").and_then(Value::as_str),
+                    has_reasoning,
+                    has_answer,
+                    has_tool_call,
+                );
+                evidence.is_reasoning_without_answer()
+            })
     }
 
     /// Assemble the accumulated state into a non-streaming response body.
@@ -797,6 +874,46 @@ mod tests {
         let message = &result["choices"][0]["message"];
         assert_eq!(message["role"], "assistant");
         assert_eq!(message["content"], "Hello world!");
+    }
+
+    #[test]
+    fn completion_evidence_requires_reasoning_without_answer_or_tool() {
+        let mut failed = CompletionEvidence::default();
+        failed.observe(None, true, false, false);
+        failed.observe(Some("stop"), false, false, false);
+        assert!(failed.is_reasoning_without_answer());
+
+        let mut answered = failed.clone();
+        answered.observe(None, false, true, false);
+        assert!(!answered.is_reasoning_without_answer());
+
+        let mut tool_call = failed;
+        tool_call.observe(None, false, false, true);
+        assert!(!tool_call.is_reasoning_without_answer());
+
+        let mut capped = CompletionEvidence::default();
+        capped.observe(Some("length"), true, false, false);
+        assert!(!capped.is_reasoning_without_answer());
+    }
+
+    #[test]
+    fn reassembler_classifies_from_its_existing_chunk_parse() {
+        let events = [
+            ev(
+                "",
+                r#"{"id":"1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"reasoning_content":"thinking"}}]}"#,
+            ),
+            ev(
+                "",
+                r#"{"id":"1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+            ),
+        ];
+        let mut reassembler = Reassembler::new();
+        for event in &events {
+            reassembler.push(event);
+        }
+
+        assert!(reassembler.is_reasoning_without_answer());
     }
 
     /// Build an event with the given type and data.

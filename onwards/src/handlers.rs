@@ -83,8 +83,13 @@ enum SseEventKind {
     /// A `data:` frame carrying an embedded provider error — the contained
     /// `error.code`, per [`embedded_error_status`].
     Error(u16, serde_json::Value),
-    /// A `data:` frame carrying normal content (or the `[DONE]` sentinel).
+    /// A non-sentinel `data:` frame (possibly metadata rather than generated text).
     Data,
+    /// The `[DONE]` sentinel. A `data:` frame, but not a token: it ends a
+    /// stream rather than carrying content. Decisive like [`SseEventKind::Data`]
+    /// and equally proof the stream was not empty, but it must never be counted
+    /// as a first token.
+    Done,
     /// No `data:` field: an SSE comment / keep-alive (e.g. `: keep-alive`), which
     /// the caller peeks past to reach the first real frame.
     Comment,
@@ -119,7 +124,7 @@ fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
         return SseEventKind::Comment;
     }
     if data.trim() == "[DONE]" {
-        return SseEventKind::Data;
+        return SseEventKind::Done;
     }
     if let Ok(body) = serde_json::from_str::<serde_json::Value>(data.trim())
         && let Some(status) = embedded_error_status(&body)
@@ -145,8 +150,15 @@ fn requests_stream(body: &[u8]) -> bool {
 struct LeadFrames {
     /// The provider embedded an error status in the first real frame.
     embedded: Option<(u16, serde_json::Value)>,
-    /// A real content frame arrived (definitely not empty).
+    /// A `data:` frame arrived, so the stream is definitely not empty. Set for
+    /// the `[DONE]` sentinel too: it proves non-emptiness even though it carries
+    /// no token. This is what suppresses the retryable `EmptyBody` verdict, so
+    /// it must stay set for `[DONE]`.
     saw_data: bool,
+    /// A data frame carrying actual content arrived — `[DONE]` excluded. This,
+    /// not `saw_data`, is the first-token signal: a zero-token stream can open
+    /// with `[DONE]`.
+    saw_content: bool,
     /// The stream closed (`None`) or errored (`Err`) before any content — a
     /// *terminal* empty, safe to retry.
     stream_ended: bool,
@@ -175,6 +187,15 @@ async fn read_lead_frames<S, E>(
                     return;
                 }
                 SseEventKind::Data => {
+                    lead.saw_data = true;
+                    lead.saw_content = true;
+                    peeked.push(Ok(chunk));
+                    return;
+                }
+                // Decisive exactly as `Data` is — it ends the peek and marks the
+                // stream non-empty — but it is not a first token, so it leaves
+                // `saw_content` alone.
+                SseEventKind::Done => {
                     lead.saw_data = true;
                     peeked.push(Ok(chunk));
                     return;
@@ -878,6 +899,14 @@ pub async fn target_message_handler<T: HttpClient>(
     // headers only arrive once the whole completion is done, so a deadline
     // would cut off legitimately long answers. So is traffic carrying the
     // configured exempt header (e.g. batch dispatch, which runs its own retries).
+    // Realtime traffic is everything the batch dispatcher did not stamp with
+    // the exempt header. Only realtime gets the first-token deadline, AIMD
+    // observation and the realtime-only fallback statuses: dispatched traffic
+    // tolerates latency and runs its own retries.
+    let is_realtime = !state
+        .first_token_timeout_exempt_header
+        .as_deref()
+        .is_some_and(|header| original_headers.contains_key(header));
     let first_token_timeout = pool
         .fallback()
         .filter(|f| f.enabled)
@@ -887,16 +916,24 @@ pub async fn target_message_handler<T: HttpClient>(
                 .or(state.first_token_timeout)
         })
         .filter(|timeout| {
-            !timeout.is_zero()
-                && pool.len() > 1
-                && !state
-                    .first_token_timeout_exempt_header
-                    .as_deref()
-                    .is_some_and(|header| original_headers.contains_key(header))
-                && requests_stream(&body_bytes)
+            !timeout.is_zero() && pool.len() > 1 && is_realtime && requests_stream(&body_bytes)
         });
+    // A status triggers failover when the pool lists it, or when it is one of
+    // the pool's realtime-only fallback statuses and this request is realtime.
+    let fails_over_on = |status: u16| {
+        if is_realtime {
+            pool.should_fallback_on_realtime_status(status)
+        } else {
+            pool.should_fallback_on_status(status)
+        }
+    };
 
-    for (_member_idx, target, connection_guard) in pool.select_iter() {
+    // Unsupported traffic keeps ordinary routing and contributes no observations.
+    let aimd_eligible = pool.aimd_enabled()
+        && state.targets.strict_mode
+        && requests_stream(&body_bytes)
+        && is_realtime;
+    for (member_idx, target, connection_guard) in pool.select_iter_aimd(aimd_eligible, &model_name, resolved_pool_name.unwrap_or("default")) {
         // A self-hosted-only account never reaches an external member: the
         // composite's eligible set is narrowed to its non-external providers
         // for this request, whatever the alias's own failover list says. The
@@ -917,10 +954,21 @@ pub async fn target_message_handler<T: HttpClient>(
         }
         any_attempted = true;
         attempt_number += 1;
+        // First-token observations are attributed to the provider actually
+        // tried: `preferred` is the pool's first provider in definition order,
+        // anything else is an alternate. Two values, so the label stays bounded
+        // on a recorder that deliberately never evicts series.
+        let provider_role = if member_idx == 0 {
+            "preferred"
+        } else {
+            "alternate"
+        };
+        let attempt_start = tokio::time::Instant::now();
+        let observation = pool.observe(aimd_eligible, member_idx, &model_name, resolved_pool_name.unwrap_or("default"), attempt_start);
         // This attempt's first-frame deadline; `None` on the final attempt.
         let first_token_deadline = first_token_timeout
             .filter(|_| (attempt_number as usize) < pool_max_attempts)
-            .map(|timeout| tokio::time::Instant::now() + timeout);
+            .map(|timeout| attempt_start + timeout);
 
         let attempt_span = tracing::info_span!(
             "onwards.provider_attempt",
@@ -1235,6 +1283,17 @@ pub async fn target_message_handler<T: HttpClient>(
                 // Name the deadline that fired, so first-token failovers are
                 // distinguishable from provider request timeouts in traces.
                 let reason = if header_deadline == first_token_deadline {
+                    if let Some(observation) = &observation { observation.deadline(); }
+                    // Header waits are part of the same first-token deadline.
+                    // A provider request timeout that fires earlier is not a
+                    // first-token breach.
+                    metrics::counter!(
+                        "onwards_first_token_breaches_total",
+                        "model" => model_name.to_string(),
+                        "pool" => resolved_pool_name.unwrap_or("default"),
+                        "role" => provider_role,
+                    )
+                    .increment(1);
                     "first_token_timeout"
                 } else {
                     "timeout"
@@ -1267,15 +1326,37 @@ pub async fn target_message_handler<T: HttpClient>(
         last_upstream_status = Some(status);
         upstream_span.record("http.response.status_code", status);
         tracing::Span::current().record("http.response.status_code", status);
+        // An error status settles the attempt's observation now: overload
+        // statuses are breaches, anything else is unknown. Left to drop, an
+        // error would only ever read as unknown.
+        if !(200..300).contains(&status)
+            && let Some(observation) = &observation
+        {
+            observation.status(status);
+        }
 
         // Check if we should fallback based on status code
-        if pool.should_fallback_on_status(status) {
+        if fails_over_on(status) {
             debug!(
                 "Provider returned fallback status {}, trying next: {:?}",
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            let error = if status == 429 {
+                OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+            } else {
+                OnwardsErrorResponse::bad_gateway()
+            };
+            return LoopAction::Continue(Some(error));
+        }
+
+        if status == 429
+            && (target.sanitize_response || state.upstream_rate_limit_message.is_some())
+        {
+            record_response_status(429);
+            return LoopAction::Done(Err(OnwardsErrorResponse::upstream_rate_limited(
+                state.upstream_rate_limit_message.as_deref(),
+            )));
         }
 
         // Sanitize error responses when sanitize_response is enabled.
@@ -1398,7 +1479,30 @@ pub async fn target_message_handler<T: HttpClient>(
                 const SSE_PEEK_MAX_EVENTS: usize = 4;
 
                 let (parts, body) = response.into_parts();
-                let mut events = SseBufferedStream::new(body.into_data_stream());
+                // Observe the same parsed events the strict path already consumes,
+                // including events polled after the bounded lead peek returns.
+                // This changes neither framing nor buffering and owns the attempt
+                // until response completion/cancellation (an unknown outcome).
+                let mut stream_observation = observation.clone();
+                let mut events = SseBufferedStream::new(body.into_data_stream()).inspect(move |event| {
+                    if stream_observation.is_none() { return; }
+                    let kind = match event {
+                        Ok(bytes) if bytes.ends_with(b"\n\n") => classify_sse_event(bytes),
+                        // The buffer flushes an incomplete final event at EOF.
+                        // Preserve its bytes, but do not count it as a first frame.
+                        _ => SseEventKind::Done,
+                    };
+                    if matches!(kind, SseEventKind::Comment) { return; }
+                    if let Some(observation) = stream_observation.take() {
+                        match kind {
+                            SseEventKind::Data => observation.frame(),
+                            // An error status embedded in a 2xx stream is judged
+                            // like the same status on the response line.
+                            SseEventKind::Error(status, _) => observation.status(status),
+                            _ => observation.unknown(),
+                        }
+                    }
+                });
                 let mut peeked = Vec::new();
                 let mut lead = LeadFrames::default();
                 if let Some(deadline) = first_token_deadline {
@@ -1414,11 +1518,23 @@ pub async fn target_message_handler<T: HttpClient>(
                     .await
                     .is_err()
                     {
+                        if let Some(observation) = &observation { observation.deadline(); }
                         warn!(
                             upstream = %target.url,
                             "No first token before the failover deadline; trying the next provider"
                         );
                         tracing::Span::current().record("onwards.fallback", "first_token_timeout");
+                        // A breach is a CENSORED observation: it establishes only
+                        // that the first token took longer than the deadline, not
+                        // how long it would have taken. Counted separately so the
+                        // deadline value never contaminates the latency histogram.
+                        metrics::counter!(
+                            "onwards_first_token_breaches_total",
+                            "model" => model_name.to_string(),
+                            "pool" => resolved_pool_name.unwrap_or("default"),
+                            "role" => provider_role,
+                        )
+                        .increment(1);
                         // Dropping `events` closes the upstream stream, which is
                         // the provider's signal to stop generating.
                         return LoopAction::Continue(Some(OnwardsErrorResponse::gateway_timeout()));
@@ -1442,6 +1558,20 @@ pub async fn target_message_handler<T: HttpClient>(
                             "Timed out waiting for decisive SSE frame; forwarding stream unmodified"
                         );
                     }
+                }
+                // An actual first token arrived: record the uncensored latency.
+                // `saw_content` excludes the `[DONE]` sentinel, which is a data
+                // frame but carries no token. Only reached on the success paths —
+                // a breach returns above — so this histogram holds observed
+                // latencies only, never censored ones.
+                if lead.saw_content {
+                    metrics::histogram!(
+                        "onwards_first_token_seconds",
+                        "model" => model_name.to_string(),
+                        "pool" => resolved_pool_name.unwrap_or("default"),
+                        "role" => provider_role,
+                    )
+                    .record(attempt_start.elapsed().as_secs_f64());
                 }
                 // Forward the consumed frames followed by the remainder, so a clean
                 // (or slow) stream is intact; on a retry path below this `response`
@@ -1520,26 +1650,29 @@ pub async fn target_message_handler<T: HttpClient>(
                 // purposes, so it overrides the 200 recorded above.
                 last_upstream_status = Some(embedded);
 
-                let retryable = pool.should_fallback_on_status(embedded)
+                let retryable = fails_over_on(embedded)
                     || (embedded == 429 && pool.should_fallback_on_rate_limit());
                 if retryable {
                     tracing::Span::current().record("onwards.fallback", "embedded_error");
-                    // Retry internally. If every attempt / provider fallback is
-                    // exhausted the caller gets a sanitized 503 — never the
-                    // upstream's rate limit (see the non-retryable arm below).
-                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
+                    // Retain rate-limit semantics if all attempts are exhausted.
+                    let error = if embedded == 429 {
+                        OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+                    } else {
+                        OnwardsErrorResponse::service_unavailable()
+                    };
+                    return LoopAction::Continue(Some(error));
                 }
 
                 record_response_status(embedded);
-                // Don't leak an upstream rate limit: a 429 — and *any* 5xx, including
-                // non-retryable ones like 501/505 — collapses to a generic 503. This is
-                // deliberately more opaque than the non-embedded error path: a
-                // 200-with-error body is already anomalous, so we hide the specifics.
+                // Keep upstream details private while preserving rate-limit semantics.
+                // Embedded server errors still collapse to a generic 503.
                 // For trusted providers, retain the standard client-error fields
                 // so the caller can fix the request. Never log the body: even
                 // validation errors can echo request content.
                 let trusted = target.trusted.unwrap_or_else(|| pool.is_trusted());
-                let err = if embedded == 429 || embedded >= 500 {
+                let err = if embedded == 429 {
+                    OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+                } else if embedded >= 500 {
                     OnwardsErrorResponse::service_unavailable()
                 } else {
                     OnwardsErrorResponse::builder()
@@ -1998,7 +2131,7 @@ mod tests {
 
     #[test]
     fn classify_sse_event_distinguishes_error_data_and_comment() {
-        use SseEventKind::{Comment, Data, Error};
+        use SseEventKind::{Comment, Data, Done, Error};
 
         // A provider's first-frame error on a 200 stream.
         assert_eq!(
@@ -2023,12 +2156,14 @@ mod tests {
             Error(429, serde_json::json!({"code":429}))
         );
 
-        // Normal content and the [DONE] sentinel are data frames, not errors.
+        // Normal content is a data frame, not an error.
         assert_eq!(
             classify_sse_event(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
             Data
         );
-        assert_eq!(classify_sse_event(b"data: [DONE]\n\n"), Data);
+        // The [DONE] sentinel is a data frame but NOT content: it closes a stream
+        // without carrying a token, so it must not count as a first token.
+        assert_eq!(classify_sse_event(b"data: [DONE]\n\n"), Done);
 
         // Comment / keep-alive frames carry no `data:` field.
         assert_eq!(classify_sse_event(b": keep-alive\n\n"), Comment);
@@ -2781,6 +2916,7 @@ mod tests {
             },
             http_client: mock_client,
             response_transform_fn: None,
+            upstream_rate_limit_message: None,
             response_id_header: None,
             body_limit: crate::DEFAULT_BODY_LIMIT,
             first_token_timeout: None,

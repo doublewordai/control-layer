@@ -38,13 +38,16 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderMap;
 use axum::routing::{any, get};
 use axum_prometheus::{
-    GenericMetricLayer, Handle, PrometheusMetricLayerBuilder,
-    metrics_exporter_prometheus::PrometheusHandle,
+    AXUM_HTTP_REQUESTS_DURATION_SECONDS, GenericMetricLayer, Handle,
+    PREFIXED_HTTP_REQUESTS_DURATION_SECONDS, PrometheusMetricLayerBuilder,
+    metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle},
+    utils::SECONDS_DURATION_BUCKETS,
 };
 use std::borrow::Cow;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
+pub mod aimd;
 pub mod auth;
 pub mod client;
 pub mod config;
@@ -134,6 +137,8 @@ pub struct AppState<T: HttpClient> {
     pub http_client: T,
     pub targets: target::Targets,
     pub response_transform_fn: Option<ResponseTransformFn>,
+    /// Optional public message for upstream 429 responses; local limits are unaffected.
+    pub upstream_rate_limit_message: Option<String>,
     /// Header name whose value overrides the generated `id` in Responses API
     /// responses. When set, the handler reads this header from the incoming
     /// request and uses its value (prefixed with `resp_` if not already) as the
@@ -173,6 +178,10 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
                 "response_transform_fn",
                 &self.response_transform_fn.as_ref().map(|_| "<function>"),
             )
+            .field(
+                "upstream_rate_limit_message",
+                &self.upstream_rate_limit_message,
+            )
             .field("response_id_header", &self.response_id_header)
             .field("body_limit", &self.body_limit)
             .field("first_token_timeout", &self.first_token_timeout)
@@ -198,6 +207,7 @@ impl AppState<HyperClient> {
             http_client,
             targets,
             response_transform_fn: None,
+            upstream_rate_limit_message: None,
             response_id_header: None,
             body_limit: DEFAULT_BODY_LIMIT,
             first_token_timeout: None,
@@ -213,11 +223,18 @@ impl<T: HttpClient> AppState<T> {
             http_client,
             targets,
             response_transform_fn: None,
+            upstream_rate_limit_message: None,
             response_id_header: None,
             body_limit: DEFAULT_BODY_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
         }
+    }
+
+    /// Customize upstream rate-limit errors without exposing provider error bodies.
+    pub fn with_upstream_rate_limit_message(mut self, message: impl Into<String>) -> Self {
+        self.upstream_rate_limit_message = Some(message.into());
+        self
     }
 
     /// Set the header name whose value overrides the Responses API `id` field.
@@ -437,6 +454,16 @@ pub fn build_metrics_router(handle: PrometheusHandle) -> Router {
     )
 }
 
+/// Histogram buckets for `onwards_first_token_seconds`, in seconds.
+///
+/// 10 is an exact edge because it is the default first-token deadline and AIMD
+/// latency budget: the share of first tokens beyond it is only exact at a
+/// bucket edge. Exported so embedders installing their own recorder can use
+/// the same buckets.
+pub const FIRST_TOKEN_SECONDS_BUCKETS: &[f64] = &[
+    0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0,
+];
+
 type MetricsLayerAndHandle = (
     GenericMetricLayer<'static, PrometheusHandle, Handle>,
     PrometheusHandle,
@@ -506,7 +533,38 @@ pub fn build_metrics_layer_and_handle(
         .with_prefix(prefix)
         .enable_response_body_size(true)
         .with_endpoint_label_type(axum_prometheus::EndpointLabel::Exact)
-        .with_default_metrics()
+        // Same as `with_default_metrics`, plus real histogram buckets for the
+        // first-token latency: without them it renders as a per-process
+        // summary, whose quantiles cannot be aggregated across replicas.
+        .with_metrics_from_fn(|| {
+            let recorder = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Full(
+                        PREFIXED_HTTP_REQUESTS_DURATION_SECONDS
+                            .get()
+                            .map_or(AXUM_HTTP_REQUESTS_DURATION_SECONDS, |s| s.as_str())
+                            .to_string(),
+                    ),
+                    SECONDS_DURATION_BUCKETS,
+                )
+                .expect("valid HTTP duration buckets")
+                .set_buckets_for_metric(
+                    Matcher::Full("onwards_first_token_seconds".to_string()),
+                    FIRST_TOKEN_SECONDS_BUCKETS,
+                )
+                .expect("valid first-token buckets")
+                .build_recorder();
+            let handle = recorder.handle();
+            let upkeep = handle.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    upkeep.run_upkeep();
+                }
+            });
+            metrics::set_global_recorder(recorder).expect("Failed to set global recorder");
+            handle
+        })
         .build_pair()
 }
 
@@ -1446,6 +1504,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_upstream_rate_limit_preserves_status_and_custom_message() {
+        for strict in [false, true] {
+            for embedded in [false, true] {
+                for streaming in [false, true] {
+                    for retry in [false, true] {
+                        let body = r#"{"error":{"code":429,"message":"private upstream details"}}"#;
+                        let status = if embedded {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::TOO_MANY_REQUESTS
+                        };
+                        let mock = if streaming {
+                            MockHttpClient::new_streaming(status, vec![format!("data: {body}\n\n")])
+                        } else {
+                            MockHttpClient::new(status, body)
+                        };
+                        let targets =
+                            fallback_targets("gpt-4", 2, if retry { vec![429] } else { vec![] });
+                        let state = AppState::with_client(targets, mock.clone())
+                            .with_upstream_rate_limit_message(
+                                "Contact support for a dedicated deployment.",
+                            );
+                        let router = if strict {
+                            crate::strict::build_strict_router(state)
+                        } else {
+                            build_router(state)
+                        };
+                        let server = TestServer::new(router).unwrap();
+                        let response = server
+                            .post(if strict {
+                                "/chat/completions"
+                            } else {
+                                "/v1/chat/completions"
+                            })
+                            .json(&json!({
+                                "model": "gpt-4", "stream": streaming,
+                                "messages": [{"role": "user", "content": "Hello"}]
+                            }))
+                            .await;
+                        assert_eq!(
+                            response.status_code(),
+                            429,
+                            "strict={strict}, embedded={embedded}, streaming={streaming}, retry={retry}"
+                        );
+                        let error = response.json::<serde_json::Value>();
+                        assert_eq!(error["error"]["type"], "rate_limit_error");
+                        assert_eq!(error["error"]["code"], "upstream_rate_limit");
+                        assert_eq!(
+                            error["error"]["message"],
+                            "Contact support for a dedicated deployment."
+                        );
+                        assert!(!response.text().contains("private upstream details"));
+                        assert_eq!(mock.get_requests().len(), if retry { 2 } else { 1 });
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn test_trusted_embedded_error_keeps_server_and_rate_limit_details_private() {
         for code in [429, 500, 501, 503] {
             for streaming in [false, true] {
@@ -1475,17 +1593,16 @@ mod tests {
                         "messages":[{"role":"user","content":"hello"}]
                     }))
                     .await;
-                assert_eq!(response.status_code(), 503);
+                assert_eq!(response.status_code(), if code == 429 { 429 } else { 503 });
                 assert!(!response.text().contains("private upstream failure"));
             }
         }
     }
 
     #[tokio::test]
-    async fn test_streaming_embedded_error_retries_then_exhausts_to_503() {
+    async fn test_streaming_embedded_error_retries_then_exhausts_to_429() {
         // 200 stream whose first frame is a `429` error envelope. onwards must
-        // retry across providers and, when exhausted, return a sanitized 503 —
-        // never the upstream 429.
+        // retry across providers and, when exhausted, return a sanitized 429.
         let error_frame =
             "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
                 .to_string();
@@ -1503,8 +1620,8 @@ mod tests {
 
         assert_eq!(
             response.status_code(),
-            503,
-            "exhausted retries must surface a sanitized 503, not the upstream 429"
+            429,
+            "exhausted retries must preserve the upstream 429"
         );
         assert_eq!(
             mock.get_requests().len(),
@@ -1550,8 +1667,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unary_embedded_error_collapses_to_503() {
-        // The same envelope on a non-streaming 200 body collapses to a 503.
+    async fn test_unary_embedded_rate_limit_preserves_429() {
+        // The same envelope on a non-streaming 200 body surfaces as a 429.
         let body = r#"{"error":{"code":429,"message":"Provider returned error"}}"#;
         let mock = MockHttpClient::new(StatusCode::OK, body);
         let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
@@ -1565,7 +1682,7 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(response.status_code(), 503);
+        assert_eq!(response.status_code(), 429);
         assert_eq!(
             mock.get_requests().len(),
             2,
@@ -1576,7 +1693,7 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_keepalive_before_error_is_still_detected() {
         // A keep-alive comment precedes the error frame; the peek must skip it
-        // and still detect the 429, retry, and exhaust to 503.
+        // and still detect the 429, retry, and exhaust to 429.
         let keepalive = ": keep-alive\n\n".to_string();
         let error_frame =
             "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
@@ -1595,7 +1712,7 @@ mod tests {
 
         assert_eq!(
             response.status_code(),
-            503,
+            429,
             "an error after a keep-alive frame must still be detected"
         );
         assert_eq!(mock.get_requests().len(), 2);
@@ -1850,6 +1967,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_done_sentinel_is_not_a_first_token_but_is_not_empty() {
+        // `[DONE]` is a data frame carrying no token. It must not count as a
+        // first token — and it must not be mistaken for an empty body either,
+        // since `saw_data` is what suppresses the retryable `EmptyBody` verdict.
+        // So: one attempt, forwarded to the client, no failover.
+        let mock =
+            MockHttpClient::new_streaming(StatusCode::OK, vec!["data: [DONE]\n\n".to_string()]);
+        let server = TestServer::new(build_router(first_token_app(mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "a [DONE]-only stream is not empty, so it must not be retried"
+        );
+    }
+
+    #[tokio::test]
     async fn test_first_token_timeout_needs_a_different_provider() {
         // A single-provider pool with a retry budget has attempts left but no
         // other provider: re-running a slow prefill on the same backend would
@@ -1900,6 +2040,7 @@ mod tests {
                     enabled: true,
                     on_status: vec![502],
                     first_token_timeout_ms: Some(ms),
+                    aimd: None,
                     ..Default::default()
                 },
             )

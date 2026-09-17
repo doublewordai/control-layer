@@ -67,6 +67,21 @@ impl OnwardsErrorResponse {
         }
     }
 
+    /// An upstream rate limit, distinct from limits enforced by this proxy.
+    pub fn upstream_rate_limited(message: Option<&str>) -> Self {
+        Self {
+            body: Some(ErrorResponseBody {
+                message: message
+                    .unwrap_or("The upstream service is rate limited. Please try again later.")
+                    .to_string(),
+                r#type: "rate_limit_error".to_string(),
+                param: None,
+                code: "upstream_rate_limit".to_string(),
+            }),
+            status: StatusCode::TOO_MANY_REQUESTS,
+        }
+    }
+
     pub fn concurrency_limited() -> Self {
         OnwardsErrorResponse {
             body: Some(ErrorResponseBody {

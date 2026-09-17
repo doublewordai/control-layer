@@ -13,6 +13,7 @@
 //!
 //! Pool-level configuration (keys, rate_limit) applies to all providers in the pool.
 //! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
+use crate::aimd::AimdConfig;
 use crate::auth::KeySet;
 use crate::serving::{AccountServing, ProviderKind, ServingClass, ServingOverlay};
 use crate::load_balancer::{Provider, ProviderPool};
@@ -196,6 +197,16 @@ pub struct FallbackConfig {
     #[serde(default)]
     pub on_status: Vec<u16>,
 
+    /// Status codes that trigger fallback for **realtime** requests only, in
+    /// addition to `on_status`. A request is realtime unless it carries the
+    /// header set with
+    /// [`AppState::with_first_token_timeout_exempt_header`](crate::AppState::with_first_token_timeout_exempt_header),
+    /// which marks dispatched traffic that runs its own retries. Use it for an
+    /// upstream's over-capacity status: realtime callers are rerouted while
+    /// dispatched callers receive the response. Same wildcards as `on_status`.
+    #[serde(default)]
+    pub realtime_on_status: Vec<u16>,
+
     /// Whether to fallback on local rate limits (pool-level and provider-level).
     /// If true, hitting a local rate limit will try the next provider instead of returning 429.
     #[serde(default)]
@@ -239,27 +250,39 @@ pub struct FallbackConfig {
     /// provider starts cleanly.
     #[serde(default)]
     pub first_token_timeout_ms: Option<u64>,
+    /// Priority-only share controller overrides. None uses defaults; enabled=false opts out.
+    #[serde(default)]
+    pub aimd: Option<AimdConfig>,
 }
 
 impl FallbackConfig {
     /// Check if a status code should trigger fallback
     pub fn should_fallback_on_status(&self, status: u16) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        self.on_status.iter().any(|&pattern| {
-            if pattern < 10 {
-                // Single digit: matches all codes starting with that digit (e.g., 5 matches 500-599)
-                status / 100 == pattern
-            } else if pattern < 100 {
-                // Two digits: matches all codes starting with those digits (e.g., 50 matches 500-509)
-                status / 10 == pattern
-            } else {
-                // Full status code: exact match
-                status == pattern
-            }
-        })
+        self.enabled && status_matches(&self.on_status, status)
     }
+
+    /// Check if a status code should trigger fallback for a realtime request:
+    /// either it is in `on_status`, or it is a realtime-only fallback status.
+    pub fn should_fallback_on_realtime_status(&self, status: u16) -> bool {
+        self.enabled
+            && (status_matches(&self.on_status, status)
+                || status_matches(&self.realtime_on_status, status))
+    }
+}
+
+/// Whether `status` matches any fallback pattern: a single digit matches its
+/// hundreds (5 matches 500-599), two digits match their tens (50 matches
+/// 500-509), and a full code matches exactly.
+fn status_matches(patterns: &[u16], status: u16) -> bool {
+    patterns.iter().any(|&pattern| {
+        if pattern < 10 {
+            status / 100 == pattern
+        } else if pattern < 100 {
+            status / 10 == pattern
+        } else {
+            status == pattern
+        }
+    })
 }
 
 /// Jitter strategy applied to retry backoff delays.
@@ -1109,6 +1132,11 @@ impl TargetPools {
     /// A pool that did not exist before starts at zero, as a new pool should.
     pub fn adopt_provider_state(&mut self, old: &TargetPools) {
         self.default.adopt_provider_state(&old.default);
+        for (name, pool) in &old.extra {
+            if !self.extra.contains_key(name) {
+                pool.retire_aimd();
+            }
+        }
         for (name, pool) in self.extra.iter_mut() {
             if let Some(old_pool) = old.extra.get(name) {
                 pool.adopt_provider_state(old_pool);
@@ -1328,9 +1356,38 @@ impl TargetsStream for WatchTargetsStream {
 fn build_pool(
     alias: &str,
     pool_name: &str,
-    pool_config: PoolConfig,
+    mut pool_config: PoolConfig,
     global_keys: &KeySet,
 ) -> Result<ProviderPool, anyhow::Error> {
+    if pool_name != DEFAULT_POOL
+        && let Some(fallback) = &mut pool_config.fallback
+    {
+        fallback.aimd = Some(crate::aimd::AimdConfig {
+            enabled: false,
+            ..crate::aimd::AimdConfig::default()
+        });
+    }
+    if let Some(fallback) = &pool_config.fallback
+        && let Some(config) = &fallback.aimd
+        && config.enabled
+    {
+        config.validate().map_err(|e| anyhow!(e))?;
+        if !fallback.enabled || pool_config.strategy != LoadBalanceStrategy::Priority {
+            return Err(anyhow!(
+                "AIMD requires enabled fallback and priority strategy"
+            ));
+        }
+        // Explicit override prevents a shorter proxy-wide deadline from
+        // turning a censored observation into a false budget breach.
+        if !fallback
+            .first_token_timeout_ms
+            .is_some_and(|ms| ms == 0 || (ms >= config.latency_budget_ms && ms <= 3_600_000))
+        {
+            return Err(anyhow!(
+                "AIMD requires an explicit first_token_timeout_ms of 0 or at least latency_budget_ms"
+            ));
+        }
+    }
     for (index, provider) in pool_config.providers.iter().enumerate() {
         if let Some(config) = provider.reasoning_translation.as_ref() {
             config.validate().map_err(|error| {
@@ -1557,7 +1614,11 @@ impl Targets {
                         // Remove deleted targets
                         for key in current_target_keys {
                             if !new_targets.targets.contains_key(&key) {
-                                targets.remove(&key);
+                                if let Some((_, removed)) = targets.remove(&key) {
+                                    for (_, pool) in removed.iter() {
+                                        pool.retire_aimd();
+                                    }
+                                }
                             }
                         }
 

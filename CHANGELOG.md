@@ -1,5 +1,66 @@
 # Changelog
 
+## [11.16.0](https://github.com/doublewordai/control-layer/compare/v11.15.1...v11.16.0) (2026-09-17)
+
+
+### Features
+
+* **onwards:** make AIMD share control decide under overload and recover ([#1803](https://github.com/doublewordai/control-layer/issues/1803)) ([8bb4a6f](https://github.com/doublewordai/control-layer/commit/8bb4a6fc3a865993d810bcd671165e13fe7c7ce7))
+
+## [11.15.1](https://github.com/doublewordai/control-layer/compare/v11.15.0...v11.15.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* **proxy:** preserve upstream rate-limit responses ([#1800](https://github.com/doublewordai/control-layer/issues/1800)) ([8a2052b](https://github.com/doublewordai/control-layer/commit/8a2052b3627d7c120b42bf436891529ba3de3f89))
+
+## [11.15.0](https://github.com/doublewordai/control-layer/compare/v11.14.0...v11.15.0) (2026-09-17)
+
+
+### Features
+
+* run schema migrations from `dwctl migrate` and check compatibility at startup ([#1756](https://github.com/doublewordai/control-layer/issues/1756)) ([38ac719](https://github.com/doublewordai/control-layer/commit/38ac71914ea151205cbf631ecbbf29ccd95ffbc0))
+
+
+### Bug Fixes
+
+* cover /completions with the cache layer (implicit billing + prov… ([#1796](https://github.com/doublewordai/control-layer/issues/1796)) ([4699d2b](https://github.com/doublewordai/control-layer/commit/4699d2b96c3aa7268eccb484ca6a425c6a61bec2))
+* **fusillade:** write terminal realtime responses directly to retained storage ([#1797](https://github.com/doublewordai/control-layer/issues/1797)) ([1e2adec](https://github.com/doublewordai/control-layer/commit/1e2adec40985a7ffc33b184278b59254326bdd3e))
+* **responses:** validate stateful requests and include projections ([#1480](https://github.com/doublewordai/control-layer/issues/1480)) ([c91f33b](https://github.com/doublewordai/control-layer/commit/c91f33b3b2b229c83c6144a7d1b431a1f371ea9b))
+
+## [11.14.0](https://github.com/doublewordai/control-layer/compare/v11.13.0...v11.14.0) (2026-09-17)
+
+
+### Features
+
+* **onwards:** add default-on AIMD provider share control ([#1793](https://github.com/doublewordai/control-layer/issues/1793)) ([5e848a5](https://github.com/doublewordai/control-layer/commit/5e848a547c8f22218e3fcdd8335b3fcd7a982a1e))
+
+## [11.13.0](https://github.com/doublewordai/control-layer/compare/v11.12.0...v11.13.0) (2026-09-16)
+
+
+### Features
+
+* **onwards:** measure first-token latency per provider role ([#1790](https://github.com/doublewordai/control-layer/issues/1790)) ([adc080b](https://github.com/doublewordai/control-layer/commit/adc080b07f6b190876bf75f034297a8a21b4961b))
+
+## [11.12.0](https://github.com/doublewordai/control-layer/compare/v11.11.0...v11.12.0) (2026-09-16)
+
+
+### Features
+
+* implicit caching using engine / upstream stats ([#1781](https://github.com/doublewordai/control-layer/issues/1781)) ([7f2adb4](https://github.com/doublewordai/control-layer/commit/7f2adb4557a29c6fcc4f4ad5f1860550a1369395))
+
+
+### Bug Fixes
+
+* **analytics:** persist billing writes through outbox ([#1787](https://github.com/doublewordai/control-layer/issues/1787)) ([7896933](https://github.com/doublewordai/control-layer/commit/7896933111c4084706884bbf11972279cb83ec6d))
+* **ci:** track the fusillade-arsenal 4.1.0 and fusillade-core 6.0.0 release baselines ([#1784](https://github.com/doublewordai/control-layer/issues/1784)) ([b644c6f](https://github.com/doublewordai/control-layer/commit/b644c6fbb7727309761f64ea0dae9e4ce2c8c1f9))
+* **retention:** use indexed probes for startup and purge route queries ([#1783](https://github.com/doublewordai/control-layer/issues/1783)) ([364cf42](https://github.com/doublewordai/control-layer/commit/364cf42636935d8d3c1ad1799f3225e392d48d3c))
+
+
+### Miscellaneous
+
+* remove unused TranslationRegistry::default and is_empty ([#1695](https://github.com/doublewordai/control-layer/issues/1695)) ([2358272](https://github.com/doublewordai/control-layer/commit/23582720503bbea35e96597ba439977b37d936f2))
+
 ## [11.11.0](https://github.com/doublewordai/control-layer/compare/v11.10.2...v11.11.0) (2026-09-15)
 
 

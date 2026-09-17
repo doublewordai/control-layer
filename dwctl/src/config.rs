@@ -142,6 +142,9 @@ pub struct Config {
     pub model_sources: Vec<ModelSource>,
     /// Declarative model catalog applied transactionally during startup.
     pub model_provisioning: ModelProvisioningConfig,
+    /// Whether this process applies schema migrations at startup or only
+    /// verifies that the database is compatible. See [`MigrationsConfig`].
+    pub migrations: MigrationsConfig,
     /// Frontend metadata displayed in the UI
     pub metadata: Metadata,
     /// Payment provider configuration (Stripe, PayPal, etc.)
@@ -1194,6 +1197,9 @@ pub struct OnwardsConfig {
     /// When false (default), all requests are passed through transparently.
     /// When true, only known OpenAI API paths are accepted and validated.
     pub strict_mode: bool,
+    /// Public message returned for upstream 429 responses, including exhausted
+    /// retries. Does not affect local request or concurrency limit messages.
+    pub upstream_rate_limit_message: String,
     /// Failover deadline for the first token of a realtime streamed response,
     /// in milliseconds. While a model still has another provider to fail over
     /// to, an attempt that hasn't produced response headers and (in strict
@@ -1208,6 +1214,9 @@ impl Default for OnwardsConfig {
     fn default() -> Self {
         Self {
             strict_mode: false,
+            upstream_rate_limit_message:
+                "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
+                    .to_string(),
             first_token_timeout_ms: 10_000,
         }
     }
@@ -3039,6 +3048,7 @@ impl Default for Config {
             secret_key: None,
             model_sources: vec![],
             model_provisioning: ModelProvisioningConfig::default(),
+            migrations: MigrationsConfig::default(),
             metadata: Metadata::default(),
             payment: None,
             auth: AuthConfig::default(),
@@ -3078,6 +3088,34 @@ impl Default for ModelSource {
             default_models: None,
         }
     }
+}
+
+/// What a process does about schema migrations when it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationsMode {
+    /// Apply pending migrations before serving (local development, single
+    /// instance installs, tests). This is what every version before the
+    /// migration Job did.
+    #[default]
+    Run,
+    /// Never execute DDL. Verify that every migration this binary ships is
+    /// recorded in the database with a matching checksum, and refuse to start
+    /// otherwise. Migrations the database has *beyond* this binary are
+    /// accepted: that is what lets an older replica keep serving while a
+    /// newer release's additive migration is applied ahead of its rollout.
+    Check,
+}
+
+/// Schema migration policy for the serving process.
+///
+/// Deployments that run `dwctl migrate` as a pre-rollout Job set `mode:
+/// check` on the application pods so that a pod never runs DDL and a pod of
+/// the new release cannot become Ready before the migration Job succeeded.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct MigrationsConfig {
+    pub mode: MigrationsMode,
 }
 
 /// Startup model provisioning configuration.
