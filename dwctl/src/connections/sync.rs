@@ -111,8 +111,13 @@ pub async fn build_ingest_file_job<P: PoolProvider + Clone + Send + Sync + 'stat
                 Ok(()) => To::done(),
                 Err(e) if e.downcast_ref::<RetryableIngest>().is_some() => {
                     // Transient: leave the entry as it is (no failed status, no
-                    // counters) and let the queue retry the step.
-                    tracing::warn!(
+                    // counters) and let the queue retry the step. Counted (not
+                    // paged) so retries stay visible on the background-error
+                    // dashboards.
+                    crate::background_error!(
+                        crate::metrics::errors::component::TASK_WORKER,
+                        "connection_file_ingest_retry",
+                        Warning,
                         sync_entry_id = %input.sync_entry_id,
                         external_key = %input.external_key,
                         error = %e,
@@ -417,6 +422,7 @@ async fn prepare_synced_record(
     ai_base_url: &str,
     token_pool: &sqlx::PgPool,
     token_attribution: crate::api::handlers::images::ImageAttribution,
+    token_auth: &crate::api::handlers::files::TokenAuthCache,
 ) -> SyncedRecord {
     let custom_id = parsed.get("custom_id").and_then(|v| v.as_str()).map(|s| s.to_string());
     let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("POST").to_string();
@@ -456,7 +462,7 @@ async fn prepare_synced_record(
         && body.contains("dw-img://")
         && let Ok(mut body_val) = serde_json::from_str::<serde_json::Value>(&body)
     {
-        match crate::api::handlers::files::authorize_submitted_tokens(&mut body_val, token_pool, token_attribution).await {
+        match crate::api::handlers::files::authorize_submitted_tokens(&mut body_val, token_pool, token_attribution, token_auth).await {
             Ok(()) => {}
             Err(e) if e.is_retryable() => {
                 tracing::error!(
@@ -591,6 +597,9 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
         user_id: sync_op.triggered_by,
         organization_id: (connection.user_id != sync_op.triggered_by).then_some(connection.user_id),
     };
+    // One verdict per distinct token for the whole file: a file that repeats a
+    // token across thousands of records costs one lookup, not thousands.
+    let token_auth = crate::api::handlers::files::TokenAuthCache::default();
 
     // 5. Stream file from provider
     let byte_stream = prov
@@ -707,16 +716,24 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                 // Tier 3: valid → ingest normally
                 match serde_json::from_str::<serde_json::Value>(line) {
                     Ok(parsed) => {
-                        let (template, line_error) =
-                            match prepare_synced_record(parsed, line_number, &api_path, &ai_base_url, &token_pool, token_attribution).await
-                            {
-                                SyncedRecord::Template { template, line_error } => (template, line_error),
-                                SyncedRecord::Abort => {
-                                    retryable_abort.store(true, std::sync::atomic::Ordering::Relaxed);
-                                    let _ = tx.send(FileStreamItem::Abort).await;
-                                    return (template_count, skipped_lines, validation_errors);
-                                }
-                            };
+                        let (template, line_error) = match prepare_synced_record(
+                            parsed,
+                            line_number,
+                            &api_path,
+                            &ai_base_url,
+                            &token_pool,
+                            token_attribution,
+                            &token_auth,
+                        )
+                        .await
+                        {
+                            SyncedRecord::Template { template, line_error } => (template, line_error),
+                            SyncedRecord::Abort => {
+                                retryable_abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                                let _ = tx.send(FileStreamItem::Abort).await;
+                                return (template_count, skipped_lines, validation_errors);
+                            }
+                        };
 
                         if let Some(ref err) = line_error {
                             if validation_errors.len() < MAX_LINE_WARNINGS as usize {
@@ -766,15 +783,24 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
             line_number += 1;
             match serde_json::from_str::<serde_json::Value>(remaining) {
                 Ok(parsed) => {
-                    let (template, line_error) =
-                        match prepare_synced_record(parsed, line_number, &api_path, &ai_base_url, &token_pool, token_attribution).await {
-                            SyncedRecord::Template { template, line_error } => (template, line_error),
-                            SyncedRecord::Abort => {
-                                retryable_abort.store(true, std::sync::atomic::Ordering::Relaxed);
-                                let _ = tx.send(FileStreamItem::Abort).await;
-                                return (template_count, skipped_lines, validation_errors);
-                            }
-                        };
+                    let (template, line_error) = match prepare_synced_record(
+                        parsed,
+                        line_number,
+                        &api_path,
+                        &ai_base_url,
+                        &token_pool,
+                        token_attribution,
+                        &token_auth,
+                    )
+                    .await
+                    {
+                        SyncedRecord::Template { template, line_error } => (template, line_error),
+                        SyncedRecord::Abort => {
+                            retryable_abort.store(true, std::sync::atomic::Ordering::Relaxed);
+                            let _ = tx.send(FileStreamItem::Abort).await;
+                            return (template_count, skipped_lines, validation_errors);
+                        }
+                    };
 
                     if let Some(ref err) = line_error {
                         if validation_errors.len() < MAX_LINE_WARNINGS as usize {

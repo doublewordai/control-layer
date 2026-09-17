@@ -370,6 +370,13 @@ impl BatchNormalizeError {
 
 const TOKEN_NOT_ACCESSIBLE: &str = "image token is not accessible to this caller";
 
+/// Per-submission memo of token authorisation verdicts, keyed by token. One
+/// upload or sync has a single attribution, so a verdict holds for the whole
+/// submission; a file that repeats a token across thousands of records then
+/// costs one database round trip, not thousands. Lookup failures are not
+/// memoised (they are retried).
+pub(crate) type TokenAuthCache = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<crate::image_normalizer::ImageToken, bool>>>;
+
 /// Authorise a `dw-img://` token a client placed in a body it is submitting
 /// for queued execution. The dispatch later signs every token in the stored
 /// body on trust, so this — and our own ingest — are the only ways a token
@@ -380,6 +387,7 @@ async fn authorize_submitted_token(
     url: &str,
     pool: Option<&sqlx::PgPool>,
     attribution: Option<crate::api::handlers::images::ImageAttribution>,
+    cache: &TokenAuthCache,
 ) -> std::result::Result<(), BatchNormalizeError> {
     let token = url
         .parse::<crate::image_normalizer::ImageToken>()
@@ -387,13 +395,26 @@ async fn authorize_submitted_token(
     let (Some(pool), Some(attribution)) = (pool, attribution) else {
         return Err(BatchNormalizeError::BadInput(TOKEN_NOT_ACCESSIBLE.to_string()));
     };
-    match crate::api::handlers::images::is_token_accessible(pool, &attribution, token).await {
-        Ok(true) => Ok(()),
-        Ok(false) => Err(BatchNormalizeError::BadInput(TOKEN_NOT_ACCESSIBLE.to_string())),
-        Err(e) => {
-            tracing::warn!(error = %e, "image_access lookup failed while authorising a submitted token");
-            Err(BatchNormalizeError::Transient("image access lookup failed".to_string()))
-        }
+    let memoised = cache.lock().ok().and_then(|c| c.get(&token).copied());
+    let accessible = match memoised {
+        Some(verdict) => verdict,
+        None => match crate::api::handlers::images::is_token_accessible(pool, &attribution, token).await {
+            Ok(verdict) => {
+                if let Ok(mut c) = cache.lock() {
+                    c.insert(token, verdict);
+                }
+                verdict
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "image_access lookup failed while authorising a submitted token");
+                return Err(BatchNormalizeError::Transient("image access lookup failed".to_string()));
+            }
+        },
+    };
+    if accessible {
+        Ok(())
+    } else {
+        Err(BatchNormalizeError::BadInput(TOKEN_NOT_ACCESSIBLE.to_string()))
     }
 }
 
@@ -407,12 +428,13 @@ pub(crate) async fn authorize_submitted_tokens(
     body: &mut serde_json::Value,
     pool: &sqlx::PgPool,
     attribution: crate::api::handlers::images::ImageAttribution,
+    cache: &TokenAuthCache,
 ) -> std::result::Result<(), BatchNormalizeError> {
     let err_cell: std::sync::Mutex<Option<BatchNormalizeError>> = std::sync::Mutex::new(None);
     let walked = image_walker::substitute_with(body, ImageNormalizerMode::TokensOnly, |url| {
         let err_cell = &err_cell;
         async move {
-            match authorize_submitted_token(&url, Some(pool), Some(attribution)).await {
+            match authorize_submitted_token(&url, Some(pool), Some(attribution), cache).await {
                 Ok(()) => Ok::<String, ()>(url),
                 Err(e) => {
                     if let Ok(mut g) = err_cell.lock()
@@ -442,6 +464,7 @@ async fn normalize_template_body_in_place(
     template: &mut fusillade::RequestTemplateInput,
     access_pool: Option<&sqlx::PgPool>,
     access_attribution: Option<crate::api::handlers::images::ImageAttribution>,
+    token_auth: &TokenAuthCache,
 ) -> std::result::Result<(), BatchNormalizeError> {
     let Some(normalizer) = normalizer else {
         return Ok(());
@@ -465,7 +488,7 @@ async fn normalize_template_body_in_place(
             // batch dispatch signs every token in a stored body on trust, so
             // this is the only place a client-supplied token is checked.
             if crate::image_normalizer::ImageToken::looks_like_token(&url) {
-                let outcome = authorize_submitted_token(&url, access_pool.as_ref(), access_attribution).await;
+                let outcome = authorize_submitted_token(&url, access_pool.as_ref(), access_attribution, token_auth).await;
                 return match outcome {
                     Ok(()) => Ok::<String, ()>(url),
                     Err(mapped) => {
@@ -822,6 +845,8 @@ fn create_file_stream(
     let normalizer_mode = config.normalizer_mode;
     let access_pool = config.access_pool.clone();
     let access_attribution = config.access_attribution;
+    // One verdict per distinct token for the whole upload (see `TokenAuthCache`).
+    let token_auth = TokenAuthCache::default();
     let (tx, rx) = mpsc::channel(config.buffer_size);
     // std::sync::Mutex is appropriate here because:
     // 1. Lock is held only briefly (no await points while locked)
@@ -1029,6 +1054,7 @@ fn create_file_stream(
                                                         &mut template,
                                                         access_pool.as_ref(),
                                                         access_attribution,
+                                                        &token_auth,
                                                     )
                                                     .await
                                                     {
@@ -1117,6 +1143,7 @@ fn create_file_stream(
                                                 &mut template,
                                                 access_pool.as_ref(),
                                                 access_attribution,
+                                                &token_auth,
                                             )
                                             .await
                                             {
@@ -2342,6 +2369,7 @@ mod tests {
             &mut template,
             Some(&pool),
             Some(attribution),
+            &super::TokenAuthCache::default(),
         )
         .await
         .expect("owned token is accepted");
@@ -2367,6 +2395,7 @@ mod tests {
             &mut template,
             Some(&pool),
             Some(attribution),
+            &super::TokenAuthCache::default(),
         )
         .await
         .expect_err("foreign token is refused");

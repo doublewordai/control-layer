@@ -95,6 +95,12 @@ pub struct ImageNormalizerMiddlewareState {
     pub pool: Option<sqlx_pool_router::DynPools>,
 }
 
+/// A `batch_metadata` header the fusillade daemon puts on EVERY dispatch
+/// (`created_at` is in the default metadata field list for batch and
+/// batchless claims alike). Read here only as a TTL hint — see
+/// `image_normalizer_middleware`.
+const DISPATCH_METADATA_HEADER: &str = "x-fusillade-batch-created-at";
+
 /// Extract the Bearer token from `Authorization`, case-insensitive.
 fn extract_bearer_token(request: &Request<Body>) -> Option<String> {
     let auth = request.headers().get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
@@ -183,7 +189,15 @@ pub async fn image_normalizer_middleware(
     // full processing attempt; a client request is realtime. (Synced records
     // keep their raw image URLs until dispatch, so the ingest path sees daemon
     // traffic too.)
-    let is_daemon_dispatch = caller_lookup.ok().flatten().is_some_and(|c| c.is_daemon_dispatch);
+    //
+    // Two independent signals, either suffices: the bearer resolving to the
+    // hidden batch key, or the daemon's own dispatch metadata header (set on
+    // every dispatch, batch and flex alike). The header keeps the choice right
+    // when the key lookup fails and a raw image still goes through ingest; it
+    // decides the TTL only, never authorisation, so forging it can at most
+    // lengthen the TTL on the forger's own authorised image.
+    let is_daemon_dispatch =
+        request.headers().contains_key(DISPATCH_METADATA_HEADER) || caller_lookup.ok().flatten().is_some_and(|c| c.is_daemon_dispatch);
     let sign_ttl = if is_daemon_dispatch { state.token_ttl } else { state.realtime_ttl };
     let pool_for_access = state.pool.clone();
     let substitute = move |url: String| {
@@ -848,6 +862,38 @@ mod tests {
         let (status, echoed) = post_json_as(build_router(state), Some(&batch_key), body).await;
 
         assert_eq!(status, StatusCode::OK, "{echoed}");
+        let (url, ttl) = signed_url_and_ttl(&echoed);
+        assert!(url.starts_with("http://test.local/dw-img/"), "{url}");
+        assert!((1800 - 60..=1800).contains(&ttl), "dispatch TTL expected, got {ttl}s");
+    }
+
+    /// The dispatch metadata header alone (no resolvable bearer, as when the
+    /// key lookup is unavailable) still selects the dispatch TTL for a raw
+    /// image, so a loopback never gets a URL that expires mid-attempt.
+    #[tokio::test]
+    async fn the_dispatch_metadata_header_alone_selects_the_dispatch_ttl_for_a_raw_image() {
+        let body = json!({
+            "model": "vision",
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "what is this?" },
+                { "type": "image_url", "image_url": { "url": TINY_PNG_DATA_URI } }
+            ]}]
+        });
+        let resp = build_router(state_for_tests())
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/chat/completions")
+                    .header("content-type", "application/json")
+                    .header(DISPATCH_METADATA_HEADER, "2026-09-17T00:00:00Z")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let echoed: Value = serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+
         let (url, ttl) = signed_url_and_ttl(&echoed);
         assert!(url.starts_with("http://test.local/dw-img/"), "{url}");
         assert!((1800 - 60..=1800).contains(&ttl), "dispatch TTL expected, got {ttl}s");

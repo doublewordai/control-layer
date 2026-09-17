@@ -32,6 +32,30 @@ FROM image_access
 WHERE organization_id IS NOT NULL
 ON CONFLICT (organization_id, sha256) DO NOTHING;
 
+-- Rolling-deploy compatibility: instances still on the previous release keep
+-- writing ONLY `image_access` (and overwrite its legacy organization column)
+-- until they drain. Mirror every organization write into the grants table
+-- from inside the database, so nothing an old writer records after the
+-- snapshot above is lost. The new release writes the grant itself as well;
+-- the two upserts are idempotent. Drop this trigger (and the legacy column)
+-- in a later contract migration once no old writer remains.
+CREATE OR REPLACE FUNCTION image_access_mirror_org_grant() RETURNS trigger AS $$
+BEGIN
+    IF NEW.organization_id IS NOT NULL THEN
+        INSERT INTO image_access_org_grants (organization_id, sha256, granted_by, first_seen_at, last_seen_at)
+        VALUES (NEW.organization_id, NEW.sha256, NEW.user_id, NEW.first_seen_at, NEW.last_seen_at)
+        ON CONFLICT (organization_id, sha256) DO UPDATE
+        SET last_seen_at = GREATEST(image_access_org_grants.last_seen_at, EXCLUDED.last_seen_at);
+    END IF;
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS image_access_mirror_org_grant ON image_access;
+CREATE TRIGGER image_access_mirror_org_grant
+    AFTER INSERT OR UPDATE OF organization_id, last_seen_at ON image_access
+    FOR EACH ROW EXECUTE FUNCTION image_access_mirror_org_grant();
+
 -- Supports the "who else references this hash" lookups alongside
 -- idx_image_access_sha256.
 CREATE INDEX IF NOT EXISTS idx_image_access_org_grants_sha256
