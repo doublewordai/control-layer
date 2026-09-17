@@ -258,13 +258,17 @@ impl ReconstructedSplit {
 ///
 /// `classifier` must have been built with that index; this call never commits, so nothing is
 /// written. `principal` is supplied directly because the bearer token behind a historical
-/// row may since have been rotated.
+/// row may since have been rotated. `route_has_blocks` must be derived from the row's
+/// stored endpoint (`!path_is_plain_completions(...)` — the same rule the serving layer
+/// applies): a plain-completions row replayed as a chat route would parse chat-shaped
+/// fields the serving path deliberately ignored and manufacture a billing disagreement.
 pub async fn reconstruct_split(
     classifier: &crate::prompt_cache::Classifier,
     virtual_model: &str,
     request_body: &[u8],
     principal: crate::types::UserId,
     at: DateTime<Utc>,
+    route_has_blocks: bool,
 ) -> CacheResult<Option<ReconstructedSplit>> {
     let outcome = classifier
         .classify(crate::prompt_cache::ClassifyRequest {
@@ -272,10 +276,7 @@ pub async fn reconstruct_split(
             body: request_body,
             api_key: None,
             principal: Some(principal),
-            // Replay verifies MODULE splits, which exist only on chat routes (blockless
-            // routes classify to zero breakpoints on the serving path, and engine-sourced
-            // rows are excluded from replay upstream of this call).
-            route_has_blocks: true,
+            route_has_blocks,
         })
         .await?;
 

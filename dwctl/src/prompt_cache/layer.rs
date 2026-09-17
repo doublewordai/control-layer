@@ -116,6 +116,19 @@ fn is_cacheable(req: &Request) -> bool {
     req.method() == Method::POST && req.uri().path().trim_end_matches('/').ends_with("/completions")
 }
 
+/// Whether a path is the PLAIN completions route — the one cacheable shape whose body
+/// carries no module-cacheable blocks. Shared with the historical replay
+/// ([`crate::recompute::cache_replay`]) so the serving route gate and reconstruction
+/// can't drift. The rule is deliberately "plain completions" and not "is a chat path":
+/// `/v1/messages` and `/v1/responses` reach this layer already translated to chat
+/// completions, so their stored, pre-translation paths must NOT read as blockless.
+/// Tolerates trailing slashes (like `onwards::RequestClass`) and a query string
+/// (stored URIs may carry one).
+pub fn path_is_plain_completions(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+    path.ends_with("/completions") && !path.ends_with("/chat/completions")
+}
+
 /// Turn a synchronous marker-validation failure into the structured 400 the rest of the stack
 /// uses (same shape as the body-read error) — the request is rejected like a bad parameter, not
 /// silently un-cached. A disabled-tier message names the tiers that ARE available so the client
@@ -209,8 +222,9 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // was going to rewrite the body anyway).
     let mut body_bytes = body_bytes;
     // Chat Completions vs the other cacheable shapes, decided once: the query param and
-    // module-cache classification are both chat-route features.
-    let chat_route = parts.uri.path().trim_end_matches('/').ends_with("/chat/completions");
+    // module-cache classification are both chat-route features. (Within the cacheable
+    // surface, "not plain completions" IS the chat route.)
+    let chat_route = !path_is_plain_completions(parts.uri.path());
     // The param is a Chat Completions feature (`super::query`'s contract): on any other
     // cacheable path — plain /completions has no blocks for the marker to bind to — it is
     // stripped from the URI (it must never leak upstream) and otherwise ignored, so it
@@ -1459,6 +1473,21 @@ mod tests {
         assert!(is_cacheable(&req(Method::POST, "/v1/chat/completions/")));
         assert!(!is_cacheable(&req(Method::GET, "/v1/completions")));
         assert!(!is_cacheable(&req(Method::POST, "/v1/embeddings")));
+    }
+
+    #[test]
+    fn plain_completions_rule_is_shared_with_replay() {
+        // Serving gate and historical replay both consume this: only the plain
+        // completions shape is blockless. Pre-translation paths (/messages, /responses)
+        // must read as block-carrying — their rows had module splits.
+        assert!(path_is_plain_completions("/v1/completions"));
+        assert!(path_is_plain_completions("/v1/completions/"));
+        assert!(path_is_plain_completions("/v1/completions?cacheBreakpoint=lastUserMessage"));
+        assert!(!path_is_plain_completions("/v1/chat/completions"));
+        assert!(!path_is_plain_completions("/v1/chat/completions/"));
+        assert!(!path_is_plain_completions("/v1/messages"));
+        assert!(!path_is_plain_completions("/v1/responses"));
+        assert!(!path_is_plain_completions("/v1/embeddings"));
     }
 
     /// Completions upstream that also proves the query param never leaks upstream.
