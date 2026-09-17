@@ -4,13 +4,14 @@ How migrations run, and how to write one that survives a rolling deployment.
 
 ## How migrations run
 
-There are three SQLx migrators plus the `underway` task queue:
+The application manages these migration targets:
 
 | target      | files                          | schema                                   |
 |-------------|--------------------------------|------------------------------------------|
 | `main`      | `dwctl/migrations`             | main database, default schema            |
 | `fusillade` | `fusillade-arsenal/migrations` | `database.fusillade` (schema or database)|
 | `underway`  | the `underway` crate           | `underway` schema of the main database   |
+| `underway_extensions` | `dwctl/underway-migrations` | history in `underway_extensions`; indexes in `underway` |
 | `outlet`    | the `outlet-postgres` crate    | `database.outlet`, when logging is on    |
 
 `dwctl migrate` applies all of them in that order and exits; `dwctl migrate
@@ -31,6 +32,14 @@ consequence for every migration you write:
 > **The previous release's pods keep running against the migrated schema until
 > the rollout completes.** Every migration must be additive with respect to
 > the previous release, or expand/contract across two releases.
+
+Application-owned Underway indexes run after the dependency's migrations.
+Their history is separate because the dependency rejects unknown migration
+versions. Main migration 146 creates the history schema; the normal migration
+job and startup policy both apply/check the extension target. These indexes
+are additive and remain compatible with older workers. Concurrent builds
+still require temporary disk space and I/O; allow the migration job to finish
+before rolling the new release.
 
 The implementation is `dwctl/src/migrations.rs` (runner, compatibility check,
 command). It deliberately contains no schema knowledge of its own: every

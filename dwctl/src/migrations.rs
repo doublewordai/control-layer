@@ -1,7 +1,7 @@
 //! Schema migrations: applying them, checking compatibility, and the
 //! `dwctl migrate` command.
 //!
-//! Three SQLx migrators plus the `underway` task-queue schema make up the
+//! Application migrators plus the `underway` task-queue schema make up the
 //! control layer's schema:
 //!
 //! | target      | migrator                       | where                                  |
@@ -9,6 +9,7 @@
 //! | `main`      | `dwctl/migrations`             | main database, default schema          |
 //! | `fusillade` | `fusillade-arsenal/migrations` | `database.fusillade` (schema or DB)    |
 //! | `underway`  | the `underway` crate           | `underway` schema of the main database |
+//! | `underway_extensions` | `dwctl/underway-migrations` | separate history; indexes on Underway tasks |
 //! | `outlet`    | the `outlet-postgres` crate    | `database.outlet`, when logging is on  |
 //!
 //! Historically every API and daemon pod ran all four at boot. That couples
@@ -72,6 +73,14 @@ impl Target {
                 migrations: Cow::Borrowed(shared.migrations.as_ref()),
                 ..*shared
             },
+        }
+    }
+
+    /// Application-owned indexes, applied after the dependency's schema exists.
+    pub fn underway_extensions() -> Self {
+        Self {
+            name: "underway_extensions",
+            migrator: sqlx::migrate!("./underway-migrations"),
         }
     }
 
@@ -440,7 +449,7 @@ pub async fn apply_underway(pool: &PgPool) -> anyhow::Result<()> {
     let _ = conn.close().await;
     result.context("underway: applying migrations")?;
     info!(target = "underway", "migrations applied");
-    Ok(())
+    underway_extensions_at_startup(MigrationsMode::Run, pool).await
 }
 
 /// Verify the `underway` schema carries every migration this binary's
@@ -472,7 +481,21 @@ pub async fn check_underway(pool: &PgPool) -> anyhow::Result<()> {
         applied = UNDERWAY_MIGRATION_VERSIONS.len(),
         "schema compatible"
     );
-    Ok(())
+    underway_extensions_at_startup(MigrationsMode::Check, pool).await
+}
+
+async fn underway_extensions_at_startup(mode: MigrationsMode, main: &PgPool) -> anyhow::Result<()> {
+    // Migration 146 creates this schema. Never mix our versions into the
+    // dependency's history: older Underway releases reject unknown versions.
+    let pool = create_schema_pool(
+        "underway_extensions",
+        main.connect_options().as_ref().clone(),
+        &command_pool_settings(),
+    )
+    .await?;
+    let result = at_startup(mode, &Target::underway_extensions(), &pool).await;
+    pool.close().await;
+    result
 }
 
 pub async fn underway_at_startup(mode: MigrationsMode, pool: &PgPool) -> anyhow::Result<()> {
@@ -782,7 +805,7 @@ mod tests {
         let fusillade_pool = fusillade_pool_without_migrations(&pool).await;
         let fusillade = Target::fusillade();
         fusillade.run_to(PREVIOUS_FUSILLADE, &fusillade_pool).await.unwrap();
-        apply_underway(&pool).await.unwrap();
+        underway::run_migrations(&pool).await.unwrap();
         assert!(check(&main, &pool).await.is_err(), "the previous release's schema is behind");
 
         let report = apply(&main, &pool).await.unwrap();
@@ -870,6 +893,7 @@ mod tests {
 
     #[sqlx::test(migrations = false)]
     async fn underway_versions_match_crate(pool: PgPool) {
+        apply(&Target::main(), &pool).await.unwrap();
         apply_underway(&pool).await.unwrap();
         let versions: Vec<i64> = sqlx::query_scalar("SELECT version FROM underway._sqlx_migrations ORDER BY version")
             .fetch_all(&pool)
@@ -880,6 +904,114 @@ mod tests {
             "update UNDERWAY_MIGRATION_VERSIONS after bumping the underway crate"
         );
         check_underway(&pool).await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn underway_extensions_are_separate_and_repeatable(pool: PgPool) {
+        underway::run_migrations(&pool).await.unwrap();
+        // The upstream schema alone is not sufficient for this release.
+        assert!(check_underway(&pool).await.is_err());
+        apply_underway(&pool).await.unwrap();
+        check_underway(&pool).await.unwrap();
+        apply_underway(&pool).await.unwrap();
+        // Older dependency migrators must still accept their own history.
+        underway::run_migrations(&pool).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM underway_extensions._sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count as usize, Target::underway_extensions().migrator.iter().count());
+    }
+
+    #[sqlx::test]
+    async fn underway_extensions_repair_interrupted_indexes(pool: PgPool) {
+        underway::run_migrations(&pool).await.unwrap();
+        // Reproduce the catalog state left by a cancelled concurrent build,
+        // before SQLx records the migration. Only in this isolated test DB.
+        sqlx::raw_sql(
+            "CREATE INDEX idx_task_queue_state ON underway.task(task_queue_name, state);
+             CREATE INDEX idx_task_id ON underway.task(id);
+             UPDATE pg_index SET indisvalid = false
+             WHERE indexrelid IN ('underway.idx_task_queue_state'::regclass, 'underway.idx_task_id'::regclass);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        apply_underway(&pool).await.unwrap();
+        let valid: bool = sqlx::query_scalar(
+            "SELECT bool_and(indisvalid AND indisready) FROM pg_index
+             WHERE indexrelid IN ('underway.idx_task_queue_state'::regclass, 'underway.idx_task_id'::regclass)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(valid);
+        check_underway(&pool).await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn underway_extensions_reject_wrong_index_definitions(pool: PgPool) {
+        underway::run_migrations(&pool).await.unwrap();
+        sqlx::query("CREATE INDEX idx_task_queue_state ON underway.task(task_queue_name)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = apply_underway(&pool).await.unwrap_err();
+        assert!(format!("{error:#}").contains("wrong definition"), "{error:#}");
+        assert!(check_underway(&pool).await.is_err());
+    }
+
+    #[sqlx::test]
+    async fn underway_indexes_bound_claim_and_completion_work(pool: PgPool) {
+        apply_underway(&pool).await.unwrap();
+        sqlx::raw_sql(include_str!("../tests/fixtures/underway_history.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut conn = pool.acquire().await.unwrap();
+        // Explicit PREPARE + both cache modes exercise the parameterized enum
+        // predicates. A pending-only partial index cannot satisfy this query.
+        sqlx::raw_sql(&format!(
+            "PREPARE claim(text, underway.task_state, underway.task_state) AS {}",
+            include_str!("../tests/fixtures/underway_claim.sql")
+        ))
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+        sqlx::raw_sql("PREPARE complete(uuid, underway.task_state) AS UPDATE underway.task SET state=$2, updated_at=now(), completed_at=now() WHERE id=$1")
+            .execute(&mut *conn).await.unwrap();
+        for mode in ["force_custom_plan", "force_generic_plan"] {
+            sqlx::raw_sql(&format!("SET plan_cache_mode = {mode}"))
+                .execute(&mut *conn)
+                .await
+                .unwrap();
+            for (query, expected_index) in [
+                ("EXECUTE claim('create-batch', 'pending', 'in_progress')", "idx_task_queue_state"),
+                (
+                    "EXECUTE complete('00000000-0000-0000-0000-000000000000', 'succeeded')",
+                    "idx_task_id",
+                ),
+            ] {
+                sqlx::raw_sql("BEGIN").execute(&mut *conn).await.unwrap();
+                let plan: serde_json::Value = sqlx::query_scalar(&format!("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) {query}"))
+                    .fetch_one(&mut *conn)
+                    .await
+                    .unwrap();
+                sqlx::raw_sql("ROLLBACK").execute(&mut *conn).await.unwrap();
+                let rendered = plan.to_string();
+                assert!(rendered.contains(expected_index), "{mode}: {rendered}");
+                fn scans_task_history(node: &serde_json::Value) -> bool {
+                    (node["Node Type"] == "Seq Scan" && node["Relation Name"] == "task")
+                        || node["Plans"].as_array().is_some_and(|plans| plans.iter().any(scans_task_history))
+                }
+                assert!(!scans_task_history(&plan[0]["Plan"]), "{mode}: {rendered}");
+                // Bound actual database work, not wall-clock time on a busy CI
+                // host. Reading the queue's 5,000 historical rows exceeds this.
+                let root = &plan[0]["Plan"];
+                let blocks = root["Shared Hit Blocks"].as_u64().unwrap() + root["Shared Read Blocks"].as_u64().unwrap();
+                assert!(blocks < 200, "{mode}: read {blocks} blocks: {rendered}");
+            }
+        }
     }
 
     #[sqlx::test(migrations = false)]
