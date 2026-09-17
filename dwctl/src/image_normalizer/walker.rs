@@ -159,11 +159,71 @@ where
     Ok(count)
 }
 
+/// Whether `body` carries at least one image input that `mode` would act on
+/// — the read-only twin of [`substitute_with`], over the same two shapes. Lets
+/// a caller skip work (a caller lookup, say) for the common image-free body.
+pub fn has_inputs(body: &Value, mode: Mode) -> bool {
+    // chat-completions shape: messages[*].content[*].image_url.url
+    let chat = body.get("messages").and_then(Value::as_array).is_some_and(|messages| {
+        messages.iter().any(|msg| {
+            msg.get("content").and_then(Value::as_array).is_some_and(|content| {
+                content.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("image_url")
+                        && item
+                            .get("image_url")
+                            .and_then(|o| o.get("url"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|url| mode.applies_to(url))
+                })
+            })
+        })
+    });
+    // responses shape: input[*].content[*].image_url
+    let responses = body.get("input").and_then(Value::as_array).is_some_and(|input| {
+        input.iter().any(|item| {
+            item.get("content").and_then(Value::as_array).is_some_and(|content| {
+                content.iter().any(|part| {
+                    part.get("type").and_then(Value::as_str) == Some("input_image")
+                        && part
+                            .get("image_url")
+                            .and_then(Value::as_str)
+                            .is_some_and(|url| mode.applies_to(url))
+                })
+            })
+        })
+    });
+    chat || responses
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::convert::Infallible;
+
+    #[test]
+    fn has_inputs_mirrors_the_walker_over_both_shapes() {
+        let chat = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "hi"},
+            {"type": "image_url", "image_url": {"url": "https://x/a.png"}}
+        ]}]});
+        let responses = json!({"input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+        ]}]});
+        let text_only = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let token_only = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "dw-img://0000000000000000000000000000000000000000000000000000000000000000"}}
+        ]}]});
+
+        assert!(has_inputs(&chat, Mode::All));
+        assert!(has_inputs(&responses, Mode::All));
+        assert!(!has_inputs(&text_only, Mode::All));
+        // Mode decides: a token is not an `All` input, but is an `AllAndTokens` one.
+        assert!(!has_inputs(&token_only, Mode::All));
+        assert!(has_inputs(&token_only, Mode::AllAndTokens));
+        // A data URI is not an `HttpOnly` input.
+        assert!(!has_inputs(&responses, Mode::HttpOnly));
+    }
 
     /// Substitution callback that just prefixes the input — easy to assert
     /// against and never errors.

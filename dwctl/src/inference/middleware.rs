@@ -505,14 +505,18 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // hands the provider a signed URL rather than the raw image/URL —
             // closing the same exposure the realtime and `/v1/files` paths
             // already close. No-op when the feature is disabled.
-            if state.image_normalizer_enabled {
-                // Attribute the image to the acting human + owning org (for org
-                // keys), mirroring how CurrentUser is derived, so the console's
-                // org-scoped image-view authorization lines up.
-                // The attribution row written here is what authorises a client
-                // re-sending this request's tokens later, so a lookup failure
-                // fails the submission (retryable) instead of silently
-                // persisting tokens without it.
+            // Only bodies that actually carry an image pay for the caller
+            // lookup (and can fail on it); text-only flex traffic is untouched.
+            if state.image_normalizer_enabled
+                && crate::image_normalizer::walker::has_inputs(&request_value, crate::image_normalizer::Mode::All)
+            {
+                // Attribute the image to the PRINCIPAL behind the key (the
+                // person, or the organization for an org key), the same
+                // principal the daemon's hidden batch key carries at dispatch.
+                // The attribution row written here is what authorises signing
+                // the tokens at dispatch (and on a later client re-send), so a
+                // lookup failure fails the submission (retryable) instead of
+                // silently persisting tokens without it.
                 let attribution = match api_key.as_deref() {
                     Some(key) => match crate::api::handlers::images::try_resolve_caller(&state.dwctl_pool.write(), key).await {
                         Ok(caller) => caller.map(|c| c.attribution),

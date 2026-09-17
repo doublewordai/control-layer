@@ -347,6 +347,14 @@ mod tests {
         let dave = create_test_user(&pool, Role::StandardUser).await; // member of neither
         let org_a = create_test_org(&pool, alice.id).await;
         let org_b = create_test_org(&pool, alice.id).await;
+        {
+            let mut conn = pool.acquire().await.unwrap();
+            Organizations::new(&mut conn).add_member(org_a.id, bob.id, "member").await.unwrap();
+            Organizations::new(&mut conn)
+                .add_member(org_b.id, carol.id, "member")
+                .await
+                .unwrap();
+        }
         let img = token(7);
 
         // What an org key / a personal key resolves to (see `try_resolve_caller`).
