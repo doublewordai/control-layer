@@ -30,6 +30,10 @@ use crate::model_provisioning::{ServingClassName, ServingPreset};
 /// Prefix of the `provisioning_source` marker on rows this catalog owns.
 const SOURCE_PREFIX: &str = "org-overlays:";
 
+/// Transaction-scoped advisory lock serialising overlay reconciliation across
+/// replicas starting at once (mirrors the model catalog's own lock).
+const ORG_OVERLAYS_LOCK: i64 = 0x4457_4f52_474f_564c;
+
 #[derive(Debug, Clone)]
 pub struct OrgCatalog {
     pub(crate) orgs: Vec<OrgCatalogEntry>,
@@ -76,12 +80,14 @@ pub struct OrgModelOverlay {
 
 impl OrgCatalog {
     /// Load every YAML document in `directory`. A missing directory is an
-    /// empty catalog: the chart may not mount one yet.
+    /// empty catalog: the chart may not mount one yet. An existing path that
+    /// is not a directory is a misconfiguration, not an empty catalog.
     pub fn load(directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref();
-        if !directory.is_dir() {
+        if !directory.exists() {
             return Ok(Self { orgs: Vec::new() });
         }
+        ensure!(directory.is_dir(), "org overlay path {} is not a directory", directory.display());
         let mut paths = fs::read_dir(directory)
             .with_context(|| format!("read org overlay directory {}", directory.display()))?
             .map(|entry| entry.map(|entry| entry.path()))
@@ -154,6 +160,11 @@ pub async fn apply(pool: &PgPool, catalog: &OrgCatalog) -> Result<()> {
 }
 
 async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(ORG_OVERLAYS_LOCK)
+        .execute(&mut *db)
+        .await
+        .context("acquire org overlay advisory lock")?;
     let orgs = resolve_orgs(db, catalog).await?;
     let aliases = resolve_aliases(db, catalog).await?;
 
@@ -279,11 +290,15 @@ mod tests {
     }
 
     #[test]
-    fn missing_directory_is_an_empty_catalog() {
+    fn missing_directory_is_an_empty_catalog_but_a_file_is_an_error() {
         let directory = tempdir().unwrap();
         let missing = directory.path().join("nope");
         assert!(OrgCatalog::load(&missing).unwrap().orgs.is_empty());
         assert!(OrgCatalog::load(directory.path()).unwrap().orgs.is_empty());
+        let file = directory.path().join("overlays.yaml");
+        fs::write(&file, "org: acme\n").unwrap();
+        let err = OrgCatalog::load(&file).unwrap_err().to_string();
+        assert!(err.contains("is not a directory"), "{err}");
     }
 
     #[test]

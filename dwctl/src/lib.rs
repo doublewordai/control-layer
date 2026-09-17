@@ -1582,11 +1582,13 @@ async fn setup_database(
     seed_database(&config.model_sources, &main.pooled.write()).await?;
 
     if config.model_provisioning.enabled {
+        // Both catalogs are parsed and validated before either is applied, so
+        // a malformed overlay file fails startup without a half-applied model
+        // catalog. Overlays reference the model catalog's aliases, so they are
+        // applied after it.
         let catalog = model_provisioning::Catalog::load(&config.model_provisioning.directory)?;
-        model_provisioning::apply(&main.pooled.write(), &catalog).await?;
-        // Organisation overlays reference the model catalog's aliases, so
-        // they are applied after it.
         let overlays = org_overlays::OrgCatalog::load(&config.model_provisioning.org_overlays_directory)?;
+        model_provisioning::apply(&main.pooled.write(), &catalog).await?;
         org_overlays::apply(&main.pooled.write(), &overlays).await?;
     }
 

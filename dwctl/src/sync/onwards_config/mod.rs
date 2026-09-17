@@ -197,7 +197,9 @@ async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::E
         SELECT mo.user_id, dm.alias, mo.default_serving_class, mo.targets, mo.self_hosted_only
         FROM model_overlays mo
         INNER JOIN deployed_models dm ON dm.id = mo.deployed_model_id
+        INNER JOIN users u ON u.id = mo.user_id
         WHERE dm.deleted = FALSE
+          AND u.is_deleted = FALSE
         "#
     )
     .fetch_all(db)

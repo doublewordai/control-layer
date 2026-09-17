@@ -83,7 +83,9 @@ pub enum ServingClass {
     /// The absence of a choice.
     Standard,
     /// Explicit targets from an overlay: a bespoke deal on one alias. Never
-    /// requestable by suffix and never declared on a model.
+    /// requestable by suffix, never declared on a model or an account: an
+    /// outcome only, so configuration cannot spell it.
+    #[serde(skip_deserializing)]
     Custom,
 }
 
@@ -800,6 +802,18 @@ mod tests {
             "\"dynamo\""
         );
 
+        // `custom` is an outcome, never configuration.
+        assert_eq!(
+            serde_json::to_string(&ServingClass::Custom).unwrap(),
+            "\"custom\""
+        );
+        assert!(serde_json::from_str::<ServingClass>("\"custom\"").is_err());
+        assert!(serde_json::from_str::<AccountServing>(r#"{"granted": ["custom"]}"#).is_err());
+        assert!(
+            serde_json::from_str::<ServingPresets>(r#"{"custom": {"ttft_ms": 1, "itl_ms": 1}}"#)
+                .is_err()
+        );
+
         let presets: ServingPresets =
             serde_json::from_str(r#"{"interactive": {"ttft_ms": 500, "itl_ms": 20, "priority": 200}, "standard": {"ttft_ms": 9, "itl_ms": 9}}"#)
                 .unwrap();
@@ -1210,6 +1224,38 @@ mod handler_tests {
     }
 
     #[tokio::test]
+    async fn an_upstream_failure_still_reports_the_resolved_class() {
+        let mut s = setup(&[DYNAMO]);
+        s.presets = both();
+        s.account = Some(holds(&BOTH_CLASSES));
+        let mock = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"boom"}"#);
+        // Straight through the router: the extension lives on the axum
+        // response, which the test-server wrapper does not expose.
+        use tower::ServiceExt;
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {KEY}"))
+            .body(axum::body::Body::from(
+                json!({"model": "gpt-4:interactive", "messages": [{"role": "user", "content": "hi"}]}).to_string(),
+            ))
+            .unwrap();
+        let response = build_router(AppState::with_client(targets(&s), mock.clone()))
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert!(response.status().is_server_error());
+        let outcome = response
+            .extensions()
+            .get::<ServingClassOutcome>()
+            .copied()
+            .expect("the outcome rides on error responses too, for analytics");
+        assert_eq!(outcome.requested, Some(ServingClass::Interactive));
+        assert_eq!(outcome.resolved, ServingClass::Interactive);
+    }
+
+    #[tokio::test]
     async fn unknown_class_suffix_is_rejected_with_the_valid_set() {
         let s = setup(&[DYNAMO]);
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
@@ -1254,8 +1300,28 @@ mod handler_tests {
             response.status_code()
         );
         let requests = mock.get_requests();
-        assert_eq!(requests.len(), 1, "the external member is never attempted");
-        assert!(requests[0].uri.starts_with("https://dynamo.example.com/"));
+        assert!(!requests.is_empty());
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.uri.starts_with("https://dynamo.example.com/")),
+            "the external member is never attempted; the attempt budget is spent on eligible members"
+        );
+
+        // An alias with no eligible member at all is refused as such, not as
+        // a pool at capacity.
+        let mut s = setup(&[EXTERNAL]);
+        s.account = Some(AccountServing {
+            self_hosted_only: true,
+            ..Default::default()
+        });
+        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+        let srv = server(&s, &mock);
+        let response = post(&srv, "gpt-4", json!({})).await;
+        assert_eq!(response.status_code(), 503);
+        let err: serde_json::Value = response.json();
+        assert_eq!(err["error"]["code"], "no_eligible_provider", "{err}");
+        assert!(mock.get_requests().is_empty());
 
         // A hosted (non-dynamo, self-hosted) member is still eligible.
         let mut s = setup(&[DYNAMO, HOSTED]);
@@ -1282,6 +1348,61 @@ mod handler_tests {
         let srv = server(&s, &mock);
         post(&srv, "gpt-4", json!({})).await;
         assert_eq!(mock.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_named_pool_request_is_resolved_against_the_alias_policy() {
+        // Presets and overlays are declared on the alias's default pool; a
+        // request served by a named pool (here: completions) must still see
+        // them, or an explicit class would be refused as "not offered".
+        let mut s = setup(&[DYNAMO]);
+        s.presets = both();
+        s.account = Some(holds(&BOTH_CLASSES));
+        let mock = MockHttpClient::new(
+            StatusCode::OK,
+            r#"{"id":"cmpl-1","object":"text_completion","model":"gpt-4","choices":[]}"#,
+        );
+        let targets = targets(&s);
+        let completions = ProviderPool::with_config(
+            vec![Provider::new(
+                Target::builder()
+                    .url("https://dynamo-completions.example.com/".parse().unwrap())
+                    .kind(ProviderKind::Dynamo)
+                    .build(),
+                1,
+            )],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+        let default_pool = targets.targets.get(ALIAS).unwrap().default_pool().clone();
+        targets.targets.insert(
+            ALIAS.to_string(),
+            TargetPools::with_pools(
+                default_pool,
+                HashMap::from([("completions".to_string(), completions)]),
+            ),
+        );
+        let srv =
+            TestServer::new(build_router(AppState::with_client(targets, mock.clone()))).unwrap();
+        let response = srv
+            .post("/v1/completions")
+            .add_header("authorization", format!("Bearer {KEY}"))
+            .json(&json!({"model": "gpt-4:interactive", "prompt": "hi"}))
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        let req = &mock.get_requests()[0];
+        assert!(
+            req.uri
+                .starts_with("https://dynamo-completions.example.com/"),
+            "{}",
+            req.uri
+        );
+        assert_eq!(sent(req), Some((500, 20, Some(200))));
     }
 
     #[test]

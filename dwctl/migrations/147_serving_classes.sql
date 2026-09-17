@@ -27,6 +27,10 @@
 --     provider" restriction knows which members are external.
 
 -- ---------------------------------------------------------------------------
+-- Every statement here is a metadata change or touches a small table; never wait
+-- behind live traffic for a lock.
+SET LOCAL lock_timeout = '5s';
+
 -- The model: the classes it offers, as presets of targets.
 ALTER TABLE deployed_models
     ADD COLUMN serving_classes JSONB NOT NULL DEFAULT '{}'::jsonb;
@@ -136,4 +140,4 @@ ALTER TABLE http_analytics
 COMMENT ON COLUMN http_analytics.requested_serving_class IS
   'Serving class the request asked for (suffix > overlay default > account default); NULL when nothing named one.';
 COMMENT ON COLUMN http_analytics.resolved_serving_class IS
-  'Serving class the request was dispatched under (interactive | throughput | standard).';
+  'Serving class the request was dispatched under (interactive | throughput | standard | custom, the last for an overlay''s explicit targets).';

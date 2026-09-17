@@ -125,7 +125,11 @@ pub struct RawAnalyticsRecord {
     pub served_by: Option<String>,
     /// Serving class the request asked for / was served under (onwards
     /// `ServingClassOutcome` extension). See `serializers::UsageMetrics`.
+    /// Defaulted so outbox rows written before these fields existed still
+    /// deserialise after a deploy.
+    #[serde(default)]
     pub requested_serving_class: Option<String>,
+    #[serde(default)]
     pub resolved_serving_class: Option<String>,
 
     // === Auth (unresolved - just the token) ===

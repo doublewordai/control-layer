@@ -541,7 +541,10 @@ pub async fn target_message_handler<T: HttpClient>(
         Ok((alias, Some(class))) => {
             let alias = alias.to_string();
             let body_bytes = rewrite_body_model(body_bytes, &alias);
-            (alias, suffix_class.or(Some(class)), body_bytes)
+            // The suffix on the selected model string wins over the
+            // extension: the string is the source that took precedence
+            // (a `Model-Override` header over the body), so its class does too.
+            (alias, Some(class), body_bytes)
         }
         Err(unknown) => {
             record_response_status(400);
@@ -577,7 +580,9 @@ pub async fn target_message_handler<T: HttpClient>(
     // the map guard so only the chosen pool is cloned: KeySets are owned, so a
     // whole-TargetPools clone would deep-copy every pool's keys per request.
     let request_class = RequestClass::from_path(&canonical_request_path);
-    let (mut resolved_pool_name, mut pool) = match state.targets.targets.get(&model_name) {
+    // The alias's serving policy (presets, overlays) is declared on its
+    // default pool and applies whichever pool serves this request's class.
+    let (mut resolved_pool_name, mut pool, mut alias_serving) = match state.targets.targets.get(&model_name) {
         Some(pools) => {
             // Now that the model is known to be a configured target, tag the
             // in-flight guard so `onwards_model_inflight{model=…}` tracks this
@@ -588,7 +593,11 @@ pub async fn target_message_handler<T: HttpClient>(
             if let Some(guard) = inflight_guard.as_mut() {
                 guard.set_model(&model_name);
             }
-            (pools.resolved_name(request_class), pools.resolve(request_class).clone())
+            (
+                pools.resolved_name(request_class),
+                pools.resolve(request_class).clone(),
+                pools.default_pool().alias_serving().clone(),
+            )
         }
         None => {
             debug!("No target found for model: {}", model_name);
@@ -672,6 +681,7 @@ pub async fn target_message_handler<T: HttpClient>(
                             // actually serves, not the source alias's.
                             Some(p) => {
                                 resolved_pool_name = p.resolved_name(request_class);
+                                alias_serving = p.default_pool().alias_serving().clone();
                                 p.resolve(request_class).clone()
                             }
                             None => {
@@ -711,13 +721,13 @@ pub async fn target_message_handler<T: HttpClient>(
             .and_then(|id| state.targets.accounts.get(id).map(|r| r.value().clone()));
         let overlay = account_id
             .as_deref()
-            .and_then(|id| pool.overlays().get(id).cloned());
+            .and_then(|id| alias_serving.overlays().get(id).cloned());
         let resolution = match serving::resolve(
             suffix_class,
             account.as_ref(),
             overlay.as_ref(),
             &model_name,
-            pool.serving_classes(),
+            alias_serving.presets(),
             key_purpose.as_deref(),
         ) {
             Ok(resolution) => resolution,
@@ -944,25 +954,38 @@ pub async fn target_message_handler<T: HttpClient>(
         && state.targets.strict_mode
         && requests_stream(&body_bytes)
         && is_realtime;
-    for (member_idx, target, connection_guard) in pool.select_iter_aimd(aimd_eligible, &model_name, resolved_pool_name.unwrap_or("default")) {
-        // A self-hosted-only account never reaches an external member: the
-        // composite's eligible set is narrowed to its non-external providers
-        // for this request, whatever the alias's own failover list says. The
-        // skipped member still consumes an attempt from the budget, so a pool
-        // of [dynamo, external] ends with the dynamo outcome rather than an
-        // external one.
-        if serving_resolution.self_hosted_only && target.kind == ProviderKind::External {
-            debug!(
-                "Skipping external provider {} for a self-hosted-only account",
-                target.url
-            );
-            metrics::counter!(
-                "onwards_self_hosted_only_skips_total",
-                "model" => model_name.to_string(),
-            )
-            .increment(1);
-            continue;
-        }
+    // A self-hosted-only account never reaches an external member: the
+    // composite's eligible set is narrowed to its non-external providers for
+    // this request, whatever the alias's own failover list says, BEFORE the
+    // attempt budget is spent, so the budget goes to eligible members under
+    // every strategy and a pool of [dynamo, external] ends with a dynamo
+    // outcome rather than an external one.
+    let ineligible_members: Vec<usize> = if serving_resolution.self_hosted_only {
+        pool.providers()
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| provider.target.kind == ProviderKind::External)
+            .map(|(idx, _)| idx)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !ineligible_members.is_empty() {
+        debug!(
+            "Excluding {} external provider(s) for a self-hosted-only account",
+            ineligible_members.len()
+        );
+        metrics::counter!(
+            "onwards_self_hosted_only_skips_total",
+            "model" => model_name.to_string(),
+        )
+        .increment(ineligible_members.len() as u64);
+    }
+    let no_eligible_member = !pool.is_empty() && ineligible_members.len() == pool.len();
+    for (member_idx, target, connection_guard) in pool
+        .select_iter_aimd(aimd_eligible, &model_name, resolved_pool_name.unwrap_or("default"))
+        .excluding_members(ineligible_members.iter().copied())
+    {
         any_attempted = true;
         attempt_number += 1;
         // First-token observations are attributed to the provider actually
@@ -2022,7 +2045,33 @@ pub async fn target_message_handler<T: HttpClient>(
         )
         .increment(1);
         record_response_status(status);
-        Err(final_error)
+        // The outcome rides on the error too: analytics records what the
+        // request resolved to whether or not the upstream served it.
+        let mut response = final_error.into_response();
+        response
+            .extensions_mut()
+            .insert::<ServingClassOutcome>(serving_resolution.outcome());
+        Ok(response)
+    } else if no_eligible_member {
+        // Every member is external and the account never uses those: not a
+        // capacity condition, and nothing to retry.
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "no_eligible_provider",
+            "status" => "503",
+            "model" => model_name.to_string(),
+        )
+        .increment(1);
+        record_response_status(503);
+        Err(OnwardsErrorResponse::builder()
+            .body(ErrorResponseBody {
+                message: format!("Model '{model_name}' has no self-hosted provider available to this account."),
+                r#type: "server_error".to_string(),
+                param: Some("model".to_string()),
+                code: "no_eligible_provider".to_string(),
+            })
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .build())
     } else if !pool.is_empty() {
         // Pool has providers but select_iter() yielded nothing — all at capacity
         metrics::counter!(

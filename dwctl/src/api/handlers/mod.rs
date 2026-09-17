@@ -42,7 +42,7 @@ pub(crate) fn validate_elevated_serving_class(class: &str) -> crate::errors::Res
     match class.parse::<onwards::ServingClass>() {
         Ok(parsed) if parsed.is_elevated() => Ok(()),
         _ => Err(crate::errors::Error::BadRequest {
-            message: format!("Invalid serving class '{class}'. Valid values: interactive, throughput (or null to clear)."),
+            message: format!("Invalid serving class '{class}'. Valid values: interactive, throughput."),
         }),
     }
 }

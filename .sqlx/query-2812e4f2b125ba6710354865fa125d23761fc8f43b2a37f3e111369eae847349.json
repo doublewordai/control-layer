@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT mo.user_id, dm.alias, mo.default_serving_class, mo.targets, mo.self_hosted_only\n        FROM model_overlays mo\n        INNER JOIN deployed_models dm ON dm.id = mo.deployed_model_id\n        WHERE dm.deleted = FALSE\n        ",
+  "query": "\n        SELECT mo.user_id, dm.alias, mo.default_serving_class, mo.targets, mo.self_hosted_only\n        FROM model_overlays mo\n        INNER JOIN deployed_models dm ON dm.id = mo.deployed_model_id\n        INNER JOIN users u ON u.id = mo.user_id\n        WHERE dm.deleted = FALSE\n          AND u.is_deleted = FALSE\n        ",
   "describe": {
     "columns": [
       {
@@ -40,5 +40,5 @@
       true
     ]
   },
-  "hash": "cc71ec28d68425eca8840fe6f500f5dfe48d391711ad7095ae2344eee84d7253"
+  "hash": "2812e4f2b125ba6710354865fa125d23761fc8f43b2a37f3e111369eae847349"
 }

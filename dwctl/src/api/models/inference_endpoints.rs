@@ -144,11 +144,23 @@ pub struct InferenceEndpointCreate {
     /// What kind of server this is: `dynamo` (self-hosted behind the dynamo
     /// frontend; the only kind that receives the serving-class envelope),
     /// `hosted` (self-hosted, not dynamo) or `external` (third-party
-    /// provider; skipped for self-hosted-only accounts). Defaults to
-    /// `external`, which stamps nothing and is never skipped for the wrong
-    /// reason.
+    /// provider; skipped for self-hosted-only accounts). When omitted:
+    /// `dynamo` if `accepts_scheduling_priority` is set (the two describe
+    /// the same server, as the migration backfill assumes), else `external`,
+    /// which stamps nothing and is never skipped for the wrong reason.
     #[serde(default)]
-    pub kind: EndpointKind,
+    pub kind: Option<EndpointKind>,
+}
+
+impl InferenceEndpointCreate {
+    /// The kind to store: explicit, else derived from the priority capability.
+    pub fn resolved_kind(&self) -> EndpointKind {
+        self.kind.unwrap_or(if self.accepts_scheduling_priority {
+            EndpointKind::Dynamo
+        } else {
+            EndpointKind::External
+        })
+    }
 }
 
 fn default_sync() -> bool {

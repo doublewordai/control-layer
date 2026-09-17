@@ -619,24 +619,15 @@ pub async fn update_organization<P: PoolProvider>(
             resource: format!("zero data retention for organization {id}"),
         });
     }
-    // SECURITY: granted serving classes are an entitlement to elevated,
-    // fleet-wide priority. Only a platform operator grants them, never the
-    // organisation itself (same rule as the users endpoint).
-    if !can_all && data.granted_serving_classes.is_some() {
+    // SECURITY: the serving account settings (granted classes, default class,
+    // routing preference) decide how the organisation's traffic is placed and
+    // prioritised fleet-wide. They are operated by platform managers only,
+    // never by the organisation itself, whatever its role: customers meet
+    // serving classes only as a model suffix. Same rule as the users endpoint.
+    if !can_all && (data.granted_serving_classes.is_some() || data.default_serving_class.is_some() || data.self_hosted_only.is_some()) {
         return Err(Error::InsufficientPermissions {
             required: Permission::Allow(Resource::Organizations, Operation::UpdateAll),
             action: Operation::UpdateAll,
-            resource: format!("granted serving classes for organization {id}"),
-        });
-    }
-    // The default class (only effective within the classes held) and the
-    // routing preference are the organisation's own choices; owner-only, like
-    // ZDR.
-    if !can_all && (data.default_serving_class.is_some() || data.self_hosted_only.is_some()) && caller_org_role.as_deref() != Some("owner")
-    {
-        return Err(Error::InsufficientPermissions {
-            required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
-            action: Operation::UpdateOwn,
             resource: format!("serving settings for organization {id}"),
         });
     }
@@ -3583,7 +3574,7 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_organization_owner_sets_serving_preferences_but_cannot_self_grant_classes(pool: PgPool) {
+    async fn test_organization_owners_cannot_touch_serving_settings_only_platform_managers(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
         let pm = create_test_admin_user(&pool, Role::PlatformManager).await;
         let pm_headers = add_auth_headers(&pm);
@@ -3599,41 +3590,50 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::CREATED);
         let org_id = resp.json::<serde_json::Value>()["id"].as_str().unwrap().to_string();
 
-        // Granted classes are an entitlement: the owner cannot hand them to
-        // their own organisation, even alongside an allowed field.
+        // Every serving setting is refused to the owner, alone or mixed with
+        // an ordinary field; the ordinary field is not applied either.
+        for body in [
+            json!({ "granted_serving_classes": ["interactive"] }),
+            json!({ "default_serving_class": "throughput" }),
+            json!({ "self_hosted_only": true }),
+            json!({ "display_name": "Renamed", "self_hosted_only": true }),
+        ] {
+            let resp = server
+                .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+                .add_header(&owner_headers[0].0, &owner_headers[0].1)
+                .add_header(&owner_headers[1].0, &owner_headers[1].1)
+                .json(&body)
+                .await;
+            resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+        }
         let resp = server
-            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
+            .get(&format!("/admin/api/v1/organizations/{org_id}"))
             .add_header(&owner_headers[0].0, &owner_headers[0].1)
             .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "granted_serving_classes": ["interactive"], "self_hosted_only": true }))
-            .await;
-        resp.assert_status(axum::http::StatusCode::FORBIDDEN);
-
-        // The default class and routing preference are the owner's own choices.
-        let resp = server
-            .patch(&format!("/admin/api/v1/organizations/{org_id}"))
-            .add_header(&owner_headers[0].0, &owner_headers[0].1)
-            .add_header(&owner_headers[1].0, &owner_headers[1].1)
-            .json(&json!({ "default_serving_class": "throughput", "self_hosted_only": true }))
             .await;
         resp.assert_status(axum::http::StatusCode::OK);
         let body = resp.json::<serde_json::Value>();
-        assert_eq!(body["default_serving_class"].as_str(), Some("throughput"));
-        assert_eq!(body["self_hosted_only"].as_bool(), Some(true));
+        assert_ne!(body["display_name"].as_str(), Some("Renamed"), "a refused patch applies nothing");
         assert_eq!(body["granted_serving_classes"].as_array().map(Vec::len), Some(0));
+        assert_eq!(body["default_serving_class"], serde_json::Value::Null);
+        assert_eq!(body["self_hosted_only"].as_bool(), Some(false));
 
-        // A platform manager grants.
+        // A platform manager operates all three.
         let resp = server
             .patch(&format!("/admin/api/v1/organizations/{org_id}"))
             .add_header(&pm_headers[0].0, &pm_headers[0].1)
             .add_header(&pm_headers[1].0, &pm_headers[1].1)
-            .json(&json!({ "granted_serving_classes": ["interactive", "throughput"] }))
+            .json(&json!({
+                "granted_serving_classes": ["interactive", "throughput"],
+                "default_serving_class": "throughput",
+                "self_hosted_only": true
+            }))
             .await;
         resp.assert_status(axum::http::StatusCode::OK);
-        assert_eq!(
-            resp.json::<serde_json::Value>()["granted_serving_classes"],
-            json!(["interactive", "throughput"])
-        );
+        let body = resp.json::<serde_json::Value>();
+        assert_eq!(body["granted_serving_classes"], json!(["interactive", "throughput"]));
+        assert_eq!(body["default_serving_class"].as_str(), Some("throughput"));
+        assert_eq!(body["self_hosted_only"].as_bool(), Some(true));
     }
 
     #[sqlx::test]

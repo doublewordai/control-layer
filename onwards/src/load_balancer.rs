@@ -80,10 +80,39 @@ pub struct ProviderPool {
     trusted: bool,
     /// Routing rules evaluated against key labels before processing
     routing_rules: Vec<RoutingRule>,
-    /// Elevated serving classes the alias offers (default pool only).
-    serving_classes: ServingPresets,
-    /// Per-account overrides on this alias, keyed by account id.
-    overlays: HashMap<String, ServingOverlay>,
+    /// The alias's serving policy (default pool only): offered presets and
+    /// per-account overlays. Shared, so cloning the pool per request is
+    /// cheap however many organisations have overlays on the alias.
+    serving: AliasServing,
+}
+
+/// The serving policy declared on an alias: the presets it offers and its
+/// per-account overlays. Both behind `Arc`: the handler clones the selected
+/// pool for every request and this must not scale with the number of
+/// organisations configured.
+#[derive(Clone, Debug, Default)]
+pub struct AliasServing {
+    presets: Arc<ServingPresets>,
+    overlays: Arc<HashMap<String, ServingOverlay>>,
+}
+
+impl AliasServing {
+    pub fn new(presets: ServingPresets, overlays: HashMap<String, ServingOverlay>) -> Self {
+        Self {
+            presets: Arc::new(presets),
+            overlays: Arc::new(overlays),
+        }
+    }
+
+    /// The classes the alias offers, each with its preset.
+    pub fn presets(&self) -> &ServingPresets {
+        &self.presets
+    }
+
+    /// Per-account overlays on the alias, keyed by account id.
+    pub fn overlays(&self) -> &HashMap<String, ServingOverlay> {
+        &self.overlays
+    }
 }
 
 /// A single provider within a pool
@@ -136,8 +165,7 @@ impl ProviderPool {
             parked: None,
             trusted: false,
             routing_rules: Vec::new(),
-            serving_classes: ServingPresets::new(),
-            overlays: HashMap::new(),
+            serving: AliasServing::default(),
         }
     }
 
@@ -167,31 +195,34 @@ impl ProviderPool {
             strategy,
             trusted,
             routing_rules,
-            serving_classes: ServingPresets::new(),
-            overlays: HashMap::new(),
+            serving: AliasServing::default(),
         }
     }
 
-    /// Attach the alias's offered serving classes and per-account overlays
+    /// Attach the alias's offered serving presets and per-account overlays
     /// (see [`crate::serving`]).
     pub fn with_serving(
         mut self,
         serving_classes: ServingPresets,
         overlays: HashMap<String, ServingOverlay>,
     ) -> Self {
-        self.serving_classes = serving_classes;
-        self.overlays = overlays;
+        self.serving = AliasServing::new(serving_classes, overlays);
         self
     }
 
     /// Elevated serving classes the alias offers.
     pub fn serving_classes(&self) -> &ServingPresets {
-        &self.serving_classes
+        self.serving.presets()
     }
 
     /// Per-account overrides on this alias, keyed by account id.
     pub fn overlays(&self) -> &HashMap<String, ServingOverlay> {
-        &self.overlays
+        self.serving.overlays()
+    }
+
+    /// The alias's serving policy, cheap to clone.
+    pub fn alias_serving(&self) -> &AliasServing {
+        &self.serving
     }
 
     /// Create a pool with a single provider
@@ -237,6 +268,7 @@ impl ProviderPool {
         SelectIter {
             pool: self,
             excluded: HashSet::new(),
+            ineligible: HashSet::new(),
             max_attempts,
             attempts: 0,
             with_replacement,
@@ -602,11 +634,31 @@ impl ProviderPool {
 /// ensuring the most up-to-date load information is used for each attempt.
 pub struct SelectIter<'a> {
     pool: &'a ProviderPool,
+    /// Members already tried in the current pass; cleared to start a new pass.
     excluded: HashSet<usize>,
+    /// Members that are never eligible for this request (a self-hosted-only
+    /// account's external members). Never cleared: the attempt budget is
+    /// spent on eligible members only, whatever the strategy.
+    ineligible: HashSet<usize>,
     max_attempts: usize,
     attempts: usize,
     with_replacement: bool,
     alternate_first: bool,
+}
+
+impl SelectIter<'_> {
+    /// Narrow the iterator to the members NOT in `members` for its whole
+    /// life. Unlike a tried member, an ineligible one is never re-included
+    /// when a new pass starts.
+    pub fn excluding_members(mut self, members: impl IntoIterator<Item = usize>) -> Self {
+        self.ineligible.extend(members);
+        self
+    }
+
+    /// The tried set plus the permanently ineligible members.
+    fn exclusions(&self) -> HashSet<usize> {
+        self.excluded.union(&self.ineligible).copied().collect()
+    }
 }
 
 impl<'a> Iterator for SelectIter<'a> {
@@ -634,16 +686,19 @@ impl<'a> Iterator for SelectIter<'a> {
         // `None` there means an empty pool or every provider at capacity: end the
         // iterator rather than re-running the same scan.
         let first_override = if self.attempts == 1 && self.alternate_first {
-            self.pool.select_priority(&HashSet::from([0]))
+            let mut exclude = self.ineligible.clone();
+            exclude.insert(0);
+            self.pool.select_priority(&exclude)
         } else {
             None
         };
-        let result = match first_override.or_else(|| self.pool.select_excluding(&self.excluded)) {
+        let result = match first_override.or_else(|| self.pool.select_excluding(&self.exclusions()))
+        {
             Some(result) => result,
             None if self.excluded.is_empty() => return None,
             None => {
                 self.excluded.clear();
-                self.pool.select_excluding(&self.excluded)?
+                self.pool.select_excluding(&self.exclusions())?
             }
         };
 

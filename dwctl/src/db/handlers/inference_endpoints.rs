@@ -552,6 +552,46 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_endpoint_kind_round_trips_through_create_and_update(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = InferenceEndpoints::new(&mut conn);
+
+        let mut request = create_test_endpoint_request(user.id, "dynamo-endpoint");
+        request.kind = EndpointKind::Dynamo;
+        let created = repo.create(&request).await.unwrap();
+        assert_eq!(created.kind, EndpointKind::Dynamo);
+        assert_eq!(repo.get_by_id(created.id).await.unwrap().unwrap().kind, EndpointKind::Dynamo);
+
+        let updated = repo
+            .update(
+                created.id,
+                &InferenceEndpointUpdateDBRequest {
+                    kind: Some(EndpointKind::Hosted),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.kind, EndpointKind::Hosted);
+        assert_eq!(updated.name, created.name, "an update touching only the kind changes nothing else");
+
+        // Omitting the kind on an update leaves it unchanged.
+        let untouched = repo
+            .update(
+                created.id,
+                &InferenceEndpointUpdateDBRequest {
+                    description: Some("renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(untouched.kind, EndpointKind::Hosted);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_apply_update_partial_fields(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();

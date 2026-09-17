@@ -60,7 +60,7 @@ pub struct InferenceEndpointCreateDBRequest {
 }
 
 /// Database request for updating an inference endpoint
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct InferenceEndpointUpdateDBRequest {
     pub name: Option<String>,
     pub description: Option<String>,
