@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT 1 AS \"exists!\"\n        WHERE EXISTS (\n                SELECT 1 FROM image_access\n                WHERE sha256 = $1 AND (user_id = $2 OR organization_id = $3)\n              )\n           OR EXISTS (\n                SELECT 1 FROM image_access_org_grants\n                WHERE sha256 = $1 AND organization_id = $3\n              )\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "exists!",
+        "type_info": "Int4"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "25802e2f35ed9c7e1d1b488330e5a9777fe6a6dc2e17f973d1080d74ae990eaf"
+}

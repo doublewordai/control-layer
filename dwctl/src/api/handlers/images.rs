@@ -154,9 +154,9 @@ pub struct ResolvedCaller {
     /// The key is a hidden `batch`-purpose key: the one the fusillade daemon
     /// dispatches with (flex enqueue and batch creation both store it on the
     /// request), and one no client ever holds — hidden keys are never exposed.
-    /// The bearer is therefore an application-verifiable daemon identity, so
-    /// a request carrying it is a dispatch loopback of a body our own ingest
-    /// stored under this principal.
+    /// It grants nothing: tokens are authorised through the image grants for
+    /// every caller. It only tells the image layer that the signed URL must
+    /// outlive a full processing attempt (the dispatch TTL, not realtime).
     pub is_daemon_dispatch: bool,
 }
 
@@ -194,11 +194,12 @@ pub async fn try_resolve_caller(pool: &sqlx::PgPool, api_key: &str) -> std::resu
     }))
 }
 
-/// Record that `attribution` submitted a request containing `token`. One grant
-/// per (user, organization-or-personal, image): idempotent on that key (updates
-/// `last_seen_at` on conflict), so submitting the same image under a second
-/// organization adds a grant for it rather than replacing the first one, and a
-/// later personal submission never revokes organization visibility.
+/// Record that `attribution` submitted a request containing `token`: the
+/// submitter's `image_access` row (idempotent on `(user_id, sha256)`, refreshing
+/// `last_seen_at`) plus, for an organization submission, that organization's
+/// own row in `image_access_org_grants` — distinct per organization, so
+/// submitting the same image under a second organization adds a grant rather
+/// than replacing the first, and a later personal submission revokes nothing.
 ///
 /// Best-effort: errors are logged and swallowed. We never block the request
 /// path on this bookkeeping write — the security control (substituting the
@@ -229,10 +230,11 @@ pub async fn try_record_image_access(
         r#"
         INSERT INTO image_access (user_id, organization_id, sha256, mime, bytes_len, first_seen_at, last_seen_at)
         VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-        ON CONFLICT (user_id, sha256, grant_scope) DO UPDATE
+        ON CONFLICT (user_id, sha256) DO UPDATE
         SET last_seen_at = NOW(),
             mime = EXCLUDED.mime,
-            bytes_len = EXCLUDED.bytes_len
+            bytes_len = EXCLUDED.bytes_len,
+            organization_id = COALESCE(EXCLUDED.organization_id, image_access.organization_id)
         "#,
         attribution.user_id,
         attribution.organization_id,
@@ -241,8 +243,27 @@ pub async fn try_record_image_access(
         bytes_len_i64,
     )
     .execute(pool)
-    .await
-    .map(|_| ())
+    .await?;
+
+    // The organization's own grant, distinct per organization: a member
+    // submitting the same image under a second organization adds a row here
+    // rather than replacing anything.
+    if let Some(organization_id) = attribution.organization_id {
+        sqlx::query!(
+            r#"
+            INSERT INTO image_access_org_grants (organization_id, sha256, granted_by, first_seen_at, last_seen_at)
+            VALUES ($1, $2, $3, NOW(), NOW())
+            ON CONFLICT (organization_id, sha256) DO UPDATE
+            SET last_seen_at = NOW()
+            "#,
+            organization_id,
+            sha_bytes,
+            attribution.user_id,
+        )
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
 }
 
 /// Whether the caller behind `attribution` may reference the image `token`
@@ -273,13 +294,20 @@ async fn is_authorized_to_view(
     viewer: uuid::Uuid,
     active_org: Option<uuid::Uuid>,
 ) -> std::result::Result<bool, sqlx::Error> {
+    // The submitter's own row, an organization grant, or — for rows written
+    // before `image_access_org_grants` existed — the legacy organization
+    // column on the submitter's row.
     let row = sqlx::query!(
         r#"
         SELECT 1 AS "exists!"
-        FROM image_access
-        WHERE sha256 = $1
-          AND (user_id = $2 OR organization_id = $3)
-        LIMIT 1
+        WHERE EXISTS (
+                SELECT 1 FROM image_access
+                WHERE sha256 = $1 AND (user_id = $2 OR organization_id = $3)
+              )
+           OR EXISTS (
+                SELECT 1 FROM image_access_org_grants
+                WHERE sha256 = $1 AND organization_id = $3
+              )
         "#,
         sha256,
         viewer,
@@ -358,10 +386,22 @@ mod tests {
         }
 
         let acting = |user_id: uuid::Uuid, organization_id: Option<uuid::Uuid>| ImageAttribution { user_id, organization_id };
-        assert!(is_token_accessible(&pool, &acting(bob.id, Some(org_a.id)), img).await.unwrap(), "org A keeps its grant");
-        assert!(is_token_accessible(&pool, &acting(carol.id, Some(org_b.id)), img).await.unwrap(), "org B gets its own grant");
-        assert!(is_token_accessible(&pool, &acting(alice.id, None), img).await.unwrap(), "the submitter, personally");
-        assert!(!is_token_accessible(&pool, &acting(dave.id, None), img).await.unwrap(), "a stranger");
+        assert!(
+            is_token_accessible(&pool, &acting(bob.id, Some(org_a.id)), img).await.unwrap(),
+            "org A keeps its grant"
+        );
+        assert!(
+            is_token_accessible(&pool, &acting(carol.id, Some(org_b.id)), img).await.unwrap(),
+            "org B gets its own grant"
+        );
+        assert!(
+            is_token_accessible(&pool, &acting(alice.id, None), img).await.unwrap(),
+            "the submitter, personally"
+        );
+        assert!(
+            !is_token_accessible(&pool, &acting(dave.id, None), img).await.unwrap(),
+            "a stranger"
+        );
         assert!(!can_view(&pool, img, dave.id, None).await, "a stranger, on the console view");
     }
 

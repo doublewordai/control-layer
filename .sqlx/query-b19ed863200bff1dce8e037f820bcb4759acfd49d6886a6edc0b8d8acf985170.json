@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO image_access_org_grants (organization_id, sha256, granted_by, first_seen_at, last_seen_at)\n            VALUES ($1, $2, $3, NOW(), NOW())\n            ON CONFLICT (organization_id, sha256) DO UPDATE\n            SET last_seen_at = NOW()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b19ed863200bff1dce8e037f820bcb4759acfd49d6886a6edc0b8d8acf985170"
+}

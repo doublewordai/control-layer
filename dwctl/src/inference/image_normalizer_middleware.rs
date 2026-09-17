@@ -8,15 +8,17 @@
 //! dispatch loopback. Signing them in this layer — which sits BELOW the
 //! prompt-cache layer — is deliberate: the cache hashes the stable
 //! content-addressed token, not the per-attempt signed URL, so a
-//! byte-identical image keeps a prefix chain intact across calls. The bearer
-//! says who is calling: a dispatch carries the daemon's hidden batch key
-//! (never exposed to clients), and its tokens are signed on trust (our own
-//! ingest put them in the stored body, under that request's principal) with
-//! the dispatch TTL. Any other key is a client re-sending a request it
-//! downloaded: each token is authorised against `image_access` (the
-//! submitting user, or anyone acting in the organization it was submitted
-//! under) and signed with the realtime TTL; anyone else's token gets a 403,
-//! and a lookup failure a 503.
+//! byte-identical image keeps a prefix chain intact across calls. EVERY
+//! token is authorised against the image grants (`image_access` /
+//! `image_access_org_grants`: the submitting user, or anyone acting in the
+//! organization it was submitted under) for the principal behind the bearer
+//! — a daemon dispatch (the hidden batch key, which resolves to the
+//! submitting principal) and a client re-sending a request it downloaded
+//! alike. There is no trusted path: a token names bytes, and signing it
+//! hands out a URL to them. What the bearer decides is only the TTL: the
+//! dispatch TTL for the daemon, the realtime TTL for a client. An
+//! unauthorised token gets a 403 and a lookup failure a 503 (which the
+//! daemon retries).
 //!
 //! Pattern: read the body once via `axum::body::to_bytes`, mutate the JSON
 //! in place, restore the body via `Body::from(...)`.
@@ -81,7 +83,7 @@ pub struct ImageNormalizerMiddlewareState {
     /// TTL applied to signed URLs handed to upstream providers from this
     /// (realtime) path. Copied from `ImageNormalizerConfig::signing.realtime_ttl()`.
     pub realtime_ttl: Duration,
-    /// TTL applied when signing a `dw-img://` token on a daemon dispatch
+    /// TTL applied when signing a `dw-img://` token for a daemon dispatch
     /// loopback: the dispatch TTL, long enough to outlive one full processing
     /// attempt. (A client re-sending its own tokens gets `realtime_ttl`.)
     /// Copied from `ImageNormalizerConfig::signing.dispatch_ttl(..)`.
@@ -182,7 +184,6 @@ pub async fn image_normalizer_middleware(
     let substitute = move |url: String| {
         let normalizer = normalizer.clone();
         let pool_for_access = pool_for_access.clone();
-        let caller_lookup = caller_lookup.clone();
         let is_data_uri = url.starts_with("data:");
         async move {
             // `dw-img://` token: sign it, no ingest — the bytes are already in
@@ -201,28 +202,23 @@ pub async fn image_normalizer_middleware(
                     Ok(None) => return Err(NormalizeError::Forbidden),
                     Err(()) => return Err(NormalizeError::Transient("caller lookup failed".to_string())),
                 };
-                if caller.is_daemon_dispatch {
-                    // The daemon's own dispatch of a body our ingest stored
-                    // under this principal: the stored body is the
-                    // authorisation record, so sign on trust with the dispatch
-                    // TTL. No `image_access` dependency, so neither a
-                    // bookkeeping gap nor a lookup blip can fail queued work.
-                    let signed = normalizer.sign(token, token_ttl).await?;
-                    return Ok::<String, NormalizeError>(signed.url);
-                }
-                // A client re-sending a request it downloaded: authorise
-                // against `image_access` (the submitting user, or anyone acting
-                // in the organization it was submitted under) and sign with the
-                // realtime TTL — this is an ordinary request, not a dispatch.
+                // Authorise against the image grants for the principal behind
+                // the bearer — the daemon's hidden batch key resolves to the
+                // submitting principal, so a dispatch is checked exactly like
+                // a client re-sending a request it downloaded. A lookup
+                // failure is retryable (the daemon re-dispatches a 503).
                 match crate::api::handlers::images::is_token_accessible(&pool.write(), &caller.attribution, token).await {
                     Ok(true) => {}
                     Ok(false) => return Err(NormalizeError::Forbidden),
                     Err(e) => {
-                        warn!(error = %e, "image_access lookup failed while signing a client token");
+                        warn!(error = %e, "image_access lookup failed while signing a token");
                         return Err(NormalizeError::Transient("image access lookup failed".to_string()));
                     }
                 }
-                let signed = normalizer.sign(token, realtime_ttl).await?;
+                // The bearer only decides the TTL: a dispatch must outlive one
+                // full processing attempt; a client request is realtime.
+                let ttl = if caller.is_daemon_dispatch { token_ttl } else { realtime_ttl };
+                let signed = normalizer.sign(token, ttl).await?;
                 return Ok::<String, NormalizeError>(signed.url);
             }
             // Pass through URLs that already point at our own normalised
@@ -658,11 +654,10 @@ mod tests {
 
     // ---- `dw-img://` token signing ----
     //
-    // Two callers, two rules, told apart by the bearer: the daemon's hidden
-    // batch key marks a dispatch, which is trusted (its body was stored by our
-    // own ingest) and signed with the dispatch TTL; any other key is a client
-    // re-sending a request it downloaded, authorised per token against
-    // `image_access` and signed with the realtime TTL.
+    // One rule for every caller: a token is signed only for a principal the
+    // image grants name. The bearer only decides the TTL — the daemon's hidden
+    // batch key marks a dispatch (dispatch TTL); any other key is a client
+    // re-sending a request it downloaded (realtime TTL).
 
     async fn post_json_as(router: Router, bearer: Option<&str>, body: Value) -> (StatusCode, Value) {
         let mut req = Request::builder()
@@ -783,18 +778,18 @@ mod tests {
 
     /// The fix for flex prompt caching with images: a daemon loopback carrying
     /// the token that enqueue stored gets a signed URL from THIS layer (below
-    /// the prompt cache). The bearer is the hidden batch key, so it is trusted
-    /// — no `image_access` row exists here — and signed with the dispatch TTL:
-    /// neither a bookkeeping gap nor a database blip can fail a queued request.
+    /// the prompt cache). The bearer is the hidden batch key, which resolves
+    /// to the principal that submitted the image, so the grant matches; the
+    /// URL is signed with the dispatch TTL.
     #[sqlx::test]
-    async fn a_daemon_dispatch_signs_its_tokens_on_trust_with_the_dispatch_ttl(pool: sqlx::PgPool) {
+    async fn a_daemon_dispatch_signs_a_token_its_principal_submitted_with_the_dispatch_ttl(pool: sqlx::PgPool) {
         use crate::api::models::users::Role;
         use crate::test::utils::create_test_user;
 
         let user = create_test_user(&pool, Role::StandardUser).await;
         let batch_key = hidden_batch_key_for(&pool, user.id).await;
         let state = state_with_pool(&pool);
-        let token = ingest_unrecorded(&state).await;
+        let token = ingest_for_key(&pool, &state, &batch_key).await;
 
         let (status, echoed) = post_json_as(build_router(state), Some(&batch_key), body_with_token(token)).await;
 
@@ -803,6 +798,25 @@ mod tests {
         assert!(url.contains(&token.to_hex()), "{url}");
         assert!((1800 - 60..=1800).contains(&ttl), "dispatch TTL expected, got {ttl}s");
         assert_eq!(echoed["messages"][0]["content"][0]["text"], "what is this?");
+    }
+
+    /// No trusted path: a dispatch whose stored body carries a token its
+    /// principal never submitted (a body queued before the submission-time
+    /// checks existed, or while normalisation was off) is refused, not signed.
+    #[sqlx::test]
+    async fn a_daemon_dispatch_is_refused_a_token_its_principal_never_submitted(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::create_test_user;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let batch_key = hidden_batch_key_for(&pool, user.id).await;
+        let state = state_with_pool(&pool);
+        let token = ingest_unrecorded(&state).await;
+
+        let (status, body) = post_json_as(build_router(state), Some(&batch_key), body_with_token(token)).await;
+
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["error"]["code"], "image_token_forbidden");
     }
 
     /// A client re-sending a request it downloaded: its own token is signed,
@@ -1035,7 +1049,7 @@ mod tests {
 
         // Same order as lib.rs: the cache layer is OUTSIDE (above) this layer.
         let state = state_with_pool(&pool);
-        let token = ingest_unrecorded(&state).await;
+        let token = ingest_for_key(&pool, &state, &batch_key).await;
         let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let app = Router::new()
             .route("/v1/chat/completions", post(recording_upstream).with_state(seen.clone()))

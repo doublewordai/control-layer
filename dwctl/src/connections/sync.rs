@@ -109,6 +109,17 @@ pub async fn build_ingest_file_job<P: PoolProvider + Clone + Send + Sync + 'stat
         .step(|cx, input: IngestFileInput| async move {
             match run_ingest_file(&cx.state, &input).await {
                 Ok(()) => To::done(),
+                Err(e) if e.downcast_ref::<RetryableIngest>().is_some() => {
+                    // Transient: leave the entry as it is (no failed status, no
+                    // counters) and let the queue retry the step.
+                    tracing::warn!(
+                        sync_entry_id = %input.sync_entry_id,
+                        external_key = %input.external_key,
+                        error = %e,
+                        "IngestFileJob hit a transient failure; retrying"
+                    );
+                    Err(TaskError::Retryable(e.to_string()))
+                }
                 Err(e) => {
                     tracing::error!(
                         sync_entry_id = %input.sync_entry_id,
@@ -373,6 +384,13 @@ async fn run_sync_connection<P: PoolProvider + Clone + Send + Sync + 'static>(
     Ok(())
 }
 
+/// An ingest that stopped for a reason that will clear on its own (the
+/// database was unreachable while authorising a record). The job maps this to
+/// a retry instead of marking the sync entry failed.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct RetryableIngest(String);
+
 /// What one parsed JSONL record of a synced file becomes.
 enum SyncedRecord {
     /// Store this template; `line_error` is its tier-2 validation error, if any
@@ -584,10 +602,16 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
     //    and feed into fusillade's create_file_stream
     let (tx, rx) = tokio::sync::mpsc::channel::<FileStreamItem>(64);
 
+    // Set by the producer when it aborts for a reason that will clear on its
+    // own, so the job retries instead of failing the entry.
+    let retryable_abort = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let retryable_abort_flag = retryable_abort.clone();
+
     // Spawn producer task: reads from S3, parses JSONL, sends templates
     let external_key = input.external_key.clone();
     let connection_id = input.connection_id;
     let producer = tokio::spawn(async move {
+        let retryable_abort = retryable_abort_flag;
         use futures::StreamExt;
 
         // Send metadata first
@@ -688,6 +712,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                             {
                                 SyncedRecord::Template { template, line_error } => (template, line_error),
                                 SyncedRecord::Abort => {
+                                    retryable_abort.store(true, std::sync::atomic::Ordering::Relaxed);
                                     let _ = tx.send(FileStreamItem::Abort).await;
                                     return (template_count, skipped_lines, validation_errors);
                                 }
@@ -745,6 +770,7 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
                         match prepare_synced_record(parsed, line_number, &api_path, &ai_base_url, &token_pool, token_attribution).await {
                             SyncedRecord::Template { template, line_error } => (template, line_error),
                             SyncedRecord::Abort => {
+                                retryable_abort.store(true, std::sync::atomic::Ordering::Relaxed);
                                 let _ = tx.send(FileStreamItem::Abort).await;
                                 return (template_count, skipped_lines, validation_errors);
                             }
@@ -877,6 +903,9 @@ pub(crate) async fn run_ingest_file<P: PoolProvider + Clone + Send + Sync + 'sta
             Ok(())
         }
         Ok(fusillade::FileStreamResult::Aborted) => {
+            if retryable_abort.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(RetryableIngest("file ingestion aborted on a transient failure; retrying".to_string()).into());
+            }
             anyhow::bail!("file ingestion aborted during streaming")
         }
         Err(e) => {
