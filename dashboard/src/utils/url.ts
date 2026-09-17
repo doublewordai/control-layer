@@ -33,6 +33,9 @@ export function mergePreservedParams(
   const qs = preserved.toString();
   if (!qs) return target;
 
-  const separator = target.includes("?") ? "&" : "?";
-  return `${target}${separator}${qs}`;
+  const hashIndex = target.indexOf("#");
+  const path = hashIndex === -1 ? target : target.slice(0, hashIndex);
+  const hash = hashIndex === -1 ? "" : target.slice(hashIndex + 1);
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}${qs}${hashIndex === -1 ? "" : `#${hash}`}`;
 }
