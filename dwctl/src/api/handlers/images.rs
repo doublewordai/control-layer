@@ -262,8 +262,39 @@ pub async fn is_token_accessible(
     attribution: &ImageAttribution,
     token: ImageToken,
 ) -> std::result::Result<bool, sqlx::Error> {
-    let mut conn = pool.acquire().await?;
-    is_authorized_to_view(&mut conn, &token.0, attribution.user_id, attribution.organization_id).await
+    Ok(accessible_tokens(pool, attribution, &[token]).await?.contains(&token))
+}
+
+/// Which of `tokens` the principal behind `attribution` may reference — the
+/// same rule as [`is_token_accessible`], answered for a whole request in ONE
+/// query, so a body carrying many images costs one round trip rather than one
+/// per image. Tokens absent from the result are not accessible.
+pub async fn accessible_tokens(
+    pool: &sqlx::PgPool,
+    attribution: &ImageAttribution,
+    tokens: &[ImageToken],
+) -> std::result::Result<std::collections::HashSet<ImageToken>, sqlx::Error> {
+    if tokens.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let hashes: Vec<Vec<u8>> = tokens.iter().map(|t| t.0.to_vec()).collect();
+    let rows = sqlx::query!(
+        r#"
+        SELECT DISTINCT sha256
+        FROM image_access
+        WHERE sha256 = ANY($1)
+          AND (user_id = $2 OR organization_id = $3)
+        "#,
+        &hashes,
+        attribution.user_id,
+        attribution.organization_id,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| <[u8; 32]>::try_from(row.sha256.as_slice()).ok().map(ImageToken))
+        .collect())
 }
 
 /// Whether `viewer` — optionally acting in organization `active_org` — is

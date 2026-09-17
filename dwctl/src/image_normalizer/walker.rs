@@ -195,11 +195,63 @@ pub fn has_inputs(body: &Value, mode: Mode) -> bool {
     chat || responses
 }
 
+/// Every `dw-img://` token in `body`, in document order, over the same two
+/// shapes as [`substitute_with`] — so a caller can authorise them all in one
+/// query before the walk signs them. Strings that merely look like a token but
+/// do not parse are skipped here; the walk itself rejects them as bad input.
+pub fn tokens(body: &Value) -> Vec<ImageToken> {
+    fn push(url: Option<&str>, out: &mut Vec<ImageToken>) {
+        if let Some(url) = url
+            && ImageToken::looks_like_token(url)
+            && let Ok(token) = url.parse::<ImageToken>()
+        {
+            out.push(token);
+        }
+    }
+    let mut out = Vec::new();
+    // chat-completions shape: messages[*].content[*].image_url.url
+    for msg in body.get("messages").and_then(Value::as_array).into_iter().flatten() {
+        for item in msg.get("content").and_then(Value::as_array).into_iter().flatten() {
+            if item.get("type").and_then(Value::as_str) == Some("image_url") {
+                push(item.get("image_url").and_then(|o| o.get("url")).and_then(Value::as_str), &mut out);
+            }
+        }
+    }
+    // responses shape: input[*].content[*].image_url
+    for item in body.get("input").and_then(Value::as_array).into_iter().flatten() {
+        for part in item.get("content").and_then(Value::as_array).into_iter().flatten() {
+            if part.get("type").and_then(Value::as_str) == Some("input_image") {
+                push(part.get("image_url").and_then(Value::as_str), &mut out);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::convert::Infallible;
+
+    #[test]
+    fn tokens_collects_every_token_over_both_shapes_and_nothing_else() {
+        let a = ImageToken([1u8; 32]);
+        let b = ImageToken([2u8; 32]);
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": a.to_dw_img_uri()}},
+                {"type": "image_url", "image_url": {"url": "https://x/a.png"}}
+            ]}],
+            "input": [{"role": "user", "content": [
+                {"type": "input_image", "image_url": b.to_dw_img_uri()},
+                {"type": "input_image", "image_url": "dw-img://not-hex"}
+            ]}]
+        });
+        assert_eq!(tokens(&body), vec![a, b]);
+        assert!(tokens(&json!({"messages": [{"role": "user", "content": "hi"}]})).is_empty());
+    }
 
     #[test]
     fn has_inputs_mirrors_the_walker_over_both_shapes() {

@@ -199,40 +199,46 @@ pub async fn image_normalizer_middleware(
         Err(()) => true,
     };
     let sign_ttl = if is_daemon_dispatch { state.token_ttl } else { state.realtime_ttl };
+
+    // Authorise every `dw-img://` token in the body in ONE query, up front,
+    // against the image grants for the principal behind the bearer — the
+    // daemon's hidden batch key resolves to the submitting principal, so a
+    // dispatch is checked exactly like a client re-sending a request it
+    // downloaded. The walk below then signs from this set. Unattributable
+    // callers get an empty set (refused, not trusted: a token names bytes, and
+    // signing it hands out a URL to them); a lookup failure is kept as such so
+    // the token path refuses with a retryable 503.
+    let grants: Result<Arc<std::collections::HashSet<ImageToken>>, ()> = {
+        let tokens = walker::tokens(&body_value);
+        match (&caller_lookup, state.pool.as_ref()) {
+            (Err(()), _) => Err(()),
+            (Ok(Some(caller)), Some(pool)) if !tokens.is_empty() => {
+                crate::api::handlers::images::accessible_tokens(&pool.write(), &caller.attribution, &tokens)
+                    .await
+                    .map(Arc::new)
+                    .map_err(|e| warn!(error = %e, "image_access lookup failed while signing tokens"))
+            }
+            _ => Ok(Arc::new(std::collections::HashSet::new())),
+        }
+    };
+
     let pool_for_access = state.pool.clone();
     let substitute = move |url: String| {
         let normalizer = normalizer.clone();
         let pool_for_access = pool_for_access.clone();
+        let grants = grants.clone();
         let is_data_uri = url.starts_with("data:");
         async move {
             // `dw-img://` token: sign it, no ingest — the bytes are already in
-            // the store.
+            // the store — if the principal holds a grant for it (see `grants`).
             if ImageToken::looks_like_token(&url) {
                 let token: ImageToken = url
                     .parse()
                     .map_err(|e: TokenParseError| NormalizeError::BadInput(format!("invalid dw-img token: {e}")))?;
-                // Unattributable callers are refused rather than trusted: a
-                // token names bytes, and signing it hands out a URL to them.
-                let Some(pool) = pool_for_access.as_ref() else {
-                    return Err(NormalizeError::Forbidden);
-                };
-                let caller = match caller_lookup {
-                    Ok(Some(c)) => c,
-                    Ok(None) => return Err(NormalizeError::Forbidden),
+                match grants {
                     Err(()) => return Err(NormalizeError::AccessUnavailable),
-                };
-                // Authorise against the image grants for the principal behind
-                // the bearer — the daemon's hidden batch key resolves to the
-                // submitting principal, so a dispatch is checked exactly like
-                // a client re-sending a request it downloaded. A lookup
-                // failure is retryable (the daemon re-dispatches a 503).
-                match crate::api::handlers::images::is_token_accessible(&pool.write(), &caller.attribution, token).await {
-                    Ok(true) => {}
-                    Ok(false) => return Err(NormalizeError::Forbidden),
-                    Err(e) => {
-                        warn!(error = %e, "image_access lookup failed while signing a token");
-                        return Err(NormalizeError::AccessUnavailable);
-                    }
+                    Ok(set) if !set.contains(&token) => return Err(NormalizeError::Forbidden),
+                    Ok(_) => {}
                 }
                 // The bearer only decides the TTL: a dispatch must outlive one
                 // full processing attempt; a client request is realtime.
