@@ -1180,8 +1180,13 @@ pub async fn upload_file<P: PoolProvider>(
         // while a personal upload stays private to the user. This is distinct
         // from file ownership above, which is credited to the org.
         // The principal, exactly as an API key resolves: the organization when
-        // acting in one, else the person. The batch's hidden key carries the
-        // same principal, so the dispatch's token authorisation matches.
+        // acting in one, else the person. A batch created from this file under
+        // the same principal (any member acting in the org, or the person)
+        // dispatches with a hidden key carrying that principal, so its token
+        // authorisation matches. Known limitation, accepted as rare: a platform
+        // manager creating a batch from a file uploaded under a DIFFERENT
+        // principal dispatches under their own, and each image line then fails
+        // with `image_token_forbidden`.
         access_attribution: Some(crate::api::handlers::images::ImageAttribution {
             user_id: current_user.active_organization.unwrap_or(current_user.id),
             organization_id: current_user.active_organization,

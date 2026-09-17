@@ -163,11 +163,12 @@ pub async fn image_normalizer_middleware(
     let mode = Mode::AllAndTokens;
 
     // Who is calling, from the bearer key. Two things come out of one lookup:
-    // the attribution (acting user + owning org — `image_access` bookkeeping
-    // for fetched/decoded images, best-effort; the authorisation for a
-    // client-sent `dw-img://` token), and whether the key is the daemon's
-    // hidden batch key, i.e. this is a dispatch loopback. The lookup error is
-    // kept: a database blip must become a retryable 503, not a 403.
+    // the attribution (the PRINCIPAL: the key's `user_id` — a person, or the
+    // organization for an org key — used for `image_access` bookkeeping of
+    // fetched/decoded images and for authorising every `dw-img://` token),
+    // and whether the key is the daemon's hidden batch key, i.e. this is a
+    // dispatch loopback. The lookup error is kept: a database blip must
+    // become a retryable 503 on the token path, not a 403.
     // The concrete error is logged here; clients only ever see a generic one.
     let caller_lookup: Result<Option<crate::api::handlers::images::ResolvedCaller>, ()> =
         match (state.pool.as_ref(), extract_bearer_token(&request)) {
@@ -184,7 +185,16 @@ pub async fn image_normalizer_middleware(
     // full processing attempt; a client request is realtime. (Synced records
     // keep their raw image URLs until dispatch, so the ingest path sees daemon
     // traffic too.)
-    let is_daemon_dispatch = caller_lookup.ok().flatten().is_some_and(|c| c.is_daemon_dispatch);
+    //
+    // If the lookup failed we cannot tell a dispatch from a client. The token
+    // path refuses with a retryable 503 regardless; for a raw image that still
+    // goes through ingest, take the longer dispatch TTL, so a loopback never
+    // gets a URL that expires mid-attempt (a client's URL merely lives longer).
+    let is_daemon_dispatch = match caller_lookup {
+        Ok(Some(caller)) => caller.is_daemon_dispatch,
+        Ok(None) => false,
+        Err(()) => true,
+    };
     let sign_ttl = if is_daemon_dispatch { state.token_ttl } else { state.realtime_ttl };
     let pool_for_access = state.pool.clone();
     let substitute = move |url: String| {
@@ -336,8 +346,9 @@ pub(crate) async fn normalize_value_to_tokens(
             };
             let ingested = normalizer.ingest(input).await?;
             // AWAITED and REQUIRED, not fire-and-forget: this row is what
-            // authorises the customer re-sending this request's tokens later
-            // (the daemon's own dispatch is trusted without it). A submission
+            // authorises signing the token — for the daemon's dispatch of this
+            // request (which can follow within the claim interval) and for the
+            // customer re-sending it later alike. A submission
             // whose bookkeeping cannot be written — or whose caller cannot be
             // attributed, which a just-authenticated key never is — fails
             // retryably (503) rather than persisting tokens nobody may re-send.
@@ -915,6 +926,162 @@ mod tests {
         let (status, body) = post_json_as(build_router(state), None, body_with_token(token)).await;
 
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    }
+
+    // ---- the regression, end to end ----
+    //
+    // The bug was layer ORDER: signing tokens before the loopback put a fresh
+    // per-attempt URL in front of the prompt cache, so every dispatch re-keyed
+    // the image prefix. This wires the real cache layer ABOVE this layer, as
+    // `lib.rs` does, and dispatches the same stored body twice as the daemon
+    // would: the second dispatch must READ the prefix the first one wrote,
+    // while upstream receives a signed URL both times.
+
+    /// Upstream stand-in that records the image URL it was handed and returns
+    /// a chat completion with usage.
+    async fn recording_upstream(
+        axum::extract::State(seen): axum::extract::State<Arc<std::sync::Mutex<Vec<String>>>>,
+        body: axum::body::Bytes,
+    ) -> axum::Json<Value> {
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let url = v["messages"][0]["content"][1]["image_url"]["url"].as_str().unwrap().to_string();
+        seen.lock().unwrap().push(url);
+        axum::Json(json!({
+            "id": "chatcmpl-1", "object": "chat.completion",
+            "choices": [{"index":0,"message":{"role":"assistant","content":"a pixel"},"finish_reason":"stop"}],
+            "usage": {"prompt_tokens": 2000, "completion_tokens": 2, "total_tokens": 2002}
+        }))
+    }
+
+    #[sqlx::test]
+    async fn a_repeated_dispatch_reads_the_image_prefix_it_wrote_while_upstream_gets_signed_urls(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::prompt_cache::{
+            CacheIndex, CacheLayerState, Classifier, IndexScope, ModelConfigResolver, PostgresIndex, PrincipalResolver, TelemetryPolicy,
+            TierPolicy, TokenizerClient, cache_middleware, parse_chat_completions,
+        };
+        use crate::test::utils::{create_test_endpoint, create_test_model, create_test_user};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const ALIAS: &str = "vision-cached";
+        const TOK_VER: &str = "sha256:img1";
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let batch_key = hidden_batch_key_for(&pool, user.id).await;
+        let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
+        let model_id = create_test_model(&pool, "m", ALIAS, endpoint, user.id).await;
+        // A cache-tariff row is what enables caching for the model.
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens)
+               VALUES ($1, 1.25, 2.0, 2.5, 1024)"#,
+            model_id
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Tokenizer stand-in. The write span runs from the first block to the
+        // marked one, so two segments (the text block, then the image block)
+        // are counted; the breakpoint's cumulative count is the second.
+        let tok = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "models": [{"alias": ALIAS, "hf_repo": "o/m", "tokenizer_version": TOK_VER}]
+            })))
+            .mount(&tok)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/tokenize"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "virtual_model": ALIAS, "tokenizer_version": TOK_VER,
+                "segment_counts": [1400, 100], "cumulative": [1400, 1500], "total": 1500
+            })))
+            .mount(&tok)
+            .await;
+        let tiers = TierPolicy::from_config(&["5m".to_string(), "1h".to_string()], "5m");
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new(tok.uri()),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            tiers.clone(),
+            TelemetryPolicy::default(),
+            false,
+        );
+
+        // Same order as lib.rs: the cache layer is OUTSIDE (above) this layer.
+        let state = state_with_pool(&pool);
+        let token = ingest_for_key(&pool, &state, &batch_key).await;
+        let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(recording_upstream).with_state(seen.clone()))
+            .layer(middleware::from_fn_with_state(state, image_normalizer_middleware))
+            .layer(middleware::from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        // The stored body: a token, with a cache marker ON the image block so the
+        // image is inside the hashed prefix.
+        let stored_body = json!({
+            "model": ALIAS,
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "what is this?" },
+                { "type": "image_url", "image_url": { "url": token.to_dw_img_uri() },
+                  "cache_control": { "type": "ephemeral", "ttl": "1h" } }
+            ]}]
+        });
+        let dispatch = || {
+            server
+                .post("/v1/chat/completions")
+                .add_header("authorization", format!("Bearer {batch_key}"))
+                .json(&stored_body)
+        };
+
+        // First dispatch attempt: writes the prefix.
+        let r1 = dispatch().await;
+        r1.assert_status_ok();
+        let v1: Value = r1.json();
+        assert_eq!(v1["usage"]["cache_creation_input_tokens"], 1500, "{v1}");
+        assert_eq!(v1["usage"]["cache_read_input_tokens"], 0);
+
+        // The commit is spawned: wait for the write, keyed on the TOKEN body.
+        let scope = IndexScope {
+            principal_id: user.id,
+            virtual_model: ALIAS.into(),
+            tokenizer_version: TOK_VER.into(),
+        };
+        // The hash at the marked (image) block — the prefix that includes the token.
+        let parsed = parse_chat_completions(&serde_json::to_vec(&stored_body).unwrap(), &tiers, &TelemetryPolicy::default()).unwrap();
+        let hash = parsed.cumulative_hashes[parsed.breakpoints[0].block_index].clone();
+        let idx = PostgresIndex::new(pool.clone(), 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while idx.lookup(&scope, std::slice::from_ref(&hash)).await.unwrap().is_empty() {
+            assert!(std::time::Instant::now() < deadline, "the write did not commit within 5s");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Second dispatch attempt of the SAME stored body (a retry, or the next
+        // turn of a conversation): a read, because the cache hashed the stable
+        // token and not the per-attempt signed URL.
+        let r2 = dispatch().await;
+        r2.assert_status_ok();
+        let v2: Value = r2.json();
+        assert_eq!(v2["usage"]["cache_read_input_tokens"], 1500, "{v2}");
+        assert_eq!(v2["usage"]["cache_creation_input_tokens"], 0);
+
+        // And upstream never saw the token: both attempts carried a signed URL.
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        for url in seen.iter() {
+            assert!(url.starts_with("http://test.local/dw-img/"), "{url}");
+            assert!(url.contains(&token.to_hex()), "{url}");
+            assert!(!url.contains("dw-img://"), "{url}");
+        }
     }
 
     #[test]
