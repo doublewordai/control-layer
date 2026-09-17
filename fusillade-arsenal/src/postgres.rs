@@ -1173,6 +1173,63 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         }
     }
 
+    /// Classify a zero-row generation-fenced transition. A surviving row (or
+    /// a response already moved to retained storage) means this worker's claim
+    /// is no longer authoritative; absence everywhere remains a genuine
+    /// RequestNotFound.
+    async fn lost_ownership_or_missing_in_transaction(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        request_id: RequestId,
+    ) -> Result<Option<RequestId>> {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM requests WHERE id = $1)")
+                .bind(*request_id as Uuid)
+                .fetch_one(&mut **tx)
+                .await
+                .map_err(|_| {
+                    FusilladeError::Other(anyhow!("Failed to classify request ownership"))
+                })?;
+
+        if exists {
+            return Err(FusilladeError::LostOwnership(request_id));
+        }
+
+        match retained_response::classify_response_write(tx, &[request_id.0]).await? {
+            Some(_) => Err(FusilladeError::LostOwnership(request_id)),
+            None => Err(FusilladeError::RequestNotFound(request_id)),
+        }
+    }
+
+    /// Classify a fenced terminal write. Replaying a response after the row
+    /// has already reached a hard terminal remains idempotent (first result
+    /// wins), while every nonterminal state means this claim generation is no
+    /// longer authoritative.
+    async fn terminal_replay_or_lost_ownership_in_transaction(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        request_id: RequestId,
+    ) -> Result<Option<RequestId>> {
+        let state: Option<String> = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(*request_id as Uuid)
+            .fetch_optional(&mut **tx)
+            .await
+            .map_err(|_| {
+                FusilladeError::Other(anyhow!("Failed to classify terminal request write"))
+            })?;
+
+        match state.as_deref() {
+            Some("completed" | "failed") => {
+                tracing::warn!("Dropped a duplicate terminal request transition");
+                Ok(None)
+            }
+            Some(_) => Err(FusilladeError::LostOwnership(request_id)),
+            None => match retained_response::classify_response_write(tx, &[request_id.0]).await? {
+                Some(retained_response::ResponseWriteDisposition::AlreadyRetained) => Ok(None),
+                Some(disposition) => Err(disposition.into_fusillade_error()),
+                None => Err(FusilladeError::RequestNotFound(request_id)),
+            },
+        }
+    }
+
     /// Unclaim stale requests that have been stuck in "claimed" or "processing" states
     /// for longer than the configured timeouts. This handles daemon crashes.
     ///
@@ -1185,62 +1242,96 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         let stale_daemon_threshold_ms = self.config.stale_daemon_threshold_ms as i64;
         let limit = self.config.unclaim_batch_size as i64;
 
-        // Unclaim requests that are stuck in claimed or processing states.
-        // Three reclaim paths, from fastest to slowest:
-        //   1. Daemon marked itself dead (graceful shutdown) — immediate
-        //   2. Daemon's heartbeat went stale (SIGKILL/OOM) — stale_daemon_threshold_ms
-        //   3. Time-based fallback (any cause) — claim_timeout_ms / processing_timeout_ms
-        //
-        // Uses UNION (not OR) so the planner can optimize each branch independently.
-        // With OR, Postgres falls into a bitmap heap scan of all in-progress rows (~50K)
-        // to evaluate the EXISTS subquery. With UNION, each branch uses its optimal
-        // index scan: ~4ms total vs ~1s with OR on a 14.5M row table.
+        // A live daemon self-cancels when it cannot renew within the stale
+        // threshold. Reclaim both claimed and processing work at that same
+        // boundary: downstream cancellation may overlap briefly with the new
+        // attempt, but generation-fenced writes ensure only the new owner is
+        // authoritative.
         let unclaim_start = std::time::Instant::now();
-        let result = sqlx::query!(
+        let reclaimed = sqlx::query!(
             r#"
-            UPDATE requests
-            SET
-                state = 'pending',
-                daemon_id = NULL,
-                claimed_at = NULL,
-                started_at = NULL
-            WHERE id IN (
-                SELECT id FROM (
+            WITH candidates AS MATERIALIZED (
+                SELECT id, previous_state, reason, daemon_id, claimed_at
+                FROM (
+                    SELECT DISTINCT ON (id)
+                        id, previous_state, reason, priority, daemon_id, claimed_at
+                    FROM (
+                    -- Explicit shutdown is authoritative and can be reclaimed immediately.
+                    SELECT r.id, r.state AS previous_state, 'explicitly_dead'::text AS reason,
+                           0 AS priority, r.daemon_id, r.claimed_at
+                    FROM requests r
+                    JOIN daemons d ON d.id = r.daemon_id
+                    WHERE r.state IN ('claimed', 'processing')
+                      AND d.status = 'dead'
+                    UNION
+                    -- A stale daemon self-fences locally at this same threshold.
+                    SELECT r.id, r.state AS previous_state, 'lease_expired'::text AS reason,
+                           1 AS priority, r.daemon_id, r.claimed_at
+                    FROM requests r
+                    JOIN daemons d ON d.id = r.daemon_id
+                    WHERE r.state IN ('claimed', 'processing')
+                      AND d.status = 'running'
+                      AND d.last_heartbeat < NOW() - ($3 || ' milliseconds')::INTERVAL
+                    UNION
                     -- Time-based fallback: request stuck too long regardless of daemon state
-                    SELECT r.id FROM requests r
+                    SELECT r.id, r.state AS previous_state, 'age_fallback'::text AS reason,
+                           2 AS priority, r.daemon_id, r.claimed_at
+                    FROM requests r
                     WHERE
                         (r.state = 'claimed' AND r.claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL)
                         OR
                         (r.state = 'processing' AND r.started_at < NOW() - ($2 || ' milliseconds')::INTERVAL)
-                    UNION
-                    -- Daemon-aware reclaim: daemon is dead or its heartbeat went stale
-                    SELECT r.id FROM requests r
-                    WHERE
-                        r.state IN ('claimed', 'processing')
-                        AND r.daemon_id IN (
-                            SELECT d.id FROM daemons d
-                            WHERE d.status = 'dead'
-                               OR d.last_heartbeat < NOW() - ($3 || ' milliseconds')::INTERVAL
-                        )
-                ) sub
+                    ) eligible
+                    ORDER BY id, priority
+                ) deduplicated
+                ORDER BY priority, id
                 LIMIT $4
+            ), updated AS (
+                UPDATE requests r
+                SET
+                    state = 'pending',
+                    daemon_id = NULL,
+                    claimed_at = NULL,
+                    started_at = NULL
+                FROM candidates c
+                WHERE r.id = c.id
+                  AND r.state = c.previous_state
+                  AND r.daemon_id = c.daemon_id
+                  AND r.claimed_at = c.claimed_at
+                RETURNING c.previous_state, c.reason
             )
+            SELECT previous_state AS "previous_state!", reason AS "reason!"
+            FROM updated
             "#,
             claim_timeout_ms.to_string(),
             processing_timeout_ms.to_string(),
             stale_daemon_threshold_ms.to_string(),
             limit,
         )
-        .execute(self.write_executor())
+        .fetch_all(self.write_executor())
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to unclaim stale requests: {}", e)))?;
         metrics::histogram!("fusillade_unclaim_stale_duration_seconds")
             .record(unclaim_start.elapsed().as_secs_f64());
 
-        let count = result.rows_affected() as usize;
+        let count = reclaimed.len();
 
         if count > 0 {
             metrics::counter!("fusillade_stale_requests_reclaimed_total").increment(count as u64);
+            let mut by_reason: HashMap<(String, String), u64> = HashMap::new();
+            for row in reclaimed {
+                *by_reason
+                    .entry((row.previous_state, row.reason))
+                    .or_default() += 1;
+            }
+            for ((previous_state, reason), reclaimed_count) in by_reason {
+                metrics::counter!(
+                    "fusillade_requests_reclaimed_total",
+                    "previous_state" => previous_state,
+                    "reason" => reason,
+                )
+                .increment(reclaimed_count);
+            }
             tracing::warn!(
                 count = count,
                 claim_timeout_ms,
@@ -3119,7 +3210,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 started_at = NULL,
                                 not_before = NULL
                             WHERE id = $1
-                              AND state NOT IN ('completed', 'failed', 'canceled')
+                              AND state = 'pending'
                             "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
@@ -3132,8 +3223,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .rows_affected();
 
                         if rows_affected == 0 {
-                            return Self::dropped_or_missing_in_transaction(&mut tx, req.data.id)
-                                .await;
+                            return Self::lost_ownership_or_missing_in_transaction(
+                                &mut tx,
+                                req.data.id,
+                            )
+                            .await;
                         }
                     }
                     AnyRequest::Processing(req) => {
@@ -3146,7 +3240,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 claimed_at = $4,
                                 started_at = clock_timestamp()
                             WHERE id = $1
-                              AND state NOT IN ('completed', 'failed', 'canceled')
+                              AND state = 'claimed'
+                              AND daemon_id = $3
+                              AND claimed_at = $4
                             "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
@@ -3159,8 +3255,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .rows_affected();
 
                         if rows_affected == 0 {
-                            return Self::dropped_or_missing_in_transaction(&mut tx, req.data.id)
-                                .await;
+                            return Self::lost_ownership_or_missing_in_transaction(
+                                &mut tx,
+                                req.data.id,
+                            )
+                            .await;
                         }
 
                         // The guarded update above acquires the row lock and may
@@ -3220,7 +3319,8 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     canceled_at = NULL
                                 FROM prev
                                 WHERE r.id = prev.id
-                                  AND r.state NOT IN ('completed', 'failed')
+                                  AND r.state IN ('processing', 'canceled')
+                                  AND r.claimed_at = $4
                                 RETURNING prev.old_state, prev.batch_id
                             ),
                             counter_fix AS (
@@ -3255,7 +3355,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             }
                             Some(_) => {}
                             None => {
-                                return Self::dropped_or_missing_in_transaction(
+                                return Self::terminal_replay_or_lost_ownership_in_transaction(
                                     &mut tx,
                                     req.data.id,
                                 )
@@ -3298,7 +3398,14 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     canceled_at = NULL
                                 FROM prev
                                 WHERE r.id = prev.id
-                                  AND r.state NOT IN ('completed', 'failed')
+                                  AND (
+                                      ($7::timestamptz IS NOT NULL
+                                       AND r.state IN ('processing', 'canceled')
+                                       AND r.claimed_at = $7)
+                                      OR
+                                      ($7::timestamptz IS NULL
+                                       AND r.state NOT IN ('completed', 'failed'))
+                                  )
                                 RETURNING prev.old_state, prev.batch_id
                             ),
                             counter_fix AS (
@@ -3318,6 +3425,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             req.state.failed_at,
                             response_size,
                             req.state.routed_model,
+                            req.state.claimed_at,
                         )
                         .fetch_optional(&mut *tx)
                         .await
@@ -3332,6 +3440,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                             }
                             Some(_) => {}
                             None => {
+                                if req.state.claimed_at.is_some() {
+                                    return Self::terminal_replay_or_lost_ownership_in_transaction(
+                                        &mut tx,
+                                        req.data.id,
+                                    )
+                                    .await;
+                                }
                                 return Self::dropped_or_missing_in_transaction(
                                     &mut tx,
                                     req.data.id,
@@ -3377,6 +3492,9 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                 Err(FusilladeError::RequestNotFound(id)) => {
                     return Err(FusilladeError::RequestNotFound(id));
                 }
+                Err(FusilladeError::LostOwnership(id)) => {
+                    return Err(FusilladeError::LostOwnership(id));
+                }
                 Err(error)
                     if RetainedResponseWriteError::from_fusillade_error(&error).is_some() =>
                 {
@@ -3405,6 +3523,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         &self,
         request_id: RequestId,
         owner: DaemonId,
+        claimed_at: DateTime<Utc>,
         retry_attempt: u32,
         not_before: Option<DateTime<Utc>>,
     ) -> Result<bool> {
@@ -3430,11 +3549,13 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             WHERE id = $1
               AND state = 'processing'
               AND daemon_id = $2
+              AND claimed_at = $5
             "#,
             *request_id as Uuid,
             *owner as Uuid,
             retry_attempt as i32,
             not_before,
+            claimed_at,
         )
         .execute(&mut *tx)
         .await
@@ -3664,6 +3785,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     "Missing failed_at for failed request"
                                 ))
                             })?,
+                            claimed_at: row.claimed_at,
                             retry_attempt: row.retry_attempt as u32,
                             batch_expires_at: row.batch_expires_at,
                             // Fall back to template model for old data without routed_model
@@ -6074,6 +6196,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                     "Missing failed_at for failed execution"
                                 ))
                             })?,
+                            claimed_at: row.claimed_at,
                             retry_attempt: row.retry_attempt as u32,
                             batch_expires_at: row.batch_expires_at,
                             // Fall back to template model for old data without routed_model
@@ -12381,7 +12504,11 @@ mod tests {
     async fn setup_processing_request(
         pool: &sqlx::PgPool,
         daemon_id: DaemonId,
-    ) -> (PostgresRequestManager<TestDbPools>, RequestId) {
+    ) -> (
+        PostgresRequestManager<TestDbPools>,
+        RequestId,
+        DateTime<Utc>,
+    ) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
@@ -12424,6 +12551,7 @@ mod tests {
                 .await;
         assert_eq!(claimed.len(), 1);
         let request_id = claimed[0].data.id;
+        let claimed_at = claimed[0].state.claimed_at;
 
         // Advance claimed -> processing, keeping the same owner. This mirrors the
         // daemon's claimed->processing transition without spawning HTTP work.
@@ -12433,7 +12561,7 @@ mod tests {
             .await
             .unwrap();
 
-        (manager, request_id)
+        (manager, request_id, claimed_at)
     }
 
     async fn read_request_row(pool: &sqlx::PgPool, request_id: RequestId) -> (String, i32) {
@@ -12487,8 +12615,7 @@ mod tests {
 
     /// Claim a single request into an in-flight state and hand back the request
     /// itself (so the caller can drive it to a terminal state and persist it),
-    /// with an optional transformer installed on the manager. persist() matches
-    /// on id alone, so the exact claimed/processing state does not matter here.
+    /// with an optional transformer installed on the manager.
     async fn claim_one_processing(
         pool: &sqlx::PgPool,
         transformer: Option<Arc<dyn crate::transform::ResponseTransformer>>,
@@ -12537,7 +12664,17 @@ mod tests {
             claim_batch_requests_for_test(&manager, 1, 1, daemon_id, &capacity, &HashMap::new())
                 .await;
         assert_eq!(claimed.len(), 1);
-        (manager, claimed.pop().unwrap())
+        let request = claimed.pop().unwrap();
+
+        // Terminal persistence is generation-fenced and is only valid after
+        // claimed -> processing has been made durable.
+        sqlx::query("UPDATE requests SET state = 'processing', started_at = NOW() WHERE id = $1")
+            .bind(*request.data.id)
+            .execute(pool)
+            .await
+            .unwrap();
+
+        (manager, request)
     }
 
     fn completed_from(req: &Request<Claimed>, body: &str) -> Request<Completed> {
@@ -12547,7 +12684,7 @@ mod tests {
             state: Completed {
                 response_status: 200,
                 response_body: body.to_string(),
-                claimed_at: now,
+                claimed_at: req.state.claimed_at,
                 started_at: now,
                 completed_at: now,
                 routed_model: req.data.model.clone(),
@@ -12561,6 +12698,7 @@ mod tests {
             state: Failed {
                 reason,
                 failed_at: chrono::Utc::now(),
+                claimed_at: Some(req.state.claimed_at),
                 retry_attempt: 0,
                 batch_expires_at: req.state.batch_expires_at,
                 routed_model: req.data.model.clone(),
@@ -12639,9 +12777,10 @@ mod tests {
         {
             let manager = manager.clone();
             let request_id = claimed[0].data.id;
+            let claimed_at = claimed[0].state.claimed_at;
             handles.push(tokio::spawn(async move {
                 let rescheduled = manager
-                    .reschedule_for_retry(request_id, daemon_id, 1, None)
+                    .reschedule_for_retry(request_id, daemon_id, claimed_at, 1, None)
                     .await?;
                 assert!(rescheduled);
                 Ok::<(), FusilladeError>(())
@@ -12733,7 +12872,7 @@ mod tests {
         // The cancel cascade catches the row while the daemon holds it.
         sqlx::query(
             "UPDATE requests SET state = 'canceled', canceled_at = NOW(), \
-             daemon_id = NULL, claimed_at = NULL, started_at = NULL WHERE id = $1",
+             daemon_id = NULL, started_at = NULL WHERE id = $1",
         )
         .bind(*req.data.id)
         .execute(&pool)
@@ -13086,11 +13225,11 @@ mod tests {
     #[sqlx::test]
     async fn test_reschedule_for_retry_owner_succeeds(pool: sqlx::PgPool) {
         let daemon_id = DaemonId::from(Uuid::new_v4());
-        let (manager, request_id) = setup_processing_request(&pool, daemon_id).await;
+        let (manager, request_id, claimed_at) = setup_processing_request(&pool, daemon_id).await;
 
         let not_before = chrono::Utc::now() + chrono::Duration::seconds(30);
         let rescheduled = manager
-            .reschedule_for_retry(request_id, daemon_id, 1, Some(not_before))
+            .reschedule_for_retry(request_id, daemon_id, claimed_at, 1, Some(not_before))
             .await
             .unwrap();
 
@@ -13109,7 +13248,7 @@ mod tests {
     #[sqlx::test]
     async fn test_reschedule_for_retry_does_not_resurrect_terminal(pool: sqlx::PgPool) {
         let daemon_id = DaemonId::from(Uuid::new_v4());
-        let (manager, request_id) = setup_processing_request(&pool, daemon_id).await;
+        let (manager, request_id, claimed_at) = setup_processing_request(&pool, daemon_id).await;
 
         // Another writer (zombie/duplicate worker) terminalizes the row first.
         sqlx::query(
@@ -13122,7 +13261,7 @@ mod tests {
 
         let not_before = chrono::Utc::now() + chrono::Duration::seconds(30);
         let rescheduled = manager
-            .reschedule_for_retry(request_id, daemon_id, 1, Some(not_before))
+            .reschedule_for_retry(request_id, daemon_id, claimed_at, 1, Some(not_before))
             .await
             .unwrap();
 
@@ -13139,11 +13278,11 @@ mod tests {
     #[sqlx::test]
     async fn test_reschedule_for_retry_wrong_owner_skips(pool: sqlx::PgPool) {
         let owner = DaemonId::from(Uuid::new_v4());
-        let (manager, request_id) = setup_processing_request(&pool, owner).await;
+        let (manager, request_id, claimed_at) = setup_processing_request(&pool, owner).await;
 
         let other = DaemonId::from(Uuid::new_v4());
         let rescheduled = manager
-            .reschedule_for_retry(request_id, other, 1, None)
+            .reschedule_for_retry(request_id, other, claimed_at, 1, None)
             .await
             .unwrap();
 
@@ -13153,6 +13292,74 @@ mod tests {
             state, "processing",
             "row must remain the owner's in-flight claim"
         );
+    }
+
+    /// Reclaiming onto the same daemon id must still invalidate the previous
+    /// attempt. The claim timestamp is the generation token; daemon identity
+    /// alone cannot distinguish an old task from a new claim by the same pod.
+    #[sqlx::test]
+    async fn test_reschedule_for_retry_stale_generation_same_owner_skips(pool: sqlx::PgPool) {
+        let owner = DaemonId::from(Uuid::new_v4());
+        let (manager, request_id, old_claimed_at) = setup_processing_request(&pool, owner).await;
+        let new_claimed_at = old_claimed_at + chrono::Duration::seconds(1);
+
+        let new_claimed_at: DateTime<Utc> = sqlx::query_scalar(
+            "UPDATE requests SET claimed_at = $2 WHERE id = $1 AND state = 'processing' \
+             RETURNING claimed_at",
+        )
+        .bind(*request_id)
+        .bind(new_claimed_at)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        let rescheduled = manager
+            .reschedule_for_retry(request_id, owner, old_claimed_at, 1, None)
+            .await
+            .unwrap();
+
+        assert!(!rescheduled, "stale claim generation must be fenced out");
+        let row_claimed_at: DateTime<Utc> =
+            sqlx::query_scalar("SELECT claimed_at FROM requests WHERE id = $1")
+                .bind(*request_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(row_claimed_at, new_claimed_at);
+    }
+
+    /// A response from an old claim must not overwrite the active generation,
+    /// even when the request id and daemon id are unchanged.
+    #[sqlx::test]
+    async fn test_terminal_persist_stale_generation_loses_ownership(pool: sqlx::PgPool) {
+        let (manager, request) = claim_one_processing(&pool, None).await;
+        let new_claimed_at = request.state.claimed_at + chrono::Duration::seconds(1);
+
+        sqlx::query("UPDATE requests SET claimed_at = $2 WHERE id = $1 AND state = 'processing'")
+            .bind(*request.data.id)
+            .bind(new_claimed_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let error = manager
+            .persist(&completed_from(&request, "stale response"))
+            .await
+            .expect_err("old generation must not terminalize the request");
+        assert!(matches!(
+            error,
+            FusilladeError::LostOwnership(id) if id == request.data.id
+        ));
+
+        let (state, _) = read_request_row(&pool, request.data.id).await;
+        assert_eq!(state, "processing");
+        let response_body: Option<String> =
+            sqlx::query_scalar("SELECT response_body FROM requests WHERE id = $1")
+                .bind(*request.data.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(response_body, None);
     }
 
     /// Regression: pending requests stranded under a terminal (completed) batch
@@ -16254,7 +16461,8 @@ mod tests {
         let status = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status.in_progress_requests, 1);
 
-        // Daemon2 claims — should reclaim daemon1's request because daemon1 is dead
+        // Daemon2 can immediately reclaim daemon1's request because daemon1
+        // explicitly marked itself dead.
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed =
             claim_batch_requests_for_test(&manager, 1, 1, daemon2_id, &capacity, &HashMap::new())
@@ -16317,7 +16525,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Register daemon1 as running but with a stale heartbeat (SIGKILL scenario)
+        // Register daemon1 as running with a heartbeat beyond the daemon lease.
         let daemon1_id = DaemonId::from(Uuid::new_v4());
         let daemon1 = DaemonRecord {
             data: DaemonData {
@@ -16329,7 +16537,7 @@ mod tests {
             },
             state: Running {
                 started_at: Utc::now() - chrono::Duration::minutes(10),
-                last_heartbeat: Utc::now() - chrono::Duration::seconds(5), // 5s ago, past 1s threshold
+                last_heartbeat: Utc::now() - chrono::Duration::milliseconds(1500),
                 stats: DaemonStats::default(),
             },
         };
@@ -16355,7 +16563,7 @@ mod tests {
         let status = manager.get_batch_status(batch.id).await.unwrap();
         assert_eq!(status.in_progress_requests, 1);
 
-        // Daemon2 claims — should reclaim because daemon1's heartbeat is stale
+        // Daemon2 reclaims at the same threshold at which daemon1 self-fences.
         let daemon2_id = DaemonId::from(Uuid::new_v4());
         let reclaimed =
             claim_batch_requests_for_test(&manager, 1, 1, daemon2_id, &capacity, &HashMap::new())

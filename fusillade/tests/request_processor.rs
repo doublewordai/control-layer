@@ -497,6 +497,7 @@ where
         let model = request.data.model.clone();
         let retry_attempt = request.state.retry_attempt;
         let batch_expires_at = request.state.batch_expires_at;
+        let claimed_at = request.state.claimed_at;
         let failed = Request {
             data: request.data,
             state: Failed {
@@ -505,6 +506,7 @@ where
                     body: "synthetic test failure".into(),
                 },
                 failed_at: chrono::Utc::now(),
+                claimed_at: Some(claimed_at),
                 retry_attempt,
                 batch_expires_at,
                 routed_model: model,

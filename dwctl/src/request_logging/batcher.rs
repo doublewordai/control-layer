@@ -1246,7 +1246,16 @@ where
 
             user_ids.push(user_id);
             amounts.push(total_cost);
-            source_ids.push(analytics_id.to_string());
+            // A Fusillade request may be executed more than once after a
+            // reclamation/retry race, and every execution has a different
+            // analytics id. Key its customer debit to the stable request id
+            // instead; the existing UNIQUE(source_id) constraint then makes
+            // billing retry- and concurrency-safe across all attempts. Keep
+            // per-attempt analytics for operations and debugging.
+            source_ids.push(match record.raw.fusillade_request_id {
+                Some(request_id) => format!("fusillade:{request_id}"),
+                None => analytics_id.to_string(),
+            });
             descriptions.push(Some(format!(
                 "API usage: {} ({} input + {} output tokens)",
                 model, record.raw.prompt_tokens, record.raw.completion_tokens
@@ -1305,6 +1314,12 @@ where
 
         let inserted_count = inserted_rows.len() as u64;
         let duplicates = expected_count.saturating_sub(inserted_count);
+        let expected_fusillade = source_ids.iter().filter(|source_id| source_id.starts_with("fusillade:")).count() as u64;
+        let inserted_fusillade = inserted_rows.iter().filter(|row| row.source_id.starts_with("fusillade:")).count() as u64;
+        let suppressed_fusillade = expected_fusillade.saturating_sub(inserted_fusillade);
+        if suppressed_fusillade > 0 {
+            counter!("dwctl_fusillade_duplicate_billing_suppressed_total").increment(suppressed_fusillade);
+        }
 
         // Fold the inserted usage amounts into the user_balance_checkpoints
         // read model: one grouped update per distinct user per flush (NOT per
@@ -2591,7 +2606,7 @@ mod integration_tests {
 
         // The credit is keyed to the request durably (no http_analytics needed).
         let row = sqlx::query!(
-            "SELECT fusillade_request_id, amount FROM credits_transactions \
+            "SELECT fusillade_request_id, amount, source_id FROM credits_transactions \
              WHERE fusillade_request_id = $1 AND transaction_type = 'usage'",
             request_id
         )
@@ -2599,7 +2614,57 @@ mod integration_tests {
         .await
         .unwrap();
         assert_eq!(row.fusillade_request_id, Some(request_id));
+        assert_eq!(row.source_id, format!("fusillade:{request_id}"));
         assert_eq!(row.amount, Decimal::from_str("0.10").unwrap(), "1000*5e-5 + 500*1e-4");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_fusillade_duplicate_attempts_create_one_usage_debit(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "fusillade-billing-idempotency").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00005").unwrap(),
+            Decimal::from_str("0.00010").unwrap(),
+            ApiKeyPurpose::Batch,
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let batch_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+
+        let mut first = create_raw_record("fusillade-billing-idempotency", Some(batch_key.clone()), 1000, 500);
+        first.batch_completion_window = Some("24h".to_string());
+        first.fusillade_batch_id = Some(batch_id);
+        first.fusillade_request_id = Some(request_id);
+
+        // A second successful dispatch has a distinct analytics correlation id
+        // but the same durable Fusillade request identity.
+        let mut duplicate = create_raw_record("fusillade-billing-idempotency", Some(batch_key), 1000, 500);
+        duplicate.batch_completion_window = Some("24h".to_string());
+        duplicate.fusillade_batch_id = Some(batch_id);
+        duplicate.fusillade_request_id = Some(request_id);
+
+        run_batcher_with_records(&pool, vec![first, duplicate]).await;
+
+        let analytics_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM http_analytics WHERE fusillade_request_id = $1")
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let charge_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM credits_transactions \
+             WHERE fusillade_request_id = $1 AND transaction_type = 'usage'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(analytics_count, 2, "both attempts remain observable");
+        assert_eq!(charge_count, 1, "one Fusillade request must produce one debit");
     }
 
     #[sqlx::test]

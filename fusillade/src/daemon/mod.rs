@@ -2652,6 +2652,7 @@ where
                     let batch_expires_at = request.state.batch_expires_at;
                     let retry_attempt_at_completion = request.state.retry_attempt;
                     let owning_daemon_id = request.state.daemon_id;
+                    let request_claimed_at = request.state.claimed_at;
 
                     let cancellation: crate::processor::CancellationFuture = Box::pin(async move {
                         tokio::select! {
@@ -2735,6 +2736,7 @@ where
                                             .reschedule_for_retry(
                                                 request_id,
                                                 owning_daemon_id,
+                                                request_claimed_at,
                                                 pending.state.retry_attempt,
                                                 pending.state.not_before,
                                             )
@@ -2781,7 +2783,25 @@ where
                                         return Ok(());
                                     }
                                     Err(failed) => {
-                                        storage.persist(&*failed).await?;
+                                        match storage.persist(&*failed).await {
+                                            Err(FusilladeError::LostOwnership(_)) => {
+                                                counter!(
+                                                    "fusillade_terminal_lost_ownership_total",
+                                                    "state" => "failed",
+                                                    "model" => model_clone.clone(),
+                                                )
+                                                .increment(1);
+                                                tracing::warn!(
+                                                    request_id = %request_id,
+                                                    batch_id = ?batch_id,
+                                                    "request.terminal_failure_skipped_lost_ownership"
+                                                );
+                                                return Ok(());
+                                            }
+                                            result => {
+                                                result?;
+                                            }
+                                        }
                                         requests_failed.fetch_add(1, Ordering::Relaxed);
                                         user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
                                             completed: AtomicU64::new(0),
@@ -2856,6 +2876,21 @@ where
                             // exit so poll_processing_tasks doesn't log it as a
                             // background task failure.
                             tracing::Span::current().record("outcome", "shutdown");
+                            Ok(())
+                        }
+                        Err(FusilladeError::LostOwnership(_)) => {
+                            tracing::Span::current().record("outcome", "lost_ownership");
+                            counter!(
+                                "fusillade_terminal_lost_ownership_total",
+                                "state" => "completion",
+                                "model" => model_clone.clone(),
+                            )
+                            .increment(1);
+                            tracing::warn!(
+                                request_id = %request_id,
+                                batch_id = ?batch_id,
+                                "request.completion_skipped_lost_ownership"
+                            );
                             Ok(())
                         }
                         Err(e) => {
@@ -2969,13 +3004,29 @@ where
         let heartbeat_interval_ms = self.config.heartbeat_interval_ms;
         let heartbeat_query_timeout =
             Duration::from_millis(heartbeat_interval_ms.saturating_mul(4));
+        let heartbeat_lease_duration = Duration::from_millis(self.config.stale_daemon_threshold_ms);
         let shutdown_signal = self.shutdown_token.clone();
 
         let heartbeat_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(heartbeat_interval_ms));
             let mut daemon_record = running_record;
+            let mut last_success = std::time::Instant::now();
+            let handle_lease_loss = || {
+                counter!("fusillade_heartbeat_lease_lost_total").increment(1);
+                crate::background_error!(
+                    "heartbeat_lease_lost", Error,
+                    daemon_id = %daemon_id,
+                    lease_ms = heartbeat_lease_duration.as_millis() as u64,
+                    "Heartbeat lease expired; cancelling in-flight work and stopping daemon"
+                );
+                // Every processing task selects on this token and aborts its
+                // downstream HTTP request when ownership may be reclaimed.
+                shutdown_signal.cancel();
+            };
 
             loop {
+                let lease_deadline =
+                    tokio::time::Instant::from_std(last_success + heartbeat_lease_duration);
                 tokio::select! {
                     _ = interval.tick() => {
                         let stats = DaemonStats {
@@ -2987,23 +3038,34 @@ where
                         // Clone the record so we preserve it if heartbeat fails
                         let current = daemon_record.clone();
                         let heartbeat_start = std::time::Instant::now();
-                        match with_query_timeout(
+                        let heartbeat = with_query_timeout(
                             "heartbeat query",
                             heartbeat_query_timeout,
                             current.heartbeat(stats, storage.as_ref()),
-                        )
-                        .await
-                        {
-                            Ok(updated) => {
+                        );
+                        tokio::pin!(heartbeat);
+                        let heartbeat_result = tokio::select! {
+                            result = &mut heartbeat => Some(result),
+                            _ = tokio::time::sleep_until(lease_deadline) => None,
+                            _ = shutdown_signal.cancelled() => break,
+                        };
+
+                        match heartbeat_result {
+                            None => {
+                                handle_lease_loss();
+                                break;
+                            }
+                            Some(Ok(updated)) => {
                                 histogram!("fusillade_heartbeat_duration_seconds")
                                     .record(heartbeat_start.elapsed().as_secs_f64());
                                 daemon_record = updated;
+                                last_success = std::time::Instant::now();
                                 tracing::trace!(
                                     daemon_id = %daemon_id,
                                     "Heartbeat sent"
                                 );
                             }
-                            Err(e) => {
+                            Some(Err(e)) => {
                                 histogram!("fusillade_heartbeat_duration_seconds")
                                     .record(heartbeat_start.elapsed().as_secs_f64());
                                 crate::background_error!(
@@ -3016,24 +3078,31 @@ where
                             }
                         }
                     }
-                    _ = shutdown_signal.cancelled() => {
-                        // Mark daemon as dead on shutdown
-                        tracing::info!("Shutting down heartbeat task");
-                        if let Err(e) = with_query_timeout(
-                            "daemon shutdown query",
-                            heartbeat_query_timeout,
-                            daemon_record.shutdown(storage.as_ref()),
-                        ).await {
-                            crate::background_error!(
-                                "shutdown_mark_failed", Error,
-                                daemon_id = %daemon_id,
-                                error = %e,
-                                "Failed to mark daemon as dead during shutdown"
-                            );
-                        }
+                    _ = tokio::time::sleep_until(lease_deadline) => {
+                        handle_lease_loss();
                         break;
                     }
+                    _ = shutdown_signal.cancelled() => break,
                 }
+            }
+
+            // Mark daemon as dead on either operator shutdown or local lease
+            // loss. The query is best-effort: reclamation also handles stale
+            // heartbeats after the grace window when the database is unavailable.
+            tracing::info!("Shutting down heartbeat task");
+            if let Err(e) = with_query_timeout(
+                "daemon shutdown query",
+                heartbeat_query_timeout,
+                daemon_record.shutdown(storage.as_ref()),
+            )
+            .await
+            {
+                crate::background_error!(
+                    "shutdown_mark_failed", Error,
+                    daemon_id = %daemon_id,
+                    error = %e,
+                    "Failed to mark daemon as dead during shutdown"
+                );
             }
         });
         daemon_handles.push(("heartbeat", heartbeat_handle));

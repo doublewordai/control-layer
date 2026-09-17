@@ -330,6 +330,10 @@ impl FailureReason {
 pub struct Failed {
     pub reason: FailureReason,
     pub failed_at: DateTime<Utc>,
+    /// Claim-generation fence for daemon-owned failures. System-generated
+    /// failures which never entered `claimed`/`processing` leave this unset.
+    #[serde(skip)]
+    pub claimed_at: Option<DateTime<Utc>>,
     /// Number of times this request has been attempted when it failed
     pub retry_attempt: u32,
     /// When the batch expires (carried over from Processing). `None` for background.
