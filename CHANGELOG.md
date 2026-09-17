@@ -1,5 +1,17 @@
 # Changelog
 
+## [12.0.0](https://github.com/doublewordai/control-layer/compare/v11.17.1...v12.0.0) (2026-09-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **onwards:** frame SSE before applying buffer limit
+
+### Bug Fixes
+
+* **onwards:** frame SSE before applying buffer limit ([5ebb4f1](https://github.com/doublewordai/control-layer/commit/5ebb4f122e5cba74fc971afd0e94b4d050ae96a4))
+* **underway:** index task claiming and completion lookups ([#1807](https://github.com/doublewordai/control-layer/issues/1807)) ([524cea4](https://github.com/doublewordai/control-layer/commit/524cea42d5381e9e39c4c4ce0d378d914eae4483))
+
 ## [11.17.1](https://github.com/doublewordai/control-layer/compare/v11.17.0...v11.17.1) (2026-09-17)
 
 
