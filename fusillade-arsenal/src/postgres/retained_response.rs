@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, SubsecRound, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgPool, PgRow};
@@ -3149,13 +3149,19 @@ pub(crate) async fn insert_completed_realtime(
     let earliest_future = now.date_naive().succ_opt().ok_or_else(incomplete_graph)?;
     let mut by_day = BTreeMap::<NaiveDate, Vec<_>>::new();
     for record in records {
-        let delete_on = RetentionPolicy::delete_on(
-            record.completed_at.max(record.started_at),
-            retention_seconds,
-        )
-        .map_err(|_| incomplete_graph())?
-        .max(earliest_future);
-        by_day.entry(delete_on).or_default().push(*record);
+        // Match PostgreSQL/SQLx timestamp precision before constructing both
+        // indexed metadata and JSON snapshots. Otherwise nanosecond input
+        // survives in JSON but is truncated in timestamptz columns, and the
+        // retained reader correctly rejects the inconsistent representation.
+        let started_at = record.started_at.trunc_subsecs(6);
+        let completed_at = record.completed_at.trunc_subsecs(6);
+        let delete_on = RetentionPolicy::delete_on(completed_at.max(started_at), retention_seconds)
+            .map_err(|_| incomplete_graph())?
+            .max(earliest_future);
+        by_day
+            .entry(delete_on)
+            .or_default()
+            .push((*record, started_at, completed_at));
     }
 
     let mut objects = Vec::with_capacity(records.len() * 2);
@@ -3167,7 +3173,7 @@ pub(crate) async fn insert_completed_realtime(
         if !lock_active_partition(tx, delete_on).await? {
             continue;
         }
-        for record in records {
+        for (record, started_at, completed_at) in records {
             let template_id = Uuid::new_v4();
             let body = super::sanitize_outbound_body(&record.request_body).into_owned();
             let completed = (200..300).contains(&record.status_code);
@@ -3193,19 +3199,19 @@ pub(crate) async fn insert_completed_realtime(
                     retry_attempt: 0,
                     not_before: None,
                     daemon_id: Some(Uuid::nil()),
-                    claimed_at: Some(record.started_at),
-                    started_at: Some(record.started_at),
+                    claimed_at: Some(started_at),
+                    started_at: Some(started_at),
                     response_status: Some(record.status_code as i16),
                     response_body: Some(record.response_body.clone()),
-                    completed_at: completed.then_some(record.completed_at),
+                    completed_at: completed.then_some(completed_at),
                     error,
-                    failed_at: (!completed).then_some(record.completed_at),
+                    failed_at: (!completed).then_some(completed_at),
                     canceled_at: None,
                     response_size: record.response_body.len() as i64,
                     routed_model: None,
                     service_tier: Some("priority".to_owned()),
                     created_by: Some(record.created_by.trim().to_owned()),
-                    created_at: record.started_at,
+                    created_at: started_at,
                     updated_at: now,
                 },
                 template: RetainedTemplateSnapshot {

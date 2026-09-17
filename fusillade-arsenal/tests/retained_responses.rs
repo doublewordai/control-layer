@@ -5465,7 +5465,12 @@ async fn direct_realtime_retained_is_readable_without_live_rows(pool: PgPool) {
         .await
         .with_realtime_retention_seconds(Some(86_400));
     let mut record = late_realtime_record(Uuid::new_v4());
-    record.started_at = Utc::now() - TimeDelta::seconds(2);
+    // Force sub-microsecond precision even on platforms with a coarser clock.
+    record.started_at = DateTime::from_timestamp(
+        (Utc::now() - TimeDelta::seconds(2)).timestamp(),
+        123_456_789,
+    )
+    .unwrap();
     record.completed_at = record.started_at + TimeDelta::seconds(1);
     let delete_on = record.completed_at.date_naive() + TimeDelta::days(2);
     ensure_partition(&pool, delete_on).await;
