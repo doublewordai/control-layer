@@ -2800,3 +2800,218 @@ async fn test_component_pool_round_trips_and_allows_dual_membership(pool: PgPool
     );
     assert!(!remaining.contains(&(members[0].as_str(), "completions")));
 }
+
+/// End-to-end regression for the free-model 403 mis-attribution bug, driven
+/// through the REAL application router (onwards + error_enrichment). A free
+/// (un-tariffed) model, a depleted-balance caller with group access, and a
+/// wiremock upstream that returns 403 (an upstream-side rejection unrelated
+/// to the caller's balance). The response that reaches the client must be
+/// the real upstream 403, NOT a 402 "add credits" rewrite from
+/// `error_enrichment` arm #3.
+///
+/// This is the forwards-side premise the unit suite stubs at the axum layer:
+/// an upstream 403 on an onwards-admitted key reaches `error_enrichment` as
+/// a 403 on the default non-strict config, and — post-fix — passes through
+/// for a free model even when the caller's balance is ≤ 0.
+#[sqlx::test]
+#[test_log::test]
+async fn test_e2e_free_model_upstream_403_passes_through_depleted_balance(pool: PgPool) {
+    use crate::db::handlers::Repository as _;
+    use crate::db::handlers::api_keys::ApiKeys;
+    use crate::db::models::api_keys::{ApiKeyCreateDBRequest, ApiKeyPurpose};
+
+    // Upstream returns a 403 for an unrelated cause (e.g. operator org-block
+    // on the default non-strict path). Body is distinctive so we can assert
+    // it surfaces unchanged.
+    let mock_server = wiremock::MockServer::start().await;
+    wiremock::Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(wiremock::ResponseTemplate::new(403).set_body_json(serde_json::json!({
+            "error": {"message": "upstream org blocked", "type": "upstream_forbidden"}
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let mut config = crate::test::utils::create_test_config();
+    config.background_services.onwards_sync.enabled = true;
+    config.background_services.probe_scheduler.enabled = false;
+    config.background_services.leader_election.enabled = false;
+    // Default non-strict onwards path (strict_mode defaults to false): a 403
+    // from the upstream is forwarded unchanged to error_enrichment.
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        .await
+        .expect("Failed to create application");
+    let (server, bg_services) = app.into_test_server();
+
+    let admin_user = create_test_admin_user(&pool, Role::PlatformManager).await;
+    let admin_headers = add_auth_headers(&admin_user);
+    let regular_user = create_test_user(&pool, Role::StandardUser).await;
+    let regular_headers = add_auth_headers(&regular_user);
+
+    // Group + membership so the user has model access.
+    let group_response = server
+        .post("/admin/api/v1/groups")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("e2e-free-{}", Uuid::new_v4()),
+            "description": "E2E free-model 403 passthrough"
+        }))
+        .await;
+    assert_eq!(group_response.status_code(), 201, "Failed to create group");
+    let group: GroupResponse = group_response.json();
+
+    let add_user_response = server
+        .post(&format!("/admin/api/v1/groups/{}/users/{}", group.id, regular_user.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(add_user_response.status_code(), 204, "Failed to add user to group");
+
+    // Grant a positive balance first so the user can be granted access / so
+    // the key is in the paid-style pool path during setup; we drain it below.
+    let credits_response = server
+        .post("/admin/api/v1/transactions")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "user_id": regular_user.id,
+            "transaction_type": "admin_grant",
+            "amount": 1000,
+            "source_id": admin_user.id,
+            "description": "Initial credits (will be drained)"
+        }))
+        .await;
+    assert_eq!(credits_response.status_code(), 201, "Failed to grant credits");
+
+    // Create an endpoint pointing at the wiremock upstream.
+    let endpoint_response = server
+        .post("/admin/api/v1/endpoints")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "name": format!("Mock Endpoint free-{}", Uuid::new_v4()),
+            "url": format!("{}/v1", mock_server.uri()),
+            "description": "Mock upstream returning 403"
+        }))
+        .await;
+    assert_eq!(endpoint_response.status_code(), 201, "Failed to create endpoint");
+    let endpoint: crate::api::models::inference_endpoints::InferenceEndpointResponse = endpoint_response.json();
+
+    // Deploy a FREE model: no `tariffs` array in the payload, so the model
+    // has no `model_tariffs` row and is admitted by onwards' `NOT EXISTS
+    // paid tariff` balance/cap free-model arm regardless of balance.
+    let deployment_response = server
+        .post("/admin/api/v1/models")
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .json(&serde_json::json!({
+            "type": "standard",
+            "model_name": "free-e2e-model",
+            "alias": "free-e2e-model",
+            "description": "Free (un-tariffed) model for 403-passthrough E2E",
+            "hosted_on": endpoint.id
+        }))
+        .await;
+    assert_eq!(deployment_response.status_code(), 200, "Failed to create free deployment");
+    let deployment: crate::api::models::deployments::DeployedModelResponse = deployment_response.json();
+
+    let add_deployment_response = server
+        .post(&format!("/admin/api/v1/groups/{}/models/{}", group.id, deployment.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(add_deployment_response.status_code(), 204, "Failed to add deployment to group");
+
+    // Mint a realtime key for the regular user.
+    let mut conn = pool.acquire().await.expect("Failed to acquire connection");
+    let mut api_keys_repo = ApiKeys::new(&mut conn);
+    let api_key = api_keys_repo
+        .create(&ApiKeyCreateDBRequest {
+            user_id: regular_user.id,
+            name: "E2E Free-Model Key".to_string(),
+            description: None,
+            purpose: ApiKeyPurpose::Realtime,
+            requests_per_second: None,
+            burst_size: None,
+            created_by: regular_user.id,
+            spend_limit: None,
+            spend_limit_interval: None,
+        })
+        .await
+        .expect("Failed to create API key");
+    drop(conn);
+
+    // Sync onwards so the key enters the model's pool, then wait for the
+    // model to be listed for this key.
+    bg_services.sync_onwards_config(&pool).await.expect("Failed to sync onwards config");
+    wait_for_model(&server, &api_key.secret, "free-e2e-model").await;
+
+    // Sanity: with a positive balance, a 403 upstream passes through. (This
+    // also confirms the wiremock 403 is reachable through the real router.)
+    let bearer = format!("Bearer {}", api_key.secret);
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", &bearer)
+        .json(&serde_json::json!({
+            "model": "free-e2e-model",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .await;
+    assert_eq!(
+        response.status_code().as_u16(),
+        403,
+        "positive-balance caller on a free model should see the upstream 403"
+    );
+
+    // Now DRAIN the balance below zero and re-issue the same request. Arm #3
+    // must NOT rewrite this to 402 — the model is free, so the balance gate
+    // is a no-op and the upstream 403 must surface unchanged.
+    let mut credits_conn = pool.acquire().await.unwrap();
+    let mut credits_repo = crate::db::handlers::Credits::new(&mut credits_conn);
+    credits_repo
+        .create_transaction(&crate::db::models::credits::CreditTransactionCreateDBRequest {
+            user_id: regular_user.id,
+            transaction_type: crate::db::models::credits::CreditTransactionType::Usage,
+            amount: rust_decimal::Decimal::new(100000, 2),
+            source_id: uuid::Uuid::new_v4().to_string(),
+            description: Some("Drain for E2E".to_string()),
+            fusillade_batch_id: None,
+            api_key_id: None,
+        })
+        .await
+        .expect("Failed to drain balance");
+    drop(credits_conn);
+
+    let drained_response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", &bearer)
+        .json(&serde_json::json!({
+            "model": "free-e2e-model",
+            "messages": [{"role": "user", "content": "Hello"}]
+        }))
+        .await;
+    assert_eq!(
+        drained_response.status_code().as_u16(),
+        403,
+        "depleted-balance caller on a FREE model must see the upstream 403, not a 402 add-credits"
+    );
+    let body = drained_response.text();
+    assert!(
+        body.contains("upstream org blocked"),
+        "the real upstream 403 body must surface to the client, not a 402 add-credits body: {body}"
+    );
+    assert!(
+        !body.contains("balance too low") && !body.contains("add credits"),
+        "the free-model upstream 403 must not be rewritten to a payment-required body: {body}"
+    );
+
+    // Teardown.
+    let delete_group_response = server
+        .delete(&format!("/admin/api/v1/groups/{}", group.id))
+        .add_header(&admin_headers[0].0, &admin_headers[0].1)
+        .add_header(&admin_headers[1].0, &admin_headers[1].1)
+        .await;
+    assert_eq!(delete_group_response.status_code(), 204, "Should delete test group");
+    bg_services.shutdown().await;
+}
