@@ -93,10 +93,40 @@ impl CacheLayerState {
     }
 }
 
-/// v1: only chat-completions (the parser handles that body shape). Responses + others
-/// pass straight through (tool-Responses per-step caching is a fast-follow).
+/// Chat completions AND plain completions (`/chat/completions` ends with `/completions`,
+/// so one suffix covers both). Responses + others pass straight through — Responses
+/// arrives here already translated to chat-completions, so it is covered upstream of
+/// this check.
+///
+/// Plain `/completions` can never touch the module cache: classification is route-gated
+/// ([`ClassifyRequest::route_has_blocks`]) to resolve tariff eligibility but always yield
+/// zero breakpoints, so even a body smuggling chat-shaped `messages`/`tools` past the
+/// router cannot create or read module entries keyed to fields the completions engine
+/// ignores. Unmarked requests on a tariffed model therefore take the engine-cache
+/// passthrough, and the scrub applies either way: before this layer covered
+/// `/completions`, the upstream's own `cached_tokens` leaked to customers unbilled. A
+/// body `cache_control` marker still arms the request (deterministic zeros — the
+/// one-paradigm rule); `cacheBreakpoint` is stripped and ignored on this route, so it
+/// cannot suppress implicit billing.
 fn is_cacheable(req: &Request) -> bool {
-    req.method() == Method::POST && req.uri().path().ends_with("/chat/completions")
+    // Mirrors `onwards::RequestClass::from_path`: trailing slashes trimmed, and the same
+    // deliberate suffix breadth. The scrub is a leak-guard, so this layer must cover
+    // every path shape onwards can serve a completions-style response on — matching
+    // narrower than the serving surface would reopen the provider-stat leak there.
+    req.method() == Method::POST && req.uri().path().trim_end_matches('/').ends_with("/completions")
+}
+
+/// Whether a path is the PLAIN completions route — the one cacheable shape whose body
+/// carries no module-cacheable blocks. Shared with the historical replay
+/// ([`crate::recompute::cache_replay`]) so the serving route gate and reconstruction
+/// can't drift. The rule is deliberately "plain completions" and not "is a chat path":
+/// `/v1/messages` and `/v1/responses` reach this layer already translated to chat
+/// completions, so their stored, pre-translation paths must NOT read as blockless.
+/// Tolerates trailing slashes (like `onwards::RequestClass`) and a query string
+/// (stored URIs may carry one).
+pub fn path_is_plain_completions(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+    path.ends_with("/completions") && !path.ends_with("/chat/completions")
 }
 
 /// Turn a synchronous marker-validation failure into the structured 400 the rest of the stack
@@ -191,31 +221,46 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     // extra cost, and only on param-carrying requests (whose marker means the outbound sanitiser
     // was going to rewrite the body anyway).
     let mut body_bytes = body_bytes;
-    match query::breakpoint_marker(parts.uri.query()) {
-        Ok(None) => {}
-        Ok(Some(marker)) => {
+    // Chat Completions vs the other cacheable shapes, decided once: the query param and
+    // module-cache classification are both chat-route features. (Within the cacheable
+    // surface, "not plain completions" IS the chat route.)
+    let chat_route = !path_is_plain_completions(parts.uri.path());
+    // The param is a Chat Completions feature (`super::query`'s contract): on any other
+    // cacheable path — plain /completions has no blocks for the marker to bind to — it is
+    // stripped from the URI (it must never leak upstream) and otherwise ignored, so it
+    // cannot arm the request and suppress implicit billing.
+    if !chat_route {
+        if query::breakpoint_marker(parts.uri.query()).is_ok_and(|m| m.is_some()) || query::breakpoint_marker(parts.uri.query()).is_err() {
             parts.uri = query::strip_param(&parts.uri);
-            let outcome = match parsed_body.as_mut() {
-                Some(body) => match query::inject_marker(body, marker) {
-                    Inject::Applied => match serde_json::to_vec(body) {
-                        Ok(b) => {
-                            body_bytes = b.into();
-                            "applied"
-                        }
-                        // Serializing a `Value` we just parsed can't realistically fail; if it
-                        // ever does, forward the original body un-injected (no caching) rather
-                        // than failing the request.
-                        Err(_) => "reserialize_failed",
-                    },
-                    Inject::BodyFieldWins => "body_field_wins",
-                    Inject::NotAnObject => "not_an_object",
-                },
-                // Unparseable JSON: nothing to inject into; onwards will 400 the body itself.
-                None => "not_json",
-            };
-            cache_metrics::record_query_breakpoint(outcome);
+            cache_metrics::record_query_breakpoint("non_chat_ignored");
         }
-        Err(e) => return query_rejection_response(&e),
+    } else {
+        match query::breakpoint_marker(parts.uri.query()) {
+            Ok(None) => {}
+            Ok(Some(marker)) => {
+                parts.uri = query::strip_param(&parts.uri);
+                let outcome = match parsed_body.as_mut() {
+                    Some(body) => match query::inject_marker(body, marker) {
+                        Inject::Applied => match serde_json::to_vec(body) {
+                            Ok(b) => {
+                                body_bytes = b.into();
+                                "applied"
+                            }
+                            // Serializing a `Value` we just parsed can't realistically fail; if
+                            // it ever does, forward the original body un-injected (no caching)
+                            // rather than failing the request.
+                            Err(_) => "reserialize_failed",
+                        },
+                        Inject::BodyFieldWins => "body_field_wins",
+                        Inject::NotAnObject => "not_an_object",
+                    },
+                    // Unparseable JSON: nothing to inject into; onwards will 400 the body itself.
+                    None => "not_json",
+                };
+                cache_metrics::record_query_breakpoint(outcome);
+            }
+            Err(e) => return query_rejection_response(&e),
+        }
     }
 
     // Reject disallowed/malformed cache_control markers synchronously, before forking + forwarding
@@ -257,6 +302,10 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
                     api_key: api_key.as_deref(),
                     // Serving always has the bearer token; only historical replay pre-resolves.
                     principal: None,
+                    // Module breakpoints exist only on chat routes: a /completions body
+                    // carrying chat-shaped `messages` must not create or read module
+                    // entries keyed to fields its engine ignores.
+                    route_has_blocks: chat_route,
                 })
                 .await
         })
@@ -1257,6 +1306,230 @@ mod tests {
         assert!(t.contains("\"cache_creation_input_tokens\":0"), "no writes on implicit: {t}");
         assert!(t.contains("\"content\":\"hi\""), "delta preserved: {t}");
         assert!(t.contains("data: [DONE]"), "DONE preserved: {t}");
+    }
+
+    // ---- plain /completions (implicit-only by construction) ----
+
+    /// Completions-shaped upstream reporting ITS OWN cache hit — the leak shape observed
+    /// in prod on /completions before the layer covered the endpoint.
+    async fn mock_upstream_completions_with_provider_cache() -> Json<serde_json::Value> {
+        Json(serde_json::json!({
+            "id": "cmpl-1", "object": "text_completion",
+            "model": "m",
+            "choices": [{"index":0,"text":" pong","finish_reason":"stop"}],
+            "usage": {
+                "prompt_tokens": 2008, "completion_tokens": 8, "total_tokens": 2016,
+                "prompt_tokens_details": {"cached_tokens": 1792}
+            }
+        }))
+    }
+
+    fn completions_app(pool: &PgPool) -> axum_test::TestServer {
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/completions", post(mock_upstream_completions_with_provider_cache))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        axum_test::TestServer::new(app).unwrap()
+    }
+
+    #[sqlx::test]
+    async fn tariffed_model_passes_engine_cache_through_on_plain_completions(pool: PgPool) {
+        // A string prompt has no blocks for markers to bind to — /completions is
+        // implicit-only, and a tariff row alone activates it.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        activate_alias(&pool, user.id).await;
+        let server = completions_app(&pool);
+
+        let r = server
+            .post("/v1/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({"model": ALIAS, "prompt": "continue this"}))
+            .await;
+        r.assert_status_ok();
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["usage"]["prompt_tokens"], 2008, "token totals untouched");
+        assert_eq!(
+            v["usage"]["prompt_tokens_details"]["cached_tokens"], 1792,
+            "engine hit passed through"
+        );
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 1792, "billed read = engine hit");
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 0, "implicit never writes");
+    }
+
+    #[sqlx::test]
+    async fn marked_plain_completions_stay_deterministically_zero(pool: PgPool) {
+        // A top-level cache_control on a blockless body arms the request (one paradigm)
+        // but the automatic marker no-ops with nothing to bind to — deterministic zeros,
+        // engine hit ignored, no 400.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        activate_alias(&pool, user.id).await;
+        let server = completions_app(&pool);
+
+        let r = server
+            .post("/v1/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({
+                "model": ALIAS, "prompt": "continue this",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }))
+            .await;
+        r.assert_status_ok();
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0, "armed → explicit zeros");
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 0, "engine hit not billed when armed");
+    }
+
+    #[sqlx::test]
+    async fn chat_shaped_fields_in_completions_bodies_cannot_touch_the_module_cache(pool: PgPool) {
+        // The router forwards arbitrary JSON, so a /completions body can carry chat-shaped
+        // marked `messages` its engine ignores. The markers arm the request (one paradigm →
+        // deterministic zeros, engine hit not billed) and the route-gated classifier
+        // (`blockless_route_never_reaches_the_chat_parser` proves the mechanism) keeps them
+        // out of the module index — no entries to discount later requests against.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        activate_alias(&pool, user.id).await;
+        let server = completions_app(&pool);
+
+        let body = serde_json::json!({
+            "model": ALIAS, "prompt": "continue this",
+            "messages": [{"role": "system", "content": [
+                {"type": "text", "text": "a long static prefix the completions engine never reads",
+                 "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+            ]}]
+        });
+        for _ in 0..2 {
+            let r = server
+                .post("/v1/completions")
+                .add_header("authorization", format!("Bearer {}", key.secret))
+                .json(&body)
+                .await;
+            r.assert_status_ok();
+            let v: serde_json::Value = r.json();
+            assert_eq!(
+                v["usage"]["cache_creation_input_tokens"], 0,
+                "no module creation from smuggled messages"
+            );
+            assert_eq!(v["usage"]["cache_read_input_tokens"], 0, "no module or engine read billed (armed)");
+            assert_eq!(
+                v["usage"]["prompt_tokens_details"]["cached_tokens"], 0,
+                "engine hit not shown when armed"
+            );
+        }
+        let entries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM prompt_cache_entries")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(entries, 0, "nothing committed to the module index");
+    }
+
+    #[sqlx::test]
+    async fn untariffed_plain_completions_scrub_provider_cache_fields(pool: PgPool) {
+        // The prod leak this closes: no tariff → inactive → the upstream's own
+        // cached_tokens must be zeroed, not shown to a customer billed at full price.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        let server = completions_app(&pool);
+
+        let r = server
+            .post("/v1/completions")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({"model": ALIAS, "prompt": "continue this"}))
+            .await;
+        r.assert_status_ok();
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0, "provider hit zeroed");
+        assert!(
+            v["usage"].get("cache_read_input_tokens").is_none(),
+            "no injected fields when inactive"
+        );
+    }
+
+    #[test]
+    fn is_cacheable_matches_the_onwards_completions_surface() {
+        let req = |method: Method, path: &str| {
+            let mut r = Request::new(Body::empty());
+            *r.method_mut() = method;
+            *r.uri_mut() = path.parse().unwrap();
+            r
+        };
+        assert!(is_cacheable(&req(Method::POST, "/v1/chat/completions")));
+        assert!(is_cacheable(&req(Method::POST, "/v1/completions")));
+        // Trailing slash: onwards normalizes it as the same route, so must we.
+        assert!(is_cacheable(&req(Method::POST, "/v1/completions/")));
+        assert!(is_cacheable(&req(Method::POST, "/v1/chat/completions/")));
+        assert!(!is_cacheable(&req(Method::GET, "/v1/completions")));
+        assert!(!is_cacheable(&req(Method::POST, "/v1/embeddings")));
+    }
+
+    #[test]
+    fn plain_completions_rule_is_shared_with_replay() {
+        // Serving gate and historical replay both consume this: only the plain
+        // completions shape is blockless. Pre-translation paths (/messages, /responses)
+        // must read as block-carrying — their rows had module splits.
+        assert!(path_is_plain_completions("/v1/completions"));
+        assert!(path_is_plain_completions("/v1/completions/"));
+        assert!(path_is_plain_completions("/v1/completions?cacheBreakpoint=lastUserMessage"));
+        assert!(!path_is_plain_completions("/v1/chat/completions"));
+        assert!(!path_is_plain_completions("/v1/chat/completions/"));
+        assert!(!path_is_plain_completions("/v1/messages"));
+        assert!(!path_is_plain_completions("/v1/responses"));
+        assert!(!path_is_plain_completions("/v1/embeddings"));
+    }
+
+    /// Completions upstream that also proves the query param never leaks upstream.
+    async fn mock_upstream_completions_asserting_no_query(req: Request) -> Json<serde_json::Value> {
+        assert!(req.uri().query().is_none(), "cacheBreakpoint must be stripped before forwarding");
+        mock_upstream_completions_with_provider_cache().await
+    }
+
+    #[sqlx::test]
+    async fn cache_breakpoint_param_is_ignored_on_plain_completions(pool: PgPool) {
+        // The param is a Chat Completions feature: on /completions it must be stripped
+        // (never forwarded) WITHOUT arming the request, so implicit billing still applies.
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(&pool, user.id).await;
+        activate_alias(&pool, user.id).await;
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new("http://127.0.0.1:1"),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        let app = Router::new()
+            .route("/v1/completions", post(mock_upstream_completions_asserting_no_query))
+            .layer(from_fn_with_state(
+                CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)),
+                cache_middleware,
+            ));
+        let server = axum_test::TestServer::new(app).unwrap();
+
+        let r = server
+            .post("/v1/completions")
+            .add_query_param("cacheBreakpoint", "lastUserMessage")
+            .add_header("authorization", format!("Bearer {}", key.secret))
+            .json(&serde_json::json!({"model": ALIAS, "prompt": "continue this"}))
+            .await;
+        r.assert_status_ok();
+        let v: serde_json::Value = r.json();
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 1792, "param must not suppress implicit");
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 1792);
     }
 
     // ---- `?cacheBreakpoint=lastUserMessage` (query-param automatic caching) ----
