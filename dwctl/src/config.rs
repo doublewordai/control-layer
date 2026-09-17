@@ -1193,6 +1193,9 @@ impl Default for RequestLimitsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OnwardsConfig {
+    /// Maximum pending bytes of an unfinished SSE event. Complete events are forwarded first.
+    /// Increase for providers that emit large tool-call events. Default: 65536.
+    pub sse_buffer_limit: usize,
     /// Enable strict mode with schema validation and typed handlers.
     /// When false (default), all requests are passed through transparently.
     /// When true, only known OpenAI API paths are accepted and validated.
@@ -1205,19 +1208,22 @@ pub struct OnwardsConfig {
     /// to, an attempt that hasn't produced response headers and (in strict
     /// mode) a first SSE frame within this window is abandoned and the next
     /// provider tried. The final attempt is never cut off, and fusillade daemon
-    /// traffic (batch, flex, background) is exempt. Default: 10000. Set to 0 to
-    /// disable.
+    /// traffic (batch, flex, background) is exempt. Default: 20000. AIMD's
+    /// separate 10-second latency budget records a later first token as a
+    /// breach without cutting it off; once breaches exceed the controller's
+    /// target rate, later requests shift to the alternates. Set to 0 to disable.
     pub first_token_timeout_ms: u64,
 }
 
 impl Default for OnwardsConfig {
     fn default() -> Self {
         Self {
+            sse_buffer_limit: onwards::sse::DEFAULT_SSE_BUFFER_LIMIT,
             strict_mode: false,
             upstream_rate_limit_message:
                 "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
                     .to_string(),
-            first_token_timeout_ms: 10_000,
+            first_token_timeout_ms: 20_000,
         }
     }
 }
@@ -4336,6 +4342,14 @@ auth:
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_onwards_sse_buffer_limit_config() {
+        let defaults: OnwardsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.sse_buffer_limit, 65536);
+        let configured: OnwardsConfig = serde_json::from_str(r#"{"sse_buffer_limit":1048576}"#).unwrap();
+        assert_eq!(configured.sse_buffer_limit, 1048576);
     }
 
     #[test]

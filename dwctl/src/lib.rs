@@ -4281,6 +4281,7 @@ impl Application {
             .with_upstream_rate_limit_message(config.onwards.upstream_rate_limit_message.clone())
             .with_response_id_header("x-fusillade-request-id")
             .with_body_limit(onwards_body_limit)
+            .with_sse_buffer_limit(config.onwards.sse_buffer_limit)
             // The fusillade daemon stamps every request it dispatches (file
             // batches, flex, background) with its batch metadata headers, and
             // `created_at` is always among them, even for batchless rows.

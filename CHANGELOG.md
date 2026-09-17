@@ -1,5 +1,31 @@
 # Changelog
 
+## [12.0.0](https://github.com/doublewordai/control-layer/compare/v11.17.1...v12.0.0) (2026-09-17)
+
+
+### ⚠ BREAKING CHANGES
+
+* **onwards:** frame SSE before applying buffer limit
+
+### Bug Fixes
+
+* **onwards:** frame SSE before applying buffer limit ([5ebb4f1](https://github.com/doublewordai/control-layer/commit/5ebb4f122e5cba74fc971afd0e94b4d050ae96a4))
+* **underway:** index task claiming and completion lookups ([#1807](https://github.com/doublewordai/control-layer/issues/1807)) ([524cea4](https://github.com/doublewordai/control-layer/commit/524cea42d5381e9e39c4c4ce0d378d914eae4483))
+
+## [11.17.1](https://github.com/doublewordai/control-layer/compare/v11.17.0...v11.17.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* **onwards:** return realtime-only failover statuses as sent when no provider is left ([#1811](https://github.com/doublewordai/control-layer/issues/1811)) ([2b954b9](https://github.com/doublewordai/control-layer/commit/2b954b9b22620e4764fffc5793c9e65303170e37))
+
+## [11.17.0](https://github.com/doublewordai/control-layer/compare/v11.16.0...v11.17.0) (2026-09-17)
+
+
+### Features
+
+* **dwctl:** let slow first tokens stream until a 20-second failover deadline ([#1808](https://github.com/doublewordai/control-layer/issues/1808)) ([444ad7c](https://github.com/doublewordai/control-layer/commit/444ad7cfd5d04d5077ef62b61a2fb9cd72b5f03e))
+
 ## [11.16.0](https://github.com/doublewordai/control-layer/compare/v11.15.1...v11.16.0) (2026-09-17)
 
 

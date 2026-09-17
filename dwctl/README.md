@@ -289,8 +289,9 @@ streaming traffic and preserves ordinary retries; it is not a binary outage brea
 `PATCH {"aimd": {"enabled": false}}` disables it; null restores defaults. Model responses expose settings under `fallback`.
 
 By default the share decreases by 20% when more than 10% of the preferred
-provider's recent completed attempts breach — a first frame later than 10 seconds,
-or an overload status (429, 503, 529) — holds between 3% and 10%, and recovers by
+provider's recent completed attempts breach — a first frame later than 10 seconds
+(the attempt keeps streaming; `onwards.first_token_timeout_ms` only cuts it off
+and fails over at 20 seconds), or an overload status (429, 503, 529) — holds between 3% and 10%, and recovers by
 five percentage points per healthy 30-second dwell. Pools with too few samples to
 judge recover a step every five minutes. Other errors and cancellations are
 excluded rather than counted either way.

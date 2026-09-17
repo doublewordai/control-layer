@@ -803,6 +803,50 @@ async fn realtime_on_status_reroutes_realtime_but_not_dispatched_traffic() {
     assert_eq!(client.calls("alternate.example.com"), 1);
 }
 
+#[tokio::test]
+async fn realtime_on_status_returns_the_upstream_status_when_no_provider_is_left() {
+    LazyLock::force(&METRICS);
+    let client = ScriptedClient::new(vec![(StatusCode::from_u16(529).unwrap(), Duration::ZERO)]);
+
+    // A single-provider pool has nothing to fail over to: the 529 reaches the
+    // caller as sent, not as a generic 502.
+    let alias = "realtime-529-single";
+    let mut cfg = config(alias, true);
+    cfg["targets"][alias]["providers"] = json!([{"url": "https://preferred.example.com"}]);
+    cfg["targets"][alias]["fallback"]["realtime_on_status"] = json!([529]);
+    let state = AppState::with_client(
+        Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap(),
+        client.clone(),
+    )
+    .with_first_token_timeout_exempt_header("x-batch");
+    let single = TestServer::new(build_router(state)).unwrap();
+    let response = single
+        .post("/v1/chat/completions")
+        .json(&json!({"model": alias, "stream": true}))
+        .await;
+    assert_eq!(response.status_code().as_u16(), 529);
+    assert_eq!(client.calls("preferred.example.com"), 1);
+
+    // The same applies on the final attempt of a multi-provider pool.
+    let alias = "realtime-529-one-attempt";
+    let mut cfg = config(alias, true);
+    cfg["targets"][alias]["fallback"]["realtime_on_status"] = json!([529]);
+    cfg["targets"][alias]["fallback"]["max_attempts"] = json!(1);
+    let state = AppState::with_client(
+        Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap(),
+        client.clone(),
+    )
+    .with_first_token_timeout_exempt_header("x-batch");
+    let capped = TestServer::new(build_router(state)).unwrap();
+    let response = capped
+        .post("/v1/chat/completions")
+        .json(&json!({"model": alias, "stream": true}))
+        .await;
+    assert_eq!(response.status_code().as_u16(), 529);
+    assert_eq!(client.calls("preferred.example.com"), 2);
+    assert_eq!(client.calls("alternate.example.com"), 0);
+}
+
 #[tokio::test(start_paused = true)]
 async fn aimd_counts_preferred_overload_statuses_as_breaches() {
     LazyLock::force(&METRICS);

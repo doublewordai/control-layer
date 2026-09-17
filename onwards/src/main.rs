@@ -63,7 +63,9 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // Register the sanitizer globally - per-target sanitize_response flag controls when it's applied
-    let app_state = AppState::new(targets).with_response_transform(create_openai_sanitizer());
+    let app_state = AppState::new(targets)
+        .with_sse_buffer_limit(config.sse_buffer_limit)
+        .with_response_transform(create_openai_sanitizer());
 
     // Use strict router if strict_mode is enabled, otherwise use standard router
     let mut router = if strict_mode {

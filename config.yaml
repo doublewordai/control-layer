@@ -512,6 +512,11 @@ openapi:
 # Onwards AI proxy configuration
 # Controls behavior of the onwards routing layer for AI proxy requests
 onwards:
+  # Maximum pending bytes of an unfinished SSE event; complete events are forwarded first.
+  # Increase for providers with large tool-call events. This is not a response-length limit.
+  # Exceeding it fails the response body stream. Zero permits no unfinished bytes.
+  # Set via environment: DWCTL_ONWARDS__SSE_BUFFER_LIMIT=1048576
+  sse_buffer_limit: 65536
   # Enable strict mode with schema validation and typed handlers.
   # When false (default), all requests are passed through transparently.
   # When true, only known OpenAI API paths are accepted and validated.
@@ -526,8 +531,11 @@ onwards:
   # hasn't started streaming within this window is abandoned and the next
   # provider tried. The final attempt is never cut off, and fusillade daemon
   # traffic (batch, flex, background) is exempt. Set to 0 to disable.
-  # Set via environment: DWCTL_ONWARDS__FIRST_TOKEN_TIMEOUT_MS=10000
-  first_token_timeout_ms: 10000
+  # AIMD records a first token later than its separate 10-second latency budget as
+  # a breach without cutting the attempt off; once breaches exceed its target rate,
+  # later requests shift to the alternates.
+  # Set via environment: DWCTL_ONWARDS__FIRST_TOKEN_TIMEOUT_MS=20000
+  first_token_timeout_ms: 20000
   # Models may override the deadline via first_token_timeout_ms in the model API.
   # Priority composites with fallback enabled use AIMD by default in strict mode.
   # Override through the model API's aimd object, or set aimd.enabled=false to opt out.
