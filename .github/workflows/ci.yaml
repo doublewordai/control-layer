@@ -1295,8 +1295,12 @@ jobs:
       packages: read
 
     steps:
+      # The image is built from the PR head, so mount config and run tests
+      # from that same revision rather than GitHub's synthetic merge commit.
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
 
       - name: Install just
         uses: extractions/setup-just@v3
