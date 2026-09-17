@@ -5456,3 +5456,434 @@ async fn an_incomplete_graph_is_skipped_and_the_next_graph_still_moves(pool: PgP
     assert_wholly_live(&pool, &broken).await;
     assert_wholly_retained(&pool, &next).await;
 }
+
+// A terminal-only write must be immediately readable without creating live
+// rows that the archive worker would later copy and delete.
+#[sqlx::test]
+async fn direct_realtime_retained_is_readable_without_live_rows(pool: PgPool) {
+    let manager = manager(&pool)
+        .await
+        .with_realtime_retention_seconds(Some(86_400));
+    let mut record = late_realtime_record(Uuid::new_v4());
+    record.started_at = Utc::now() - TimeDelta::seconds(2);
+    record.completed_at = record.started_at + TimeDelta::seconds(1);
+    let delete_on = record.completed_at.date_naive() + TimeDelta::days(2);
+    ensure_partition(&pool, delete_on).await;
+    // Fail even if an implementation inserts then archives within one
+    // transaction: the fast path must never create either live row.
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_live_realtime_insert() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN RAISE EXCEPTION 'terminal realtime touched the live heap'; END $$;
+         CREATE TRIGGER reject_live_request BEFORE INSERT ON requests
+         FOR EACH ROW EXECUTE FUNCTION reject_live_realtime_insert();
+         CREATE TRIGGER reject_live_template BEFORE INSERT ON request_templates
+         FOR EACH ROW EXECUTE FUNCTION reject_live_realtime_insert();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    manager
+        .persist_completed_realtime_batch(&[record.clone()])
+        .await
+        .unwrap();
+    let live: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM requests) + (SELECT count(*) FROM request_templates)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 0, "terminal realtime must bypass the live heaps");
+    let detail = manager
+        .get_request_detail(RequestId(record.request_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        detail.response_body.as_deref(),
+        Some(record.response_body.as_str())
+    );
+    assert_eq!(detail.body.as_deref(), Some(record.request_body.as_str()));
+    assert_eq!(detail.duration_ms, Some(1000.0));
+    assert_eq!(detail.created_by, OWNER);
+    let route: NaiveDate = sqlx::query_scalar(
+        "SELECT delete_on FROM retained_response_request_routes WHERE request_id = $1",
+    )
+    .bind(record.request_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(route, delete_on);
+}
+
+#[sqlx::test]
+async fn direct_realtime_retained_preserves_failures_and_listing(pool: PgPool) {
+    let manager = manager(&pool)
+        .await
+        .with_realtime_retention_seconds(Some(86_400));
+    let mut record = late_realtime_record(Uuid::new_v4());
+    record.status_code = 503;
+    record.request_body = r#"{"model":"m","service_tier":"priority","background":false}"#.into();
+    let delete_on = record.completed_at.date_naive() + TimeDelta::days(2);
+    ensure_partition(&pool, delete_on).await;
+    manager
+        .persist_completed_realtime_batch(&[record.clone()])
+        .await
+        .unwrap();
+    let detail = manager
+        .get_request_detail(RequestId(record.request_id))
+        .await
+        .unwrap();
+    assert_eq!(detail.status, "failed");
+    assert!(detail.completed_at.is_none());
+    assert!(detail.failed_at.is_some());
+    assert_eq!(detail.response_status, Some(503));
+    assert_eq!(
+        serde_json::from_str::<Value>(detail.body.as_ref().unwrap()).unwrap(),
+        json!({"model":"m"})
+    );
+    let error: Value = serde_json::from_str(detail.error.as_ref().unwrap()).unwrap();
+    assert_eq!(
+        error,
+        json!({"type":"NonRetriableHttpStatus","details":{"status":503,"body":record.response_body}})
+    );
+    assert_list_ids(
+        &manager,
+        ListRequestsFilter {
+            created_by: Some(OWNER.into()),
+            status: Some("failed".into()),
+            service_tiers: Some(vec!["priority".into()]),
+            ..Default::default()
+        },
+        &[record.request_id],
+    )
+    .await;
+    assert_list_ids(
+        &manager,
+        ListRequestsFilter {
+            created_by: Some("another-owner".into()),
+            ..Default::default()
+        },
+        &[],
+    )
+    .await;
+}
+
+#[sqlx::test]
+async fn direct_realtime_retained_duplicates_and_retries_keep_first_result(pool: PgPool) {
+    let manager = manager(&pool)
+        .await
+        .with_realtime_retention_seconds(Some(86_400));
+    let first = late_realtime_record(Uuid::new_v4());
+    ensure_partition(&pool, first.completed_at.date_naive() + TimeDelta::days(2)).await;
+    let mut loser = first.clone();
+    loser.response_body = "losing-response".into();
+    loser.request_body = "losing-request".into();
+    loser.created_by = "losing-owner".into();
+    loser.status_code = 500;
+    loser.completed_at += TimeDelta::days(1);
+    manager
+        .persist_completed_realtime_batch(&[first.clone(), loser.clone()])
+        .await
+        .unwrap();
+    manager
+        .persist_completed_realtime_batch(&[loser])
+        .await
+        .unwrap();
+    let detail = manager
+        .get_request_detail(RequestId(first.request_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        detail.response_body.as_deref(),
+        Some(first.response_body.as_str())
+    );
+    assert_eq!(detail.created_by, OWNER);
+    assert_eq!(detail.status, "completed");
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM retained_response_objects")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+    let live: i64 = sqlx::query_scalar("SELECT count(*) FROM request_templates")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(live, 0);
+}
+
+#[sqlx::test]
+async fn direct_realtime_retained_concurrent_retries_store_one_graph(pool: PgPool) {
+    let manager = Arc::new(
+        manager(&pool)
+            .await
+            .with_realtime_retention_seconds(Some(86_400)),
+    );
+    let record = late_realtime_record(Uuid::new_v4());
+    ensure_partition(&pool, record.completed_at.date_naive() + TimeDelta::days(2)).await;
+    let mut tasks = Vec::new();
+    let barrier = Arc::new(Barrier::new(4));
+    for _ in 0..4 {
+        let manager = manager.clone();
+        let record = record.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            manager.persist_completed_realtime_batch(&[record]).await
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap().unwrap();
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM retained_response_objects")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
+}
+
+#[sqlx::test]
+async fn direct_realtime_retained_mixed_processing_and_fresh_records(pool: PgPool) {
+    let manager = manager(&pool)
+        .await
+        .with_realtime_retention_seconds(Some(86_400));
+    let existing = late_realtime_record(Uuid::new_v4());
+    let fresh = late_realtime_record(Uuid::new_v4());
+    manager
+        .create_realtime(CreateRealtimeInput {
+            request_id: existing.request_id,
+            body: "original-live-body".into(),
+            model: MODEL.into(),
+            endpoint: existing.endpoint.clone(),
+            method: existing.method.clone(),
+            path: existing.path.clone(),
+            api_key: existing.api_key.clone(),
+            created_by: OWNER.into(),
+        })
+        .await
+        .unwrap();
+    ensure_partition(&pool, fresh.completed_at.date_naive() + TimeDelta::days(2)).await;
+    manager
+        .persist_completed_realtime_batch(&[existing.clone(), fresh.clone()])
+        .await
+        .unwrap();
+    let detail = manager
+        .get_request_detail(RequestId(existing.request_id))
+        .await
+        .unwrap();
+    assert_eq!(detail.status, "completed");
+    assert_eq!(detail.body.as_deref(), Some("original-live-body"));
+    assert_eq!(
+        count_ids(&pool, "requests", &[existing.request_id]).await,
+        1
+    );
+    assert_eq!(count_ids(&pool, "requests", &[fresh.request_id]).await, 0);
+    let listed = manager
+        .list_requests(ListRequestsFilter {
+            created_by: Some(OWNER.into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(listed.total_count, 2);
+    assert_eq!(listed.data.len(), 2);
+}
+
+#[sqlx::test]
+async fn direct_realtime_retained_deletion_and_retirement_fence_retries(pool: PgPool) {
+    let manager = manager(&pool)
+        .await
+        .with_realtime_retention_seconds(Some(86_400));
+    let erased = late_realtime_record(Uuid::new_v4());
+    let retired = late_realtime_record(Uuid::new_v4());
+    let delete_on = erased.completed_at.date_naive() + TimeDelta::days(2);
+    ensure_partition(&pool, delete_on).await;
+    manager
+        .persist_completed_realtime_batch(&[erased.clone(), retired.clone()])
+        .await
+        .unwrap();
+    // Wrong ownership cannot erase the retained payload.
+    assert!(matches!(
+        manager
+            .delete_owned_response_group(erased.request_id, "another-owner")
+            .await,
+        Err(fusillade_arsenal::error::FusilladeError::RequestNotFound(_))
+    ));
+    assert_eq!(
+        manager
+            .delete_owned_response_group(erased.request_id, OWNER)
+            .await
+            .unwrap(),
+        1
+    );
+    let mut tx = pool.begin().await.unwrap();
+    fence_partition_for_retirement(&mut tx, delete_on).await;
+    tx.commit().await.unwrap();
+    for record in [erased, retired] {
+        let error = manager
+            .persist_completed_realtime_batch(&[record])
+            .await
+            .unwrap_err();
+        assert_write_error(&error, RetainedResponseWriteError::NotFound);
+    }
+    let live: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM requests) + (SELECT count(*) FROM request_templates)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 0);
+}
+
+#[sqlx::test]
+async fn direct_realtime_retained_missing_or_invalid_partition_falls_back_to_live(pool: PgPool) {
+    let manager = manager(&pool)
+        .await
+        .with_realtime_retention_seconds(Some(86_400));
+    let missing = late_realtime_record(Uuid::new_v4());
+    let invalid = late_realtime_record(Uuid::new_v4());
+    manager
+        .persist_completed_realtime_batch(&[missing.clone()])
+        .await
+        .unwrap();
+    let delete_on = invalid.completed_at.date_naive() + TimeDelta::days(2);
+    ensure_partition(&pool, delete_on).await;
+    sqlx::query("UPDATE retained_response_buckets SET partition_oid = 0 WHERE delete_on = $1")
+        .bind(delete_on)
+        .execute(&pool)
+        .await
+        .unwrap();
+    manager
+        .persist_completed_realtime_batch(&[invalid.clone()])
+        .await
+        .unwrap();
+    for record in [missing, invalid] {
+        assert_eq!(count_ids(&pool, "requests", &[record.request_id]).await, 1);
+        assert_eq!(
+            manager
+                .get_request_detail(RequestId(record.request_id))
+                .await
+                .unwrap()
+                .status,
+            "completed"
+        );
+    }
+    let retained: i64 = sqlx::query_scalar("SELECT count(*) FROM retained_response_objects")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(retained, 0);
+}
+
+#[sqlx::test]
+async fn direct_realtime_retained_overdue_records_use_next_future_day(pool: PgPool) {
+    let manager = manager(&pool)
+        .await
+        .with_realtime_retention_seconds(Some(86_400));
+    let mut record = late_realtime_record(Uuid::new_v4());
+    record.started_at -= TimeDelta::days(10);
+    record.completed_at -= TimeDelta::days(10);
+    let tomorrow = Utc::now().date_naive() + TimeDelta::days(1);
+    ensure_partition(&pool, tomorrow).await;
+    manager
+        .persist_completed_realtime_batch(&[record.clone()])
+        .await
+        .unwrap();
+    let route: NaiveDate = sqlx::query_scalar(
+        "SELECT delete_on FROM retained_response_request_routes WHERE request_id = $1",
+    )
+    .bind(record.request_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(route, tomorrow);
+    assert_eq!(
+        manager
+            .get_request_detail(RequestId(record.request_id))
+            .await
+            .unwrap()
+            .status,
+        "completed"
+    );
+}
+
+#[sqlx::test]
+async fn direct_realtime_retained_invalid_owner_rolls_back_whole_batch(pool: PgPool) {
+    let manager = manager(&pool)
+        .await
+        .with_realtime_retention_seconds(Some(86_400));
+    let valid = late_realtime_record(Uuid::new_v4());
+    let mut invalid = late_realtime_record(Uuid::new_v4());
+    invalid.created_by = "   ".into();
+    ensure_partition(&pool, valid.completed_at.date_naive() + TimeDelta::days(2)).await;
+    manager
+        .persist_completed_realtime_batch(&[valid, invalid])
+        .await
+        .unwrap_err();
+    let count: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM retained_response_objects) + (SELECT count(*) FROM retained_response_group_routes) + (SELECT count(*) FROM retained_response_request_routes)")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(count, 0);
+}
+
+#[sqlx::test]
+async fn direct_realtime_retained_bulk_dates_and_fallback_stay_associated(pool: PgPool) {
+    let manager = manager(&pool)
+        .await
+        .with_realtime_retention_seconds(Some(3 * 86_400));
+    let mut older = late_realtime_record(Uuid::new_v4());
+    older.started_at -= TimeDelta::days(1);
+    older.completed_at -= TimeDelta::days(1);
+    older.response_body = "older-result".into();
+    let fresh = late_realtime_record(Uuid::new_v4());
+    let mut future = late_realtime_record(Uuid::new_v4());
+    future.started_at += TimeDelta::days(1);
+    future.completed_at += TimeDelta::days(1);
+    let older_day = older.completed_at.date_naive() + TimeDelta::days(4);
+    let fresh_day = fresh.completed_at.date_naive() + TimeDelta::days(4);
+    ensure_partition(&pool, older_day).await;
+    ensure_partition(&pool, fresh_day).await;
+    manager
+        .persist_completed_realtime_batch(&[fresh.clone(), future.clone(), older.clone()])
+        .await
+        .unwrap();
+    for (record, day) in [(older, older_day), (fresh, fresh_day)] {
+        let route: NaiveDate = sqlx::query_scalar(
+            "SELECT delete_on FROM retained_response_request_routes WHERE request_id = $1",
+        )
+        .bind(record.request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(route, day);
+        assert_eq!(
+            manager
+                .get_request_detail(RequestId(record.request_id))
+                .await
+                .unwrap()
+                .response_body,
+            Some(record.response_body)
+        );
+        assert_eq!(count_ids(&pool, "requests", &[record.request_id]).await, 0);
+    }
+    assert_eq!(count_ids(&pool, "requests", &[future.request_id]).await, 1);
+}
+
+#[sqlx::test]
+async fn direct_realtime_retained_conflicting_route_rolls_back_siblings(pool: PgPool) {
+    let manager = manager(&pool)
+        .await
+        .with_realtime_retention_seconds(Some(86_400));
+    let valid = late_realtime_record(Uuid::new_v4());
+    let conflicting = late_realtime_record(Uuid::new_v4());
+    let day = valid.completed_at.date_naive() + TimeDelta::days(2);
+    ensure_partition(&pool, day).await;
+    // Model an incomplete prior route: it must not be silently claimed or
+    // overwritten just because the active-graph classification rejects it.
+    sqlx::query("INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) VALUES ($1, $1, $2)")
+        .bind(conflicting.request_id).bind(day).execute(&pool).await.unwrap();
+    manager
+        .persist_completed_realtime_batch(&[valid, conflicting])
+        .await
+        .unwrap_err();
+    let payloads_and_groups: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM retained_response_objects) + (SELECT count(*) FROM retained_response_group_routes)")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(payloads_and_groups, 0);
+}

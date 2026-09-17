@@ -4,6 +4,7 @@
 //! atomic mover, and active-bucket read routing for retained response graphs.
 //! Partition retirement remains a separate lifecycle phase.
 
+use std::collections::{BTreeMap, HashSet};
 use std::fmt;
 
 use chrono::{DateTime, NaiveDate, Utc};
@@ -20,7 +21,8 @@ use crate::manager::{
     RetainedResponseMaintenanceError, RetainedResponseWriteError, RetentionPolicy,
 };
 use crate::request::{
-    ListRequestsFilter, RequestDetail, RequestId, RequestListResult, RequestSummary,
+    FailureReason, ListRequestsFilter, PersistCompletedRealtimeInput, RequestDetail, RequestId,
+    RequestListResult, RequestSummary,
 };
 
 /// The only retained response payload version this binary knows how to read.
@@ -3118,6 +3120,211 @@ async fn lock_active_partition(
     .await
     .map_err(database_failure)
     .map(|bucket| bucket.is_some())
+}
+
+/// Bulk-persist fresh realtime identities while the caller holds their graph
+/// locks. Existing live/retained identities and deletion fences must already
+/// have been classified in this transaction. Global route primary keys provide
+/// identity uniqueness across partitions: unlike the mover, this path never
+/// reconciles an earlier copy, so conflicts fail the whole transaction rather
+/// than scanning every payload partition or accepting a partial graph.
+///
+/// Return the identities stored here. An unavailable destination stays on the
+/// existing live-write path so a partition-maintenance outage cannot drop a
+/// buffered response. No DDL is performed on the response writer's connection.
+pub(crate) async fn insert_completed_realtime(
+    tx: &mut Transaction<'_, Postgres>,
+    records: &[&PersistCompletedRealtimeInput],
+    retention_seconds: u64,
+    fence_seconds: Option<u64>,
+) -> Result<HashSet<Uuid>> {
+    let mut retained_ids = HashSet::new();
+    if records.is_empty() {
+        return Ok(retained_ids);
+    }
+    let now: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(database_failure)?;
+    let earliest_future = now.date_naive().succ_opt().ok_or_else(incomplete_graph)?;
+    let mut by_day = BTreeMap::<NaiveDate, Vec<_>>::new();
+    for record in records {
+        let delete_on = RetentionPolicy::delete_on(
+            record.completed_at.max(record.started_at),
+            retention_seconds,
+        )
+        .map_err(|_| incomplete_graph())?
+        .max(earliest_future);
+        by_day.entry(delete_on).or_default().push(*record);
+    }
+
+    let mut objects = Vec::with_capacity(records.len() * 2);
+    let mut ids = Vec::with_capacity(records.len());
+    let mut dates = Vec::with_capacity(records.len());
+    // All writers acquire day locks in date order, matching the mover's
+    // graph-before-partition lock order and avoiding cross-day deadlocks.
+    for (delete_on, records) in by_day {
+        if !lock_active_partition(tx, delete_on).await? {
+            continue;
+        }
+        for record in records {
+            let template_id = Uuid::new_v4();
+            let body = super::sanitize_outbound_body(&record.request_body).into_owned();
+            let completed = (200..300).contains(&record.status_code);
+            let error = if completed {
+                None
+            } else {
+                Some(
+                    serde_json::to_string(&FailureReason::NonRetriableHttpStatus {
+                        status: record.status_code,
+                        body: record.response_body.clone(),
+                    })
+                    .map_err(database_failure)?,
+                )
+            };
+            let payload = RetainedRequestPayloadV1 {
+                request: RetainedRequestSnapshot {
+                    id: record.request_id,
+                    batch_id: None,
+                    template_id: Some(template_id),
+                    custom_id: None,
+                    model: record.model.clone(),
+                    state: if completed { "completed" } else { "failed" }.to_owned(),
+                    retry_attempt: 0,
+                    not_before: None,
+                    daemon_id: Some(Uuid::nil()),
+                    claimed_at: Some(record.started_at),
+                    started_at: Some(record.started_at),
+                    response_status: Some(record.status_code as i16),
+                    response_body: Some(record.response_body.clone()),
+                    completed_at: completed.then_some(record.completed_at),
+                    error,
+                    failed_at: (!completed).then_some(record.completed_at),
+                    canceled_at: None,
+                    response_size: record.response_body.len() as i64,
+                    routed_model: None,
+                    service_tier: Some("priority".to_owned()),
+                    created_by: Some(record.created_by.trim().to_owned()),
+                    created_at: record.started_at,
+                    updated_at: now,
+                },
+                template: RetainedTemplateSnapshot {
+                    id: template_id,
+                    file_id: None,
+                    custom_id: None,
+                    endpoint: record.endpoint.clone(),
+                    method: record.method.clone(),
+                    path: record.path.clone(),
+                    body_byte_size: body.len() as i64,
+                    body,
+                    model: record.model.clone(),
+                    api_key: record.api_key.clone(),
+                    line_number: 0,
+                    metadata: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+            };
+            objects.extend(
+                RetainedGroup::compose_rows(
+                    delete_on,
+                    RetainedGroup {
+                        group_id: record.request_id,
+                        request_ids: vec![record.request_id],
+                    },
+                    vec![payload],
+                )
+                .map_err(RetainedResponseSerializationError::into_fusillade_error)?,
+            );
+            ids.push(record.request_id);
+            dates.push(delete_on);
+            retained_ids.insert(record.request_id);
+        }
+    }
+    if ids.is_empty() {
+        return Ok(retained_ids);
+    }
+    // Plain INSERT is deliberate. A conflicting route (including an invalid
+    // bucket route not classified as retained) must roll back every payload.
+    sqlx::query(
+        "INSERT INTO retained_response_group_routes (group_id, delete_on) \
+         SELECT id, delete_on FROM UNNEST($1::uuid[], $2::date[]) AS v(id, delete_on)",
+    )
+    .bind(&ids)
+    .bind(&dates)
+    .execute(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+    sqlx::query(
+        "INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) \
+         SELECT id, id, delete_on FROM UNNEST($1::uuid[], $2::date[]) AS v(id, delete_on)",
+    )
+    .bind(&ids)
+    .bind(&dates)
+    .execute(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+
+    // A fixed statement shape amortises planning across different flush sizes
+    // and keeps the bind count independent of the response batch size.
+    sqlx::query(
+        r#"
+        INSERT INTO retained_response_objects
+            (delete_on, group_id, object_kind, object_id, request_id, created_by,
+             service_tier, state, model, created_at, terminal_at, schema_version, payload)
+        SELECT delete_on, group_id, object_kind, object_id, request_id, created_by,
+               service_tier, state, model, created_at, terminal_at, schema_version, payload
+        FROM UNNEST(
+            $1::date[], $2::uuid[], $3::text[], $4::uuid[], $5::uuid[],
+            $6::text[], $7::text[], $8::text[], $9::text[],
+            $10::timestamptz[], $11::timestamptz[], $12::smallint[], $13::jsonb[]
+        ) AS v(delete_on, group_id, object_kind, object_id, request_id, created_by,
+               service_tier, state, model, created_at, terminal_at, schema_version, payload)
+        "#,
+    )
+    .bind(objects.iter().map(|r| r.delete_on).collect::<Vec<_>>())
+    .bind(objects.iter().map(|r| r.group_id).collect::<Vec<_>>())
+    .bind(
+        objects
+            .iter()
+            .map(|r| r.object_kind.as_str())
+            .collect::<Vec<_>>(),
+    )
+    .bind(objects.iter().map(|r| r.object_id).collect::<Vec<_>>())
+    .bind(objects.iter().map(|r| r.request_id).collect::<Vec<_>>())
+    .bind(
+        objects
+            .iter()
+            .map(|r| r.created_by.as_deref())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        objects
+            .iter()
+            .map(|r| r.service_tier.as_deref())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        objects
+            .iter()
+            .map(|r| r.state.as_deref())
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        objects
+            .iter()
+            .map(|r| r.model.as_deref())
+            .collect::<Vec<_>>(),
+    )
+    .bind(objects.iter().map(|r| r.created_at).collect::<Vec<_>>())
+    .bind(objects.iter().map(|r| r.terminal_at).collect::<Vec<_>>())
+    .bind(objects.iter().map(|r| r.schema_version).collect::<Vec<_>>())
+    .bind(objects.iter().map(|r| &r.payload).collect::<Vec<_>>())
+    .execute(&mut **tx)
+    .await
+    .map_err(database_failure)?;
+    upsert_resurrection_fences(tx, &ids, "archived", fence_seconds).await?;
+    Ok(retained_ids)
 }
 
 async fn insert_and_verify_objects(

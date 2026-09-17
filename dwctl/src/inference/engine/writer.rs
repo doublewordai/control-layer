@@ -9,7 +9,7 @@
 //! polling) is the wrong shape for realtime/responses persistence. Realtime
 //! cannot meaningfully be retried (the client connection is already gone),
 //! flex durability is owned by the fusillade daemon, and the only
-//! `requests`-table guarantee we actually need is "the row eventually
+//! persistence guarantee we actually need is "the response eventually
 //! appears for observability". The pre-existing analytics batcher solves
 //! the same shape for `http_analytics`; this is the parallel for `requests`.
 //!
