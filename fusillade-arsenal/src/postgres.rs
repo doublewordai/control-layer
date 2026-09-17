@@ -3400,7 +3400,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 WHERE r.id = prev.id
                                   AND (
                                       ($7::timestamptz IS NOT NULL
-                                       AND r.state IN ('processing', 'canceled')
+                                       AND r.state IN ('claimed', 'processing', 'canceled')
                                        AND r.claimed_at = $7)
                                       OR
                                       ($7::timestamptz IS NULL
