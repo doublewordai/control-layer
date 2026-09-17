@@ -1893,6 +1893,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "crc",
  "criterion",
  "ctor",
  "dashmap",
