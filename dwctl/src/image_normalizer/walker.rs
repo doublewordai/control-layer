@@ -16,10 +16,12 @@
 //! - [`Mode::All`] — additionally substitute `data:` URIs (the opt-in
 //!   "image privacy" mode).
 //!
-//! The walker also has a third operating mode, [`Mode::TokensOnly`], used
-//! at dispatch time: it only touches values that already look like
-//! `dw-img://...` opaque tokens — swapping them for freshly-signed URLs
-//! without re-running ingest.
+//! Two more modes cover `dw-img://...` opaque tokens (what the flex enqueue
+//! and file-ingest paths store): [`Mode::TokensOnly`] touches only tokens,
+//! and [`Mode::AllAndTokens`] — the edge middleware's mode — touches every
+//! kind, so a daemon loopback gets its tokens swapped for freshly-signed
+//! URLs (without re-running ingest) in the same pass that normalises a
+//! client's URLs and data URIs.
 use serde_json::Value;
 use std::future::Future;
 
@@ -34,9 +36,14 @@ pub enum Mode {
     /// HTTP(S) URLs and `data:` URIs. Used when the calling user has the
     /// per-account opt-in enabled.
     All,
-    /// Only opaque `dw-img://` tokens. Used at dispatch time to swap
-    /// tokens for fresh signed URLs.
+    /// Only opaque `dw-img://` tokens: swap tokens for fresh signed URLs.
     TokensOnly,
+    /// Everything: HTTP(S) URLs, `data:` URIs AND `dw-img://` tokens. The
+    /// edge middleware's mode — a daemon loopback carries the tokens that
+    /// flex enqueue / file ingest stored, and signing them here (below the
+    /// prompt-cache layer) is what keeps the cache identity of an image the
+    /// stable content-addressed token rather than a per-dispatch signed URL.
+    AllAndTokens,
 }
 
 impl Mode {
@@ -45,6 +52,7 @@ impl Mode {
             Mode::HttpOnly => is_http_url(input),
             Mode::All => is_http_url(input) || crate::image_normalizer::data_uri::looks_like_data_uri(input),
             Mode::TokensOnly => ImageToken::looks_like_token(input),
+            Mode::AllAndTokens => Mode::All.applies_to(input) || ImageToken::looks_like_token(input),
         }
     }
 }
@@ -273,6 +281,33 @@ mod tests {
         // http url untouched in TokensOnly mode
         assert_eq!(content[0]["image_url"]["url"], "https://example.com/x.png");
         assert!(content[1]["image_url"]["url"].as_str().unwrap().starts_with("S:dw-img://"));
+    }
+
+    /// The edge middleware's mode: a daemon loopback carries the tokens that
+    /// enqueue stored alongside whatever a client may echo back, so every kind
+    /// of image input must be handed to the callback in document order.
+    #[tokio::test]
+    async fn all_and_tokens_mode_substitutes_every_kind() {
+        let mut body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "https://example.com/x.png" } },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                    { "type": "image_url", "image_url": { "url": "dw-img://0000000000000000000000000000000000000000000000000000000000000001" } }
+                ]
+            }]
+        });
+
+        let count = substitute_with(&mut body, Mode::AllAndTokens, |u| prefix_with("S", u))
+            .await
+            .unwrap();
+
+        assert_eq!(count, 3);
+        let content = &body["messages"][0]["content"];
+        assert!(content[0]["image_url"]["url"].as_str().unwrap().starts_with("S:https://"));
+        assert!(content[1]["image_url"]["url"].as_str().unwrap().starts_with("S:data:"));
+        assert!(content[2]["image_url"]["url"].as_str().unwrap().starts_with("S:dw-img://"));
     }
 
     #[tokio::test]

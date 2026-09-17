@@ -295,9 +295,9 @@ struct FileStreamConfig {
     /// Optional DB pool for `image_access` bookkeeping. `None` disables
     /// the bookkeeping (the substitution itself still runs).
     access_pool: Option<sqlx::PgPool>,
-    /// Who to attribute `image_access` rows to: the acting human, plus the
-    /// owning org when the upload is in org context (so org members can view
-    /// it, but personal uploads stay private to the user).
+    /// Who to attribute `image_access` rows to: the principal — the
+    /// organization when the upload is in org context (so org members can use
+    /// the image), else the person (personal uploads stay private).
     access_attribution: Option<crate::api::handlers::images::ImageAttribution>,
 }
 
@@ -382,18 +382,29 @@ async fn normalize_template_body_in_place(
             match normalizer.ingest(input).await {
                 Ok(ingested) => {
                     if let (Some(pool), Some(attribution)) = (access_pool, access_attribution) {
-                        // Batch ingest is already async (file upload latency dominates),
-                        // so we AWAIT the bookkeeping write rather than fire-and-forget —
-                        // the user's later "view what I submitted" lookup depends on it.
-                        // Records real (mime, bytes_len) captured from the ingest result.
-                        crate::api::handlers::images::record_image_access(
+                        // AWAITED and REQUIRED, not fire-and-forget: this row is what
+                        // authorises signing the token when the daemon dispatches the
+                        // batch (and the user's later "view what I submitted" lookup),
+                        // so a silently-failed write would refuse the customer's own
+                        // image. Fail the upload (retryable) instead. Records real
+                        // (mime, bytes_len) captured from the ingest result.
+                        if let Err(e) = crate::api::handlers::images::try_record_image_access(
                             &pool,
                             attribution,
                             ingested.token,
                             &ingested.mime,
                             ingested.bytes_len,
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(error = %e, "image_access bookkeeping failed on file upload");
+                            if let Ok(mut g) = err_cell.lock()
+                                && g.is_none()
+                            {
+                                *g = Some(BatchNormalizeError::StoreFailed("image_access bookkeeping failed".to_string()));
+                            }
+                            return Err(());
+                        }
                     }
                     Ok::<String, ()>(ingested.token.to_dw_img_uri())
                 }
@@ -406,6 +417,11 @@ async fn normalize_template_body_in_place(
                         crate::image_normalizer::NormalizeError::StoreFailed(m) => BatchNormalizeError::StoreFailed(m),
                         crate::image_normalizer::NormalizeError::NotFound => {
                             BatchNormalizeError::StoreFailed("image token not found in store".to_string())
+                        }
+                        // Ingest never authorises tokens (it only produces them), so this
+                        // variant cannot arise here; map it defensively as bad input.
+                        crate::image_normalizer::NormalizeError::Forbidden => {
+                            BatchNormalizeError::BadInput("image token is not accessible to this caller".to_string())
                         }
                     };
                     if let Ok(mut g) = err_cell.lock()
@@ -1163,8 +1179,11 @@ pub async fn upload_file<P: PoolProvider>(
         // uploads, the owning org — so org members can view org-key images
         // while a personal upload stays private to the user. This is distinct
         // from file ownership above, which is credited to the org.
+        // The principal, exactly as an API key resolves: the organization when
+        // acting in one, else the person. The batch's hidden key carries the
+        // same principal, so the dispatch's token authorisation matches.
         access_attribution: Some(crate::api::handlers::images::ImageAttribution {
-            user_id: current_user.id,
+            user_id: current_user.active_organization.unwrap_or(current_user.id),
             organization_id: current_user.active_organization,
         }),
     };
