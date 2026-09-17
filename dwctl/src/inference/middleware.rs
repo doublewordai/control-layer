@@ -518,9 +518,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                         Ok(caller) => caller.map(|c| c.attribution),
                         Err(e) => {
                             tracing::warn!(error = %e, "Image attribution lookup failed on flex enqueue");
-                            return normalize_error_response(crate::image_normalizer::NormalizeError::Transient(
-                                "caller lookup failed".to_string(),
-                            ));
+                            return normalize_error_response(crate::image_normalizer::NormalizeError::AccessUnavailable);
                         }
                     },
                     None => None,

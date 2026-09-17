@@ -51,6 +51,9 @@
 //!   not an internal bug).
 //! - `NormalizeError::Forbidden` → 403 (a `dw-img://` token the caller's
 //!   user/organization never submitted, or a caller we cannot attribute).
+//! - `NormalizeError::AccessUnavailable` → 503 (the authorisation /
+//!   bookkeeping store could not be reached; retryable, and reported as
+//!   `image_access_unavailable` rather than as a failed fetch).
 //! - `NormalizeError::NotFound` / other → 500 (internal inconsistency).
 //!
 //! The middleware never falls through to passing the original URL on a
@@ -216,7 +219,7 @@ pub async fn image_normalizer_middleware(
                 let caller = match caller_lookup {
                     Ok(Some(c)) => c,
                     Ok(None) => return Err(NormalizeError::Forbidden),
-                    Err(()) => return Err(NormalizeError::Transient("caller lookup failed".to_string())),
+                    Err(()) => return Err(NormalizeError::AccessUnavailable),
                 };
                 // Authorise against the image grants for the principal behind
                 // the bearer — the daemon's hidden batch key resolves to the
@@ -228,7 +231,7 @@ pub async fn image_normalizer_middleware(
                     Ok(false) => return Err(NormalizeError::Forbidden),
                     Err(e) => {
                         warn!(error = %e, "image_access lookup failed while signing a token");
-                        return Err(NormalizeError::Transient("image access lookup failed".to_string()));
+                        return Err(NormalizeError::AccessUnavailable);
                     }
                 }
                 // The bearer only decides the TTL: a dispatch must outlive one
@@ -354,7 +357,7 @@ pub(crate) async fn normalize_value_to_tokens(
             // retryably (503) rather than persisting tokens nobody may re-send.
             if let Some(pool) = access_pool {
                 let Some(attribution) = attribution else {
-                    return Err(NormalizeError::Transient("image attribution unavailable".to_string()));
+                    return Err(NormalizeError::AccessUnavailable);
                 };
                 crate::api::handlers::images::try_record_image_access(
                     &pool,
@@ -366,7 +369,7 @@ pub(crate) async fn normalize_value_to_tokens(
                 .await
                 .map_err(|e| {
                     warn!(error = %e, "image_access bookkeeping failed on flex enqueue");
-                    NormalizeError::StoreFailed("image_access bookkeeping failed".to_string())
+                    NormalizeError::AccessUnavailable
                 })?;
             }
             Ok::<String, NormalizeError>(ingested.token.to_dw_img_uri())
@@ -386,6 +389,7 @@ pub(crate) fn normalize_error_response(err: NormalizeError) -> Response {
         NormalizeError::StoreFailed(_) => (StatusCode::SERVICE_UNAVAILABLE, "image_store_failed"),
         NormalizeError::NotFound => (StatusCode::INTERNAL_SERVER_ERROR, "image_token_not_found"),
         NormalizeError::Forbidden => (StatusCode::FORBIDDEN, "image_token_forbidden"),
+        NormalizeError::AccessUnavailable => (StatusCode::SERVICE_UNAVAILABLE, "image_access_unavailable"),
     };
     let body = serde_json::json!({
         "error": {
@@ -1104,6 +1108,9 @@ mod tests {
             // A token the caller never submitted is refused, not "not found":
             // the bytes may well exist, they just aren't theirs.
             (NormalizeError::Forbidden, StatusCode::FORBIDDEN),
+            // The authorisation store being down is retryable, and named as
+            // such rather than as a failed fetch.
+            (NormalizeError::AccessUnavailable, StatusCode::SERVICE_UNAVAILABLE),
         ];
         for (err, expected) in cases {
             assert_eq!(normalize_error_response(err).status(), expected);

@@ -90,6 +90,12 @@ pub enum NormalizeError {
     /// that image (no `image_access` row for their user or organization).
     #[error("image token is not accessible to this caller")]
     Forbidden,
+    /// The authorisation / bookkeeping store (`image_access`, the API-key
+    /// lookup behind it) could not be reached. Transient and retryable, but
+    /// distinct from a failed image FETCH so clients and telemetry are told
+    /// what actually failed.
+    #[error("image access store unavailable")]
+    AccessUnavailable,
 }
 
 impl From<fetcher::FetchError> for NormalizeError {

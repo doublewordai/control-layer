@@ -423,6 +423,9 @@ async fn normalize_template_body_in_place(
                         crate::image_normalizer::NormalizeError::Forbidden => {
                             BatchNormalizeError::BadInput("image token is not accessible to this caller".to_string())
                         }
+                        crate::image_normalizer::NormalizeError::AccessUnavailable => {
+                            BatchNormalizeError::StoreFailed("image access store unavailable".to_string())
+                        }
                     };
                     if let Ok(mut g) = err_cell.lock()
                         && g.is_none()
