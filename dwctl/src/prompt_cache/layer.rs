@@ -98,14 +98,15 @@ impl CacheLayerState {
 /// arrives here already translated to chat-completions, so it is covered upstream of
 /// this check.
 ///
-/// Plain `/completions` is **implicit-only by construction**: its `prompt` is one string,
-/// so there are no content blocks for markers to bind to, and the parser finds zero
-/// breakpoints (a top-level automatic marker no-ops on a blockless body per the
-/// Anthropic rule — no 400). Unmarked requests on a tariffed model therefore take the
-/// engine-cache passthrough, and the scrub applies either way — before this, the layer
-/// skipped `/completions` entirely and the upstream's own `cached_tokens` leaked to
-/// customers unbilled. A marker or `cacheBreakpoint` param on a completions body still
-/// arms the request (deterministic zeros — the one-paradigm rule), it just cannot cache.
+/// Plain `/completions` cannot create module cache entries because the chat parser does
+/// not interpret its `prompt` field (string, string-array, or token-array alike), so it
+/// finds zero breakpoints (a top-level automatic marker no-ops on a blockless body per
+/// the Anthropic rule — no 400). Unmarked requests on a tariffed model therefore take
+/// the engine-cache passthrough, and the scrub applies either way: before this layer
+/// covered `/completions`, the upstream's own `cached_tokens` leaked to customers
+/// unbilled. A body `cache_control` marker still arms the request (deterministic zeros —
+/// the one-paradigm rule); `cacheBreakpoint` is stripped and ignored on this route, so
+/// it cannot suppress implicit billing.
 fn is_cacheable(req: &Request) -> bool {
     // Mirrors `onwards::RequestClass::from_path`: trailing slashes trimmed, and the same
     // deliberate suffix breadth. The scrub is a leak-guard, so this layer must cover
