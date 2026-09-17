@@ -445,9 +445,15 @@ pub async fn at_startup(mode: MigrationsMode, target: &Target, pool: &PgPool) ->
 /// a failure still holding its session advisory lock.
 pub async fn apply_underway(pool: &PgPool) -> anyhow::Result<()> {
     let mut conn = pool.acquire().await?.detach();
-    let result = underway::run_migrations(&mut conn).await;
+    let result = async {
+        // Wait outside Underway's transaction: a blocking advisory-lock wait
+        // inside it can retain a snapshot needed by a concurrent index build.
+        acquire_migration_lock(&mut conn, "underway").await?;
+        underway::run_migrations(&mut conn).await.context("underway: applying migrations")
+    }
+    .await;
     let _ = conn.close().await;
-    result.context("underway: applying migrations")?;
+    result?;
     info!(target = "underway", "migrations applied");
     underway_extensions_at_startup(MigrationsMode::Run, pool).await
 }
