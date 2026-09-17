@@ -4277,6 +4277,7 @@ impl Application {
         // `outbound_request` middleware, so onwards needs no BodyTransformFn.
         let mut onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
+            .with_upstream_rate_limit_message(config.onwards.upstream_rate_limit_message.clone())
             .with_response_id_header("x-fusillade-request-id")
             .with_body_limit(onwards_body_limit)
             // The fusillade daemon stamps every request it dispatches (file
