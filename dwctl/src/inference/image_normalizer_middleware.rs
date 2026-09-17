@@ -178,8 +178,13 @@ pub async fn image_normalizer_middleware(
     let attribution_for_access = caller_lookup.as_ref().ok().copied().flatten().map(|c| c.attribution);
 
     let normalizer = state.normalizer.clone();
-    let realtime_ttl = state.realtime_ttl;
-    let token_ttl = state.token_ttl;
+    // Every signed URL this request produces — a signed token, or a freshly
+    // ingested image — gets the same TTL: a daemon loopback must outlive one
+    // full processing attempt; a client request is realtime. (Synced records
+    // keep their raw image URLs until dispatch, so the ingest path sees daemon
+    // traffic too.)
+    let is_daemon_dispatch = caller_lookup.ok().flatten().is_some_and(|c| c.is_daemon_dispatch);
+    let sign_ttl = if is_daemon_dispatch { state.token_ttl } else { state.realtime_ttl };
     let pool_for_access = state.pool.clone();
     let substitute = move |url: String| {
         let normalizer = normalizer.clone();
@@ -217,8 +222,7 @@ pub async fn image_normalizer_middleware(
                 }
                 // The bearer only decides the TTL: a dispatch must outlive one
                 // full processing attempt; a client request is realtime.
-                let ttl = if caller.is_daemon_dispatch { token_ttl } else { realtime_ttl };
-                let signed = normalizer.sign(token, ttl).await?;
+                let signed = normalizer.sign(token, sign_ttl).await?;
                 return Ok::<String, NormalizeError>(signed.url);
             }
             // Pass through URLs that already point at our own normalised
@@ -234,7 +238,10 @@ pub async fn image_normalizer_middleware(
                 ImageInput::HttpUrl(url)
             };
             let ingested = normalizer.ingest(input).await?;
-            let signed = normalizer.sign(ingested.token, realtime_ttl).await?;
+            // Same TTL rule as for tokens: a daemon loopback (a synced record
+            // keeps its raw image URLs until dispatch) must outlive one full
+            // processing attempt; a client request is realtime.
+            let signed = normalizer.sign(ingested.token, sign_ttl).await?;
             // Best-effort image_access bookkeeping: fire-and-forget so
             // the realtime request path isn't blocked. Records real
             // (mime, bytes_len) captured from the ingest result rather
@@ -817,6 +824,33 @@ mod tests {
 
         assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert_eq!(body["error"]["code"], "image_token_forbidden");
+    }
+
+    /// A synced record keeps its raw image until dispatch, so the daemon's
+    /// loopback reaches the ingest path too: the URL it produces must also
+    /// outlive a full processing attempt (dispatch TTL), not a realtime one.
+    #[sqlx::test]
+    async fn a_daemon_dispatch_ingesting_a_raw_image_signs_it_with_the_dispatch_ttl(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::create_test_user;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let batch_key = hidden_batch_key_for(&pool, user.id).await;
+        let state = state_with_pool(&pool);
+        let body = json!({
+            "model": "vision",
+            "messages": [{ "role": "user", "content": [
+                { "type": "text", "text": "what is this?" },
+                { "type": "image_url", "image_url": { "url": TINY_PNG_DATA_URI } }
+            ]}]
+        });
+
+        let (status, echoed) = post_json_as(build_router(state), Some(&batch_key), body).await;
+
+        assert_eq!(status, StatusCode::OK, "{echoed}");
+        let (url, ttl) = signed_url_and_ttl(&echoed);
+        assert!(url.starts_with("http://test.local/dw-img/"), "{url}");
+        assert!((1800 - 60..=1800).contains(&ttl), "dispatch TTL expected, got {ttl}s");
     }
 
     /// A client re-sending a request it downloaded: its own token is signed,

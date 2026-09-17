@@ -22,6 +22,16 @@ CREATE TABLE IF NOT EXISTS image_access_org_grants (
     PRIMARY KEY (organization_id, sha256)
 );
 
+-- Carry every existing organization grant across, so the first post-upgrade
+-- submission of an image under a second organization (which still overwrites
+-- the legacy column) cannot cost the first organization its access. Reads
+-- `image_access` under a share lock only; writes go to the new table.
+INSERT INTO image_access_org_grants (organization_id, sha256, granted_by, first_seen_at, last_seen_at)
+SELECT organization_id, sha256, user_id, first_seen_at, last_seen_at
+FROM image_access
+WHERE organization_id IS NOT NULL
+ON CONFLICT (organization_id, sha256) DO NOTHING;
+
 -- Supports the "who else references this hash" lookups alongside
 -- idx_image_access_sha256.
 CREATE INDEX IF NOT EXISTS idx_image_access_org_grants_sha256
