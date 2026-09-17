@@ -512,6 +512,11 @@ openapi:
 # Onwards AI proxy configuration
 # Controls behavior of the onwards routing layer for AI proxy requests
 onwards:
+  # Maximum pending bytes of an unfinished SSE event; complete events are forwarded first.
+  # Increase for providers with large tool-call events. This is not a response-length limit.
+  # Exceeding it fails the response body stream. Zero permits no unfinished bytes.
+  # Set via environment: DWCTL_ONWARDS__SSE_BUFFER_LIMIT=1048576
+  sse_buffer_limit: 65536
   # Enable strict mode with schema validation and typed handlers.
   # When false (default), all requests are passed through transparently.
   # When true, only known OpenAI API paths are accepted and validated.

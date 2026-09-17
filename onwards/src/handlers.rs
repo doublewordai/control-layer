@@ -1347,7 +1347,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 // This changes neither framing nor buffering and owns the attempt
                 // until response completion/cancellation (an unknown outcome).
                 let mut stream_observation = observation.clone();
-                let mut events = SseBufferedStream::new(body.into_data_stream()).inspect(move |event| {
+                let mut events = SseBufferedStream::with_limit(body.into_data_stream(), state.sse_buffer_limit).inspect(move |event| {
                     if stream_observation.is_none() { return; }
                     let kind = match event {
                         Ok(bytes) if bytes.ends_with(b"\n\n") => classify_sse_event(bytes),
@@ -1604,7 +1604,7 @@ pub async fn target_message_handler<T: HttpClient>(
             debug!("Wrapping SSE response with buffered stream for non-strict sanitization");
             let (parts, body) = response.into_parts();
             let byte_stream = body.into_data_stream();
-            let buffered = SseBufferedStream::new(byte_stream);
+            let buffered = SseBufferedStream::with_limit(byte_stream, state.sse_buffer_limit);
             let new_body = axum::body::Body::from_stream(buffered);
             response = Response::from_parts(parts, new_body);
         }
@@ -2778,6 +2778,7 @@ mod tests {
             upstream_rate_limit_message: None,
             response_id_header: None,
             body_limit: crate::DEFAULT_BODY_LIMIT,
+            sse_buffer_limit: crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
         };
