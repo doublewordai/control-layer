@@ -18,6 +18,27 @@ dashboard_url: "http://localhost:5173"
 # Email address where support requests are sent
 # support_email: "support@doubleword.ai"
 
+# Schema migrations
+#
+# `dwctl migrate` applies every pending migration (main, fusillade, underway,
+# and outlet when request logging is enabled) and exits; it repairs
+# interrupted concurrent index builds first and verifies the result. Run it
+# from a pre-rollout Job with the release image, or by hand against a local
+# database.
+#
+# `migrations.mode` decides what the serving process does at startup:
+#   run   - apply pending migrations before serving (default; local
+#           development and single-instance installs)
+#   check - never execute DDL. Verify the database carries every migration
+#           this binary ships with matching checksums and refuse to start
+#           otherwise. A database that is AHEAD of the binary is accepted, so
+#           replicas of the previous release keep serving while the next
+#           release's migrations are applied before its rollout.
+# Deployments that run the migration Job set `check` on the application pods
+# (DWCTL_MIGRATIONS__MODE=check).
+migrations:
+  mode: run
+
 # Database configuration
 database:
   # Configure connectivity to an external postgres database here

@@ -41,6 +41,15 @@ pub struct ClassifyRequest<'a> {
     /// would resolve to nothing and silently classify the request as uncacheable. Supplying
     /// the principal directly keeps the scope the request actually used.
     pub principal: Option<crate::types::UserId>,
+    /// Whether the request's ROUTE carries the content blocks module breakpoints key on
+    /// (Chat Completions `messages`/`tools`). `false` for plain `/completions`: the router
+    /// forwards arbitrary JSON, so a completions body CAN carry chat-shaped fields — but the
+    /// completions engine reads only `prompt`, and module entries keyed on smuggled
+    /// `messages` would bill cache discounts for content that was never served. When false,
+    /// classification still resolves tariff eligibility (the active/inactive gate that drives
+    /// scrub-vs-inject and implicit passthrough) but short-circuits to zero breakpoints
+    /// before the body is ever parsed.
+    pub route_has_blocks: bool,
 }
 
 /// Version pair from tokenizer-svc `/v1/models`: the tokenizer hash the index has always
@@ -235,6 +244,16 @@ impl Classifier {
         let cfg = self.model_config.resolve(req.virtual_model).await?;
         if !cfg.enabled {
             return Ok(ClassifyOutcome::inactive());
+        }
+
+        // Route gate, deliberately BEFORE the parse: a blockless route (plain /completions)
+        // resolves eligibility like any other — active, uniform zeros, implicit passthrough
+        // stays available — but its body must never reach the chat parser, which would
+        // happily find breakpoints in chat-shaped fields the serving engine ignores (see
+        // `ClassifyRequest::route_has_blocks`).
+        if !req.route_has_blocks {
+            cache_metrics::record_skip("blockless_route");
+            return Ok(ClassifyOutcome::zero_active());
         }
 
         // From here the model is cache-enabled: any bail is `zero_active`.
@@ -1087,7 +1106,36 @@ mod tests {
             body,
             api_key: Some(secret),
             principal: None,
+            route_has_blocks: true,
         }
+    }
+
+    #[sqlx::test]
+    async fn blockless_route_never_reaches_the_chat_parser(pool: PgPool) {
+        // A plain /completions body can smuggle chat-shaped marked `messages` past the
+        // router; the completions engine ignores them, so module entries keyed on them
+        // would discount content that was never served. The route gate must stop this
+        // while still resolving tariff eligibility.
+        let h = harness(&pool, true, 1500, 1024).await;
+        let b = body();
+
+        let gated = h
+            .classifier
+            .classify(ClassifyRequest {
+                route_has_blocks: false,
+                ..req(&h.secret, &b)
+            })
+            .await
+            .unwrap();
+        assert!(gated.active, "tariff eligibility still resolves on a blockless route");
+        assert!(gated.stats.is_zero(), "no module read/creation from chat-shaped fields");
+        assert!(gated.pending.is_empty(), "no module entries created");
+        assert!(!gated.degraded, "a deterministic property of the route, not an outage");
+
+        // Control: the same body on a chat route DOES produce a module write — the route
+        // gate is the only thing standing between chat-shaped fields and the index.
+        let ungated = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        assert!(!ungated.pending.is_empty(), "control: chat route writes for this body");
     }
 
     /// An unreachable tokenizer degrades to the same uniform zeros the wire always shows,
