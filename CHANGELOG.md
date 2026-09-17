@@ -1,5 +1,19 @@
 # Changelog
 
+## [11.15.0](https://github.com/doublewordai/control-layer/compare/v11.14.0...v11.15.0) (2026-09-17)
+
+
+### Features
+
+* run schema migrations from `dwctl migrate` and check compatibility at startup ([#1756](https://github.com/doublewordai/control-layer/issues/1756)) ([38ac719](https://github.com/doublewordai/control-layer/commit/38ac71914ea151205cbf631ecbbf29ccd95ffbc0))
+
+
+### Bug Fixes
+
+* cover /completions with the cache layer (implicit billing + prov… ([#1796](https://github.com/doublewordai/control-layer/issues/1796)) ([4699d2b](https://github.com/doublewordai/control-layer/commit/4699d2b96c3aa7268eccb484ca6a425c6a61bec2))
+* **fusillade:** write terminal realtime responses directly to retained storage ([#1797](https://github.com/doublewordai/control-layer/issues/1797)) ([1e2adec](https://github.com/doublewordai/control-layer/commit/1e2adec40985a7ffc33b184278b59254326bdd3e))
+* **responses:** validate stateful requests and include projections ([#1480](https://github.com/doublewordai/control-layer/issues/1480)) ([c91f33b](https://github.com/doublewordai/control-layer/commit/c91f33b3b2b229c83c6144a7d1b431a1f371ea9b))
+
 ## [11.14.0](https://github.com/doublewordai/control-layer/compare/v11.13.0...v11.14.0) (2026-09-17)
 
 
