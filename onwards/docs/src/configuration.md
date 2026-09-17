@@ -212,3 +212,22 @@ Non-strict gateways forward provider-native reasoning fields such as
 gateway to receive requests already translated by a public gateway. Strict
 mode rejects these fields in favor of canonical reasoning controls. Configured
 `reasoning_effort` translations still apply in either mode.
+
+## Streaming response buffering
+
+Onwards forwards complete SSE events before checking the unfinished remainder.
+A single network chunk can contain many complete events and is not subject to a
+64 KiB aggregate limit. The default limit on an unfinished event is 65,536 bytes;
+it is not a total response or token limit. Increase it for providers that emit
+large fragmented tool-call events. Zero permits no unfinished bytes.
+
+- Standalone: `--sse-buffer-limit 1048576` or `ONWARDS_SSE_BUFFER_LIMIT=1048576`.
+- Embedded library: `AppState::with_sse_buffer_limit(1048576)`.
+- Control layer: `onwards.sse_buffer_limit: 1048576` in `config.yaml`, or
+  `DWCTL_ONWARDS__SSE_BUFFER_LIMIT=1048576`.
+
+The limit applies wherever Onwards buffers SSE, including strict response
+sanitization, its leading-event inspection, and non-strict sanitization. Exceeding
+it produces a response-body error and drops the upstream stream, rather than
+reporting a clean end of stream. Once HTTP headers have been sent, this cannot
+change the HTTP status or transparently retry already forwarded output.

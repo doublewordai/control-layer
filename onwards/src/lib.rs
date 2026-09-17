@@ -151,6 +151,8 @@ pub struct AppState<T: HttpClient> {
     /// `DefaultBodyLimit`, which rejects large (e.g. long-context or base64
     /// image) payloads with a 413. Defaults to [`DEFAULT_BODY_LIMIT`].
     pub body_limit: usize,
+    /// Maximum buffered bytes of an unfinished SSE event. Complete events are forwarded first.
+    pub sse_buffer_limit: usize,
     /// Proxy-wide default for
     /// [`FallbackConfig::first_token_timeout_ms`](target::FallbackConfig::first_token_timeout_ms),
     /// applied to every pool with fallback enabled that doesn't set its own.
@@ -184,6 +186,7 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
             )
             .field("response_id_header", &self.response_id_header)
             .field("body_limit", &self.body_limit)
+            .field("sse_buffer_limit", &self.sse_buffer_limit)
             .field("first_token_timeout", &self.first_token_timeout)
             .field(
                 "first_token_timeout_exempt_header",
@@ -210,6 +213,7 @@ impl AppState<HyperClient> {
             upstream_rate_limit_message: None,
             response_id_header: None,
             body_limit: DEFAULT_BODY_LIMIT,
+            sse_buffer_limit: sse::DEFAULT_SSE_BUFFER_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
         }
@@ -226,6 +230,7 @@ impl<T: HttpClient> AppState<T> {
             upstream_rate_limit_message: None,
             response_id_header: None,
             body_limit: DEFAULT_BODY_LIMIT,
+            sse_buffer_limit: sse::DEFAULT_SSE_BUFFER_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
         }
@@ -260,6 +265,13 @@ impl<T: HttpClient> AppState<T> {
     /// Set the response transformation function (builder pattern)
     pub fn with_response_transform(mut self, transform_fn: ResponseTransformFn) -> Self {
         self.response_transform_fn = Some(transform_fn);
+        self
+    }
+
+    /// Set the maximum unfinished SSE event size in bytes.
+    /// This is neither a total response limit nor a limit on coalesced complete events.
+    pub fn with_sse_buffer_limit(mut self, limit: usize) -> Self {
+        self.sse_buffer_limit = limit;
         self
     }
 

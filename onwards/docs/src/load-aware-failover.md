@@ -25,8 +25,13 @@ Existing eligible pools immediately use these defaults without a database backfi
 }
 ```
 
-The default 10-second budget matches the application's default first-token
-failover deadline. Controllers and sample minima are per process, not aggregated
+The default 10-second latency budget and dwctl's default 20-second first-token
+failover deadline are separate thresholds. An attempt whose first frame arrives
+between them keeps streaming from the preferred provider and is recorded as a
+breach; only an attempt with no first frame by the deadline is cut off and fails
+over. Breaches lower the share once the window's breach rate exceeds the target,
+so sustained slowness shifts later requests to the alternates without cutting
+slow attempts off. Controllers and sample minima are per process, not aggregated
 across replicas. With the defaults:
 
 - **Decrease** the share by 20% when more than 10% of the window's completed
