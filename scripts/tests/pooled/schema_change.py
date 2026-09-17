@@ -113,9 +113,13 @@ def verify_models_schema_change(app, direct):
 
     def aimd_settings():
         alias = "schema-aimd-" + uuid.uuid4().hex
+        # Every member is explicit: responses carry the full config, including
+        # defaults for members a request omits.
         settings = {"enabled": True, "latency_budget_ms": 100, "breach_rate_target": 0.1,
-                    "window_samples": 20, "min_samples": 5, "share_step": 0.05,
-                    "share_decay": 0.5, "share_floor": 0.1, "dwell_ms": 1000}
+                    "recovery_breach_rate": 0.03, "window_samples": 20, "min_samples": 5,
+                    "share_step": 0.05, "share_decay": 0.5, "share_floor": 0.1,
+                    "dwell_ms": 1000, "idle_recovery_ms": 300000,
+                    "overload_statuses": [429, 503, 529]}
         response = session.post(base + "/admin/api/v1/models", json={
             "type": "composite", "model_name": alias, "alias": alias,
             "lb_strategy": "priority", "fallback_enabled": True,
