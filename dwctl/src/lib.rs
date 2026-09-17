@@ -4055,6 +4055,15 @@ impl Application {
             fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
         )
         .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
+        .with_realtime_retention_seconds(
+            config
+                .background_services
+                .batch_daemon
+                .retention
+                .batchless_seconds_by_service_tier
+                .get("priority")
+                .copied(),
+        )
         .with_retained_response_retention_bounds_seconds(
             config
                 .background_services
