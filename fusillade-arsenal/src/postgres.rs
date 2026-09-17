@@ -146,6 +146,7 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
     retained_response_fence_seconds: Option<u64>,
+    realtime_retention_seconds: Option<u64>,
     /// (min, max) batchless retention seconds across configured tiers, from
     /// [`fusillade_core::RetentionPolicy::batchless_retention_bounds_seconds`].
     /// Lets the trailing-demand query prune retained partitions that cannot
@@ -385,6 +386,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             pools,
             config,
             retained_response_fence_seconds: None,
+            realtime_retention_seconds: None,
             retained_response_retention_bounds_seconds: None,
             template_generation_writes_enabled: false,
             partition_maintenance_pool: None,
@@ -461,6 +463,14 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// retained-response lifecycle paths must pass their explicit policy.
     pub fn with_retained_response_fence_seconds(mut self, seconds: Option<u64>) -> Self {
         self.retained_response_fence_seconds = seconds;
+        self
+    }
+
+    /// Persist new terminal realtime records directly into retained partitions.
+    /// Pass the priority tier's retention duration; `None` preserves live storage
+    /// for installations without an automatic realtime retention policy.
+    pub fn with_realtime_retention_seconds(mut self, seconds: Option<u64>) -> Self {
+        self.realtime_retention_seconds = seconds;
         self
     }
 
@@ -6504,21 +6514,33 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .map_err(|_| FusilladeError::Other(anyhow!("Failed to classify existing requests")))?
         .into_iter()
         .collect();
-        // Non-background realtime: no row existed yet. Synthesize a template
-        // + a request row directly in 'completed' state. The two INSERTs run
-        // in the same transaction; commit happens once at the end.
-        //
-        // ON CONFLICT (id) DO NOTHING on the request INSERT handles the rare
-        // case where a row appeared in a terminal state between our UPDATE
-        // and INSERT (duplicate enqueues, late completions for flex
-        // slip-through). Unused templates are removed below before commit.
-        let to_insert: Vec<&PersistCompletedRealtimeInput> = writable
+        // Non-background realtime has no live row. With a priority retention
+        // policy and an active destination partition, write its final retained
+        // representation now. The legacy live insert remains the fallback for
+        // unconfigured retention or unavailable partitions; it is later moved
+        // by the existing archive worker.
+        let mut to_insert: Vec<&PersistCompletedRealtimeInput> = writable
             .iter()
             .copied()
             .filter(|r| {
                 !updated_set.contains(&r.request_id) && !existing_ids.contains(&r.request_id)
             })
             .collect();
+
+        let mut retained_count = 0;
+        let mut retained_fallback_count = 0;
+        if let Some(retention_seconds) = self.realtime_retention_seconds {
+            let retained_ids = retained_response::insert_completed_realtime(
+                &mut tx,
+                &to_insert,
+                retention_seconds,
+                self.retained_response_fence_seconds,
+            )
+            .await?;
+            retained_count = retained_ids.len() as u64;
+            to_insert.retain(|record| !retained_ids.contains(&record.request_id));
+            retained_fallback_count = to_insert.len() as u64;
+        }
 
         if !to_insert.is_empty() {
             let template_ids: Vec<Uuid> = (0..to_insert.len()).map(|_| Uuid::new_v4()).collect();
@@ -6681,6 +6703,14 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         tx.commit()
             .await
             .map_err(|_| FusilladeError::Other(anyhow!("Failed to finish response write")))?;
+
+        if retained_count > 0 {
+            metrics::counter!("fusillade_realtime_retained_total").increment(retained_count);
+        }
+        if retained_fallback_count > 0 {
+            metrics::counter!("fusillade_realtime_retained_fallback_total")
+                .increment(retained_fallback_count);
+        }
 
         Ok(())
     }
