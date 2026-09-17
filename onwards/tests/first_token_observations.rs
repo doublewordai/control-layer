@@ -707,6 +707,10 @@ struct ScriptedClient {
 
 impl ScriptedClient {
     fn new(preferred: Vec<(StatusCode, Duration)>) -> Self {
+        assert!(
+            !preferred.is_empty(),
+            "the preferred provider needs at least one scripted response"
+        );
         Self {
             preferred: std::sync::Arc::new(preferred),
             calls: Default::default(),

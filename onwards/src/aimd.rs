@@ -215,8 +215,10 @@ impl Controller {
     }
 
     /// Resume a parked controller. The share is kept (and idle recovery
-    /// credits the time spent parked), but samples and in-flight attempts from
-    /// before parking are discarded. Returns whether the controller resumed.
+    /// credits the time spent parked), but samples from before parking are
+    /// discarded and attempts begun before it no longer count as outcomes; they
+    /// still leave `in_flight` as they finish or drop. Returns whether the
+    /// controller resumed.
     pub(crate) fn resume(&mut self) -> bool {
         if self.state != State::Parked {
             return false;
@@ -226,6 +228,7 @@ impl Controller {
         self.window.clear();
         self.breaches = 0;
         self.healthy_since = None;
+        self.publish();
         true
     }
 
