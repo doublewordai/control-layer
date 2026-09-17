@@ -212,10 +212,24 @@ Single-provider configs still work unchanged:
 
 ## Load-aware priority share
 
-Priority pools with enabled fallback and multiple providers automatically decrease their preferred-first
-share when first-frame budget breaches exceed a configured rate, and increase
-it gradually after healthy observations. Set `fallback.aimd.enabled: false` to
-opt out, or override the default parameters. The controller applies
-only to eligible strict-mode streams. It preserves the preferred provider in
-subsequent failover attempts. See [load-aware failover](load-aware-failover.md)
-for configuration, eligibility, sampling limits, reload behavior and rollout.
+Priority pools with enabled fallback and multiple providers automatically adjust
+the share of requests that try the preferred provider first. The share decreases
+when the preferred provider's breach rate — first frames later than the budget,
+plus overload statuses such as 429, 503 and 529 — rises above a target, holds
+inside a hysteresis band, and recovers in steps once the rate stays low or the
+pool has too few samples to judge. A pool that temporarily drops to one provider
+keeps its controller and resumes it when the preferred provider returns. Set
+`fallback.aimd.enabled: false` to opt out, or override the default parameters.
+The controller applies only to eligible strict-mode streams, and it preserves the
+preferred provider in subsequent failover attempts. See
+[load-aware failover](load-aware-failover.md) for configuration, eligibility,
+sampling limits, reload behavior and rollout.
+
+### Realtime-only failover statuses
+
+`AppState::with_realtime_fallback_statuses` adds statuses that fail a request over
+to the next provider only when the request is realtime — it lacks the header set
+with `AppState::with_first_token_timeout_exempt_header` — in any pool with
+fallback enabled, on top of `fallback.on_status`. Use it for a provider's
+over-capacity status: realtime callers are rerouted, while dispatched traffic that
+runs its own retries receives the upstream response.
