@@ -41,9 +41,17 @@ Use `*add_batch_owner_page_index*` and `*validate_batch_owner_page_index*` in
   states, plus rejection of invalid and wrong-definition indexes. Executing
   the files only through psql misses SQLx transaction and bookkeeping behavior.
 
-For populated deployments, prebuild the concurrent file separately on a direct
-connection in autocommit mode with the intended database/search path. Run the
-validation/comment file, then ANALYZE the affected table before deploying dependent
-queries. Startup SQLx migrations skip the existing build, validate it again, and
-record it normally; do not manually mark the prebuild as applied. If validation
-fails, inspect and repair the specific index before proceeding.
+Migrations are applied by `dwctl migrate` (a pre-rollout Job in deployments,
+startup in local development); see `docs/migrations.md` for the runner and for
+the recoverable sequence for concurrent builds: create, then a separate
+`-- no-transaction` `REINDEX INDEX CONCURRENTLY` file, then the validation and
+comment file, with numbering room between them. The reindex step turns an
+interrupted build's INVALID index into a valid one on the next run, so no repair
+lives outside the migration files.
+
+For populated deployments that must prebuild, run the concurrent file separately
+on a direct connection in autocommit mode with the intended database/search
+path, then the validation/comment file, then ANALYZE the affected table before
+deploying dependent queries. The runner skips the existing build, validates it
+again, and records it normally; do not manually mark the prebuild as applied. If
+validation fails, inspect and repair the specific index before proceeding.
