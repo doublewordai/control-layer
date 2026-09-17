@@ -202,8 +202,8 @@ struct DeployedModel {
     // Catalog metadata
     pub metadata: serde_json::Value,
     pub provisioning_source: Option<String>,
-    /// Elevated serving classes this model has activated (subset of interactive, throughput).
-    pub serving_classes: Vec<String>,
+    /// Serving classes this model offers, keyed by class name, each a preset of targets.
+    pub serving_classes: serde_json::Value,
 }
 
 pub struct Deployments<'c> {

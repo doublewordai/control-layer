@@ -98,8 +98,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     }
 
     // Read and parse the request body
-    let (mut parts, body) = req.into_parts();
-    strip_serving_envelope_headers(&mut parts.headers);
+    let (parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -123,7 +122,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // extension fields and a legitimate `previous_response_id` are left intact.
     scrub_request_id_fields(&mut request_value);
 
-    let scrubbed_pool_field = strip_scheduling_priority(&mut request_value);
+    let scrubbed_router_targets = strip_scheduling_priority(&mut request_value);
 
     // A serving-class suffix (`alias:interactive`) is a request for a class,
     // not part of the model's identity: strip it here, at the outermost layer,
@@ -145,8 +144,8 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
 
     // The realtime path forwards `body_bytes` verbatim; a stripped suffix (or
-    // a scrubbed pool field) must not survive in them.
-    let body_bytes = if requested_class.is_some() || scrubbed_pool_field {
+    // scrubbed router targets) must not survive in them.
+    let body_bytes = if requested_class.is_some() || scrubbed_router_targets {
         bytes::Bytes::from(request_value.to_string())
     } else {
         body_bytes
@@ -1312,11 +1311,12 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) {
 /// dwctl reachable without traversing that proxy would let a client set the
 /// header and skip this strip. Defense-in-depth here depends on that perimeter.
 ///
-/// Returns whether the typed pool selector (`nvext.interactivity_pool`) was
-/// removed: unlike `priority`, that field is not in onwards' strict schema, so
-/// the caller must re-serialise the body for it to actually be gone.
+/// Returns whether the serving router targets (`nvext.router.{ttft_target,
+/// itl_target}`) were removed: unlike `priority`, those fields are not in
+/// onwards' strict schema, so the caller must re-serialise the body for them
+/// to actually be gone.
 fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
-    let mut scrubbed_pool_field = false;
+    let mut scrubbed_router_targets = false;
     if let Some(obj) = value.as_object_mut() {
         obj.remove("priority");
         // The carrier the dynamo frontend ACTUALLY honours is
@@ -1325,25 +1325,15 @@ fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
         // cannot steer the scheduler through the vendor extension, while the
         // rest of a caller's `nvext` (e.g. cache_control) passes through.
         if let Some(nvext) = obj.get_mut("nvext").and_then(|n| n.as_object_mut()) {
-            // The serving-class pool selector is ours to set (onwards stamps
-            // it as a header after resolution), never the caller's.
-            scrubbed_pool_field = nvext.remove(onwards::serving::NVEXT_POOL_FIELD).is_some();
+            // The serving targets are the resolver's to set (onwards writes
+            // them after resolution), never the caller's.
+            scrubbed_router_targets = onwards::serving::scrub_router_targets(nvext);
             if let Some(hints) = nvext.get_mut("agent_hints").and_then(|h| h.as_object_mut()) {
                 hints.remove("priority");
             }
         }
     }
-    scrubbed_pool_field
-}
-
-/// Remove the serving-class envelope headers a caller may have sent. Only
-/// onwards' resolver sets them, on the member that understands them; anything
-/// inbound is an attempt to steer the serving stack directly. Same perimeter
-/// argument as [`strip_scheduling_priority`]: internal legs (fusillade,
-/// continuation) never pass through here and keep what they carry.
-fn strip_serving_envelope_headers(headers: &mut axum::http::HeaderMap) {
-    headers.remove(onwards::serving::POOL_TAG_HEADER);
-    headers.remove(onwards::serving::PRIORITY_HEADER);
+    scrubbed_router_targets
 }
 
 /// Strip a serving-class suffix (`alias:class`) from the request's `model`,
@@ -1421,25 +1411,13 @@ mod tests {
     }
 
     #[test]
-    fn serving_envelope_headers_are_removed_from_external_requests() {
-        let mut headers = axum::http::HeaderMap::new();
-        headers.insert(onwards::serving::POOL_TAG_HEADER, "interactive".parse().unwrap());
-        headers.insert(onwards::serving::PRIORITY_HEADER, "999".parse().unwrap());
-        headers.insert("x-custom", "keep".parse().unwrap());
-        strip_serving_envelope_headers(&mut headers);
-        assert!(!headers.contains_key(onwards::serving::POOL_TAG_HEADER));
-        assert!(!headers.contains_key(onwards::serving::PRIORITY_HEADER));
-        assert_eq!(headers.get("x-custom").unwrap(), "keep");
-    }
-
-    #[test]
-    fn strip_scheduling_priority_also_scrubs_the_pool_selector() {
+    fn strip_scheduling_priority_also_scrubs_the_router_targets() {
         let mut body = serde_json::json!({
             "model": "m",
-            "nvext": {"interactivity_pool": "interactive", "cache_control": {"enabled": true}, "agent_hints": {"priority": 5}}
+            "nvext": {"router": {"ttft_target": 1, "itl_target": 1}, "cache_control": {"enabled": true}, "agent_hints": {"priority": 5}}
         });
-        assert!(strip_scheduling_priority(&mut body), "the pool field was present and removed");
-        assert!(body["nvext"].get("interactivity_pool").is_none());
+        assert!(strip_scheduling_priority(&mut body), "the targets were present and removed");
+        assert!(body["nvext"].get("router").is_none());
         assert!(body["nvext"]["agent_hints"].get("priority").is_none());
         assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
 

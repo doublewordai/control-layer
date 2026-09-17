@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
-use crate::model_provisioning::ServingClassName;
+use crate::model_provisioning::{ServingClassName, ServingPreset};
 
 /// Prefix of the `provisioning_source` marker on rows this catalog owns.
 const SOURCE_PREFIX: &str = "org-overlays:";
@@ -61,8 +61,14 @@ pub struct OrgModelOverlay {
     pub alias: String,
     /// Overrides the account's default serving class on this model. Applies
     /// only where the organisation holds the class and the model offers it.
+    /// Mutually exclusive with `targets`.
     #[serde(default)]
     pub default_class: Option<ServingClassName>,
+    /// Explicit targets for a bespoke deal on this model, sent as-is whenever
+    /// a request names no class. Writing them here is the authority to use
+    /// them: no class grant is checked. Mutually exclusive with `default_class`.
+    #[serde(default)]
+    pub targets: Option<ServingPreset>,
     /// Overrides the account's `self_hosted_only` setting on this model.
     #[serde(default)]
     pub self_hosted_only: Option<bool>,
@@ -117,10 +123,18 @@ impl OrgCatalog {
                     model.alias
                 );
                 ensure!(
-                    model.default_class.is_some() || model.self_hosted_only.is_some(),
+                    model.default_class.is_some() || model.targets.is_some() || model.self_hosted_only.is_some(),
                     "{source}: overlay for model {:?} overrides nothing",
                     model.alias
                 );
+                ensure!(
+                    model.default_class.is_none() || model.targets.is_none(),
+                    "{source}: overlay for model {:?} sets both default_class and targets; use one",
+                    model.alias
+                );
+                if let Some(targets) = &model.targets {
+                    targets.validate(&format!("{source}: overlay targets for model {:?}", model.alias))?;
+                }
             }
         }
         Ok(())
@@ -151,20 +165,23 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
             let model_id = aliases[&model.alias];
             desired.push((org_id, model_id));
             sqlx::query(
-                r#"INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, self_hosted_only, provisioning_source)
-                   VALUES ($1, $2, $3, $4, $5)
+                r#"INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, targets, self_hosted_only, provisioning_source)
+                   VALUES ($1, $2, $3, $4, $5, $6)
                    ON CONFLICT (user_id, deployed_model_id) DO UPDATE SET
                        default_serving_class = EXCLUDED.default_serving_class,
+                       targets = EXCLUDED.targets,
                        self_hosted_only = EXCLUDED.self_hosted_only,
                        provisioning_source = EXCLUDED.provisioning_source,
                        updated_at = NOW()
                    WHERE model_overlays.default_serving_class IS DISTINCT FROM EXCLUDED.default_serving_class
+                      OR model_overlays.targets IS DISTINCT FROM EXCLUDED.targets
                       OR model_overlays.self_hosted_only IS DISTINCT FROM EXCLUDED.self_hosted_only
                       OR model_overlays.provisioning_source IS DISTINCT FROM EXCLUDED.provisioning_source"#,
             )
             .bind(org_id)
             .bind(model_id)
             .bind(model.default_class.map(|class| class.as_db_str()))
+            .bind(model.targets.map(|targets| serde_json::to_value(targets)).transpose().context("serialize overlay targets")?)
             .bind(model.self_hosted_only)
             .bind(&source)
             .execute(&mut *db)
@@ -300,10 +317,39 @@ mod tests {
         );
         assert!(OrgCatalog::load(directory.path()).is_err(), "unknown fields are rejected");
 
-        fs::remove_file(directory.path().join("acme2.yaml")).unwrap();
+        // A class default and explicit targets are two ways of saying what a
+        // request asks for; one entry says one thing.
+        write(
+            directory.path(),
+            "acme2.yaml",
+            "org: other\nmodels:\n  - alias: m\n    default_class: throughput\n    targets: {ttft_ms: 800, itl_ms: 30}\n",
+        );
+        let err = OrgCatalog::load(directory.path()).unwrap_err().to_string();
+        assert!(err.contains("both default_class and targets"), "{err}");
+        write(
+            directory.path(),
+            "acme2.yaml",
+            "org: other\nmodels:\n  - alias: m\n    targets: {ttft_ms: 800, itl_ms: 0}\n",
+        );
+        let err = OrgCatalog::load(directory.path()).unwrap_err().to_string();
+        assert!(err.contains("itl_ms must be positive"), "{err}");
+
+        write(
+            directory.path(),
+            "acme2.yaml",
+            "org: other\nmodels:\n  - alias: m\n    targets: {ttft_ms: 800, itl_ms: 30, priority: 50}\n",
+        );
         let catalog = OrgCatalog::load(directory.path()).unwrap();
-        assert_eq!(catalog.orgs.len(), 1);
+        assert_eq!(catalog.orgs.len(), 2);
         assert_eq!(catalog.orgs[0].document.models[0].default_class, Some(ServingClassName::Throughput));
+        assert_eq!(
+            catalog.orgs[1].document.models[0].targets,
+            Some(ServingPreset {
+                ttft_ms: 800,
+                itl_ms: 30,
+                priority: 50
+            })
+        );
     }
 
     #[sqlx::test]
@@ -359,7 +405,7 @@ mod tests {
             "org: acme\nmodels:\n  - alias: org/model\n    default_class: throughput\n    self_hosted_only: true\n",
         );
         apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
-        let row = sqlx::query("SELECT default_serving_class, self_hosted_only, provisioning_source FROM model_overlays WHERE user_id = $1 AND deployed_model_id = $2")
+        let row = sqlx::query("SELECT default_serving_class, targets, self_hosted_only, provisioning_source FROM model_overlays WHERE user_id = $1 AND deployed_model_id = $2")
             .bind(org_id)
             .bind(model_id)
             .fetch_one(&pool)
@@ -369,11 +415,34 @@ mod tests {
             row.try_get::<Option<String>, _>("default_serving_class").unwrap().as_deref(),
             Some("throughput")
         );
+        assert_eq!(row.try_get::<Option<serde_json::Value>, _>("targets").unwrap(), None);
         assert_eq!(row.try_get::<Option<bool>, _>("self_hosted_only").unwrap(), Some(true));
         assert_eq!(
             row.try_get::<Option<String>, _>("provisioning_source").unwrap().as_deref(),
             Some("org-overlays:acme.yaml")
         );
+
+        // Switching the entry to explicit targets replaces the class default.
+        write(
+            directory.path(),
+            "acme.yaml",
+            "org: acme\nmodels:\n  - alias: org/model\n    targets: {ttft_ms: 800, itl_ms: 30}\n",
+        );
+        apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+        let row = sqlx::query(
+            "SELECT default_serving_class, targets, self_hosted_only FROM model_overlays WHERE user_id = $1 AND deployed_model_id = $2",
+        )
+        .bind(org_id)
+        .bind(model_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.try_get::<Option<String>, _>("default_serving_class").unwrap(), None);
+        assert_eq!(
+            row.try_get::<Option<serde_json::Value>, _>("targets").unwrap(),
+            Some(serde_json::json!({"ttft_ms": 800, "itl_ms": 30, "priority": 0}))
+        );
+        assert_eq!(row.try_get::<Option<bool>, _>("self_hosted_only").unwrap(), None);
 
         // A hand-written row for another org survives; the catalog's own row
         // goes when its entry is removed from the file.

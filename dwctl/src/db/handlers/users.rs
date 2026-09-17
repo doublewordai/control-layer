@@ -119,11 +119,11 @@ struct User {
     pub verified: bool,
     pub zero_data_retention: bool,
     pub invoicing_enabled: bool,
-    /// Account setting: elevated serving classes held (migration 146).
+    /// Account setting: elevated serving classes held (migration 147).
     pub granted_serving_classes: Vec<String>,
-    /// Account setting: default serving class (migration 146).
+    /// Account setting: default serving class (migration 147).
     pub default_serving_class: Option<String>,
-    /// Account setting: never fall over to an external provider (migration 146).
+    /// Account setting: never fall over to an external provider (migration 147).
     pub self_hosted_only: bool,
     /// Organizations only: admit signups from the claimed domain without
     /// review.

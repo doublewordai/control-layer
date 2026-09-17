@@ -15,9 +15,9 @@
 //! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
 use crate::aimd::AimdConfig;
 use crate::auth::KeySet;
-use crate::serving::{AccountServing, ProviderKind, ServingClass, ServingOverlay};
 use crate::load_balancer::{Provider, ProviderPool};
 use crate::reasoning::ReasoningTranslationConfig;
+use crate::serving::{AccountServing, ProviderKind, ServingOverlay, ServingPresets};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
@@ -421,10 +421,11 @@ pub struct PoolSpec {
     #[serde(default)]
     pub routing_rules: Vec<RoutingRule>,
 
-    /// Elevated serving classes this alias offers (see [`crate::serving`]).
-    /// Declared on the `default` pool: activation is a property of the alias.
+    /// The serving classes this alias offers, each a preset of targets (see
+    /// [`crate::serving`]). Declared on the `default` pool: activation is a
+    /// property of the alias.
     #[serde(default)]
-    pub serving_classes: Vec<ServingClass>,
+    pub serving_classes: ServingPresets,
 
     /// Per-account overrides on this alias, keyed by account id (the value of
     /// a key's `account` label). See [`crate::serving::ServingOverlay`].
@@ -551,7 +552,7 @@ pub struct PoolConfig {
     pub sanitize_response: bool,
     pub trusted: bool,
     pub routing_rules: Vec<RoutingRule>,
-    pub serving_classes: Vec<ServingClass>,
+    pub serving_classes: ServingPresets,
     pub overlays: HashMap<String, ServingOverlay>,
     pub providers: Vec<ProviderSpec>,
 }
@@ -714,7 +715,7 @@ impl TargetSpecOrList {
                     sanitize_response: false,
                     trusted,
                     routing_rules: Vec::new(),
-                    serving_classes: Vec::new(),
+                    serving_classes: ServingPresets::new(),
                     overlays: HashMap::new(),
                     providers,
                 })
@@ -755,7 +756,7 @@ impl TargetSpecOrList {
                     sanitize_response,
                     trusted,
                     routing_rules: Vec::new(),
-                    serving_classes: Vec::new(),
+                    serving_classes: ServingPresets::new(),
                     overlays: HashMap::new(),
                     providers: vec![provider],
                 })
@@ -1097,10 +1098,10 @@ impl TargetPools {
         self.default.evaluate_routing_rules(labels)
     }
 
-    /// The elevated serving classes this alias has activated. Declared on the
+    /// The serving classes this alias offers, with their presets. Declared on the
     /// default pool: activation is a property of the alias, not of which
     /// pool serves a request class.
-    pub fn active_serving_classes(&self) -> &[ServingClass] {
+    pub fn active_serving_classes(&self) -> &ServingPresets {
         self.default.serving_classes()
     }
 
@@ -2798,7 +2799,7 @@ mod tests {
                 accepts_scheduling_priority: false,
                 kind: Default::default(),
             }],
-            serving_classes: Vec::new(),
+            serving_classes: Default::default(),
             overlays: Default::default(),
         };
 

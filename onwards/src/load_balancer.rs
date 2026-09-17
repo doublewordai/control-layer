@@ -9,7 +9,7 @@
 
 use crate::aimd::{AimdConfig, Controller, Observation};
 use crate::auth::KeySet;
-use crate::serving::{ServingClass, ServingOverlay};
+use crate::serving::{ServingOverlay, ServingPresets};
 use crate::target::{
     ConcurrencyGuard, ConcurrencyLimiter, FallbackConfig, LoadBalanceStrategy, RateLimiter,
     RoutingAction, RoutingRule, Target,
@@ -81,7 +81,7 @@ pub struct ProviderPool {
     /// Routing rules evaluated against key labels before processing
     routing_rules: Vec<RoutingRule>,
     /// Elevated serving classes the alias offers (default pool only).
-    serving_classes: Vec<ServingClass>,
+    serving_classes: ServingPresets,
     /// Per-account overrides on this alias, keyed by account id.
     overlays: HashMap<String, ServingOverlay>,
 }
@@ -136,7 +136,7 @@ impl ProviderPool {
             parked: None,
             trusted: false,
             routing_rules: Vec::new(),
-            serving_classes: Vec::new(),
+            serving_classes: ServingPresets::new(),
             overlays: HashMap::new(),
         }
     }
@@ -167,21 +167,25 @@ impl ProviderPool {
             strategy,
             trusted,
             routing_rules,
-            serving_classes: Vec::new(),
+            serving_classes: ServingPresets::new(),
             overlays: HashMap::new(),
         }
     }
 
     /// Attach the alias's offered serving classes and per-account overlays
     /// (see [`crate::serving`]).
-    pub fn with_serving(mut self, serving_classes: Vec<ServingClass>, overlays: HashMap<String, ServingOverlay>) -> Self {
+    pub fn with_serving(
+        mut self,
+        serving_classes: ServingPresets,
+        overlays: HashMap<String, ServingOverlay>,
+    ) -> Self {
         self.serving_classes = serving_classes;
         self.overlays = overlays;
         self
     }
 
     /// Elevated serving classes the alias offers.
-    pub fn serving_classes(&self) -> &[ServingClass] {
+    pub fn serving_classes(&self) -> &ServingPresets {
         &self.serving_classes
     }
 

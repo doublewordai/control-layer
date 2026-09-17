@@ -116,7 +116,7 @@
       {
         "ordinal": 22,
         "name": "serving_classes",
-        "type_info": "TextArray"
+        "type_info": "Jsonb"
       }
     ],
     "parameters": {

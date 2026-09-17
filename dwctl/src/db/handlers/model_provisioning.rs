@@ -222,10 +222,10 @@ impl<'c> ModelProvisioning<'c> {
         let pricing = pricing_fields(provider_pricing)?;
         // Activation is the virtual model's; a physical deployment row is a
         // composite member and never activates classes of its own.
-        let serving_classes: Vec<&str> = if is_composite {
-            desired.clay.serving_classes.iter().map(|class| class.as_db_str()).collect()
+        let serving_classes = if is_composite {
+            serde_json::to_value(&desired.clay.serving_classes).context("serialize serving class presets")?
         } else {
-            Vec::new()
+            serde_json::json!({})
         };
         let fallback = &desired.clay.routing.fallback;
         let backoff_enabled = is_composite && fallback.backoff.is_some();

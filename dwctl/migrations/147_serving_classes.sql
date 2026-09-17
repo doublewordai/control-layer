@@ -9,30 +9,34 @@
 -- dynamo member as a pool tag and priority band.
 --
 -- Declared state, by where it lives:
---   * the model: which elevated classes it offers (`deployed_models.serving_classes`),
---     declared in the model catalog next to the model's pools;
+--   * the model: the classes it offers, each a PRESET of objective targets
+--     (`deployed_models.serving_classes`: class → {ttft_ms, itl_ms, priority}), declared
+--     in the model catalog once its pools exist. Onwards sends the resolved preset to
+--     the dynamo frontend as `nvext.router` targets, which the GlobalRouter maps to a
+--     pool;
 --   * the organisation, org-wide: ACCOUNT SETTINGS on the users row, next to
 --     zero_data_retention: the classes it holds, a default class, and "never
 --     fall over to an external provider". Operational settings, toggled in the
 --     console like ZDR;
 --   * the organisation, per model: an OVERLAY (`model_overlays`) — a per-model
---     override of the account default class or routing preference. Declared in
---     the per-organisation catalog files and materialised here;
+--     override of the account default class (or explicit targets for a bespoke
+--     deal, which imply authority) or of the routing preference. Declared in the
+--     per-organisation catalog files and materialised here;
 --   * the endpoint: what kind of server it is (`inference_endpoints.kind`), so
 --     the envelope is only ever sent to the dynamo frontend and a "no external
 --     provider" restriction knows which members are external.
 
 -- ---------------------------------------------------------------------------
--- The model: elevated classes it offers.
+-- The model: the classes it offers, as presets of targets.
 ALTER TABLE deployed_models
-    ADD COLUMN serving_classes TEXT[] NOT NULL DEFAULT '{}';
+    ADD COLUMN serving_classes JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 ALTER TABLE deployed_models
     ADD CONSTRAINT chk_deployed_models_serving_classes
-    CHECK (serving_classes <@ ARRAY['interactive', 'throughput']::text[]);
+    CHECK (jsonb_typeof(serving_classes) = 'object');
 
 COMMENT ON COLUMN deployed_models.serving_classes IS
-  'Elevated serving classes this model offers (subset of interactive, throughput), declared in the model catalog once its pools exist. Empty = standard only.';
+  'Serving classes this model offers, keyed by class name (interactive, throughput, optionally standard), each a preset {ttft_ms, itl_ms, priority} declared in the model catalog once its pools exist. Empty object = standard only.';
 
 -- ---------------------------------------------------------------------------
 -- Account settings: org-wide, every model the org calls. Same shape and sync
@@ -73,6 +77,10 @@ CREATE TABLE model_overlays (
     deployed_model_id UUID NOT NULL REFERENCES deployed_models(id) ON DELETE CASCADE,
     -- Overrides the account's default_serving_class on this model. NULL = inherit.
     default_serving_class TEXT,
+    -- Explicit targets {ttft_ms, itl_ms, priority} for a bespoke deal on this model,
+    -- taking precedence over any class preset. Writing them implies authority, so no
+    -- class grant is checked. Mutually exclusive with default_serving_class.
+    targets JSONB,
     -- Overrides the account's self_hosted_only on this model. NULL = inherit.
     self_hosted_only BOOLEAN,
     -- Set when the row is owned by the catalog (same marker format as
@@ -82,11 +90,15 @@ CREATE TABLE model_overlays (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT model_overlays_one_per_org_model UNIQUE (user_id, deployed_model_id),
     CONSTRAINT chk_model_overlays_default_serving_class
-        CHECK (default_serving_class IS NULL OR default_serving_class IN ('interactive', 'throughput'))
+        CHECK (default_serving_class IS NULL OR default_serving_class IN ('interactive', 'throughput')),
+    CONSTRAINT chk_model_overlays_targets
+        CHECK (targets IS NULL OR jsonb_typeof(targets) = 'object'),
+    CONSTRAINT chk_model_overlays_class_xor_targets
+        CHECK (default_serving_class IS NULL OR targets IS NULL)
 );
 
 COMMENT ON TABLE model_overlays IS
-  'One organisation''s per-model overrides of its account settings (default serving class, routing preference). Declared in the per-organisation catalog; applied by API-key owner, never addressed by name.';
+  'One organisation''s per-model overrides of its account settings (default serving class or explicit targets, routing preference). Declared in the per-organisation catalog; applied by API-key owner, never addressed by name.';
 
 CREATE INDEX idx_model_overlays_deployed_model_id ON model_overlays (deployed_model_id);
 

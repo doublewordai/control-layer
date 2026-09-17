@@ -862,8 +862,9 @@ pub struct DeploymentDBResponse {
     pub metadata: serde_json::Value,
     /// Declarative source reapplied during startup, or None for manually managed rows.
     pub provisioning_source: Option<String>,
-    /// Elevated serving classes this model has activated (migration 146).
-    pub serving_classes: Vec<String>,
+    /// Serving classes this model offers, keyed by class name, each a preset
+    /// of targets (`{ttft_ms, itl_ms, priority}`; migration 147).
+    pub serving_classes: serde_json::Value,
 }
 
 /// DB action for a traffic routing rule (used at the repository layer)

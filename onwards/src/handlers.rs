@@ -8,8 +8,10 @@ use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::models::ListModelResponse;
+use crate::serving::{
+    self, ProviderKind, RequestedServingClass, ServingClassOutcome, ServingResolution,
+};
 use crate::sse::SseBufferedStream;
-use crate::serving::{self, ProviderKind, RequestedServingClass, ServingClassOutcome, ServingResolution};
 use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
 use axum::{
     Json,
@@ -1128,6 +1130,39 @@ pub async fn target_message_handler<T: HttpClient>(
             };
         }
 
+        // Send the resolved serving targets to a member of kind `dynamo`, the
+        // only serving stack that reads them, as `nvext.router` targets plus
+        // (when the preset carries one) `nvext.agent_hints.priority`. A
+        // resolution without targets — no policy, `standard` on a model with
+        // no standard preset, the daemon legs — sends nothing, so the body is
+        // byte-identical to today and a partial rollout is safe. Values
+        // already present are overwritten, never removed: this same crate runs
+        // again as the hop inside the serving namespace, with no key policy of
+        // its own, and must forward what the first hop set. Client-supplied
+        // targets are scrubbed at dwctl's ingress, alongside the body priority
+        // (the same perimeter the priority strip relies on).
+        if target.kind == ProviderKind::Dynamo
+            && let Some(targets) = serving_resolution.targets
+            && !attempt_body.is_empty()
+        {
+            let mut body: serde_json::Value = match serde_json::from_slice(&attempt_body) {
+                Ok(body) => body,
+                Err(_) => {
+                    return LoopAction::Done(Err(OnwardsErrorResponse::bad_request(
+                        "Request body must be valid JSON.",
+                        None,
+                    )))
+                }
+            };
+            if let Some(object) = body.as_object_mut() {
+                targets.stamp(object);
+                attempt_body = match serde_json::to_vec(&body) {
+                    Ok(bytes) => axum::body::Bytes::from(bytes),
+                    Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
+                };
+            }
+        }
+
         // Build the upstream URI for this target
         let request_path = path_and_query.strip_prefix('/').unwrap_or(&path_and_query);
         let target_path = target.url.path().trim_end_matches('/');
@@ -1185,26 +1220,6 @@ pub async fn target_message_handler<T: HttpClient>(
 
         // Filter headers for upstream forwarding
         filter_headers_for_upstream(&mut attempt_headers, target);
-
-        // Stamp the v1 envelope — pool tag plus priority band — on a member
-        // of kind `dynamo`, the only serving stack that reads it. Only
-        // elevated classes carry anything: `standard` and the
-        // daemon legs travel untagged, byte-identical to today, so a partial
-        // rollout is safe. Headers already present are overwritten, never
-        // removed: this same crate runs again as the hop inside the serving
-        // namespace, with no key policy of its own, and must forward what the
-        // first hop stamped. Client-supplied values are scrubbed at dwctl's
-        // ingress, alongside the body priority (the same perimeter the
-        // priority strip relies on).
-        if target.kind == ProviderKind::Dynamo
-            && let Some(tag) = serving_resolution.resolved.pool_tag()
-        {
-            attempt_headers.insert(serving::POOL_TAG_HEADER, HeaderValue::from_static(tag));
-            attempt_headers.insert(
-                serving::PRIORITY_HEADER,
-                HeaderValue::from(serving_resolution.resolved.priority_band()),
-            );
-        }
 
         // Apply W3C trace-context policy for this upstream, gated on the
         // per-target propagate_trace_context flag (defaults to the resolved

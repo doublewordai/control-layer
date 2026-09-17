@@ -376,6 +376,10 @@ pub struct CompositeModelCreate {
     pub metadata: Option<ModelCatalogMetadata>,
 }
 
+fn empty_presets() -> serde_json::Value {
+    serde_json::json!({})
+}
+
 fn default_true() -> bool {
     true
 }
@@ -617,10 +621,12 @@ pub struct DeployedModelResponse {
     /// Declarative source reapplied during startup. Absent for manually managed models.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provisioning_source: Option<String>,
-    /// Elevated serving classes this model has activated (`interactive`,
-    /// `throughput`). Empty = standard only. Declared in the model catalog.
-    #[serde(default)]
-    pub serving_classes: Vec<String>,
+    /// Serving classes this model offers, keyed by class name (`interactive`,
+    /// `throughput`, optionally `standard`), each a preset of targets
+    /// `{ttft_ms, itl_ms, priority}`. Empty = standard only. Declared in the
+    /// model catalog.
+    #[serde(default = "empty_presets")]
+    pub serving_classes: serde_json::Value,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
