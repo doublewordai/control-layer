@@ -1212,7 +1212,7 @@ impl Default for OnwardsConfig {
         Self {
             strict_mode: false,
             upstream_rate_limit_message:
-                "Our realtime API is not intended for production use cases. For a dedicated deployment, contact support@doubleword.ai."
+                "This is a shared best-effort endpoint, rate limited under load – retry with backoff (see Retry-After). For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
                     .to_string(),
             first_token_timeout_ms: 10_000,
         }
