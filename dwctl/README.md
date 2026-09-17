@@ -269,3 +269,28 @@ migrations, concurrent indexes and destructive changes.
 - Management API requests are served under `/admin/api/v1/*`
 - Provider display configs (operator-set logos / display names for inference providers) live under `/admin/api/v1/provider-display-configs`, with `GET .../{provider_key}/icon` serving as a same-origin proxy for operator-set icon URLs so the dashboard can keep a tight `img-src` CSP regardless of which CDN an admin pastes
 
+## First-token metrics
+
+The embedded onwards proxy records `onwards_first_token_seconds` and
+`onwards_first_token_breaches_total` with `model`, `pool`, and `role` labels.
+The histogram measures observed strict-mode SSE data frames; the counter
+records first-token failover deadlines, including waits for response headers.
+Timeouts never enter the latency histogram. See
+[First-token observations](../onwards/docs/src/load-balancing.md#first-token-observations)
+for sampling limits and label semantics before using these series to compare
+providers. Eligible priority pools also use the AIMD controller described below.
+
+### Load-aware priority routing (AIMD)
+
+Priority composite models with fallback enabled use an AIMD preferred-first
+traffic share controller by default, including existing models. Override its
+settings through the model API's `aimd` object and explicit `first_token_timeout_ms`. The controller applies only to strict-mode
+streaming traffic and preserves ordinary retries; it is not a binary outage breaker.
+`PATCH {"aimd": {"enabled": false}}` disables it; null restores defaults. Model responses expose settings under `fallback`.
+
+`onwards_provider_share{model,pool}` reports the configured preferred-first share;
+`onwards_share_adjustments_total{model,pool,direction}` counts increases/decreases.
+The share is per gateway process, and capacity/concurrency constraints can change
+the realized split. Missing samples and hard errors never count as healthy capacity.
+See [configuration, observation coverage and rollout](../onwards/docs/src/load-aware-failover.md)
+before enabling a model. The existing histogram is not the controller denominator.

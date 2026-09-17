@@ -1,5 +1,50 @@
 # Changelog
 
+## [11.14.0](https://github.com/doublewordai/control-layer/compare/v11.13.0...v11.14.0) (2026-09-17)
+
+
+### Features
+
+* **onwards:** add default-on AIMD provider share control ([#1793](https://github.com/doublewordai/control-layer/issues/1793)) ([5e848a5](https://github.com/doublewordai/control-layer/commit/5e848a547c8f22218e3fcdd8335b3fcd7a982a1e))
+
+## [11.13.0](https://github.com/doublewordai/control-layer/compare/v11.12.0...v11.13.0) (2026-09-16)
+
+
+### Features
+
+* **onwards:** measure first-token latency per provider role ([#1790](https://github.com/doublewordai/control-layer/issues/1790)) ([adc080b](https://github.com/doublewordai/control-layer/commit/adc080b07f6b190876bf75f034297a8a21b4961b))
+
+## [11.12.0](https://github.com/doublewordai/control-layer/compare/v11.11.0...v11.12.0) (2026-09-16)
+
+
+### Features
+
+* implicit caching using engine / upstream stats ([#1781](https://github.com/doublewordai/control-layer/issues/1781)) ([7f2adb4](https://github.com/doublewordai/control-layer/commit/7f2adb4557a29c6fcc4f4ad5f1860550a1369395))
+
+
+### Bug Fixes
+
+* **analytics:** persist billing writes through outbox ([#1787](https://github.com/doublewordai/control-layer/issues/1787)) ([7896933](https://github.com/doublewordai/control-layer/commit/7896933111c4084706884bbf11972279cb83ec6d))
+* **ci:** track the fusillade-arsenal 4.1.0 and fusillade-core 6.0.0 release baselines ([#1784](https://github.com/doublewordai/control-layer/issues/1784)) ([b644c6f](https://github.com/doublewordai/control-layer/commit/b644c6fbb7727309761f64ea0dae9e4ce2c8c1f9))
+* **retention:** use indexed probes for startup and purge route queries ([#1783](https://github.com/doublewordai/control-layer/issues/1783)) ([364cf42](https://github.com/doublewordai/control-layer/commit/364cf42636935d8d3c1ad1799f3225e392d48d3c))
+
+
+### Miscellaneous
+
+* remove unused TranslationRegistry::default and is_empty ([#1695](https://github.com/doublewordai/control-layer/issues/1695)) ([2358272](https://github.com/doublewordai/control-layer/commit/23582720503bbea35e96597ba439977b37d936f2))
+
+## [11.11.0](https://github.com/doublewordai/control-layer/compare/v11.10.2...v11.11.0) (2026-09-15)
+
+
+### Features
+
+* **onwards:** fail over streamed requests whose first token stalls ([#1780](https://github.com/doublewordai/control-layer/issues/1780)) ([2418bf8](https://github.com/doublewordai/control-layer/commit/2418bf869e9cb3734bb625ab382eae075dab5c0e))
+
+
+### Bug Fixes
+
+* **batches:** results survive input-file deletion, 410 once output/error files are deleted ([#1741](https://github.com/doublewordai/control-layer/issues/1741)) ([144c1e4](https://github.com/doublewordai/control-layer/commit/144c1e460ee563693ceba174d5144db13acd6d4f))
+
 ## [11.10.2](https://github.com/doublewordai/control-layer/compare/v11.10.1...v11.10.2) (2026-09-15)
 
 

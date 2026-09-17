@@ -82,8 +82,13 @@ enum SseEventKind {
     /// A `data:` frame carrying an embedded provider error — the contained
     /// `error.code`, per [`embedded_error_status`].
     Error(u16, serde_json::Value),
-    /// A `data:` frame carrying normal content (or the `[DONE]` sentinel).
+    /// A non-sentinel `data:` frame (possibly metadata rather than generated text).
     Data,
+    /// The `[DONE]` sentinel. A `data:` frame, but not a token: it ends a
+    /// stream rather than carrying content. Decisive like [`SseEventKind::Data`]
+    /// and equally proof the stream was not empty, but it must never be counted
+    /// as a first token.
+    Done,
     /// No `data:` field: an SSE comment / keep-alive (e.g. `: keep-alive`), which
     /// the caller peeks past to reach the first real frame.
     Comment,
@@ -118,7 +123,7 @@ fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
         return SseEventKind::Comment;
     }
     if data.trim() == "[DONE]" {
-        return SseEventKind::Data;
+        return SseEventKind::Done;
     }
     if let Ok(body) = serde_json::from_str::<serde_json::Value>(data.trim())
         && let Some(status) = embedded_error_status(&body)
@@ -126,6 +131,86 @@ fn classify_sse_event(chunk: &[u8]) -> SseEventKind {
         SseEventKind::Error(status, body["error"].clone())
     } else {
         SseEventKind::Data
+    }
+}
+
+/// Whether a request body asks for a streamed response (`"stream": true`).
+/// The substring guard skips the parse for the common non-streaming body.
+fn requests_stream(body: &[u8]) -> bool {
+    body.windows(8).any(|w| w == b"\"stream\"")
+        && serde_json::from_slice::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| v.get("stream")?.as_bool())
+            .unwrap_or(false)
+}
+
+/// What reading the lead frames of a 2xx SSE stream has established so far.
+#[derive(Default)]
+struct LeadFrames {
+    /// The provider embedded an error status in the first real frame.
+    embedded: Option<(u16, serde_json::Value)>,
+    /// A `data:` frame arrived, so the stream is definitely not empty. Set for
+    /// the `[DONE]` sentinel too: it proves non-emptiness even though it carries
+    /// no token. This is what suppresses the retryable `EmptyBody` verdict, so
+    /// it must stay set for `[DONE]`.
+    saw_data: bool,
+    /// A data frame carrying actual content arrived — `[DONE]` excluded. This,
+    /// not `saw_data`, is the first-token signal: a zero-token stream can open
+    /// with `[DONE]`.
+    saw_content: bool,
+    /// The stream closed (`None`) or errored (`Err`) before any content — a
+    /// *terminal* empty, safe to retry.
+    stream_ended: bool,
+}
+
+/// Pull up to `max_events` frames from `events` into `peeked`, stopping at the
+/// first decisive one: an embedded error, real content, or end of stream.
+/// Keep-alive / comment frames are buffered and skipped. `peeked` and `lead`
+/// live outside this future so a caller's timeout cancelling it loses nothing:
+/// frames consumed so far are still replayed to the client.
+async fn read_lead_frames<S, E>(
+    events: &mut S,
+    peeked: &mut Vec<Result<axum::body::Bytes, E>>,
+    lead: &mut LeadFrames,
+    max_events: usize,
+) where
+    S: futures_util::Stream<Item = Result<axum::body::Bytes, E>> + Unpin,
+{
+    use futures_util::StreamExt;
+    for _ in 0..max_events {
+        match events.next().await {
+            Some(Ok(chunk)) => match classify_sse_event(&chunk) {
+                SseEventKind::Error(status, error) => {
+                    lead.embedded = Some((status, error));
+                    peeked.push(Ok(chunk));
+                    return;
+                }
+                SseEventKind::Data => {
+                    lead.saw_data = true;
+                    lead.saw_content = true;
+                    peeked.push(Ok(chunk));
+                    return;
+                }
+                // Decisive exactly as `Data` is — it ends the peek and marks the
+                // stream non-empty — but it is not a first token, so it leaves
+                // `saw_content` alone.
+                SseEventKind::Done => {
+                    lead.saw_data = true;
+                    peeked.push(Ok(chunk));
+                    return;
+                }
+                SseEventKind::Comment => peeked.push(Ok(chunk)),
+            },
+            Some(Err(e)) => {
+                lead.stream_ended = true;
+                peeked.push(Err(e));
+                return;
+            }
+            None => {
+                lead.stream_ended = true;
+                return;
+            }
+        }
     }
 }
 
@@ -696,9 +781,57 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
     let pool_max_attempts = pool.fallback_max_attempts();
-    for (_member_idx, target, connection_guard) in pool.select_iter() {
+
+    // First-token failover: bound how long a streamed attempt may go without
+    // producing its first frame before it is abandoned for another provider.
+    // Armed only while a *different* provider is left to take over (the pool
+    // has more than one) and never on the final attempt (checked per attempt
+    // below), so it can reroute a stalled request but never fail one that
+    // would otherwise have succeeded. Non-streaming requests are exempt: their
+    // headers only arrive once the whole completion is done, so a deadline
+    // would cut off legitimately long answers. So is traffic carrying the
+    // configured exempt header (e.g. batch dispatch, which runs its own retries).
+    let first_token_timeout = pool
+        .fallback()
+        .filter(|f| f.enabled)
+        .and_then(|f| {
+            f.first_token_timeout_ms
+                .map(std::time::Duration::from_millis)
+                .or(state.first_token_timeout)
+        })
+        .filter(|timeout| {
+            !timeout.is_zero()
+                && pool.len() > 1
+                && !state
+                    .first_token_timeout_exempt_header
+                    .as_deref()
+                    .is_some_and(|header| original_headers.contains_key(header))
+                && requests_stream(&body_bytes)
+        });
+
+    // Unsupported traffic keeps ordinary routing and contributes no observations.
+    let aimd_eligible = pool.aimd_enabled()
+        && state.targets.strict_mode && requests_stream(&body_bytes)
+        && !state.first_token_timeout_exempt_header.as_deref()
+            .is_some_and(|header| original_headers.contains_key(header));
+    for (member_idx, target, connection_guard) in pool.select_iter_aimd(aimd_eligible, &model_name, resolved_pool_name.unwrap_or("default")) {
         any_attempted = true;
         attempt_number += 1;
+        // First-token observations are attributed to the provider actually
+        // tried: `preferred` is the pool's first provider in definition order,
+        // anything else is an alternate. Two values, so the label stays bounded
+        // on a recorder that deliberately never evicts series.
+        let provider_role = if member_idx == 0 {
+            "preferred"
+        } else {
+            "alternate"
+        };
+        let attempt_start = tokio::time::Instant::now();
+        let observation = pool.observe(aimd_eligible, member_idx, &model_name, resolved_pool_name.unwrap_or("default"), attempt_start);
+        // This attempt's first-frame deadline; `None` on the final attempt.
+        let first_token_deadline = first_token_timeout
+            .filter(|_| (attempt_number as usize) < pool_max_attempts)
+            .map(|timeout| attempt_start + timeout);
 
         let attempt_span = tracing::info_span!(
             "onwards.provider_attempt",
@@ -957,18 +1090,23 @@ pub async fn target_message_handler<T: HttpClient>(
             url.full = %upstream_uri,
             http.response.status_code = tracing::field::Empty,
         );
+        // The header wait ends at the earlier of the provider's request timeout
+        // and this attempt's first-token deadline.
+        let request_deadline = target
+            .request_timeout_secs
+            .map(|secs| tokio::time::Instant::now() + std::time::Duration::from_secs(secs));
+        let header_deadline = match (request_deadline, first_token_deadline) {
+            (Some(request), Some(first_token)) => Some(request.min(first_token)),
+            (request, first_token) => request.or(first_token),
+        };
         let request_result = async {
-            if let Some(timeout_secs) = target.request_timeout_secs {
-                let timeout_duration = std::time::Duration::from_secs(timeout_secs);
-                match tokio::time::timeout(timeout_duration, state.http_client.request(attempt_req))
+            if let Some(deadline) = header_deadline {
+                match tokio::time::timeout_at(deadline, state.http_client.request(attempt_req))
                     .await
                 {
                     Err(_) => {
                         // Timeout occurred
-                        debug!(
-                            "Request to {} timed out after {:?}",
-                            upstream_uri, timeout_duration
-                        );
+                        debug!("Request to {} timed out waiting for response headers", upstream_uri);
                         Err(UpstreamOutcome::Timeout)
                     }
                     Ok(result) => result.map_err(UpstreamOutcome::Error),
@@ -985,7 +1123,25 @@ pub async fn target_message_handler<T: HttpClient>(
         let mut response = match request_result {
             Err(UpstreamOutcome::Timeout) => {
                 upstream_span.record("http.response.status_code", 504_u16);
-                tracing::Span::current().record("onwards.fallback", "timeout");
+                // Name the deadline that fired, so first-token failovers are
+                // distinguishable from provider request timeouts in traces.
+                let reason = if header_deadline == first_token_deadline {
+                    if let Some(observation) = &observation { observation.deadline(); }
+                    // Header waits are part of the same first-token deadline.
+                    // A provider request timeout that fires earlier is not a
+                    // first-token breach.
+                    metrics::counter!(
+                        "onwards_first_token_breaches_total",
+                        "model" => model_name.to_string(),
+                        "pool" => resolved_pool_name.unwrap_or("default"),
+                        "role" => provider_role,
+                    )
+                    .increment(1);
+                    "first_token_timeout"
+                } else {
+                    "timeout"
+                };
+                tracing::Span::current().record("onwards.fallback", reason);
                 if pool.fallback_enabled() {
                     return LoopAction::Continue(Some(OnwardsErrorResponse::gateway_timeout()));
                 } else {
@@ -1144,93 +1300,103 @@ pub async fn target_message_handler<T: HttpClient>(
                 const SSE_PEEK_MAX_EVENTS: usize = 4;
 
                 let (parts, body) = response.into_parts();
-                let mut events = SseBufferedStream::new(body.into_data_stream());
-                // `peeked` / `embedded` live outside the peek future so a partial
-                // peek survives a budget timeout (consumed frames are not lost).
-                let mut peeked = Vec::new();
-                let mut embedded = None;
-                // `saw_data` = a real content frame arrived (definitely not empty).
-                // `stream_ended` = the stream closed (`None`) or errored (`Err`)
-                // before any content — a *terminal* empty, safe to retry.
-                let mut saw_data = false;
-                let mut stream_ended = false;
-                let peek = async {
-                    for _ in 0..SSE_PEEK_MAX_EVENTS {
-                        match events.next().await {
-                            Some(Ok(chunk)) => match classify_sse_event(&chunk) {
-                                SseEventKind::Error(status, error) => {
-                                    embedded = Some((status, error));
-                                    peeked.push(Ok(chunk));
-                                    break;
-                                }
-                                // First real data frame is normal content — stop.
-                                SseEventKind::Data => {
-                                    saw_data = true;
-                                    peeked.push(Ok(chunk));
-                                    break;
-                                }
-                                // Keep-alive / comment — keep looking.
-                                SseEventKind::Comment => peeked.push(Ok(chunk)),
-                            },
-                            Some(Err(e)) => {
-                                stream_ended = true;
-                                peeked.push(Err(e));
-                                break;
-                            }
-                            None => {
-                                stream_ended = true;
-                                break;
-                            }
-                        }
-                    }
-                };
-                if tokio::time::timeout(SSE_PEEK_BUDGET, peek).await.is_err() {
-                    debug!("Timed out peeking SSE lead frames; waiting for first terminal frame");
-                    let decisive_wait = async {
-                        for _ in 0..SSE_PEEK_MAX_EVENTS {
-                            match events.next().await {
-                                Some(Ok(chunk)) => match classify_sse_event(&chunk) {
-                                    SseEventKind::Error(status, error) => {
-                                        embedded = Some((status, error));
-                                        peeked.push(Ok(chunk));
-                                        break;
-                                    }
-                                    SseEventKind::Data => {
-                                        saw_data = true;
-                                        peeked.push(Ok(chunk));
-                                        break;
-                                    }
-                                    SseEventKind::Comment => peeked.push(Ok(chunk)),
-                                },
-                                Some(Err(e)) => {
-                                    stream_ended = true;
-                                    peeked.push(Err(e));
-                                    break;
-                                }
-                                None => {
-                                    stream_ended = true;
-                                    break;
-                                }
-                            }
-                        };
+                // Observe the same parsed events the strict path already consumes,
+                // including events polled after the bounded lead peek returns.
+                // This changes neither framing nor buffering and owns the attempt
+                // until response completion/cancellation (an unknown outcome).
+                let mut stream_observation = observation.clone();
+                let mut events = SseBufferedStream::new(body.into_data_stream()).inspect(move |event| {
+                    if stream_observation.is_none() { return; }
+                    let kind = match event {
+                        Ok(bytes) if bytes.ends_with(b"\n\n") => classify_sse_event(bytes),
+                        // The buffer flushes an incomplete final event at EOF.
+                        // Preserve its bytes, but do not count it as a first frame.
+                        _ => SseEventKind::Done,
                     };
-                    if tokio::time::timeout(SSE_DECISIVE_WAIT_BUDGET, decisive_wait)
-                        .await
-                        .is_err()
+                    if matches!(kind, SseEventKind::Comment) { return; }
+                    if let Some(observation) = stream_observation.take() {
+                        if matches!(kind, SseEventKind::Data) { observation.frame(); }
+                        else { observation.unknown(); }
+                    }
+                });
+                let mut peeked = Vec::new();
+                let mut lead = LeadFrames::default();
+                if let Some(deadline) = first_token_deadline {
+                    // First-token failover is armed: hold out for the first
+                    // decisive frame until this attempt's deadline. Keep-alive
+                    // comments don't count — a stalled provider may keep sending
+                    // them — so there is no event cap. Nothing has reached the
+                    // client yet, so abandoning the stream is safe.
+                    if tokio::time::timeout_at(
+                        deadline,
+                        read_lead_frames(&mut events, &mut peeked, &mut lead, usize::MAX),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        if let Some(observation) = &observation { observation.deadline(); }
+                        warn!(
+                            upstream = %target.url,
+                            "No first token before the failover deadline; trying the next provider"
+                        );
+                        tracing::Span::current().record("onwards.fallback", "first_token_timeout");
+                        // A breach is a CENSORED observation: it establishes only
+                        // that the first token took longer than the deadline, not
+                        // how long it would have taken. Counted separately so the
+                        // deadline value never contaminates the latency histogram.
+                        metrics::counter!(
+                            "onwards_first_token_breaches_total",
+                            "model" => model_name.to_string(),
+                            "pool" => resolved_pool_name.unwrap_or("default"),
+                            "role" => provider_role,
+                        )
+                        .increment(1);
+                        // Dropping `events` closes the upstream stream, which is
+                        // the provider's signal to stop generating.
+                        return LoopAction::Continue(Some(OnwardsErrorResponse::gateway_timeout()));
+                    }
+                } else if tokio::time::timeout(
+                    SSE_PEEK_BUDGET,
+                    read_lead_frames(&mut events, &mut peeked, &mut lead, SSE_PEEK_MAX_EVENTS),
+                )
+                .await
+                .is_err()
+                {
+                    debug!("Timed out peeking SSE lead frames; waiting for first terminal frame");
+                    if tokio::time::timeout(
+                        SSE_DECISIVE_WAIT_BUDGET,
+                        read_lead_frames(&mut events, &mut peeked, &mut lead, SSE_PEEK_MAX_EVENTS),
+                    )
+                    .await
+                    .is_err()
                     {
                         debug!(
                             "Timed out waiting for decisive SSE frame; forwarding stream unmodified"
                         );
                     }
                 }
+                // An actual first token arrived: record the uncensored latency.
+                // `saw_content` excludes the `[DONE]` sentinel, which is a data
+                // frame but carries no token. Only reached on the success paths —
+                // a breach returns above — so this histogram holds observed
+                // latencies only, never censored ones.
+                if lead.saw_content {
+                    metrics::histogram!(
+                        "onwards_first_token_seconds",
+                        "model" => model_name.to_string(),
+                        "pool" => resolved_pool_name.unwrap_or("default"),
+                        "role" => provider_role,
+                    )
+                    .record(attempt_start.elapsed().as_secs_f64());
+                }
                 // Forward the consumed frames followed by the remainder, so a clean
                 // (or slow) stream is intact; on a retry path below this `response`
                 // is dropped when we return.
                 let rest = futures_util::stream::iter(peeked).chain(events);
                 response = Response::from_parts(parts, axum::body::Body::from_stream(rest));
-                if let Some((status, error)) = embedded {
+                if let Some((status, error)) = lead.embedded {
                     Scan2xx::Embedded(status, error)
-                } else if stream_ended && !saw_data {
+                } else if lead.stream_ended && !lead.saw_data {
                     // Stream closed/errored before any content frame: nothing was
                     // forwarded, so retrying is safe. A valid-but-slow stream that
                     // eventually produces content falls through to `Clean` with the
@@ -1775,7 +1941,7 @@ mod tests {
 
     #[test]
     fn classify_sse_event_distinguishes_error_data_and_comment() {
-        use SseEventKind::{Comment, Data, Error};
+        use SseEventKind::{Comment, Data, Done, Error};
 
         // A provider's first-frame error on a 200 stream.
         assert_eq!(
@@ -1800,12 +1966,14 @@ mod tests {
             Error(429, serde_json::json!({"code":429}))
         );
 
-        // Normal content and the [DONE] sentinel are data frames, not errors.
+        // Normal content is a data frame, not an error.
         assert_eq!(
             classify_sse_event(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n"),
             Data
         );
-        assert_eq!(classify_sse_event(b"data: [DONE]\n\n"), Data);
+        // The [DONE] sentinel is a data frame but NOT content: it closes a stream
+        // without carrying a token, so it must not count as a first token.
+        assert_eq!(classify_sse_event(b"data: [DONE]\n\n"), Done);
 
         // Comment / keep-alive frames carry no `data:` field.
         assert_eq!(classify_sse_event(b": keep-alive\n\n"), Comment);
@@ -2559,6 +2727,8 @@ mod tests {
             response_transform_fn: None,
             response_id_header: None,
             body_limit: crate::DEFAULT_BODY_LIMIT,
+            first_token_timeout: None,
+            first_token_timeout_exempt_header: None,
         };
 
         // Create a simple POST request

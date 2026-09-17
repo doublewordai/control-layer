@@ -205,6 +205,8 @@ mod tests {
             backoff_factor: 2.0,
             backoff_jitter: "full".to_string(),
             backoff_max_total_ms: None,
+            first_token_timeout_ms: None,
+            aimd: None,
             sanitize_responses: true,
             trusted: false,
             reasoning_translation_overrides: None,
