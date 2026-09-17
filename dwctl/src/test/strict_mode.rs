@@ -1182,7 +1182,11 @@ async fn test_strict_mode_upstream_rate_limit_uses_custom_message(pool: PgPool) 
         .await;
 
     let mut config = create_test_config();
-    config.onwards.strict_mode = true;
+    config.onwards = serde_json::from_value(serde_json::json!({
+        "strict_mode": true,
+        "upstream_rate_limit_message": "Please contact our team for dedicated capacity."
+    }))
+    .expect("Custom upstream rate-limit message should deserialize");
     config.background_services.onwards_sync.enabled = true;
 
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
@@ -1301,10 +1305,7 @@ async fn test_strict_mode_upstream_rate_limit_uses_custom_message(pool: PgPool) 
     let body: serde_json::Value = serde_json::from_str(&body_text).expect("Response should be valid JSON");
 
     assert_eq!(response.status_code(), 429, "Should preserve the upstream rate limit");
-    assert_eq!(
-        body["error"]["message"],
-        "Our realtime API is not intended for production use cases. For a dedicated deployment, contact support@doubleword.ai."
-    );
+    assert_eq!(body["error"]["message"], "Please contact our team for dedicated capacity.");
     assert_eq!(body["error"]["type"], "rate_limit_error");
     assert_eq!(body["error"]["code"], "upstream_rate_limit");
     assert!(body["error"].get("details").is_none(), "Provider details should remain private");
