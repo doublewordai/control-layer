@@ -112,13 +112,14 @@ including traffic remaining at the floor.
 
 ### Realtime-only failover statuses
 
-Separately from the controller, `AppState::with_realtime_fallback_statuses` lists
-upstream statuses that fail a **realtime** request over to the next provider in
-any pool with fallback enabled, on top of the pool's own `on_status`. Requests
-carrying the exempt header keep the upstream response and retry on their own
-terms. Dwctl exposes this as `onwards.realtime_fallback_on_status`, defaulting to
-`[529]`. Whether or not a status fails over, a listed overload status from the
-preferred provider still counts as a controller breach.
+Separately from the controller, a pool's `fallback.realtime_on_status` lists
+upstream statuses that fail a **realtime** request over to the next provider, on
+top of `on_status`. Requests carrying the exempt header keep the upstream response
+and retry on their own terms. Dwctl stores this per model as
+`fallback_realtime_on_status` (the dashboard's "Overloaded (529, realtime only)"
+switch); new composite models default to `[529]`. Whether or not a status fails
+over, a listed overload status from the preferred provider still counts as a
+controller breach.
 
 Monitor client latency, errors, preferred-first share, adjustment rate and alternate
 spend after deployment. A low share is an indicator of capacity shortfall, not proof.

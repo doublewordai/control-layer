@@ -4286,8 +4286,7 @@ impl Application {
             // Realtime traffic never carries it (the realtime path only adds
             // `x-fusillade-request-id`), so it exempts exactly the daemon
             // traffic, which tolerates latency and runs its own retries.
-            .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at")
-            .with_realtime_fallback_statuses(config.onwards.realtime_fallback_on_status.iter().copied());
+            .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at");
         if config.onwards.first_token_timeout_ms > 0 {
             onwards_app_state =
                 onwards_app_state.with_first_token_timeout(std::time::Duration::from_millis(config.onwards.first_token_timeout_ms));

@@ -468,6 +468,14 @@ impl ProviderPool {
             .is_some_and(|f| f.should_fallback_on_status(status_code))
     }
 
+    /// Check if a status code should trigger fallback for a realtime request,
+    /// including the pool's realtime-only fallback statuses.
+    pub fn should_fallback_on_realtime_status(&self, status_code: u16) -> bool {
+        self.fallback
+            .as_ref()
+            .is_some_and(|f| f.should_fallback_on_realtime_status(status_code))
+    }
+
     /// Check if local rate limits should trigger fallback
     pub fn should_fallback_on_rate_limit(&self) -> bool {
         self.fallback

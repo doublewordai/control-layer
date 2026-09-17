@@ -45,6 +45,17 @@ fn validate_reasoning_translation_overrides(overrides: Option<&ReasoningTranslat
     Ok(())
 }
 
+/// Realtime-only failover statuses use the same patterns as `fallback_on_status`:
+/// an exact 4xx/5xx code, a decade (`52` = 520-529) or a class (`5` = 5xx).
+fn validate_realtime_fallback_statuses(statuses: Option<&[i32]>) -> Result<()> {
+    if statuses.is_some_and(|statuses| statuses.iter().any(|status| !matches!(status, 4..=5 | 40..=59 | 400..=599))) {
+        return Err(Error::BadRequest {
+            message: "fallback_realtime_on_status entries must be 4xx/5xx status codes or 4, 5, 40-59 patterns".into(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_aimd(timeout: Option<i64>, config: Option<&AimdConfig>, composite: bool, priority: bool, fallback: bool) -> Result<()> {
     if timeout.is_some_and(|ms| !(0..=3_600_000).contains(&ms)) {
         return Err(Error::BadRequest {
@@ -634,6 +645,9 @@ pub async fn create_deployed_model<P: PoolProvider>(
         DeployedModelCreate::Composite(c) => (c.backoff_initial_ms, c.backoff_max_ms, c.backoff_factor, c.backoff_max_total_ms),
     };
     validate_backoff(Some(b_initial), Some(b_max), Some(b_factor), b_total)?;
+    if let DeployedModelCreate::Composite(c) = &create {
+        validate_realtime_fallback_statuses(Some(&c.fallback_realtime_on_status))?;
+    }
     match &create {
         DeployedModelCreate::Standard(s) => validate_aimd(s.first_token_timeout_ms, s.aimd.as_ref(), false, false, s.backoff_enabled)?,
         DeployedModelCreate::Composite(c) => validate_aimd(
@@ -813,6 +827,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
         }
     };
 
+    validate_realtime_fallback_statuses(update.fallback_realtime_on_status.as_deref())?;
     validate_aimd(
         update.first_token_timeout_ms.unwrap_or(cur_timeout),
         update.aimd.as_ref().map(|v| v.as_ref()).unwrap_or(cur_aimd.as_ref()),
@@ -1549,6 +1564,59 @@ mod tests {
         let stored = Deployments::new(&mut conn).get_by_id(model.id).await.unwrap().unwrap();
         assert!(stored.aimd.is_none());
         assert!(stored.first_token_timeout_ms.is_none());
+    }
+
+    #[sqlx::test]
+    async fn realtime_fallback_statuses_default_patch_and_validate(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&user);
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"type":"composite","model_name":"realtime-fallback-model"}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert_eq!(model.fallback.unwrap().realtime_on_status, vec![529]);
+        let path = format!("/admin/api/v1/models/{}", model.id);
+
+        for statuses in [json!([200]), json!([600]), json!([-529])] {
+            app.patch(&path)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"fallback_realtime_on_status": statuses}))
+                .await
+                .assert_status_bad_request();
+        }
+
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"fallback_realtime_on_status": []}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert!(model.fallback.unwrap().realtime_on_status.is_empty());
+
+        // Omitting the field leaves the stored statuses untouched.
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"fallback_realtime_on_status": [529]}))
+            .await
+            .assert_status_ok();
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"fallback_on_status": [500]}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert_eq!(model.fallback.unwrap().realtime_on_status, vec![529]);
     }
 
     /// Helper function to find a model by ID in a paginated response

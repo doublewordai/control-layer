@@ -206,6 +206,10 @@ pub struct Fallback {
     pub on_rate_limit: bool,
     #[serde(default = "default_fallback_statuses")]
     pub on_status: Vec<i32>,
+    /// Extra statuses that fail over realtime traffic only. Omit to keep the
+    /// value already stored for the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realtime_on_status: Option<Vec<i32>>,
     pub with_replacement: bool,
     pub max_attempts: Option<i32>,
     pub backoff: Option<Backoff>,
@@ -218,6 +222,7 @@ impl Default for Fallback {
             enabled: true,
             on_rate_limit: true,
             on_status: default_fallback_statuses(),
+            realtime_on_status: None,
             with_replacement: false,
             max_attempts: None,
             backoff: None,
@@ -834,6 +839,35 @@ clay:
             .await
             .unwrap();
         assert_eq!(disabled, Some(serde_json::json!({"enabled":false})));
+    }
+
+    #[sqlx::test]
+    async fn catalog_keeps_realtime_fallback_statuses_unless_declared(pool: PgPool) {
+        sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
+            .execute(&pool).await.unwrap();
+        let realtime_statuses = || async {
+            sqlx::query_scalar::<_, Vec<i32>>("SELECT fallback_realtime_on_status FROM deployed_models WHERE alias = 'org/model'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let directory = tempdir().unwrap();
+        let omitted = catalog_yaml("0.50", false, "0.1");
+        write(directory.path(), "model.yaml", &omitted);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(realtime_statuses().await, Vec::<i32>::new());
+
+        sqlx::query("UPDATE deployed_models SET fallback_realtime_on_status = '{529}' WHERE alias = 'org/model'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(realtime_statuses().await, vec![529]);
+
+        let declared = omitted.replace("  routing:\n", "  routing:\n    fallback:\n      realtime_on_status: []\n");
+        write(directory.path(), "model.yaml", &declared);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(realtime_statuses().await, Vec::<i32>::new());
     }
 
     #[sqlx::test]

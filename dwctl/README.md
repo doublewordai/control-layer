@@ -303,8 +303,10 @@ and `onwards_aimd_in_flight` expose controller state, and
 excluded and overload outcomes. The share is per gateway process, and
 capacity/concurrency constraints can change the realized split.
 
-`onwards.realtime_fallback_on_status` (default `[529]`) lists upstream statuses that
-fail a realtime request over to the model's next provider, in addition to the
-model's own fallback statuses. Fusillade daemon traffic is never affected.
+`fallback_realtime_on_status` on a model (default `[529]` for new composite models;
+the dashboard's "Overloaded (529, realtime only)" failover switch) lists upstream
+statuses that fail a realtime request over to the next provider, in addition to
+`fallback_on_status`. Fusillade daemon traffic is never affected. Catalog files set
+it as `routing.fallback.realtime_on_status`; omitting it keeps the stored value.
 See [configuration, observation coverage and rollout](../onwards/docs/src/load-aware-failover.md)
 before enabling a model. The existing histogram is not the controller denominator.

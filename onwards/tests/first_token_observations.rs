@@ -764,21 +764,21 @@ fn aimd_scripted_server(
     let mut cfg = config(alias, true);
     cfg["targets"][alias]["fallback"]["aimd"] = aimd_config();
     cfg["targets"][alias]["fallback"]["first_token_timeout_ms"] = json!(first_token_timeout_ms);
+    cfg["targets"][alias]["fallback"]["realtime_on_status"] = json!([529]);
     let targets = Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap();
-    let state = AppState::with_client(targets, client)
-        .with_first_token_timeout_exempt_header("x-batch")
-        .with_realtime_fallback_statuses([529]);
+    let state =
+        AppState::with_client(targets, client).with_first_token_timeout_exempt_header("x-batch");
     TestServer::new(build_router(state)).unwrap()
 }
 
 #[tokio::test]
-async fn realtime_fallback_statuses_reroute_realtime_but_not_dispatched_traffic() {
+async fn realtime_on_status_reroutes_realtime_but_not_dispatched_traffic() {
     LazyLock::force(&METRICS);
     let client = ScriptedClient::new(vec![(StatusCode::from_u16(529).unwrap(), Duration::ZERO)]);
     let server = aimd_scripted_server("realtime-529", client.clone(), 100);
 
-    // Realtime: 529 is not in the pool's on_status, but it is a realtime
-    // fallback status, so the request is rerouted and succeeds.
+    // Realtime: 529 is not in the pool's on_status, but it is in its
+    // realtime_on_status, so the request is rerouted and succeeds.
     let realtime = server
         .post("/v1/chat/completions")
         .json(&json!({"model":"realtime-529","stream":true}))

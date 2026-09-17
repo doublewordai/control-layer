@@ -1208,12 +1208,6 @@ pub struct OnwardsConfig {
     /// traffic (batch, flex, background) is exempt. Default: 10000. Set to 0 to
     /// disable.
     pub first_token_timeout_ms: u64,
-    /// Upstream statuses that fail a realtime request over to the model's next
-    /// provider, in addition to each model's own fallback statuses. Fusillade
-    /// daemon traffic (batch, flex, background) is never affected: it runs its
-    /// own retries. Default: [529], so a self-hosted provider shedding load
-    /// reroutes realtime traffic instead of returning the rejection.
-    pub realtime_fallback_on_status: Vec<u16>,
 }
 
 impl Default for OnwardsConfig {
@@ -1224,7 +1218,6 @@ impl Default for OnwardsConfig {
                 "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
                     .to_string(),
             first_token_timeout_ms: 10_000,
-            realtime_fallback_on_status: vec![529],
         }
     }
 }

@@ -158,14 +158,6 @@ pub struct AppState<T: HttpClient> {
     /// failover timeout — e.g. a marker a batch dispatcher stamps on traffic
     /// that tolerates latency and runs its own retry policy.
     pub first_token_timeout_exempt_header: Option<String>,
-    /// Upstream statuses that trigger failover for realtime requests only —
-    /// requests without [`first_token_timeout_exempt_header`](Self::first_token_timeout_exempt_header)
-    /// — in any pool with fallback enabled, in addition to the pool's own
-    /// `fallback.on_status`. For example, a self-hosted provider's
-    /// over-capacity status can reroute realtime traffic while dispatched
-    /// batch traffic, which runs its own retries, is left to handle it. Empty
-    /// by default.
-    pub realtime_fallback_statuses: Vec<u16>,
 }
 
 /// Default maximum request body size (32 MB).
@@ -195,10 +187,6 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
                 "first_token_timeout_exempt_header",
                 &self.first_token_timeout_exempt_header,
             )
-            .field(
-                "realtime_fallback_statuses",
-                &self.realtime_fallback_statuses,
-            )
             .finish()
     }
 }
@@ -222,7 +210,6 @@ impl AppState<HyperClient> {
             body_limit: DEFAULT_BODY_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
-            realtime_fallback_statuses: Vec::new(),
         }
     }
 }
@@ -239,7 +226,6 @@ impl<T: HttpClient> AppState<T> {
             body_limit: DEFAULT_BODY_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
-            realtime_fallback_statuses: Vec::new(),
         }
     }
 
@@ -266,16 +252,6 @@ impl<T: HttpClient> AppState<T> {
     /// failover timeout (builder pattern).
     pub fn with_first_token_timeout_exempt_header(mut self, header: impl Into<String>) -> Self {
         self.first_token_timeout_exempt_header = Some(header.into());
-        self
-    }
-
-    /// Set upstream statuses that trigger failover for realtime requests only
-    /// (builder pattern). See [`AppState::realtime_fallback_statuses`].
-    pub fn with_realtime_fallback_statuses(
-        mut self,
-        statuses: impl IntoIterator<Item = u16>,
-    ) -> Self {
-        self.realtime_fallback_statuses = statuses.into_iter().collect();
         self
     }
 

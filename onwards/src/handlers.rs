@@ -811,12 +811,13 @@ pub async fn target_message_handler<T: HttpClient>(
             !timeout.is_zero() && pool.len() > 1 && is_realtime && requests_stream(&body_bytes)
         });
     // A status triggers failover when the pool lists it, or when it is one of
-    // the proxy's realtime-only fallback statuses and this request is realtime.
+    // the pool's realtime-only fallback statuses and this request is realtime.
     let fails_over_on = |status: u16| {
-        pool.should_fallback_on_status(status)
-            || (is_realtime
-                && pool.fallback_enabled()
-                && state.realtime_fallback_statuses.contains(&status))
+        if is_realtime {
+            pool.should_fallback_on_realtime_status(status)
+        } else {
+            pool.should_fallback_on_status(status)
+        }
     };
 
     // Unsupported traffic keeps ordinary routing and contributes no observations.
@@ -2770,7 +2771,6 @@ mod tests {
             body_limit: crate::DEFAULT_BODY_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
-            realtime_fallback_statuses: Vec::new(),
         };
 
         // Create a simple POST request

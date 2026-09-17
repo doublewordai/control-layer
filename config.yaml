@@ -528,12 +528,6 @@ onwards:
   # traffic (batch, flex, background) is exempt. Set to 0 to disable.
   # Set via environment: DWCTL_ONWARDS__FIRST_TOKEN_TIMEOUT_MS=10000
   first_token_timeout_ms: 10000
-  # Upstream statuses that fail a realtime request over to the model's next
-  # provider, on top of each model's own fallback statuses. Fusillade daemon
-  # traffic (batch, flex, background) is never affected; it runs its own retries.
-  # The default reroutes realtime traffic when a self-hosted provider sheds load.
-  # Set via environment: DWCTL_ONWARDS__REALTIME_FALLBACK_ON_STATUS='[529]'
-  realtime_fallback_on_status: [529]
   # Models may override the deadline via first_token_timeout_ms in the model API.
   # Priority composites with fallback enabled use AIMD by default in strict mode.
   # Override through the model API's aimd object, or set aimd.enabled=false to opt out.

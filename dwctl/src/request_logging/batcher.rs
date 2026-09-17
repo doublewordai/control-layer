@@ -2093,6 +2093,7 @@ mod integration_tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_realtime_on_status: None,
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 backoff_enabled: false,

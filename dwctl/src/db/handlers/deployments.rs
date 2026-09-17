@@ -183,6 +183,7 @@ struct DeployedModel {
     pub fallback_enabled: Option<bool>,
     pub fallback_on_rate_limit: Option<bool>,
     pub fallback_on_status: Option<Vec<i32>>,
+    pub fallback_realtime_on_status: Vec<i32>,
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<i32>,
     pub backoff_enabled: bool,
@@ -251,6 +252,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             fallback_enabled: m.fallback_enabled.unwrap_or(true),
             fallback_on_rate_limit: m.fallback_on_rate_limit.unwrap_or(true),
             fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
+            fallback_realtime_on_status: m.fallback_realtime_on_status,
             fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
             fallback_max_attempts: m.fallback_max_attempts,
             backoff_enabled: m.backoff_enabled,
@@ -327,15 +329,15 @@ impl<'c> Repository for Deployments<'c> {
                 sanitize_responses, trusted, allowed_batch_completion_windows,
                 metadata,
                 backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
-                reasoning_translation_overrides, first_token_timeout_ms, aimd
+                reasoning_translation_overrides, first_token_timeout_ms, aimd, fallback_realtime_on_status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, COALESCE($41, '{}'))
             RETURNING id, model_name, alias, display_name, description,
                 type, capabilities, created_by, hosted_on, status,
                 last_sync, deleted, created_at, updated_at, requests_per_second,
                 burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode,
                 downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
-                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement,
+                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement,
                 fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
                 backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, reasoning_translation_overrides,
                 allowed_batch_completion_windows, metadata, provisioning_source
@@ -387,6 +389,7 @@ impl<'c> Repository for Deployments<'c> {
         .bind(reasoning_translation_overrides)
         .bind(request.first_token_timeout_ms)
         .bind(request.aimd.as_ref().map(Json))
+        .bind(request.fallback_realtime_on_status.as_deref())
         .fetch_one(&mut *self.db)
         .await?;
 
@@ -403,7 +406,7 @@ impl<'c> Repository for Deployments<'c> {
     #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
         let model = sqlx::query_as::<_, DeployedModel>(
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = $1",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = $1",
         )
             .bind(id)
             .fetch_optional(&mut *self.db)
@@ -428,7 +431,7 @@ impl<'c> Repository for Deployments<'c> {
         }
 
         let deployments = sqlx::query_as::<_, DeployedModel>(
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = ANY($1)",
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = ANY($1)",
         )
             .bind(ids.as_slice())
             .fetch_all(&mut *self.db)
@@ -629,6 +632,7 @@ impl<'c> Repository for Deployments<'c> {
 
             first_token_timeout_ms = CASE WHEN $57 THEN $58 ELSE first_token_timeout_ms END,
             aimd = CASE WHEN $59 THEN $60 ELSE aimd END,
+            fallback_realtime_on_status = COALESCE($61, fallback_realtime_on_status),
             updated_at = NOW()
         WHERE id = $1
         RETURNING id, model_name, alias, display_name, description,
@@ -636,7 +640,7 @@ impl<'c> Repository for Deployments<'c> {
                 last_sync, deleted, created_at, updated_at, requests_per_second,
                 burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode,
                 downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
-                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement,
+                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement,
                 fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
                 backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, reasoning_translation_overrides,
                 allowed_batch_completion_windows, metadata, provisioning_source
@@ -708,6 +712,7 @@ impl<'c> Repository for Deployments<'c> {
         .bind(request.first_token_timeout_ms.flatten())
         .bind(request.aimd.is_some())
         .bind(request.aimd.as_ref().and_then(Option::as_ref).map(Json))
+        .bind(request.fallback_realtime_on_status.as_deref())
         .fetch_one(&mut *self.db)
         .await?;
 
@@ -733,7 +738,7 @@ impl<'c> Repository for Deployments<'c> {
                 dm.last_sync, dm.deleted, dm.created_at, dm.updated_at, dm.requests_per_second,
                 dm.burst_size, dm.capacity, dm.batch_capacity, dm.throughput, dm.downstream_pricing_mode,
                 dm.downstream_input_price_per_token, dm.downstream_output_price_per_token, dm.downstream_hourly_rate, dm.downstream_input_token_cost_ratio, dm.is_composite,
-                dm.lb_strategy, dm.fallback_enabled, dm.fallback_on_rate_limit, dm.fallback_on_status, dm.fallback_with_replacement,
+                dm.lb_strategy, dm.fallback_enabled, dm.fallback_on_rate_limit, dm.fallback_on_status, dm.fallback_realtime_on_status, dm.fallback_with_replacement,
                 dm.fallback_max_attempts, dm.backoff_enabled, dm.backoff_initial_ms, dm.backoff_max_ms, dm.backoff_factor,
                 dm.backoff_jitter, dm.backoff_max_total_ms, dm.first_token_timeout_ms, dm.aimd, dm.sanitize_responses, dm.trusted, dm.reasoning_translation_overrides,
                 dm.allowed_batch_completion_windows, dm.metadata, dm.provisioning_source
@@ -4693,6 +4698,46 @@ mod tests {
         };
         tx.commit().await.unwrap();
         result
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn realtime_fallback_backfill_follows_server_error_failover(pool: PgPool) {
+        let migrator = crate::migrator();
+        let (before, backfill): (Vec<_>, Vec<_>) = migrator.iter().partition(|migration| migration.version < 145);
+        for migration in before {
+            sqlx::raw_sql(migration.sql.as_ref()).execute(&pool).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO deployed_models (model_name, alias, created_by, is_composite, fallback_on_status) VALUES
+                ('explicit', 'explicit', '00000000-0000-0000-0000-000000000000', TRUE, '{429,503}'),
+                ('class', 'class', '00000000-0000-0000-0000-000000000000', TRUE, '{5}'),
+                ('inherited', 'inherited', '00000000-0000-0000-0000-000000000000', TRUE, NULL),
+                ('no-5xx', 'no-5xx', '00000000-0000-0000-0000-000000000000', TRUE, '{429,499}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let backfill = backfill.first().expect("realtime fallback migration");
+        assert_eq!(backfill.version, 145);
+        sqlx::raw_sql(backfill.sql.as_ref()).execute(&pool).await.unwrap();
+
+        let statuses: BTreeMap<String, Vec<i32>> =
+            sqlx::query_as::<_, (String, Vec<i32>)>("SELECT alias, fallback_realtime_on_status FROM deployed_models")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+        let expected: BTreeMap<String, Vec<i32>> = [
+            ("class", vec![529]),
+            ("explicit", vec![529]),
+            ("inherited", vec![529]),
+            ("no-5xx", vec![]),
+        ]
+        .into_iter()
+        .map(|(alias, statuses)| (alias.to_string(), statuses))
+        .collect();
+        assert_eq!(statuses, expected);
     }
 
     #[sqlx::test]

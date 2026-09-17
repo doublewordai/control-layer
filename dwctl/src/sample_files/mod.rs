@@ -197,6 +197,7 @@ mod tests {
             fallback_enabled: true,
             fallback_on_rate_limit: true,
             fallback_on_status: vec![429, 499, 500, 502, 503, 504],
+            fallback_realtime_on_status: Vec::new(),
             fallback_with_replacement: false,
             fallback_max_attempts: None,
             backoff_enabled: false,

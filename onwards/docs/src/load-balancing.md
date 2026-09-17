@@ -36,6 +36,7 @@ Controls automatic retry on other providers when requests fail:
 |--------|------|---------|-------------|
 | `enabled` | bool | `false` | Master switch for fallback |
 | `on_status` | int[] | -- | Status codes that trigger fallback (supports wildcards) |
+| `realtime_on_status` | int[] | `[]` | Extra statuses that trigger fallback for realtime requests only |
 | `on_rate_limit` | bool | `false` | Fallback when hitting local rate limits |
 | `first_token_timeout_ms` | int | -- | Failover deadline for the first token of a streamed response; `0` disables (see below) |
 
@@ -227,9 +228,9 @@ sampling limits, reload behavior and rollout.
 
 ### Realtime-only failover statuses
 
-`AppState::with_realtime_fallback_statuses` adds statuses that fail a request over
-to the next provider only when the request is realtime — it lacks the header set
-with `AppState::with_first_token_timeout_exempt_header` — in any pool with
-fallback enabled, on top of `fallback.on_status`. Use it for a provider's
-over-capacity status: realtime callers are rerouted, while dispatched traffic that
-runs its own retries receives the upstream response.
+`fallback.realtime_on_status` adds statuses that fail a request over to the next
+provider only when the request is realtime — it lacks the header set with
+`AppState::with_first_token_timeout_exempt_header` — on top of `fallback.on_status`.
+It accepts the same wildcards. Use it for a provider's over-capacity status:
+realtime callers are rerouted, while dispatched traffic that runs its own retries
+receives the upstream response.

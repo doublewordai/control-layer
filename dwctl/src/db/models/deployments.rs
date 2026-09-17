@@ -410,6 +410,10 @@ pub struct FallbackConfig {
     /// HTTP status codes that trigger fallback (default: [429, 499, 500, 502, 503, 504])
     #[serde(default = "default_fallback_status_codes")]
     pub on_status: Vec<i32>,
+    /// Extra HTTP status codes that trigger fallback for realtime traffic only
+    /// (default: []). Batch, flex and background requests run their own retries.
+    #[serde(default)]
+    pub realtime_on_status: Vec<i32>,
     /// When true, weighted random failover samples with replacement (default: false)
     #[serde(default)]
     pub with_replacement: bool,
@@ -436,6 +440,7 @@ impl FallbackConfig {
             enabled: true,
             on_rate_limit: true,
             on_status: default_fallback_status_codes(),
+            realtime_on_status: Vec::new(),
             with_replacement: false,
             max_attempts: None,
             backoff: None,
@@ -571,6 +576,7 @@ pub struct DeploymentCreateDBRequest {
     pub fallback_enabled: Option<bool>,
     pub fallback_on_rate_limit: Option<bool>,
     pub fallback_on_status: Option<Vec<i32>>,
+    pub fallback_realtime_on_status: Option<Vec<i32>>,
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<i32>,
     /// Inter-attempt backoff flag (defaults to false: legacy zero-delay).
@@ -670,6 +676,7 @@ impl DeploymentCreateDBRequest {
                 .fallback_enabled(composite.fallback_enabled)
                 .fallback_on_rate_limit(composite.fallback_on_rate_limit)
                 .fallback_on_status(composite.fallback_on_status)
+                .fallback_realtime_on_status(composite.fallback_realtime_on_status)
                 .fallback_with_replacement(composite.fallback_with_replacement)
                 .maybe_fallback_max_attempts(composite.fallback_max_attempts)
                 .backoff_enabled(composite.backoff_enabled)
@@ -713,6 +720,7 @@ pub struct DeploymentUpdateDBRequest {
     pub fallback_enabled: Option<bool>,
     pub fallback_on_rate_limit: Option<bool>,
     pub fallback_on_status: Option<Vec<i32>>,
+    pub fallback_realtime_on_status: Option<Vec<i32>>,
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<Option<i32>>,
     /// Toggle inter-attempt backoff (None = no change).
@@ -757,6 +765,7 @@ impl From<DeployedModelUpdate> for DeploymentUpdateDBRequest {
             .maybe_fallback_enabled(update.fallback_enabled)
             .maybe_fallback_on_rate_limit(update.fallback_on_rate_limit)
             .maybe_fallback_on_status(update.fallback_on_status)
+            .maybe_fallback_realtime_on_status(update.fallback_realtime_on_status)
             .maybe_fallback_with_replacement(update.fallback_with_replacement)
             .maybe_fallback_max_attempts(update.fallback_max_attempts)
             .maybe_backoff_enabled(update.backoff_enabled)
@@ -829,6 +838,7 @@ pub struct DeploymentDBResponse {
     pub fallback_enabled: bool,
     pub fallback_on_rate_limit: bool,
     pub fallback_on_status: Vec<i32>,
+    pub fallback_realtime_on_status: Vec<i32>,
     pub fallback_with_replacement: bool,
     pub fallback_max_attempts: Option<i32>,
     /// Inter-attempt backoff fields (mirrored from deployed_models columns).
@@ -902,6 +912,7 @@ mod backoff_derivation_tests {
 
         assert_eq!(request.fallback_on_rate_limit, Some(true));
         assert_eq!(request.fallback_on_status, Some(vec![499, 500, 502, 503, 504]));
+        assert_eq!(request.fallback_realtime_on_status, Some(vec![529]));
     }
 
     // Regression guard for the headline invariant: a single-provider model

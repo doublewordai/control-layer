@@ -732,6 +732,9 @@ const EditRoutingModal: React.FC<{
   const [fallbackOn5xx, setFallbackOn5xx] = useState(
     model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false,
   );
+  const [fallbackOnRealtime529, setFallbackOnRealtime529] = useState(
+    model.fallback?.realtime_on_status?.includes(529) ?? false,
+  );
   const [withReplacement, setWithReplacement] = useState(
     model.fallback?.with_replacement ?? false
   );
@@ -752,6 +755,9 @@ const EditRoutingModal: React.FC<{
     setFallbackOn5xx(
       model.fallback?.on_status?.some((s) => s >= 500 && s < 600) ?? false,
     );
+    setFallbackOnRealtime529(
+      model.fallback?.realtime_on_status?.includes(529) ?? false,
+    );
     setWithReplacement(model.fallback?.with_replacement ?? false);
     setMaxAttempts(model.fallback?.max_attempts ?? null);
   }, [model]);
@@ -765,6 +771,8 @@ const EditRoutingModal: React.FC<{
       on499: fallbackOn499,
       on404: fallbackOn404,
       on5xx: fallbackOn5xx,
+      originalRealtimeStatuses: model.fallback?.realtime_on_status ?? [],
+      onRealtime529: fallbackOnRealtime529,
       withReplacement,
       maxAttempts,
     });
@@ -918,6 +926,22 @@ const EditRoutingModal: React.FC<{
                   <Switch
                     checked={fallbackOn5xx}
                     onCheckedChange={setFallbackOn5xx}
+                  />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label className="text-sm">
+                      Overloaded (529, realtime only)
+                    </Label>
+                    <p className="text-xs text-gray-500">
+                      When the provider sheds load. Batch requests retry instead
+                    </p>
+                  </div>
+                  <Switch
+                    aria-label="Overloaded (529, realtime only)"
+                    checked={fallbackOnRealtime529}
+                    onCheckedChange={setFallbackOnRealtime529}
                   />
                 </div>
 
@@ -1240,6 +1264,9 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
         fallbackTriggers.push(`Status codes: ${otherErrors.join(", ")}`);
       }
     }
+    if (model.fallback.realtime_on_status?.includes(529)) {
+      fallbackTriggers.push("Overloaded (529, realtime only)");
+    }
   }
 
   return (
@@ -1313,6 +1340,11 @@ export const ProvidersTab: React.FC<ProvidersTabProps> = ({
                         <p>
                           <strong>Server errors (5xx):</strong> The upstream
                           provider returned a server error.
+                        </p>
+                        <p>
+                          <strong>Overloaded (529, realtime only):</strong> The
+                          provider is shedding load. Only realtime requests fail
+                          over; batch requests retry on their own schedule.
                         </p>
                       </div>
                     </HoverCardContent>
