@@ -145,10 +145,12 @@ struct SetupSessionCopy<'a> {
     /// Description recorded on the SetupIntent, for reconciliation in Stripe.
     setup_intent_description: &'a str,
     purpose: SetupPurpose,
-    /// Payment method types Checkout offers. Verification is cards and Link
-    /// only: a SEPA mandate needs nothing but an IBAN, and in September 2026
-    /// one IBAN verified 178 bot accounts. Auto top-up keeps SEPA because a
-    /// verified customer may genuinely want to be debited that way.
+    /// Payment method types Checkout offers. Verification is cards only: a
+    /// SEPA mandate needs nothing but an IBAN, and in September 2026 one IBAN
+    /// verified 178 bot accounts; a Link payment method carries no
+    /// fingerprint, so the one-instrument-one-account rule could not be
+    /// applied to it. Auto top-up keeps Link and SEPA because a verified
+    /// customer may genuinely want to pay that way.
     payment_method_types: Vec<CreateCheckoutSessionPaymentMethodTypes>,
 }
 
@@ -451,21 +453,29 @@ impl StripeProvider {
                 .and_then(|card| card.fingerprint.clone())
                 .or_else(|| pm.sepa_debit.as_ref().and_then(|sepa| sepa.fingerprint.clone()))
         });
-        let claimed_by_other = match instrument_fingerprint.as_deref() {
-            Some(fingerprint) => {
-                let owner = Credits::new(&mut *conn)
-                    .claim_verification_instrument(fingerprint, target_id)
-                    .await?;
-                (owner != target_id).then_some(owner)
-            }
-            None => {
-                tracing::warn!(
-                    session_id,
-                    "Setup session payment method has no fingerprint; instrument reuse cannot be checked"
-                );
-                None
-            }
+        // No fingerprint means the claim cannot be made, so verification
+        // cannot be granted: fail closed. The verification Checkout only
+        // offers cards, which always carry one, so this is a malformed or
+        // unexpanded session (or an auto top-up enrolment with Link or SEPA,
+        // which is saved but does not verify).
+        let Some(fingerprint) = instrument_fingerprint.as_deref() else {
+            tracing::warn!(
+                session_id,
+                target_id = %target_id,
+                purpose = purpose.as_str(),
+                "Setup session payment method has no fingerprint; not verifying"
+            );
+            return match purpose {
+                SetupPurpose::Verification => Err(PaymentError::InvalidData(
+                    "Payment method has no fingerprint; verification requires a card".to_string(),
+                )),
+                SetupPurpose::AutoTopup => Ok(()),
+            };
         };
+        let owner = Credits::new(&mut *conn)
+            .claim_verification_instrument(fingerprint, target_id)
+            .await?;
+        let claimed_by_other = (owner != target_id).then_some(owner);
         if let Some(owner) = claimed_by_other {
             tracing::warn!(
                 session_id,
@@ -909,10 +919,7 @@ impl PaymentProvider for StripeProvider {
                 submit_label: "Verify payment method",
                 setup_intent_description: "Payment method verification",
                 purpose: SetupPurpose::Verification,
-                payment_method_types: vec![
-                    CreateCheckoutSessionPaymentMethodTypes::Card,
-                    CreateCheckoutSessionPaymentMethodTypes::Link,
-                ],
+                payment_method_types: vec![CreateCheckoutSessionPaymentMethodTypes::Card],
             },
         )
         .await
