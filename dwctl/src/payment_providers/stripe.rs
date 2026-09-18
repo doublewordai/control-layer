@@ -101,6 +101,36 @@ impl From<crate::config::StripeConfig> for StripeProvider {
     }
 }
 
+/// What a setup-mode Checkout is for. Recorded on the SetupIntent as
+/// `metadata.purpose` so the completed session can be told apart again:
+/// `checkout.session.completed` arrives for both kinds, and only verification
+/// is subject to the one-instrument-one-account rule.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SetupPurpose {
+    Verification,
+    AutoTopup,
+}
+
+impl SetupPurpose {
+    const METADATA_KEY: &'static str = "purpose";
+
+    fn as_str(self) -> &'static str {
+        match self {
+            SetupPurpose::Verification => "verification",
+            SetupPurpose::AutoTopup => "auto_topup",
+        }
+    }
+
+    /// Sessions created before the purpose was recorded carry no metadata;
+    /// treat those as verification, the stricter reading.
+    fn from_metadata(metadata: Option<&HashMap<String, String>>) -> Self {
+        match metadata.and_then(|m| m.get(Self::METADATA_KEY)).map(String::as_str) {
+            Some("auto_topup") => SetupPurpose::AutoTopup,
+            _ => SetupPurpose::Verification,
+        }
+    }
+}
+
 /// The only things that differ between our two setup-mode checkouts.
 ///
 /// Both save a card for later off-session use and are otherwise identical
@@ -114,6 +144,7 @@ struct SetupSessionCopy<'a> {
     submit_label: &'a str,
     /// Description recorded on the SetupIntent, for reconciliation in Stripe.
     setup_intent_description: &'a str,
+    purpose: SetupPurpose,
     /// Payment method types Checkout offers. Verification is cards and Link
     /// only: a SEPA mandate needs nothing but an IBAN, and in September 2026
     /// one IBAN verified 178 bot accounts. Auto top-up keeps SEPA because a
@@ -165,7 +196,10 @@ impl StripeProvider {
             .payment_method_types(copy.payment_method_types.clone())
             .setup_intent_data(CreateCheckoutSessionSetupIntentData {
                 description: Some(copy.setup_intent_description.to_string()),
-                metadata: None,
+                metadata: Some(HashMap::from([(
+                    SetupPurpose::METADATA_KEY.to_string(),
+                    copy.purpose.as_str().to_string(),
+                )])),
                 on_behalf_of: None,
             });
 
@@ -401,40 +435,64 @@ impl StripeProvider {
             {
                 tracing::debug!("Saved newly created stripe ID {} for user ID {}", provider_id, target_id);
             }
-
-            // A verified card clears the unverified rate-limit tier in onwards,
-            // same as a completed purchase does.
-            users.set_verified(target_id).await?;
         }
 
-        // Signup credits. Best-effort by the same reasoning as the first-payment
-        // match: verification is the thing that must stick, and a failed freebie
-        // is not worth undoing it. This path isn't retried once verification has
-        // landed, so the error log is the signal to grant manually.
-        // Stripe's fingerprint identifies the card or bank account across
-        // customers; it is what stops one instrument funding many accounts.
-        // Only present on the expanded payment method, which
-        // `get_setup_session` requests.
+        // One instrument verifies one account. Stripe's fingerprint identifies
+        // the card or bank account across customers, and is only present on
+        // the expanded payment method (`get_setup_session` requests it). The
+        // first account to complete a setup session with an instrument claims
+        // it; any other account presenting the same instrument is not verified
+        // and gets no credits, whatever the session was for. The instrument
+        // itself stays attached to their customer and can pay for top-ups.
+        let purpose = SetupPurpose::from_metadata(setup_intent.metadata.as_ref());
         let instrument_fingerprint = setup_intent.payment_method.as_ref().and_then(|pm| pm.as_object()).and_then(|pm| {
             pm.card
                 .as_ref()
                 .and_then(|card| card.fingerprint.clone())
                 .or_else(|| pm.sepa_debit.as_ref().and_then(|sepa| sepa.fingerprint.clone()))
         });
-        if instrument_fingerprint.is_none() {
+        let claimed_by_other = match instrument_fingerprint.as_deref() {
+            Some(fingerprint) => {
+                let owner = Credits::new(&mut *conn)
+                    .claim_verification_instrument(fingerprint, target_id)
+                    .await?;
+                (owner != target_id).then_some(owner)
+            }
+            None => {
+                tracing::warn!(
+                    session_id,
+                    "Setup session payment method has no fingerprint; instrument reuse cannot be checked"
+                );
+                None
+            }
+        };
+        if let Some(owner) = claimed_by_other {
             tracing::warn!(
                 session_id,
-                "Setup session payment method has no fingerprint; verification credits keyed on payee only"
+                target_id = %target_id,
+                owner = %owner,
+                purpose = purpose.as_str(),
+                "Payment instrument has already verified another account; not verifying this one"
             );
+            return match purpose {
+                // The user asked to be verified and was not: tell them.
+                SetupPurpose::Verification => Err(PaymentError::InstrumentAlreadyUsed),
+                // Enrolment succeeded (the instrument is saved and default);
+                // only the verification side effects are withheld.
+                SetupPurpose::AutoTopup => Ok(()),
+            };
         }
 
+        // A verified card clears the unverified rate-limit tier in onwards,
+        // same as a completed purchase does.
+        crate::db::handlers::users::Users::new(&mut *conn).set_verified(target_id).await?;
+
+        // Signup credits. Best-effort by the same reasoning as the first-payment
+        // match: verification is the thing that must stick, and a failed freebie
+        // is not worth undoing it. This path isn't retried once verification has
+        // landed, so the error log is the signal to grant manually.
         if let Err(e) = Credits::new(&mut *conn)
-            .grant_verification_credits(
-                credits_config.verification_credits,
-                target_id,
-                session_id,
-                instrument_fingerprint.as_deref(),
-            )
+            .grant_verification_credits(credits_config.verification_credits, target_id, session_id)
             .await
         {
             tracing::error!(
@@ -850,6 +908,7 @@ impl PaymentProvider for StripeProvider {
                     .or(self.config.auto_topup_terms_of_service_text.as_deref()),
                 submit_label: "Verify payment method",
                 setup_intent_description: "Payment method verification",
+                purpose: SetupPurpose::Verification,
                 payment_method_types: vec![
                     CreateCheckoutSessionPaymentMethodTypes::Card,
                     CreateCheckoutSessionPaymentMethodTypes::Link,
@@ -868,6 +927,7 @@ impl PaymentProvider for StripeProvider {
                 terms_of_service_text: self.config.auto_topup_terms_of_service_text.as_deref(),
                 submit_label: "Set up auto top-up",
                 setup_intent_description: "Auto top-up setup",
+                purpose: SetupPurpose::AutoTopup,
                 payment_method_types: vec![
                     CreateCheckoutSessionPaymentMethodTypes::Card,
                     CreateCheckoutSessionPaymentMethodTypes::Link,
@@ -1112,6 +1172,23 @@ mod tests {
             }),
             409,
         )
+    }
+
+    #[test]
+    fn test_instrument_already_used_is_a_conflict_for_direct_callers() {
+        // The front-channel caller must learn that this card cannot verify
+        // them; the webhook acks it separately so Stripe stops redelivering.
+        let status: axum::http::StatusCode = PaymentError::InstrumentAlreadyUsed.into();
+        assert_eq!(status, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn test_setup_purpose_round_trips_and_defaults_to_verification() {
+        let meta = HashMap::from([(SetupPurpose::METADATA_KEY.to_string(), "auto_topup".to_string())]);
+        assert_eq!(SetupPurpose::from_metadata(Some(&meta)), SetupPurpose::AutoTopup);
+        let meta = HashMap::from([(SetupPurpose::METADATA_KEY.to_string(), "verification".to_string())]);
+        assert_eq!(SetupPurpose::from_metadata(Some(&meta)), SetupPurpose::Verification);
+        assert_eq!(SetupPurpose::from_metadata(None), SetupPurpose::Verification);
     }
 
     #[test]

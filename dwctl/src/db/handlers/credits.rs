@@ -14,7 +14,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgConnection};
 use std::collections::{HashMap, HashSet};
-use tracing::{instrument, trace, warn};
+use tracing::{instrument, trace};
 use uuid::Uuid;
 
 // Database entity model for credit transaction
@@ -392,35 +392,12 @@ impl<'c> Credits<'c> {
     /// Recorded as an `admin_grant` via `create_transaction`, so it fires the
     /// balance-restored notify like any other credit.
     ///
-    /// `instrument_fingerprint` is Stripe's fingerprint of the verified payment
-    /// method: the same card or bank account yields the same fingerprint on
-    /// every customer. The first account to verify with an instrument claims it
-    /// in `verification_instruments`; a later account verifying with the same
-    /// instrument is still verified but receives no credits. Without this, one
-    /// IBAN funded 178 accounts in September 2026. `None` (no fingerprint on
-    /// the payment method, e.g. Link) falls back to the per-payee key alone.
+    /// Whether the payee may be verified at all is decided before this is
+    /// called: see `claim_verification_instrument`.
     #[instrument(skip(self), fields(payee = %abbrev_uuid(&payee), amount = %amount), err)]
-    pub async fn grant_verification_credits(
-        &mut self,
-        amount: Decimal,
-        payee: UserId,
-        setup_source_id: &str,
-        instrument_fingerprint: Option<&str>,
-    ) -> Result<()> {
+    pub async fn grant_verification_credits(&mut self, amount: Decimal, payee: UserId, setup_source_id: &str) -> Result<()> {
         if amount <= Decimal::ZERO {
             return Ok(());
-        }
-
-        if let Some(fingerprint) = instrument_fingerprint {
-            let owner = self.claim_verification_instrument(fingerprint, payee).await?;
-            if owner != payee {
-                warn!(
-                    owner = %abbrev_uuid(&owner),
-                    setup_source_id,
-                    "Payment instrument already claimed verification credits for another account; verified without credits"
-                );
-                return Ok(());
-            }
         }
 
         let request = CreditTransactionCreateDBRequest {
@@ -441,11 +418,18 @@ impl<'c> Credits<'c> {
         Ok(())
     }
 
-    /// Record `payee` as the owner of a verified payment instrument and return
-    /// whoever owns it afterwards: `payee` when it was unclaimed or already
-    /// theirs, otherwise the earlier claimant. Two statements rather than one
-    /// CTE so a concurrent first claim is visible to the loser's read.
-    async fn claim_verification_instrument(&mut self, fingerprint: &str, payee: UserId) -> Result<UserId> {
+    /// Record `payee` as the account verified by a payment instrument and
+    /// return whoever holds it afterwards: `payee` when it was unclaimed or
+    /// already theirs, otherwise the earlier claimant.
+    ///
+    /// `fingerprint` is Stripe's fingerprint of the payment method: the same
+    /// card or bank account yields the same value on every customer. One
+    /// instrument verifies one account. It can still pay for top-ups on any
+    /// account; only verification consults this table. Rows are never
+    /// deleted, so a scrubbed-and-recreated account cannot claim again.
+    /// Two statements rather than one CTE so a concurrent first claim is
+    /// visible to the loser's read.
+    pub async fn claim_verification_instrument(&mut self, fingerprint: &str, payee: UserId) -> Result<UserId> {
         sqlx::query("INSERT INTO verification_instruments (fingerprint, user_id) VALUES ($1, $2) ON CONFLICT (fingerprint) DO NOTHING")
             .bind(fingerprint)
             .bind(payee)
@@ -2511,7 +2495,7 @@ mod tests {
         assert_eq!(verification_grant_amount(&pool, user).await, None);
 
         credits
-            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, "cs_setup_1", None)
+            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, "cs_setup_1")
             .await
             .unwrap();
 
@@ -2527,10 +2511,7 @@ mod tests {
         let mut conn = pool.acquire().await.unwrap();
         let mut credits = Credits::new(&mut conn);
 
-        credits
-            .grant_verification_credits(Decimal::ZERO, user, "cs_setup_1", None)
-            .await
-            .unwrap();
+        credits.grant_verification_credits(Decimal::ZERO, user, "cs_setup_1").await.unwrap();
 
         assert_eq!(verification_grant_amount(&pool, user).await, None);
     }
@@ -2545,7 +2526,7 @@ mod tests {
 
         for _ in 0..3 {
             credits
-                .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, "cs_setup_1", None)
+                .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, "cs_setup_1")
                 .await
                 .unwrap();
         }
@@ -2562,11 +2543,11 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         credits
-            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, "cs_setup_1", None)
+            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, "cs_setup_1")
             .await
             .unwrap();
         credits
-            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, "cs_setup_2", None)
+            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, "cs_setup_2")
             .await
             .unwrap();
 
@@ -2598,7 +2579,7 @@ mod tests {
             async move {
                 let mut conn = pool.acquire().await.unwrap();
                 Credits::new(&mut conn)
-                    .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, &format!("cs_setup_{i}"), None)
+                    .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, &format!("cs_setup_{i}"))
                     .await
             }
         }))
@@ -2618,11 +2599,11 @@ mod tests {
         let mut credits = Credits::new(&mut conn);
 
         credits
-            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), first, "cs_setup_1", None)
+            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), first, "cs_setup_1")
             .await
             .unwrap();
         credits
-            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), second, "cs_setup_2", None)
+            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), second, "cs_setup_2")
             .await
             .unwrap();
 
@@ -2631,70 +2612,39 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_verification_credits_denied_when_instrument_already_claimed(pool: PgPool) {
+    async fn test_instrument_claim_goes_to_first_account(pool: PgPool) {
         let first = create_test_user(&pool).await;
         let second = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
         let mut credits = Credits::new(&mut conn);
 
-        credits
-            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), first, "cs_setup_1", Some("fp_shared"))
-            .await
-            .unwrap();
-        credits
-            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), second, "cs_setup_2", Some("fp_shared"))
-            .await
-            .unwrap();
-
-        assert_eq!(verification_grant_count(&pool, first).await, 1);
+        assert_eq!(credits.claim_verification_instrument("fp_shared", first).await.unwrap(), first);
         assert_eq!(
-            verification_grant_count(&pool, second).await,
-            0,
-            "a reused instrument must not fund a second account"
+            credits.claim_verification_instrument("fp_shared", second).await.unwrap(),
+            first,
+            "a second account presenting the same instrument must see the first claimant"
         );
-
-        // The instrument stays with its first claimant.
-        let owner: Uuid = sqlx::query_scalar("SELECT user_id FROM verification_instruments WHERE fingerprint = $1")
-            .bind("fp_shared")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(owner, first);
     }
 
     #[sqlx::test]
-    async fn test_verification_credits_same_instrument_same_user_is_idempotent(pool: PgPool) {
+    async fn test_instrument_claim_is_idempotent_for_the_owner(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
         let mut credits = Credits::new(&mut conn);
 
-        for session in ["cs_setup_1", "cs_setup_2"] {
-            credits
-                .grant_verification_credits(Decimal::from_str("25.0").unwrap(), user, session, Some("fp_mine"))
-                .await
-                .unwrap();
+        for _ in 0..3 {
+            assert_eq!(credits.claim_verification_instrument("fp_mine", user).await.unwrap(), user);
         }
-
-        assert_eq!(verification_grant_count(&pool, user).await, 1);
     }
 
     #[sqlx::test]
-    async fn test_verification_credits_distinct_instruments_distinct_users(pool: PgPool) {
+    async fn test_instrument_claims_are_independent(pool: PgPool) {
         let first = create_test_user(&pool).await;
         let second = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
         let mut credits = Credits::new(&mut conn);
 
-        credits
-            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), first, "cs_setup_1", Some("fp_a"))
-            .await
-            .unwrap();
-        credits
-            .grant_verification_credits(Decimal::from_str("25.0").unwrap(), second, "cs_setup_2", Some("fp_b"))
-            .await
-            .unwrap();
-
-        assert_eq!(verification_grant_count(&pool, first).await, 1);
-        assert_eq!(verification_grant_count(&pool, second).await, 1);
+        assert_eq!(credits.claim_verification_instrument("fp_a", first).await.unwrap(), first);
+        assert_eq!(credits.claim_verification_instrument("fp_b", second).await.unwrap(), second);
     }
 }
