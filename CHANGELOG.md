@@ -1,5 +1,13 @@
 # Changelog
 
+## [12.0.1](https://github.com/doublewordai/control-layer/compare/v12.0.0...v12.0.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* honor configured SSE limits in cache and continuation streams ([#1816](https://github.com/doublewordai/control-layer/issues/1816)) ([7f823cc](https://github.com/doublewordai/control-layer/commit/7f823cc299f0f227bb2e0ad5f6c4cf2a3bbd33e6))
+* keep image prefix cache identity stable across flex/batch dispat… ([#1806](https://github.com/doublewordai/control-layer/issues/1806)) ([b41cf6d](https://github.com/doublewordai/control-layer/commit/b41cf6d72a1ae7fa252b09f93b7c82036001bb68))
+
 ## [12.0.0](https://github.com/doublewordai/control-layer/compare/v11.17.1...v12.0.0) (2026-09-17)
 
 
