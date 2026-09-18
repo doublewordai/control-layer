@@ -28,9 +28,14 @@ interface EditUserModalProps {
     avatar?: string;
     roles: Role[];
     zero_data_retention: boolean;
+    granted_serving_classes?: string[];
+    default_serving_class?: string | null;
+    self_hosted_only?: boolean;
   };
   /** Whether the current user may toggle zero data retention (admins only). */
   canEditZdr?: boolean;
+  /** Whether the current user may change the serving account settings (platform managers only). */
+  canEditServing?: boolean;
 }
 
 export const EditUserModal: React.FC<EditUserModalProps> = ({
@@ -40,12 +45,16 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
   userId,
   currentUser,
   canEditZdr = false,
+  canEditServing = false,
 }) => {
   const [formData, setFormData] = useState({
     display_name: currentUser.name,
     avatar_url: currentUser.avatar || "",
     roles: currentUser.roles,
     zero_data_retention: currentUser.zero_data_retention,
+    granted_serving_classes: currentUser.granted_serving_classes ?? [],
+    default_serving_class: currentUser.default_serving_class ?? "standard",
+    self_hosted_only: currentUser.self_hosted_only ?? false,
   });
   const [error, setError] = useState<string | null>(null);
 
@@ -66,6 +75,17 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
           // edit it, otherwise dwctl rejects the whole request with a 403.
           ...(canEditZdr
             ? { zero_data_retention: formData.zero_data_retention }
+            : {}),
+          // Serving settings are platform-manager only server-side.
+          ...(canEditServing
+            ? {
+                granted_serving_classes: formData.granted_serving_classes,
+                default_serving_class:
+                  formData.default_serving_class === "standard"
+                    ? null
+                    : formData.default_serving_class,
+                self_hosted_only: formData.self_hosted_only,
+              }
             : {}),
         },
       });
@@ -264,6 +284,80 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                 aria-label="Toggle zero data retention"
               />
             </div>
+            )}
+
+            {canEditServing && (
+              <div className="space-y-3 border-t pt-4">
+                <p className="text-sm font-medium text-gray-700">
+                  Serving (platform managers only)
+                </p>
+                <div className="flex gap-4">
+                  {(["interactive", "throughput"] as const).map((c) => (
+                    <label key={c} className="flex items-center gap-2 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={formData.granted_serving_classes.includes(c)}
+                        onChange={(e) =>
+                          setFormData((prev) => ({
+                            ...prev,
+                            granted_serving_classes: e.target.checked
+                              ? Array.from(
+                                  new Set([...prev.granted_serving_classes, c]),
+                                )
+                              : prev.granted_serving_classes.filter(
+                                  (x) => x !== c,
+                                ),
+                          }))
+                        }
+                        aria-label={`Grant ${c}`}
+                      />
+                      {c}
+                    </label>
+                  ))}
+                </div>
+                <div className="flex items-center justify-between gap-4">
+                  <label
+                    htmlFor="default_serving_class"
+                    className="text-sm text-gray-700"
+                  >
+                    Default class
+                  </label>
+                  <select
+                    id="default_serving_class"
+                    className="h-9 rounded-md border border-gray-300 bg-white px-3 text-sm"
+                    value={formData.default_serving_class}
+                    onChange={(e) =>
+                      setFormData((prev) => ({
+                        ...prev,
+                        default_serving_class: e.target.value,
+                      }))
+                    }
+                  >
+                    <option value="standard">standard</option>
+                    <option value="interactive">interactive</option>
+                    <option value="throughput">throughput</option>
+                  </select>
+                </div>
+                <div className="flex items-center justify-between gap-4">
+                  <label
+                    htmlFor="self_hosted_only"
+                    className="text-sm text-gray-700"
+                  >
+                    Self-hosted only
+                  </label>
+                  <Switch
+                    id="self_hosted_only"
+                    checked={formData.self_hosted_only}
+                    onCheckedChange={(checked) =>
+                      setFormData((prev) => ({
+                        ...prev,
+                        self_hosted_only: checked,
+                      }))
+                    }
+                    aria-label="Toggle self-hosted only"
+                  />
+                </div>
+              </div>
             )}
 
             <div className="bg-gray-50 rounded-lg p-3">

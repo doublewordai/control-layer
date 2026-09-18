@@ -3,8 +3,10 @@ import { useParams, useNavigate } from "react-router-dom";
 import { useOrganization } from "@/api/control-layer/hooks";
 import { Button } from "@/components/ui/button";
 import { ArrowLeft } from "lucide-react";
+import { useAuthorization } from "@/utils";
 import { MemberManagement } from "./MemberManagement";
 import { EditOrganizationModal } from "./EditOrganizationModal";
+import { OrganizationServingCard } from "./OrganizationServingCard";
 import { PendingEmailChangeBadge } from "./PendingEmailChangeBadge";
 
 export function OrganizationDetail() {
@@ -12,6 +14,8 @@ export function OrganizationDetail() {
   const navigate = useNavigate();
   const { data: org, isLoading } = useOrganization(organizationId!);
   const [showEditModal, setShowEditModal] = useState(false);
+  const { hasPermission } = useAuthorization();
+  const isPlatformManager = hasPermission("users-groups");
 
   if (isLoading) {
     return (
@@ -72,10 +76,16 @@ export function OrganizationDetail() {
 
       <MemberManagement organizationId={organizationId!} />
 
+      {isPlatformManager && (
+        <OrganizationServingCard organizationId={organizationId!} />
+      )}
+
       <EditOrganizationModal
         isOpen={showEditModal}
         onClose={() => setShowEditModal(false)}
         organization={org}
+        canEditZdr={isPlatformManager}
+        canEditServing={isPlatformManager}
       />
     </div>
   );

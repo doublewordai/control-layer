@@ -976,6 +976,7 @@ impl<'c> ApiKeys<'c> {
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = dm.id
                         AND mt.valid_until IS NULL
+                        AND mt.user_id IS NULL
                         AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     )
                 )
@@ -1022,6 +1023,7 @@ impl<'c> ApiKeys<'c> {
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = dm.id
                         AND mt.valid_until IS NULL
+                        AND mt.user_id IS NULL
                         AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     )
                 )
@@ -3410,6 +3412,7 @@ mod tests {
                     api_key_purpose: None,
                     completion_window: None,
                     valid_from: None,
+                    user_id: None,
                 })
                 .await
                 .unwrap();
@@ -3522,6 +3525,7 @@ mod tests {
                     api_key_purpose: None,
                     completion_window: None,
                     valid_from: None,
+                    user_id: None,
                 })
                 .await
                 .unwrap();
@@ -4207,6 +4211,7 @@ mod tests {
                     api_key_purpose: None,
                     completion_window: None,
                     valid_from: None,
+                    user_id: None,
                 })
                 .await
                 .unwrap();
@@ -4346,6 +4351,7 @@ mod tests {
                     api_key_purpose: None,
                     completion_window: None,
                     valid_from: None,
+                    user_id: None,
                 })
                 .await
                 .unwrap();

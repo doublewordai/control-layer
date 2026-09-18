@@ -285,6 +285,17 @@ export function useModelCachePricing(
   });
 }
 
+export function useModelOverlays(
+  modelId: string,
+  options?: { enabled?: boolean },
+) {
+  return useQuery({
+    queryKey: queryKeys.models.overlays(modelId),
+    queryFn: () => dwctlApi.models.overlays.list(modelId),
+    enabled: options?.enabled ?? true,
+  });
+}
+
 export function useUpdateModelCachePricing() {
   const queryClient = useQueryClient();
 
@@ -1645,6 +1656,18 @@ export function useOrganization(id: string) {
   return useQuery({
     queryKey: queryKeys.organizations.byId(id),
     queryFn: () => dwctlApi.organizations.get(id),
+    staleTime: 30 * 1000,
+  });
+}
+
+export function useOrganizationServing(
+  id: string,
+  options?: { enabled?: boolean },
+) {
+  return useQuery({
+    queryKey: queryKeys.organizations.serving(id),
+    queryFn: () => dwctlApi.organizations.serving(id),
+    enabled: options?.enabled ?? true,
     staleTime: 30 * 1000,
   });
 }

@@ -505,6 +505,7 @@ pub async fn list_deployed_models<P: PoolProvider>(
         can_read_rate_limits,
         can_read_users,
         can_read_composite_info: can_read_all_models,
+        pricing_account: Some(current_user.active_organization.unwrap_or(current_user.id)),
     };
 
     let response = enricher.enrich_many(models).await?;
@@ -711,6 +712,7 @@ pub async fn create_deployed_model<P: PoolProvider>(
                 api_key_purpose: tariff_def.api_key_purpose,
                 completion_window: tariff_def.completion_window,
                 valid_from: None, // Use NOW()
+                user_id: None,
             };
             tariffs_repo.create(&tariff_request).await?;
         }
@@ -970,6 +972,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
                 api_key_purpose: tariff_def.api_key_purpose,
                 completion_window: tariff_def.completion_window,
                 valid_from: None, // Use NOW()
+                user_id: None,
             };
             tariffs_repo.create(&tariff_request).await?;
         }
@@ -1153,6 +1156,7 @@ pub async fn get_deployed_model<P: PoolProvider>(
         can_read_rate_limits,
         can_read_users,
         can_read_composite_info: can_read_all_models,
+        pricing_account: Some(current_user.active_organization.unwrap_or(current_user.id)),
     };
 
     response = enricher.enrich_one(response).await?;

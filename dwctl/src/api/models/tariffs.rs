@@ -37,6 +37,12 @@ pub struct TariffResponse {
     /// Indicates if this tariff is currently active (valid_until IS NULL)
     #[serde(default)]
     pub is_active: bool,
+    /// Set when this is an organisation's own price rather than the model's general
+    /// price. A customer sees it only on their own organisation's rows; platform
+    /// managers see every organisation's rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = "uuid")]
+    pub organization_id: Option<Uuid>,
 }
 
 impl From<ModelTariff> for TariffResponse {
@@ -52,6 +58,7 @@ impl From<ModelTariff> for TariffResponse {
             valid_from: tariff.valid_from,
             valid_until: tariff.valid_until,
             is_active: tariff.valid_until.is_none(),
+            organization_id: tariff.user_id,
         }
     }
 }

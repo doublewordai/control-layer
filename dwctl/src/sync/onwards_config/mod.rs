@@ -797,6 +797,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = cm.id
                           AND mt.valid_until IS NULL
+                          AND mt.user_id IS NULL
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     )
                 )
@@ -826,6 +827,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                           SELECT 1 FROM model_tariffs mt
                           WHERE mt.deployed_model_id = cm.id
                             AND mt.valid_until IS NULL
+                            AND mt.user_id IS NULL
                             AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                       )
                 )
@@ -1626,6 +1628,7 @@ pub async fn load_targets_from_db(
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = dm.id
                           AND mt.valid_until IS NULL
+                          AND mt.user_id IS NULL
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     )
                 )
@@ -1655,6 +1658,7 @@ pub async fn load_targets_from_db(
                           SELECT 1 FROM model_tariffs mt
                           WHERE mt.deployed_model_id = dm.id
                             AND mt.valid_until IS NULL
+                            AND mt.user_id IS NULL
                             AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                       )
                 )

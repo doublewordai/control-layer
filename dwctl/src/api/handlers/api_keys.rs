@@ -1296,6 +1296,7 @@ mod tests {
                 output_price_per_token: rust_decimal::Decimal::new(3, 5),
                 valid_from: None,
                 completion_window: None,
+                user_id: None,
             })
             .await
             .unwrap();

@@ -2712,6 +2712,7 @@ mod tests {
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
                 completion_window: Some("24h".to_string()),
                 valid_from: None,
+                user_id: None,
             })
             .await
             .unwrap();
@@ -2726,6 +2727,7 @@ mod tests {
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
                 completion_window: Some("24h".to_string()),
                 valid_from: None,
+                user_id: None,
             })
             .await
             .unwrap();
@@ -2842,6 +2844,7 @@ mod tests {
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
                 completion_window: Some("24h".to_string()),
                 valid_from: None,
+                user_id: None,
             })
             .await
             .unwrap();
@@ -2856,6 +2859,7 @@ mod tests {
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
                 completion_window: Some("1h".to_string()),
                 valid_from: None,
+                user_id: None,
             })
             .await
             .unwrap();

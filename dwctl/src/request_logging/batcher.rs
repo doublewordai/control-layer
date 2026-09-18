@@ -679,11 +679,13 @@ where
             let (provider_name, input_price, output_price) = if let Some(ref model_alias) = raw.request_model {
                 if let Some(model_info) = model_map.get(model_alias) {
                     // Find best matching tariff
+                    // The billed account's own tariffs (an organisation's deal) come first.
                     let (input, output) = find_best_tariff(
                         &model_info.tariffs,
                         api_key_purpose.as_ref(),
                         raw.batch_completion_window.as_deref(),
                         pricing_timestamp,
+                        user_id,
                     );
 
                     (Some(model_info.provider_name.clone()), input, output)
@@ -703,7 +705,7 @@ where
                 .request_model
                 .as_deref()
                 .and_then(|alias| cache_tariff_map.get(alias))
-                .and_then(|rows| resolve_cache_multipliers(rows, pricing_timestamp));
+                .and_then(|rows| resolve_cache_multipliers(rows, pricing_timestamp, user_id));
 
             // dwctl only injects cache tokens when a tariff is active, so if no tariff was valid
             // at inference yet the response still carries cache_* tokens, those are the upstream
@@ -825,6 +827,7 @@ where
             tariff_input_price: Option<Decimal>,
             tariff_output_price: Option<Decimal>,
             tariff_completion_window: Option<String>,
+            tariff_account: Option<Uuid>,
         }
 
         // Query models with ALL their tariffs (including expired) for historical pricing
@@ -840,7 +843,8 @@ where
                 mt.valid_until as "tariff_valid_until?",
                 mt.input_price_per_token as "tariff_input_price?",
                 mt.output_price_per_token as "tariff_output_price?",
-                mt.completion_window as "tariff_completion_window?"
+                mt.completion_window as "tariff_completion_window?",
+                mt.user_id as "tariff_account?"
             FROM deployed_models dm
             LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
             LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id
@@ -874,6 +878,7 @@ where
                     input_price_per_token: input_price,
                     output_price_per_token: output_price,
                     completion_window: row.tariff_completion_window,
+                    account: row.tariff_account,
                 });
             }
         }
@@ -2168,6 +2173,7 @@ mod integration_tests {
                 output_price_per_token: output_price,
                 valid_from: None,
                 completion_window,
+                user_id: None,
             })
             .await
             .unwrap();

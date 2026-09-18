@@ -13,6 +13,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { Checkbox } from "@/components/ui/checkbox";
 import { AlertBox } from "@/components/ui/alert-box";
 import { describeWaitingOn } from "./pendingEmailChange";
 import { toast } from "sonner";
@@ -23,6 +24,8 @@ interface EditOrganizationModalProps {
   organization: Organization | null;
   /** Whether the current user may toggle zero data retention (admins only). */
   canEditZdr?: boolean;
+  /** Whether the viewer may change the serving account settings (platform managers only). */
+  canEditServing?: boolean;
 }
 
 export function EditOrganizationModal({
@@ -30,10 +33,14 @@ export function EditOrganizationModal({
   onClose,
   organization,
   canEditZdr = false,
+  canEditServing = false,
 }: EditOrganizationModalProps) {
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [zeroDataRetention, setZeroDataRetention] = useState(false);
+  const [grantedClasses, setGrantedClasses] = useState<string[]>([]);
+  const [defaultClass, setDefaultClass] = useState<string>("standard");
+  const [selfHostedOnly, setSelfHostedOnly] = useState(false);
   const updateOrg = useUpdateOrganization();
 
   useEffect(() => {
@@ -41,6 +48,9 @@ export function EditOrganizationModal({
       setEmail(organization.email || "");
       setDisplayName(organization.display_name || "");
       setZeroDataRetention(organization.zero_data_retention ?? false);
+      setGrantedClasses(organization.granted_serving_classes ?? []);
+      setDefaultClass(organization.default_serving_class ?? "standard");
+      setSelfHostedOnly(organization.self_hosted_only ?? false);
     }
   }, [organization]);
 
@@ -62,6 +72,16 @@ export function EditOrganizationModal({
           email: requestedEmail || undefined,
           ...(canEditZdr
             ? { zero_data_retention: zeroDataRetention }
+            : {}),
+          // Serving settings are platform-manager only server-side; sending
+          // them as anyone else fails the whole request with a 403.
+          ...(canEditServing
+            ? {
+                granted_serving_classes: grantedClasses,
+                default_serving_class:
+                  defaultClass === "standard" ? null : defaultClass,
+                self_hosted_only: selfHostedOnly,
+              }
             : {}),
         },
       });
@@ -148,6 +168,72 @@ export function EditOrganizationModal({
                   onCheckedChange={setZeroDataRetention}
                   aria-label="Toggle zero data retention"
                 />
+              </div>
+            )}
+            {canEditServing && (
+              <div className="grid gap-4 border-t pt-4">
+                <div className="grid gap-1">
+                  <Label>Serving classes held</Label>
+                  <p className="text-sm text-muted-foreground">
+                    A request may name one of these classes; the model must
+                    offer it too. Customers never edit this.
+                  </p>
+                  <div className="flex gap-4 pt-1">
+                    {(["interactive", "throughput"] as const).map((c) => (
+                      <label
+                        key={c}
+                        className="flex items-center gap-2 text-sm"
+                      >
+                        <Checkbox
+                          checked={grantedClasses.includes(c)}
+                          onCheckedChange={(checked) =>
+                            setGrantedClasses((prev) =>
+                              checked === true
+                                ? Array.from(new Set([...prev, c]))
+                                : prev.filter((x) => x !== c),
+                            )
+                          }
+                          aria-label={`Grant ${c}`}
+                        />
+                        {c}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+                <div className="grid gap-1">
+                  <Label htmlFor="edit-default-class">Default class</Label>
+                  <p className="text-sm text-muted-foreground">
+                    What requests ask for when they name no class. Applies only
+                    where the class is held and the model offers it.
+                  </p>
+                  <select
+                    id="edit-default-class"
+                    className="h-9 rounded-md border border-input bg-transparent px-3 text-sm"
+                    value={defaultClass}
+                    onChange={(e) => setDefaultClass(e.target.value)}
+                  >
+                    <option value="standard">standard</option>
+                    <option value="interactive">interactive</option>
+                    <option value="throughput">throughput</option>
+                  </select>
+                </div>
+                <div className="flex items-center justify-between gap-4">
+                  <div className="grid gap-1">
+                    <Label htmlFor="edit-self-hosted-only">
+                      Self-hosted only
+                    </Label>
+                    <p className="text-sm text-muted-foreground">
+                      Never fall over to an external provider for this
+                      organisation's requests.
+                    </p>
+                  </div>
+                  <Switch
+                    id="edit-self-hosted-only"
+                    checked={selfHostedOnly}
+                    onCheckedChange={setSelfHostedOnly}
+                    aria-label="Toggle self-hosted only"
+                  />
+                </div>
               </div>
             )}
           </div>

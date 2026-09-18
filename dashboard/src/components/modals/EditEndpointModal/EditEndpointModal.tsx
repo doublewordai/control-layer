@@ -79,6 +79,7 @@ const formSchema = z.object({
   description: z.string().optional(),
   authHeaderName: z.string().optional(),
   authHeaderPrefix: z.string().optional(),
+  kind: z.enum(["dynamo", "hosted", "external"]).optional(),
 });
 
 type FormData = z.infer<typeof formSchema>;
@@ -170,6 +171,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       description: "",
       authHeaderName: "",
       authHeaderPrefix: "",
+      kind: "external",
     },
   });
 
@@ -185,6 +187,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
       description: endpoint.description || "",
       authHeaderName: "",
       authHeaderPrefix: "",
+      kind: endpoint.kind ?? "external",
     });
 
     setValidationState("idle");
@@ -485,6 +488,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
         auth_header_prefix: data.authHeaderPrefix.trim(),
       }),
       reasoning_translation: reasoningTranslation,
+      ...(data.kind && { kind: data.kind }),
     };
 
     try {
@@ -849,6 +853,31 @@ const ConnectionStep: React.FC<ConnectionStepProps> = ({
                 <p className="text-xs text-gray-500">
                   The prefix before the API key header value. Default is
                   "Bearer " (with trailing space).
+                </p>
+              </FormItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name="kind"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>Server kind</FormLabel>
+                <FormControl>
+                  <select
+                    className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm"
+                    value={field.value ?? "external"}
+                    onChange={(e) => field.onChange(e.target.value)}
+                  >
+                    <option value="external">external (third-party provider)</option>
+                    <option value="hosted">hosted (self-hosted, not dynamo)</option>
+                    <option value="dynamo">dynamo (self-hosted, behind the dynamo frontend)</option>
+                  </select>
+                </FormControl>
+                <p className="text-xs text-gray-500">
+                  Only a dynamo endpoint receives serving-class targets; an
+                  external one is skipped for self-hosted-only organisations.
                 </p>
               </FormItem>
             )}

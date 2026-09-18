@@ -40,11 +40,11 @@ impl<'c> Tariffs<'c> {
             r#"
             INSERT INTO model_tariffs (
                 deployed_model_id, name, input_price_per_token, output_price_per_token,
-                api_key_purpose, completion_window, valid_from
+                api_key_purpose, completion_window, valid_from, user_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()))
+            VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()), $8)
             RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                      valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window
+                      valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
             "#,
             request.deployed_model_id,
             request.name,
@@ -53,6 +53,7 @@ impl<'c> Tariffs<'c> {
             purpose_str,
             request.completion_window,
             request.valid_from,
+            request.user_id,
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -67,7 +68,7 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
             FROM model_tariffs
             WHERE id = $1
             "#,
@@ -79,19 +80,90 @@ impl<'c> Tariffs<'c> {
         Ok(tariff)
     }
 
-    /// List all current (active) tariffs for a deployed model
+    /// List the current (active) GENERAL tariffs for a deployed model: the model's
+    /// own price, without any organisation's rows.
     #[instrument(skip(self), err)]
     pub async fn list_current_by_model(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TariffDBResponse>> {
         let tariffs = sqlx::query_as!(
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
             FROM model_tariffs
-            WHERE deployed_model_id = $1 AND valid_until IS NULL
+            WHERE deployed_model_id = $1 AND valid_until IS NULL AND user_id IS NULL
             ORDER BY api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
             deployed_model_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(tariffs)
+    }
+
+    /// List every current (active) tariff for a deployed model, general and
+    /// organisation-scoped alike. Operator views group them by `user_id`.
+    #[instrument(skip(self), err)]
+    pub async fn list_current_by_model_all_scopes(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TariffDBResponse>> {
+        let tariffs = sqlx::query_as!(
+            ModelTariff,
+            r#"
+            SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
+            FROM model_tariffs
+            WHERE deployed_model_id = $1 AND valid_until IS NULL
+            ORDER BY user_id ASC NULLS FIRST, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
+            "#,
+            deployed_model_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(tariffs)
+    }
+
+    /// List one organisation's current (active) tariffs across every model.
+    #[instrument(skip(self), err)]
+    pub async fn list_current_by_account(&mut self, user_id: Uuid) -> Result<Vec<TariffDBResponse>> {
+        let tariffs = sqlx::query_as!(
+            ModelTariff,
+            r#"
+            SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
+            FROM model_tariffs
+            WHERE user_id = $1 AND valid_until IS NULL
+            ORDER BY deployed_model_id ASC, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
+            "#,
+            user_id
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
+
+        Ok(tariffs)
+    }
+
+    /// The tariffs a caller billed to `account` effectively pays on these models: the
+    /// organisation's active rows where it has them (per purpose and completion window),
+    /// the general active rows otherwise. Mirrors the billing assigner's preference.
+    #[instrument(skip(self), err)]
+    pub async fn list_effective_for_account(
+        &mut self,
+        deployed_model_ids: &[DeploymentId],
+        account: Uuid,
+    ) -> Result<Vec<TariffDBResponse>> {
+        let tariffs = sqlx::query_as!(
+            ModelTariff,
+            r#"
+            SELECT DISTINCT ON (deployed_model_id, api_key_purpose, completion_window)
+                   id, deployed_model_id, name, input_price_per_token, output_price_per_token,
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
+            FROM model_tariffs
+            WHERE deployed_model_id = ANY($1) AND valid_until IS NULL
+              AND (user_id IS NULL OR user_id = $2)
+            ORDER BY deployed_model_id, api_key_purpose, completion_window, user_id ASC NULLS LAST, name ASC
+            "#,
+            deployed_model_ids,
+            account
         )
         .fetch_all(&mut *self.db)
         .await?;
@@ -106,9 +178,9 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
             FROM model_tariffs
-            WHERE deployed_model_id = $1
+            WHERE deployed_model_id = $1 AND user_id IS NULL
             ORDER BY valid_from DESC, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
             deployed_model_id
@@ -192,6 +264,7 @@ impl<'c> Tariffs<'c> {
             WHERE deployed_model_id = $1
               AND api_key_purpose = $2
               AND valid_until IS NULL
+              AND user_id IS NULL
               AND ($3::VARCHAR IS NULL OR completion_window = $3 OR api_key_purpose != 'batch')
             LIMIT 1
             "#,
@@ -218,6 +291,7 @@ impl<'c> Tariffs<'c> {
             FROM model_tariffs
             WHERE deployed_model_id = $1
               AND api_key_purpose = $2
+              AND user_id IS NULL
               AND valid_from <= $3
               AND (valid_until IS NULL OR valid_until > $3)
               AND ($4::VARCHAR IS NULL OR completion_window = $4 OR api_key_purpose != 'batch')
@@ -315,6 +389,7 @@ mod tests {
             api_key_purpose: Some(ApiKeyPurpose::Batch),
             completion_window: Some("24h".to_string()),
             valid_from: None,
+            user_id: None,
         };
         let created_24h = tariffs.create(&tariff_24h).await.unwrap();
         assert_eq!(created_24h.completion_window, Some("24h".to_string()));
@@ -328,6 +403,7 @@ mod tests {
             api_key_purpose: Some(ApiKeyPurpose::Batch),
             completion_window: Some("1h".to_string()),
             valid_from: None,
+            user_id: None,
         };
         let created_1h = tariffs.create(&tariff_1h).await.unwrap();
         assert_eq!(created_1h.completion_window, Some("1h".to_string()));
@@ -391,6 +467,7 @@ mod tests {
             api_key_purpose: Some(ApiKeyPurpose::Batch),
             completion_window: Some("24h".to_string()),
             valid_from: None,
+            user_id: None,
         };
         tariffs.create(&tariff_24h).await.unwrap();
 
@@ -403,6 +480,7 @@ mod tests {
             api_key_purpose: Some(ApiKeyPurpose::Batch),
             completion_window: Some("24h".to_string()),
             valid_from: None,
+            user_id: None,
         };
         let result = tariffs.create(&duplicate_tariff).await;
         assert!(result.is_err(), "Should not allow duplicate batch tariff with same SLA");
@@ -449,6 +527,7 @@ mod tests {
             api_key_purpose: Some(ApiKeyPurpose::Realtime),
             completion_window: None,
             valid_from: None,
+            user_id: None,
         };
         tariffs.create(&realtime_tariff).await.unwrap();
 
@@ -461,6 +540,7 @@ mod tests {
             api_key_purpose: Some(ApiKeyPurpose::Realtime),
             completion_window: None,
             valid_from: None,
+            user_id: None,
         };
         let result = tariffs.create(&duplicate_realtime).await;
         assert!(result.is_err(), "Should still enforce single realtime tariff per model");
@@ -507,6 +587,7 @@ mod tests {
             api_key_purpose: Some(ApiKeyPurpose::Batch),
             completion_window: None, // This should be rejected by CHECK constraint
             valid_from: None,
+            user_id: None,
         };
         let result = tariffs.create(&batch_without_sla).await;
         assert!(result.is_err(), "Should not allow batch tariff without completion_window");

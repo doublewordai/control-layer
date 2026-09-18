@@ -491,6 +491,7 @@ mod tests {
             api_key_purpose: None,
             completion_window: None,
             valid_from: None,
+            user_id: None,
         })
         .await
         .unwrap();
@@ -1387,6 +1388,7 @@ mod tests {
             api_key_purpose: None,
             completion_window: None,
             valid_from: None,
+            user_id: None,
         })
         .await
         .unwrap();

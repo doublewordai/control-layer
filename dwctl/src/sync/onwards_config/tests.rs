@@ -1399,6 +1399,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             api_key_purpose: None,
             completion_window: None,
             valid_from: None,
+            user_id: None,
         })
         .await
         .unwrap();

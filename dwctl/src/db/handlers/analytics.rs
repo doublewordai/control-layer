@@ -1206,7 +1206,7 @@ pub async fn get_realtime_tariffs(pool: &PgPool) -> Result<HashMap<String, (Deci
         SELECT dm.alias, t.input_price_per_token, t.output_price_per_token
         FROM model_tariffs t
         JOIN deployed_models dm ON dm.id = t.deployed_model_id
-        WHERE t.api_key_purpose = 'realtime' AND t.valid_until IS NULL
+        WHERE t.api_key_purpose = 'realtime' AND t.valid_until IS NULL AND t.user_id IS NULL
         "#
     )
     .fetch_all(pool)

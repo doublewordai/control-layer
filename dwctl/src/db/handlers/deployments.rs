@@ -758,7 +758,7 @@ impl<'c> Repository for Deployments<'c> {
             Some(ModelSortField::ContextWindow) => ("(dm.metadata->>'context_window')::bigint", "DESC"),
             Some(ModelSortField::Provider) => ("dm.metadata->>'provider'", "ASC"),
             Some(ModelSortField::PriceFrom) => (
-                "(SELECT MIN(mt.input_price_per_token + mt.output_price_per_token) FROM model_tariffs mt WHERE mt.deployed_model_id = dm.id AND mt.valid_until IS NULL AND (mt.input_price_per_token + mt.output_price_per_token) > 0)",
+                "(SELECT MIN(mt.input_price_per_token + mt.output_price_per_token) FROM model_tariffs mt WHERE mt.deployed_model_id = dm.id AND mt.valid_until IS NULL AND mt.user_id IS NULL AND (mt.input_price_per_token + mt.output_price_per_token) > 0)",
                 "ASC",
             ),
             Some(ModelSortField::CreatedAt) | None => ("dm.created_at", "DESC"),
