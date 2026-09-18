@@ -2638,6 +2638,43 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn test_instrument_claim_race_has_one_winner(pool: PgPool) {
+        // Two accounts present the same instrument at the same moment on
+        // separate connections. Exactly one may hold it afterwards, and both
+        // callers must be told who that is.
+        let contenders: Vec<UserId> = vec![
+            create_test_user(&pool).await,
+            create_test_user(&pool).await,
+            create_test_user(&pool).await,
+            create_test_user(&pool).await,
+        ];
+
+        let owners = futures::future::join_all(contenders.iter().map(|&user| {
+            let pool = pool.clone();
+            async move {
+                let mut conn = pool.acquire().await.unwrap();
+                Credits::new(&mut conn).claim_verification_instrument("fp_raced", user).await
+            }
+        }))
+        .await;
+
+        let owners: Vec<UserId> = owners.into_iter().map(|r| r.expect("a losing racer must not error")).collect();
+        let winner = owners[0];
+        assert!(contenders.contains(&winner));
+        assert!(
+            owners.iter().all(|&o| o == winner),
+            "every racer must observe the same owner: {owners:?}"
+        );
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM verification_instruments WHERE fingerprint = $1")
+            .bind("fp_raced")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[sqlx::test]
     async fn test_instrument_claims_are_independent(pool: PgPool) {
         let first = create_test_user(&pool).await;
         let second = create_test_user(&pool).await;

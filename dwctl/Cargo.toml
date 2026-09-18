@@ -152,6 +152,9 @@ async-stripe-webhook = { version = "1.0.0-rc.0", features = [
   "deserialize",
 ] }
 async-stripe-types = { version = "1.0.0-rc.0" }
+# The shared object types (PaymentMethod, SetupIntent, ...) the other stripe
+# crates hand back; named directly for the instrument-fingerprint helper.
+async-stripe-shared = { version = "1.0.0-rc.0" }
 async-stripe-core = { version = "1.0.0-rc.0", features = [
   "payment_intent",
   "customer",
@@ -184,6 +187,9 @@ google-cloud-auth = "1.10"
 
 [dev-dependencies]
 axum-test = { version = "18.4.1" }
+# Builds Stripe objects from JSON in tests; the async-stripe types deserialize
+# through miniserde unconditionally, serde only behind a feature.
+miniserde = "0.1"
 sqlx = { version = "0.8", features = [
   "postgres",
   "runtime-tokio-rustls",

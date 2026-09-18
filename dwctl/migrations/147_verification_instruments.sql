@@ -17,6 +17,11 @@
 -- fingerprint -> customer -> user) is possible but deliberately not done
 -- here, so the migration stays free of external calls and production data.
 --
+-- Scope is one regional plane. Each plane has its own database while one
+-- Stripe account serves all of them, so an instrument can verify one account
+-- per plane. Closing that would need a cross-plane store; Stripe offers no
+-- per-fingerprint metadata to hang a claim on.
+--
 -- No foreign key to users: rows must survive the user being soft-deleted,
 -- or a scrubbed-and-recreated account could claim again.
 CREATE TABLE verification_instruments (

@@ -103,8 +103,10 @@ impl From<crate::config::StripeConfig> for StripeProvider {
 
 /// What a setup-mode Checkout is for. Recorded on the SetupIntent as
 /// `metadata.purpose` so the completed session can be told apart again:
-/// `checkout.session.completed` arrives for both kinds, and only verification
-/// is subject to the one-instrument-one-account rule.
+/// `checkout.session.completed` arrives for both kinds. Both claim the saved
+/// instrument when it has a fingerprint; only verification reports an
+/// instrument another account already holds (auto top-up enrolment then
+/// succeeds without verifying).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SetupPurpose {
     Verification,
@@ -131,12 +133,24 @@ impl SetupPurpose {
     }
 }
 
+/// Stripe's fingerprint of a saved payment method: the same card or bank
+/// account yields the same value on every customer, which is what the
+/// one-instrument-one-account rule keys on. `None` for types without one
+/// (Link, wallets), which therefore cannot verify an account.
+fn instrument_fingerprint(pm: &stripe_shared::PaymentMethod) -> Option<String> {
+    pm.card
+        .as_ref()
+        .and_then(|card| card.fingerprint.clone())
+        .or_else(|| pm.sepa_debit.as_ref().and_then(|sepa| sepa.fingerprint.clone()))
+}
+
 /// The only things that differ between our two setup-mode checkouts.
 ///
-/// Both save a card for later off-session use and are otherwise identical
-/// (hosted page, tax id + business name collection, ToS + reuse consent, the
-/// same payment method types, the same customer handling), so the shape of the
-/// session lives in `create_setup_mode_session` and only the wording varies.
+/// Both save a payment method for later off-session use and are otherwise
+/// identical (hosted page, tax id + business name collection, ToS + reuse
+/// consent, the same customer handling), so the shape of the session lives in
+/// `create_setup_mode_session`; the wording, the purpose and the payment
+/// method types offered vary.
 struct SetupSessionCopy<'a> {
     /// Custom terms-of-service acceptance text. `None` shows no ToS copy.
     terms_of_service_text: Option<&'a str>,
@@ -447,12 +461,11 @@ impl StripeProvider {
         // and gets no credits, whatever the session was for. The instrument
         // itself stays attached to their customer and can pay for top-ups.
         let purpose = SetupPurpose::from_metadata(setup_intent.metadata.as_ref());
-        let instrument_fingerprint = setup_intent.payment_method.as_ref().and_then(|pm| pm.as_object()).and_then(|pm| {
-            pm.card
-                .as_ref()
-                .and_then(|card| card.fingerprint.clone())
-                .or_else(|| pm.sepa_debit.as_ref().and_then(|sepa| sepa.fingerprint.clone()))
-        });
+        let instrument_fingerprint = setup_intent
+            .payment_method
+            .as_ref()
+            .and_then(|pm| pm.as_object())
+            .and_then(instrument_fingerprint);
         // No fingerprint means the claim cannot be made, so verification
         // cannot be granted: fail closed. The verification Checkout only
         // offers cards, which always carry one, so this is a malformed or
@@ -1179,6 +1192,41 @@ mod tests {
             }),
             409,
         )
+    }
+
+    /// A Stripe PaymentMethod as the API returns it, expanded on a SetupIntent.
+    /// Only the fields the type requires plus the one under test.
+    fn payment_method_json(type_: &str, details: &str) -> stripe_shared::PaymentMethod {
+        let json = format!(
+            r#"{{"id":"pm_test","object":"payment_method","billing_details":{{}},"created":1700000000,"livemode":false,"type":"{type_}",{details}}}"#
+        );
+        miniserde::json::from_str(&json).expect("payment method json")
+    }
+
+    #[test]
+    fn test_instrument_fingerprint_reads_card_and_sepa_and_nothing_else() {
+        let card = payment_method_json(
+            "card",
+            r#""card":{"brand":"visa","exp_month":1,"exp_year":2030,"funding":"credit","last4":"4242","fingerprint":"fp_card"}"#,
+        );
+        assert_eq!(instrument_fingerprint(&card).as_deref(), Some("fp_card"));
+
+        let sepa = payment_method_json(
+            "sepa_debit",
+            r#""sepa_debit":{"bank_code":"ABNA","branch_code":"","country":"NL","last4":"0000","fingerprint":"fp_iban"}"#,
+        );
+        assert_eq!(instrument_fingerprint(&sepa).as_deref(), Some("fp_iban"));
+
+        // Link carries no fingerprint, so it can never claim an instrument.
+        let link = payment_method_json("link", r#""link":{"email":"someone@example.com"}"#);
+        assert_eq!(instrument_fingerprint(&link), None);
+
+        // A card the API returned without a fingerprint is treated as none.
+        let bare = payment_method_json(
+            "card",
+            r#""card":{"brand":"visa","exp_month":1,"exp_year":2030,"funding":"credit","last4":"4242"}"#,
+        );
+        assert_eq!(instrument_fingerprint(&bare), None);
     }
 
     #[test]

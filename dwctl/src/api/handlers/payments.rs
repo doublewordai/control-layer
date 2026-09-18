@@ -366,6 +366,7 @@ pub async fn create_payment_setup<P: PoolProvider>(State(state): State<AppState<
     responses(
         (status = 200, description = "Payment processed successfully"),
         (status = 402, description = "Payment not completed yet"),
+        (status = 409, description = "The payment method saved by this verification session has already verified another account; the account is not verified. Verify with a different card or add credit."),
         (status = 400, description = "Invalid payment ID or missing data"),
         (status = 501, description = "Payment provider not configured"),
     ),
