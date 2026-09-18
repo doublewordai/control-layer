@@ -1753,12 +1753,10 @@ pub async fn target_message_handler<T: HttpClient>(
         if let Some(ref header_name) = state.response_id_header
             && crate::response_id::path_supports_id_override(&path_and_query)
             && (200..300).contains(&status)
-        {
-            if let Some(override_id) =
+            && let Some(override_id) =
                 crate::response_id::extract_override_id(&original_headers, header_name)
-            {
-                crate::response_id::patch_response_body_id(&mut response, override_id).await;
-            }
+        {
+            crate::response_id::patch_response_body_id(&mut response, override_id).await;
         }
 
         // Add custom response headers

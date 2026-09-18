@@ -95,6 +95,7 @@ pub async fn models_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 /// validate-and-forward-original: `422 Unprocessable Entity` for a well-formed JSON
 /// body that doesn't match the schema (missing/mistyped field), `400 Bad Request`
 /// for malformed JSON.
+#[allow(clippy::result_large_err)]
 fn parse_strict_request<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Response> {
     serde_json::from_slice::<T>(body).map_err(|e| {
         let status = if e.is_data() {

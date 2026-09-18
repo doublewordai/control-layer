@@ -84,6 +84,7 @@ impl OnwardsErrorResponse {
                 code: "upstream_rate_limit".to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            authenticated_api_key_id: None,
         }
     }
 
