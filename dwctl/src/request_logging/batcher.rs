@@ -908,12 +908,12 @@ where
 
     /// Batch INSERT http_analytics records within a transaction.
     ///
-    /// Returns `(id_map, newly_inserted)`: the analytics id for each
-    /// `(instance_id, correlation_id)`, and the subset of those ids that were freshly
-    /// INSERTed this call (`xmax = 0`) rather than updated on conflict. The batch-analytics
-    /// fold in `batch_insert_credits` uses `newly_inserted` as its idempotency anchor so that
-    /// free / zero-priced batched requests (which never produce a credit row to ride) are
-    /// still folded exactly once under retries.
+    /// Returns the analytics ids inserted by this call. A repeated physical
+    /// receipt, and (once the logical-request unique index is deployed) a
+    /// second successful attempt for the same Fusillade request, returns no
+    /// row and therefore cannot proceed to billing or aggregation. The
+    /// batch-analytics fold uses the same returned ids as its idempotency
+    /// anchor, including for free requests that have no credit row.
     async fn batch_insert_analytics(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1060,49 +1060,8 @@ where
                 $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[],
                 $46::text[]
             )
-            ON CONFLICT (instance_id, correlation_id)
-            DO UPDATE SET
-                status_code = EXCLUDED.status_code,
-                duration_ms = EXCLUDED.duration_ms,
-                duration_to_first_byte_ms = EXCLUDED.duration_to_first_byte_ms,
-                prompt_tokens = EXCLUDED.prompt_tokens,
-                completion_tokens = EXCLUDED.completion_tokens,
-                reasoning_tokens = EXCLUDED.reasoning_tokens,
-                total_tokens = EXCLUDED.total_tokens,
-                response_type = EXCLUDED.response_type,
-                user_id = EXCLUDED.user_id,
-                access_source = EXCLUDED.access_source,
-                input_price_per_token = EXCLUDED.input_price_per_token,
-                output_price_per_token = EXCLUDED.output_price_per_token,
-                fusillade_batch_id = EXCLUDED.fusillade_batch_id,
-                fusillade_request_id = EXCLUDED.fusillade_request_id,
-                custom_id = EXCLUDED.custom_id,
-                request_origin = EXCLUDED.request_origin,
-                batch_sla = EXCLUDED.batch_sla,
-                batch_request_source = EXCLUDED.batch_request_source,
-                api_key_id = EXCLUDED.api_key_id,
-                trace_id = EXCLUDED.trace_id,
-                cache_read_input_tokens = EXCLUDED.cache_read_input_tokens,
-                cache_creation_input_tokens = EXCLUDED.cache_creation_input_tokens,
-                cache_creation_5m_input_tokens = EXCLUDED.cache_creation_5m_input_tokens,
-                cache_creation_1h_input_tokens = EXCLUDED.cache_creation_1h_input_tokens,
-                cache_creation_24h_input_tokens = EXCLUDED.cache_creation_24h_input_tokens,
-                total_cost = EXCLUDED.total_cost,
-                uncached_cost = EXCLUDED.uncached_cost,
-                served_by = EXCLUDED.served_by,
-                finish_reason = EXCLUDED.finish_reason,
-                user_agent = EXCLUDED.user_agent,
-                submitted_at = EXCLUDED.submitted_at,
-                engine_cached_tokens = EXCLUDED.engine_cached_tokens,
-                stream = EXCLUDED.stream,
-                max_tokens = EXCLUDED.max_tokens,
-                temperature = EXCLUDED.temperature,
-                top_p = EXCLUDED.top_p,
-                n = EXCLUDED.n,
-                tool_count = EXCLUDED.tool_count,
-                message_count = EXCLUDED.message_count,
-                cache_read_source = EXCLUDED.cache_read_source
-            RETURNING id, instance_id, correlation_id, (xmax = 0) AS "newly_inserted!"
+            ON CONFLICT DO NOTHING
+            RETURNING id, instance_id, correlation_id
             "#,
             &instance_ids,
             &correlation_ids,
@@ -1155,17 +1114,21 @@ where
         .await?;
 
         let mut id_map = HashMap::with_capacity(rows.len());
-        let mut newly_inserted: HashSet<i64> = HashSet::new();
+        let mut newly_inserted: HashSet<i64> = HashSet::with_capacity(rows.len());
         for row in rows {
             id_map.insert((row.instance_id, row.correlation_id), row.id);
-            if row.newly_inserted {
-                newly_inserted.insert(row.id);
-            }
+            newly_inserted.insert(row.id);
+        }
+
+        let duplicate_receipts = records.len().saturating_sub(id_map.len());
+        if duplicate_receipts > 0 {
+            counter!("dwctl_analytics_duplicate_receipts_total").increment(duplicate_receipts as u64);
         }
 
         trace!(
             count = id_map.len(),
-            newly = newly_inserted.len(),
+            inserted = newly_inserted.len(),
+            duplicates = duplicate_receipts,
             "Batch inserted analytics records"
         );
         Ok((id_map, newly_inserted))
@@ -1203,15 +1166,29 @@ where
         // durably (by fusillade_request_id) instead of joining http_analytics, which ages
         // out of retention. NULL for non-fusillade (realtime) usage.
         let mut fusillade_request_ids_credit: Vec<Option<Uuid>> = Vec::new();
-        // Stable logical-transaction identity used only for ledger
-        // idempotency. For authenticated Fusillade usage this is the request
-        // id; source_id remains the exact analytics-row correlation.
-        let mut deduplication_ids: Vec<Option<Uuid>> = Vec::new();
         // Spending-cap scope root per billed row (None for the uncapped
         // majority); parallel to the vecs above, consumed by the cap fold below.
         let mut cap_scope_roots: Vec<Option<Uuid>> = Vec::new();
+        let mut processed_analytics_ids: HashSet<i64> = HashSet::new();
 
         for record in records {
+            // Only a row returned by the analytics INSERT may have downstream
+            // effects. If the same physical identity appeared twice in one
+            // flush, process the first input row (the one INSERT considered
+            // first) exactly once.
+            let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
+                trace!(
+                    instance_id = %record.raw.instance_id,
+                    correlation_id = record.raw.correlation_id,
+                    fusillade_request_id = ?record.raw.fusillade_request_id,
+                    "Skipping billing for an analytics receipt rejected by a uniqueness constraint"
+                );
+                continue;
+            };
+            if !processed_analytics_ids.insert(analytics_id) {
+                continue;
+            }
+
             // Billing eligibility is the shared effective HTTP outcome. Failed
             // requests remain in analytics, but never create a debit even when
             // the provider reported usage and a non-zero price.
@@ -1235,24 +1212,10 @@ where
                 continue;
             }
 
-            // Get analytics_id
-            let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
-                crate::background_error!(
-                    ANALYTICS_BATCHER, "analytics_id_missing", Warning,
-                    instance_id = %record.raw.instance_id,
-                    correlation_id = record.raw.correlation_id,
-                    "Analytics ID not found for credit transaction"
-                );
-                continue;
-            };
-
             let model = record.raw.request_model.clone().unwrap_or_default();
 
             user_ids.push(user_id);
             amounts.push(total_cost);
-            // Preserve the ledger/recompute contract: source_id identifies the
-            // canonical analytics row. Logical-request idempotency has its own
-            // deduplication_id column.
             source_ids.push(analytics_id.to_string());
             descriptions.push(Some(format!(
                 "API usage: {} ({} input + {} output tokens)",
@@ -1264,16 +1227,7 @@ where
             api_key_ids_credit.push(record.api_key_id);
             service_tiers
                 .push(compute_billing_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref()).to_string());
-            // A caller can supply x-fusillade-request-id when reaching dwctl
-            // outside the normal ingress. Only the hidden batch-purpose key is
-            // an authenticated marker that this correlation id came from the
-            // daemon. Migration 147 independently enforces the same rule for
-            // old binaries during rolling deploys.
-            let fusillade_request_id = matches!(record.api_key_purpose.as_ref(), Some(ApiKeyPurpose::Batch))
-                .then_some(record.raw.fusillade_request_id)
-                .flatten();
-            fusillade_request_ids_credit.push(fusillade_request_id);
-            deduplication_ids.push(fusillade_request_id);
+            fusillade_request_ids_credit.push(record.raw.fusillade_request_id);
             cap_scope_roots.push(record.cap_scope_root);
         }
 
@@ -1297,14 +1251,14 @@ where
         // re-folded nor re-aggregated.
         let inserted_rows = sqlx::query!(
             r#"
-            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, is_aggregated, service_tier, fusillade_request_id, deduplication_id)
+            INSERT INTO credits_transactions (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, is_aggregated, service_tier, fusillade_request_id)
             SELECT u.user_id, u.transaction_type, u.amount, u.source_id, u.description, u.fusillade_batch_id, u.api_key_id,
-                   u.fusillade_batch_id IS NOT NULL, u.service_tier, u.fusillade_request_id, u.deduplication_id
+                   u.fusillade_batch_id IS NOT NULL, u.service_tier, u.fusillade_request_id
             FROM UNNEST(
-                $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[], $7::uuid[], $8::text[], $9::uuid[], $10::uuid[]
-            ) AS u(user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, service_tier, fusillade_request_id, deduplication_id)
-            ON CONFLICT DO NOTHING
-            RETURNING source_id, user_id, amount, seq, created_at, fusillade_batch_id, service_tier, fusillade_request_id, deduplication_id
+                $1::uuid[], $2::text[], $3::numeric[], $4::text[], $5::text[], $6::uuid[], $7::uuid[], $8::text[], $9::uuid[]
+            ) AS u(user_id, transaction_type, amount, source_id, description, fusillade_batch_id, api_key_id, service_tier, fusillade_request_id)
+            ON CONFLICT (source_id) DO NOTHING
+            RETURNING source_id, user_id, amount, seq, created_at, fusillade_batch_id, service_tier
             "#,
             &user_ids,
             &vec!["usage".to_string(); user_ids.len()],
@@ -1315,19 +1269,12 @@ where
             &api_key_ids_credit as &[Option<Uuid>],
             &service_tiers,
             &fusillade_request_ids_credit as &[Option<Uuid>],
-            &deduplication_ids as &[Option<Uuid>],
         )
         .fetch_all(&mut **tx)
         .await?;
 
         let inserted_count = inserted_rows.len() as u64;
         let duplicates = expected_count.saturating_sub(inserted_count);
-        let expected_fusillade = deduplication_ids.iter().flatten().count() as u64;
-        let inserted_fusillade = inserted_rows.iter().filter(|row| row.deduplication_id.is_some()).count() as u64;
-        let suppressed_fusillade = expected_fusillade.saturating_sub(inserted_fusillade);
-        if suppressed_fusillade > 0 {
-            counter!("dwctl_fusillade_duplicate_billing_suppressed_total").increment(suppressed_fusillade);
-        }
 
         // Fold the inserted usage amounts into the user_balance_checkpoints
         // read model: one grouped update per distinct user per flush (NOT per
@@ -1342,7 +1289,7 @@ where
 
         // Billing fold: total_amount / transaction_count per batch, over the *billed* rows
         // (the credit set). The per-batch analytics aggregates (tokens/latency/cost) are folded
-        // separately below over ALL 2xx requests, so free-model batches are counted too.
+        // separately below over ALL newly inserted 2xx requests, so free-model batches are counted too.
         struct BatchFold {
             user_id: Uuid,
             total: Decimal,
@@ -1619,8 +1566,8 @@ where
         // rides the credit set and so excludes free / zero-priced requests — this covers ALL
         // 2xx batched requests, matching get_batch_analytics's historical "status 2xx" set, so
         // free-model batches still report tokens/latency/cost. Idempotency rides the
-        // http_analytics upsert's newly-inserted flag (`xmax = 0`): a retried flush re-folds
-        // nothing. count_duration_ms / count_ttfb_ms count only requests that reported the
+        // http_analytics INSERT's returned rows: a conflicting receipt returns nothing and
+        // is not folded. count_duration_ms / count_ttfb_ms count only requests that reported the
         // metric so the endpoint's AVG (which ignores NULLs) is reproduced; total_requests is
         // the plain 2xx count (distinct from transaction_count, the billed-row count).
         struct AnalyticsFold {
@@ -1639,7 +1586,15 @@ where
             list_cost: Decimal,
         }
         let mut analytics_folds: HashMap<Uuid, AnalyticsFold> = HashMap::new();
+        let mut folded_analytics_ids: HashSet<i64> = HashSet::new();
         for record in records {
+            let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
+                continue;
+            };
+            if !newly_inserted.contains(&analytics_id) || !folded_analytics_ids.insert(analytics_id) {
+                continue;
+            }
+
             let Some(batch_id) = record.raw.fusillade_batch_id else { continue };
             if !(200..=299).contains(&record.raw.status_code) {
                 continue;
@@ -1648,16 +1603,6 @@ where
             if user_id == Uuid::nil() {
                 continue;
             }
-            // Idempotency anchor: only rows this flush actually INSERTed (xmax = 0) contribute,
-            // so a retried flush re-folds nothing even for free requests (which have no credit
-            // row to ride the ON CONFLICT DO NOTHING dedup).
-            let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
-                continue;
-            };
-            if !newly_inserted.contains(&analytics_id) {
-                continue;
-            }
-
             let af = analytics_folds.entry(batch_id).or_insert_with(|| AnalyticsFold {
                 user_id,
                 service_tier: compute_billing_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref())
@@ -2209,9 +2154,6 @@ mod integration_tests {
 
         let mut conn = pool.acquire().await.unwrap();
         let mut api_keys = ApiKeys::new(&mut conn);
-        if purpose == ApiKeyPurpose::Batch {
-            return api_keys.get_or_create_hidden_key(user_id, purpose, user_id).await.unwrap();
-        }
         let api_key = api_keys
             .create(&ApiKeyCreateDBRequest {
                 user_id,
@@ -2617,7 +2559,7 @@ mod integration_tests {
 
         // The credit is keyed to the request durably (no http_analytics needed).
         let row = sqlx::query!(
-            "SELECT fusillade_request_id, deduplication_id, amount, source_id FROM credits_transactions \
+            "SELECT fusillade_request_id, amount FROM credits_transactions \
              WHERE fusillade_request_id = $1 AND transaction_type = 'usage'",
             request_id
         )
@@ -2625,19 +2567,24 @@ mod integration_tests {
         .await
         .unwrap();
         assert_eq!(row.fusillade_request_id, Some(request_id));
-        assert_eq!(row.deduplication_id, Some(request_id));
-        let analytics_id: i64 = sqlx::query_scalar("SELECT id FROM http_analytics WHERE fusillade_request_id = $1")
-            .bind(request_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(row.source_id, analytics_id.to_string());
         assert_eq!(row.amount, Decimal::from_str("0.10").unwrap(), "1000*5e-5 + 500*1e-4");
     }
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_fusillade_duplicate_attempts_create_one_usage_debit(pool: sqlx::PgPool) {
+    async fn test_future_fusillade_success_index_gates_billing_and_aggregation(pool: sqlx::PgPool) {
+        // This preparation release does not ship the index: production history
+        // must be reconciled first. Install its intended definition in this
+        // isolated test database to prove the application is ready for it.
+        sqlx::query(
+            "CREATE UNIQUE INDEX test_http_analytics_fusillade_success_unique \
+             ON http_analytics (fusillade_request_id) \
+             WHERE fusillade_request_id IS NOT NULL AND status_code BETWEEN 200 AND 299",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
         let model_id = create_test_model(&pool, "fusillade-billing-idempotency").await;
         setup_tariff(
             &pool,
@@ -2665,18 +2612,15 @@ mod integration_tests {
         first.fusillade_batch_id = Some(batch_id);
         first.fusillade_request_id = Some(request_id);
 
-        // A second successful dispatch has a distinct analytics correlation id
-        // but the same durable Fusillade request identity.
+        // A second successful physical attempt has a different gateway
+        // identity but the same logical Fusillade request identity.
         let mut duplicate = create_raw_record("fusillade-billing-idempotency", Some(batch_key), 1000, 500);
         duplicate.batch_completion_window = Some("24h".to_string());
         duplicate.fusillade_batch_id = Some(batch_id);
         duplicate.fusillade_request_id = Some(request_id);
 
         run_batcher_with_records(&pool, vec![failed]).await;
-        let ((), ()) = tokio::join!(
-            run_batcher_with_records(&pool, vec![first]),
-            run_batcher_with_records(&pool, vec![duplicate]),
-        );
+        run_batcher_with_records(&pool, vec![first, duplicate]).await;
 
         let analytics_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM http_analytics WHERE fusillade_request_id = $1")
             .bind(request_id)
@@ -2718,33 +2662,24 @@ mod integration_tests {
         assert_eq!(aggregate.total_prompt_tokens, 1000);
         assert_eq!(aggregate.total_completion_tokens, 500);
         assert_eq!(aggregate.total_amount, Decimal::from_str("0.10").unwrap());
-        let deduplication_id: Option<Uuid> = sqlx::query_scalar(
-            "SELECT deduplication_id FROM credits_transactions \
-             WHERE fusillade_request_id = $1 AND transaction_type = 'usage'",
-        )
-        .bind(request_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(deduplication_id, Some(request_id));
     }
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_legacy_fusillade_inserts_are_deduplicated_during_rollout(pool: sqlx::PgPool) {
+    async fn test_legacy_fusillade_duplicates_remain_reconcilable_during_rollout(pool: sqlx::PgPool) {
         let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
-        let _batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
-        let batch_key_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE user_id = $1 AND purpose = 'batch' AND hidden = true")
-            .bind(user_id)
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let batch_key_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
+            .bind(batch_key)
             .fetch_one(&pool)
             .await
             .unwrap();
         let batch_id = Uuid::new_v4();
         let request_id = Uuid::new_v4();
 
-        // Model the pre-change binary: it supplies fusillade_request_id, uses
-        // a per-attempt analytics source_id, does not know deduplication_id,
-        // and only names source_id as its conflict target.
+        // A pre-change binary supplies fusillade_request_id but uses a
+        // per-attempt analytics source_id. Both writes remain visible during
+        // the rollout window so the separate reconciliation can find them.
         let insert_legacy = |source_id: &'static str| {
             sqlx::query(
                 r#"
@@ -2770,21 +2705,20 @@ mod integration_tests {
         second.unwrap();
 
         let rows = sqlx::query!(
-            "SELECT source_id, fusillade_request_id, deduplication_id \
+            "SELECT source_id, fusillade_request_id \
              FROM credits_transactions WHERE fusillade_request_id = $1",
             request_id,
         )
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(rows.len(), 1, "mixed-version concurrent inserts must produce one debit");
-        assert_eq!(rows[0].fusillade_request_id, Some(request_id));
-        assert_eq!(rows[0].deduplication_id, Some(request_id));
+        assert_eq!(rows.len(), 2, "rollout-window duplicates must remain available for reconciliation");
+        assert!(rows.iter().all(|row| row.fusillade_request_id == Some(request_id)));
     }
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_spoofed_fusillade_id_does_not_suppress_realtime_billing(pool: sqlx::PgPool) {
+    async fn test_shared_fusillade_id_does_not_suppress_realtime_billing(pool: sqlx::PgPool) {
         let model_id = create_test_model(&pool, "spoofed-fusillade-id").await;
         setup_tariff(
             &pool,
@@ -2808,7 +2742,7 @@ mod integration_tests {
         run_batcher_with_records(&pool, vec![first, second]).await;
 
         let rows = sqlx::query!(
-            "SELECT user_id, fusillade_request_id, deduplication_id FROM credits_transactions \
+            "SELECT user_id, fusillade_request_id FROM credits_transactions \
              WHERE user_id = ANY($1) AND transaction_type = 'usage'",
             &[first_user, second_user],
         )
@@ -2817,9 +2751,8 @@ mod integration_tests {
         .unwrap();
         assert_eq!(rows.len(), 2, "an untrusted header must not deduplicate billing");
         assert!(
-            rows.iter()
-                .all(|row| row.fusillade_request_id.is_none() && row.deduplication_id.is_none()),
-            "untrusted correlation and deduplication ids must not enter the durable ledger"
+            rows.iter().all(|row| row.fusillade_request_id == Some(spoofed_request_id)),
+            "without the future analytics index, the shared correlation id is retained for reconciliation"
         );
     }
 
@@ -2994,8 +2927,9 @@ mod integration_tests {
             .expect("the analytics row should exist");
         assert_eq!(stored.as_deref(), Some("engine"));
 
-        // Reprocessing the same (instance_id, correlation_id) takes the ON CONFLICT
-        // path — the EXCLUDED mapping must carry the column too.
+        // A second receipt for the same physical attempt is ignored. Analytics
+        // records are complete when enqueued, so a replay must not rewrite the
+        // canonical row or repeat any downstream usage effects.
         record.cache_read_source = Some("module".to_string());
         run_batcher_with_records(&pool, vec![record]).await;
         let rows: Vec<Option<String>> =
@@ -3003,8 +2937,8 @@ mod integration_tests {
                 .fetch_all(&pool)
                 .await
                 .expect("query should succeed");
-        assert_eq!(rows.len(), 1, "the upsert must update, not duplicate");
-        assert_eq!(rows[0].as_deref(), Some("module"), "EXCLUDED mapping on the conflict path");
+        assert_eq!(rows.len(), 1, "the duplicate receipt must not create another row");
+        assert_eq!(rows[0].as_deref(), Some("engine"), "the first complete receipt remains canonical");
     }
 
     /// Realtime work is not submitted ahead of time, so there is no distinct submission
