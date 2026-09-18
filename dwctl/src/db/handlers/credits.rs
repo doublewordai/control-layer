@@ -453,6 +453,19 @@ impl<'c> Credits<'c> {
         Ok(balance.unwrap_or(Decimal::ZERO))
     }
 
+    /// Balance used for admission checks; `None` means this billing account
+    /// permits debt. This policy never changes the balance used for accounting.
+    #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
+    pub async fn get_balance_for_admission(&mut self, user_id: UserId) -> Result<Option<Decimal>> {
+        if super::feature_flags::FeatureFlags::new(&mut *self.db)
+            .has_feature(user_id, super::feature_flags::FeatureFlag::AllowNegativeBalance)
+            .await?
+        {
+            return Ok(None);
+        }
+        self.get_user_balance(user_id).await.map(Some)
+    }
+
     /// Get balances for multiple users: point reads of the read model.
     #[instrument(skip(self, user_ids), fields(count = user_ids.len()), err)]
     pub async fn get_users_balances_bulk(&mut self, user_ids: &[UserId]) -> Result<HashMap<UserId, Decimal>> {
@@ -972,6 +985,42 @@ mod tests {
             .expect("Failed to add user role");
 
         user_id
+    }
+
+    #[sqlx::test]
+    async fn test_allow_negative_balance_preserves_accounting(pool: PgPool) {
+        let user_id = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            Credits::new(&mut conn).get_balance_for_admission(user_id).await.unwrap(),
+            Some(Decimal::ZERO)
+        );
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut credits = Credits::new(&mut conn);
+        credits
+            .create_transaction(&CreditTransactionCreateDBRequest {
+                user_id,
+                transaction_type: CreditTransactionType::Usage,
+                amount: Decimal::from(25),
+                source_id: Uuid::new_v4().to_string(),
+                description: None,
+                fusillade_batch_id: None,
+                api_key_id: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(credits.get_user_balance(user_id).await.unwrap(), Decimal::from(-25));
+        assert_eq!(credits.get_balance_for_admission(user_id).await.unwrap(), None);
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', false) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+            .bind(user_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(credits.get_balance_for_admission(user_id).await.unwrap(), Some(Decimal::from(-25)));
     }
 
     #[sqlx::test]

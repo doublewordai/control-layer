@@ -595,12 +595,14 @@ pub async fn create_batch<P: PoolProvider>(
             operation: format!("get db connection for credit check: {}", e),
         })?;
         let balance = Credits::new(&mut conn)
-            .get_user_balance(balance_check_id)
+            .get_balance_for_admission(balance_check_id)
             .await
             .map_err(|e| Error::Internal {
                 operation: format!("check credit balance: {}", e),
             })?;
-        if balance < rust_decimal::Decimal::ZERO {
+        if let Some(balance) = balance
+            && balance < rust_decimal::Decimal::ZERO
+        {
             return Err(Error::InsufficientCredits {
                 current_balance: balance,
                 message: "Account balance too low. Please add credits to continue.".to_string(),
@@ -643,17 +645,19 @@ pub async fn create_batch<P: PoolProvider>(
         && let Ok(file_owner_id) = uuid::Uuid::parse_str(uploaded_by)
     {
         let file_owner_id = crate::types::UserId::from(file_owner_id);
-        if file_owner_id != current_user.id {
+        if file_owner_id != balance_check_id {
             let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
                 operation: format!("get db connection for file owner credit check: {}", e),
             })?;
             let owner_balance = Credits::new(&mut conn)
-                .get_user_balance(file_owner_id)
+                .get_balance_for_admission(file_owner_id)
                 .await
                 .map_err(|e| Error::Internal {
                     operation: format!("check file owner credit balance: {}", e),
                 })?;
-            if owner_balance < rust_decimal::Decimal::ZERO {
+            if let Some(owner_balance) = owner_balance
+                && owner_balance < rust_decimal::Decimal::ZERO
+            {
                 let owner_name = {
                     let mut users_repo = Users::new(&mut conn);
                     users_repo
@@ -805,6 +809,32 @@ pub async fn create_batch<P: PoolProvider>(
             .resolve_batch_execution_key(target_user_id, attribution_user_id, authenticating_key_id)
             .await
             .map_err(Error::Database)?;
+        // A capped authenticating key can resolve to a different billing
+        // account than the active organization. Check the execution key's
+        // owner independently; the organization's opt-in must not cover it.
+        let execution_account_id = ApiKeys::new(&mut conn)
+            .get_by_id(key_id)
+            .await
+            .map_err(Error::Database)?
+            .ok_or_else(|| Error::NotFound {
+                resource: "API key".to_string(),
+                id: key_id.to_string(),
+            })?
+            .user_id;
+        if execution_account_id != balance_check_id {
+            let balance = Credits::new(&mut conn)
+                .get_balance_for_admission(execution_account_id)
+                .await
+                .map_err(Error::Database)?;
+            if let Some(balance) = balance
+                && balance < rust_decimal::Decimal::ZERO
+            {
+                return Err(Error::InsufficientCredits {
+                    current_balance: balance,
+                    message: "Execution key account balance too low. Please add credits to continue.".to_string(),
+                });
+            }
+        }
         // Spending-cap pre-flight, beside the balance gate above: if the
         // execution key's cap scope is already exhausted, reject up front
         // instead of accepting a batch whose every request would be refused
@@ -814,8 +844,8 @@ pub async fn create_batch<P: PoolProvider>(
                 message: "The API key used for this batch has reached its spending cap. Raise or remove the cap, or wait for the cap window to reset, then resubmit.".to_string(),
             });
         }
-        // Resolve the creditor's verified flag on the same connection (the org in
-        // org context, else the user) for the volume cap below — no extra acquire.
+        // Verification and outstanding-volume accounting use the same active
+        // account. Execution-account balance admission is checked separately.
         let verified = Users::new(&mut conn).is_verified(target_user_id).await?;
         (secret, key_id, verified)
     };
@@ -4997,6 +5027,102 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_create_batch_allowed_with_negative_balance_flag(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        submit_one_request_batch(&app, &user, "24h")
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_negative_balance_org_flag_does_not_cover_personal_file(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        add_user_to_group(&pool, org.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Upload personally: request templates bill the personal account, even
+        // when the batch is subsequently submitted in organization context.
+        let jsonl = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part(
+                "file",
+                axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("personal.jsonl"),
+            )
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        upload.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload.json();
+        let request = CreateBatchRequest {
+            input_file_id: file["id"].as_str().unwrap().to_owned(),
+            endpoint: "/v1/chat/completions".to_owned(),
+            completion_window: "24h".to_owned(),
+            metadata: None,
+            api_key_id: None,
+        };
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1 OR user_id = $2")
+            .bind(user.id)
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true)")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for enabled in [false, true, false] {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(user.id).bind(enabled).execute(&pool).await.unwrap();
+            let response = app
+                .post("/ai/v1/batches")
+                .json(&request)
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .add_header("cookie", &org_cookie)
+                .await;
+            response.assert_status(if enabled {
+                StatusCode::CREATED
+            } else {
+                StatusCode::PAYMENT_REQUIRED
+            });
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_create_batch_in_org_context_checks_org_balance_not_user(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
 
@@ -5081,6 +5207,37 @@ mod tests {
             .await;
 
         resp.assert_status(StatusCode::CREATED);
+        // A personal exemption does not cover the organization's debt.
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for enabled in [false, true, false] {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(org.id)
+                .bind(enabled)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let resp = app
+                .post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .add_header("cookie", &org_cookie)
+                .await;
+            resp.assert_status(if enabled {
+                StatusCode::CREATED
+            } else {
+                StatusCode::PAYMENT_REQUIRED
+            });
+        }
     }
 
     #[sqlx::test]
@@ -5919,6 +6076,50 @@ mod tests {
             completion_window: "24h".to_string(),
             metadata: None,
             api_key_id,
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_negative_balance_checks_execution_account_in_org_context(pool: PgPool) {
+        let (app, _bg_services, owner, _member, org, file_id) = setup_org_batch_env(&pool).await;
+        let auth = add_auth_headers(&owner);
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", owner.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&serde_json::json!({"name": "Personal capped key", "purpose": "realtime", "spend_limit": "10"}))
+            .await;
+        response.assert_status(StatusCode::CREATED);
+        let key: serde_json::Value = response.json();
+        let secret = key["key"].as_str().unwrap();
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1 OR user_id = $2")
+            .bind(owner.id)
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true)")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The org owns the file and permits debt, but the execution key bills
+        // the personal account. Its opt-in must be checked independently.
+        for enabled in [false, true, false] {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(owner.id).bind(enabled).execute(&pool).await.unwrap();
+            app.post("/ai/v1/batches")
+                .json(&batch_req(&file_id, None))
+                .add_header("authorization", &format!("Bearer {secret}"))
+                .add_header("cookie", &format!("dw_active_org={}", org.id))
+                .await
+                .assert_status(if enabled {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::PAYMENT_REQUIRED
+                });
         }
     }
 
