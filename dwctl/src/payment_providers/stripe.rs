@@ -114,6 +114,11 @@ struct SetupSessionCopy<'a> {
     submit_label: &'a str,
     /// Description recorded on the SetupIntent, for reconciliation in Stripe.
     setup_intent_description: &'a str,
+    /// Payment method types Checkout offers. Verification is cards and Link
+    /// only: a SEPA mandate needs nothing but an IBAN, and in September 2026
+    /// one IBAN verified 178 bot accounts. Auto top-up keeps SEPA because a
+    /// verified customer may genuinely want to be debited that way.
+    payment_method_types: Vec<CreateCheckoutSessionPaymentMethodTypes>,
 }
 
 impl StripeProvider {
@@ -157,11 +162,7 @@ impl StripeProvider {
                 after_submit: None,
                 shipping_address: None,
             })
-            .payment_method_types(vec![
-                CreateCheckoutSessionPaymentMethodTypes::Card,
-                CreateCheckoutSessionPaymentMethodTypes::Link,
-                CreateCheckoutSessionPaymentMethodTypes::SepaDebit,
-            ])
+            .payment_method_types(copy.payment_method_types.clone())
             .setup_intent_data(CreateCheckoutSessionSetupIntentData {
                 description: Some(copy.setup_intent_description.to_string()),
                 metadata: None,
@@ -410,8 +411,30 @@ impl StripeProvider {
         // match: verification is the thing that must stick, and a failed freebie
         // is not worth undoing it. This path isn't retried once verification has
         // landed, so the error log is the signal to grant manually.
+        // Stripe's fingerprint identifies the card or bank account across
+        // customers; it is what stops one instrument funding many accounts.
+        // Only present on the expanded payment method, which
+        // `get_setup_session` requests.
+        let instrument_fingerprint = setup_intent.payment_method.as_ref().and_then(|pm| pm.as_object()).and_then(|pm| {
+            pm.card
+                .as_ref()
+                .and_then(|card| card.fingerprint.clone())
+                .or_else(|| pm.sepa_debit.as_ref().and_then(|sepa| sepa.fingerprint.clone()))
+        });
+        if instrument_fingerprint.is_none() {
+            tracing::warn!(
+                session_id,
+                "Setup session payment method has no fingerprint; verification credits keyed on payee only"
+            );
+        }
+
         if let Err(e) = Credits::new(&mut *conn)
-            .grant_verification_credits(credits_config.verification_credits, target_id, session_id)
+            .grant_verification_credits(
+                credits_config.verification_credits,
+                target_id,
+                session_id,
+                instrument_fingerprint.as_deref(),
+            )
             .await
         {
             tracing::error!(
@@ -827,6 +850,10 @@ impl PaymentProvider for StripeProvider {
                     .or(self.config.auto_topup_terms_of_service_text.as_deref()),
                 submit_label: "Verify payment method",
                 setup_intent_description: "Payment method verification",
+                payment_method_types: vec![
+                    CreateCheckoutSessionPaymentMethodTypes::Card,
+                    CreateCheckoutSessionPaymentMethodTypes::Link,
+                ],
             },
         )
         .await
@@ -841,6 +868,11 @@ impl PaymentProvider for StripeProvider {
                 terms_of_service_text: self.config.auto_topup_terms_of_service_text.as_deref(),
                 submit_label: "Set up auto top-up",
                 setup_intent_description: "Auto top-up setup",
+                payment_method_types: vec![
+                    CreateCheckoutSessionPaymentMethodTypes::Card,
+                    CreateCheckoutSessionPaymentMethodTypes::Link,
+                    CreateCheckoutSessionPaymentMethodTypes::SepaDebit,
+                ],
             },
         )
         .await

@@ -133,7 +133,7 @@ impl PaymentProvider for DummyProvider {
             }
 
             if let Err(e) = Credits::new(&mut conn)
-                .grant_verification_credits(credits_config.verification_credits, target_id, session_id)
+                .grant_verification_credits(credits_config.verification_credits, target_id, session_id, None)
                 .await
             {
                 tracing::error!(session_id, target_id = %target_id, error = %e, "Verification credits grant failed");
