@@ -632,7 +632,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     AND cm.alias = ANY($1::text[])
                 )
             )
-            -- Require positive balance OR free model (system user always passes)
+            -- Require positive balance, a contracted account, or a free model.
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
                 -- Positive balance read directly from the total
@@ -641,10 +641,10 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 -- is_deleted guard mirrors the old balance CTE, which only
                 -- contained non-deleted users; key deletion is not implied by
                 -- user deletion, so this check is load-bearing.
-                OR (u.is_deleted = false AND EXISTS (
+                OR (u.is_deleted = false AND (u.allow_negative_balance OR EXISTS (
                     SELECT 1 FROM user_balance_checkpoints ub
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
-                ))
+                )))
                 OR (
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
@@ -1451,10 +1451,10 @@ pub async fn load_targets_from_db(
                 -- is_deleted guard mirrors the old balance CTE, which only
                 -- contained non-deleted users; key deletion is not implied by
                 -- user deletion, so this check is load-bearing.
-                OR (u.is_deleted = false AND EXISTS (
+                OR (u.is_deleted = false AND (u.allow_negative_balance OR EXISTS (
                     SELECT 1 FROM user_balance_checkpoints ub
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
-                ))
+                )))
                 OR (
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt

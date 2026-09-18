@@ -185,3 +185,23 @@ This is expected for up to N milliseconds (rate limit + fallback interval). The 
 **Why in-memory rate limiting?** Adding database queries to the hot path (analytics batcher) would add latency and load. In-memory tracking is fast and works well enough in multi-instance setups.
 
 **Why allow multi-instance redundancy?** Coordinating rate limiting across instances adds complexity and failure modes. Sending ~3x notifications is acceptable since cache reloads are idempotent and cheap.
+
+## Contracted accounts with negative balances
+
+Set `users.allow_negative_balance` directly in the database to let an account
+continue using paid models and submitting batches with a zero or negative
+balance. It defaults to `false` and is not exposed through the self-service API.
+
+```sql
+UPDATE users SET allow_negative_balance = true WHERE id = '<billing-account-uuid>';
+```
+
+For organization-owned API keys, set the flag on the organization's `users`
+row. Personal keys use the individual account's flag. Changes trigger an
+onwards configuration reload; setting it back to `false` restores normal
+balance enforcement. Group/model permissions, deleted-key checks, and explicit
+API-key spending caps still apply.
+
+Usage charges and balance accounting continue normally, so debt remains visible
+for month-end settlement. This flag does not schedule top-ups or invoices and is
+independent of `invoicing_enabled`, which controls how payments are collected.

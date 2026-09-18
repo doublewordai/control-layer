@@ -595,12 +595,14 @@ pub async fn create_batch<P: PoolProvider>(
             operation: format!("get db connection for credit check: {}", e),
         })?;
         let balance = Credits::new(&mut conn)
-            .get_user_balance(balance_check_id)
+            .get_balance_for_admission(balance_check_id)
             .await
             .map_err(|e| Error::Internal {
                 operation: format!("check credit balance: {}", e),
             })?;
-        if balance < rust_decimal::Decimal::ZERO {
+        if let Some(balance) = balance
+            && balance < rust_decimal::Decimal::ZERO
+        {
             return Err(Error::InsufficientCredits {
                 current_balance: balance,
                 message: "Account balance too low. Please add credits to continue.".to_string(),
@@ -648,12 +650,14 @@ pub async fn create_batch<P: PoolProvider>(
                 operation: format!("get db connection for file owner credit check: {}", e),
             })?;
             let owner_balance = Credits::new(&mut conn)
-                .get_user_balance(file_owner_id)
+                .get_balance_for_admission(file_owner_id)
                 .await
                 .map_err(|e| Error::Internal {
                     operation: format!("check file owner credit balance: {}", e),
                 })?;
-            if owner_balance < rust_decimal::Decimal::ZERO {
+            if let Some(owner_balance) = owner_balance
+                && owner_balance < rust_decimal::Decimal::ZERO
+            {
                 let owner_name = {
                     let mut users_repo = Users::new(&mut conn);
                     users_repo
@@ -4997,6 +5001,34 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_create_batch_allowed_with_negative_balance_flag(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        sqlx::query("UPDATE users SET allow_negative_balance = true WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        submit_one_request_batch(&app, &user, "24h")
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_create_batch_in_org_context_checks_org_balance_not_user(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
 
@@ -5081,6 +5113,37 @@ mod tests {
             .await;
 
         resp.assert_status(StatusCode::CREATED);
+        // A personal exemption does not cover the organization's debt.
+        sqlx::query("UPDATE users SET allow_negative_balance = true WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for enabled in [false, true, false] {
+            sqlx::query("UPDATE users SET allow_negative_balance = $2 WHERE id = $1")
+                .bind(org.id)
+                .bind(enabled)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let resp = app
+                .post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .add_header("cookie", &org_cookie)
+                .await;
+            resp.assert_status(if enabled {
+                StatusCode::CREATED
+            } else {
+                StatusCode::PAYMENT_REQUIRED
+            });
+        }
     }
 
     #[sqlx::test]

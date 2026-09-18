@@ -905,7 +905,8 @@ impl<'c> ApiKeys<'c> {
     }
 
     /// Get all API keys that can access the specified deployment with full response data
-    /// Excludes API keys from users with insufficient credits (balance <= 0)
+    /// Excludes API keys from users with insufficient credits (balance <= 0),
+    /// unless their billing account allows negative balances.
     #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id)), err)]
     pub async fn get_api_keys_for_deployment_with_sufficient_credit(
         &mut self,
@@ -963,6 +964,10 @@ impl<'c> ApiKeys<'c> {
             AND (
                 ak.user_id = $2  -- System user always has access
                 OR EXISTS (
+                    SELECT 1 FROM users u
+                    WHERE u.id = ak.user_id AND u.allow_negative_balance AND NOT u.is_deleted
+                )
+                OR EXISTS (
                     -- User has positive balance: point read of the total
                     -- user_balance_checkpoints read model (kept current by
                     -- writers folding synchronously with each charge)
@@ -1008,6 +1013,10 @@ impl<'c> ApiKeys<'c> {
             AND ak.user_id != '00000000-0000-0000-0000-000000000000'  -- Exclude system user (already covered above)
             AND (
                 ak.user_id = $2  -- System user always has access
+                OR EXISTS (
+                    SELECT 1 FROM users u
+                    WHERE u.id = ak.user_id AND u.allow_negative_balance AND NOT u.is_deleted
+                )
                 OR EXISTS (
                     -- User has positive balance: point read of the total
                     -- user_balance_checkpoints read model (kept current by

@@ -168,7 +168,7 @@ pub async fn error_enrichment_middleware(
         }
 
         // 3. Insufficient balance.
-        if let Ok(balance) = get_balance_of_api_key(pools.write().into_inner(), &key).await
+        if let Ok(Some(balance)) = get_balance_of_api_key(pools.write().into_inner(), &key).await
             && balance <= Decimal::ZERO
         {
             return Error::InsufficientCredits {
@@ -456,17 +456,13 @@ async fn get_api_key_user_and_purpose(pool: PgPool, api_key: &str) -> Result<Opt
     Ok(row.map(|r| (r.user_id, r.purpose)))
 }
 
-#[instrument(skip_all, name = "dwctl.get_balance_of_api_key")]
-pub async fn get_balance_of_api_key(pool: PgPool, api_key: &str) -> Result<Decimal, DbError> {
-    // Look up user_id from API key
+/// An exempt account must not get a misleading insufficient-credit error when
+/// onwards denies a request for another reason (for example a key spending cap).
+#[instrument(skip_all)]
+async fn get_balance_of_api_key(pool: PgPool, api_key: &str) -> Result<Option<Decimal>, DbError> {
     let user_id = get_user_id_of_api_key(pool.clone(), api_key).await?;
-
-    debug!("Found user_id for API key: {}", user_id);
-
-    // Query user's current balance
     let mut conn = pool.acquire().await?;
-    let mut credits_repo = Credits::new(&mut conn);
-    credits_repo.get_user_balance(user_id).await
+    Credits::new(&mut conn).get_balance_for_admission(user_id).await
 }
 
 #[instrument(skip_all, name = "dwctl.check_user_has_model_access")]
@@ -833,6 +829,22 @@ mod tests {
         let body = response.text();
         assert!(body.contains("balance too low"), "balance must supersede the cap, got: {body}");
         assert!(!body.contains("spend_cap_exceeded"), "cap error must not surface, got: {body}");
+
+        // Contracted accounts skip the balance error but retain their key cap.
+        sqlx::query("UPDATE users SET allow_negative_balance = true WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = request().await;
+        response.assert_status(StatusCode::PAYMENT_REQUIRED);
+        assert!(response.text().contains("spend_cap_exceeded"));
+        assert!(!response.text().contains("balance too low"));
+        sqlx::query("UPDATE users SET allow_negative_balance = false WHERE id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         // 3. Post-boundary lag: restore the balance, make the cap windowed
         //    with a rolled-over (stale) window — exhausted counter, expired
