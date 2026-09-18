@@ -3200,6 +3200,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         }
                     }
                     AnyRequest::Claimed(req) => {
+                        // The single-row Pending -> Claimed transition can be
+                        // driven by a stale in-memory Request<Pending>. Only a
+                        // durable pending row may be claimed; otherwise this
+                        // write could resurrect a terminal request or steal a
+                        // newer in-flight generation.
                         let rows_affected = sqlx::query!(
                             r#"
                             UPDATE requests SET
@@ -3210,6 +3215,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                                 started_at = NULL,
                                 not_before = NULL
                             WHERE id = $1
+                              AND state = 'pending'
                             "#,
                             *req.data.id as Uuid,
                             req.state.retry_attempt as i32,
@@ -3222,8 +3228,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
                         .rows_affected();
 
                         if rows_affected == 0 {
-                            return Self::dropped_or_missing_in_transaction(&mut tx, req.data.id)
-                                .await;
+                            return Self::lost_ownership_or_missing_in_transaction(
+                                &mut tx,
+                                req.data.id,
+                            )
+                            .await;
                         }
                     }
                     AnyRequest::Processing(req) => {
@@ -13063,6 +13072,45 @@ mod tests {
             state, "pending",
             "manual retry terminal->pending must keep working"
         );
+    }
+
+    /// A stale in-memory Pending value must not claim a request after another
+    /// writer has terminalized it. Manual retry remains an explicit two-step
+    /// terminal -> Pending -> Claimed transition; Claim itself cannot perform
+    /// the resurrection.
+    #[sqlx::test]
+    async fn persist_claimed_does_not_resurrect_terminal_row(pool: sqlx::PgPool) {
+        let (manager, req) = claim_one_processing(&pool, None).await;
+        manager
+            .persist(&failed_from(
+                &req,
+                FailureReason::NonRetriableHttpStatus {
+                    status: 500,
+                    body: "terminal".to_string(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let stale_pending = Request {
+            data: req.data.clone(),
+            state: fusillade_core::request::Pending {
+                retry_attempt: req.state.retry_attempt,
+                not_before: None,
+                batch_expires_at: req.state.batch_expires_at,
+            },
+        };
+        let error = stale_pending
+            .claim(DaemonId::from(Uuid::new_v4()), &manager)
+            .await
+            .expect_err("a stale pending value must not claim a terminal row");
+        assert!(matches!(
+            error,
+            FusilladeError::LostOwnership(id) if id == req.data.id
+        ));
+
+        let (state, _) = read_request_row(&pool, req.data.id).await;
+        assert_eq!(state, "failed");
     }
 
     /// Custom processors are allowed to finish directly from Claimed without

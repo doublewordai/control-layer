@@ -347,6 +347,20 @@ async fn with_query_timeout<T>(
     }
 }
 
+/// Advance the local heartbeat lease only when the write completed before the
+/// existing lease expired. The renewed lease is anchored at write start,
+/// matching the timestamp stored by `DaemonRecord::heartbeat` before it awaits
+/// Postgres; anchoring it at completion would let local ownership outlive the
+/// heartbeat visible to reclaimers by the database wait time.
+fn renewed_heartbeat_lease_anchor(
+    current_anchor: std::time::Instant,
+    heartbeat_started_at: std::time::Instant,
+    completed_at: std::time::Instant,
+    lease_duration: Duration,
+) -> Option<std::time::Instant> {
+    (completed_at < current_anchor + lease_duration).then_some(heartbeat_started_at)
+}
+
 /// Run maintenance work only while the daemon remains live. Dropping the
 /// future cancels an in-flight SQLx operation and its transaction.
 async fn until_shutdown<T>(
@@ -3032,7 +3046,7 @@ where
         let heartbeat_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(heartbeat_interval_ms));
             let mut daemon_record = running_record;
-            let mut last_success = std::time::Instant::now();
+            let mut lease_anchor = std::time::Instant::now();
             let handle_lease_loss = || {
                 counter!("fusillade_heartbeat_lease_lost_total").increment(1);
                 crate::background_error!(
@@ -3048,7 +3062,7 @@ where
 
             loop {
                 let lease_deadline =
-                    tokio::time::Instant::from_std(last_success + heartbeat_lease_duration);
+                    tokio::time::Instant::from_std(lease_anchor + heartbeat_lease_duration);
                 tokio::select! {
                     _ = interval.tick() => {
                         let stats = DaemonStats {
@@ -3079,14 +3093,19 @@ where
                             }
                             Some(Ok(updated)) => {
                                 let completed_at = std::time::Instant::now();
-                                if completed_at >= last_success + heartbeat_lease_duration {
+                                let Some(renewed_anchor) = renewed_heartbeat_lease_anchor(
+                                    lease_anchor,
+                                    heartbeat_start,
+                                    completed_at,
+                                    heartbeat_lease_duration,
+                                ) else {
                                     handle_lease_loss();
                                     break;
-                                }
+                                };
                                 histogram!("fusillade_heartbeat_duration_seconds")
                                     .record(heartbeat_start.elapsed().as_secs_f64());
                                 daemon_record = updated;
-                                last_success = completed_at;
+                                lease_anchor = renewed_anchor;
                                 tracing::trace!(
                                     daemon_id = %daemon_id,
                                     "Heartbeat sent"
@@ -5748,6 +5767,30 @@ mod tests {
 
         config.heartbeat_interval_ms = 2_500;
         assert!(validate_daemon_intervals(&config).is_ok());
+    }
+
+    #[test]
+    fn heartbeat_lease_renews_from_write_start_not_completion() {
+        let current_anchor = std::time::Instant::now();
+        let write_started = current_anchor + Duration::from_millis(100);
+        let completed_at = current_anchor + Duration::from_millis(900);
+        let lease = Duration::from_secs(1);
+
+        let renewed =
+            renewed_heartbeat_lease_anchor(current_anchor, write_started, completed_at, lease);
+        assert_eq!(renewed, Some(write_started));
+        assert_ne!(renewed, Some(completed_at));
+
+        assert_eq!(
+            renewed_heartbeat_lease_anchor(
+                current_anchor,
+                write_started,
+                current_anchor + lease,
+                lease,
+            ),
+            None,
+            "a write completing at the old deadline must not renew ownership"
+        );
     }
 
     #[tokio::test]
