@@ -347,6 +347,20 @@ async fn with_query_timeout<T>(
     }
 }
 
+/// Advance the local heartbeat lease only when the write completed before the
+/// existing lease expired. The renewed lease is anchored at write start,
+/// matching the timestamp stored by `DaemonRecord::heartbeat` before it awaits
+/// Postgres; anchoring it at completion would let local ownership outlive the
+/// heartbeat visible to reclaimers by the database wait time.
+fn renewed_heartbeat_lease_anchor(
+    current_anchor: std::time::Instant,
+    heartbeat_started_at: std::time::Instant,
+    completed_at: std::time::Instant,
+    lease_duration: Duration,
+) -> Option<std::time::Instant> {
+    (completed_at < current_anchor + lease_duration).then_some(heartbeat_started_at)
+}
+
 /// Run maintenance work only while the daemon remains live. Dropping the
 /// future cancels an in-flight SQLx operation and its transaction.
 async fn until_shutdown<T>(
@@ -1540,6 +1554,21 @@ fn validate_daemon_intervals(config: &DaemonConfig) -> Result<()> {
             )));
         }
     }
+    if config.stale_daemon_threshold_ms == 0 {
+        return Err(FusilladeError::ValidationError(
+            "stale_daemon_threshold_ms must be positive".to_string(),
+        ));
+    }
+    // Keep at least one full heartbeat interval available for the database
+    // query after a scheduled tick. Merely requiring a positive remainder
+    // permits configurations such as 4_999ms/5_000ms, which guarantee a
+    // near-zero query timeout and make a healthy daemon self-fence.
+    if config.heartbeat_interval_ms > config.stale_daemon_threshold_ms / 2 {
+        return Err(FusilladeError::ValidationError(format!(
+            "heartbeat_interval_ms ({}) must be at most half of stale_daemon_threshold_ms ({})",
+            config.heartbeat_interval_ms, config.stale_daemon_threshold_ms
+        )));
+    }
     Ok(())
 }
 
@@ -2652,6 +2681,7 @@ where
                     let batch_expires_at = request.state.batch_expires_at;
                     let retry_attempt_at_completion = request.state.retry_attempt;
                     let owning_daemon_id = request.state.daemon_id;
+                    let request_claimed_at = request.state.claimed_at;
 
                     let cancellation: crate::processor::CancellationFuture = Box::pin(async move {
                         tokio::select! {
@@ -2735,6 +2765,7 @@ where
                                             .reschedule_for_retry(
                                                 request_id,
                                                 owning_daemon_id,
+                                                request_claimed_at,
                                                 pending.state.retry_attempt,
                                                 pending.state.not_before,
                                             )
@@ -2781,7 +2812,25 @@ where
                                         return Ok(());
                                     }
                                     Err(failed) => {
-                                        storage.persist(&*failed).await?;
+                                        match storage.persist(&*failed).await {
+                                            Err(FusilladeError::LostOwnership(_)) => {
+                                                counter!(
+                                                    "fusillade_terminal_lost_ownership_total",
+                                                    "state" => "failed",
+                                                    "model" => model_clone.clone(),
+                                                )
+                                                .increment(1);
+                                                tracing::warn!(
+                                                    request_id = %request_id,
+                                                    batch_id = ?batch_id,
+                                                    "request.terminal_failure_skipped_lost_ownership"
+                                                );
+                                                return Ok(());
+                                            }
+                                            result => {
+                                                result?;
+                                            }
+                                        }
                                         requests_failed.fetch_add(1, Ordering::Relaxed);
                                         user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
                                             completed: AtomicU64::new(0),
@@ -2856,6 +2905,21 @@ where
                             // exit so poll_processing_tasks doesn't log it as a
                             // background task failure.
                             tracing::Span::current().record("outcome", "shutdown");
+                            Ok(())
+                        }
+                        Err(FusilladeError::LostOwnership(_)) => {
+                            tracing::Span::current().record("outcome", "lost_ownership");
+                            counter!(
+                                "fusillade_terminal_lost_ownership_total",
+                                "state" => "completion",
+                                "model" => model_clone.clone(),
+                            )
+                            .increment(1);
+                            tracing::warn!(
+                                request_id = %request_id,
+                                batch_id = ?batch_id,
+                                "request.completion_skipped_lost_ownership"
+                            );
                             Ok(())
                         }
                         Err(e) => {
@@ -2967,15 +3031,38 @@ where
         let requests_failed = self.requests_failed.clone();
         let daemon_id = self.daemon_id;
         let heartbeat_interval_ms = self.config.heartbeat_interval_ms;
-        let heartbeat_query_timeout =
-            Duration::from_millis(heartbeat_interval_ms.saturating_mul(4));
+        // Leave enough of the lease after each scheduled tick for the query to
+        // finish. The startup invariant guarantees at least one full heartbeat
+        // interval of query budget; the deadline check below remains the final
+        // authority at the boundary.
+        let heartbeat_query_timeout = Duration::from_millis(
+            heartbeat_interval_ms
+                .saturating_mul(4)
+                .min(self.config.stale_daemon_threshold_ms - heartbeat_interval_ms),
+        );
+        let heartbeat_lease_duration = Duration::from_millis(self.config.stale_daemon_threshold_ms);
         let shutdown_signal = self.shutdown_token.clone();
 
         let heartbeat_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(heartbeat_interval_ms));
             let mut daemon_record = running_record;
+            let mut lease_anchor = std::time::Instant::now();
+            let handle_lease_loss = || {
+                counter!("fusillade_heartbeat_lease_lost_total").increment(1);
+                crate::background_error!(
+                    "heartbeat_lease_lost", Error,
+                    daemon_id = %daemon_id,
+                    lease_ms = heartbeat_lease_duration.as_millis() as u64,
+                    "Heartbeat lease expired; cancelling in-flight work and stopping daemon"
+                );
+                // Every processing task selects on this token and aborts its
+                // downstream HTTP request when ownership may be reclaimed.
+                shutdown_signal.cancel();
+            };
 
             loop {
+                let lease_deadline =
+                    tokio::time::Instant::from_std(lease_anchor + heartbeat_lease_duration);
                 tokio::select! {
                     _ = interval.tick() => {
                         let stats = DaemonStats {
@@ -2987,23 +3074,44 @@ where
                         // Clone the record so we preserve it if heartbeat fails
                         let current = daemon_record.clone();
                         let heartbeat_start = std::time::Instant::now();
-                        match with_query_timeout(
+                        let heartbeat = with_query_timeout(
                             "heartbeat query",
                             heartbeat_query_timeout,
                             current.heartbeat(stats, storage.as_ref()),
-                        )
-                        .await
-                        {
-                            Ok(updated) => {
+                        );
+                        tokio::pin!(heartbeat);
+                        let heartbeat_result = tokio::select! {
+                            result = &mut heartbeat => Some(result),
+                            _ = tokio::time::sleep_until(lease_deadline) => None,
+                            _ = shutdown_signal.cancelled() => break,
+                        };
+
+                        match heartbeat_result {
+                            None => {
+                                handle_lease_loss();
+                                break;
+                            }
+                            Some(Ok(updated)) => {
+                                let completed_at = std::time::Instant::now();
+                                let Some(renewed_anchor) = renewed_heartbeat_lease_anchor(
+                                    lease_anchor,
+                                    heartbeat_start,
+                                    completed_at,
+                                    heartbeat_lease_duration,
+                                ) else {
+                                    handle_lease_loss();
+                                    break;
+                                };
                                 histogram!("fusillade_heartbeat_duration_seconds")
                                     .record(heartbeat_start.elapsed().as_secs_f64());
                                 daemon_record = updated;
+                                lease_anchor = renewed_anchor;
                                 tracing::trace!(
                                     daemon_id = %daemon_id,
                                     "Heartbeat sent"
                                 );
                             }
-                            Err(e) => {
+                            Some(Err(e)) => {
                                 histogram!("fusillade_heartbeat_duration_seconds")
                                     .record(heartbeat_start.elapsed().as_secs_f64());
                                 crate::background_error!(
@@ -3016,24 +3124,31 @@ where
                             }
                         }
                     }
-                    _ = shutdown_signal.cancelled() => {
-                        // Mark daemon as dead on shutdown
-                        tracing::info!("Shutting down heartbeat task");
-                        if let Err(e) = with_query_timeout(
-                            "daemon shutdown query",
-                            heartbeat_query_timeout,
-                            daemon_record.shutdown(storage.as_ref()),
-                        ).await {
-                            crate::background_error!(
-                                "shutdown_mark_failed", Error,
-                                daemon_id = %daemon_id,
-                                error = %e,
-                                "Failed to mark daemon as dead during shutdown"
-                            );
-                        }
+                    _ = tokio::time::sleep_until(lease_deadline) => {
+                        handle_lease_loss();
                         break;
                     }
+                    _ = shutdown_signal.cancelled() => break,
                 }
+            }
+
+            // Mark daemon as dead on either operator shutdown or local lease
+            // loss. The query is best-effort: reclamation also handles stale
+            // heartbeats after the grace window when the database is unavailable.
+            tracing::info!("Shutting down heartbeat task");
+            if let Err(e) = with_query_timeout(
+                "daemon shutdown query",
+                heartbeat_query_timeout,
+                daemon_record.shutdown(storage.as_ref()),
+            )
+            .await
+            {
+                crate::background_error!(
+                    "shutdown_mark_failed", Error,
+                    daemon_id = %daemon_id,
+                    error = %e,
+                    "Failed to mark daemon as dead during shutdown"
+                );
             }
         });
         daemon_handles.push(("heartbeat", heartbeat_handle));
@@ -5633,6 +5748,49 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_daemon_intervals(&config).is_ok());
+    }
+
+    #[test]
+    fn heartbeat_cadence_must_fit_inside_lease() {
+        let mut config = DaemonConfig {
+            stale_daemon_threshold_ms: 0,
+            ..Default::default()
+        };
+        assert!(validate_daemon_intervals(&config).is_err());
+
+        config.stale_daemon_threshold_ms = 5_000;
+        config.heartbeat_interval_ms = 5_000;
+        assert!(validate_daemon_intervals(&config).is_err());
+
+        config.heartbeat_interval_ms = 4_999;
+        assert!(validate_daemon_intervals(&config).is_err());
+
+        config.heartbeat_interval_ms = 2_500;
+        assert!(validate_daemon_intervals(&config).is_ok());
+    }
+
+    #[test]
+    fn heartbeat_lease_renews_from_write_start_not_completion() {
+        let current_anchor = std::time::Instant::now();
+        let write_started = current_anchor + Duration::from_millis(100);
+        let completed_at = current_anchor + Duration::from_millis(900);
+        let lease = Duration::from_secs(1);
+
+        let renewed =
+            renewed_heartbeat_lease_anchor(current_anchor, write_started, completed_at, lease);
+        assert_eq!(renewed, Some(write_started));
+        assert_ne!(renewed, Some(completed_at));
+
+        assert_eq!(
+            renewed_heartbeat_lease_anchor(
+                current_anchor,
+                write_started,
+                current_anchor + lease,
+                lease,
+            ),
+            None,
+            "a write completing at the old deadline must not renew ownership"
+        );
     }
 
     #[tokio::test]
