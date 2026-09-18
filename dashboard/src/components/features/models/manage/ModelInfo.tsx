@@ -20,6 +20,7 @@ import {
   useEndpoint,
   useUpdateModel,
   useModelCachePricing,
+  useModelOverlays,
   useProbes,
   useModelComponents,
   useDaemons,
@@ -246,6 +247,16 @@ const ModelInfo: React.FC = () => {
     useModelCachePricing(modelId!, {
       enabled: !!modelId && canManageModels,
     });
+  // Organisations with a serving overlay on this model (platform managers only).
+  const { data: modelOverlays } = useModelOverlays(modelId!, {
+    enabled: !!modelId && canManageModels,
+  });
+  // The model's own prices vs organisation deals (platform managers see both).
+  const generalTariffs = (model?.tariffs ?? []).filter((t) => !t.organization_id);
+  const organisationTariffs = (model?.tariffs ?? []).filter(
+    (t) => !!t.organization_id,
+  );
+  const servingPresets = Object.entries(model?.serving_classes ?? {});
 
   const {
     data: endpoint,
@@ -2494,9 +2505,9 @@ const ModelInfo: React.FC = () => {
                               </Button>
                             )}
                           </div>
-                          {model.tariffs && model.tariffs.length > 0 ? (
+                          {generalTariffs.length > 0 ? (
                             <div className="space-y-3">
-                              {model.tariffs.map((tariff) => (
+                              {generalTariffs.map((tariff) => (
                                 <div
                                   key={tariff.id}
                                   className="bg-gray-50 rounded-lg p-3"
@@ -2553,8 +2564,142 @@ const ModelInfo: React.FC = () => {
                                 ' Click "Manage Tariffs" to set up pricing.'}
                             </p>
                           )}
+                          {organisationTariffs.length > 0 && (
+                            <div className="mt-4">
+                              <p className="text-sm text-gray-600 mb-2">
+                                Organisation prices
+                              </p>
+                              <p className="text-xs text-gray-500 mb-2">
+                                Deals declared in the organisation catalog; they
+                                replace the general price for that organisation.
+                              </p>
+                              <div className="space-y-2">
+                                {organisationTariffs.map((tariff) => (
+                                  <div
+                                    key={tariff.id}
+                                    className="bg-gray-50 rounded-lg p-3 text-sm flex flex-wrap items-center gap-x-4 gap-y-1"
+                                  >
+                                    <span className="font-mono text-xs">
+                                      {tariff.organization_id}
+                                    </span>
+                                    <span className="font-medium">
+                                      {getTariffDisplayName(
+                                        tariff.api_key_purpose,
+                                        tariff.completion_window,
+                                      )}
+                                    </span>
+                                    <span className="tabular-nums">
+                                      $
+                                      {(
+                                        parseFloat(tariff.input_price_per_token) *
+                                        1000000
+                                      ).toFixed(2)}{" "}
+                                      in / $
+                                      {(
+                                        parseFloat(tariff.output_price_per_token) *
+                                        1000000
+                                      ).toFixed(2)}{" "}
+                                      out
+                                    </span>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          )}
                         </div>
                       }
+                      {/* Serving classes and organisation overlays (platform managers only; catalog-declared) */}
+                      {canManageModels && (
+                        <div className="border-t pt-6">
+                          <div className="flex items-center gap-1 mb-3">
+                            <p className="text-sm text-gray-600">
+                              Serving classes
+                            </p>
+                            <InfoTip>
+                              <p className="text-sm text-muted-foreground">
+                                Classes this model offers, each a preset of
+                                router targets sent to the serving stack.
+                                Declared in the model catalog; no class means
+                                every request is served as standard.
+                              </p>
+                            </InfoTip>
+                          </div>
+                          {servingPresets.length === 0 ? (
+                            <p className="text-sm text-gray-500">
+                              None offered (standard only).
+                            </p>
+                          ) : (
+                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                              {servingPresets.map(([name, preset]) => (
+                                <div
+                                  key={name}
+                                  className="bg-gray-50 rounded-lg p-3 text-sm"
+                                >
+                                  <p className="font-medium">{name}</p>
+                                  <p className="text-xs text-gray-500 mt-1 tabular-nums">
+                                    TTFT {preset.ttft_ms} ms · ITL {preset.itl_ms}{" "}
+                                    ms
+                                    {preset.priority
+                                      ? ` · priority ${preset.priority}`
+                                      : ""}
+                                  </p>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                          <div className="flex items-center gap-1 mt-5 mb-2">
+                            <p className="text-sm text-gray-600">
+                              Organisation overlays
+                            </p>
+                            <InfoTip>
+                              <p className="text-sm text-muted-foreground">
+                                Per-organisation overrides on this model from
+                                the organisation catalog: a default class or
+                                explicit targets, and the routing preference.
+                              </p>
+                            </InfoTip>
+                          </div>
+                          {!modelOverlays || modelOverlays.length === 0 ? (
+                            <p className="text-sm text-gray-500">
+                              No organisation overlays.
+                            </p>
+                          ) : (
+                            <div className="space-y-2">
+                              {modelOverlays.map((o) => (
+                                <div
+                                  key={o.organization_id}
+                                  className="bg-gray-50 rounded-lg p-3 text-sm flex flex-wrap items-center gap-x-4 gap-y-1"
+                                >
+                                  <span className="font-medium">
+                                    {o.organization_name}
+                                  </span>
+                                  {o.default_serving_class && (
+                                    <span>default {o.default_serving_class}</span>
+                                  )}
+                                  {o.targets && (
+                                    <span className="tabular-nums">
+                                      TTFT {o.targets.ttft_ms} ms · ITL{" "}
+                                      {o.targets.itl_ms} ms
+                                      {o.targets.priority
+                                        ? ` · priority ${o.targets.priority}`
+                                        : ""}
+                                    </span>
+                                  )}
+                                  {o.self_hosted_only !== undefined && (
+                                    <span>
+                                      self-hosted only:{" "}
+                                      {o.self_hosted_only ? "yes" : "no"}
+                                    </span>
+                                  )}
+                                  <span className="text-xs text-gray-500 ml-auto">
+                                    {o.provisioning_source ?? "hand-written"}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      )}
                       {/* Cache Pricing Display (admin-only; data via the dedicated endpoint) */}
                       {canManageModels && (
                         <div className="border-t pt-6">

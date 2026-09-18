@@ -20,12 +20,14 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
+use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
-use crate::model_provisioning::{ServingClassName, ServingPreset};
+use crate::db::handlers::ModelProvisioning;
+use crate::model_provisioning::{CacheTariff, ServingClassName, ServingPreset, Tariff, validate_cache_tariff, validate_tariffs};
 
 /// Prefix of the `provisioning_source` marker on rows this catalog owns.
 const SOURCE_PREFIX: &str = "org-overlays:";
@@ -76,6 +78,29 @@ pub struct OrgModelOverlay {
     /// Overrides the account's `self_hosted_only` setting on this model.
     #[serde(default)]
     pub self_hosted_only: Option<bool>,
+    /// The organisation's own prices on this model, per purpose and completion
+    /// window, same shape as the model catalog's `tariffs`. Billing uses these
+    /// where they exist and the model's general price otherwise. Omitting a
+    /// purpose here means the general price for that purpose.
+    #[serde(default)]
+    pub tariffs: Vec<Tariff>,
+    /// The organisation's own prompt-cache multipliers on this model. Caching
+    /// itself is enabled by the model's general cache tariff; this only
+    /// changes the multipliers this organisation pays.
+    #[serde(default)]
+    pub cache_tariff: Option<CacheTariff>,
+}
+
+impl OrgModelOverlay {
+    /// The models this entry prices; the applier reconciles even an empty list
+    /// (the file is the source, so a removed deal closes the organisation's rows).
+    fn overrides_something(&self) -> bool {
+        self.default_class.is_some()
+            || self.targets.is_some()
+            || self.self_hosted_only.is_some()
+            || !self.tariffs.is_empty()
+            || self.cache_tariff.is_some()
+    }
 }
 
 impl OrgCatalog {
@@ -129,10 +154,14 @@ impl OrgCatalog {
                     model.alias
                 );
                 ensure!(
-                    model.default_class.is_some() || model.targets.is_some() || model.self_hosted_only.is_some(),
+                    model.overrides_something(),
                     "{source}: overlay for model {:?} overrides nothing",
                     model.alias
                 );
+                validate_tariffs(&model.tariffs, &format!("{source}: model {:?}", model.alias))?;
+                if let Some(cache) = &model.cache_tariff {
+                    validate_cache_tariff(cache, &format!("{source}: model {:?}", model.alias))?;
+                }
                 ensure!(
                     model.default_class.is_none() || model.targets.is_none(),
                     "{source}: overlay for model {:?} sets both default_class and targets; use one",
@@ -167,14 +196,37 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
         .context("acquire org overlay advisory lock")?;
     let orgs = resolve_orgs(db, catalog).await?;
     let aliases = resolve_aliases(db, catalog).await?;
+    let effective_at: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+        .fetch_one(&mut *db)
+        .await
+        .context("read org overlay effective timestamp")?;
+    for entry in &catalog.orgs {
+        ModelProvisioning::new(db)
+            .preflight_future_account_tariffs(orgs[entry.document.org.trim()], effective_at)
+            .await
+            .with_context(|| format!("{}: organisation {:?}", entry.source, entry.document.org))?;
+    }
 
     let mut desired: Vec<(Uuid, Uuid)> = Vec::new();
     for entry in &catalog.orgs {
         let org_id = orgs[entry.document.org.trim()];
         let source = format!("{SOURCE_PREFIX}{}", entry.source);
+        let mut declared_models: Vec<Uuid> = Vec::new();
         for model in &entry.document.models {
             let model_id = aliases[&model.alias];
             desired.push((org_id, model_id));
+            declared_models.push(model_id);
+            // The organisation's prices on this model: a temporal ledger scoped to the
+            // organisation, versioned exactly like the model catalog's general prices.
+            let mut provisioning = ModelProvisioning::new(db);
+            provisioning
+                .reconcile_tariffs(model_id, Some(org_id), &model.tariffs, effective_at)
+                .await
+                .with_context(|| format!("reconcile tariffs of org {:?} on {:?}", entry.document.org, model.alias))?;
+            provisioning
+                .reconcile_cache_tariff(model_id, Some(org_id), model.cache_tariff.as_ref(), effective_at)
+                .await
+                .with_context(|| format!("reconcile cache tariff of org {:?} on {:?}", entry.document.org, model.alias))?;
             sqlx::query(
                 r#"INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, targets, self_hosted_only, provisioning_source)
                    VALUES ($1, $2, $3, $4, $5, $6)
@@ -199,6 +251,12 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
             .await
             .with_context(|| format!("upsert overlay for org {:?} on {:?}", entry.document.org, model.alias))?;
         }
+        // A deal on a model the file no longer mentions is over: close the
+        // organisation's rows there. Other organisations are untouched.
+        ModelProvisioning::new(db)
+            .close_account_tariffs_except(org_id, &declared_models, effective_at)
+            .await
+            .with_context(|| format!("close undeclared tariffs of org {:?}", entry.document.org))?;
     }
 
     // Rows this catalog owns but no longer declares are removed; hand rows
@@ -458,6 +516,96 @@ mod tests {
             Some(serde_json::json!({"ttft_ms": 800, "itl_ms": 30, "priority": 0}))
         );
         assert_eq!(row.try_get::<Option<bool>, _>("self_hosted_only").unwrap(), None);
+
+        // The organisation's prices live next to the model's general price, scoped by
+        // user_id: general rows are untouched, org rows are versioned like the catalog's.
+        sqlx::query(
+            "INSERT INTO model_tariffs (deployed_model_id, name, input_price_per_token, output_price_per_token, api_key_purpose) VALUES ($1, 'general', 0.00000100, 0.00000200, 'realtime')",
+        )
+        .bind(model_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        write(
+            directory.path(),
+            "acme.yaml",
+            "org: acme\nmodels:\n  - alias: org/model\n    tariffs:\n      - {name: deal, purpose: realtime, input_per_million_tokens: \"0.50\", output_per_million_tokens: \"1.00\"}\n      - {name: deal-24h, purpose: batch, completion_window: 24h, input_per_million_tokens: \"0.25\", output_per_million_tokens: \"0.50\"}\n    cache_tariff: {write_multiplier_5m: \"1.1\", write_multiplier_1h: \"1.5\", write_multiplier_24h: \"2.0\", read_multiplier: \"0.05\", min_prefix_tokens: 512}\n",
+        );
+        apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+        let org_rows: Vec<(String, Option<String>, Option<Uuid>)> = sqlx::query_as(
+            "SELECT name, completion_window, user_id FROM model_tariffs WHERE deployed_model_id = $1 AND valid_until IS NULL ORDER BY name",
+        )
+        .bind(model_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            org_rows,
+            vec![
+                ("deal".to_string(), None, Some(org_id)),
+                ("deal-24h".to_string(), Some("24h".to_string()), Some(org_id)),
+                ("general".to_string(), None, None),
+            ]
+        );
+        let cache_scope: Option<Uuid> =
+            sqlx::query_scalar("SELECT user_id FROM model_cache_tariffs WHERE deployed_model_id = $1 AND valid_until IS NULL")
+                .bind(model_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cache_scope, Some(org_id));
+
+        // A changed price closes the organisation's row and inserts its successor.
+        write(
+            directory.path(),
+            "acme.yaml",
+            "org: acme\nmodels:\n  - alias: org/model\n    tariffs:\n      - {name: deal, purpose: realtime, input_per_million_tokens: \"0.40\", output_per_million_tokens: \"1.00\"}\n",
+        );
+        apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+        let versions: Vec<(String, bool)> = sqlx::query_as(
+            "SELECT name, valid_until IS NULL FROM model_tariffs WHERE deployed_model_id = $1 AND user_id = $2 ORDER BY valid_from, name",
+        )
+        .bind(model_id)
+        .bind(org_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            versions,
+            vec![
+                ("deal".to_string(), false),
+                ("deal-24h".to_string(), false),
+                ("deal".to_string(), true)
+            ]
+        );
+        let cache_open: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM model_cache_tariffs WHERE deployed_model_id = $1 AND user_id = $2 AND valid_until IS NULL",
+        )
+        .bind(model_id)
+        .bind(org_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cache_open, 0, "an omitted cache_tariff closes the organisation's row");
+
+        // Dropping the model from the file ends the deal: every org row is closed,
+        // the general price stays open.
+        write(directory.path(), "acme.yaml", "org: acme\nmodels: []\n");
+        apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+        let open: Vec<(String, Option<Uuid>)> =
+            sqlx::query_as("SELECT name, user_id FROM model_tariffs WHERE deployed_model_id = $1 AND valid_until IS NULL")
+                .bind(model_id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(open, vec![("general".to_string(), None)]);
+        // put the entry back so the pruning assertions below run as before
+        write(
+            directory.path(),
+            "acme.yaml",
+            "org: acme\nmodels:\n  - alias: org/model\n    targets: {ttft_ms: 800, itl_ms: 30}\n",
+        );
+        apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
 
         // A hand-written row for another org survives; the catalog's own row
         // goes when its entry is removed from the file.

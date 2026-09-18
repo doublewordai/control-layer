@@ -87,8 +87,8 @@ impl<'c> ModelProvisioning<'c> {
         for model in &catalog.models {
             let model_id = ids[&model.clay.alias];
             self.reconcile_components(model_id, model, &ids).await?;
-            self.reconcile_tariffs(model_id, &model.clay.tariffs, effective_at).await?;
-            self.reconcile_cache_tariff(model_id, model.clay.cache_tariff.as_ref(), effective_at)
+            self.reconcile_tariffs(model_id, None, &model.clay.tariffs, effective_at).await?;
+            self.reconcile_cache_tariff(model_id, None, model.clay.cache_tariff.as_ref(), effective_at)
                 .await?;
             self.reconcile_groups(model_id, &model.clay.access_groups, &groups).await?;
             self.reconcile_traffic_rules(model_id, &model.clay.traffic_rules, &redirect_ids)
@@ -142,6 +142,46 @@ impl<'c> ModelProvisioning<'c> {
         Ok(())
     }
 
+    /// Close every active tariff and cache tariff of `account` on models NOT in
+    /// `keep`: an organisation's deal on a model its file no longer declares.
+    pub(crate) async fn close_account_tariffs_except(&mut self, account: Uuid, keep: &[Uuid], effective_at: DateTime<Utc>) -> Result<()> {
+        for table in ["model_tariffs", "model_cache_tariffs"] {
+            sqlx::query(&format!(
+                "UPDATE {table} SET valid_until = $3
+                 WHERE user_id = $1 AND NOT (deployed_model_id = ANY($2))
+                   AND valid_from <= $3 AND (valid_until IS NULL OR valid_until > $3)"
+            ))
+            .bind(account)
+            .bind(keep)
+            .bind(effective_at)
+            .execute(&mut *self.db)
+            .await
+            .with_context(|| format!("close {table} rows of an organisation on undeclared models"))?;
+        }
+        Ok(())
+    }
+
+    /// Refuse to reconcile an organisation whose rows carry a future `valid_from`:
+    /// startup provisioning has no scheduling semantics (same rule as the model catalog).
+    pub(crate) async fn preflight_future_account_tariffs(&mut self, account: Uuid, effective_at: DateTime<Utc>) -> Result<()> {
+        for table in ["model_tariffs", "model_cache_tariffs"] {
+            let future: Option<DateTime<Utc>> = sqlx::query_scalar(&format!(
+                "SELECT valid_from FROM {table}
+                 WHERE user_id = $1 AND valid_from > $2 AND (valid_until IS NULL OR valid_until > valid_from)
+                 ORDER BY valid_from LIMIT 1"
+            ))
+            .bind(account)
+            .bind(effective_at)
+            .fetch_optional(&mut *self.db)
+            .await
+            .with_context(|| format!("check future {table} rows of an organisation"))?;
+            if let Some(valid_from) = future {
+                bail!("organisation has a future tariff scheduled for {valid_from}; startup provisioning has no scheduling semantics");
+            }
+        }
+        Ok(())
+    }
+
     async fn preflight_future_tariffs(&mut self, catalog: &Catalog, effective_at: DateTime<Utc>) -> Result<()> {
         let aliases: Vec<String> = catalog.models.iter().map(|model| model.clay.alias.clone()).collect();
         let future_customer = sqlx::query(
@@ -149,6 +189,7 @@ impl<'c> ModelProvisioning<'c> {
                FROM model_tariffs mt
                JOIN deployed_models dm ON dm.id = mt.deployed_model_id
                WHERE dm.alias = ANY($1)
+                 AND mt.user_id IS NULL
                  AND mt.valid_from > $2
                  AND (mt.valid_until IS NULL OR mt.valid_until > mt.valid_from)
                ORDER BY mt.valid_from
@@ -172,6 +213,7 @@ impl<'c> ModelProvisioning<'c> {
                FROM model_cache_tariffs mt
                JOIN deployed_models dm ON dm.id = mt.deployed_model_id
                WHERE dm.alias = ANY($1)
+                 AND mt.user_id IS NULL
                  AND mt.valid_from > $2
                  AND (mt.valid_until IS NULL OR mt.valid_until > mt.valid_from)
                ORDER BY mt.valid_from
@@ -483,18 +525,29 @@ impl<'c> ModelProvisioning<'c> {
         Ok(())
     }
 
-    async fn reconcile_tariffs(&mut self, model_id: Uuid, desired: &[Tariff], effective_at: DateTime<Utc>) -> Result<()> {
+    /// Bring one scope's active tariffs on a model to `desired`: the model's general
+    /// price (`account` = None, the model catalog) or one organisation's deal (the
+    /// organisation catalog). Rows of other scopes are never touched.
+    pub(crate) async fn reconcile_tariffs(
+        &mut self,
+        model_id: Uuid,
+        account: Option<Uuid>,
+        desired: &[Tariff],
+        effective_at: DateTime<Utc>,
+    ) -> Result<()> {
         let rows = sqlx::query(
             r#"SELECT id, name, input_price_per_token, output_price_per_token,
                       api_key_purpose, completion_window, valid_until
                FROM model_tariffs
                WHERE deployed_model_id = $1
+                 AND user_id IS NOT DISTINCT FROM $3
                  AND valid_from <= $2
                  AND (valid_until IS NULL OR valid_until > $2)
                ORDER BY valid_from DESC"#,
         )
         .bind(model_id)
         .bind(effective_at)
+        .bind(account)
         .fetch_all(&mut *self.db)
         .await
         .context("read active model tariffs")?;
@@ -545,8 +598,8 @@ impl<'c> ModelProvisioning<'c> {
             sqlx::query(
                 r#"INSERT INTO model_tariffs (
                        deployed_model_id, name, input_price_per_token, output_price_per_token,
-                       valid_from, api_key_purpose, completion_window
-                   ) VALUES ($1,$2,$3,$4,$5,$6,$7)"#,
+                       valid_from, api_key_purpose, completion_window, user_id
+                   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"#,
             )
             .bind(model_id)
             .bind(&tariff.name)
@@ -555,6 +608,7 @@ impl<'c> ModelProvisioning<'c> {
             .bind(effective_at)
             .bind(tariff.purpose.as_db_str())
             .bind(&tariff.completion_window)
+            .bind(account)
             .execute(&mut *self.db)
             .await
             .with_context(|| format!("insert replacement tariff {:?}", tariff.name))?;
@@ -575,18 +629,27 @@ impl<'c> ModelProvisioning<'c> {
         Ok(())
     }
 
-    async fn reconcile_cache_tariff(&mut self, model_id: Uuid, desired: Option<&CacheTariff>, effective_at: DateTime<Utc>) -> Result<()> {
+    /// Same as [`Self::reconcile_tariffs`] for the prompt-cache multipliers of one scope.
+    pub(crate) async fn reconcile_cache_tariff(
+        &mut self,
+        model_id: Uuid,
+        account: Option<Uuid>,
+        desired: Option<&CacheTariff>,
+        effective_at: DateTime<Utc>,
+    ) -> Result<()> {
         let rows = sqlx::query(
             r#"SELECT id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h,
                       read_multiplier, min_prefix_tokens, valid_until
                FROM model_cache_tariffs
                WHERE deployed_model_id = $1
+                 AND user_id IS NOT DISTINCT FROM $3
                  AND valid_from <= $2
                  AND (valid_until IS NULL OR valid_until > $2)
                ORDER BY valid_from DESC"#,
         )
         .bind(model_id)
         .bind(effective_at)
+        .bind(account)
         .fetch_all(&mut *self.db)
         .await
         .context("read active cache tariffs")?;
@@ -627,8 +690,8 @@ impl<'c> ModelProvisioning<'c> {
         sqlx::query(
             r#"INSERT INTO model_cache_tariffs (
                    deployed_model_id, write_multiplier_5m, write_multiplier_1h,
-                   write_multiplier_24h, read_multiplier, min_prefix_tokens, valid_from
-               ) VALUES ($1,$2,$3,$4,$5,$6,$7)"#,
+                   write_multiplier_24h, read_multiplier, min_prefix_tokens, valid_from, user_id
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"#,
         )
         .bind(model_id)
         .bind(write_5m)
@@ -637,6 +700,7 @@ impl<'c> ModelProvisioning<'c> {
         .bind(read)
         .bind(desired.min_prefix_tokens)
         .bind(effective_at)
+        .bind(account)
         .execute(&mut *self.db)
         .await
         .context("insert replacement cache tariff")?;

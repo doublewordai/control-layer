@@ -1986,6 +1986,7 @@ pub async fn build_router(
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
+        .route("/models/{id}/overlays", get(api::handlers::serving::list_model_overlays))
         .route("/models/{id}/cache-pricing", get(api::handlers::cache_pricing::get_cache_pricing))
         .route(
             "/models/{id}/cache-pricing",
@@ -2067,6 +2068,7 @@ pub async fn build_router(
         .route("/organizations/{id}", get(api::handlers::organizations::get_organization))
         .route("/organizations/{id}", patch(api::handlers::organizations::update_organization))
         .route("/organizations/{id}", delete(api::handlers::organizations::delete_organization))
+        .route("/organizations/{id}/serving", get(api::handlers::serving::get_organization_serving))
         // Organization membership
         .route("/organizations/{id}/members", get(api::handlers::organizations::list_members))
         .route("/organizations/{id}/members", post(api::handlers::organizations::add_member))

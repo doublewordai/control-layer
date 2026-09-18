@@ -504,51 +504,9 @@ impl Catalog {
             );
             validate_fallback(&model.clay.routing.fallback, &model.source)?;
 
-            let mut tariff_keys = HashSet::new();
-            for tariff in &model.clay.tariffs {
-                ensure_nonempty(&tariff.name, &model.source, "tariff.name")?;
-                match tariff.purpose {
-                    Purpose::Batch => ensure!(
-                        tariff.completion_window.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                        "{}: batch tariff {:?} requires completion_window",
-                        model.source,
-                        tariff.name
-                    ),
-                    _ => ensure!(
-                        tariff.completion_window.is_none(),
-                        "{}: non-batch tariff {:?} must not set completion_window",
-                        model.source,
-                        tariff.name
-                    ),
-                }
-                ensure!(
-                    tariff_keys.insert((tariff.purpose, tariff.completion_window.clone())),
-                    "{}: duplicate tariff for purpose {:?} and completion window {:?}",
-                    model.source,
-                    tariff.purpose,
-                    tariff.completion_window
-                );
-                parse_per_million(&tariff.input_per_million_tokens)
-                    .with_context(|| format!("{}: tariff {:?} input price", model.source, tariff.name))?;
-                parse_per_million(&tariff.output_per_million_tokens)
-                    .with_context(|| format!("{}: tariff {:?} output price", model.source, tariff.name))?;
-            }
-
+            validate_tariffs(&model.clay.tariffs, &model.source)?;
             if let Some(cache) = &model.clay.cache_tariff {
-                for (field, value) in [
-                    ("write_multiplier_5m", &cache.write_multiplier_5m),
-                    ("write_multiplier_1h", &cache.write_multiplier_1h),
-                    ("write_multiplier_24h", &cache.write_multiplier_24h),
-                    ("read_multiplier", &cache.read_multiplier),
-                ] {
-                    let parsed = parse_decimal(value).with_context(|| format!("{}: cache tariff {field}", model.source))?;
-                    ensure!(parsed >= Decimal::ZERO, "{}: cache tariff {field} cannot be negative", model.source);
-                }
-                ensure!(
-                    cache.min_prefix_tokens > 0,
-                    "{}: cache tariff min_prefix_tokens must be positive",
-                    model.source
-                );
+                validate_cache_tariff(cache, &model.source)?;
             }
 
             ensure_unique_strings(&model.clay.access_groups, &model.source, "access group")?;
@@ -585,6 +543,54 @@ pub async fn apply(pool: &PgPool, catalog: &Catalog) -> Result<()> {
     let mut transaction = pool.begin().await.context("begin model provisioning transaction")?;
     ModelProvisioning::new(&mut transaction).apply(catalog).await?;
     transaction.commit().await.context("commit model provisioning transaction")?;
+    Ok(())
+}
+
+/// The tariff rules shared by the model catalog (a model's general price) and the
+/// organisation catalog (a deal on one model): batch rows carry a completion window,
+/// others do not, one row per (purpose, window), prices exact at 8 dp per token.
+pub(crate) fn validate_tariffs(tariffs: &[Tariff], source: &str) -> Result<()> {
+    let mut tariff_keys = HashSet::new();
+    for tariff in tariffs {
+        ensure_nonempty(&tariff.name, source, "tariff.name")?;
+        match tariff.purpose {
+            Purpose::Batch => ensure!(
+                tariff.completion_window.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                "{source}: batch tariff {:?} requires completion_window",
+                tariff.name
+            ),
+            _ => ensure!(
+                tariff.completion_window.is_none(),
+                "{source}: non-batch tariff {:?} must not set completion_window",
+                tariff.name
+            ),
+        }
+        ensure!(
+            tariff_keys.insert((tariff.purpose, tariff.completion_window.clone())),
+            "{source}: duplicate tariff for purpose {:?} and completion window {:?}",
+            tariff.purpose,
+            tariff.completion_window
+        );
+        parse_per_million(&tariff.input_per_million_tokens).with_context(|| format!("{source}: tariff {:?} input price", tariff.name))?;
+        parse_per_million(&tariff.output_per_million_tokens).with_context(|| format!("{source}: tariff {:?} output price", tariff.name))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_cache_tariff(cache: &CacheTariff, source: &str) -> Result<()> {
+    for (field, value) in [
+        ("write_multiplier_5m", &cache.write_multiplier_5m),
+        ("write_multiplier_1h", &cache.write_multiplier_1h),
+        ("write_multiplier_24h", &cache.write_multiplier_24h),
+        ("read_multiplier", &cache.read_multiplier),
+    ] {
+        let parsed = parse_decimal(value).with_context(|| format!("{source}: cache tariff {field}"))?;
+        ensure!(parsed >= Decimal::ZERO, "{source}: cache tariff {field} cannot be negative");
+    }
+    ensure!(
+        cache.min_prefix_tokens > 0,
+        "{source}: cache tariff min_prefix_tokens must be positive"
+    );
     Ok(())
 }
 

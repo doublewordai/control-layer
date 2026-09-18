@@ -47,6 +47,11 @@ pub struct DeployedModelEnricher<'a> {
     pub can_read_rate_limits: bool,
     /// Whether the user can read who created models
     pub can_read_users: bool,
+    /// The account the caller is billed to (their active organisation, else themselves).
+    /// A customer's pricing view is the EFFECTIVE one: their organisation's own rows
+    /// where they exist, the general rows otherwise. Platform managers (`can_read_pricing`)
+    /// see every scope instead, each organisation row marked with its `organization_id`.
+    pub pricing_account: Option<crate::types::UserId>,
     /// Whether the user can read composite model information (is_composite, lb_strategy, fallback, components)
     pub can_read_composite_info: bool,
 }
@@ -157,12 +162,34 @@ impl<'a> DeployedModelEnricher<'a> {
 
                     let mut tariffs_map: HashMap<DeploymentId, Vec<TariffResponse>> = HashMap::new();
 
-                    for model_id in &model_ids {
+                    if self.can_read_pricing {
+                        // Operators: every scope, organisation rows marked.
+                        for model_id in &model_ids {
+                            let mut tariffs_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
+                            let mut tariffs_repo = Tariffs::new(&mut tariffs_conn);
+                            if let Ok(tariffs) = tariffs_repo.list_current_by_model_all_scopes(*model_id).await {
+                                tariffs_map.insert(*model_id, tariffs.into_iter().map(TariffResponse::from).collect());
+                            }
+                        }
+                    } else if let Some(account) = self.pricing_account {
+                        // Customers: what they actually pay, in one query.
                         let mut tariffs_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
                         let mut tariffs_repo = Tariffs::new(&mut tariffs_conn);
-
-                        if let Ok(tariffs) = tariffs_repo.list_current_by_model(*model_id).await {
-                            tariffs_map.insert(*model_id, tariffs.into_iter().map(TariffResponse::from).collect());
+                        if let Ok(tariffs) = tariffs_repo.list_effective_for_account(&model_ids, account).await {
+                            for tariff in tariffs {
+                                tariffs_map
+                                    .entry(tariff.deployed_model_id)
+                                    .or_default()
+                                    .push(TariffResponse::from(tariff));
+                            }
+                        }
+                    } else {
+                        for model_id in &model_ids {
+                            let mut tariffs_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
+                            let mut tariffs_repo = Tariffs::new(&mut tariffs_conn);
+                            if let Ok(tariffs) = tariffs_repo.list_current_by_model(*model_id).await {
+                                tariffs_map.insert(*model_id, tariffs.into_iter().map(TariffResponse::from).collect());
+                            }
                         }
                     }
 
@@ -175,7 +202,18 @@ impl<'a> DeployedModelEnricher<'a> {
             async {
                 if self.include_pricing {
                     let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-                    Ok::<_, Error>(Some(CacheTariffs::new(&mut conn).get_active_bulk(&model_ids).await?))
+                    let mut repo = CacheTariffs::new(&mut conn);
+                    let mut active = repo.get_active_bulk(&model_ids).await?;
+                    // A customer's organisation multipliers sit over the general ones; caching
+                    // itself stays gated on the general row, so only override where one exists.
+                    if let Some(account) = self.pricing_account.filter(|_| !self.can_read_pricing) {
+                        for (model_id, own) in repo.get_active_for_account_bulk(&model_ids, account).await? {
+                            if active.contains_key(&model_id) {
+                                active.insert(model_id, own);
+                            }
+                        }
+                    }
+                    Ok::<_, Error>(Some(active))
                 } else {
                     Ok(None)
                 }
@@ -737,6 +775,7 @@ mod tests {
                 valid_from: Utc::now(),
                 valid_until: None,
                 is_active: true,
+                organization_id: None,
             }],
         );
 
@@ -787,6 +826,7 @@ mod tests {
             valid_from: Utc::now(),
             valid_until: None,
             is_active: true,
+            organization_id: None,
         }
     }
 
