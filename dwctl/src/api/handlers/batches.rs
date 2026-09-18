@@ -844,8 +844,9 @@ pub async fn create_batch<P: PoolProvider>(
                 message: "The API key used for this batch has reached its spending cap. Raise or remove the cap, or wait for the cap window to reset, then resubmit.".to_string(),
             });
         }
-        // Use the actual creditor's verification status for the volume cap.
-        let verified = Users::new(&mut conn).is_verified(execution_account_id).await?;
+        // Verification and outstanding-volume accounting use the same active
+        // account. Execution-account balance admission is checked separately.
+        let verified = Users::new(&mut conn).is_verified(target_user_id).await?;
         (secret, key_id, verified)
     };
 
