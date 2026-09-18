@@ -1,5 +1,13 @@
 # Changelog
 
+## [6.0.1](https://github.com/doublewordai/control-layer/compare/fusillade-core-v6.0.0...fusillade-core-v6.0.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* **fusillade:** fence reclaimed request ownership ([#1804](https://github.com/doublewordai/control-layer/issues/1804)) ([14a53f9](https://github.com/doublewordai/control-layer/commit/14a53f9cfe6efc02051467ec33f08b622c967a5e))
+* **fusillade:** write terminal realtime responses directly to retained storage ([#1797](https://github.com/doublewordai/control-layer/issues/1797)) ([1e2adec](https://github.com/doublewordai/control-layer/commit/1e2adec40985a7ffc33b184278b59254326bdd3e))
+
 ## [6.0.0](https://github.com/doublewordai/control-layer/compare/fusillade-core-v5.0.0...fusillade-core-v6.0.0) (2026-09-15)
 
 
