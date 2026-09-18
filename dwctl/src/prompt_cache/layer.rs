@@ -76,6 +76,8 @@ pub struct CacheLayerState {
     /// more restrictive than the entry point — a request onwards would accept is buffered,
     /// one it would reject degrades here too. Bounds memory (defence-in-depth vs a DoS).
     pub body_limit: usize,
+    /// Pending SSE event bytes, shared with the core proxy's configured limit.
+    pub sse_buffer_limit: usize,
 }
 
 impl CacheLayerState {
@@ -89,7 +91,13 @@ impl CacheLayerState {
             classifier,
             deadline,
             body_limit,
+            sse_buffer_limit: onwards::sse::DEFAULT_SSE_BUFFER_LIMIT,
         }
+    }
+
+    pub fn with_sse_buffer_limit(mut self, limit: usize) -> Self {
+        self.sse_buffer_limit = limit;
+        self
     }
 }
 
@@ -358,6 +366,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
             upstream_cached,
             cache_billing,
             had_markers,
+            state.sse_buffer_limit,
         );
     }
 
@@ -517,13 +526,14 @@ fn defer_classify_into_stream(
     upstream_cached: UpstreamCachedTokens,
     cache_billing: CacheBilling,
     had_markers: bool,
+    sse_buffer_limit: usize,
 ) -> Response {
     let (parts, body) = response.into_parts();
     let status_ok = parts.status.is_success();
     // Normalise the body error to io::Error, then re-aggregate provider chunks into complete SSE
     // events so a terminal usage frame split across body chunks isn't missed.
     let body_stream = BodyExt::into_data_stream(body).map(|r| r.map_err(std::io::Error::other));
-    let buffered = SseBufferedStream::new(body_stream);
+    let buffered = SseBufferedStream::with_limit(body_stream, sse_buffer_limit);
 
     let stream = async_stream::stream! {
         futures::pin_mut!(buffered);
@@ -690,6 +700,82 @@ mod tests {
 
     fn all_tiers() -> TierPolicy {
         TierPolicy::from_config(&["5m".to_string(), "1h".to_string(), "24h".to_string()], "5m")
+    }
+
+    #[sqlx::test]
+    async fn large_fragmented_tool_call_uses_configured_sse_limit(pool: PgPool) {
+        use tower::ServiceExt;
+
+        let arguments = "x".repeat(512 * 1024);
+        let event = serde_json::json!({"choices": [{"delta": {"tool_calls": [{
+            "index": 0, "id": "call_large", "type": "function",
+            "function": {"name": "write_file", "arguments": arguments}
+        }]}, "finish_reason": "tool_calls"}]});
+        let wire = format!(
+            "data: {event}\n\ndata: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":10,\"completion_tokens\":20,\"total_tokens\":30,\"prompt_tokens_details\":{{\"cached_tokens\":8}}}}}}\n\ndata: [DONE]\n\n"
+        );
+        for limit in [64 * 1024, 1024 * 1024] {
+            let classifier = Classifier::new(
+                PrincipalResolver::new(pool.clone()),
+                ModelConfigResolver::new(pool.clone()),
+                TokenizerClient::new("http://127.0.0.1:1"),
+                Arc::new(PostgresIndex::new(pool.clone(), 1)),
+                all_tiers(),
+                TelemetryPolicy::default(),
+                false,
+            );
+            let payload = wire.clone();
+            let app = Router::new()
+                .route(
+                    "/v1/chat/completions",
+                    post(move || {
+                        let payload = payload.clone();
+                        async move {
+                            let chunks: Vec<_> = payload
+                                .as_bytes()
+                                .chunks(8192)
+                                .map(|b| Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(b)))
+                                .collect();
+                            (
+                                [(header::CONTENT_TYPE, "text/event-stream")],
+                                Body::from_stream(futures::stream::iter(chunks)),
+                            )
+                                .into_response()
+                        }
+                    }),
+                )
+                .layer(from_fn_with_state(
+                    CacheLayerState::new(classifier, usize::MAX, Duration::from_secs(5)).with_sse_buffer_limit(limit),
+                    cache_middleware,
+                ));
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({"model": ALIAS, "messages": [{"role": "user", "content": "write a file"}], "stream": true})
+                        .to_string(),
+                ))
+                .unwrap();
+            let response = app.oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let result = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+            if limit == 64 * 1024 {
+                assert!(result.is_err(), "a fragmented event exceeding the configured limit must fail");
+            } else {
+                let data = String::from_utf8(result.unwrap().to_vec()).unwrap();
+                let lines: Vec<_> = data.lines().filter_map(|line| line.strip_prefix("data: ")).collect();
+                assert_eq!(lines.last(), Some(&"[DONE]"));
+                let tool: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+                assert_eq!(tool, event, "large tool arguments and finish reason are preserved");
+                let usage: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+                assert_eq!(usage["usage"]["total_tokens"], 30);
+                assert_eq!(
+                    usage["usage"]["prompt_tokens_details"]["cached_tokens"], 0,
+                    "cache accounting still scrubs untariffed provider hits"
+                );
+            }
+        }
     }
 
     /// Poll until `hash` is visible in the index for `scope`, or panic after ~5s.
