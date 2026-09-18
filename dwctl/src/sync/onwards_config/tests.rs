@@ -22,12 +22,11 @@ fn test_balance_eligibility_reads_read_model_and_filters_deleted_users() {
 
     // Key deletion is not implied by user deletion, so the deleted-user guard
     // on the balance arm is load-bearing in both queries.
-    assert_eq!(
-        source
-            .matches("u.is_deleted = false AND (user_has_feature(u.id, 'ALLOW_NEGATIVE_BALANCE') OR EXISTS")
-            .count(),
-        2
-    );
+    assert_eq!(source.matches("u.is_deleted = false AND (EXISTS (").count(), 2);
+    // Bulk sync must expose the flag lookup to the planner, rather than call
+    // the single-account function for every model/key pair.
+    assert_eq!(source.matches("FROM user_feature_flags f").count(), 2);
+    assert!(!source.contains("user_has_feature("));
 }
 
 // Helper function to create a test target

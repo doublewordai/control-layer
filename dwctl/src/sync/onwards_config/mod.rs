@@ -641,7 +641,15 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 -- is_deleted guard mirrors the old balance CTE, which only
                 -- contained non-deleted users; key deletion is not implied by
                 -- user deletion, so this check is load-bearing.
-                OR (u.is_deleted = false AND (user_has_feature(u.id, 'ALLOW_NEGATIVE_BALANCE') OR EXISTS (
+                -- Keep this lookup inline so PostgreSQL can build a hashed
+                -- set of enabled accounts once instead of calling a function
+                -- for every model/key pair. The outer guard excludes deleted users.
+                OR (u.is_deleted = false AND (EXISTS (
+                    SELECT 1 FROM user_feature_flags f
+                    WHERE f.user_id = u.id
+                      AND f.feature_flag = 'ALLOW_NEGATIVE_BALANCE'
+                      AND f.enabled
+                ) OR EXISTS (
                     SELECT 1 FROM user_balance_checkpoints ub
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
                 )))
@@ -1451,7 +1459,15 @@ pub async fn load_targets_from_db(
                 -- is_deleted guard mirrors the old balance CTE, which only
                 -- contained non-deleted users; key deletion is not implied by
                 -- user deletion, so this check is load-bearing.
-                OR (u.is_deleted = false AND (user_has_feature(u.id, 'ALLOW_NEGATIVE_BALANCE') OR EXISTS (
+                -- Keep this lookup inline so PostgreSQL can build a hashed
+                -- set of enabled accounts once instead of calling a function
+                -- for every model/key pair. The outer guard excludes deleted users.
+                OR (u.is_deleted = false AND (EXISTS (
+                    SELECT 1 FROM user_feature_flags f
+                    WHERE f.user_id = u.id
+                      AND f.feature_flag = 'ALLOW_NEGATIVE_BALANCE'
+                      AND f.enabled
+                ) OR EXISTS (
                     SELECT 1 FROM user_balance_checkpoints ub
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
                 )))
