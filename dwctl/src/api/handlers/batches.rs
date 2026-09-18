@@ -809,6 +809,32 @@ pub async fn create_batch<P: PoolProvider>(
             .resolve_batch_execution_key(target_user_id, attribution_user_id, authenticating_key_id)
             .await
             .map_err(Error::Database)?;
+        // A capped authenticating key can resolve to a different billing
+        // account than the active organization. Check the execution key's
+        // owner independently; the organization's opt-in must not cover it.
+        let execution_account_id = ApiKeys::new(&mut conn)
+            .get_by_id(key_id)
+            .await
+            .map_err(Error::Database)?
+            .ok_or_else(|| Error::NotFound {
+                resource: "API key".to_string(),
+                id: key_id.to_string(),
+            })?
+            .user_id;
+        if execution_account_id != balance_check_id {
+            let balance = Credits::new(&mut conn)
+                .get_balance_for_admission(execution_account_id)
+                .await
+                .map_err(Error::Database)?;
+            if let Some(balance) = balance
+                && balance < rust_decimal::Decimal::ZERO
+            {
+                return Err(Error::InsufficientCredits {
+                    current_balance: balance,
+                    message: "Execution key account balance too low. Please add credits to continue.".to_string(),
+                });
+            }
+        }
         // Spending-cap pre-flight, beside the balance gate above: if the
         // execution key's cap scope is already exhausted, reject up front
         // instead of accepting a batch whose every request would be refused
@@ -818,9 +844,8 @@ pub async fn create_batch<P: PoolProvider>(
                 message: "The API key used for this batch has reached its spending cap. Raise or remove the cap, or wait for the cap window to reset, then resubmit.".to_string(),
             });
         }
-        // Resolve the creditor's verified flag on the same connection (the org in
-        // org context, else the user) for the volume cap below — no extra acquire.
-        let verified = Users::new(&mut conn).is_verified(target_user_id).await?;
+        // Use the actual creditor's verification status for the volume cap.
+        let verified = Users::new(&mut conn).is_verified(execution_account_id).await?;
         (secret, key_id, verified)
     };
 
@@ -6050,6 +6075,50 @@ mod tests {
             completion_window: "24h".to_string(),
             metadata: None,
             api_key_id,
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_negative_balance_checks_execution_account_in_org_context(pool: PgPool) {
+        let (app, _bg_services, owner, _member, org, file_id) = setup_org_batch_env(&pool).await;
+        let auth = add_auth_headers(&owner);
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", owner.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&serde_json::json!({"name": "Personal capped key", "purpose": "realtime", "spend_limit": "10"}))
+            .await;
+        response.assert_status(StatusCode::CREATED);
+        let key: serde_json::Value = response.json();
+        let secret = key["key"].as_str().unwrap();
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1 OR user_id = $2")
+            .bind(owner.id)
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true)")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The org owns the file and permits debt, but the execution key bills
+        // the personal account. Its opt-in must be checked independently.
+        for enabled in [false, true, false] {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(owner.id).bind(enabled).execute(&pool).await.unwrap();
+            app.post("/ai/v1/batches")
+                .json(&batch_req(&file_id, None))
+                .add_header("authorization", &format!("Bearer {secret}"))
+                .add_header("cookie", &format!("dw_active_org={}", org.id))
+                .await
+                .assert_status(if enabled {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::PAYMENT_REQUIRED
+                });
         }
     }
 

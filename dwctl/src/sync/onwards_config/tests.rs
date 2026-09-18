@@ -2106,3 +2106,35 @@ async fn aimd_and_first_token_deadline_survive_database_sync(pool: sqlx::PgPool)
         Some(300)
     );
 }
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
+async fn test_deleted_keys_excluded_from_deployment_lookup(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+
+    sqlx::query("INSERT INTO api_keys (name, secret, user_id, created_by, purpose) VALUES ('revoked-system', 'sk-revoked-system', $1, $1, 'realtime')")
+        .bind(uuid::Uuid::nil()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) SELECT id, 'ALLOW_NEGATIVE_BALANCE', true FROM users")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE user_balance_checkpoints SET balance = -100")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Exercise the private-group, public-group, and unconditional system arms.
+    for deleted in [false, true] {
+        sqlx::query("UPDATE api_keys SET is_deleted = $1")
+            .bind(deleted)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for id in ["40000000-0000-0000-0000-000000000002", "40000000-0000-0000-0000-000000000003"] {
+            let mut conn = pool.acquire().await.unwrap();
+            let keys = ApiKeys::new(&mut conn)
+                .get_api_keys_for_deployment_with_sufficient_credit(id.parse().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(keys.is_empty(), deleted, "deployment {id}: deleted={deleted}");
+        }
+    }
+}

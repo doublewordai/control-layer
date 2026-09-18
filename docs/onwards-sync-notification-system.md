@@ -192,7 +192,8 @@ This is expected for up to N milliseconds (rate limit + fallback interval). The 
 `users` for each feature. Its primary key is `(user_id, feature_flag)`. Names use
 uppercase letters, digits, and underscores. A missing row and `enabled = false`
 both mean disabled. `created_at` records insertion and `updated_at` is maintained
-by a database trigger. Deleting an account cascades to its flags.
+by a database trigger. Physically deleting an account cascades to its flags.
+Soft-deleted accounts retain their flag rows, but those flags do not grant access.
 
 Rust callers use `FeatureFlags::has_feature(account_id, FeatureFlag::...)`.
 SQL callers use `user_has_feature(account_id, flag_name)`. Both resolve against
@@ -212,8 +213,9 @@ API. Existing ZDR, invoicing, and auto-join fields retain their current storage.
 
 ### Contracted accounts with negative balances
 
-Enable `ALLOW_NEGATIVE_BALANCE` to let an account continue using paid models and
-submitting batches with a zero or negative balance:
+Enable `ALLOW_NEGATIVE_BALANCE` to let an account continue using paid models at
+zero or negative balance, and submitting batches at negative balance. Batch
+submission already permits zero balance without this flag:
 
 ```sql
 INSERT INTO user_feature_flags (user_id, feature_flag, enabled)

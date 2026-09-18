@@ -934,7 +934,7 @@ impl<'c> ApiKeys<'c> {
                 ak.parent_api_key_id,
                 ak.secret_revealed_at
             FROM api_keys ak
-            WHERE ak.user_id = $2  -- System user has access to all deployments
+            WHERE ak.user_id = $2 AND ak.is_deleted = false  -- System user has access to all deployments
 
             UNION
 
@@ -961,6 +961,7 @@ impl<'c> ApiKeys<'c> {
             INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
             INNER JOIN deployed_models dm ON dg.deployment_id = dm.id
             WHERE dg.deployment_id = $1
+            AND ak.is_deleted = false
             AND (
                 ak.user_id = $2  -- System user always has access
                 OR user_has_feature(ak.user_id, 'ALLOW_NEGATIVE_BALANCE')
@@ -1007,6 +1008,7 @@ impl<'c> ApiKeys<'c> {
             INNER JOIN deployment_groups dg ON dg.group_id = '00000000-0000-0000-0000-000000000000'
             INNER JOIN deployed_models dm ON dg.deployment_id = dm.id
             WHERE dg.deployment_id = $1
+            AND ak.is_deleted = false
             AND ak.user_id != '00000000-0000-0000-0000-000000000000'  -- Exclude system user (already covered above)
             AND (
                 ak.user_id = $2  -- System user always has access
@@ -1052,14 +1054,14 @@ impl<'c> ApiKeys<'c> {
                 FROM api_keys ak
                 INNER JOIN user_groups ug ON ak.user_id = ug.user_id
                 INNER JOIN deployment_groups dg ON ug.group_id = dg.group_id
-                WHERE ak.id = ANY($1)
+                WHERE ak.id = ANY($1) AND ak.is_deleted = false
 
                 UNION
 
                 SELECT ak.id as api_key_id, dg.deployment_id
                 FROM api_keys ak
                 INNER JOIN deployment_groups dg ON dg.group_id = '00000000-0000-0000-0000-000000000000'
-                WHERE ak.id = ANY($1)
+                WHERE ak.id = ANY($1) AND ak.is_deleted = false
                 AND ak.user_id != '00000000-0000-0000-0000-000000000000'
                 "#,
                 &api_key_ids
