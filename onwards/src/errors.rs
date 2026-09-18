@@ -25,6 +25,10 @@ pub struct ErrorResponseBody {
 pub struct OnwardsErrorResponse {
     pub body: Option<ErrorResponseBody>,
     pub status: StatusCode,
+    /// What the request resolved to before it failed, when it got that far.
+    /// Attached to the response as an extension so analytics records the
+    /// class for failed requests too.
+    pub serving_outcome: Option<crate::serving::ServingClassOutcome>,
 }
 
 impl OnwardsErrorResponse {
@@ -38,6 +42,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::from_u16(error.status_code())
                 .expect("reasoning errors use valid HTTP status codes"),
+            serving_outcome: None,
         }
     }
 
@@ -52,6 +57,7 @@ impl OnwardsErrorResponse {
                 code: "model_not_found".to_string(),
             }),
             status: StatusCode::NOT_FOUND,
+            serving_outcome: None,
         }
     }
 
@@ -64,6 +70,7 @@ impl OnwardsErrorResponse {
                 code: "rate_limit".to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            serving_outcome: None,
         }
     }
 
@@ -79,6 +86,7 @@ impl OnwardsErrorResponse {
                 code: "upstream_rate_limit".to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            serving_outcome: None,
         }
     }
 
@@ -91,6 +99,7 @@ impl OnwardsErrorResponse {
                 code: "concurrency_limit_exceeded".to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
+            serving_outcome: None,
         }
     }
 
@@ -103,6 +112,7 @@ impl OnwardsErrorResponse {
                 code: "internal_error".to_string(),
             }),
             status: StatusCode::INTERNAL_SERVER_ERROR,
+            serving_outcome: None,
         }
     }
 
@@ -115,6 +125,7 @@ impl OnwardsErrorResponse {
                 code: "internal_error".to_string(),
             }),
             status: StatusCode::BAD_GATEWAY,
+            serving_outcome: None,
         }
     }
 
@@ -127,6 +138,7 @@ impl OnwardsErrorResponse {
                 code: "service_unavailable".to_string(),
             }),
             status: StatusCode::SERVICE_UNAVAILABLE,
+            serving_outcome: None,
         }
     }
 
@@ -140,6 +152,7 @@ impl OnwardsErrorResponse {
                 code: "gateway_timeout".to_string(),
             }),
             status: StatusCode::GATEWAY_TIMEOUT,
+            serving_outcome: None,
         }
     }
 
@@ -154,6 +167,7 @@ impl OnwardsErrorResponse {
                 code: "payload_too_large".to_string(),
             }),
             status: StatusCode::PAYLOAD_TOO_LARGE,
+            serving_outcome: None,
         }
     }
 
@@ -166,6 +180,7 @@ impl OnwardsErrorResponse {
                 code: "unprocessable_request".to_string(),
             }),
             status: StatusCode::UNPROCESSABLE_ENTITY,
+            serving_outcome: None,
         }
     }
 
@@ -182,6 +197,7 @@ impl OnwardsErrorResponse {
                 code: code.to_string(),
             }),
             status: StatusCode::BAD_REQUEST,
+            serving_outcome: None,
         }
     }
 
@@ -194,6 +210,7 @@ impl OnwardsErrorResponse {
                 code: "forbidden".to_string(),
             }),
             status: StatusCode::FORBIDDEN,
+            serving_outcome: None,
         }
     }
 
@@ -207,6 +224,7 @@ impl OnwardsErrorResponse {
                 code: "unauthenticated".to_string(),
             }),
             status: StatusCode::UNAUTHORIZED,
+            serving_outcome: None,
         }
     }
 }
@@ -219,10 +237,14 @@ struct ErrorEnvelope<'a> {
 
 impl IntoResponse for OnwardsErrorResponse {
     fn into_response(self) -> Response {
-        match self.body {
+        let mut response = match self.body {
             Some(ref body) => (self.status, Json(ErrorEnvelope { error: body })).into_response(),
             None => self.status.into_response(), // No body, just status
+        };
+        if let Some(outcome) = self.serving_outcome {
+            response.extensions_mut().insert(outcome);
         }
+        response
     }
 }
 

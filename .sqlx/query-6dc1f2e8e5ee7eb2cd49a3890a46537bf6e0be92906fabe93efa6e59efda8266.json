@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled FROM users WHERE email = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false AND user_type = 'individual'",
+  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                password_hash = COALESCE($4, password_hash),\n                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),\n                low_balance_threshold = CASE\n                    WHEN $6::boolean THEN $7\n                    ELSE low_balance_threshold\n                END,\n                low_balance_notification_sent = CASE\n                    WHEN $6::boolean THEN false\n                    ELSE low_balance_notification_sent\n                END,\n                auto_topup_amount = CASE\n                    WHEN $8::boolean THEN $9\n                    ELSE auto_topup_amount\n                END,\n                auto_topup_threshold = CASE\n                    WHEN $10::boolean THEN $11\n                    ELSE auto_topup_threshold\n                END,\n                auto_topup_monthly_limit = CASE\n                    WHEN $12::boolean THEN $13\n                    ELSE auto_topup_monthly_limit\n                END,\n                auto_topup_limit_notification_sent = CASE\n                    WHEN $12::boolean THEN false\n                    ELSE auto_topup_limit_notification_sent\n                END,\n                auto_topup_soft_failure_count = CASE\n                    WHEN $8::boolean OR $10::boolean THEN 0\n                    ELSE auto_topup_soft_failure_count\n                END,\n                auto_topup_retry_after = CASE\n                    WHEN $8::boolean OR $10::boolean THEN NULL\n                    ELSE auto_topup_retry_after\n                END,\n                zero_data_retention = COALESCE($14, zero_data_retention),\n                default_serving_class = CASE\n                    WHEN $15::boolean THEN $16\n                    ELSE default_serving_class\n                END,\n                self_hosted_only = COALESCE($17, self_hosted_only),\n                granted_serving_classes = COALESCE($18, granted_serving_classes),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only\n            ",
   "describe": {
     "columns": [
       {
@@ -152,11 +152,43 @@
         "ordinal": 29,
         "name": "auto_join_enabled",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 30,
+        "name": "granted_serving_classes",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 31,
+        "name": "default_serving_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 32,
+        "name": "self_hosted_only",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Bool",
+        "Bool",
+        "Float4",
+        "Bool",
+        "Float4",
+        "Bool",
+        "Float4",
+        "Bool",
+        "Float4",
+        "Bool",
+        "Bool",
+        "Text",
+        "Bool",
+        "TextArray"
       ]
     },
     "nullable": [
@@ -189,8 +221,11 @@
       false,
       true,
       false,
+      false,
+      false,
+      true,
       false
     ]
   },
-  "hash": "d216a676b3e6d53491830096e5d004449ef6d54e1d4f6e104a0a6d94ce6cbad2"
+  "hash": "6dc1f2e8e5ee7eb2cd49a3890a46537bf6e0be92906fabe93efa6e59efda8266"
 }

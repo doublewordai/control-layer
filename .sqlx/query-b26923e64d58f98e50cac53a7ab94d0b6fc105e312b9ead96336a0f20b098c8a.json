@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled FROM users WHERE external_user_id = $1 AND id != '00000000-0000-0000-0000-000000000000' AND is_deleted = false",
+  "query": "\n            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, user_type, is_admin)\n            VALUES ($1, $2, $3, $4, $5, 'organization', 'organization', false)\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                      is_admin, password_hash, external_user_id, payment_provider_id,\n                      is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,\n                      low_balance_notification_sent, low_balance_threshold,\n                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,\n                   granted_serving_classes, default_serving_class, self_hosted_only\n            ",
   "describe": {
     "columns": [
       {
@@ -45,118 +45,112 @@
       },
       {
         "ordinal": 8,
-        "name": "last_login",
-        "type_info": "Timestamptz"
-      },
-      {
-        "ordinal": 9,
         "name": "is_admin",
         "type_info": "Bool"
       },
       {
-        "ordinal": 10,
+        "ordinal": 9,
         "name": "password_hash",
         "type_info": "Text"
       },
       {
-        "ordinal": 11,
+        "ordinal": 10,
         "name": "external_user_id",
         "type_info": "Text"
       },
       {
-        "ordinal": 12,
+        "ordinal": 11,
         "name": "payment_provider_id",
         "type_info": "Varchar"
       },
       {
-        "ordinal": 13,
+        "ordinal": 12,
         "name": "is_deleted",
         "type_info": "Bool"
       },
       {
-        "ordinal": 14,
+        "ordinal": 13,
         "name": "is_internal",
         "type_info": "Bool"
       },
       {
-        "ordinal": 15,
+        "ordinal": 14,
         "name": "batch_notifications_enabled",
         "type_info": "Bool"
       },
       {
-        "ordinal": 16,
+        "ordinal": 15,
         "name": "first_batch_email_sent",
         "type_info": "Bool"
       },
       {
-        "ordinal": 17,
+        "ordinal": 16,
         "name": "low_balance_notification_sent",
         "type_info": "Bool"
       },
       {
-        "ordinal": 18,
+        "ordinal": 17,
         "name": "low_balance_threshold",
         "type_info": "Float4"
       },
       {
-        "ordinal": 19,
-        "name": "user_type",
-        "type_info": "Varchar"
-      },
-      {
-        "ordinal": 20,
+        "ordinal": 18,
         "name": "auto_topup_amount",
         "type_info": "Float4"
       },
       {
-        "ordinal": 21,
+        "ordinal": 19,
         "name": "auto_topup_threshold",
         "type_info": "Float4"
       },
       {
-        "ordinal": 22,
+        "ordinal": 20,
         "name": "auto_topup_monthly_limit",
         "type_info": "Float4"
       },
       {
-        "ordinal": 23,
-        "name": "auto_topup_limit_notification_sent",
-        "type_info": "Bool"
+        "ordinal": 21,
+        "name": "user_type",
+        "type_info": "Varchar"
       },
       {
-        "ordinal": 24,
+        "ordinal": 22,
         "name": "verified",
         "type_info": "Bool"
       },
       {
-        "ordinal": 25,
-        "name": "zero_data_retention",
-        "type_info": "Bool"
-      },
-      {
-        "ordinal": 26,
-        "name": "auto_topup_soft_failure_count",
-        "type_info": "Int4"
-      },
-      {
-        "ordinal": 27,
-        "name": "auto_topup_retry_after",
-        "type_info": "Timestamptz"
-      },
-      {
-        "ordinal": 28,
+        "ordinal": 23,
         "name": "invoicing_enabled",
         "type_info": "Bool"
       },
       {
-        "ordinal": 29,
-        "name": "auto_join_enabled",
+        "ordinal": 24,
+        "name": "zero_data_retention",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 25,
+        "name": "granted_serving_classes",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 26,
+        "name": "default_serving_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 27,
+        "name": "self_hosted_only",
         "type_info": "Bool"
       }
     ],
     "parameters": {
       "Left": [
-        "Text"
+        "Uuid",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar"
       ]
     },
     "nullable": [
@@ -168,7 +162,6 @@
       false,
       false,
       false,
-      true,
       false,
       true,
       true,
@@ -179,7 +172,6 @@
       false,
       false,
       true,
-      false,
       true,
       true,
       true,
@@ -187,10 +179,10 @@
       false,
       false,
       false,
-      true,
       false,
+      true,
       false
     ]
   },
-  "hash": "ec8384ed4443ede902868a1c95fbce717604eea57593553970c0787d02e84bf0"
+  "hash": "b26923e64d58f98e50cac53a7ab94d0b6fc105e312b9ead96336a0f20b098c8a"
 }

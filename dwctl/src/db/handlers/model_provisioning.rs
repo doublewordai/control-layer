@@ -220,6 +220,13 @@ impl<'c> ModelProvisioning<'c> {
             };
         let source = format!("model-catalog:{}", desired.source);
         let pricing = pricing_fields(provider_pricing)?;
+        // Activation is the virtual model's; a physical deployment row is a
+        // composite member and never activates classes of its own.
+        let serving_classes = if is_composite {
+            serde_json::to_value(&desired.clay.serving_classes).context("serialize serving class presets")?
+        } else {
+            serde_json::json!({})
+        };
         let fallback = &desired.clay.routing.fallback;
         let backoff_enabled = is_composite && fallback.backoff.is_some();
         let backoff_initial = fallback.backoff.as_ref().map_or(100, |backoff| backoff.initial_ms);
@@ -237,13 +244,13 @@ impl<'c> ModelProvisioning<'c> {
                    fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms,
                    backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
                    sanitize_responses, trusted, allowed_batch_completion_windows, metadata,
-                   reasoning_translation_overrides, provisioning_source, deleted, updated_at,
+                   reasoning_translation_overrides, provisioning_source, deleted, updated_at, serving_classes,
                    fallback_realtime_on_status
                ) VALUES (
                    $1,$2,$3,$4,$5,$6,'00000000-0000-0000-0000-000000000000',$7,
                    $8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,
-                   $27,$28,$29,$30,$31,$32,$33,$34,$35,$36,FALSE,$37,
-                   COALESCE($38::INTEGER[], '{}')
+                   $27,$28,$29,$30,$31,$32,$33,$34,$35,$36,FALSE,$37,$38,
+                   COALESCE($39::INTEGER[], '{}')
                )
                ON CONFLICT (alias) DO UPDATE SET
                    model_name = EXCLUDED.model_name,
@@ -272,7 +279,7 @@ impl<'c> ModelProvisioning<'c> {
                    fallback_on_rate_limit = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_on_rate_limit ELSE deployed_models.fallback_on_rate_limit END,
                    fallback_on_status = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_on_status ELSE deployed_models.fallback_on_status END,
                    -- An omitted catalog value keeps the stored one.
-                   fallback_realtime_on_status = CASE WHEN EXCLUDED.is_composite AND $38::INTEGER[] IS NOT NULL
+                   fallback_realtime_on_status = CASE WHEN EXCLUDED.is_composite AND $39::INTEGER[] IS NOT NULL
                        THEN EXCLUDED.fallback_realtime_on_status ELSE deployed_models.fallback_realtime_on_status END,
                    fallback_with_replacement = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_with_replacement ELSE deployed_models.fallback_with_replacement END,
                    fallback_max_attempts = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_max_attempts ELSE deployed_models.fallback_max_attempts END,
@@ -288,6 +295,7 @@ impl<'c> ModelProvisioning<'c> {
                    metadata = EXCLUDED.metadata,
                    reasoning_translation_overrides = EXCLUDED.reasoning_translation_overrides,
                    provisioning_source = EXCLUDED.provisioning_source,
+                   serving_classes = EXCLUDED.serving_classes,
                    deleted = FALSE,
                    updated_at = CASE WHEN ROW(
                        deployed_models.model_name, deployed_models.display_name, deployed_models.description,
@@ -304,6 +312,7 @@ impl<'c> ModelProvisioning<'c> {
                        deployed_models.sanitize_responses, deployed_models.trusted,
                        deployed_models.allowed_batch_completion_windows, deployed_models.metadata,
                        deployed_models.reasoning_translation_overrides, deployed_models.deleted,
+                       deployed_models.serving_classes,
                        deployed_models.fallback_realtime_on_status
                    ) IS DISTINCT FROM ROW(
                        EXCLUDED.model_name, EXCLUDED.display_name, EXCLUDED.description,
@@ -326,7 +335,8 @@ impl<'c> ModelProvisioning<'c> {
                        CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.backoff_max_total_ms ELSE deployed_models.backoff_max_total_ms END,
                        EXCLUDED.sanitize_responses, EXCLUDED.trusted, EXCLUDED.allowed_batch_completion_windows,
                        EXCLUDED.metadata, EXCLUDED.reasoning_translation_overrides, FALSE,
-                       CASE WHEN EXCLUDED.is_composite AND $38::INTEGER[] IS NOT NULL
+                       EXCLUDED.serving_classes,
+                       CASE WHEN EXCLUDED.is_composite AND $39::INTEGER[] IS NOT NULL
                            THEN EXCLUDED.fallback_realtime_on_status ELSE deployed_models.fallback_realtime_on_status END
                    ) THEN $37 ELSE deployed_models.updated_at END"#,
         )
@@ -367,6 +377,7 @@ impl<'c> ModelProvisioning<'c> {
         .bind(&settings.reasoning_translation_overrides)
         .bind(source)
         .bind(effective_at)
+        .bind(serving_classes)
         .bind(if is_composite { fallback.realtime_on_status.as_deref() } else { None })
         .execute(&mut *self.db)
         .await

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE users SET\n                display_name = COALESCE($2, display_name),\n                avatar_url = COALESCE($3, avatar_url),\n                password_hash = COALESCE($4, password_hash),\n                batch_notifications_enabled = COALESCE($5, batch_notifications_enabled),\n                low_balance_threshold = CASE\n                    WHEN $6::boolean THEN $7\n                    ELSE low_balance_threshold\n                END,\n                low_balance_notification_sent = CASE\n                    WHEN $6::boolean THEN false\n                    ELSE low_balance_notification_sent\n                END,\n                auto_topup_amount = CASE\n                    WHEN $8::boolean THEN $9\n                    ELSE auto_topup_amount\n                END,\n                auto_topup_threshold = CASE\n                    WHEN $10::boolean THEN $11\n                    ELSE auto_topup_threshold\n                END,\n                auto_topup_monthly_limit = CASE\n                    WHEN $12::boolean THEN $13\n                    ELSE auto_topup_monthly_limit\n                END,\n                auto_topup_limit_notification_sent = CASE\n                    WHEN $12::boolean THEN false\n                    ELSE auto_topup_limit_notification_sent\n                END,\n                auto_topup_soft_failure_count = CASE\n                    WHEN $8::boolean OR $10::boolean THEN 0\n                    ELSE auto_topup_soft_failure_count\n                END,\n                auto_topup_retry_after = CASE\n                    WHEN $8::boolean OR $10::boolean THEN NULL\n                    ELSE auto_topup_retry_after\n                END,\n                zero_data_retention = COALESCE($14, zero_data_retention),\n                updated_at = NOW()\n            WHERE id = $1\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled\n            ",
+  "query": "\n            INSERT INTO users (id, username, email, display_name, avatar_url, auth_source, is_admin, password_hash, external_user_id)\n            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)\n            RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at, last_login, is_admin, password_hash, external_user_id, payment_provider_id, is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent, low_balance_notification_sent, low_balance_threshold, user_type, auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, auto_topup_limit_notification_sent, verified, zero_data_retention, auto_topup_soft_failure_count, auto_topup_retry_after, invoicing_enabled, auto_join_enabled, granted_serving_classes, default_serving_class, self_hosted_only\n            ",
   "describe": {
     "columns": [
       {
@@ -152,6 +152,21 @@
         "ordinal": 29,
         "name": "auto_join_enabled",
         "type_info": "Bool"
+      },
+      {
+        "ordinal": 30,
+        "name": "granted_serving_classes",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 31,
+        "name": "default_serving_class",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 32,
+        "name": "self_hosted_only",
+        "type_info": "Bool"
       }
     ],
     "parameters": {
@@ -159,17 +174,12 @@
         "Uuid",
         "Varchar",
         "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Bool",
         "Text",
-        "Bool",
-        "Bool",
-        "Float4",
-        "Bool",
-        "Float4",
-        "Bool",
-        "Float4",
-        "Bool",
-        "Float4",
-        "Bool"
+        "Text"
       ]
     },
     "nullable": [
@@ -202,8 +212,11 @@
       false,
       true,
       false,
+      false,
+      false,
+      true,
       false
     ]
   },
-  "hash": "f375cd555a8511a28c23e96931fa36bd3582e1bc8d27786ddb56cc4589f8c79c"
+  "hash": "1e58059d2038426045c82e58c7eb452fae8f00be38bd884b57ceeef70dbcc8cf"
 }

@@ -198,6 +198,7 @@ pub async fn update_inference_endpoint<P: PoolProvider>(
             auth_header_prefix: update.auth_header_prefix.clone(),
             reasoning_translation: update.reasoning_translation.clone(),
             accepts_scheduling_priority: update.accepts_scheduling_priority,
+            kind: update.kind,
         };
 
         let endpoint = repo.update(id, &db_request).await?;
@@ -255,6 +256,7 @@ pub async fn update_inference_endpoint<P: PoolProvider>(
             auth_header_prefix: update.auth_header_prefix,
             reasoning_translation: update.reasoning_translation,
             accepts_scheduling_priority: update.accepts_scheduling_priority,
+            kind: update.kind,
         };
 
         let endpoint = repo.update(id, &db_request).await?;
@@ -389,6 +391,7 @@ pub async fn create_inference_endpoint<P: PoolProvider>(
 
     // Create the endpoint within the transaction
     let mut repo = InferenceEndpoints::new(&mut tx);
+    let kind = create_request.resolved_kind();
     let db_request = InferenceEndpointCreateDBRequest {
         created_by: current_user.id,
         name: create_request.name,
@@ -400,6 +403,7 @@ pub async fn create_inference_endpoint<P: PoolProvider>(
         auth_header_prefix: create_request.auth_header_prefix,
         reasoning_translation: create_request.reasoning_translation,
         accepts_scheduling_priority: create_request.accepts_scheduling_priority,
+        kind,
     };
 
     let endpoint = repo.create(&db_request).await?;

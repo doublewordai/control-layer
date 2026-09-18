@@ -17,6 +17,7 @@ use crate::aimd::AimdConfig;
 use crate::auth::KeySet;
 use crate::load_balancer::{Provider, ProviderPool};
 use crate::reasoning::ReasoningTranslationConfig;
+use crate::serving::{AccountServing, ProviderKind, ServingOverlay, ServingPresets};
 use anyhow::anyhow;
 use async_trait::async_trait;
 use bon::Builder;
@@ -162,6 +163,14 @@ pub struct ProviderSpec {
     /// failure is a leg queued at priority 0, never a leg rejected outright.
     #[serde(default)]
     pub accepts_scheduling_priority: bool,
+
+    /// What kind of server this provider is (see [`ProviderKind`]). Only a
+    /// `dynamo` member receives the serving-class envelope; an `external`
+    /// member is skipped for self-hosted-only accounts. Defaults to
+    /// `external`, the safe direction: nothing is stamped on an unclassified
+    /// provider.
+    #[serde(default)]
+    pub kind: ProviderKind,
 }
 
 /// Load balancing strategy for selecting providers
@@ -412,6 +421,17 @@ pub struct PoolSpec {
     #[serde(default)]
     pub routing_rules: Vec<RoutingRule>,
 
+    /// The serving classes this alias offers, each a preset of targets (see
+    /// [`crate::serving`]). Declared on the `default` pool: activation is a
+    /// property of the alias.
+    #[serde(default)]
+    pub serving_classes: ServingPresets,
+
+    /// Per-account overrides on this alias, keyed by account id (the value of
+    /// a key's `account` label). See [`crate::serving::ServingOverlay`].
+    #[serde(default)]
+    pub overlays: HashMap<String, ServingOverlay>,
+
     /// The list of providers to load balance across
     pub providers: Vec<ProviderSpec>,
 }
@@ -464,6 +484,11 @@ pub struct TargetSpec {
     #[serde(default)]
     #[builder(default)]
     pub accepts_scheduling_priority: bool,
+
+    /// See [`ProviderSpec::kind`].
+    #[serde(default)]
+    #[builder(default)]
+    pub kind: ProviderKind,
 
     /// Request timeout in seconds. If specified, requests exceeding this duration
     /// will be cancelled and return a 504 Gateway Timeout error.
@@ -527,6 +552,8 @@ pub struct PoolConfig {
     pub sanitize_response: bool,
     pub trusted: bool,
     pub routing_rules: Vec<RoutingRule>,
+    pub serving_classes: ServingPresets,
+    pub overlays: HashMap<String, ServingOverlay>,
     pub providers: Vec<ProviderSpec>,
 }
 
@@ -542,6 +569,8 @@ impl From<PoolSpec> for PoolConfig {
             sanitize_response: pool.sanitize_response,
             trusted: pool.trusted,
             routing_rules: pool.routing_rules,
+            serving_classes: pool.serving_classes,
+            overlays: pool.overlays,
             providers: pool.providers,
         }
     }
@@ -673,6 +702,7 @@ impl TargetSpecOrList {
                         propagate_trace_context: t.propagate_trace_context,
                         reasoning_translation: t.reasoning_translation,
                         accepts_scheduling_priority: t.accepts_scheduling_priority,
+                        kind: t.kind,
                     })
                     .collect();
                 Ok(PoolConfig {
@@ -685,6 +715,8 @@ impl TargetSpecOrList {
                     sanitize_response: false,
                     trusted,
                     routing_rules: Vec::new(),
+                    serving_classes: ServingPresets::new(),
+                    overlays: HashMap::new(),
                     providers,
                 })
             }
@@ -712,6 +744,7 @@ impl TargetSpecOrList {
                     propagate_trace_context: spec.propagate_trace_context,
                     reasoning_translation: spec.reasoning_translation,
                     accepts_scheduling_priority: spec.accepts_scheduling_priority,
+                    kind: spec.kind,
                 };
                 Ok(PoolConfig {
                     keys,
@@ -723,6 +756,8 @@ impl TargetSpecOrList {
                     sanitize_response,
                     trusted,
                     routing_rules: Vec::new(),
+                    serving_classes: ServingPresets::new(),
+                    overlays: HashMap::new(),
                     providers: vec![provider],
                 })
             }
@@ -766,6 +801,7 @@ impl From<TargetSpec> for Target {
             propagate_trace_context: value.propagate_trace_context,
             reasoning_translation: value.reasoning_translation,
             accepts_scheduling_priority: value.accepts_scheduling_priority,
+            kind: value.kind,
         }
     }
 }
@@ -792,6 +828,7 @@ impl From<ProviderSpec> for Target {
             propagate_trace_context: value.propagate_trace_context,
             reasoning_translation: value.reasoning_translation,
             accepts_scheduling_priority: value.accepts_scheduling_priority,
+            kind: value.kind,
         }
     }
 }
@@ -943,6 +980,9 @@ pub struct Target {
     /// See [`ProviderSpec::accepts_scheduling_priority`].
     #[builder(default)]
     pub accepts_scheduling_priority: bool,
+    /// See [`ProviderSpec::kind`].
+    #[builder(default)]
+    pub kind: ProviderKind,
 }
 
 impl Target {
@@ -1056,6 +1096,13 @@ impl TargetPools {
         labels: &HashMap<String, String>,
     ) -> Option<&RoutingAction> {
         self.default.evaluate_routing_rules(labels)
+    }
+
+    /// The serving classes this alias offers, with their presets. Declared on the
+    /// default pool: activation is a property of the alias, not of which
+    /// pool serves a request class.
+    pub fn active_serving_classes(&self) -> &ServingPresets {
+        self.default.serving_classes()
     }
 
     /// Look a pool up by name.
@@ -1175,6 +1222,10 @@ pub struct ConfigFile {
     /// HTTP connection pooling configuration (global)
     #[serde(default)]
     pub http_pool: Option<HttpPoolConfig>,
+    /// Serving account settings per account id (the value of a key's
+    /// `account` label). Only accounts with a non-empty policy are listed.
+    #[serde(default)]
+    pub accounts: HashMap<String, AccountServing>,
 }
 
 /// The live-updating collection of targets.
@@ -1189,6 +1240,9 @@ pub struct Targets {
     pub key_concurrency_limiters: Arc<DashMap<String, ConcurrencyLimiter>>,
     /// Labels per actual API key (actual key -> labels map)
     pub key_labels: Arc<DashMap<String, HashMap<String, String>>>,
+    /// Serving account settings per account id. A key finds its account
+    /// through its `account` label; only accounts with a policy are present.
+    pub accounts: Arc<DashMap<String, AccountServing>>,
     /// Enable strict mode with schema validation
     pub strict_mode: bool,
     /// HTTP connection pool configuration (global)
@@ -1409,7 +1463,8 @@ fn build_pool(
         pool_config.strategy,
         pool_config.trusted,
         pool_config.routing_rules,
-    ))
+    )
+    .with_serving(pool_config.serving_classes, pool_config.overlays))
 }
 
 impl Targets {
@@ -1476,6 +1531,13 @@ impl Targets {
             }
         }
 
+        let accounts = Arc::new(DashMap::new());
+        for (account_id, policy) in config_file.accounts {
+            if !policy.is_empty() {
+                accounts.insert(account_id, policy);
+            }
+        }
+
         let targets = Arc::new(DashMap::new());
         for (name, target_spec_or_list) in config_file.targets {
             // Every target is one or more named pools; the legacy shapes are a
@@ -1511,6 +1573,7 @@ impl Targets {
             key_rate_limiters,
             key_concurrency_limiters,
             key_labels,
+            accounts,
             strict_mode: config_file.strict_mode,
             http_pool_config: config_file.http_pool,
         })
@@ -1530,6 +1593,7 @@ impl Targets {
         let key_rate_limiters = Arc::clone(&self.key_rate_limiters);
         let key_concurrency_limiters = Arc::clone(&self.key_concurrency_limiters);
         let key_labels = Arc::clone(&self.key_labels);
+        let accounts = Arc::clone(&self.accounts);
 
         let mut stream = targets_stream.stream().await?;
 
@@ -1628,6 +1692,18 @@ impl Targets {
                         for entry in new_targets.key_labels.iter() {
                             key_labels.insert(entry.key().clone(), entry.value().clone());
                         }
+
+                        // Serving account settings: same remove-then-upsert pattern.
+                        let current_accounts: Vec<String> =
+                            accounts.iter().map(|entry| entry.key().clone()).collect();
+                        for account in current_accounts {
+                            if !new_targets.accounts.contains_key(&account) {
+                                accounts.remove(&account);
+                            }
+                        }
+                        for entry in new_targets.accounts.iter() {
+                            accounts.insert(entry.key().clone(), entry.value().clone());
+                        }
                     }
                     Err(e) => {
                         let err: anyhow::Error = e.into();
@@ -1718,6 +1794,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         }
@@ -1781,6 +1858,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1846,6 +1924,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
+            accounts: Arc::new(DashMap::new()),
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1899,6 +1978,7 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1939,6 +2019,7 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1972,6 +2053,7 @@ mod tests {
             auth: None,
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -1999,6 +2081,7 @@ mod tests {
             auth: None,
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -2088,6 +2171,7 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -2109,6 +2193,7 @@ mod tests {
             auth: None,
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -2141,6 +2226,7 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -2181,6 +2267,7 @@ mod tests {
             auth: None,
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -2269,6 +2356,7 @@ mod tests {
             auth: None,
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -2299,6 +2387,7 @@ mod tests {
             auth: None,
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -2378,6 +2467,7 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -2414,6 +2504,7 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
 
         let targets = Targets::from_config(config_file).unwrap();
@@ -2706,7 +2797,10 @@ mod tests {
                 propagate_trace_context: None,
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
+                kind: Default::default(),
             }],
+            serving_classes: Default::default(),
+            overlays: Default::default(),
         };
 
         let pool_config = TargetSpecOrList::Pool(pool_spec)
@@ -3123,6 +3217,7 @@ mod tests {
             }),
             strict_mode: false,
             http_pool: None,
+            accounts: Default::default(),
         };
 
         let targets = Targets::from_config(config_file).unwrap();

@@ -33,6 +33,19 @@
 
 pub mod ai_models;
 pub mod api_keys;
+
+/// Validate a serving class supplied through the API where only an ELEVATED
+/// class makes sense as a stored preference (a key's class, an account's
+/// default): `standard` is the absence of a preference and is expressed by
+/// clearing the field, never by storing it.
+pub(crate) fn validate_elevated_serving_class(class: &str) -> crate::errors::Result<()> {
+    match class.parse::<onwards::ServingClass>() {
+        Ok(parsed) if parsed.is_elevated() => Ok(()),
+        _ => Err(crate::errors::Error::BadRequest {
+            message: format!("Invalid serving class '{class}'. Valid values: interactive, throughput."),
+        }),
+    }
+}
 pub mod auth;
 pub mod batch_requests;
 pub mod batches;
