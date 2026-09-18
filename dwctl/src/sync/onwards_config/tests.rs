@@ -24,7 +24,7 @@ fn test_balance_eligibility_reads_read_model_and_filters_deleted_users() {
     // on the balance arm is load-bearing in both queries.
     assert_eq!(
         source
-            .matches("u.is_deleted = false AND (u.allow_negative_balance OR EXISTS")
+            .matches("u.is_deleted = false AND (user_has_feature(u.id, 'ALLOW_NEGATIVE_BALANCE') OR EXISTS")
             .count(),
         2
     );
@@ -649,17 +649,20 @@ async fn test_allow_negative_balance_toggles_paid_access(pool: sqlx::PgPool) {
 
     let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
     listener.listen("auth_config_changed").await.unwrap();
-    for (index, enabled) in [false, true, false].into_iter().enumerate() {
-        sqlx::query("UPDATE users SET allow_negative_balance = $2 WHERE id = $1")
-            .bind(user_a)
-            .bind(enabled)
-            .execute(&pool)
-            .await
-            .unwrap();
-        if index > 0 {
-            let notification = timeout(Duration::from_secs(5), listener.recv()).await.unwrap().unwrap();
-            assert!(notification.payload().starts_with("users:"));
+    for state in [None, Some(true), Some(false), Some(true), None] {
+        let enabled = state.unwrap_or(false);
+        if let Some(value) = state {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(user_a).bind(value).execute(&pool).await.unwrap();
+        } else {
+            sqlx::query("DELETE FROM user_feature_flags WHERE user_id = $1")
+                .bind(user_a)
+                .execute(&pool)
+                .await
+                .unwrap();
         }
+        let notification = timeout(Duration::from_secs(5), listener.recv()).await.unwrap().unwrap();
+        assert!(notification.payload().starts_with("user_feature_flags:"));
         let mut conn = pool.acquire().await.unwrap();
         let keys = ApiKeys::new(&mut conn)
             .get_api_keys_for_deployment_with_sufficient_credit("40000000-0000-0000-0000-000000000003".parse().unwrap())
@@ -681,7 +684,7 @@ async fn test_allow_negative_balance_toggles_paid_access(pool: sqlx::PgPool) {
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
 async fn test_allow_negative_balance_preserves_access_restrictions(pool: sqlx::PgPool) {
     let tiers = RateLimitTiersConfig::default();
-    sqlx::query("UPDATE users SET allow_negative_balance = true WHERE username = 'cache_user_b'")
+    sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) SELECT id, 'ALLOW_NEGATIVE_BALANCE', true FROM users WHERE username = 'cache_user_b'")
         .execute(&pool)
         .await
         .unwrap();

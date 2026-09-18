@@ -963,10 +963,7 @@ impl<'c> ApiKeys<'c> {
             WHERE dg.deployment_id = $1
             AND (
                 ak.user_id = $2  -- System user always has access
-                OR EXISTS (
-                    SELECT 1 FROM users u
-                    WHERE u.id = ak.user_id AND u.allow_negative_balance AND NOT u.is_deleted
-                )
+                OR user_has_feature(ak.user_id, 'ALLOW_NEGATIVE_BALANCE')
                 OR EXISTS (
                     -- User has positive balance: point read of the total
                     -- user_balance_checkpoints read model (kept current by
@@ -1013,10 +1010,7 @@ impl<'c> ApiKeys<'c> {
             AND ak.user_id != '00000000-0000-0000-0000-000000000000'  -- Exclude system user (already covered above)
             AND (
                 ak.user_id = $2  -- System user always has access
-                OR EXISTS (
-                    SELECT 1 FROM users u
-                    WHERE u.id = ak.user_id AND u.allow_negative_balance AND NOT u.is_deleted
-                )
+                OR user_has_feature(ak.user_id, 'ALLOW_NEGATIVE_BALANCE')
                 OR EXISTS (
                     -- User has positive balance: point read of the total
                     -- user_balance_checkpoints read model (kept current by

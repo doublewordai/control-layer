@@ -645,7 +645,7 @@ pub async fn create_batch<P: PoolProvider>(
         && let Ok(file_owner_id) = uuid::Uuid::parse_str(uploaded_by)
     {
         let file_owner_id = crate::types::UserId::from(file_owner_id);
-        if file_owner_id != current_user.id {
+        if file_owner_id != balance_check_id {
             let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
                 operation: format!("get db connection for file owner credit check: {}", e),
             })?;
@@ -5011,7 +5011,7 @@ mod tests {
         let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
         add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
-        sqlx::query("UPDATE users SET allow_negative_balance = true WHERE id = $1")
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
             .bind(user.id)
             .execute(&pool)
             .await
@@ -5025,6 +5025,74 @@ mod tests {
         submit_one_request_batch(&app, &user, "24h")
             .await
             .assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_negative_balance_org_flag_does_not_cover_personal_file(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        add_user_to_group(&pool, org.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Upload personally: request templates bill the personal account, even
+        // when the batch is subsequently submitted in organization context.
+        let jsonl = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part(
+                "file",
+                axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("personal.jsonl"),
+            )
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        upload.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload.json();
+        let request = CreateBatchRequest {
+            input_file_id: file["id"].as_str().unwrap().to_owned(),
+            endpoint: "/v1/chat/completions".to_owned(),
+            completion_window: "24h".to_owned(),
+            metadata: None,
+            api_key_id: None,
+        };
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1 OR user_id = $2")
+            .bind(user.id)
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true)")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for enabled in [false, true, false] {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(user.id).bind(enabled).execute(&pool).await.unwrap();
+            let response = app
+                .post("/ai/v1/batches")
+                .json(&request)
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .add_header("cookie", &org_cookie)
+                .await;
+            response.assert_status(if enabled {
+                StatusCode::CREATED
+            } else {
+                StatusCode::PAYMENT_REQUIRED
+            });
+        }
     }
 
     #[sqlx::test]
@@ -5114,7 +5182,7 @@ mod tests {
 
         resp.assert_status(StatusCode::CREATED);
         // A personal exemption does not cover the organization's debt.
-        sqlx::query("UPDATE users SET allow_negative_balance = true WHERE id = $1")
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
             .bind(user.id)
             .execute(&pool)
             .await
@@ -5125,7 +5193,7 @@ mod tests {
             .await
             .unwrap();
         for enabled in [false, true, false] {
-            sqlx::query("UPDATE users SET allow_negative_balance = $2 WHERE id = $1")
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
                 .bind(org.id)
                 .bind(enabled)
                 .execute(&pool)

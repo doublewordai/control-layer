@@ -457,15 +457,10 @@ impl<'c> Credits<'c> {
     /// permits debt. This policy never changes the balance used for accounting.
     #[instrument(skip(self), fields(user_id = %abbrev_uuid(&user_id)), err)]
     pub async fn get_balance_for_admission(&mut self, user_id: UserId) -> Result<Option<Decimal>> {
-        let allow_negative_balance = sqlx::query_scalar!(
-            "SELECT allow_negative_balance FROM users WHERE id = $1 AND is_deleted = false",
-            user_id
-        )
-        .fetch_optional(&mut *self.db)
-        .await?
-        .unwrap_or(false);
-
-        if allow_negative_balance {
+        if super::feature_flags::FeatureFlags::new(&mut *self.db)
+            .has_feature(user_id, super::feature_flags::FeatureFlag::AllowNegativeBalance)
+            .await?
+        {
             return Ok(None);
         }
         self.get_user_balance(user_id).await.map(Some)
@@ -1000,7 +995,7 @@ mod tests {
             Credits::new(&mut conn).get_balance_for_admission(user_id).await.unwrap(),
             Some(Decimal::ZERO)
         );
-        sqlx::query("UPDATE users SET allow_negative_balance = true WHERE id = $1")
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
             .bind(user_id)
             .execute(&pool)
             .await
@@ -1020,7 +1015,7 @@ mod tests {
             .unwrap();
         assert_eq!(credits.get_user_balance(user_id).await.unwrap(), Decimal::from(-25));
         assert_eq!(credits.get_balance_for_admission(user_id).await.unwrap(), None);
-        sqlx::query("UPDATE users SET allow_negative_balance = false WHERE id = $1")
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', false) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
             .bind(user_id)
             .execute(&pool)
             .await

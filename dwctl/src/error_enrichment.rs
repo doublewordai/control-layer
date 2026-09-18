@@ -831,7 +831,7 @@ mod tests {
         assert!(!body.contains("spend_cap_exceeded"), "cap error must not surface, got: {body}");
 
         // Contracted accounts skip the balance error but retain their key cap.
-        sqlx::query("UPDATE users SET allow_negative_balance = true WHERE id = $1")
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
             .bind(user.id)
             .execute(&pool)
             .await
@@ -840,7 +840,7 @@ mod tests {
         response.assert_status(StatusCode::PAYMENT_REQUIRED);
         assert!(response.text().contains("spend_cap_exceeded"));
         assert!(!response.text().contains("balance too low"));
-        sqlx::query("UPDATE users SET allow_negative_balance = false WHERE id = $1")
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', false) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
             .bind(user.id)
             .execute(&pool)
             .await
