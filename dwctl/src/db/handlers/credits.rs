@@ -391,6 +391,9 @@ impl<'c> Credits<'c> {
     ///
     /// Recorded as an `admin_grant` via `create_transaction`, so it fires the
     /// balance-restored notify like any other credit.
+    ///
+    /// Whether the payee may be verified at all is decided before this is
+    /// called: see `claim_verification_instrument`.
     #[instrument(skip(self), fields(payee = %abbrev_uuid(&payee), amount = %amount), err)]
     pub async fn grant_verification_credits(&mut self, amount: Decimal, payee: UserId, setup_source_id: &str) -> Result<()> {
         if amount <= Decimal::ZERO {
@@ -413,6 +416,31 @@ impl<'c> Credits<'c> {
             trace!("Payee {} already received verification credits, skipping", payee);
         }
         Ok(())
+    }
+
+    /// Record `payee` as the account verified by a payment instrument and
+    /// return whoever holds it afterwards: `payee` when it was unclaimed or
+    /// already theirs, otherwise the earlier claimant.
+    ///
+    /// `fingerprint` is Stripe's fingerprint of the payment method: the same
+    /// card or bank account yields the same value on every customer. One
+    /// instrument verifies one account. It can still pay for top-ups on any
+    /// account; only verification consults this table. Rows are never
+    /// deleted, so a scrubbed-and-recreated account cannot claim again.
+    /// Two statements rather than one CTE so a concurrent first claim is
+    /// visible to the loser's read.
+    pub async fn claim_verification_instrument(&mut self, fingerprint: &str, payee: UserId) -> Result<UserId> {
+        sqlx::query("INSERT INTO verification_instruments (fingerprint, user_id) VALUES ($1, $2) ON CONFLICT (fingerprint) DO NOTHING")
+            .bind(fingerprint)
+            .bind(payee)
+            .execute(&mut *self.db)
+            .await?;
+
+        let owner: Uuid = sqlx::query_scalar("SELECT user_id FROM verification_instruments WHERE fingerprint = $1")
+            .bind(fingerprint)
+            .fetch_one(&mut *self.db)
+            .await?;
+        Ok(owner)
     }
 
     /// Send a pg_notify so the onwards config sync re-evaluates key
@@ -2630,5 +2658,79 @@ mod tests {
 
         assert_eq!(verification_grant_count(&pool, first).await, 1);
         assert_eq!(verification_grant_count(&pool, second).await, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_instrument_claim_goes_to_first_account(pool: PgPool) {
+        let first = create_test_user(&pool).await;
+        let second = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        assert_eq!(credits.claim_verification_instrument("fp_shared", first).await.unwrap(), first);
+        assert_eq!(
+            credits.claim_verification_instrument("fp_shared", second).await.unwrap(),
+            first,
+            "a second account presenting the same instrument must see the first claimant"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_instrument_claim_is_idempotent_for_the_owner(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        for _ in 0..3 {
+            assert_eq!(credits.claim_verification_instrument("fp_mine", user).await.unwrap(), user);
+        }
+    }
+
+    #[sqlx::test]
+    async fn test_instrument_claim_race_has_one_winner(pool: PgPool) {
+        // Two accounts present the same instrument at the same moment on
+        // separate connections. Exactly one may hold it afterwards, and both
+        // callers must be told who that is.
+        let contenders: Vec<UserId> = vec![
+            create_test_user(&pool).await,
+            create_test_user(&pool).await,
+            create_test_user(&pool).await,
+            create_test_user(&pool).await,
+        ];
+
+        let owners = futures::future::join_all(contenders.iter().map(|&user| {
+            let pool = pool.clone();
+            async move {
+                let mut conn = pool.acquire().await.unwrap();
+                Credits::new(&mut conn).claim_verification_instrument("fp_raced", user).await
+            }
+        }))
+        .await;
+
+        let owners: Vec<UserId> = owners.into_iter().map(|r| r.expect("a losing racer must not error")).collect();
+        let winner = owners[0];
+        assert!(contenders.contains(&winner));
+        assert!(
+            owners.iter().all(|&o| o == winner),
+            "every racer must observe the same owner: {owners:?}"
+        );
+
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM verification_instruments WHERE fingerprint = $1")
+            .bind("fp_raced")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[sqlx::test]
+    async fn test_instrument_claims_are_independent(pool: PgPool) {
+        let first = create_test_user(&pool).await;
+        let second = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+
+        assert_eq!(credits.claim_verification_instrument("fp_a", first).await.unwrap(), first);
+        assert_eq!(credits.claim_verification_instrument("fp_b", second).await.unwrap(), second);
     }
 }
