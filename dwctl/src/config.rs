@@ -1193,7 +1193,7 @@ impl Default for RequestLimitsConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OnwardsConfig {
-    /// Maximum pending bytes of an unfinished SSE event in the proxy and prompt-cache layer.
+    /// Maximum pending bytes of an unfinished SSE event in the proxy, cache, and continuation layers.
     /// Complete events are forwarded first.
     /// Increase for providers that emit large tool-call events. Default: 65536.
     pub sse_buffer_limit: usize,
