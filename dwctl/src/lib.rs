@@ -2457,7 +2457,8 @@ pub async fn build_router(
                     classifier,
                     body_limit,
                     std::time::Duration::from_secs(cfg.cache.classify_deadline_secs),
-                ),
+                )
+                .with_sse_buffer_limit(cfg.onwards.sse_buffer_limit),
                 crate::prompt_cache::cache_middleware,
             ))
         } else {
