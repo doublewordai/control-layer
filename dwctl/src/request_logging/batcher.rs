@@ -2648,12 +2648,7 @@ mod integration_tests {
     #[test_log::test]
     async fn test_legacy_fusillade_duplicates_remain_reconcilable_during_rollout(pool: sqlx::PgPool) {
         let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
-        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
-        let batch_key_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
-            .bind(batch_key)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let batch_key_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
         let batch_id = Uuid::new_v4();
         let request_id = Uuid::new_v4();
 
