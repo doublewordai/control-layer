@@ -7,10 +7,12 @@ use std::time::Duration;
 
 mod adaptive_concurrency;
 pub mod config;
+mod in_flight_bytes;
 mod memory_gate;
 
 use adaptive_concurrency::{AdaptiveConcurrencyController, ConcurrencyAdjustment};
-use memory_gate::{CgroupMemorySource, MemoryGate};
+use in_flight_bytes::InFlightBytesAccounting;
+use memory_gate::{CgroupMemorySource, MemoryGate, MemorySource};
 use metrics::{counter, gauge, histogram};
 use tokio::task::JoinSet;
 
@@ -111,6 +113,18 @@ pub const MIN_SLA_DYNAMO_PRIORITY: i32 = i32::MIN + 1;
 /// be configured correctly.
 fn adaptive_concurrency_permitted(requested: bool, has_memory_gate: bool) -> bool {
     !requested || has_memory_gate
+}
+
+/// Derive the in-flight byte budget from config and this process's own cgroup
+/// limit. `None` leaves the budget off: fraction unset, or no readable limit -
+/// in which case there is nothing to derive a budget from, and the gate (if
+/// configured) remains the only pressure control.
+fn byte_budget_from_config(config: &DaemonConfig) -> Option<u64> {
+    if config.memory_budget_fraction <= 0.0 {
+        return None;
+    }
+    let limit = CgroupMemorySource.read().map(|reading| reading.limit)?;
+    Some((limit as f64 * config.memory_budget_fraction) as u64)
 }
 
 fn background_capacity(ordinary_limit: usize, background_limit: usize, in_flight: usize) -> usize {
@@ -1676,6 +1690,11 @@ where
     /// local memory pressure, so this is the only bound that corresponds to
     /// running out of memory.
     memory_gate: Option<Arc<MemoryGate>>,
+    /// Bounds what the daemon admits by bytes rather than counts: charges each
+    /// claim its request bytes plus an estimated response size, and suspends
+    /// claiming once the committed total reaches its budget. Complements the
+    /// memory gate, which can only react after the working set has grown.
+    in_flight_bytes: Arc<InFlightBytesAccounting>,
     /// Per-user in-flight request counts across all models, used to prioritise
     /// users with fewer active requests during claim (per-user fair scheduling).
     user_requests_in_flight: Arc<dashmap::DashMap<String, AtomicUsize>>,
@@ -1728,6 +1747,10 @@ where
             Box::new(CgroupMemorySource),
         )
         .map(Arc::new);
+        let in_flight_bytes = Arc::new(InFlightBytesAccounting::new(
+            byte_budget_from_config(&config),
+            config.memory_budget_default_response_bytes as u64,
+        ));
 
         // The controller treats a model's configured limit as a starting point
         // and grows past it, so with it on nothing else bounds in-flight work.
@@ -1766,6 +1789,7 @@ where
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
             adaptive_concurrency,
             memory_gate,
+            in_flight_bytes,
             user_requests_in_flight: Arc::new(dashmap::DashMap::new()),
             leak_buckets: Arc::new(dashmap::DashMap::new()),
             user_throughput: Arc::new(dashmap::DashMap::new()),
@@ -1893,10 +1917,19 @@ where
     /// Checked before per-model capacity is computed, because when it bites the
     /// answer is "nothing, from any model" - unlike the total in-flight cap,
     /// which scales models down proportionally.
+    ///
+    /// Two controls, answering two different questions. The gate measures what
+    /// the process actually holds and bites once the working set is deep into
+    /// its headroom; the byte budget bounds what has been admitted and bites
+    /// before the working set gets there. Either one stopping claims is enough:
+    /// claiming is the only way in-flight work grows.
     fn memory_pressure_blocks_claiming(&self) -> bool {
-        self.memory_gate
+        let gate_blocks = self
+            .memory_gate
             .as_ref()
-            .is_some_and(|gate| gate.should_block(self.total_in_flight()))
+            .is_some_and(|gate| gate.should_block(self.total_in_flight()));
+        let budget_blocks = self.in_flight_bytes.blocks_claiming();
+        gate_blocks || budget_blocks
     }
 
     fn available_capacity(&self) -> HashMap<String, usize> {
@@ -2521,6 +2554,15 @@ where
                 let user_id = request.data.created_by.clone();
                 let is_background = kind.is_background();
                 let uses_foreground_accounting = kind.uses_foreground_accounting();
+
+                // Charge the byte budget before the task exists, so a claim
+                // cycle that saturates the budget mid-loop still stops at the
+                // next cycle's check rather than dispatching the whole batch
+                // past it. Background work occupies the same memory as
+                // foreground work and answers to the same budget.
+                let byte_charge = self
+                    .in_flight_bytes
+                    .charge(&request.data.model, request.data.body.len());
                 let completion_window = if is_background {
                     "background".to_string()
                 } else {
@@ -2559,6 +2601,7 @@ where
                 let should_retry = self.config.should_retry.clone();
                 let shutdown_token = self.shutdown_token.clone();
                 let cancellation_tokens = self.cancellation_tokens.clone();
+                let in_flight_bytes = self.in_flight_bytes.clone();
 
                 let batch_cancellation_token = match batch_id {
                     Some(bid) => cancellation_tokens.entry(bid).or_default().clone(),
@@ -2630,7 +2673,13 @@ where
                     let background_for_guard = is_background;
                     let foreground_accounting_for_guard = uses_foreground_accounting;
                     let background_model_for_guard = model_clone.clone();
+                    let bytes_for_guard = in_flight_bytes.clone();
+                    let byte_charge_for_guard = byte_charge;
                     let _guard = scopeguard::guard((), move |_| {
+                        // Release first: an abort or panic here must not leave
+                        // the budget holding a charge for work that no longer
+                        // exists, or the budget ratchets shut.
+                        bytes_for_guard.release(byte_charge_for_guard);
                         if background_for_guard {
                             gauge!("fusillade_background_requests_in_flight", "model" => background_model_for_guard).decrement(1.0);
                         } else if foreground_accounting_for_guard {
@@ -2673,6 +2722,21 @@ where
                             cancellation,
                         )
                         .await;
+
+                    // Fold the attempt's actual response size into its model's
+                    // estimate, so the budget's charges converge on what this
+                    // workload really costs. Only the terminal response is
+                    // visible here; that is the observation the estimate needs.
+                    let response_bytes = match &completion_result {
+                        Ok(RequestCompletionResult::Completed(completed)) => {
+                            completed.state.response_body.len()
+                        }
+                        Ok(RequestCompletionResult::Failed(failed)) => {
+                            failed.state.reason.response_body_len()
+                        }
+                        Ok(RequestCompletionResult::Canceled(_)) | Err(_) => 0,
+                    };
+                    in_flight_bytes.record_response(&model_clone, response_bytes);
 
                     match completion_result {
                         Ok(RequestCompletionResult::Completed(completed)) => {
