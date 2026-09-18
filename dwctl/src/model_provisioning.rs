@@ -206,6 +206,10 @@ pub struct Fallback {
     pub on_rate_limit: bool,
     #[serde(default = "default_fallback_statuses")]
     pub on_status: Vec<i32>,
+    /// Extra statuses that fail over realtime traffic only. Omit to keep the
+    /// value already stored for the model.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub realtime_on_status: Option<Vec<i32>>,
     pub with_replacement: bool,
     pub max_attempts: Option<i32>,
     pub backoff: Option<Backoff>,
@@ -218,6 +222,7 @@ impl Default for Fallback {
             enabled: true,
             on_rate_limit: true,
             on_status: default_fallback_statuses(),
+            realtime_on_status: None,
             with_replacement: false,
             max_attempts: None,
             backoff: None,
@@ -795,6 +800,74 @@ clay:
     min_prefix_tokens: 1024
 "#
         )
+    }
+
+    #[sqlx::test]
+    async fn catalog_reconciles_incompatible_aimd_overrides(pool: PgPool) {
+        sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
+            .execute(&pool).await.unwrap();
+        let directory = tempdir().unwrap();
+        let weighted = catalog_yaml("0.50", false, "0.1");
+        let priority = weighted.replace("  routing:\n", "  routing:\n    strategy: priority\n");
+        write(directory.path(), "model.yaml", &priority);
+        let catalog = Catalog::load(directory.path()).unwrap();
+        apply(&pool, &catalog).await.unwrap();
+        let config = serde_json::to_value(crate::db::models::deployments::AimdConfig::default()).unwrap();
+        sqlx::query("UPDATE deployed_models SET aimd = $1, first_token_timeout_ms = 10000, lb_strategy = 'priority', fallback_enabled = true WHERE alias = 'org/model'")
+            .bind(&config).execute(&pool).await.unwrap();
+        apply(&pool, &catalog).await.unwrap();
+        let preserved: Option<serde_json::Value> = sqlx::query_scalar("SELECT aimd FROM deployed_models WHERE alias = 'org/model'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(preserved, Some(config));
+        write(directory.path(), "model.yaml", &weighted);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        let cleared: (Option<serde_json::Value>, Option<i64>) =
+            sqlx::query_as("SELECT aimd, first_token_timeout_ms FROM deployed_models WHERE alias = 'org/model'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(cleared, (None, Some(10000)));
+        sqlx::query("UPDATE deployed_models SET aimd = '{\"enabled\":false}'::jsonb WHERE alias = 'org/model'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        let disabled: Option<serde_json::Value> = sqlx::query_scalar("SELECT aimd FROM deployed_models WHERE alias = 'org/model'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(disabled, Some(serde_json::json!({"enabled":false})));
+    }
+
+    #[sqlx::test]
+    async fn catalog_keeps_realtime_fallback_statuses_unless_declared(pool: PgPool) {
+        sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
+            .execute(&pool).await.unwrap();
+        let realtime_statuses = || async {
+            sqlx::query_scalar::<_, Vec<i32>>("SELECT fallback_realtime_on_status FROM deployed_models WHERE alias = 'org/model'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let directory = tempdir().unwrap();
+        let omitted = catalog_yaml("0.50", false, "0.1");
+        write(directory.path(), "model.yaml", &omitted);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(realtime_statuses().await, Vec::<i32>::new());
+
+        sqlx::query("UPDATE deployed_models SET fallback_realtime_on_status = '{529}' WHERE alias = 'org/model'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(realtime_statuses().await, vec![529]);
+
+        let declared = omitted.replace("  routing:\n", "  routing:\n    fallback:\n      realtime_on_status: []\n");
+        write(directory.path(), "model.yaml", &declared);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(realtime_statuses().await, Vec::<i32>::new());
     }
 
     #[sqlx::test]

@@ -252,7 +252,11 @@ sqlx database reset # add `-y` to skip confirmation and `-f` if you get a
 
 ## Database Schema
 
-Migrations are stored in the `migrations/` directory, and run automatically on startup.
+Migrations are stored in the `migrations/` directory. By default they run
+automatically on startup (`migrations.mode: run`); deployments run them from a
+pre-rollout Job with `dwctl migrate` and set `migrations.mode: check` on the
+serving pods. See [docs/migrations.md](../docs/migrations.md) for how to add
+migrations, concurrent indexes and destructive changes.
 
 - `001_initial.sql` - Users, groups, models tables
 - `002_listen_notify.sql` - PostgreSQL notify triggers
@@ -274,4 +278,36 @@ records first-token failover deadlines, including waits for response headers.
 Timeouts never enter the latency histogram. See
 [First-token observations](../onwards/docs/src/load-balancing.md#first-token-observations)
 for sampling limits and label semantics before using these series to compare
-providers. Provider selection is unchanged; load-aware control is not enabled.
+providers. Eligible priority pools also use the AIMD controller described below.
+
+### Load-aware priority routing (AIMD)
+
+Priority composite models with fallback enabled use an AIMD preferred-first
+traffic share controller by default, including existing models. Override its
+settings through the model API's `aimd` object and explicit `first_token_timeout_ms`. The controller applies only to strict-mode
+streaming traffic and preserves ordinary retries; it is not a binary outage breaker.
+`PATCH {"aimd": {"enabled": false}}` disables it; null restores defaults. Model responses expose settings under `fallback`.
+
+By default the share decreases by 20% when more than 10% of the preferred
+provider's recent completed attempts breach — a first frame later than 10 seconds
+(the attempt keeps streaming; `onwards.first_token_timeout_ms` only cuts it off
+and fails over at 20 seconds), or an overload status (429, 503, 529) — holds between 3% and 10%, and recovers by
+five percentage points per healthy 30-second dwell. Pools with too few samples to
+judge recover a step every five minutes. Other errors and cancellations are
+excluded rather than counted either way.
+
+`onwards_provider_share{model,pool}` reports the configured preferred-first share;
+`onwards_share_adjustments_total{model,pool,direction}` counts increases/decreases.
+`onwards_aimd_active`, `onwards_aimd_window_samples`, `onwards_aimd_window_breach_rate`
+and `onwards_aimd_in_flight` expose controller state, and
+`onwards_aimd_unknown_total` / `onwards_aimd_overload_breaches_total{status}` count
+excluded and overload outcomes. The share is per gateway process, and
+capacity/concurrency constraints can change the realized split.
+
+`fallback_realtime_on_status` on a model (default `[529]` for new composite models;
+the dashboard's "Overloaded (529, realtime only)" failover switch) lists upstream
+statuses that fail a realtime request over to the next provider, in addition to
+`fallback_on_status`. Fusillade daemon traffic is never affected. Catalog files set
+it as `routing.fallback.realtime_on_status`; omitting it keeps the stored value.
+See [configuration, observation coverage and rollout](../onwards/docs/src/load-aware-failover.md)
+before enabling a model. The existing histogram is not the controller denominator.

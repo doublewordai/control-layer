@@ -18,6 +18,27 @@ dashboard_url: "http://localhost:5173"
 # Email address where support requests are sent
 # support_email: "support@doubleword.ai"
 
+# Schema migrations
+#
+# `dwctl migrate` applies every pending migration (main, fusillade, underway,
+# and outlet when request logging is enabled) and exits; it repairs
+# interrupted concurrent index builds first and verifies the result. Run it
+# from a pre-rollout Job with the release image, or by hand against a local
+# database.
+#
+# `migrations.mode` decides what the serving process does at startup:
+#   run   - apply pending migrations before serving (default; local
+#           development and single-instance installs)
+#   check - never execute DDL. Verify the database carries every migration
+#           this binary ships with matching checksums and refuse to start
+#           otherwise. A database that is AHEAD of the binary is accepted, so
+#           replicas of the previous release keep serving while the next
+#           release's migrations are applied before its rollout.
+# Deployments that run the migration Job set `check` on the application pods
+# (DWCTL_MIGRATIONS__MODE=check).
+migrations:
+  mode: run
+
 # Database configuration
 database:
   # Configure connectivity to an external postgres database here
@@ -491,18 +512,34 @@ openapi:
 # Onwards AI proxy configuration
 # Controls behavior of the onwards routing layer for AI proxy requests
 onwards:
+  # Maximum pending bytes of an unfinished SSE event; complete events are forwarded first.
+  # Increase for providers with large tool-call events. This is not a response-length limit.
+  # Exceeding it fails the response body stream. Zero permits no unfinished bytes.
+  # Set via environment: DWCTL_ONWARDS__SSE_BUFFER_LIMIT=1048576
+  sse_buffer_limit: 65536
   # Enable strict mode with schema validation and typed handlers.
   # When false (default), all requests are passed through transparently.
   # When true, only known OpenAI API paths are accepted and validated.
   # Set via environment: DWCTL_ONWARDS__STRICT_MODE=true
   strict_mode: false
+  # Public message for upstream 429 responses, including exhausted retries.
+  # Local request and concurrency limits keep their existing messages.
+  # Set via environment: DWCTL_ONWARDS__UPSTREAM_RATE_LIMIT_MESSAGE
+  upstream_rate_limit_message: "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
   # Failover deadline (ms) for the first token of a realtime streamed response.
   # While a model still has another provider to fail over to, an attempt that
   # hasn't started streaming within this window is abandoned and the next
   # provider tried. The final attempt is never cut off, and fusillade daemon
   # traffic (batch, flex, background) is exempt. Set to 0 to disable.
-  # Set via environment: DWCTL_ONWARDS__FIRST_TOKEN_TIMEOUT_MS=10000
-  first_token_timeout_ms: 10000
+  # AIMD records a first token later than its separate 10-second latency budget as
+  # a breach without cutting the attempt off; once breaches exceed its target rate,
+  # later requests shift to the alternates.
+  # Set via environment: DWCTL_ONWARDS__FIRST_TOKEN_TIMEOUT_MS=20000
+  first_token_timeout_ms: 20000
+  # Models may override the deadline via first_token_timeout_ms in the model API.
+  # Priority composites with fallback enabled use AIMD by default in strict mode.
+  # Override through the model API's aimd object, or set aimd.enabled=false to opt out.
+  # See onwards/docs/src/load-aware-failover.md for coverage and tuning.
 
 # Cached-input pricing (the dwctl-owned cache layer)
 cache:
@@ -765,6 +802,11 @@ background_services:
     #                                            # one-off drain lever (sweep stays sequential). Needs
     #                                            # this many spare fusillade write connections.
     # retained_response_partitions_days_ahead: <positive runway>
+    # With retention configured for "priority", terminal realtime responses
+    # are written directly into these partitions. Missing/unavailable partitions
+    # fall back to live storage for later archival; monitor
+    # fusillade_realtime_retained_fallback_total (normally zero) alongside
+    # fusillade_realtime_retained_total.
     # Daily partition retirement irreversibly drops whole expired
     # retained-response partitions. It is independently disabled and needs a
     # session-capable direct primary connection: in schema mode the primary

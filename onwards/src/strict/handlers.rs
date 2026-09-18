@@ -146,6 +146,7 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
 
     let resolved_model =
         extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model.clone());
+    let sse_buffer_limit = state.sse_buffer_limit;
     let ForwardResult {
         response,
         trusted,
@@ -167,7 +168,8 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         }
 
         if is_streaming || response_is_sse {
-            sanitize_streaming_chat_response(response, resolved_model, trusted).await
+            sanitize_streaming_chat_response(response, resolved_model, trusted, sse_buffer_limit)
+                .await
         } else {
             sanitize_chat_response(response, resolved_model).await
         }
@@ -302,6 +304,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
                 resolved_model,
                 trusted,
                 response_id_override,
+                state.sse_buffer_limit,
             )
             .await
         } else {
@@ -424,6 +427,7 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 
     let resolved_model =
         extract_model_from_request(&headers, &body_bytes).unwrap_or(original_model);
+    let sse_buffer_limit = state.sse_buffer_limit;
     let ForwardResult {
         response,
         trusted,
@@ -435,7 +439,13 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         let response_is_sse = response_is_sse(&response);
 
         if is_streaming || response_is_sse {
-            sanitize_streaming_completions_response(response, resolved_model, trusted).await
+            sanitize_streaming_completions_response(
+                response,
+                resolved_model,
+                trusted,
+                sse_buffer_limit,
+            )
+            .await
         } else {
             sanitize_completions_response(response, resolved_model).await
         }
@@ -649,13 +659,14 @@ async fn sanitize_streaming_chat_response(
     mut response: Response,
     original_model: String,
     trusted: bool,
+    sse_buffer_limit: usize,
 ) -> Response {
     // Wrap with SseBufferedStream to ensure we receive complete SSE events (delimited by \n\n).
     // Providers may send partial chunks that split JSON across network packets.
     // This buffering ensures we can successfully parse JSON in each event.
     let body_stream =
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
-    let buffered_stream = crate::sse::SseBufferedStream::new(body_stream);
+    let buffered_stream = crate::sse::SseBufferedStream::with_limit(body_stream, sse_buffer_limit);
     let stream_fallback_id = generated_chat_completion_id();
 
     let sanitized_stream = buffered_stream.map(move |chunk_result| {
@@ -873,10 +884,11 @@ async fn sanitize_streaming_completions_response(
     mut response: Response,
     original_model: String,
     trusted: bool,
+    sse_buffer_limit: usize,
 ) -> Response {
     let body_stream =
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
-    let buffered_stream = crate::sse::SseBufferedStream::new(body_stream);
+    let buffered_stream = crate::sse::SseBufferedStream::with_limit(body_stream, sse_buffer_limit);
     let stream_fallback_id = generated_completion_id();
 
     let sanitized_stream = buffered_stream.map(move |chunk_result| {
@@ -1151,13 +1163,14 @@ async fn sanitize_streaming_responses_response(
     original_model: String,
     trusted: bool,
     response_id_override: Option<String>,
+    sse_buffer_limit: usize,
 ) -> Response {
     // Wrap with SseBufferedStream to ensure we receive complete SSE events (delimited by \n\n).
     // Providers may send partial chunks that split JSON across network packets.
     // This buffering ensures we can successfully parse JSON in each event.
     let body_stream =
         http_body_util::BodyExt::into_data_stream(std::mem::take(response.body_mut()));
-    let buffered_stream = crate::sse::SseBufferedStream::new(body_stream);
+    let buffered_stream = crate::sse::SseBufferedStream::with_limit(body_stream, sse_buffer_limit);
     let response_id_override = response_id_override.clone();
     let stream_fallback_response_id = response_id_override
         .clone()
@@ -1517,6 +1530,84 @@ mod tests {
     use dashmap::DashMap;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    #[rstest::rstest]
+    #[case(false, 65536, false)]
+    #[case(false, 262144, true)]
+    #[case(true, 65536, false)]
+    #[case(true, 262144, true)]
+    #[tokio::test]
+    async fn test_router_applies_sse_buffer_limit(
+        #[case] strict_mode: bool,
+        #[case] limit: usize,
+        #[case] succeeds: bool,
+    ) {
+        let targets = Arc::new(DashMap::new());
+        targets.insert(
+            "gpt-4".to_string(),
+            Target::builder()
+                .url("https://api.example.com/v1/".parse().unwrap())
+                .sanitize_response(true)
+                .build()
+                .into_pool(),
+        );
+        let targets = Targets {
+            targets,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels: Arc::new(DashMap::new()),
+            strict_mode,
+            http_pool_config: None,
+        };
+        let content = "x".repeat(128 * 1024);
+        let event = format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "id": "chatcmpl-large", "object": "chat.completion.chunk", "created": 1,
+                "model": "provider-model",
+                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}]
+            })
+        );
+        // Fragmentation must survive both strict lead inspection and sanitization.
+        let chunks = vec![
+            event[..70 * 1024].to_string(),
+            event[70 * 1024..].to_string(),
+            "data: [DONE]\n\n".to_string(),
+        ];
+        let state = AppState::with_client(
+            targets,
+            MockHttpClient::new_streaming(StatusCode::OK, chunks),
+        )
+        .with_response_transform(crate::create_openai_sanitizer())
+        .with_sse_buffer_limit(limit);
+        let router = if strict_mode {
+            crate::strict::build_strict_router(state)
+        } else {
+            crate::build_router(state)
+        };
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}],"stream":true}"#,
+            ))
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        if succeeds {
+            assert_eq!(status, StatusCode::OK);
+            let bytes = body.unwrap();
+            let text = String::from_utf8_lossy(&bytes);
+            assert!(text.contains(&content));
+            assert!(text.contains("data: [DONE]"));
+            assert!(text.contains("gpt-4"));
+        } else {
+            // Strict lead inspection can reject before headers; otherwise the body errors.
+            assert!(status.is_server_error() || body.is_err());
+        }
+    }
 
     // --- ZDR no-payload-logging regression tests (COR-497) ---
 
@@ -3377,9 +3468,14 @@ mod tests {
             ))
             .unwrap();
 
-        let result =
-            sanitize_streaming_responses_response(response, "test-model".to_string(), true, None)
-                .await;
+        let result = sanitize_streaming_responses_response(
+            response,
+            "test-model".to_string(),
+            true,
+            None,
+            crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+        )
+        .await;
         assert_eq!(result.status(), StatusCode::OK);
 
         let body = axum::body::to_bytes(result.into_body(), usize::MAX)
@@ -6265,8 +6361,13 @@ mod tests {
             .body(Body::from(error_body))
             .unwrap();
 
-        let result =
-            sanitize_streaming_chat_response(response, "test-model".to_string(), true).await;
+        let result = sanitize_streaming_chat_response(
+            response,
+            "test-model".to_string(),
+            true,
+            crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+        )
+        .await;
         // HTTP status stays 200 — error is in the SSE body
         assert_eq!(result.status(), StatusCode::OK);
 
@@ -6286,8 +6387,13 @@ mod tests {
             .body(Body::from(error_body))
             .unwrap();
 
-        let result =
-            sanitize_streaming_chat_response(response, "test-model".to_string(), false).await;
+        let result = sanitize_streaming_chat_response(
+            response,
+            "test-model".to_string(),
+            false,
+            crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+        )
+        .await;
         assert_eq!(result.status(), StatusCode::OK);
 
         let body = axum::body::to_bytes(result.into_body(), usize::MAX)
@@ -6320,8 +6426,13 @@ mod tests {
             .body(Body::from(chunk_with_embedded_error))
             .unwrap();
 
-        let result =
-            sanitize_streaming_chat_response(response, "test-model".to_string(), false).await;
+        let result = sanitize_streaming_chat_response(
+            response,
+            "test-model".to_string(),
+            false,
+            crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+        )
+        .await;
         assert_eq!(result.status(), StatusCode::OK);
 
         let body = axum::body::to_bytes(result.into_body(), usize::MAX)
@@ -6365,8 +6476,13 @@ mod tests {
             .body(Body::from(chunk_with_embedded_error))
             .unwrap();
 
-        let result =
-            sanitize_streaming_chat_response(response, "test-model".to_string(), true).await;
+        let result = sanitize_streaming_chat_response(
+            response,
+            "test-model".to_string(),
+            true,
+            crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
+        )
+        .await;
         assert_eq!(result.status(), StatusCode::OK);
 
         let body = axum::body::to_bytes(result.into_body(), usize::MAX)

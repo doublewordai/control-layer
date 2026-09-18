@@ -810,6 +810,14 @@ pub async fn target_message_handler<T: HttpClient>(
     // headers only arrive once the whole completion is done, so a deadline
     // would cut off legitimately long answers. So is traffic carrying the
     // configured exempt header (e.g. batch dispatch, which runs its own retries).
+    // Realtime traffic is everything the batch dispatcher did not stamp with
+    // the exempt header. Only realtime gets the first-token deadline, AIMD
+    // observation and the realtime-only fallback statuses: dispatched traffic
+    // tolerates latency and runs its own retries.
+    let is_realtime = !state
+        .first_token_timeout_exempt_header
+        .as_deref()
+        .is_some_and(|header| original_headers.contains_key(header));
     let first_token_timeout = pool
         .fallback()
         .filter(|f| f.enabled)
@@ -819,16 +827,33 @@ pub async fn target_message_handler<T: HttpClient>(
                 .or(state.first_token_timeout)
         })
         .filter(|timeout| {
-            !timeout.is_zero()
-                && pool.len() > 1
-                && !state
-                    .first_token_timeout_exempt_header
-                    .as_deref()
-                    .is_some_and(|header| original_headers.contains_key(header))
-                && requests_stream(&body_bytes)
+            !timeout.is_zero() && pool.len() > 1 && is_realtime && requests_stream(&body_bytes)
         });
+    // A status triggers failover when the pool lists it, or when it is one of
+    // the pool's realtime-only fallback statuses, this request is realtime and
+    // another provider is left to try. A realtime-only status on the final
+    // attempt (or in a single-provider pool) is returned to the caller as the
+    // upstream sent it, exactly as without the setting, rather than collapsing
+    // into a generic gateway error.
+    let realtime_failover_attempts = if pool.fallback().is_some_and(|f| f.with_replacement) {
+        pool_max_attempts
+    } else {
+        pool_max_attempts.min(pool.len())
+    };
+    let fails_over_on = |status: u16, attempt_number: u32| {
+        pool.should_fallback_on_status(status)
+            || (is_realtime
+                && pool.len() > 1
+                && (attempt_number as usize) < realtime_failover_attempts
+                && pool.should_fallback_on_realtime_status(status))
+    };
 
-    for (member_idx, target, connection_guard) in pool.select_iter() {
+    // Unsupported traffic keeps ordinary routing and contributes no observations.
+    let aimd_eligible = pool.aimd_enabled()
+        && state.targets.strict_mode
+        && requests_stream(&body_bytes)
+        && is_realtime;
+    for (member_idx, target, connection_guard) in pool.select_iter_aimd(aimd_eligible, &model_name, resolved_pool_name.unwrap_or("default")) {
         any_attempted = true;
         attempt_number += 1;
         // First-token observations are attributed to the provider actually
@@ -841,10 +866,11 @@ pub async fn target_message_handler<T: HttpClient>(
             "alternate"
         };
         let attempt_start = tokio::time::Instant::now();
+        let observation = pool.observe(aimd_eligible, member_idx, &model_name, resolved_pool_name.unwrap_or("default"), attempt_start);
         // This attempt's first-frame deadline; `None` on the final attempt.
         let first_token_deadline = first_token_timeout
             .filter(|_| (attempt_number as usize) < pool_max_attempts)
-            .map(|timeout| tokio::time::Instant::now() + timeout);
+            .map(|timeout| attempt_start + timeout);
 
         let attempt_span = tracing::info_span!(
             "onwards.provider_attempt",
@@ -1139,6 +1165,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 // Name the deadline that fired, so first-token failovers are
                 // distinguishable from provider request timeouts in traces.
                 let reason = if header_deadline == first_token_deadline {
+                    if let Some(observation) = &observation { observation.deadline(); }
                     // Header waits are part of the same first-token deadline.
                     // A provider request timeout that fires earlier is not a
                     // first-token breach.
@@ -1181,15 +1208,37 @@ pub async fn target_message_handler<T: HttpClient>(
         last_upstream_status = Some(status);
         upstream_span.record("http.response.status_code", status);
         tracing::Span::current().record("http.response.status_code", status);
+        // An error status settles the attempt's observation now: overload
+        // statuses are breaches, anything else is unknown. Left to drop, an
+        // error would only ever read as unknown.
+        if !(200..300).contains(&status)
+            && let Some(observation) = &observation
+        {
+            observation.status(status);
+        }
 
         // Check if we should fallback based on status code
-        if pool.should_fallback_on_status(status) {
+        if fails_over_on(status, attempt_number) {
             debug!(
                 "Provider returned fallback status {}, trying next: {:?}",
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            return LoopAction::Continue(Some(OnwardsErrorResponse::bad_gateway()));
+            let error = if status == 429 {
+                OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+            } else {
+                OnwardsErrorResponse::bad_gateway()
+            };
+            return LoopAction::Continue(Some(error));
+        }
+
+        if status == 429
+            && (target.sanitize_response || state.upstream_rate_limit_message.is_some())
+        {
+            record_response_status(429);
+            return LoopAction::Done(Err(OnwardsErrorResponse::upstream_rate_limited(
+                state.upstream_rate_limit_message.as_deref(),
+            )));
         }
 
         // Sanitize error responses when sanitize_response is enabled.
@@ -1312,7 +1361,30 @@ pub async fn target_message_handler<T: HttpClient>(
                 const SSE_PEEK_MAX_EVENTS: usize = 4;
 
                 let (parts, body) = response.into_parts();
-                let mut events = SseBufferedStream::new(body.into_data_stream());
+                // Observe the same parsed events the strict path already consumes,
+                // including events polled after the bounded lead peek returns.
+                // This changes neither framing nor buffering and owns the attempt
+                // until response completion/cancellation (an unknown outcome).
+                let mut stream_observation = observation.clone();
+                let mut events = SseBufferedStream::with_limit(body.into_data_stream(), state.sse_buffer_limit).inspect(move |event| {
+                    if stream_observation.is_none() { return; }
+                    let kind = match event {
+                        Ok(bytes) if bytes.ends_with(b"\n\n") => classify_sse_event(bytes),
+                        // The buffer flushes an incomplete final event at EOF.
+                        // Preserve its bytes, but do not count it as a first frame.
+                        _ => SseEventKind::Done,
+                    };
+                    if matches!(kind, SseEventKind::Comment) { return; }
+                    if let Some(observation) = stream_observation.take() {
+                        match kind {
+                            SseEventKind::Data => observation.frame(),
+                            // An error status embedded in a 2xx stream is judged
+                            // like the same status on the response line.
+                            SseEventKind::Error(status, _) => observation.status(status),
+                            _ => observation.unknown(),
+                        }
+                    }
+                });
                 let mut peeked = Vec::new();
                 let mut lead = LeadFrames::default();
                 if let Some(deadline) = first_token_deadline {
@@ -1328,6 +1400,7 @@ pub async fn target_message_handler<T: HttpClient>(
                     .await
                     .is_err()
                     {
+                        if let Some(observation) = &observation { observation.deadline(); }
                         warn!(
                             upstream = %target.url,
                             "No first token before the failover deadline; trying the next provider"
@@ -1459,26 +1532,29 @@ pub async fn target_message_handler<T: HttpClient>(
                 // purposes, so it overrides the 200 recorded above.
                 last_upstream_status = Some(embedded);
 
-                let retryable = pool.should_fallback_on_status(embedded)
+                let retryable = fails_over_on(embedded, attempt_number)
                     || (embedded == 429 && pool.should_fallback_on_rate_limit());
                 if retryable {
                     tracing::Span::current().record("onwards.fallback", "embedded_error");
-                    // Retry internally. If every attempt / provider fallback is
-                    // exhausted the caller gets a sanitized 503 — never the
-                    // upstream's rate limit (see the non-retryable arm below).
-                    return LoopAction::Continue(Some(OnwardsErrorResponse::service_unavailable()));
+                    // Retain rate-limit semantics if all attempts are exhausted.
+                    let error = if embedded == 429 {
+                        OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+                    } else {
+                        OnwardsErrorResponse::service_unavailable()
+                    };
+                    return LoopAction::Continue(Some(error));
                 }
 
                 record_response_status(embedded);
-                // Don't leak an upstream rate limit: a 429 — and *any* 5xx, including
-                // non-retryable ones like 501/505 — collapses to a generic 503. This is
-                // deliberately more opaque than the non-embedded error path: a
-                // 200-with-error body is already anomalous, so we hide the specifics.
+                // Keep upstream details private while preserving rate-limit semantics.
+                // Embedded server errors still collapse to a generic 503.
                 // For trusted providers, retain the standard client-error fields
                 // so the caller can fix the request. Never log the body: even
                 // validation errors can echo request content.
                 let trusted = target.trusted.unwrap_or_else(|| pool.is_trusted());
-                let err = if embedded == 429 || embedded >= 500 {
+                let err = if embedded == 429 {
+                    OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
+                } else if embedded >= 500 {
                     OnwardsErrorResponse::service_unavailable()
                 } else {
                     OnwardsErrorResponse::builder()
@@ -1547,7 +1623,7 @@ pub async fn target_message_handler<T: HttpClient>(
             debug!("Wrapping SSE response with buffered stream for non-strict sanitization");
             let (parts, body) = response.into_parts();
             let byte_stream = body.into_data_stream();
-            let buffered = SseBufferedStream::new(byte_stream);
+            let buffered = SseBufferedStream::with_limit(byte_stream, state.sse_buffer_limit);
             let new_body = axum::body::Body::from_stream(buffered);
             response = Response::from_parts(parts, new_body);
         }
@@ -2737,8 +2813,10 @@ mod tests {
             },
             http_client: mock_client,
             response_transform_fn: None,
+            upstream_rate_limit_message: None,
             response_id_header: None,
             body_limit: crate::DEFAULT_BODY_LIMIT,
+            sse_buffer_limit: crate::sse::DEFAULT_SSE_BUFFER_LIMIT,
             first_token_timeout: None,
             first_token_timeout_exempt_header: None,
         };

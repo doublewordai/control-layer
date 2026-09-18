@@ -7,8 +7,8 @@ use crate::api::models::cache_pricing::CachePricingResponse;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::models::deployments::{
-    BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy, ModelCatalogMetadata, ModelType,
-    ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
+    AimdConfig, BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy, ModelCatalogMetadata,
+    ModelType, ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
 };
 use crate::reasoning::{ReasoningTranslationOverrides, SupportedReasoningEfforts};
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
@@ -257,6 +257,13 @@ pub struct StandardModelCreate {
     pub backoff_jitter: JitterStrategy,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_max_total_ms: Option<i32>,
+    /// Stream first-frame deadline; null inherits the global default, 0 disables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_timeout_ms: Option<i64>,
+    /// Priority-only share controller overrides; absent/null inherits defaults.
+    /// Set enabled=false to disable. Explicit enabled overrides require a compatible deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aimd: Option<AimdConfig>,
     /// Traffic routing rules evaluated against API key labels.
     /// Each rule matches on key labels (e.g., purpose) and either denies or redirects traffic.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -311,6 +318,11 @@ pub struct CompositeModelCreate {
     /// which defaults to true.
     #[serde(default = "default_fallback_statuses")]
     pub fallback_on_status: Vec<i32>,
+    /// Extra HTTP status codes that trigger fallback for realtime traffic only
+    /// (defaults to [529], so realtime requests reroute when a provider sheds
+    /// load). Batch, flex and background requests run their own retries.
+    #[serde(default = "default_realtime_fallback_statuses")]
+    pub fallback_realtime_on_status: Vec<i32>,
     /// Sample with replacement during weighted random failover (defaults to false)
     #[serde(default)]
     pub fallback_with_replacement: bool,
@@ -338,6 +350,13 @@ pub struct CompositeModelCreate {
     /// (null = no budget cap).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backoff_max_total_ms: Option<i32>,
+    /// Stream first-frame deadline; null inherits the global default, 0 disables.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_token_timeout_ms: Option<i64>,
+    /// Priority-only share controller overrides; absent/null inherits defaults.
+    /// Set enabled=false to disable. Explicit enabled overrides require a compatible deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aimd: Option<AimdConfig>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false, used when strict_mode=false)
     #[serde(default)]
     pub sanitize_responses: bool,
@@ -363,6 +382,10 @@ fn default_true() -> bool {
 
 fn default_fallback_statuses() -> Vec<i32> {
     vec![499, 500, 502, 503, 504]
+}
+
+fn default_realtime_fallback_statuses() -> Vec<i32> {
+    vec![529]
 }
 
 fn default_backoff_initial_ms() -> i32 {
@@ -420,6 +443,9 @@ pub struct DeployedModelUpdate {
     /// HTTP status codes that trigger fallback (null = no change)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_on_status: Option<Vec<i32>>,
+    /// Extra HTTP status codes that trigger fallback for realtime traffic only (null = no change)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_realtime_on_status: Option<Vec<i32>>,
     /// Sample with replacement during weighted random failover (null = no change)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback_with_replacement: Option<bool>,
@@ -445,6 +471,13 @@ pub struct DeployedModelUpdate {
     /// (null = no change, Some(None) = clear cap, Some(Some(n)) = set).
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub backoff_max_total_ms: Option<Option<i32>>,
+    /// Omitted = unchanged; null = inherit proxy default; 0 = disable deadline.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub first_token_timeout_ms: Option<Option<i64>>,
+    /// Omitted = unchanged; null = inherit defaults; object = replace overrides.
+    /// Use {"enabled":false} to disable.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub aimd: Option<Option<AimdConfig>>,
     /// Whether to sanitize/filter sensitive data from model responses (null = no change, used when strict_mode=false)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
@@ -604,10 +637,13 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             enabled: db.fallback_enabled,
             on_rate_limit: db.fallback_on_rate_limit,
             on_status: db.fallback_on_status,
+            realtime_on_status: db.fallback_realtime_on_status,
             with_replacement: db.fallback_with_replacement,
             max_attempts: db.fallback_max_attempts,
             backoff,
             max_total_backoff_ms: db.backoff_max_total_ms,
+            first_token_timeout_ms: db.first_token_timeout_ms,
+            aimd: db.aimd,
         });
 
         Self {

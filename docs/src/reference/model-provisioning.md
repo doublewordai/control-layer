@@ -67,6 +67,7 @@ clay:
       enabled: true
       on_rate_limit: true
       on_status: [429, 499, 500, 502, 503, 504]
+      realtime_on_status: [529]
       with_replacement: false
       max_attempts: 3
       backoff:
@@ -155,7 +156,8 @@ For models present in YAML, model fields, physical deployments, components,
 routing, access groups, traffic rules and active tariffs are authoritative.
 Manual dashboard changes to those fields remain visible until the next server
 restart, when YAML restores them. The dashboard displays a warning on such
-models.
+models. The exception is `routing.fallback.realtime_on_status` (statuses that
+fail over realtime requests only): when omitted, the stored value is kept.
 
 Models omitted from YAML are not deleted or otherwise rewritten. Their
 `provisioning_source` becomes `NULL`, which makes them manually managed again.

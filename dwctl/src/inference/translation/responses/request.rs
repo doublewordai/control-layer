@@ -8,8 +8,8 @@
 //! already carries any prior context and this is a plain, synchronous transform.
 
 use super::types::{
-    ContentPart, Input, Item, MessageContent as ResponseMessageContent, ResponsesRequest, StopSequence as ResponsesStopSequence,
-    TextConfig, Tool as ResponseTool, ToolChoice as ResponseToolChoice,
+    ContentPart, Include, Input, Item, MessageContent as ResponseMessageContent, ReasoningContent, ResponsesRequest,
+    StopSequence as ResponsesStopSequence, TextConfig, Tool as ResponseTool, ToolChoice as ResponseToolChoice,
 };
 use onwards::strict::schemas::chat_completions::{
     ChatCompletionRequest, ChatMessage, ContentPart as ChatContentPart, FunctionCall, FunctionDefinition, ImageUrl, MessageContent,
@@ -20,10 +20,8 @@ use tracing::{debug, warn};
 
 /// Convert a (fully hydrated) Responses request into a Chat Completions request.
 ///
-/// Pure and infallible: any `previous_response_id` context has already been
-/// inlined into `request.input` by the hydration stage, so this only walks the
-/// self-contained request. Message order is `[instructions, input...]`, matching
-/// the onwards adapter.
+/// Any `previous_response_id` context has already been inlined into
+/// `request.input` by the hydration stage.
 pub fn to_chat_request(request: &ResponsesRequest) -> ChatCompletionRequest {
     let mut messages: Vec<ChatMessage> = Vec::new();
 
@@ -47,6 +45,8 @@ pub fn to_chat_request(request: &ResponsesRequest) -> ChatCompletionRequest {
     let tools = request.tools.as_ref().map(|t| convert_tools(t));
     let tool_choice = request.tool_choice.as_ref().map(convert_tool_choice);
 
+    let include_logprobs = request.includes(Include::MessageOutputTextLogprobs);
+
     ChatCompletionRequest {
         model: request.model.clone(),
         messages,
@@ -69,8 +69,8 @@ pub fn to_chat_request(request: &ResponsesRequest) -> ChatCompletionRequest {
         presence_penalty: None,
         frequency_penalty: None,
         logit_bias: None,
-        logprobs: None,
-        top_logprobs: None,
+        logprobs: include_logprobs.then_some(true),
+        top_logprobs: include_logprobs.then_some(request.top_logprobs).flatten(),
         user: request.user.clone(),
         seed: None,
         tools,
@@ -106,10 +106,14 @@ fn input_to_messages(input: &Input) -> Vec<ChatMessage> {
 /// into the current request, which is why it lives on the request side.
 pub fn items_to_messages(items: &[Item]) -> Vec<ChatMessage> {
     let mut messages = Vec::new();
+    let mut pending_reasoning: Option<String> = None;
 
     for item in items {
         match item {
             Item::Message(msg) => {
+                if msg.role != "assistant" {
+                    flush_pending_reasoning(&mut messages, &mut pending_reasoning);
+                }
                 messages.push(ChatMessage {
                     role: msg.role.clone(),
                     content: Some(convert_message_content(&msg.content)),
@@ -117,7 +121,7 @@ pub fn items_to_messages(items: &[Item]) -> Vec<ChatMessage> {
                     tool_calls: None,
                     tool_call_id: None,
                     reasoning: None,
-                    reasoning_content: None,
+                    reasoning_content: if msg.role == "assistant" { pending_reasoning.take() } else { None },
                     reasoning_details: None,
                     extra: None,
                 });
@@ -137,6 +141,9 @@ pub fn items_to_messages(items: &[Item]) -> Vec<ChatMessage> {
                 if let Some(last) = messages.last_mut()
                     && last.role == "assistant"
                 {
+                    if last.reasoning_content.is_none() {
+                        last.reasoning_content = pending_reasoning.take();
+                    }
                     if let Some(ref mut calls) = last.tool_calls {
                         calls.push(tool_call);
                     } else {
@@ -152,12 +159,13 @@ pub fn items_to_messages(items: &[Item]) -> Vec<ChatMessage> {
                     tool_calls: Some(vec![tool_call]),
                     tool_call_id: None,
                     reasoning: None,
-                    reasoning_content: None,
+                    reasoning_content: pending_reasoning.take(),
                     reasoning_details: None,
                     extra: None,
                 });
             }
             Item::FunctionCallOutput(output) => {
+                flush_pending_reasoning(&mut messages, &mut pending_reasoning);
                 messages.push(ChatMessage {
                     role: "tool".to_string(),
                     content: Some(MessageContent::Text(output.output.clone())),
@@ -170,9 +178,29 @@ pub fn items_to_messages(items: &[Item]) -> Vec<ChatMessage> {
                     extra: None,
                 });
             }
-            Item::Reasoning(_) => {
-                // Reasoning items are model-internal and can't be fed back.
-                debug!("Skipping reasoning item in conversion to messages");
+            Item::Reasoning(reasoning) => {
+                let plaintext_content = reasoning
+                    .content
+                    .as_ref()
+                    .map(|content| {
+                        content
+                            .iter()
+                            .map(|part| match part {
+                                ReasoningContent::Text { text } => text.as_str(),
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
+                if !plaintext_content.is_empty() {
+                    match pending_reasoning.as_mut() {
+                        Some(pending) => {
+                            pending.push('\n');
+                            pending.push_str(&plaintext_content);
+                        }
+                        None => pending_reasoning = Some(plaintext_content),
+                    }
+                }
             }
             Item::Unknown(_) => {
                 warn!("Unknown item type encountered during conversion");
@@ -180,7 +208,25 @@ pub fn items_to_messages(items: &[Item]) -> Vec<ChatMessage> {
         }
     }
 
+    flush_pending_reasoning(&mut messages, &mut pending_reasoning);
     messages
+}
+
+fn flush_pending_reasoning(messages: &mut Vec<ChatMessage>, pending_reasoning: &mut Option<String>) {
+    let Some(reasoning_content) = pending_reasoning.take() else {
+        return;
+    };
+    messages.push(ChatMessage {
+        role: "assistant".to_string(),
+        content: None,
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+        reasoning: None,
+        reasoning_content: Some(reasoning_content),
+        reasoning_details: None,
+        extra: None,
+    });
 }
 
 /// Convert Responses message content to Chat Completions message content.
@@ -380,6 +426,50 @@ mod tests {
 
         let chat = to_chat_request(&request);
         assert_eq!(chat.reasoning_effort.as_ref(), Some(&serde_json::json!("none")));
+    }
+
+    #[test]
+    fn logprobs_include_requests_chat_logprobs() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "input": "Hello",
+            "include": ["message.output_text.logprobs"],
+            "top_logprobs": 3
+        }))
+        .unwrap();
+
+        let chat = to_chat_request(&request);
+        assert_eq!(chat.logprobs, Some(true));
+        assert_eq!(chat.top_logprobs, Some(3));
+    }
+
+    #[test]
+    fn plaintext_reasoning_item_is_replayed_on_assistant_message() {
+        let request: ResponsesRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "content": [{"type": "reasoning_text", "text": "private chain"}]
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "answer"}]
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}]
+                }
+            ]
+        }))
+        .unwrap();
+
+        let chat = to_chat_request(&request);
+        assert_eq!(chat.messages[0].role, "assistant");
+        assert_eq!(chat.messages[0].reasoning_content.as_deref(), Some("private chain"));
+        assert_eq!(chat.messages[1].role, "user");
     }
 
     #[test]
