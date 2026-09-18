@@ -192,7 +192,7 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
             .bind(org_id)
             .bind(model_id)
             .bind(model.default_class.map(|class| class.as_db_str()))
-            .bind(model.targets.map(|targets| serde_json::to_value(targets)).transpose().context("serialize overlay targets")?)
+            .bind(model.targets.map(serde_json::to_value).transpose().context("serialize overlay targets")?)
             .bind(model.self_hosted_only)
             .bind(&source)
             .execute(&mut *db)

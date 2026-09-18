@@ -2047,11 +2047,9 @@ pub async fn target_message_handler<T: HttpClient>(
         record_response_status(status);
         // The outcome rides on the error too: analytics records what the
         // request resolved to whether or not the upstream served it.
-        let mut response = final_error.into_response();
-        response
-            .extensions_mut()
-            .insert::<ServingClassOutcome>(serving_resolution.outcome());
-        Ok(response)
+        let mut final_error = final_error;
+        final_error.serving_outcome = Some(serving_resolution.outcome());
+        Err(final_error)
     } else if no_eligible_member {
         // Every member is external and the account never uses those: not a
         // capacity condition, and nothing to retry.

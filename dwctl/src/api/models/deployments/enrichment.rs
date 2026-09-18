@@ -498,7 +498,7 @@ mod tests {
             allowed_batch_completion_windows: None,
             metadata: None,
             provisioning_source: None,
-            serving_classes: serde_json::json!({}),
+            serving_classes: None,
         }
     }
 

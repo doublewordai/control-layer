@@ -376,10 +376,6 @@ pub struct CompositeModelCreate {
     pub metadata: Option<ModelCatalogMetadata>,
 }
 
-fn empty_presets() -> serde_json::Value {
-    serde_json::json!({})
-}
-
 fn default_true() -> bool {
     true
 }
@@ -623,10 +619,11 @@ pub struct DeployedModelResponse {
     pub provisioning_source: Option<String>,
     /// Serving classes this model offers, keyed by class name (`interactive`,
     /// `throughput`, optionally `standard`), each a preset of targets
-    /// `{ttft_ms, itl_ms, priority}`. Empty = standard only. Declared in the
-    /// model catalog.
-    #[serde(default = "empty_presets")]
-    pub serving_classes: serde_json::Value,
+    /// `{ttft_ms, itl_ms, priority}`. Empty object = standard only. Declared
+    /// in the model catalog. An internal, platform-manager detail: only
+    /// included for callers with `Models::ReadAll`, never shown to customers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_classes: Option<serde_json::Value>,
 }
 
 impl From<DeploymentDBResponse> for DeployedModelResponse {
@@ -700,7 +697,8 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
                 .ok()
                 .filter(|m| *m != ModelCatalogMetadata::default()),
             provisioning_source: db.provisioning_source,
-            serving_classes: db.serving_classes,
+            // Attached by the handler for platform managers only.
+            serving_classes: None,
         }
     }
 }
@@ -727,6 +725,12 @@ impl DeployedModelResponse {
     /// Create a response with provider pricing included (admin only)
     pub fn with_provider_pricing(mut self, provider_pricing: Option<ProviderPricing>) -> Self {
         self.provider_pricing = provider_pricing;
+        self
+    }
+
+    /// Include the model's serving-class presets (platform managers only).
+    pub fn with_serving_classes(mut self, serving_classes: Option<serde_json::Value>) -> Self {
+        self.serving_classes = serving_classes;
         self
     }
 
