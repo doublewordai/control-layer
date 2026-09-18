@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "fusillade-core"
-version = "6.0.0"
+version = "6.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
