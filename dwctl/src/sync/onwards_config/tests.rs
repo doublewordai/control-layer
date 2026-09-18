@@ -553,6 +553,10 @@ async fn test_cache_shape_zero_data_retention_label_reflects_owner(pool: sqlx::P
         "ZDR-enabled owner's key must be labelled true"
     );
     assert_eq!(key_a_labels.get("purpose"), Some(&"realtime".to_string()));
+    assert_eq!(
+        key_a_labels.get("api_key_id"),
+        Some(&"20000000-0000-0000-0000-0000000000a1".to_string())
+    );
 
     let key_b_labels = targets.key_labels.get(KEY_B_SECRET).expect("user B's key should carry labels");
     assert_eq!(
