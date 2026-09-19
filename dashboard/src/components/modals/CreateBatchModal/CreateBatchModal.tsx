@@ -247,6 +247,7 @@ export function CreateBatchModal({
         setFileToUpload(droppedFile);
         setFilename(droppedFile.name);
         setSelectedFileId(null); // Clear combobox selection
+        setFileSearchQuery("");
         setError(null);
       } else {
         setError(validation.error);
@@ -262,6 +263,7 @@ export function CreateBatchModal({
         setFileToUpload(file);
         setFilename(file.name);
         setSelectedFileId(null); // Clear combobox selection
+        setFileSearchQuery("");
         setError(null);
       } else {
         setError(validation.error);
@@ -273,13 +275,15 @@ export function CreateBatchModal({
     setFileToUpload(null);
     setSelectedFileId(null);
     setFilename("");
+    setFileSearchQuery("");
   };
 
   const handleSubmit = async () => {
     let finalFileId = selectedFileId;
 
-    // If a file needs to be uploaded, upload it first
-    if (fileToUpload) {
+    // Only upload the staged file when no file has been selected yet — the
+    // cost-estimate flow already uploads and sets selectedFileId.
+    if (fileToUpload && !selectedFileId) {
       setIsUploading(true);
       setUploadProgress(0);
       setIsProcessing(false);
@@ -784,6 +788,8 @@ export function CreateBatchModal({
                             },
                           );
                           setSelectedFileId(uploadedFile.id);
+                          setFileToUpload(null);
+                          setFilename("");
                           toast.success(
                             `File "${filename || fileToUpload.name}" uploaded successfully`,
                           );
