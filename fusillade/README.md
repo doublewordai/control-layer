@@ -398,8 +398,7 @@ observed healthy:
    graphs per tick and then moves up to that many of them at the same time,
    each in its own transaction under the per-graph advisory lock and a
    shared (not exclusive) lock on the target day, so the moves overlap in
-   full. Discovery stays serial (one index probe per candidate), so scaling
-   flattens well past the recommended range. The steady sweep is always
+   full. The steady sweep is always
    sequential. Concurrent
    passes (several pods, or a pod plus a drain) remain safe because every
    move takes `FOR UPDATE SKIP LOCKED` and verifies by read-back; they simply
