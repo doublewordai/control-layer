@@ -481,6 +481,49 @@ mod tests {
         let text = response.text();
         assert!(text.contains("event: response.output_text.delta"), "chunk was dropped:\n{text}");
         assert!(text.contains("Hi"), "missing text delta in:\n{text}");
+        // A length-capped stream ends incomplete, exactly like the blocking path.
+        assert!(text.contains("event: response.incomplete"), "length cap not surfaced:\n{text}");
+        assert!(
+            text.contains(r#""reason":"max_output_tokens""#),
+            "missing incomplete_details:\n{text}"
+        );
+        assert!(!text.contains("event: response.completed"), "must not also complete:\n{text}");
+    }
+
+    /// An upstream that closes cleanly without ever sending a `finish_reason`
+    /// (worker restart, proxy idle timeout) must not be reported to the client
+    /// as a completed response; partial output is kept but the status is failed.
+    #[tokio::test]
+    async fn stream_cut_without_finish_reason_is_reported_failed() {
+        async fn truncated_chat_sse(_req: Request) -> Response {
+            let sse = concat!(
+                "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"partial\"}}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            let mut r = Response::new(Body::from(sse));
+            r.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+            r
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(truncated_chat_sse))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({ "model": "gpt-4o", "input": "hi", "stream": true }))
+            .await;
+
+        assert_eq!(response.status_code().as_u16(), 200);
+        let text = response.text();
+        assert!(text.contains("partial"), "partial output dropped:\n{text}");
+        assert!(text.contains("event: response.failed"), "truncation not surfaced:\n{text}");
+        assert!(text.contains(r#""status":"failed""#), "{text}");
+        assert!(text.contains("upstream_stream_ended"), "{text}");
+        assert!(!text.contains("event: response.completed"), "must not complete:\n{text}");
     }
 
     /// A 2xx body the translator genuinely cannot translate must surface as a
