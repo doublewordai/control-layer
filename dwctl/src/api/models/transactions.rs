@@ -140,27 +140,43 @@ pub struct TransactionFilters {
 }
 
 impl ListTransactionsQuery {
-    /// Parse query parameters into TransactionFilters struct
-    pub fn to_filters(&self) -> TransactionFilters {
-        let transaction_types = self.transaction_types.as_ref().map(|types_str| {
-            types_str
-                .split(',')
-                .filter_map(|t| match t.trim() {
-                    "admin_grant" => Some(CreditTransactionType::AdminGrant),
-                    "admin_removal" => Some(CreditTransactionType::AdminRemoval),
-                    "usage" => Some(CreditTransactionType::Usage),
-                    "purchase" => Some(CreditTransactionType::Purchase),
-                    _ => None,
-                })
-                .collect()
-        });
+    /// Parse query parameters into a `TransactionFilters` struct.
+    ///
+    /// `transaction_types` is a comma-separated list of closed-enum tokens
+    /// (`admin_grant`, `admin_removal`, `usage`, `purchase`). Unlike a free
+    /// filter, an unrecognized token is a client error — the create endpoint
+    /// rejects unknown `transaction_type` values via serde, and the list
+    /// endpoint validates the same taxonomy here. Returns an `Err(message)`
+    /// describing the first unrecognized token so the handler can map it to a
+    /// `400 BadRequest`. Stray empty tokens (e.g. `",,"`) are tolerated; an
+    /// all-empty parse collapses to `None` (no filter) rather than "match no
+    /// rows".
+    pub fn to_filters(&self) -> Result<TransactionFilters, String> {
+        let transaction_types = self
+            .transaction_types
+            .as_ref()
+            .and_then(|types_str| {
+                let mut parsed = Vec::new();
+                for t in types_str.split(',').map(str::trim) {
+                    match t {
+                        "admin_grant" => parsed.push(CreditTransactionType::AdminGrant),
+                        "admin_removal" => parsed.push(CreditTransactionType::AdminRemoval),
+                        "usage" => parsed.push(CreditTransactionType::Usage),
+                        "purchase" => parsed.push(CreditTransactionType::Purchase),
+                        "" => {} // tolerate stray empty tokens (e.g. ",,")
+                        other => return Some(Err(format!("unrecognized transaction_types value: '{other}'"))),
+                    }
+                }
+                if parsed.is_empty() { None } else { Some(Ok(parsed)) }
+            })
+            .transpose()?;
 
-        TransactionFilters {
+        Ok(TransactionFilters {
             search: self.search.clone(),
             transaction_types,
             start_date: self.start_date,
             end_date: self.end_date,
-        }
+        })
     }
 }
 
@@ -212,5 +228,74 @@ impl CreditTransactionResponse {
 impl From<CreditTransactionDBResponse> for CreditTransactionResponse {
     fn from(db: CreditTransactionDBResponse) -> Self {
         Self::from_db_with_batch_id(db, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::models::pagination::Pagination;
+
+    fn query() -> ListTransactionsQuery {
+        ListTransactionsQuery {
+            user_id: None,
+            all: None,
+            group_batches: None,
+            search: None,
+            transaction_types: None,
+            start_date: None,
+            end_date: None,
+            pagination: Pagination::default(),
+        }
+    }
+
+    fn query_with_types(types: &str) -> ListTransactionsQuery {
+        let mut q = query();
+        q.transaction_types = Some(types.to_string());
+        q
+    }
+
+    #[test]
+    fn to_filters_all_four_valid_tokens_parse_in_order() {
+        let filters = query_with_types("admin_grant,admin_removal,usage,purchase").to_filters().unwrap();
+        let types = filters.transaction_types.unwrap();
+        assert_eq!(
+            types,
+            vec![
+                CreditTransactionType::AdminGrant,
+                CreditTransactionType::AdminRemoval,
+                CreditTransactionType::Usage,
+                CreditTransactionType::Purchase,
+            ]
+        );
+    }
+
+    #[test]
+    fn to_filters_rejects_all_invalid_tokens() {
+        let err = query_with_types("admin_grnt_typo").to_filters().unwrap_err();
+        assert!(
+            err.contains("unrecognized transaction_types value"),
+            "error should describe the unrecognized token, got: {err}"
+        );
+        assert!(err.contains("admin_grnt_typo"), "error should name the offending token, got: {err}");
+    }
+
+    #[test]
+    fn to_filters_rejects_first_invalid_token_and_stops() {
+        // A single valid token mixed with garbage must still be rejected — the
+        // taxonomy is closed, just like the create endpoint's serde enum, so a
+        // silent `filter_map`-style drop of unknown tokens must not return.
+        let err = query_with_types("admin_grant,bogus").to_filters().unwrap_err();
+        assert!(err.contains("bogus"), "error should name the offending token, got: {err}");
+    }
+
+    #[test]
+    fn to_filters_empty_string_collapses_to_no_filter() {
+        // An empty `transaction_types=` query param deserializes to Some("")
+        // (the field is present). The sole token is empty and deemed stray
+        // noise; with nothing left to filter on it collapses to None rather
+        // than matching zero rows.
+        let filters = query_with_types("").to_filters().unwrap();
+        assert!(filters.transaction_types.is_none(), "bare empty string => None (no filter)");
     }
 }
