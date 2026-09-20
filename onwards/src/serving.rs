@@ -139,6 +139,38 @@ impl fmt::Display for UnknownServingClass {
 
 impl std::error::Error for UnknownServingClass {}
 
+/// A malformed model selector or an unsupported realtime serving class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvalidModelSelector {
+    Malformed,
+    UnknownClass(UnknownServingClass),
+}
+
+impl fmt::Display for InvalidModelSelector {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Malformed => f.write_str("Invalid model selector: expected a nonempty alias with at most one nonempty ':class' suffix."),
+            Self::UnknownClass(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for InvalidModelSelector {}
+
+/// Validate selector syntax without interpreting the class. Async ingestion
+/// discards the suffix because its deadline determines scheduling.
+pub fn split_model_suffix(model: &str) -> Result<(&str, Option<&str>), InvalidModelSelector> {
+    match model.split_once(SUFFIX_SEPARATOR) {
+        None if !model.is_empty() => Ok((model, None)),
+        Some((alias, suffix))
+            if !alias.is_empty() && !suffix.is_empty() && !suffix.contains(SUFFIX_SEPARATOR) =>
+        {
+            Ok((alias, Some(suffix)))
+        }
+        _ => Err(InvalidModelSelector::Malformed),
+    }
+}
+
 impl FromStr for ServingClass {
     type Err = UnknownServingClass;
 
@@ -152,16 +184,16 @@ impl FromStr for ServingClass {
 
 /// Split `alias:class` into the bare alias and the requested class.
 ///
-/// A model string without a separator is returned unchanged. Aliases never
-/// contain `:` today, so anything after the last one is a class request and
-/// an unknown class is an error, never silently ignored.
+/// Public model aliases do not contain colons; a colon selects a serving class.
 pub fn split_class_suffix(
     model: &str,
-) -> Result<(&str, Option<ServingClass>), UnknownServingClass> {
-    match model.rsplit_once(SUFFIX_SEPARATOR) {
-        None => Ok((model, None)),
-        Some((alias, suffix)) => suffix.parse().map(|class| (alias, Some(class))),
-    }
+) -> Result<(&str, Option<ServingClass>), InvalidModelSelector> {
+    let (alias, suffix) = split_model_suffix(model)?;
+    let class = suffix
+        .map(str::parse)
+        .transpose()
+        .map_err(InvalidModelSelector::UnknownClass)?;
+    Ok((alias, class))
 }
 
 /// The objective targets one request is served to. A class is a name for a
@@ -533,13 +565,37 @@ mod tests {
             Ok(("m", Some(ServingClass::Standard)))
         );
         let err = split_class_suffix("m:fast").unwrap_err();
-        assert_eq!(err, UnknownServingClass("fast".to_string()));
+        assert_eq!(
+            err,
+            InvalidModelSelector::UnknownClass(UnknownServingClass("fast".to_string()))
+        );
         assert!(
             err.to_string()
                 .contains("interactive, throughput, standard")
         );
         // `custom` is an outcome, never a request
         assert!(split_class_suffix("m:custom").is_err());
+    }
+
+    #[test]
+    fn selector_syntax_is_checked_before_class_resolution() {
+        for model in [
+            "",
+            ":interactive",
+            "m:",
+            "m:throughput:interactive",
+            "m::interactive",
+        ] {
+            assert_eq!(
+                split_model_suffix(model),
+                Err(InvalidModelSelector::Malformed)
+            );
+            assert_eq!(
+                split_class_suffix(model),
+                Err(InvalidModelSelector::Malformed)
+            );
+        }
+        assert_eq!(split_model_suffix("m:x-fast"), Ok(("m", Some("x-fast"))));
     }
 
     #[test]
@@ -837,13 +893,18 @@ mod handler_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use axum::http::StatusCode;
+    use axum::Extension;
+    use axum::body::Body;
+    use axum::extract::State;
+    use axum::http::{Request, StatusCode};
     use axum_test::TestServer;
     use dashmap::DashMap;
     use serde_json::json;
 
     use super::*;
+    use crate::handlers::target_message_handler;
     use crate::load_balancer::{Provider, ProviderPool};
+    use crate::strict::build_strict_router;
     use crate::target::{FallbackConfig, LoadBalanceStrategy, Target, TargetPools, Targets};
     use crate::test_utils::{MockHttpClient, MockRequest};
     use crate::{AppState, build_router};
@@ -1004,6 +1065,78 @@ mod handler_tests {
             mock.clone(),
         )))
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn strict_handlers_preserve_the_ingress_class_extension() {
+        for (path, payload) in [
+            ("/chat/completions", json!({"model":ALIAS,"messages":[]})),
+            ("/completions", json!({"model":ALIAS,"prompt":"hi"})),
+            ("/embeddings", json!({"model":ALIAS,"input":"hi"})),
+            ("/responses", json!({"model":ALIAS,"input":"hi"})),
+        ] {
+            let mut s = setup(&[DYNAMO]);
+            s.presets = both();
+            for granted in [false, true] {
+                s.account = granted.then(|| holds(&BOTH_CLASSES));
+                // An upstream failure avoids coupling this forwarding test to
+                // four different success-response schemas.
+                let mock = MockHttpClient::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    r#"{"error":"unavailable"}"#,
+                );
+                let router = build_strict_router(AppState::with_client(targets(&s), mock.clone()))
+                    .layer(Extension(RequestedServingClass(ServingClass::Interactive)));
+                let srv = TestServer::new(router).unwrap();
+                let response = srv
+                    .post(path)
+                    .add_header("authorization", format!("Bearer {KEY}"))
+                    .json(&payload)
+                    .await;
+                if granted {
+                    assert_eq!(response.status_code(), 503, "{path}");
+                    assert_eq!(
+                        sent(&mock.get_requests()[0]),
+                        Some((500, 20, Some(200))),
+                        "{path}"
+                    );
+                } else {
+                    assert_eq!(response.status_code(), 403, "{path}");
+                    assert!(mock.get_requests().is_empty(), "{path}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn no_eligible_provider_retains_the_resolved_class() {
+        let mut s = setup(&[EXTERNAL]);
+        s.presets = both();
+        s.account = Some(AccountServing {
+            self_hosted_only: true,
+            ..holds(&BOTH_CLASSES)
+        });
+        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/chat/completions")
+            .header("authorization", format!("Bearer {KEY}"))
+            .body(Body::from(
+                json!({"model":"gpt-4:interactive","messages":[]}).to_string(),
+            ))
+            .unwrap();
+        let error = target_message_handler(
+            State(AppState::with_client(targets(&s), mock.clone())),
+            request,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            error.serving_outcome.unwrap().resolved,
+            ServingClass::Interactive
+        );
+        assert!(mock.get_requests().is_empty());
     }
 
     #[tokio::test]

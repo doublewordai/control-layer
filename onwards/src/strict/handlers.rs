@@ -35,7 +35,7 @@ use crate::handlers::{ResolvedTrust, target_message_handler};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{FromRequest, State};
-use axum::http::{HeaderMap, Request, StatusCode, header};
+use axum::http::{Extensions, HeaderMap, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use futures_util::StreamExt;
 use serde_json::json;
@@ -108,6 +108,7 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
     req: Request<Body>,
 ) -> Response {
     let headers = req.headers().clone();
+    let extensions = req.extensions().clone();
     let body_bytes = match axum::body::to_bytes(req.into_body(), state.body_limit).await {
         Ok(bytes) => bytes,
         Err(_) => return OnwardsErrorResponse::payload_too_large(state.body_limit).into_response(),
@@ -140,7 +141,14 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         response,
         trusted,
         internal_error,
-    } = forward_request(state, headers, "/chat/completions", body_bytes.to_vec()).await;
+    } = forward_request(
+        state,
+        headers,
+        extensions,
+        "/chat/completions",
+        body_bytes.to_vec(),
+    )
+    .await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -192,6 +200,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         return chat_completions_handler(State(state), req).await;
     }
 
+    let extensions = req.extensions().clone();
     let request: ResponsesRequest = match axum::extract::Json::from_request(req, &state).await {
         Ok(Json(r)) => r,
         Err(e) => {
@@ -276,7 +285,7 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         response,
         trusted,
         internal_error,
-    } = forward_request(state.clone(), headers, "/responses", body_bytes).await;
+    } = forward_request(state.clone(), headers, extensions, "/responses", body_bytes).await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -313,6 +322,7 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     req: Request<Body>,
 ) -> Response {
     let headers = req.headers().clone();
+    let extensions = req.extensions().clone();
     let body_bytes = match axum::body::to_bytes(req.into_body(), state.body_limit).await {
         Ok(bytes) => bytes,
         Err(_) => return OnwardsErrorResponse::payload_too_large(state.body_limit).into_response(),
@@ -337,7 +347,14 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         response,
         trusted,
         internal_error,
-    } = forward_request(state, headers, "/embeddings", body_bytes.to_vec()).await;
+    } = forward_request(
+        state,
+        headers,
+        extensions,
+        "/embeddings",
+        body_bytes.to_vec(),
+    )
+    .await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -361,6 +378,7 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     req: Request<Body>,
 ) -> Response {
     let headers = req.headers().clone();
+    let extensions = req.extensions().clone();
     let body_bytes = match axum::body::to_bytes(req.into_body(), state.body_limit).await {
         Ok(bytes) => bytes,
         Err(_) => return OnwardsErrorResponse::payload_too_large(state.body_limit).into_response(),
@@ -415,7 +433,14 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         response,
         trusted,
         internal_error,
-    } = forward_request(state, headers, "/completions", body_bytes.to_vec()).await;
+    } = forward_request(
+        state,
+        headers,
+        extensions,
+        "/completions",
+        body_bytes.to_vec(),
+    )
+    .await;
 
     if response.status().is_success() {
         let response_is_sse = response_is_sse(&response);
@@ -443,6 +468,7 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
 async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
     state: AppState<T>,
     mut headers: HeaderMap,
+    extensions: Extensions,
     path: &str,
     body_bytes: Vec<u8>,
 ) -> ForwardResult {
@@ -463,7 +489,7 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
         request_builder = request_builder.header(name, value);
     }
 
-    let request = match request_builder.body(Body::from(body_bytes)) {
+    let mut request = match request_builder.body(Body::from(body_bytes)) {
         Ok(req) => req,
         Err(e) => {
             error!(error = %e, "Failed to build request");
@@ -479,6 +505,10 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
             };
         }
     };
+
+    // Ingress may have normalized the model and carried its requested class
+    // in an extension. Preserve that context across strict validation.
+    request.extensions_mut().extend(extensions);
 
     // Use the existing target message handler
     let (response, internal_error) = match target_message_handler(State(state), request).await {

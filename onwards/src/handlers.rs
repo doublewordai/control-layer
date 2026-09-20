@@ -529,14 +529,20 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
-    // A class suffix (`alias:interactive`) is a request for a serving class,
-    // not part of the model's identity. dwctl strips it ahead of us and hands
-    // the class over as an extension so every layer above keys on the bare
-    // alias; a suffix that still reaches here (standalone deployments, direct
-    // callers) is parsed the same way, and the body rewritten so no upstream
-    // ever sees it. An unknown class is a 400, never silently ignored.
+    // A class suffix requests a serving class on the base alias. DWCTL strips
+    // it and hands it over as an extension; standalone callers are parsed here.
+    // Unknown class suffixes are a 400.
     let suffix_class = req.extensions().get::<RequestedServingClass>().map(|c| c.0);
-    let (model_name, suffix_class, body_bytes) = match serving::split_class_suffix(&model_name) {
+    // DWCTL has already split the body selector once. Do not reinterpret its
+    // base alias (e.g. turn nonexistent `model:interactive` into `model`). A
+    // Model-Override header is a separate selector and still needs resolution.
+    let has_model_override = req.headers().get("model-override").and_then(|value| value.to_str().ok()).is_some();
+    let selected_model = if suffix_class.is_some() && !has_model_override {
+        Ok((model_name.as_str(), None))
+    } else {
+        serving::split_class_suffix(&model_name)
+    };
+    let (model_name, suffix_class, body_bytes) = match selected_model {
         Ok((_, None)) => (model_name, suffix_class, body_bytes),
         Ok((alias, Some(class))) => {
             let alias = alias.to_string();
@@ -2069,6 +2075,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 code: "no_eligible_provider".to_string(),
             })
             .status(StatusCode::SERVICE_UNAVAILABLE)
+            .serving_outcome(serving_resolution.outcome())
             .build())
     } else if !pool.is_empty() {
         // Pool has providers but select_iter() yielded nothing — all at capacity
