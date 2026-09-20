@@ -36,6 +36,7 @@ Controls automatic retry on other providers when requests fail:
 |--------|------|---------|-------------|
 | `enabled` | bool | `false` | Master switch for fallback |
 | `on_status` | int[] | -- | Status codes that trigger fallback (supports wildcards) |
+| `realtime_on_status` | int[] | `[]` | Extra statuses that trigger fallback for realtime requests only |
 | `on_rate_limit` | bool | `false` | Fallback when hitting local rate limits |
 | `first_token_timeout_ms` | int | -- | Failover deadline for the first token of a streamed response; `0` disables (see below) |
 
@@ -209,3 +210,27 @@ Single-provider configs still work unchanged:
   }
 }
 ```
+
+## Load-aware priority share
+
+Priority pools with enabled fallback and multiple providers automatically adjust
+the share of requests that try the preferred provider first. The share decreases
+when the preferred provider's breach rate — first frames later than the budget,
+plus overload statuses such as 429, 503 and 529 — rises above a target, holds
+inside a hysteresis band, and recovers in steps once the rate stays low or the
+pool has too few samples to judge. A pool that temporarily drops to one provider
+keeps its controller and resumes it when the preferred provider returns. Set
+`fallback.aimd.enabled: false` to opt out, or override the default parameters.
+The controller applies only to eligible strict-mode streams, and it preserves the
+preferred provider in subsequent failover attempts. See
+[load-aware failover](load-aware-failover.md) for configuration, eligibility,
+sampling limits, reload behavior and rollout.
+
+### Realtime-only failover statuses
+
+`fallback.realtime_on_status` adds statuses that fail a request over to the next
+provider only when the request is realtime — it lacks the header set with
+`AppState::with_first_token_timeout_exempt_header` — on top of `fallback.on_status`.
+It accepts the same wildcards. Use it for a provider's over-capacity status:
+realtime callers are rerouted, while dispatched traffic that runs its own retries
+receives the upstream response.

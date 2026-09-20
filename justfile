@@ -508,7 +508,10 @@ test target="" *args="":
                 fi
             else
                 echo "🚀 [$(date '+%H:%M:%S')] Starting docker services..."
-                docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --wait
+                if ! docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --wait; then
+                    docker compose -f docker-compose.yml -f docker-compose.test.yml logs --no-color --tail=100
+                    exit 1
+                fi
                 
                 echo "⏳ Waiting for control-layer service to be ready..."
                 MAX_WAIT=60  # 1 minute max wait for pre-built images

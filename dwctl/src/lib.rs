@@ -159,6 +159,7 @@ pub mod keystore;
 mod leader_election;
 pub mod limits;
 mod metrics;
+pub mod migrations;
 pub mod model_provisioning;
 mod notifications;
 mod openapi;
@@ -414,6 +415,13 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
                     SUBMISSION_LATENCY_BUCKETS,
                 )
                 .expect("Failed to set custom buckets for fusillade_request_pickup_delay_seconds")
+                // Without buckets the first-token latency renders as a per-process
+                // summary, whose quantiles cannot be aggregated across replicas.
+                .set_buckets_for_metric(
+                    Matcher::Full("onwards_first_token_seconds".to_string()),
+                    onwards::FIRST_TOKEN_SECONDS_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for onwards_first_token_seconds")
                 .install_recorder()
                 .expect("Failed to install Prometheus recorder");
             initialize_database_error_metrics();
@@ -604,6 +612,8 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
                             backoff_factor: 2.0,
                             backoff_jitter: Default::default(),
                             backoff_max_total_ms: None,
+                            first_token_timeout_ms: None,
+                            aimd: None,
                             traffic_routing_rules: None,
                             allowed_batch_completion_windows: None,
                             metadata: None,
@@ -658,7 +668,7 @@ pub async fn seed_database(sources: &[config::ModelSource], db: &PgPool) -> Resu
 /// set at the connection level (via `PgConnectOptions::options`) rather than
 /// with an `after_connect` hook, so it cannot be unset and works with replicas.
 /// Eager connection (`connect_with`) so `min_connections` is honoured at boot.
-async fn create_schema_pool(
+pub(crate) async fn create_schema_pool(
     schema: &str,
     opts: sqlx::postgres::PgConnectOptions,
     settings: &config::PoolSettings,
@@ -668,7 +678,7 @@ async fn create_schema_pool(
     db::pool_options(settings).connect_with(opts_with_schema).await
 }
 
-fn connect_options(url: &str, slow_threshold: std::time::Duration) -> anyhow::Result<PgConnectOptions> {
+pub(crate) fn connect_options(url: &str, slow_threshold: std::time::Duration) -> anyhow::Result<PgConnectOptions> {
     Ok(PgConnectOptions::from_str(url)?.log_slow_statements(log::LevelFilter::Warn, slow_threshold))
 }
 
@@ -703,7 +713,7 @@ async fn verify_schema_on_default_search_path(component_name: &str, schema: &str
 /// creating schemas or migrating. Names, catalog OIDs and system identifiers can
 /// survive cloning; contention on a fresh database-scoped lock cannot. Both locks
 /// are transaction scoped so errors and cancellation cannot leak session locks.
-async fn verify_same_live_database(component_name: &str, main: &PgPool, component: &PgPool) -> anyhow::Result<()> {
+pub(crate) async fn verify_same_live_database(component_name: &str, main: &PgPool, component: &PgPool) -> anyhow::Result<()> {
     let challenge = Uuid::new_v4().as_u128() as i64;
     let mut main_transaction = main.begin().await?;
     let held: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
@@ -789,6 +799,26 @@ mod pooled_schema_tests {
         );
     }
 
+    /// `migrations.mode: check` must not create a missing component schema.
+    #[sqlx::test(migrations = false)]
+    async fn check_mode_reports_a_missing_schema_instead_of_creating_it(pool: PgPool) {
+        let component = serde_json::from_value(serde_json::json!({"mode": "schema", "name": "fusillade_missing"})).unwrap();
+        let main = db::PoolPair::unsplit(DbPools::new(pool.clone()));
+        let err = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), false)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = 'fusillade_missing')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!exists, "check mode executed DDL");
+        setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true)
+            .await
+            .unwrap();
+    }
+
     #[sqlx::test(migrations = false)]
     async fn pooled_fusillade_defaults_to_role_schema_validation(pool: PgPool) {
         let mut endpoint = pool.connect_options().to_url_lossy();
@@ -799,7 +829,7 @@ mod pooled_schema_tests {
         }))
         .unwrap();
         let main = db::PoolPair::unsplit(DbPools::new(pool));
-        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
         assert!(
             result.is_err(),
             "role_default must reject a shared login whose default schema is public"
@@ -822,7 +852,7 @@ mod pooled_schema_tests {
                     .unwrap(),
             ),
         };
-        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
         assert!(
             result.is_err(),
             "explicit direct credentials must not inherit main pooled credentials"
@@ -837,7 +867,7 @@ mod pooled_schema_tests {
         .unwrap();
         let main = db::PoolPair::unsplit(DbPools::new(pool));
         assert!(
-            setup_component_pools("outlet", &component, &main, std::time::Duration::from_secs(1))
+            setup_component_pools("outlet", &component, &main, std::time::Duration::from_secs(1), true)
                 .await
                 .is_err()
         );
@@ -855,7 +885,7 @@ mod pooled_schema_tests {
         }))
         .unwrap();
         let main = db::PoolPair::unsplit(DbPools::new(pool.clone()));
-        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
         // Clean up even on a failed assertion against the old implementation.
         let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = $1)")
             .bind(&schema)
@@ -888,7 +918,7 @@ mod pooled_schema_tests {
             "mode": "schema", "name": "fusillade", "url": endpoint.as_str()
         }))
         .unwrap();
-        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1)).await;
+        let result = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true).await;
         let (identity, has_replica) = match result {
             Ok(pair) => {
                 let identity: String = sqlx::query_scalar("SELECT current_user")
@@ -940,7 +970,7 @@ mod pooled_schema_tests {
         }))
         .unwrap();
         let main = db::PoolPair::unsplit(DbPools::new(pool.clone()));
-        let pair = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1))
+        let pair = setup_component_pools("fusillade", &component, &main, std::time::Duration::from_secs(1), true)
             .await
             .unwrap();
         assert!(
@@ -1055,11 +1085,15 @@ mod pooled_schema_tests {
 /// role schema; Fusillade also supports explicit transaction mode. Dedicated mode has its
 /// own `url` and optional `pooled_url`. Without a pooled endpoint, the pair is
 /// unsplit and sized by `pool`, preserving the existing connection behavior.
+///
+/// `create_schema` is false in `migrations.mode: check`, where startup must not
+/// execute DDL: a missing component schema is reported instead of created.
 async fn setup_component_pools(
     component_name: &str,
     component: &config::ComponentDb,
     main: &db::PoolPair,
     slow_threshold: std::time::Duration,
+    create_schema: bool,
 ) -> anyhow::Result<db::PoolPair> {
     component
         .validate_schema_pooling(component_name, main.is_split())
@@ -1095,6 +1129,9 @@ async fn setup_component_pools(
                 .bind(name)
                 .fetch_one(&direct)
                 .await?;
+            if !schema_exists && !create_schema {
+                anyhow::bail!("{component_name}: schema `{name}` does not exist and migrations.mode is `check`; run `dwctl migrate` first");
+            }
             if !schema_exists {
                 direct
                     .execute(&*format!("CREATE SCHEMA IF NOT EXISTS \"{}\"", name.replace('"', "\"\"")))
@@ -1324,7 +1361,7 @@ async fn setup_database(
             .await
             .expect("Failed to create TestDbPools");
         let replica_pool = test_pools.read().into_inner();
-        migrator().run(&existing_pool).await?;
+        migrations::at_startup(config.migrations.mode, &migrations::Target::main(), &existing_pool).await?;
         (None, db::PoolPair::unsplit(DbPools::with_replica(existing_pool, replica_pool)))
     } else {
         // Database connection - handle both embedded and external
@@ -1368,8 +1405,10 @@ async fn setup_database(
             .connect_with(connect_options(&database_url, slow_threshold)?)
             .await?;
 
-        // Migrations take a session-level advisory lock: always a direct connection.
-        migrator().run(&direct).await?;
+        // Migrations take a session-level advisory lock: always a direct
+        // connection. `migrations.mode` decides whether this process applies
+        // them or only verifies the schema is compatible.
+        migrations::at_startup(config.migrations.mode, &migrations::Target::main(), &direct).await?;
 
         let replica = match config.database.external_replica_url() {
             Some(replica_url) => {
@@ -1422,9 +1461,16 @@ async fn setup_database(
 
     // Fusillade batch processing pools
     info!("Setting up fusillade batch processing pool");
-    let fusillade = setup_component_pools("fusillade", config.database.fusillade(), &main, slow_threshold).await?;
+    let fusillade = setup_component_pools(
+        "fusillade",
+        config.database.fusillade(),
+        &main,
+        slow_threshold,
+        config.migrations.mode == config::MigrationsMode::Run,
+    )
+    .await?;
     // sqlx's migrator holds a session advisory lock: direct connections.
-    fusillade_arsenal::migrator().run(&*fusillade.direct.write()).await?;
+    migrations::at_startup(config.migrations.mode, &migrations::Target::fusillade(), &fusillade.direct.write()).await?;
 
     // Every batch-capable process performs the content-free preflight, even
     // when its daemon is disabled. That makes disabling the last archive
@@ -1486,13 +1532,20 @@ async fn setup_database(
 
     // Underway migrations (background task queue) — one transaction, but keep
     // them on the direct connection like every other migration.
-    underway::run_migrations(&*main.direct.write()).await?;
+    migrations::underway_at_startup(config.migrations.mode, &main.direct.write()).await?;
 
     // Outlet request-logging pools, if enabled
     let outlet = if config.enable_request_logging {
         info!("Setting up outlet request logging pool (logging enabled)");
-        let outlet = setup_component_pools("outlet", config.database.outlet(), &main, slow_threshold).await?;
-        outlet_postgres::migrator().run(&*outlet.direct.write()).await?;
+        let outlet = setup_component_pools(
+            "outlet",
+            config.database.outlet(),
+            &main,
+            slow_threshold,
+            config.migrations.mode == config::MigrationsMode::Run,
+        )
+        .await?;
+        migrations::at_startup(config.migrations.mode, &migrations::Target::outlet(), &outlet.direct.write()).await?;
         Some(outlet)
     } else {
         info!("Skipping outlet pool setup (logging disabled)");
@@ -1706,7 +1759,7 @@ fn security_header_pairs(cfg: &crate::config::SecurityHeadersConfig) -> anyhow::
 ///
 /// - `state`: Mutable application state (metrics recorder may be initialized here)
 /// - `onwards_router`: Pre-configured router for AI request proxying
-/// - `analytics_sender`: Optional sender for analytics records (from background services)
+/// - `analytics_writer`: Optional durable outbox writer (from background services)
 /// - `metrics_recorder`: Optional GenAI metrics recorder (created before background services)
 ///
 /// # Returns
@@ -1722,7 +1775,7 @@ fn security_header_pairs(cfg: &crate::config::SecurityHeadersConfig) -> anyhow::
 pub async fn build_router(
     state: &mut AppState,
     onwards_router: Router,
-    analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
+    analytics_writer: Option<request_logging::batcher::AnalyticsOutboxWriter>,
     requests_writer_sender: Option<crate::inference::engine::writer::RequestsWriterSender>,
     metrics_recorder: Option<GenAiMetrics>,
     strict_mode: bool,
@@ -1771,12 +1824,12 @@ pub async fn build_router(
 
         // Add AnalyticsHandler for analytics/billing if enabled
         // The batcher is spawned in setup_background_services and managed by BackgroundServices
-        if let Some(sender) = analytics_sender {
+        if let Some(writer) = analytics_writer {
             // Billing reads usage from the single `parse_ai_response -> AiResponse`
             // parse (the same value request logging stores), via `TokenMetrics::from`.
             // The outlet sits outer to translation, so it captures the foreign
             // response body; `AiResponse` covers each protocol's own shape.
-            let analytics_handler = request_logging::AnalyticsHandler::new(sender, instance_id, config.as_ref().clone());
+            let analytics_handler = request_logging::AnalyticsHandler::new(writer, instance_id, config.as_ref().clone());
             multi_handler = multi_handler.with(analytics_handler);
         }
 
@@ -2293,10 +2346,17 @@ pub async fn build_router(
         // Re-use the AppState-bound singleton built once at startup.
         let normalizer = state.image_normalizer.clone();
         let realtime_ttl = cfg.image_normalizer.signing.realtime_ttl();
+        // Tokens arriving on a daemon loopback (flex enqueue / file ingest
+        // store them) are signed with the dispatch TTL: long enough to outlive
+        // one full processing attempt. Client-presented tokens are authorised
+        // the same way and use the realtime TTL.
+        let processing_timeout = std::time::Duration::from_millis(cfg.background_services.batch_daemon.processing_timeout_ms);
+        let token_ttl = cfg.image_normalizer.signing.dispatch_ttl(processing_timeout);
         let image_normalizer_state = crate::inference::image_normalizer_middleware::ImageNormalizerMiddlewareState {
             enabled: cfg.image_normalizer.enabled,
             normalizer,
             realtime_ttl,
+            token_ttl,
             pool: Some(sqlx_pool_router::DynPools::new(state.db.clone())),
         };
         onwards_router.layer(middleware::from_fn_with_state(
@@ -2337,6 +2397,7 @@ pub async fn build_router(
                 sqlx_pool_router::DynPools::new(state.db.clone()),
                 resume_target,
                 body_limit,
+                cfg.onwards.sse_buffer_limit,
             )
             .await
             {
@@ -2404,7 +2465,8 @@ pub async fn build_router(
                     classifier,
                     body_limit,
                     std::time::Duration::from_secs(cfg.cache.classify_deadline_secs),
-                ),
+                )
+                .with_sse_buffer_limit(cfg.onwards.sse_buffer_limit),
                 crate::prompt_cache::cache_middleware,
             ))
         } else {
@@ -2792,8 +2854,8 @@ pub struct BackgroundServices {
     onwards_sender: Option<tokio::sync::watch::Sender<onwards::target::Targets>>,
     #[allow(dead_code)] // Used in sync_onwards_config method
     strict_mode: bool,
-    /// Sender for analytics records (if analytics is enabled)
-    analytics_sender: Option<request_logging::batcher::AnalyticsSender>,
+    /// Durable analytics outbox writer (if analytics is enabled)
+    analytics_writer: Option<request_logging::batcher::AnalyticsOutboxWriter>,
     /// Prefix-chain recorder (workload profiling), when `prefix_chain.enabled`.
     prefix_chain: Option<Arc<crate::prefix_chain::PrefixChainRecorder>>,
     /// Sender for completed-response records consumed by the in-process
@@ -3758,8 +3820,8 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     }
 
     // Start analytics batcher if enabled
-    let analytics_sender = if config.enable_analytics {
-        let (batcher, sender) = request_logging::AnalyticsBatcher::new(dyn_pools.clone(), config.clone(), metrics_recorder);
+    let analytics_writer = if config.enable_analytics {
+        let (batcher, writer) = request_logging::AnalyticsBatcher::new(dyn_pools.clone(), config.clone(), metrics_recorder);
         let batcher = batcher.with_usage_refresh_notify(usage_refresh_notify.clone());
 
         let batcher_shutdown = shutdown_token.clone();
@@ -3768,7 +3830,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
             Ok(())
         });
 
-        Some(sender)
+        Some(writer)
     } else {
         None
     };
@@ -3867,7 +3929,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         zdr_key_cache,
         onwards_sender,
         strict_mode: config.onwards.strict_mode,
-        analytics_sender,
+        analytics_writer,
         prefix_chain,
         requests_writer_sender,
         background_tasks,
@@ -4009,6 +4071,15 @@ impl Application {
             fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
         )
         .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
+        .with_realtime_retention_seconds(
+            config
+                .background_services
+                .batch_daemon
+                .retention
+                .batchless_seconds_by_service_tier
+                .get("priority")
+                .copied(),
+        )
         .with_retained_response_retention_bounds_seconds(
             config
                 .background_services
@@ -4066,19 +4137,13 @@ impl Application {
         // dispatched without it. Two steps that cannot happen on the loopback:
         //   - ZDR decrypt: the stored body is `dwzdr1:` ciphertext, so it is not
         //     parseable JSON and every edge layer chokes before it could act.
-        //   - JIT image signing: the edge normaliser runs `Mode::All`, which does
-        //     not match the `dw-img://` tokens that file ingest stores.
-        // Derive the signing TTL from the daemon's processing timeout so a signed
-        // URL always outlives one full dispatch attempt.
+        //   (`dw-img://` image tokens are deliberately NOT signed here: the loopback's
+        //   image-normaliser layer signs them below the prompt-cache layer, so the
+        //   cache keys on the stable token rather than a per-attempt signed URL.)
         {
-            let processing_timeout = std::time::Duration::from_millis(config.background_services.batch_daemon.processing_timeout_ms);
-            let dispatch_ttl = config.image_normalizer.signing.dispatch_ttl(processing_timeout);
-            let mut dispatch_processor = crate::inference::engine::dispatch_processor::DispatchProcessor::new()
+            let dispatch_processor = crate::inference::engine::dispatch_processor::DispatchProcessor::new()
                 .with_keystore(keystore.clone())
                 .with_streamable_endpoints(config.background_services.batch_daemon.streamable_endpoints.clone());
-            if config.image_normalizer.enabled {
-                dispatch_processor = dispatch_processor.with_image_normalizer(image_normalizer.clone(), dispatch_ttl);
-            }
             if let Err(e) = postgres_daemon.set_processor(Arc::new(dispatch_processor)) {
                 tracing::warn!(error = e, "Dispatch processor was already set; skipping");
             }
@@ -4215,8 +4280,10 @@ impl Application {
         // `outbound_request` middleware, so onwards needs no BodyTransformFn.
         let mut onwards_app_state = onwards::AppState::new(bg_services.onwards_targets.clone())
             .with_response_transform(onwards::create_openai_sanitizer())
+            .with_upstream_rate_limit_message(config.onwards.upstream_rate_limit_message.clone())
             .with_response_id_header("x-fusillade-request-id")
             .with_body_limit(onwards_body_limit)
+            .with_sse_buffer_limit(config.onwards.sse_buffer_limit)
             // The fusillade daemon stamps every request it dispatches (file
             // batches, flex, background) with its batch metadata headers, and
             // `created_at` is always among them, even for batchless rows.
@@ -4264,7 +4331,7 @@ impl Application {
         let router = build_router(
             &mut app_state,
             onwards_router,
-            bg_services.analytics_sender.clone(),
+            bg_services.analytics_writer.clone(),
             bg_services.requests_writer_sender.clone(),
             metrics_recorder,
             bg_services.onwards_targets.strict_mode,

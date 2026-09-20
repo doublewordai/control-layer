@@ -78,6 +78,8 @@ pub struct ContinuationState {
     /// Bound for buffering the request body, set to the same limit onwards
     /// enforces so this layer is never more restrictive than the entry point.
     pub body_limit: usize,
+    /// Pending SSE event bytes, shared with the core proxy's configured limit.
+    pub sse_buffer_limit: usize,
 }
 
 impl ContinuationState {
@@ -91,6 +93,7 @@ impl ContinuationState {
         pools: sqlx_pool_router::DynPools,
         resume_target: Router,
         body_limit: usize,
+        sse_buffer_limit: usize,
     ) -> anyhow::Result<Self> {
         let key_secret = super::provision_global_key(&pools.write()).await?;
         let tokenizer_url = cfg.tokenizer_url.clone().unwrap_or_else(|| cache_tokenizer_url.to_string());
@@ -117,6 +120,7 @@ impl ContinuationState {
             purposes: PurposeResolver::new(pools),
             inflight: Arc::new(InflightLimiter::new(cfg.max_inflight_per_model)),
             body_limit,
+            sse_buffer_limit,
         })
     }
 
@@ -458,7 +462,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         // Which reconstructor this stream gets is a per-model capability lookup;
         // see `accumulate::for_model`.
         let mut acc: Box<dyn StreamAccumulator> = accumulate::for_model(&ctx.model, &state.cfg, &ctx.route);
-        let mut current: LegStream = Box::pin(SseBufferedStream::new(leg_one));
+        let mut current: LegStream = Box::pin(SseBufferedStream::with_limit(leg_one, state.sse_buffer_limit));
         // Is `current` a resume leg (text_completion chunks needing reframing)?
         let mut resuming = false;
         // Which upstream serves the CURRENT leg ("dynamo" / "external"),

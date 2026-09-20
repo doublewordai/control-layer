@@ -1599,6 +1599,7 @@ pub trait Storage: Send + Sync {
         &self,
         request_id: RequestId,
         owner: DaemonId,
+        claimed_at: chrono::DateTime<chrono::Utc>,
         retry_attempt: u32,
         not_before: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<bool>;
@@ -1668,11 +1669,12 @@ pub trait Storage: Send + Sync {
     ///
     ///   * Background realtime: a `processing` row exists (created inline by
     ///     `create_realtime` before the 202 response). UPDATEd to `completed`.
-    ///   * Non-background realtime: no row exists. INSERTed (template + request)
-    ///     directly in `completed` state.
+    ///   * Non-background realtime: no row exists. Persisted directly in retained
+    ///     storage when the backend has a realtime retention policy and an active
+    ///     partition; otherwise inserted as a terminal live request and template.
     ///
-    /// Rows already in a terminal state (rare: duplicate enqueues, late
-    /// completions for flex slip-through) are left alone via `ON CONFLICT`.
+    /// Existing terminal identities are idempotent no-ops; the first terminal
+    /// result wins. Non-2xx responses are persisted in the failed state.
     ///
     /// All work runs in a single transaction so commit overhead amortises
     /// across the batch. An empty input is a no-op.

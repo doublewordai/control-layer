@@ -16,10 +16,12 @@
 //! - [`Mode::All`] — additionally substitute `data:` URIs (the opt-in
 //!   "image privacy" mode).
 //!
-//! The walker also has a third operating mode, [`Mode::TokensOnly`], used
-//! at dispatch time: it only touches values that already look like
-//! `dw-img://...` opaque tokens — swapping them for freshly-signed URLs
-//! without re-running ingest.
+//! Two more modes cover `dw-img://...` opaque tokens (what the flex enqueue
+//! and file-ingest paths store): [`Mode::TokensOnly`] touches only tokens,
+//! and [`Mode::AllAndTokens`] — the edge middleware's mode — touches every
+//! kind, so a daemon loopback gets its tokens swapped for freshly-signed
+//! URLs (without re-running ingest) in the same pass that normalises a
+//! client's URLs and data URIs.
 use serde_json::Value;
 use std::future::Future;
 
@@ -34,9 +36,14 @@ pub enum Mode {
     /// HTTP(S) URLs and `data:` URIs. Used when the calling user has the
     /// per-account opt-in enabled.
     All,
-    /// Only opaque `dw-img://` tokens. Used at dispatch time to swap
-    /// tokens for fresh signed URLs.
+    /// Only opaque `dw-img://` tokens: swap tokens for fresh signed URLs.
     TokensOnly,
+    /// Everything: HTTP(S) URLs, `data:` URIs AND `dw-img://` tokens. The
+    /// edge middleware's mode — a daemon loopback carries the tokens that
+    /// flex enqueue / file ingest stored, and signing them here (below the
+    /// prompt-cache layer) is what keeps the cache identity of an image the
+    /// stable content-addressed token rather than a per-dispatch signed URL.
+    AllAndTokens,
 }
 
 impl Mode {
@@ -45,6 +52,7 @@ impl Mode {
             Mode::HttpOnly => is_http_url(input),
             Mode::All => is_http_url(input) || crate::image_normalizer::data_uri::looks_like_data_uri(input),
             Mode::TokensOnly => ImageToken::looks_like_token(input),
+            Mode::AllAndTokens => Mode::All.applies_to(input) || ImageToken::looks_like_token(input),
         }
     }
 }
@@ -151,11 +159,123 @@ where
     Ok(count)
 }
 
+/// Whether `body` carries at least one image input that `mode` would act on
+/// — the read-only twin of [`substitute_with`], over the same two shapes. Lets
+/// a caller skip work (a caller lookup, say) for the common image-free body.
+pub fn has_inputs(body: &Value, mode: Mode) -> bool {
+    // chat-completions shape: messages[*].content[*].image_url.url
+    let chat = body.get("messages").and_then(Value::as_array).is_some_and(|messages| {
+        messages.iter().any(|msg| {
+            msg.get("content").and_then(Value::as_array).is_some_and(|content| {
+                content.iter().any(|item| {
+                    item.get("type").and_then(Value::as_str) == Some("image_url")
+                        && item
+                            .get("image_url")
+                            .and_then(|o| o.get("url"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|url| mode.applies_to(url))
+                })
+            })
+        })
+    });
+    // responses shape: input[*].content[*].image_url
+    let responses = body.get("input").and_then(Value::as_array).is_some_and(|input| {
+        input.iter().any(|item| {
+            item.get("content").and_then(Value::as_array).is_some_and(|content| {
+                content.iter().any(|part| {
+                    part.get("type").and_then(Value::as_str) == Some("input_image")
+                        && part
+                            .get("image_url")
+                            .and_then(Value::as_str)
+                            .is_some_and(|url| mode.applies_to(url))
+                })
+            })
+        })
+    });
+    chat || responses
+}
+
+/// Every `dw-img://` token in `body`, in document order, over the same two
+/// shapes as [`substitute_with`] — so a caller can authorise them all in one
+/// query before the walk signs them. Strings that merely look like a token but
+/// do not parse are skipped here; the walk itself rejects them as bad input.
+pub fn tokens(body: &Value) -> Vec<ImageToken> {
+    fn push(url: Option<&str>, out: &mut Vec<ImageToken>) {
+        if let Some(url) = url
+            && ImageToken::looks_like_token(url)
+            && let Ok(token) = url.parse::<ImageToken>()
+        {
+            out.push(token);
+        }
+    }
+    let mut out = Vec::new();
+    // chat-completions shape: messages[*].content[*].image_url.url
+    for msg in body.get("messages").and_then(Value::as_array).into_iter().flatten() {
+        for item in msg.get("content").and_then(Value::as_array).into_iter().flatten() {
+            if item.get("type").and_then(Value::as_str) == Some("image_url") {
+                push(item.get("image_url").and_then(|o| o.get("url")).and_then(Value::as_str), &mut out);
+            }
+        }
+    }
+    // responses shape: input[*].content[*].image_url
+    for item in body.get("input").and_then(Value::as_array).into_iter().flatten() {
+        for part in item.get("content").and_then(Value::as_array).into_iter().flatten() {
+            if part.get("type").and_then(Value::as_str) == Some("input_image") {
+                push(part.get("image_url").and_then(Value::as_str), &mut out);
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
     use std::convert::Infallible;
+
+    #[test]
+    fn tokens_collects_every_token_over_both_shapes_and_nothing_else() {
+        let a = ImageToken([1u8; 32]);
+        let b = ImageToken([2u8; 32]);
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "hi"},
+                {"type": "image_url", "image_url": {"url": a.to_dw_img_uri()}},
+                {"type": "image_url", "image_url": {"url": "https://x/a.png"}}
+            ]}],
+            "input": [{"role": "user", "content": [
+                {"type": "input_image", "image_url": b.to_dw_img_uri()},
+                {"type": "input_image", "image_url": "dw-img://not-hex"}
+            ]}]
+        });
+        assert_eq!(tokens(&body), vec![a, b]);
+        assert!(tokens(&json!({"messages": [{"role": "user", "content": "hi"}]})).is_empty());
+    }
+
+    #[test]
+    fn has_inputs_mirrors_the_walker_over_both_shapes() {
+        let chat = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "hi"},
+            {"type": "image_url", "image_url": {"url": "https://x/a.png"}}
+        ]}]});
+        let responses = json!({"input": [{"role": "user", "content": [
+            {"type": "input_image", "image_url": "data:image/png;base64,AAAA"}
+        ]}]});
+        let text_only = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let token_only = json!({"messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "dw-img://0000000000000000000000000000000000000000000000000000000000000000"}}
+        ]}]});
+
+        assert!(has_inputs(&chat, Mode::All));
+        assert!(has_inputs(&responses, Mode::All));
+        assert!(!has_inputs(&text_only, Mode::All));
+        // Mode decides: a token is not an `All` input, but is an `AllAndTokens` one.
+        assert!(!has_inputs(&token_only, Mode::All));
+        assert!(has_inputs(&token_only, Mode::AllAndTokens));
+        // A data URI is not an `HttpOnly` input.
+        assert!(!has_inputs(&responses, Mode::HttpOnly));
+    }
 
     /// Substitution callback that just prefixes the input — easy to assert
     /// against and never errors.
@@ -273,6 +393,33 @@ mod tests {
         // http url untouched in TokensOnly mode
         assert_eq!(content[0]["image_url"]["url"], "https://example.com/x.png");
         assert!(content[1]["image_url"]["url"].as_str().unwrap().starts_with("S:dw-img://"));
+    }
+
+    /// The edge middleware's mode: a daemon loopback carries the tokens that
+    /// enqueue stored alongside whatever a client may echo back, so every kind
+    /// of image input must be handed to the callback in document order.
+    #[tokio::test]
+    async fn all_and_tokens_mode_substitutes_every_kind() {
+        let mut body = json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "image_url", "image_url": { "url": "https://example.com/x.png" } },
+                    { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } },
+                    { "type": "image_url", "image_url": { "url": "dw-img://0000000000000000000000000000000000000000000000000000000000000001" } }
+                ]
+            }]
+        });
+
+        let count = substitute_with(&mut body, Mode::AllAndTokens, |u| prefix_with("S", u))
+            .await
+            .unwrap();
+
+        assert_eq!(count, 3);
+        let content = &body["messages"][0]["content"];
+        assert!(content[0]["image_url"]["url"].as_str().unwrap().starts_with("S:https://"));
+        assert!(content[1]["image_url"]["url"].as_str().unwrap().starts_with("S:data:"));
+        assert!(content[2]["image_url"]["url"].as_str().unwrap().starts_with("S:dw-img://"));
     }
 
     #[tokio::test]

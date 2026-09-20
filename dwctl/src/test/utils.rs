@@ -285,6 +285,7 @@ pub fn create_test_config() -> crate::config::Config {
             default_models: None,
         }],
         model_provisioning: Default::default(),
+        migrations: Default::default(),
         metadata: crate::config::Metadata::default(),
         payment: None,
         auth: crate::config::AuthConfig {
