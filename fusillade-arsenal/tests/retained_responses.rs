@@ -1335,6 +1335,7 @@ async fn generic_persist_and_retry_paths_share_retained_and_fenced_outcomes(pool
             .reschedule_for_retry(
                 RequestId(graph.request_ids[0]),
                 DaemonId(Uuid::new_v4()),
+                chrono::Utc::now(),
                 3,
                 None,
             )
@@ -1358,6 +1359,7 @@ async fn generic_persist_and_retry_paths_share_retained_and_fenced_outcomes(pool
             .reschedule_for_retry(
                 RequestId(graph.request_ids[0]),
                 DaemonId(Uuid::new_v4()),
+                chrono::Utc::now(),
                 4,
                 None,
             )

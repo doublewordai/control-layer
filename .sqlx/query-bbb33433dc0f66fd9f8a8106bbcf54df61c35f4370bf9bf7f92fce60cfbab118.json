@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT window_spend AS \"window_spend!\" FROM api_key_spend_checkpoints WHERE api_key_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "window_spend!",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "bbb33433dc0f66fd9f8a8106bbcf54df61c35f4370bf9bf7f92fce60cfbab118"
+}

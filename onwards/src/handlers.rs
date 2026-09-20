@@ -26,6 +26,7 @@ use axum::{
 use opentelemetry::propagation::{Extractor, Injector, TextMapPropagator};
 use serde_json::map::Entry;
 use tracing::{Instrument, debug, error, instrument, trace, warn};
+use uuid::Uuid;
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
 struct HeaderExtractor<'a>(&'a HeaderMap);
@@ -347,6 +348,10 @@ fn rewrite_body_model(body: axum::body::Bytes, alias: &str) -> axum::body::Bytes
         _ => body,
     }
 }
+/// Stable identity of the API key accepted for this request. This is carried
+/// only in the in-process response extensions and is never sent to the client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AuthenticatedApiKeyId(pub Uuid);
 
 /// Resolve whether W3C trace context headers should be propagated to an
 /// upstream provider. The per-provider `propagate_trace_context` overrides;
@@ -645,11 +650,24 @@ pub async fn target_message_handler<T: HttpClient>(
         );
     }
 
+    let bearer_token = bearer_token.map(str::to_owned);
+    let authenticated_api_key_id = bearer_token
+        .as_deref()
+        .filter(|token| {
+            pool.keys()
+                .is_some_and(|keys| auth::validate_bearer_token(keys, token))
+        })
+        .and_then(|token| state.targets.key_labels.get(token))
+            .and_then(|labels| labels.get("api_key_id").cloned())
+        .and_then(|id| id.parse::<Uuid>().ok());
+
+    let result = async move {
+
     // Evaluate routing rules against key labels (after auth, before rate limiting).
     // Rules on the pool are matched against the authenticated key's labels.
     // Note: routing rules are NOT re-evaluated on the redirect target pool.
     if !pool.routing_rules().is_empty()
-        && let Some(token) = bearer_token
+        && let Some(token) = bearer_token.as_deref()
     {
             let labels = state
                 .targets
@@ -714,6 +732,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // is refused rather than quietly downgraded.
     let serving_resolution: ServingResolution = {
         let (account_id, key_purpose) = bearer_token
+            .as_ref()
             .and_then(|token| state.targets.key_labels.get(token))
             .map(|labels| {
                 (
@@ -831,7 +850,7 @@ pub async fn target_message_handler<T: HttpClient>(
         }
 
         // Check per-key rate limits if bearer token is present
-        if let Some(token) = bearer_token
+        if let Some(token) = bearer_token.as_deref()
             && let Some(limiter) = state.targets.key_rate_limiters.get(token)
             && limiter.check().is_err()
         {
@@ -860,7 +879,7 @@ pub async fn target_message_handler<T: HttpClient>(
         };
 
         // Acquire per-key concurrency permit
-        let key_guard = if let Some(token) = bearer_token {
+        let key_guard = if let Some(token) = bearer_token.as_deref() {
             if let Some(limiter) = state.targets.key_concurrency_limiters.get(token) {
                 match limiter.try_acquire() {
                     Some(guard) => Some(guard),
@@ -1924,12 +1943,10 @@ pub async fn target_message_handler<T: HttpClient>(
         if let Some(ref header_name) = state.response_id_header
             && crate::response_id::path_supports_id_override(&path_and_query)
             && (200..300).contains(&status)
-        {
-            if let Some(override_id) =
+            && let Some(override_id) =
                 crate::response_id::extract_override_id(&original_headers, header_name)
-            {
-                crate::response_id::patch_response_body_id(&mut response, override_id).await;
-            }
+        {
+            crate::response_id::patch_response_body_id(&mut response, override_id).await;
         }
 
         // Add custom response headers
@@ -1966,6 +1983,11 @@ pub async fn target_message_handler<T: HttpClient>(
         response
             .extensions_mut()
             .insert::<ServingClassOutcome>(serving_resolution.outcome());
+        if let Some(api_key_id) = authenticated_api_key_id {
+            response
+                .extensions_mut()
+                .insert(AuthenticatedApiKeyId(api_key_id));
+        }
 
         // Attach the connection guard and inflight guard to the response body so both
         // are decremented when the body stream completes, not when the handler returns.
@@ -2103,15 +2125,16 @@ pub async fn target_message_handler<T: HttpClient>(
         Err(err)
     }
     }
+    .await;
+
+    result.map_err(|error| error.with_authenticated_api_key_id(authenticated_api_key_id))
+    }
     .instrument(span)
     .await
 }
 
 #[instrument(skip(state, req))]
-pub async fn models<T: HttpClient>(
-    State(state): State<AppState<T>>,
-    req: Request,
-) -> impl IntoResponse {
+pub async fn models<T: HttpClient>(State(state): State<AppState<T>>, req: Request) -> Response {
     // Extract bearer token from Authorization header
     let bearer_token = req
         .headers()
@@ -2146,8 +2169,21 @@ pub async fn models<T: HttpClient>(
         .map(|entry| entry.key().clone())
         .collect();
 
-    // Create filtered response
-    Json(ListModelResponse::from_model_names(&accessible_models))
+    let authenticated_api_key_id = bearer_token
+        .and_then(|token| state.targets.key_labels.get(token))
+        .and_then(|labels| labels.get("api_key_id").cloned())
+        .and_then(|id| id.parse::<Uuid>().ok());
+
+    // Create filtered response and retain the authenticated identity for
+    // in-process analytics. Response extensions are never sent to the client.
+    let mut response =
+        Json(ListModelResponse::from_model_names(&accessible_models)).into_response();
+    if let Some(api_key_id) = authenticated_api_key_id {
+        response
+            .extensions_mut()
+            .insert(AuthenticatedApiKeyId(api_key_id));
+    }
+    response
 }
 
 #[cfg(test)]

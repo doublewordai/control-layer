@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO prompt_cache_entries\n               (principal_id, virtual_model, tokenizer_version, prefix_hash,\n                cumulative_token_count, ttl_tier, created_at, expires_at)\n             VALUES ($1,'m','tok-v1',$2,4096,'5m',$3,$4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "37edb8dd3763241c753fff947aa88ab727290b133ba72526dba1a86f00802eb0"
+}

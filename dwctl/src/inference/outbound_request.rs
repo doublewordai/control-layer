@@ -434,7 +434,6 @@ fn json_body_response(mut parts: axum::http::response::Parts, status: StatusCode
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::Request as HttpRequest;
     use std::convert::Infallible;
     use std::time::Duration;
 

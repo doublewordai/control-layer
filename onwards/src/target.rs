@@ -1614,11 +1614,11 @@ impl Targets {
 
                         // Remove deleted targets
                         for key in current_target_keys {
-                            if !new_targets.targets.contains_key(&key) {
-                                if let Some((_, removed)) = targets.remove(&key) {
-                                    for (_, pool) in removed.iter() {
-                                        pool.retire_aimd();
-                                    }
+                            if !new_targets.targets.contains_key(&key)
+                                && let Some((_, removed)) = targets.remove(&key)
+                            {
+                                for (_, pool) in removed.iter() {
+                                    pool.retire_aimd();
                                 }
                             }
                         }

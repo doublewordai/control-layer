@@ -78,6 +78,12 @@ pub enum PaymentError {
     /// stop redelivering an event this plane can never process.
     #[error("Payment session references a user unknown to this plane: {0}")]
     UnknownReference(String),
+
+    /// The payment method saved by a verification session has already been
+    /// used to verify a different account. One instrument verifies one
+    /// account; it can still pay for top-ups on any number of them.
+    #[error("Payment method has already verified another account")]
+    InstrumentAlreadyUsed,
 }
 
 impl From<PaymentError> for StatusCode {
@@ -92,6 +98,7 @@ impl From<PaymentError> for StatusCode {
             // cannot process would be a lie to the caller.
             PaymentError::UnknownReference(_) => StatusCode::NOT_FOUND,
             PaymentError::AutoTopupDeclined(_) => StatusCode::PAYMENT_REQUIRED,
+            PaymentError::InstrumentAlreadyUsed => StatusCode::CONFLICT,
             PaymentError::ProviderApi(_) | PaymentError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

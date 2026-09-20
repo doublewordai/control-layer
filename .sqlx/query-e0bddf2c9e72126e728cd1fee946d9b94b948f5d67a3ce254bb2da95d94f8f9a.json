@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT source_id, fusillade_request_id FROM credits_transactions WHERE fusillade_request_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "source_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "fusillade_request_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "e0bddf2c9e72126e728cd1fee946d9b94b948f5d67a3ce254bb2da95d94f8f9a"
+}

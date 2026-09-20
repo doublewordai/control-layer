@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE sync_entries SET file_id = $2, template_count = 2 WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "250cbf95bf737de463bab8f602b095a9b4168f299aa7bc2de53502c1825bd69c"
+}

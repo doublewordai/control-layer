@@ -65,6 +65,7 @@ pub mod capacity_reservations;
 pub mod connections;
 pub mod credits;
 pub mod deployments;
+pub mod feature_flags;
 pub mod groups;
 pub mod inference_endpoints;
 pub mod model_provisioning;

@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO model_cache_tariffs\n                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens, valid_until)\n               VALUES ($1, 1.25, 2.0, 2.5, $2, CASE WHEN $3 THEN now() - interval '1 hour' ELSE NULL END)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a030498be47a6e7646b5274e497709557c72f2a87ddb3f39a793de8da1b13206"
+}

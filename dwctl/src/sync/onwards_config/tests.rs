@@ -22,7 +22,11 @@ fn test_balance_eligibility_reads_read_model_and_filters_deleted_users() {
 
     // Key deletion is not implied by user deletion, so the deleted-user guard
     // on the balance arm is load-bearing in both queries.
-    assert_eq!(source.matches("u.is_deleted = false AND EXISTS").count(), 2);
+    assert_eq!(source.matches("u.is_deleted = false AND (EXISTS (").count(), 2);
+    // Bulk sync must expose the flag lookup to the planner, rather than call
+    // the single-account function for every model/key pair.
+    assert_eq!(source.matches("FROM user_feature_flags f").count(), 2);
+    assert!(!source.contains("user_has_feature("));
 }
 
 // Helper function to create a test target
@@ -569,6 +573,10 @@ async fn test_cache_shape_zero_data_retention_label_reflects_owner(pool: sqlx::P
         "ZDR-enabled owner's key must be labelled true"
     );
     assert_eq!(key_a_labels.get("purpose"), Some(&"realtime".to_string()));
+    assert_eq!(
+        key_a_labels.get("api_key_id"),
+        Some(&"20000000-0000-0000-0000-0000000000a1".to_string())
+    );
 
     let key_b_labels = targets.key_labels.get(KEY_B_SECRET).expect("user B's key should carry labels");
     assert_eq!(
@@ -640,6 +648,103 @@ async fn test_balance_change_toggles_paid_access_on_reload(pool: sqlx::PgPool) {
         pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_A_SECRET),
         "restored user regains paid-model access"
     );
+}
+
+// Contracted accounts retain paid access, but disabling the flag restores enforcement.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
+async fn test_allow_negative_balance_toggles_paid_access(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+
+    let user_a: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
+    let tiers = RateLimitTiersConfig::default();
+    // Also meter a composite so both sync queries are exercised.
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id, name, input_price_per_token, output_price_per_token) SELECT id, 'contract-test', 1, 1 FROM deployed_models WHERE alias = 'composite-priority'")
+        .execute(&pool).await.unwrap();
+    sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1")
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
+    listener.listen("auth_config_changed").await.unwrap();
+    for state in [None, Some(true), Some(false), Some(true), None] {
+        let enabled = state.unwrap_or(false);
+        if let Some(value) = state {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(user_a).bind(value).execute(&pool).await.unwrap();
+        } else {
+            sqlx::query("DELETE FROM user_feature_flags WHERE user_id = $1")
+                .bind(user_a)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let notification = timeout(Duration::from_secs(5), listener.recv()).await.unwrap().unwrap();
+        assert!(notification.payload().starts_with("user_feature_flags:"));
+        let mut conn = pool.acquire().await.unwrap();
+        let keys = ApiKeys::new(&mut conn)
+            .get_api_keys_for_deployment_with_sufficient_credit("40000000-0000-0000-0000-000000000003".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(keys.iter().any(|key| key.secret == KEY_A_SECRET), enabled);
+        let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+        for alias in ["metered-public", "composite-priority"] {
+            assert_eq!(
+                pool_has_key(targets.targets.get(alias).unwrap().value(), KEY_A_SECRET),
+                enabled,
+                "{alias}: flag={enabled}"
+            );
+            assert!(!pool_has_key(targets.targets.get(alias).unwrap().value(), KEY_B_SECRET));
+        }
+    }
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
+async fn test_allow_negative_balance_preserves_access_restrictions(pool: sqlx::PgPool) {
+    let tiers = RateLimitTiersConfig::default();
+    sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) SELECT id, 'ALLOW_NEGATIVE_BALANCE', true FROM users WHERE username = 'cache_user_b'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_B_SECRET));
+    assert!(!pool_has_key(targets.targets.get("regular-private").unwrap().value(), KEY_B_SECRET));
+
+    sqlx::query("UPDATE api_keys SET spend_limit = 1 WHERE secret = $1")
+        .bind(KEY_B_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend) SELECT id, 1, 1 FROM api_keys WHERE secret = $1",
+    )
+    .bind(KEY_B_SECRET)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(!pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_B_SECRET));
+
+    sqlx::query("UPDATE api_keys SET spend_limit = NULL, is_deleted = true WHERE secret = $1")
+        .bind(KEY_B_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(!pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_B_SECRET));
+
+    sqlx::query("UPDATE api_keys SET is_deleted = false WHERE secret = $1")
+        .bind(KEY_B_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET is_deleted = true WHERE username = 'cache_user_b'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(!pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_B_SECRET));
 }
 
 /// Spending-cap gate: an exhausted scope loses paid-model access as a unit
@@ -2160,4 +2265,36 @@ async fn aimd_and_first_token_deadline_survive_database_sync(pool: sqlx::PgPool)
         standard.value().default_pool().fallback().unwrap().first_token_timeout_ms,
         Some(300)
     );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
+async fn test_deleted_keys_excluded_from_deployment_lookup(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+
+    sqlx::query("INSERT INTO api_keys (name, secret, user_id, created_by, purpose) VALUES ('revoked-system', 'sk-revoked-system', $1, $1, 'realtime')")
+        .bind(uuid::Uuid::nil()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) SELECT id, 'ALLOW_NEGATIVE_BALANCE', true FROM users")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE user_balance_checkpoints SET balance = -100")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Exercise the private-group, public-group, and unconditional system arms.
+    for deleted in [false, true] {
+        sqlx::query("UPDATE api_keys SET is_deleted = $1")
+            .bind(deleted)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for id in ["40000000-0000-0000-0000-000000000002", "40000000-0000-0000-0000-000000000003"] {
+            let mut conn = pool.acquire().await.unwrap();
+            let keys = ApiKeys::new(&mut conn)
+                .get_api_keys_for_deployment_with_sufficient_credit(id.parse().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(keys.is_empty(), deleted, "deployment {id}: deleted={deleted}");
+        }
+    }
 }
