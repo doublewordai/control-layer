@@ -1264,6 +1264,7 @@ mod tests {
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels,
+            accounts: Default::default(),
             strict_mode: true,
             http_pool_config: None,
         };
