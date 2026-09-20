@@ -918,67 +918,6 @@ pub async fn target_message_handler<T: HttpClient>(
     // distinction that matters for backpressure is gone.
     let mut last_upstream_status: Option<u16> = None;
 
-    // Iterate through providers (with fallback support).
-    // select_iter() uses weighted least connections: picks the provider with the
-    // lowest active_connections/weight ratio, skipping providers at their
-    // concurrency limit. The returned guard tracks the active connection.
-    let mut any_attempted = false;
-    let mut attempt_number: u32 = 0;
-    let mut total_backoff_ms: u64 = 0;
-    let pool_max_attempts = pool.fallback_max_attempts();
-
-    // First-token failover: bound how long a streamed attempt may go without
-    // producing its first frame before it is abandoned for another provider.
-    // Armed only while a *different* provider is left to take over (the pool
-    // has more than one) and never on the final attempt (checked per attempt
-    // below), so it can reroute a stalled request but never fail one that
-    // would otherwise have succeeded. Non-streaming requests are exempt: their
-    // headers only arrive once the whole completion is done, so a deadline
-    // would cut off legitimately long answers. So is traffic carrying the
-    // configured exempt header (e.g. batch dispatch, which runs its own retries).
-    // Realtime traffic is everything the batch dispatcher did not stamp with
-    // the exempt header. Only realtime gets the first-token deadline, AIMD
-    // observation and the realtime-only fallback statuses: dispatched traffic
-    // tolerates latency and runs its own retries.
-    let is_realtime = !state
-        .first_token_timeout_exempt_header
-        .as_deref()
-        .is_some_and(|header| original_headers.contains_key(header));
-    let first_token_timeout = pool
-        .fallback()
-        .filter(|f| f.enabled)
-        .and_then(|f| {
-            f.first_token_timeout_ms
-                .map(std::time::Duration::from_millis)
-                .or(state.first_token_timeout)
-        })
-        .filter(|timeout| {
-            !timeout.is_zero() && pool.len() > 1 && is_realtime && requests_stream(&body_bytes)
-        });
-    // A status triggers failover when the pool lists it, or when it is one of
-    // the pool's realtime-only fallback statuses, this request is realtime and
-    // another provider is left to try. A realtime-only status on the final
-    // attempt (or in a single-provider pool) is returned to the caller as the
-    // upstream sent it, exactly as without the setting, rather than collapsing
-    // into a generic gateway error.
-    let realtime_failover_attempts = if pool.fallback().is_some_and(|f| f.with_replacement) {
-        pool_max_attempts
-    } else {
-        pool_max_attempts.min(pool.len())
-    };
-    let fails_over_on = |status: u16, attempt_number: u32| {
-        pool.should_fallback_on_status(status)
-            || (is_realtime
-                && pool.len() > 1
-                && (attempt_number as usize) < realtime_failover_attempts
-                && pool.should_fallback_on_realtime_status(status))
-    };
-
-    // Unsupported traffic keeps ordinary routing and contributes no observations.
-    let aimd_eligible = pool.aimd_enabled()
-        && state.targets.strict_mode
-        && requests_stream(&body_bytes)
-        && is_realtime;
     // A self-hosted-only account never reaches an external member: the
     // composite's eligible set is narrowed to its non-external providers for
     // this request, whatever the alias's own failover list says, BEFORE the
@@ -1007,6 +946,73 @@ pub async fn target_message_handler<T: HttpClient>(
         .increment(ineligible_members.len() as u64);
     }
     let no_eligible_member = !pool.is_empty() && ineligible_members.len() == pool.len();
+    let eligible_member_count = pool.len() - ineligible_members.len();
+
+    // Iterate through providers (with fallback support).
+    // select_iter() uses weighted least connections: picks the provider with the
+    // lowest active_connections/weight ratio, skipping providers at their
+    // concurrency limit. The returned guard tracks the active connection.
+    let mut any_attempted = false;
+    let mut attempt_number: u32 = 0;
+    let mut total_backoff_ms: u64 = 0;
+    let pool_max_attempts = if pool.fallback().is_some_and(|f| f.with_replacement) {
+        pool.fallback_max_attempts()
+    } else {
+        pool.fallback_max_attempts().min(eligible_member_count)
+    };
+
+    // First-token failover: bound how long a streamed attempt may go without
+    // producing its first frame before it is abandoned for another provider.
+    // Armed only while a *different* provider is left to take over (the pool
+    // has more than one) and never on the final attempt (checked per attempt
+    // below), so it can reroute a stalled request but never fail one that
+    // would otherwise have succeeded. Non-streaming requests are exempt: their
+    // headers only arrive once the whole completion is done, so a deadline
+    // would cut off legitimately long answers. So is traffic carrying the
+    // configured exempt header (e.g. batch dispatch, which runs its own retries).
+    // Realtime traffic is everything the batch dispatcher did not stamp with
+    // the exempt header. Only realtime gets the first-token deadline, AIMD
+    // observation and the realtime-only fallback statuses: dispatched traffic
+    // tolerates latency and runs its own retries.
+    let is_realtime = !state
+        .first_token_timeout_exempt_header
+        .as_deref()
+        .is_some_and(|header| original_headers.contains_key(header));
+    let first_token_timeout = pool
+        .fallback()
+        .filter(|f| f.enabled)
+        .and_then(|f| {
+            f.first_token_timeout_ms
+                .map(std::time::Duration::from_millis)
+                .or(state.first_token_timeout)
+        })
+        .filter(|timeout| {
+            !timeout.is_zero() && eligible_member_count > 1 && is_realtime && requests_stream(&body_bytes)
+        });
+    // A status triggers failover when the pool lists it, or when it is one of
+    // the pool's realtime-only fallback statuses, this request is realtime and
+    // another provider is left to try. A realtime-only status on the final
+    // attempt (or in a single-provider pool) is returned to the caller as the
+    // upstream sent it, exactly as without the setting, rather than collapsing
+    // into a generic gateway error.
+    let realtime_failover_attempts = if pool.fallback().is_some_and(|f| f.with_replacement) {
+        pool_max_attempts
+    } else {
+        pool_max_attempts.min(eligible_member_count)
+    };
+    let fails_over_on = |status: u16, attempt_number: u32| {
+        pool.should_fallback_on_status(status)
+            || (is_realtime
+                && eligible_member_count > 1
+                && (attempt_number as usize) < realtime_failover_attempts
+                && pool.should_fallback_on_realtime_status(status))
+    };
+
+    // Unsupported traffic keeps ordinary routing and contributes no observations.
+    let aimd_eligible = pool.aimd_enabled()
+        && state.targets.strict_mode
+        && requests_stream(&body_bytes)
+        && is_realtime;
     for (member_idx, target, connection_guard) in pool
         .select_iter_aimd(aimd_eligible, &model_name, resolved_pool_name.unwrap_or("default"))
         .excluding_members(ineligible_members.iter().copied())
