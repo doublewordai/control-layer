@@ -295,9 +295,9 @@ struct FileStreamConfig {
     /// Optional DB pool for `image_access` bookkeeping. `None` disables
     /// the bookkeeping (the substitution itself still runs).
     access_pool: Option<sqlx::PgPool>,
-    /// Who to attribute `image_access` rows to: the acting human, plus the
-    /// owning org when the upload is in org context (so org members can view
-    /// it, but personal uploads stay private to the user).
+    /// Who to attribute `image_access` rows to: the principal — the
+    /// organization when the upload is in org context (so org members can use
+    /// the image), else the person (personal uploads stay private).
     access_attribution: Option<crate::api::handlers::images::ImageAttribution>,
 }
 
@@ -348,6 +348,11 @@ enum BatchNormalizeError {
     /// The content store itself failed (GCS unreachable, IAM error).
     /// Surface as "service unavailable".
     StoreFailed(String),
+    /// The image-access database (the grant written for every ingested image,
+    /// which later authorises signing its token) could not be reached. The
+    /// content store already succeeded, so this names the right dependency.
+    /// Retryable.
+    AccessUnavailable,
 }
 
 async fn normalize_template_body_in_place(
@@ -382,18 +387,29 @@ async fn normalize_template_body_in_place(
             match normalizer.ingest(input).await {
                 Ok(ingested) => {
                     if let (Some(pool), Some(attribution)) = (access_pool, access_attribution) {
-                        // Batch ingest is already async (file upload latency dominates),
-                        // so we AWAIT the bookkeeping write rather than fire-and-forget —
-                        // the user's later "view what I submitted" lookup depends on it.
-                        // Records real (mime, bytes_len) captured from the ingest result.
-                        crate::api::handlers::images::record_image_access(
+                        // AWAITED and REQUIRED, not fire-and-forget: this row is what
+                        // authorises signing the token when the daemon dispatches the
+                        // batch (and the user's later "view what I submitted" lookup),
+                        // so a silently-failed write would refuse the customer's own
+                        // image. Fail the upload (retryable) instead. Records real
+                        // (mime, bytes_len) captured from the ingest result.
+                        if let Err(e) = crate::api::handlers::images::try_record_image_access(
                             &pool,
                             attribution,
                             ingested.token,
                             &ingested.mime,
                             ingested.bytes_len,
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(error = %e, "image_access bookkeeping failed on file upload");
+                            if let Ok(mut g) = err_cell.lock()
+                                && g.is_none()
+                            {
+                                *g = Some(BatchNormalizeError::AccessUnavailable);
+                            }
+                            return Err(());
+                        }
                     }
                     Ok::<String, ()>(ingested.token.to_dw_img_uri())
                 }
@@ -407,6 +423,12 @@ async fn normalize_template_body_in_place(
                         crate::image_normalizer::NormalizeError::NotFound => {
                             BatchNormalizeError::StoreFailed("image token not found in store".to_string())
                         }
+                        // Ingest never authorises tokens (it only produces them), so this
+                        // variant cannot arise here; map it defensively as bad input.
+                        crate::image_normalizer::NormalizeError::Forbidden => {
+                            BatchNormalizeError::BadInput("image token is not accessible to this caller".to_string())
+                        }
+                        crate::image_normalizer::NormalizeError::AccessUnavailable => BatchNormalizeError::AccessUnavailable,
                     };
                     if let Ok(mut g) = err_cell.lock()
                         && g.is_none()
@@ -469,6 +491,9 @@ enum FileUploadError {
     /// Image normaliser content-store backend failed (GCS unreachable,
     /// IAM error). 502/503 territory; not the user's fault.
     ImageStoreFailed { line: u64, message: String },
+    /// The image-access database was unreachable while recording the grant
+    /// for an ingested image. Retryable; distinct from the content store.
+    ImageAccessUnavailable { line: u64 },
     /// A referenced image's origin returned a non-408/429 4xx (forbidden, gated,
     /// missing; 408/429 are transient and surface as `ImageTransient`). The file
     /// references an image the user cannot grant us access to — their bad input,
@@ -498,6 +523,7 @@ fn map_batch_normalize_error(e: BatchNormalizeError, line: u64) -> FileUploadErr
         BatchNormalizeError::FetchFailed(message) => FileUploadError::ImageFetchFailed { line, message },
         BatchNormalizeError::Transient(message) => FileUploadError::ImageTransient { line, message },
         BatchNormalizeError::StoreFailed(message) => FileUploadError::ImageStoreFailed { line, message },
+        BatchNormalizeError::AccessUnavailable => FileUploadError::ImageAccessUnavailable { line },
     }
 }
 
@@ -562,6 +588,9 @@ impl FileUploadError {
             },
             FileUploadError::ImageStoreFailed { line, message } => Error::ServiceUnavailable {
                 message: format!("Line {}: image content store temporarily unavailable: {}", line, message),
+            },
+            FileUploadError::ImageAccessUnavailable { line } => Error::ServiceUnavailable {
+                message: format!("Line {}: image access store temporarily unavailable, please retry", line),
             },
             FileUploadError::ImageUnfetchable { line, message } => Error::UnprocessableEntity {
                 message: format!(
@@ -1163,8 +1192,16 @@ pub async fn upload_file<P: PoolProvider>(
         // uploads, the owning org — so org members can view org-key images
         // while a personal upload stays private to the user. This is distinct
         // from file ownership above, which is credited to the org.
+        // The principal, exactly as an API key resolves: the organization when
+        // acting in one, else the person. A batch created from this file under
+        // the same principal (any member acting in the org, or the person)
+        // dispatches with a hidden key carrying that principal, so its token
+        // authorisation matches. Known limitation, accepted as rare: a platform
+        // manager creating a batch from a file uploaded under a DIFFERENT
+        // principal dispatches under their own, and each image line then fails
+        // with `image_token_forbidden`.
         access_attribution: Some(crate::api::handlers::images::ImageAttribution {
-            user_id: current_user.id,
+            user_id: current_user.active_organization.unwrap_or(current_user.id),
             organization_id: current_user.active_organization,
         }),
     };
@@ -1919,7 +1956,9 @@ pub async fn delete_file<P: PoolProvider>(
         });
     }
 
-    // Perform the deletion (hard delete - cascades to batches and requests)
+    // Soft-delete the file: cancels non-terminal batches and unlinks them
+    // (file_id = NULL), NULLs output_file_id/error_file_id, and marks the file
+    // deleted (retained for audit). Existing batch results survive file deletion.
     state
         .request_manager
         .delete_file(fusillade::FileId(file_id))

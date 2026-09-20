@@ -33,6 +33,10 @@ pub struct Config {
     #[arg(long, default_value = "onwards")]
     pub metrics_prefix: String,
 
+    /// Maximum pending bytes of an unfinished SSE event (complete events are forwarded first).
+    #[arg(long, env = "ONWARDS_SSE_BUFFER_LIMIT", default_value_t = crate::sse::DEFAULT_SSE_BUFFER_LIMIT)]
+    pub sse_buffer_limit: usize,
+
     /// Seconds to continue serving after readiness fails, before closing admission.
     #[arg(long, env = "ONWARDS_SHUTDOWN_DELAY_SECS", default_value_t = 5)]
     pub shutdown_delay_secs: u64,

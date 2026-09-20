@@ -1,37 +1,30 @@
-//! Analytics batching system for efficient database writes.
+//! Durable analytics outbox writer and batched projector.
 //!
-//! This module provides [`AnalyticsBatcher`] which accumulates analytics records
-//! and writes them to the database in batches, significantly reducing per-request
-//! database overhead.
+//! Completed captures are inserted into PostgreSQL immediately. [`AnalyticsBatcher`]
+//! then enriches and projects already-durable rows in batches.
 //!
 //! # Architecture
 //!
 //! ```text
-//! Request → AnalyticsHandler (extract only) → Channel → AnalyticsBatcher
-//!                                                            ↓
-//!                                                 [Accumulate in buffer]
-//!                                                            ↓
-//!                                              [Flush immediately (write-through)]
-//!                                                            ↓
-//!                                              Phase 1: Batch enrich
-//!                                                - Token → user_id lookup
-//!                                                - Model → pricing lookup
-//!                                                            ↓
-//!                                              Phase 2: Batch write (transaction)
+//! Request → AnalyticsHandler → INSERT analytics_outbox
+//!                                      ↓
+//!                              claim + project (transaction)
+//!                                - Key ID → user lookup
+//!                                - Model → pricing lookup
 //!                                                - INSERT http_analytics
 //!                                                - INSERT credit_transactions
-//!                                                            ↓
-//!                                              Phase 3: Record metrics
+//!                                                - DELETE analytics_outbox
 //! ```
 //!
 //! # Key Design Decisions
 //!
-//! - **All DB work in batcher**: The handler sends unenriched `RawAnalyticsRecord`s.
-//!   Enrichment (user lookup, pricing lookup) happens in the batcher via batch queries.
-//! - **Transactional writes**: Analytics and credit inserts happen in a single transaction.
-//!   Either both succeed or both roll back.
-//! - **Batch enrichment**: User and pricing lookups are batched using `IN` clauses,
-//!   reducing from O(N) queries to O(1) per batch.
+//! - **Durable first hand-off**: The handler writes an unenriched, content-free
+//!   `RawAnalyticsRecord` directly to PostgreSQL. Bearer tokens are excluded.
+//!   The projector also accepts the enriched payload written by release 11.12.0
+//!   so rolling upgrades can drain rows created by either version.
+//! - **Batch enrichment**: Key and pricing lookups happen only after the row is durable.
+//! - **Transactional projection**: Analytics, credit inserts and outbox deletion happen in
+//!   a single transaction. Either all succeed or the durable row remains for retry.
 
 use crate::config::{Config, ONWARDS_CONFIG_CHANGED_CHANNEL};
 
@@ -39,28 +32,28 @@ use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::metrics::MetricsRecorder;
 use crate::metrics::errors::component::ANALYTICS_BATCHER;
 use crate::pricing::{
-    CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, find_best_tariff, list_price, resolve_cache_multipliers,
+    CacheTariffRow, ModelInfo, TariffInfo, TokenCounts, charged_cost, clamp_implicit_read_multiplier, find_best_tariff, list_price,
+    resolve_cache_multipliers,
 };
 use crate::request_logging::serializers::{HttpAnalyticsRow, RequestParams};
 use chrono::{DateTime, Utc};
 use metrics::{counter, histogram};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
+use serde::{Deserialize, Serialize};
+use sqlx::Row;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, debug, error, info, info_span, trace, warn};
+use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
-/// Channel buffer size - how many records can be queued before backpressure
-const CHANNEL_BUFFER_SIZE: usize = 10_000;
-
-/// Raw analytics record sent through the channel (unenriched).
+/// Raw analytics record durably written to the outbox before enrichment.
 ///
 /// This contains only data that can be extracted from the request/response
 /// without any database lookups. Enrichment happens in the batcher.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawAnalyticsRecord {
     // === Core metrics (from request/response) ===
     pub instance_id: Uuid,
@@ -106,6 +99,10 @@ pub struct RawAnalyticsRecord {
     /// Observational: distinct from `cache_read_input_tokens`, which is dwctl's cache layer
     /// and is what gets priced. See `serializers::extract_engine_cached_tokens`.
     pub engine_cached_tokens: Option<i64>,
+    /// Provenance of the billed cache read: "module" (dwctl's classifier) or "engine"
+    /// (upstream hit passed through as an implicit discount). `None` when the billed read
+    /// is zero. See `serializers::extract_cache_read_source`.
+    pub cache_read_source: Option<String>,
     /// Content-free request parameters (stream, max_tokens, sampling, message and tool
     /// counts). See `serializers::RequestParams`.
     pub request_params: RequestParams,
@@ -115,9 +112,9 @@ pub struct RawAnalyticsRecord {
     /// extension) — per-component attribution for composite models.
     pub served_by: Option<String>,
 
-    // === Auth (unresolved - just the token) ===
-    /// The bearer token from the Authorization header (not yet resolved to user_id)
-    pub bearer_token: Option<String>,
+    // === Auth ===
+    /// Stable key identity attached by Onwards after successful authentication.
+    pub api_key_id: Option<Uuid>,
 
     // === Fusillade batch metadata (from headers) ===
     pub fusillade_batch_id: Option<Uuid>,
@@ -137,7 +134,7 @@ pub struct RawAnalyticsRecord {
 }
 
 /// Enriched data resolved during batch processing
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct EnrichedRecord {
     raw: RawAnalyticsRecord,
     user_id: Option<Uuid>,
@@ -169,7 +166,7 @@ struct EnrichedRecord {
     cap_scope_root: Option<Uuid>,
 }
 
-/// Per-bearer-token lookup result used during enrichment.
+/// Per-key lookup result used during enrichment.
 struct KeyLookup {
     user_id: Uuid,
     api_key_id: Uuid,
@@ -203,16 +200,65 @@ fn compute_list_price(raw: &RawAnalyticsRecord, input_price: Option<Decimal>, ou
     list_price(raw.prompt_tokens, raw.completion_tokens, input_price, output_price)
 }
 
-/// Sender handle for submitting analytics records to the batcher
-pub type AnalyticsSender = mpsc::Sender<RawAnalyticsRecord>;
+/// Direct writer for the durable analytics handoff. Each completed capture is
+/// inserted immediately; enrichment and final writes remain batched later.
+#[derive(Clone)]
+pub struct AnalyticsOutboxWriter {
+    destination: AnalyticsOutboxDestination,
+}
 
-/// Analytics batcher that accumulates records and writes them in batches.
-///
-/// This significantly reduces database overhead by:
-/// 1. Batching enrichment queries (user lookup, pricing lookup)
-/// 2. Batching INSERT operations (analytics, credits)
-/// 3. Using a single transaction for consistency
-/// 4. Retrying failed batches with exponential backoff
+#[derive(Clone)]
+enum AnalyticsOutboxDestination {
+    Database {
+        pool: sqlx_pool_router::DynPools,
+        projector_notify: Arc<Notify>,
+    },
+    #[cfg(test)]
+    Channel(tokio::sync::mpsc::Sender<RawAnalyticsRecord>),
+}
+
+impl AnalyticsOutboxWriter {
+    pub async fn publish(&self, record: RawAnalyticsRecord) -> anyhow::Result<()> {
+        #[cfg(test)]
+        if let AnalyticsOutboxDestination::Channel(sender) = &self.destination {
+            sender.send(record).await?;
+            return Ok(());
+        }
+
+        let (pool, projector_notify) = match &self.destination {
+            AnalyticsOutboxDestination::Database { pool, projector_notify } => (pool, projector_notify),
+            #[cfg(test)]
+            AnalyticsOutboxDestination::Channel(_) => unreachable!("test channel is handled above"),
+        };
+        let payload = serde_json::to_value(&record)?;
+        sqlx::query(
+            r#"
+            INSERT INTO analytics_outbox (instance_id, correlation_id, payload)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (instance_id, correlation_id)
+            DO UPDATE SET payload = EXCLUDED.payload
+            "#,
+        )
+        .bind(record.instance_id)
+        .bind(record.correlation_id)
+        .bind(payload)
+        .execute(&pool.write())
+        .await?;
+
+        counter!("dwctl_analytics_outbox_published_total").increment(1);
+        projector_notify.notify_one();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(sender: tokio::sync::mpsc::Sender<RawAnalyticsRecord>) -> Self {
+        Self {
+            destination: AnalyticsOutboxDestination::Channel(sender),
+        }
+    }
+}
+
+/// Background projector for already-durable analytics rows.
 pub struct AnalyticsBatcher<M = crate::metrics::GenAiMetrics>
 where
     M: MetricsRecorder + Clone + Send + Sync + 'static,
@@ -220,10 +266,8 @@ where
     /// Live provider (not a pinned pool): survives runtime pool swaps.
     pool: sqlx_pool_router::DynPools,
     metrics_recorder: Option<M>,
-    receiver: mpsc::Receiver<RawAnalyticsRecord>,
     batch_size: usize,
-    max_retries: u32,
-    retry_base_delay: std::time::Duration,
+    projector_notify: Arc<Notify>,
     /// In-process wake signal for the usage-refresh daemon. Nudged after every
     /// successful batch write so the daemon folds the just-written rows into
     /// `user_model_usage_daily`. `None` disables the nudge (tests, refresh daemon off).
@@ -234,7 +278,7 @@ impl<M> AnalyticsBatcher<M>
 where
     M: MetricsRecorder + Clone + Send + Sync + 'static,
 {
-    /// Creates a new analytics batcher and returns the batcher along with a sender.
+    /// Creates the durable writer and its background projector.
     ///
     /// # Arguments
     ///
@@ -244,27 +288,26 @@ where
     ///
     /// # Returns
     ///
-    /// A tuple of (batcher, sender) where the sender is used by AnalyticsHandler
-    /// to submit records.
-    pub fn new(pool: impl sqlx_pool_router::PoolProvider, config: Config, metrics_recorder: Option<M>) -> (Self, AnalyticsSender) {
+    /// A tuple of (projector, writer) where the writer is used by AnalyticsHandler.
+    pub fn new(pool: impl sqlx_pool_router::PoolProvider, config: Config, metrics_recorder: Option<M>) -> (Self, AnalyticsOutboxWriter) {
         let pool = sqlx_pool_router::DynPools::new(pool);
-        let (sender, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
-
-        let batch_size = config.analytics.batch_size;
-        let max_retries = config.analytics.max_retries;
-        let retry_base_delay = std::time::Duration::from_millis(config.analytics.retry_base_delay_ms);
+        // A zero limit would leave every durable row unprojected forever.
+        let batch_size = config.analytics.batch_size.max(1);
+        let projector_notify = Arc::new(Notify::new());
 
         let batcher = Self {
-            pool,
+            pool: pool.clone(),
             metrics_recorder,
-            receiver,
             batch_size,
-            max_retries,
-            retry_base_delay,
+            projector_notify: projector_notify.clone(),
             usage_refresh_notify: None,
         };
 
-        (batcher, sender)
+        let writer = AnalyticsOutboxWriter {
+            destination: AnalyticsOutboxDestination::Database { pool, projector_notify },
+        };
+
+        (batcher, writer)
     }
 
     /// Attach the usage-refresh daemon's wake signal. After each successful batch
@@ -276,207 +319,186 @@ where
         self
     }
 
-    /// Runs the batcher's background write loop.
-    ///
-    /// This should be spawned as a tokio task. The strategy is:
-    /// 1. Block until at least one record arrives
-    /// 2. Non-blocking drain of all available records in the channel
-    /// 3. Write the batch immediately
-    /// 4. Repeat
-    ///
-    /// This minimizes latency at low load (single record → immediate write) while
-    /// getting batching efficiency at high load (records queue while writing → bigger batch).
-    pub async fn run(mut self, shutdown_token: CancellationToken) {
-        info!(
-            max_batch_size = self.batch_size,
-            max_retries = self.max_retries,
-            retry_base_delay_ms = self.retry_base_delay.as_millis() as u64,
-            "Analytics batcher started (write-through mode with retry)"
-        );
-
-        let mut buffer: Vec<RawAnalyticsRecord> = Vec::with_capacity(self.batch_size);
+    /// Projects durable rows immediately after publication. The periodic wake
+    /// also recovers rows left behind by a process restart or another instance.
+    pub async fn run(self, shutdown_token: CancellationToken) {
+        info!(max_batch_size = self.batch_size, "Analytics outbox projector started");
+        let mut outbox_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        outbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            // Step 1: Wait for at least one record OR shutdown
-            tokio::select! {
-                biased; // Check shutdown first
-
+            let observe = tokio::select! {
                 _ = shutdown_token.cancelled() => {
-                    info!("Shutdown signal received, draining analytics channel");
-                    self.receiver.close();
-                    // Drain remaining records in batches to avoid OOM with large backlogs
-                    while let Some(record) = self.receiver.recv().await {
-                        buffer.push(record);
-                        if buffer.len() >= self.batch_size {
-                            self.flush_batch(&mut buffer).await;
+                    let drained = loop {
+                        match self.project_outbox_batch().await {
+                            Ok(0) => break true,
+                            Ok(_) => {}
+                            Err(error) => {
+                                crate::background_error!(
+                                    ANALYTICS_BATCHER,
+                                    "outbox_project",
+                                    Error,
+                                    error = %error,
+                                    "Failed to drain analytics outbox during shutdown; rows remain durable"
+                                );
+                                counter!("dwctl_analytics_outbox_projection_total", "result" => "error").increment(1);
+                                break false;
+                            }
                         }
-                    }
-                    if !buffer.is_empty() {
-                        self.flush_batch(&mut buffer).await;
-                    }
-                    info!("Analytics batcher shutdown complete");
+                    };
+                    info!(drained, "Analytics outbox projector shutdown complete");
                     break;
                 }
-
-                maybe_record = self.receiver.recv() => {
-                    match maybe_record {
-                        Some(record) => buffer.push(record),
-                        None => {
-                            // Channel closed (all senders dropped)
-                            info!("Analytics channel closed, shutting down batcher");
-                            if !buffer.is_empty() {
-                                self.flush_batch(&mut buffer).await;
-                            }
-                            break;
-                        }
-                    }
+                _ = outbox_tick.tick() => {
+                    true
                 }
-            }
-
-            // Step 2: Non-blocking drain of all available records (up to batch_size)
-            while buffer.len() < self.batch_size {
-                match self.receiver.try_recv() {
-                    Ok(record) => buffer.push(record),
-                    Err(_) => break, // Channel empty or closed
-                }
-            }
-
-            // Step 3: Write immediately
-            self.flush_batch(&mut buffer).await;
-        }
-    }
-
-    /// Flushes the buffer to the database with retry on failure.
-    ///
-    /// This performs:
-    /// 1. Batch enrichment (user lookup, pricing lookup) - no retry, data issues won't fix themselves
-    /// 2. Transactional write (analytics + credits) - retried with exponential backoff
-    /// 3. Metrics recording
-    async fn flush_batch(&self, buffer: &mut Vec<RawAnalyticsRecord>) {
-        if buffer.is_empty() {
-            return;
-        }
-
-        let batch_size = buffer.len();
-        let span = info_span!("dwctl.flush_analytics_batch", batch_size = batch_size);
-
-        async {
-            let start = std::time::Instant::now();
-
-            // Collect correlation IDs for log correlation
-            let correlation_ids: Vec<i64> = buffer.iter().map(|r| r.correlation_id).collect();
-
-            // Phase 1: Batch enrich (no retry - enrichment failures are usually data issues)
-            let enriched = match self.enrich_batch(buffer).await {
-                Ok(enriched) => enriched,
-                Err(e) => {
-                    crate::background_error!(ANALYTICS_BATCHER, "enrich", Error, error = %e, batch_size = batch_size, ?correlation_ids, "Failed to enrich analytics batch");
-                    buffer.clear();
-                    return;
+                _ = self.projector_notify.notified() => {
+                    false
                 }
             };
 
-            // Phase 2: Transactional write with retry
-            let mut last_error = None;
-            for attempt in 0..=self.max_retries {
-                match self.write_batch_transactional(&enriched).await {
-                    Ok(()) => {
-                        if attempt > 0 {
-                            debug!(
-                                attempt = attempt,
-                                batch_size = batch_size,
-                                ?correlation_ids,
-                                "Batch write succeeded after retry"
-                            );
-                            counter!("dwctl_analytics_batch_retries_total", "outcome" => "success").increment(1);
-                        }
-                        last_error = None;
+            loop {
+                match self.project_outbox_batch().await {
+                    Ok(0) => break,
+                    Ok(projected) if projected < self.batch_size => break,
+                    Ok(_) => tokio::task::yield_now().await,
+                    Err(error) => {
+                        crate::background_error!(
+                            ANALYTICS_BATCHER,
+                            "outbox_project",
+                            Error,
+                            error = %error,
+                            "Failed to project analytics outbox batch; rows remain durable"
+                        );
+                        counter!("dwctl_analytics_outbox_projection_total", "result" => "error").increment(1);
                         break;
                     }
-                    Err(e) => {
-                        last_error = Some(e);
-                        if attempt < self.max_retries {
-                            let delay = self.retry_base_delay * 2u32.pow(attempt);
-                            warn!(
-                                error = %last_error.as_ref().unwrap(),
-                                attempt = attempt + 1,
-                                max_retries = self.max_retries,
-                                delay_ms = delay.as_millis() as u64,
-                                batch_size = batch_size,
-                                ?correlation_ids,
-                                "Batch write failed, retrying"
-                            );
-                            counter!("dwctl_analytics_batch_retries_total", "outcome" => "retry").increment(1);
-                            tokio::time::sleep(delay).await;
-                        }
-                    }
                 }
             }
 
-            if let Some(e) = last_error {
-                crate::background_error!(
-                    ANALYTICS_BATCHER, "write_drop", Critical,
-                    error = %e,
-                    batch_size = batch_size,
-                    attempts = self.max_retries + 1,
-                    ?correlation_ids,
-                    "Failed to write analytics batch after all retries, dropping batch"
-                );
-                buffer.clear();
-                return;
+            if observe {
+                self.observe_outbox().await;
             }
-
-            // Write succeeded: nudge the usage-refresh daemon so the just-written rows
-            // get folded into user_model_usage_daily. In-memory and essentially free;
-            // the daemon coalesces bursts and rate-limits itself.
-            if let Some(notify) = &self.usage_refresh_notify {
-                notify.notify_one();
-            }
-
-            // Phase 3: Record per-record metrics
-            let now = chrono::Utc::now();
-            for record in &enriched {
-                // Record analytics lag (time from response to now)
-                let total_ms = now.signed_duration_since(record.raw.timestamp).num_milliseconds();
-                let lag_ms = total_ms - record.raw.duration_ms;
-                histogram!("dwctl_analytics_lag_seconds").record(lag_ms as f64 / 1000.0);
-
-                // Record GenAI metrics
-                if let Some(ref recorder) = self.metrics_recorder {
-                    let row = self.enriched_to_row(record);
-                    recorder.record_from_analytics(&row).await;
-                }
-            }
-
-            let duration = start.elapsed();
-            histogram!("dwctl_analytics_batch_duration_seconds").record(duration.as_secs_f64());
-            counter!("dwctl_analytics_batched_records_total").increment(batch_size as u64);
-
-            debug!(
-                batch_size = batch_size,
-                duration_ms = duration.as_millis() as u64,
-                ?correlation_ids,
-                "Flushed analytics batch"
-            );
-
-            buffer.clear();
         }
-        .instrument(span)
+    }
+
+    /// Claim, apply and delete one durable batch. The row locks, analytics and
+    /// credit writes, and deletion all share the same transaction; a crash or
+    /// error rolls everything back and makes the outbox rows claimable again.
+    async fn project_outbox_batch(&self) -> anyhow::Result<usize> {
+        let mut tx = self.pool.write().begin().await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT id, payload, created_at
+            FROM analytics_outbox
+            ORDER BY id
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .bind(i64::try_from(self.batch_size).unwrap_or(i64::MAX))
+        .fetch_all(&mut *tx)
+        .await?;
+
+        if rows.is_empty() {
+            tx.commit().await?;
+            return Ok(0);
+        }
+
+        let mut ids = Vec::with_capacity(rows.len());
+        let mut raw_records = Vec::with_capacity(rows.len());
+        let mut records = Vec::with_capacity(rows.len());
+        let mut oldest = Utc::now();
+        for row in rows {
+            ids.push(row.try_get::<i64, _>("id")?);
+            let mut payload = row.try_get::<serde_json::Value, _>("payload")?;
+            if payload.get("raw").is_some() {
+                // Release 11.12.0 wrote EnrichedRecord. Its nested raw record
+                // predates api_key_id, so copy the already-resolved top-level
+                // value into the new field before deserializing it.
+                let api_key_id = payload.get("api_key_id").cloned().unwrap_or(serde_json::Value::Null);
+                if let Some(raw) = payload.get_mut("raw").and_then(serde_json::Value::as_object_mut) {
+                    raw.entry("api_key_id").or_insert(api_key_id);
+                }
+                records.push(serde_json::from_value::<EnrichedRecord>(payload)?);
+            } else {
+                raw_records.push(serde_json::from_value::<RawAnalyticsRecord>(payload)?);
+            }
+            oldest = oldest.min(row.try_get::<DateTime<Utc>, _>("created_at")?);
+        }
+
+        records.extend(self.enrich_batch(&mut tx, &raw_records).await?);
+
+        self.write_batch_in_transaction(&mut tx, &records).await?;
+        sqlx::query("DELETE FROM analytics_outbox WHERE id = ANY($1)")
+            .bind(&ids)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        if let Some(notify) = &self.usage_refresh_notify {
+            notify.notify_one();
+        }
+
+        let now = Utc::now();
+        for record in &records {
+            let total_ms = now.signed_duration_since(record.raw.timestamp).num_milliseconds();
+            let lag_ms = total_ms - record.raw.duration_ms;
+            histogram!("dwctl_analytics_lag_seconds").record(lag_ms as f64 / 1000.0);
+            if let Some(ref recorder) = self.metrics_recorder {
+                let row = self.enriched_to_row(record);
+                recorder.record_from_analytics(&row).await;
+            }
+        }
+
+        let projected = records.len();
+        counter!("dwctl_analytics_outbox_projection_total", "result" => "success").increment(projected as u64);
+        histogram!("dwctl_analytics_outbox_oldest_projected_age_seconds")
+            .record(now.signed_duration_since(oldest).num_milliseconds().max(0) as f64 / 1000.0);
+        Ok(projected)
+    }
+
+    async fn observe_outbox(&self) {
+        let observation = sqlx::query(
+            r#"
+            SELECT COUNT(*)::bigint AS depth,
+                   COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(created_at))), 0)::float8 AS oldest_age_seconds
+            FROM analytics_outbox
+            "#,
+        )
+        // The outbox is writer-owned mutable state. Reading it from a replica
+        // could report stale depth/age and create a false stalled-outbox alert.
+        .fetch_one(&self.pool.write())
         .await;
+
+        match observation {
+            Ok(row) => {
+                let depth = row.try_get::<i64, _>("depth").unwrap_or_default();
+                let age = row.try_get::<f64, _>("oldest_age_seconds").unwrap_or_default();
+                metrics::gauge!("dwctl_analytics_outbox_depth").set(depth as f64);
+                metrics::gauge!("dwctl_analytics_outbox_oldest_age_seconds").set(age);
+            }
+            Err(error) => {
+                debug!(%error, "Failed to observe analytics outbox");
+            }
+        }
     }
 
     /// Batch enrich raw records with user info and pricing.
     ///
-    /// Performs two batch queries:
-    /// 1. Token → (user_id, purpose) lookup
+    /// Performs batched queries inside the projector transaction:
+    /// 1. API-key ID → (user_id, purpose) lookup
     /// 2. Model alias → (model_id, provider, tariffs) lookup
     #[tracing::instrument(skip_all)]
-    async fn enrich_batch(&self, buffer: &[RawAnalyticsRecord]) -> Result<Vec<EnrichedRecord>, sqlx::Error> {
-        // Collect unique bearer tokens
-        let tokens: Vec<&str> = buffer
+    async fn enrich_batch(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        buffer: &[RawAnalyticsRecord],
+    ) -> Result<Vec<EnrichedRecord>, sqlx::Error> {
+        let key_ids: Vec<Uuid> = buffer
             .iter()
-            .filter_map(|r| r.bearer_token.as_deref())
-            .collect::<std::collections::HashSet<_>>()
+            .filter_map(|r| r.api_key_id)
+            .collect::<HashSet<_>>()
             .into_iter()
             .collect();
 
@@ -488,23 +510,22 @@ where
             .into_iter()
             .collect();
 
-        // Batch lookup: token → (user_id, purpose)
-        let user_map = if !tokens.is_empty() {
-            self.batch_lookup_users(&tokens).await?
+        let key_map = if !key_ids.is_empty() {
+            self.batch_lookup_users_by_ids(tx, &key_ids).await?
         } else {
             HashMap::new()
         };
 
         // Batch lookup: model alias → (model_id, provider_name, tariffs)
         let model_map = if !models.is_empty() {
-            self.batch_lookup_models_with_tariffs(&models).await?
+            self.batch_lookup_models_with_tariffs(tx, &models).await?
         } else {
             HashMap::new()
         };
 
         // Batch lookup: model alias → cache tariffs (per tier), for the cache multipliers.
         let cache_tariff_map = if !models.is_empty() {
-            self.batch_lookup_cache_tariffs(&models).await?
+            self.batch_lookup_cache_tariffs(tx, &models).await?
         } else {
             HashMap::new()
         };
@@ -512,18 +533,17 @@ where
         // Enrich each record
         let mut enriched = Vec::with_capacity(buffer.len());
         for raw in buffer.iter().cloned() {
-            let (user_id, api_key_id, access_source, api_key_purpose, cap_scope_root) = if let Some(ref token) = raw.bearer_token {
-                if let Some(key) = user_map.get(token) {
-                    (
-                        Some(key.user_id),
-                        Some(key.api_key_id),
-                        "api_key".to_string(),
-                        Some(key.purpose.clone()),
-                        key.cap_scope_root,
-                    )
-                } else {
-                    (None, None, "unknown_api_key".to_string(), None, None)
-                }
+            let key = raw.api_key_id.and_then(|id| key_map.get(&id));
+            let (user_id, api_key_id, access_source, api_key_purpose, cap_scope_root) = if let Some(key) = key {
+                (
+                    Some(key.user_id),
+                    Some(key.api_key_id),
+                    "api_key".to_string(),
+                    Some(key.purpose.clone()),
+                    key.cap_scope_root,
+                )
+            } else if raw.api_key_id.is_some() {
+                (None, raw.api_key_id, "unknown_api_key".to_string(), None, None)
             } else {
                 (None, None, "unauthenticated".to_string(), None, None)
             };
@@ -588,15 +608,23 @@ where
                     "response carried cache tokens but the model is not dwctl-cache-enabled; ignoring them and billing at list price"
                 );
             }
-            let total_cost = charged_cost(
-                &TokenCounts::from(&raw),
-                raw.request_model.as_deref(),
-                input_price,
-                output_price,
-                cache_mults_resolved,
-                ANALYTICS_BATCHER,
-            );
-            let uncached_cost = compute_list_price(&raw, input_price, output_price);
+            let cache_mults_resolved = clamp_implicit_read_multiplier(cache_mults_resolved, raw.cache_read_source.as_deref());
+            let billable = (200..=299).contains(&raw.status_code);
+            let (total_cost, uncached_cost) = if billable {
+                (
+                    charged_cost(
+                        &TokenCounts::from(&raw),
+                        raw.request_model.as_deref(),
+                        input_price,
+                        output_price,
+                        cache_mults_resolved,
+                        ANALYTICS_BATCHER,
+                    ),
+                    compute_list_price(&raw, input_price, output_price),
+                )
+            } else {
+                (None, None)
+            };
 
             enriched.push(EnrichedRecord {
                 raw,
@@ -616,18 +644,14 @@ where
         Ok(enriched)
     }
 
-    /// Batch lookup user info by bearer tokens.
-    ///
-    /// `cap_scope_root` is the spending-cap scope for the key (see
-    /// `EnrichedRecord::cap_scope_root`): the root of `COALESCE(parent, id)`
-    /// when that root currently has a cap, else `None`. Resolved here (PK
-    /// self-join) so the fold in `batch_insert_credits` needs no extra query.
     #[tracing::instrument(skip_all)]
-    async fn batch_lookup_users(&self, tokens: &[&str]) -> Result<HashMap<String, KeyLookup>, sqlx::Error> {
-        let tokens_vec: Vec<String> = tokens.iter().map(|s| s.to_string()).collect();
-
+    async fn batch_lookup_users_by_ids(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        key_ids: &[Uuid],
+    ) -> Result<HashMap<Uuid, KeyLookup>, sqlx::Error> {
+        #[derive(sqlx::FromRow)]
         struct UserRow {
-            secret: String,
             user_id: Uuid,
             api_key_id: Uuid,
             purpose: String,
@@ -637,32 +661,29 @@ where
         let rows: Vec<UserRow> = sqlx::query_as!(
             UserRow,
             r#"
-            SELECT ak.secret, ak.user_id, ak.id as api_key_id, ak.purpose,
-                   CASE WHEN root.spend_limit IS NOT NULL THEN root.id END AS cap_scope_root
+            SELECT ak.user_id, ak.id as api_key_id, ak.purpose,
+                   CASE WHEN root.spend_limit IS NOT NULL THEN root.id END AS "cap_scope_root?"
             FROM api_keys ak
             JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)
-            WHERE ak.secret = ANY($1) AND ak.is_deleted = false
+            WHERE ak.id = ANY($1)
             "#,
-            &tokens_vec
+            key_ids
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **tx)
         .await?;
 
         let mut map = HashMap::with_capacity(rows.len());
         for row in rows {
-            let purpose = parse_api_key_purpose(&row.purpose);
             map.insert(
-                row.secret,
+                row.api_key_id,
                 KeyLookup {
                     user_id: row.user_id,
                     api_key_id: row.api_key_id,
-                    purpose,
+                    purpose: parse_api_key_purpose(&row.purpose),
                     cap_scope_root: row.cap_scope_root,
                 },
             );
         }
-
-        trace!(count = map.len(), "Batch lookup users completed");
         Ok(map)
     }
 
@@ -671,7 +692,11 @@ where
     /// Fetches ALL tariffs (including expired ones) to support historical pricing
     /// for batch requests that may have been created in the past.
     #[tracing::instrument(skip_all)]
-    async fn batch_lookup_models_with_tariffs(&self, aliases: &[&str]) -> Result<HashMap<String, ModelInfo>, sqlx::Error> {
+    async fn batch_lookup_models_with_tariffs(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        aliases: &[&str],
+    ) -> Result<HashMap<String, ModelInfo>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
 
         struct ModelRow {
@@ -707,7 +732,7 @@ where
             "#,
             &aliases_vec
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut **tx)
         .await?;
 
         // Group by alias
@@ -746,40 +771,44 @@ where
     /// time, exactly like `batch_lookup_models_with_tariffs`. Models without cache tariffs
     /// simply don't appear (the resolver then falls back to safe defaults).
     #[tracing::instrument(skip_all)]
-    async fn batch_lookup_cache_tariffs(&self, aliases: &[&str]) -> Result<HashMap<String, Vec<CacheTariffRow>>, sqlx::Error> {
+    async fn batch_lookup_cache_tariffs(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        aliases: &[&str],
+    ) -> Result<HashMap<String, Vec<CacheTariffRow>>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
-        let map = crate::pricing::lookup_cache_tariffs(&self.pool.write(), &aliases_vec).await?;
+        let map = crate::pricing::lookup_cache_tariffs(&mut **tx, &aliases_vec).await?;
         trace!(count = map.len(), "Batch lookup cache tariffs completed");
         Ok(map)
     }
 
-    /// Write enriched records to the database in a single transaction.
+    /// Write enriched records using the caller's outbox transaction.
     #[tracing::instrument(skip_all)]
-    async fn write_batch_transactional(&self, records: &[EnrichedRecord]) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.write().begin().await?;
-
+    async fn write_batch_in_transaction(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        records: &[EnrichedRecord],
+    ) -> Result<(), sqlx::Error> {
         // Phase 1: Batch INSERT http_analytics
-        let (analytics_ids, newly_inserted) = self.batch_insert_analytics(&mut tx, records).await?;
+        let (analytics_ids, newly_inserted) = self.batch_insert_analytics(tx, records).await?;
 
         // Phase 2: Batch INSERT credit_transactions (+ fold batch_aggregates)
-        let duplicates = self.batch_insert_credits(&mut tx, records, &analytics_ids, &newly_inserted).await?;
+        let duplicates = self.batch_insert_credits(tx, records, &analytics_ids, &newly_inserted).await?;
         if duplicates > 0 {
             warn!(duplicates = duplicates, "Some credit transactions were duplicates");
             counter!("dwctl_credits_duplicates_total").increment(duplicates);
         }
-
-        tx.commit().await?;
         Ok(())
     }
 
     /// Batch INSERT http_analytics records within a transaction.
     ///
-    /// Returns `(id_map, newly_inserted)`: the analytics id for each
-    /// `(instance_id, correlation_id)`, and the subset of those ids that were freshly
-    /// INSERTed this call (`xmax = 0`) rather than updated on conflict. The batch-analytics
-    /// fold in `batch_insert_credits` uses `newly_inserted` as its idempotency anchor so that
-    /// free / zero-priced batched requests (which never produce a credit row to ride) are
-    /// still folded exactly once under retries.
+    /// Returns the analytics ids inserted by this call. A repeated physical
+    /// receipt, and (once the logical-request unique index is deployed) a
+    /// second successful attempt for the same Fusillade request, returns no
+    /// row and therefore cannot proceed to billing or aggregation. The
+    /// batch-analytics fold uses the same returned ids as its idempotency
+    /// anchor, including for free requests that have no credit row.
     async fn batch_insert_analytics(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -829,6 +858,7 @@ where
         let mut user_agent_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut submitted_at_vec: Vec<Option<DateTime<Utc>>> = Vec::with_capacity(records.len());
         let mut engine_cached_vec: Vec<Option<i64>> = Vec::with_capacity(records.len());
+        let mut cache_read_source_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut stream_vec: Vec<Option<bool>> = Vec::with_capacity(records.len());
         let mut max_tokens_vec: Vec<Option<i64>> = Vec::with_capacity(records.len());
         let mut temperature_vec: Vec<Option<f32>> = Vec::with_capacity(records.len());
@@ -887,6 +917,7 @@ where
             // queue delay (timestamp - submitted_at) survives past this process.
             submitted_at_vec.push(record.raw.batch_created_at);
             engine_cached_vec.push(record.raw.engine_cached_tokens);
+            cache_read_source_vec.push(record.raw.cache_read_source.clone());
             let p = &record.raw.request_params;
             stream_vec.push(p.stream);
             max_tokens_vec.push(p.max_tokens);
@@ -908,7 +939,8 @@ where
                 cache_read_input_tokens, cache_creation_input_tokens,
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
                 total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at,
-                engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count
+                engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count,
+                cache_read_source
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -920,50 +952,11 @@ where
                 $29::bigint[], $30::bigint[], $31::bigint[],
                 $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],
                 $37::timestamptz[],
-                $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[]
+                $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[],
+                $46::text[]
             )
-            ON CONFLICT (instance_id, correlation_id)
-            DO UPDATE SET
-                status_code = EXCLUDED.status_code,
-                duration_ms = EXCLUDED.duration_ms,
-                duration_to_first_byte_ms = EXCLUDED.duration_to_first_byte_ms,
-                prompt_tokens = EXCLUDED.prompt_tokens,
-                completion_tokens = EXCLUDED.completion_tokens,
-                reasoning_tokens = EXCLUDED.reasoning_tokens,
-                total_tokens = EXCLUDED.total_tokens,
-                response_type = EXCLUDED.response_type,
-                user_id = EXCLUDED.user_id,
-                access_source = EXCLUDED.access_source,
-                input_price_per_token = EXCLUDED.input_price_per_token,
-                output_price_per_token = EXCLUDED.output_price_per_token,
-                fusillade_batch_id = EXCLUDED.fusillade_batch_id,
-                fusillade_request_id = EXCLUDED.fusillade_request_id,
-                custom_id = EXCLUDED.custom_id,
-                request_origin = EXCLUDED.request_origin,
-                batch_sla = EXCLUDED.batch_sla,
-                batch_request_source = EXCLUDED.batch_request_source,
-                api_key_id = EXCLUDED.api_key_id,
-                trace_id = EXCLUDED.trace_id,
-                cache_read_input_tokens = EXCLUDED.cache_read_input_tokens,
-                cache_creation_input_tokens = EXCLUDED.cache_creation_input_tokens,
-                cache_creation_5m_input_tokens = EXCLUDED.cache_creation_5m_input_tokens,
-                cache_creation_1h_input_tokens = EXCLUDED.cache_creation_1h_input_tokens,
-                cache_creation_24h_input_tokens = EXCLUDED.cache_creation_24h_input_tokens,
-                total_cost = EXCLUDED.total_cost,
-                uncached_cost = EXCLUDED.uncached_cost,
-                served_by = EXCLUDED.served_by,
-                finish_reason = EXCLUDED.finish_reason,
-                user_agent = EXCLUDED.user_agent,
-                submitted_at = EXCLUDED.submitted_at,
-                engine_cached_tokens = EXCLUDED.engine_cached_tokens,
-                stream = EXCLUDED.stream,
-                max_tokens = EXCLUDED.max_tokens,
-                temperature = EXCLUDED.temperature,
-                top_p = EXCLUDED.top_p,
-                n = EXCLUDED.n,
-                tool_count = EXCLUDED.tool_count,
-                message_count = EXCLUDED.message_count
-            RETURNING id, instance_id, correlation_id, (xmax = 0) AS "newly_inserted!"
+            ON CONFLICT DO NOTHING
+            RETURNING id, instance_id, correlation_id
             "#,
             &instance_ids,
             &correlation_ids,
@@ -1010,22 +1003,27 @@ where
             &n_vec as &[Option<i32>],
             &tool_count_vec as &[Option<i32>],
             &message_count_vec as &[Option<i32>],
+            &cache_read_source_vec as &[Option<String>],
         )
         .fetch_all(&mut **tx)
         .await?;
 
         let mut id_map = HashMap::with_capacity(rows.len());
-        let mut newly_inserted: HashSet<i64> = HashSet::new();
+        let mut newly_inserted: HashSet<i64> = HashSet::with_capacity(rows.len());
         for row in rows {
             id_map.insert((row.instance_id, row.correlation_id), row.id);
-            if row.newly_inserted {
-                newly_inserted.insert(row.id);
-            }
+            newly_inserted.insert(row.id);
+        }
+
+        let duplicate_receipts = records.len().saturating_sub(id_map.len());
+        if duplicate_receipts > 0 {
+            counter!("dwctl_analytics_duplicate_receipts_total").increment(duplicate_receipts as u64);
         }
 
         trace!(
             count = id_map.len(),
-            newly = newly_inserted.len(),
+            inserted = newly_inserted.len(),
+            duplicates = duplicate_receipts,
             "Batch inserted analytics records"
         );
         Ok((id_map, newly_inserted))
@@ -1066,8 +1064,33 @@ where
         // Spending-cap scope root per billed row (None for the uncapped
         // majority); parallel to the vecs above, consumed by the cap fold below.
         let mut cap_scope_roots: Vec<Option<Uuid>> = Vec::new();
+        let mut processed_analytics_ids: HashSet<i64> = HashSet::new();
 
         for record in records {
+            // Only a row returned by the analytics INSERT may have downstream
+            // effects. If the same physical identity appeared twice in one
+            // flush, process the first input row (the one INSERT considered
+            // first) exactly once.
+            let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
+                trace!(
+                    instance_id = %record.raw.instance_id,
+                    correlation_id = record.raw.correlation_id,
+                    fusillade_request_id = ?record.raw.fusillade_request_id,
+                    "Skipping billing for an analytics receipt rejected by a uniqueness constraint"
+                );
+                continue;
+            };
+            if !processed_analytics_ids.insert(analytics_id) {
+                continue;
+            }
+
+            // Billing eligibility is the shared effective HTTP outcome. Failed
+            // requests remain in analytics, but never create a debit even when
+            // the provider reported usage and a non-zero price.
+            if !(200..=299).contains(&record.raw.status_code) {
+                continue;
+            }
+
             // Skip if no user or no pricing
             let Some(user_id) = record.user_id else { continue };
 
@@ -1083,17 +1106,6 @@ where
             if total_cost <= Decimal::ZERO {
                 continue;
             }
-
-            // Get analytics_id
-            let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
-                crate::background_error!(
-                    ANALYTICS_BATCHER, "analytics_id_missing", Warning,
-                    instance_id = %record.raw.instance_id,
-                    correlation_id = record.raw.correlation_id,
-                    "Analytics ID not found for credit transaction"
-                );
-                continue;
-            };
 
             let model = record.raw.request_model.clone().unwrap_or_default();
 
@@ -1172,7 +1184,7 @@ where
 
         // Billing fold: total_amount / transaction_count per batch, over the *billed* rows
         // (the credit set). The per-batch analytics aggregates (tokens/latency/cost) are folded
-        // separately below over ALL 2xx requests, so free-model batches are counted too.
+        // separately below over ALL newly inserted 2xx requests, so free-model batches are counted too.
         struct BatchFold {
             user_id: Uuid,
             total: Decimal,
@@ -1449,8 +1461,8 @@ where
         // rides the credit set and so excludes free / zero-priced requests — this covers ALL
         // 2xx batched requests, matching get_batch_analytics's historical "status 2xx" set, so
         // free-model batches still report tokens/latency/cost. Idempotency rides the
-        // http_analytics upsert's newly-inserted flag (`xmax = 0`): a retried flush re-folds
-        // nothing. count_duration_ms / count_ttfb_ms count only requests that reported the
+        // http_analytics INSERT's returned rows: a conflicting receipt returns nothing and
+        // is not folded. count_duration_ms / count_ttfb_ms count only requests that reported the
         // metric so the endpoint's AVG (which ignores NULLs) is reproduced; total_requests is
         // the plain 2xx count (distinct from transaction_count, the billed-row count).
         struct AnalyticsFold {
@@ -1469,7 +1481,15 @@ where
             list_cost: Decimal,
         }
         let mut analytics_folds: HashMap<Uuid, AnalyticsFold> = HashMap::new();
+        let mut folded_analytics_ids: HashSet<i64> = HashSet::new();
         for record in records {
+            let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
+                continue;
+            };
+            if !newly_inserted.contains(&analytics_id) || !folded_analytics_ids.insert(analytics_id) {
+                continue;
+            }
+
             let Some(batch_id) = record.raw.fusillade_batch_id else { continue };
             if !(200..=299).contains(&record.raw.status_code) {
                 continue;
@@ -1478,16 +1498,6 @@ where
             if user_id == Uuid::nil() {
                 continue;
             }
-            // Idempotency anchor: only rows this flush actually INSERTed (xmax = 0) contribute,
-            // so a retried flush re-folds nothing even for free requests (which have no credit
-            // row to ride the ON CONFLICT DO NOTHING dedup).
-            let Some(&analytics_id) = analytics_ids.get(&(record.raw.instance_id, record.raw.correlation_id)) else {
-                continue;
-            };
-            if !newly_inserted.contains(&analytics_id) {
-                continue;
-            }
-
             let af = analytics_folds.entry(batch_id).or_insert_with(|| AnalyticsFold {
                 user_id,
                 service_tier: compute_billing_tier(record.raw.fusillade_batch_id, record.raw.batch_completion_window.as_deref())
@@ -1725,6 +1735,7 @@ mod tests {
 
     #[test]
     fn test_raw_analytics_record_creation() {
+        let api_key_id = Uuid::new_v4();
         let record = RawAnalyticsRecord {
             served_by: None,
             instance_id: Uuid::new_v4(),
@@ -1749,10 +1760,11 @@ mod tests {
             finish_reason: None,
             user_agent: None,
             engine_cached_tokens: None,
+            cache_read_source: None,
             request_params: RequestParams::default(),
             server_address: "localhost".to_string(),
             server_port: 8080,
-            bearer_token: Some("test-token".to_string()),
+            api_key_id: Some(api_key_id),
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
@@ -1763,7 +1775,10 @@ mod tests {
         };
 
         assert_eq!(record.correlation_id, 123);
-        assert_eq!(record.bearer_token, Some("test-token".to_string()));
+
+        let payload = serde_json::to_value(&record).unwrap();
+        let restored: RawAnalyticsRecord = serde_json::from_value(payload).unwrap();
+        assert_eq!(restored.api_key_id, Some(api_key_id));
     }
 
     #[test]
@@ -1801,10 +1816,11 @@ mod tests {
             finish_reason: None,
             user_agent: None,
             engine_cached_tokens: None,
+            cache_read_source: None,
             request_params: RequestParams::default(),
             server_address: "x".to_string(),
             server_port: 1,
-            bearer_token: None,
+            api_key_id: None,
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
@@ -1882,6 +1898,7 @@ mod integration_tests {
     use crate::db::handlers::Repository;
     use crate::db::handlers::credits::Credits;
     use crate::db::models::credits::CreditTransactionType;
+    use crate::pricing::CacheMultipliers;
     use crate::test::utils::create_test_user;
     use rust_decimal::prelude::FromStr;
 
@@ -1936,6 +1953,7 @@ mod integration_tests {
                 fallback_enabled: None,
                 fallback_on_rate_limit: None,
                 fallback_on_status: None,
+                fallback_realtime_on_status: None,
                 fallback_with_replacement: None,
                 fallback_max_attempts: None,
                 backoff_enabled: false,
@@ -1944,6 +1962,8 @@ mod integration_tests {
                 backoff_factor: 2.0,
                 backoff_jitter: "full".to_string(),
                 backoff_max_total_ms: None,
+                first_token_timeout_ms: None,
+                aimd: None,
                 sanitize_responses: true,
                 trusted: false,
                 reasoning_translation_overrides: None,
@@ -2020,7 +2040,7 @@ mod integration_tests {
     }
 
     /// Helper: Create an API key for a user
-    async fn create_api_key_for_user(pool: &sqlx::PgPool, user_id: Uuid, purpose: ApiKeyPurpose) -> String {
+    async fn create_api_key_for_user(pool: &sqlx::PgPool, user_id: Uuid, purpose: ApiKeyPurpose) -> Uuid {
         use crate::db::handlers::api_keys::ApiKeys;
         use crate::db::models::api_keys::ApiKeyCreateDBRequest;
 
@@ -2041,11 +2061,11 @@ mod integration_tests {
             .await
             .unwrap();
 
-        api_key.secret
+        api_key.id
     }
 
     /// Helper: Create a raw analytics record for testing
-    fn create_raw_record(model: &str, bearer_token: Option<String>, prompt_tokens: i64, completion_tokens: i64) -> RawAnalyticsRecord {
+    fn create_raw_record(model: &str, api_key_id: Option<Uuid>, prompt_tokens: i64, completion_tokens: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
             served_by: None,
             instance_id: Uuid::new_v4(),
@@ -2070,10 +2090,11 @@ mod integration_tests {
             finish_reason: None,
             user_agent: None,
             engine_cached_tokens: None,
+            cache_read_source: None,
             request_params: RequestParams::default(),
             server_address: "api.test.com".to_string(),
             server_port: 443,
-            bearer_token,
+            api_key_id,
             fusillade_batch_id: None,
             fusillade_request_id: None,
             custom_id: None,
@@ -2087,19 +2108,107 @@ mod integration_tests {
     /// Run the batcher with given records and wait for completion
     async fn run_batcher_with_records(pool: &sqlx::PgPool, records: Vec<RawAnalyticsRecord>) {
         let config = crate::test::utils::create_test_config();
-        let (batcher, sender) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let (batcher, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
 
-        // Send all records
         for record in records {
-            sender.send(record).await.unwrap();
+            writer.publish(record).await.unwrap();
         }
 
-        // Drop sender to close channel
-        drop(sender);
+        while batcher.project_outbox_batch().await.unwrap() > 0 {}
+    }
 
-        // Run batcher until channel is drained
-        let shutdown = CancellationToken::new();
-        batcher.run(shutdown).await;
+    #[sqlx::test]
+    async fn test_writer_checkpoints_raw_record_before_enrichment(pool: sqlx::PgPool) {
+        let config = crate::test::utils::create_test_config();
+        let (_projector, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let api_key_id = Uuid::new_v4();
+        let record = create_raw_record("checkpoint-test", Some(api_key_id), 10, 5);
+        let instance_id = record.instance_id;
+        let correlation_id = record.correlation_id;
+
+        writer.publish(record).await.unwrap();
+
+        let payload: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM analytics_outbox WHERE instance_id = $1 AND correlation_id = $2")
+                .bind(instance_id)
+                .bind(correlation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        assert_eq!(payload["api_key_id"], api_key_id.to_string());
+        assert!(payload.get("user_id").is_none());
+        assert!(payload.get("total_cost").is_none());
+    }
+
+    #[sqlx::test]
+    async fn test_projector_accepts_deployed_and_raw_outbox_payloads(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "mixed-outbox-payload-test").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00001").unwrap(),
+            Decimal::from_str("0.00003").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from(10)).await;
+        let api_key_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+
+        let config = crate::test::utils::create_test_config();
+        let (batcher, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+
+        let deployed_raw = create_raw_record("mixed-outbox-payload-test", Some(api_key_id), 10, 5);
+        let mut tx = pool.begin().await.unwrap();
+        let deployed_enriched = batcher
+            .enrich_batch(&mut tx, std::slice::from_ref(&deployed_raw))
+            .await
+            .unwrap()
+            .remove(0);
+        tx.rollback().await.unwrap();
+
+        // Match the payload emitted by release 11.12.0: EnrichedRecord at the
+        // top level and no api_key_id field inside its nested raw record.
+        let mut deployed_payload = serde_json::to_value(deployed_enriched).unwrap();
+        deployed_payload
+            .get_mut("raw")
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap()
+            .remove("api_key_id");
+        sqlx::query("INSERT INTO analytics_outbox (instance_id, correlation_id, payload) VALUES ($1, $2, $3)")
+            .bind(deployed_raw.instance_id)
+            .bind(deployed_raw.correlation_id)
+            .bind(deployed_payload)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let raw = create_raw_record("mixed-outbox-payload-test", Some(api_key_id), 20, 10);
+        writer.publish(raw).await.unwrap();
+
+        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 2);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM analytics_outbox")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM http_analytics WHERE model = 'mixed-outbox-payload-test'",)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM credits_transactions WHERE transaction_type = 'usage' AND api_key_id = $1",)
+                .bind(api_key_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            2
+        );
     }
 
     #[sqlx::test]
@@ -2140,6 +2249,50 @@ mod integration_tests {
         let usage_tx = transactions.iter().find(|tx| tx.transaction_type == CreditTransactionType::Usage);
         assert!(usage_tx.is_some(), "Usage transaction should be created");
         assert_eq!(usage_tx.unwrap().amount, expected_cost);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn failed_response_is_analytic_but_not_billed(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "failed-response-test").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00001").unwrap(),
+            Decimal::from_str("0.00003").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+
+        let initial_balance = Decimal::from_str("10.00").unwrap();
+        let user_id = setup_user_with_balance(&pool, initial_balance).await;
+        let api_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+        let mut record = create_raw_record("failed-response-test", Some(api_key), 1000, 500);
+        record.status_code = 502;
+        run_batcher_with_records(&pool, vec![record]).await;
+
+        let (analytics_status, total_cost): (i32, Option<Decimal>) =
+            sqlx::query_as("SELECT status_code, total_cost FROM http_analytics WHERE model = 'failed-response-test'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(analytics_status, 502);
+        assert_eq!(total_cost, None);
+
+        let mut conn = pool.acquire().await.unwrap();
+        let mut credits = Credits::new(&mut conn);
+        assert_eq!(credits.get_user_balance(user_id).await.unwrap(), initial_balance);
+        let transactions = credits
+            .list_user_transactions(user_id, 0, 10, &TransactionFilters::default())
+            .await
+            .unwrap();
+        assert!(transactions.iter().all(|tx| tx.transaction_type != CreditTransactionType::Usage));
+
+        let outbox_depth: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM analytics_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(outbox_depth, 0, "projection must delete the durable row after committing analytics");
     }
 
     #[sqlx::test]
@@ -2399,6 +2552,187 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_future_fusillade_success_index_gates_billing_and_aggregation(pool: sqlx::PgPool) {
+        // This preparation release does not ship the index: production history
+        // must be reconciled first. Install its intended definition in this
+        // isolated test database to prove the application is ready for it.
+        sqlx::query(
+            "CREATE UNIQUE INDEX test_http_analytics_fusillade_success_unique \
+             ON http_analytics (fusillade_request_id) \
+             WHERE fusillade_request_id IS NOT NULL AND status_code BETWEEN 200 AND 299",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let model_id = create_test_model(&pool, "fusillade-billing-idempotency").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00005").unwrap(),
+            Decimal::from_str("0.00010").unwrap(),
+            ApiKeyPurpose::Batch,
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let batch_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+
+        // Failed attempts remain observable, but must not become the canonical
+        // usage row or prevent a later success from being billed.
+        let mut failed = create_raw_record("fusillade-billing-idempotency", Some(batch_key.clone()), 1000, 500);
+        failed.status_code = 500;
+        failed.batch_completion_window = Some("24h".to_string());
+        failed.fusillade_batch_id = Some(batch_id);
+        failed.fusillade_request_id = Some(request_id);
+
+        let mut first = create_raw_record("fusillade-billing-idempotency", Some(batch_key.clone()), 1000, 500);
+        first.batch_completion_window = Some("24h".to_string());
+        first.fusillade_batch_id = Some(batch_id);
+        first.fusillade_request_id = Some(request_id);
+
+        // A second successful physical attempt has a different gateway
+        // identity but the same logical Fusillade request identity.
+        let mut duplicate = create_raw_record("fusillade-billing-idempotency", Some(batch_key), 1000, 500);
+        duplicate.batch_completion_window = Some("24h".to_string());
+        duplicate.fusillade_batch_id = Some(batch_id);
+        duplicate.fusillade_request_id = Some(request_id);
+
+        run_batcher_with_records(&pool, vec![failed]).await;
+        run_batcher_with_records(&pool, vec![first, duplicate]).await;
+
+        let analytics_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM http_analytics WHERE fusillade_request_id = $1")
+            .bind(request_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let charge_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM credits_transactions \
+             WHERE fusillade_request_id = $1 AND transaction_type = 'usage'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let successful_analytics_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM http_analytics \
+             WHERE fusillade_request_id = $1 AND status_code BETWEEN 200 AND 299",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(analytics_count, 2, "the failed attempt and one canonical success remain observable");
+        assert_eq!(successful_analytics_count, 1, "only one success may contribute usage");
+        assert_eq!(charge_count, 1, "one Fusillade request must produce one debit");
+        let aggregate = sqlx::query!(
+            "SELECT total_requests, total_prompt_tokens, total_completion_tokens, total_amount \
+             FROM batch_aggregates WHERE fusillade_batch_id = $1",
+            batch_id,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            aggregate.total_requests, 1,
+            "customer-visible usage must count the logical request once"
+        );
+        assert_eq!(aggregate.total_prompt_tokens, 1000);
+        assert_eq!(aggregate.total_completion_tokens, 500);
+        assert_eq!(aggregate.total_amount, Decimal::from_str("0.10").unwrap());
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_legacy_fusillade_duplicates_remain_reconcilable_during_rollout(pool: sqlx::PgPool) {
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let batch_id = Uuid::new_v4();
+        let request_id = Uuid::new_v4();
+
+        // A pre-change binary supplies fusillade_request_id but uses a
+        // per-attempt analytics source_id. Both writes remain visible during
+        // the rollout window so the separate reconciliation can find them.
+        let insert_legacy = |source_id: &'static str| {
+            sqlx::query(
+                r#"
+                INSERT INTO credits_transactions (
+                    user_id, transaction_type, amount, source_id, description,
+                    fusillade_batch_id, api_key_id, service_tier, fusillade_request_id
+                )
+                VALUES ($1, 'usage', $2, $3, 'legacy Fusillade usage', $4, $5, 'batch', $6)
+                ON CONFLICT (source_id) DO NOTHING
+                "#,
+            )
+            .bind(user_id)
+            .bind(Decimal::from_str("0.10").unwrap())
+            .bind(source_id)
+            .bind(batch_id)
+            .bind(batch_key_id)
+            .bind(request_id)
+            .execute(&pool)
+        };
+
+        let (first, second) = tokio::join!(insert_legacy("legacy-attempt-a"), insert_legacy("legacy-attempt-b"));
+        first.unwrap();
+        second.unwrap();
+
+        let rows = sqlx::query!(
+            "SELECT source_id, fusillade_request_id \
+             FROM credits_transactions WHERE fusillade_request_id = $1",
+            request_id,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "rollout-window duplicates must remain available for reconciliation");
+        assert!(rows.iter().all(|row| row.fusillade_request_id == Some(request_id)));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_shared_fusillade_id_does_not_suppress_realtime_billing(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "spoofed-fusillade-id").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00005").unwrap(),
+            Decimal::from_str("0.00010").unwrap(),
+            ApiKeyPurpose::Realtime,
+        )
+        .await;
+        let first_user = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let second_user = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let first_key = create_api_key_for_user(&pool, first_user, ApiKeyPurpose::Realtime).await;
+        let second_key = create_api_key_for_user(&pool, second_user, ApiKeyPurpose::Realtime).await;
+        let spoofed_request_id = Uuid::new_v4();
+
+        let mut first = create_raw_record("spoofed-fusillade-id", Some(first_key), 1000, 500);
+        first.fusillade_request_id = Some(spoofed_request_id);
+        let mut second = create_raw_record("spoofed-fusillade-id", Some(second_key), 1000, 500);
+        second.fusillade_request_id = Some(spoofed_request_id);
+
+        run_batcher_with_records(&pool, vec![first, second]).await;
+
+        let rows = sqlx::query!(
+            "SELECT user_id, fusillade_request_id FROM credits_transactions \
+             WHERE user_id = ANY($1) AND transaction_type = 'usage'",
+            &[first_user, second_user],
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2, "an untrusted header must not deduplicate billing");
+        assert!(
+            rows.iter().all(|row| row.fusillade_request_id == Some(spoofed_request_id)),
+            "without the future analytics index, the shared correlation id is retained for reconciliation"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_batcher_fallback_to_realtime_when_batch_tariff_missing(pool: sqlx::PgPool) {
         // Setup: Create model with ONLY realtime tariff
         let model_id = create_test_model(&pool, "gpt-4-fallback-test").await;
@@ -2518,6 +2852,68 @@ mod integration_tests {
             (stored - submitted).num_seconds().abs() < 1,
             "expected {submitted}, stored {stored}"
         );
+    }
+
+    #[test]
+    fn implicit_reads_clamp_the_read_multiplier_to_list_price() {
+        let mults = CacheMultipliers {
+            read: Decimal::new(15, 1), // 1.5 — misconfigured surcharge
+            write_5m: Decimal::new(125, 2),
+            write_1h: Decimal::TWO,
+            write_24h: Decimal::new(25, 1),
+        };
+        // Engine-sourced read: clamped to 1 (never above list price).
+        let clamped = clamp_implicit_read_multiplier(Some(mults), Some("engine")).unwrap();
+        assert_eq!(clamped.read, Decimal::ONE);
+        assert_eq!(clamped.write_1h, Decimal::TWO, "write premiums untouched");
+        // Module-sourced (explicit) read: configured multiplier stands.
+        assert_eq!(
+            clamp_implicit_read_multiplier(Some(mults), Some("module")).unwrap().read,
+            Decimal::new(15, 1)
+        );
+        // Sane multipliers pass through unchanged for both sources.
+        let sane = CacheMultipliers {
+            read: Decimal::new(1, 1),
+            ..mults
+        };
+        assert_eq!(
+            clamp_implicit_read_multiplier(Some(sane), Some("engine")).unwrap().read,
+            Decimal::new(1, 1)
+        );
+        assert!(clamp_implicit_read_multiplier(None, Some("engine")).is_none());
+    }
+
+    /// The same last hop for `cache_read_source`: the value rides the `CacheBilling`
+    /// extension into this struct upstream, so the only thing that can break is the
+    /// write — a dropped bind or a misordered UNNEST array would leave the column
+    /// silently NULL (or misaligned) on every row.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn batcher_persists_the_cache_read_source_to_http_analytics(pool: sqlx::PgPool) {
+        create_test_model(&pool, "cache-source-test").await;
+
+        let mut record = create_raw_record("cache-source-test", None, 10, 5);
+        record.cache_read_source = Some("engine".to_string());
+        run_batcher_with_records(&pool, vec![record.clone()]).await;
+
+        let stored: Option<String> = sqlx::query_scalar("SELECT cache_read_source FROM http_analytics WHERE model = 'cache-source-test'")
+            .fetch_one(&pool)
+            .await
+            .expect("the analytics row should exist");
+        assert_eq!(stored.as_deref(), Some("engine"));
+
+        // A second receipt for the same physical attempt is ignored. Analytics
+        // records are complete when enqueued, so a replay must not rewrite the
+        // canonical row or repeat any downstream usage effects.
+        record.cache_read_source = Some("module".to_string());
+        run_batcher_with_records(&pool, vec![record]).await;
+        let rows: Vec<Option<String>> =
+            sqlx::query_scalar("SELECT cache_read_source FROM http_analytics WHERE model = 'cache-source-test'")
+                .fetch_all(&pool)
+                .await
+                .expect("query should succeed");
+        assert_eq!(rows.len(), 1, "the duplicate receipt must not create another row");
+        assert_eq!(rows[0].as_deref(), Some("engine"), "the first complete receipt remains canonical");
     }
 
     /// Realtime work is not submitted ahead of time, so there is no distinct submission
@@ -2675,24 +3071,19 @@ mod integration_tests {
 
         // Wealthy user so no balance crossing interferes with the assertions.
         let user_id = setup_user_with_balance(&pool, Decimal::from_str("100").unwrap()).await;
-        let parent_secret = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
-        let uncapped_secret = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+        let parent_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+        let uncapped_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
 
         // Cap the parent at $0.04 (each request below costs $0.025) and mint its child.
-        sqlx::query("UPDATE api_keys SET spend_limit = 0.04 WHERE secret = $1")
-            .bind(&parent_secret)
+        sqlx::query("UPDATE api_keys SET spend_limit = 0.04 WHERE id = $1")
+            .bind(parent_id)
             .execute(&pool)
             .await
             .unwrap();
-        let parent_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
-            .bind(&parent_secret)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let child_secret = {
+        let child_id = {
             let mut conn = pool.acquire().await.unwrap();
-            let (secret, _) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent_id).await.unwrap();
-            secret
+            let (_, id) = ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent_id).await.unwrap();
+            id
         };
 
         let mut listener = PgListener::connect_with(&pool).await.expect("Failed to create listener");
@@ -2701,12 +3092,12 @@ mod integration_tests {
 
         // Parent realtime + child batch + uncapped key, one flush. Each row
         // costs $0.025; the scope total 0.05 crosses the 0.04 cap.
-        let mut child_record = create_raw_record("gpt-4-cap-fold-test", Some(child_secret), 1000, 500);
+        let mut child_record = create_raw_record("gpt-4-cap-fold-test", Some(child_id), 1000, 500);
         child_record.batch_completion_window = Some("24h".to_string());
         let records = vec![
-            create_raw_record("gpt-4-cap-fold-test", Some(parent_secret.clone()), 1000, 500),
+            create_raw_record("gpt-4-cap-fold-test", Some(parent_id), 1000, 500),
             child_record,
-            create_raw_record("gpt-4-cap-fold-test", Some(uncapped_secret), 1000, 500),
+            create_raw_record("gpt-4-cap-fold-test", Some(uncapped_id), 1000, 500),
         ];
         run_batcher_with_records(&pool, records).await;
 
@@ -2731,11 +3122,7 @@ mod integration_tests {
         assert_eq!(rows[0].window_spend, Decimal::from_str("0.05").unwrap());
 
         // Edge-trigger: a further over-cap flush folds but does not re-notify.
-        run_batcher_with_records(
-            &pool,
-            vec![create_raw_record("gpt-4-cap-fold-test", Some(parent_secret), 1000, 500)],
-        )
-        .await;
+        run_batcher_with_records(&pool, vec![create_raw_record("gpt-4-cap-fold-test", Some(parent_id), 1000, 500)]).await;
         assert_no_cap_notification(&mut listener).await;
         let window_spend: Decimal = sqlx::query_scalar!(
             r#"SELECT window_spend AS "window_spend!" FROM api_key_spend_checkpoints WHERE api_key_id = $1"#,
@@ -2768,16 +3155,11 @@ mod integration_tests {
         )
         .await;
         let user_id = setup_user_with_balance(&pool, Decimal::from_str("100").unwrap()).await;
-        let secret = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
+        let key_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Realtime).await;
 
-        sqlx::query("UPDATE api_keys SET spend_limit = 10, spend_limit_interval = 'daily' WHERE secret = $1")
-            .bind(&secret)
+        sqlx::query("UPDATE api_keys SET spend_limit = 10, spend_limit_interval = 'daily' WHERE id = $1")
+            .bind(key_id)
             .execute(&pool)
-            .await
-            .unwrap();
-        let key_id: Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret = $1")
-            .bind(&secret)
-            .fetch_one(&pool)
             .await
             .unwrap();
 
@@ -2795,7 +3177,7 @@ mod integration_tests {
         listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await.expect("Failed to listen");
         while timeout(Duration::from_millis(10), listener.try_recv()).await.is_ok() {}
 
-        run_batcher_with_records(&pool, vec![create_raw_record("gpt-4-cap-rollover-test", Some(secret), 1000, 500)]).await;
+        run_batcher_with_records(&pool, vec![create_raw_record("gpt-4-cap-rollover-test", Some(key_id), 1000, 500)]).await;
 
         let row = sqlx::query!(
             r#"SELECT total_spend AS "total_spend!", window_spend AS "window_spend!",

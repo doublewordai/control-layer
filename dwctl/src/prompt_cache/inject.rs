@@ -28,7 +28,7 @@ use std::sync::{Arc, OnceLock};
 use tracing::error;
 
 use super::parse::{TELEMETRY_ROLE, TelemetryPolicy};
-use super::stats::CacheStats;
+use super::stats::{BilledCache, CacheBilling, CacheReadSource, CacheStats};
 
 /// The upstream's `prompt_tokens_details.cached_tokens` exactly as it arrived, captured
 /// BEFORE this layer zeroes it (inactive model) or overwrites it with dwctl's own read
@@ -55,6 +55,11 @@ impl UpstreamCachedTokens {
 }
 
 /// The upstream's own cached-prompt count from a `usage` object, read before any rewrite.
+/// Every upstream we serve through (SGLang/vLLM behind the dynamo frontend, OpenRouter)
+/// speaks the one OpenAI-compatible shape — `prompt_tokens_details.cached_tokens` — so
+/// that is the ONLY field read. A provider-specific dialect field is never consumed:
+/// the scrub list deletes such fields from customer bodies, and here they simply read as
+/// "no report".
 fn upstream_cached_tokens(usage: &serde_json::Map<String, Value>) -> Option<u64> {
     usage
         .get("prompt_tokens_details")
@@ -255,9 +260,31 @@ pub fn scrub_usage_json(body: &[u8]) -> Option<Bytes> {
 /// billing semantics (request_logging::batcher::compute_total_cost): drift caps the READ
 /// count to fit; write counts alone exceeding the prompt is corrupt and reports no cache
 /// activity at all — matching the list-price bill for that case.
-fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &CacheStats, model: Option<&str>) {
-    // Scrub first so nothing an upstream reported (e.g. DeepSeek's `prompt_cache_hit_tokens`
-    // on an unsanitized model) survives alongside the fields we're about to write.
+///
+/// **Engine-cache passthrough** — strictly one paradigm per request, chosen by ARMING,
+/// never by cache values: arming is whether the request carried cache markers (block,
+/// top-level automatic, or the `cacheBreakpoint` query param — the layer's pre-flight
+/// `had_markers` signal). An ARMED request is wholly explicit: deterministic module
+/// numbers, even all-zeros ("no caching: below the minimum prefix") and even where the
+/// engine reports a hit — predictable beats occasionally-bigger. An UNARMED request on a
+/// tariffed model bills the upstream's own reported hit, capped to `prompt_tokens`, with
+/// no creations: implicit caching has no write concept, no premium, and no guarantee.
+/// (An unarmed request's module split is definitionally zero — no markers, no
+/// breakpoints.) `allow_implicit` is the arming gate, computed by the layer as
+/// `!had_markers`. Fail-safes: no engine report or no `prompt_tokens` to bound it → no
+/// passthrough; billing additionally clamps the read multiplier to 1 for engine-sourced
+/// reads (a >1 multiplier is a misconfiguration — an unmarked customer must never pay
+/// above list price for a cache hit).
+fn splice_cache_fields(
+    usage: &mut serde_json::Map<String, Value>,
+    stats: &CacheStats,
+    model: Option<&str>,
+    allow_implicit: bool,
+) -> BilledCache {
+    // Read the upstream's own cache report BEFORE the scrub deletes/zeroes it.
+    let engine_reported = upstream_cached_tokens(usage);
+    // Scrub so nothing an upstream reported (e.g. a provider-dialect cache field on an
+    // unsanitized model) survives alongside the fields we're about to write.
     scrub_provider_cache_fields(usage);
 
     // Drift alarm (exact counting only): our chat-templated full-prompt count vs the
@@ -286,6 +313,22 @@ fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &Cache
         }
     }
 
+    // Engine-cache passthrough, gated on `allow_implicit` = the request sent no markers
+    // (arming picks the paradigm, never cache values).
+    // A marked request is explicit whatever its split turned out to be — zeros included —
+    // so its cache numbers are always explainable from its own markers. Capped to
+    // `prompt_tokens` (an engine value above the prompt is upstream nonsense — the cap
+    // is the distrust guard); without a `prompt_tokens` to bound it there is no
+    // passthrough.
+    let mut read_source = (read > 0).then_some(CacheReadSource::Module);
+    if allow_implicit && let (Some(engine), Some(prompt)) = (engine_reported, usage.get("prompt_tokens").and_then(Value::as_u64)) {
+        let engine_capped = engine.min(prompt);
+        if engine_capped > 0 {
+            read = engine_capped;
+            read_source = Some(CacheReadSource::Engine);
+        }
+    }
+
     let details = usage.entry("prompt_tokens_details").or_insert_with(|| serde_json::json!({}));
     if let Some(details_obj) = details.as_object_mut() {
         details_obj.insert("cached_tokens".to_string(), serde_json::json!(read));
@@ -300,17 +343,27 @@ fn splice_cache_fields(usage: &mut serde_json::Map<String, Value>, stats: &Cache
             "ephemeral_24h_input_tokens": c24,
         }),
     );
+    BilledCache {
+        stats: CacheStats {
+            read,
+            creation_5m: c5,
+            creation_1h: c1,
+            creation_24h: c24,
+            ..*stats
+        },
+        read_source,
+    }
 }
 
-/// Inject the cache stats into a non-streaming chat-completion JSON body. Returns the
-/// rewritten body, or `None` if it can't be parsed or has no `usage` object.
-pub fn inject_into_usage_json(body: &[u8], stats: &CacheStats) -> Option<Bytes> {
+/// Inject the cache stats into a non-streaming chat-completion JSON body. Returns
+/// the rewritten body and capped billing counts, or `None` if there is no usage.
+pub fn inject_into_usage_json(body: &[u8], stats: &CacheStats, allow_implicit: bool) -> Option<(Bytes, BilledCache)> {
     let mut json: Value = serde_json::from_slice(body).ok()?;
     let obj = json.as_object_mut()?;
     let model = obj.get("model").and_then(Value::as_str).map(String::from);
     let usage = obj.get_mut("usage")?.as_object_mut()?;
-    splice_cache_fields(usage, stats, model.as_deref());
-    serde_json::to_vec(&json).ok().map(Bytes::from)
+    let billed = splice_cache_fields(usage, stats, model.as_deref(), allow_implicit);
+    serde_json::to_vec(&json).ok().map(|body| (Bytes::from(body), billed))
 }
 
 /// The outcome of scanning one SSE body chunk: the (optionally) rewritten bytes plus the
@@ -325,6 +378,8 @@ pub(crate) struct SseScan {
     pub saw_usage: bool,
     /// The upstream's `cached_tokens` from that usage frame, read before any edit.
     pub upstream_cached_tokens: Option<u64>,
+    /// Capped counts + read source, populated only when cache usage was successfully emitted.
+    pub billing_stats: Option<BilledCache>,
 }
 
 /// How [`scan_edit_sse`] treats the (single) usage frame it finds.
@@ -333,8 +388,10 @@ pub(crate) enum UsageEdit<'a> {
     /// Collect the billing signals only, never rewrite — used by the streaming layer to probe
     /// frames before/after the one it edits.
     Probe,
-    /// Splice the caching module's stats into the usage frame (active, cache-enabled request).
-    Inject(&'a CacheStats),
+    /// Splice the caching module's stats into the usage frame (active, cache-enabled
+    /// request) — or, for an UNARMED request, the engine-cache passthrough
+    /// (see `splice_cache_fields`).
+    Inject { stats: &'a CacheStats, allow_implicit: bool },
     /// Remove provider-written cache fields from the usage frame (inactive request — the
     /// customer must not see an upstream's own cache accounting).
     Scrub,
@@ -360,6 +417,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
             saw_error: false,
             saw_usage: false,
             upstream_cached_tokens: None,
+            billing_stats: None,
         };
     };
 
@@ -384,6 +442,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
             saw_error,
             saw_usage,
             upstream_cached_tokens: upstream,
+            billing_stats: None,
         };
     }
 
@@ -392,6 +451,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
     let mut saw_error = false;
     let mut saw_usage = false;
     let mut upstream = None;
+    let mut billing_stats = None;
 
     let mut first = true;
     for line in body_str.split('\n') {
@@ -417,17 +477,19 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
                     // (split on '\n') ends with '\r', which the reserialized JSON drops —
                     // re-append it so we don't emit a lone '\n' amid '\r\n' framing.
                     let has_cr = line.ends_with('\r');
+                    let mut billed = None;
                     let changed = match edit {
                         // Probe returned on the fast path above; a frame can't reach here.
                         UsageEdit::Probe => false,
-                        UsageEdit::Inject(stats) => {
-                            splice_cache_fields(usage_obj, stats, model.as_deref());
+                        UsageEdit::Inject { stats, allow_implicit } => {
+                            billed = Some(splice_cache_fields(usage_obj, stats, model.as_deref(), allow_implicit));
                             true
                         }
                         // A clean frame needs no rewrite — keep the original bytes.
                         UsageEdit::Scrub => scrub_provider_cache_fields(usage_obj),
                     };
                     if changed && let Ok(reserialized) = serde_json::to_string(&chunk) {
+                        billing_stats = billed;
                         out.push_str("data: ");
                         out.push_str(&reserialized);
                         if has_cr {
@@ -447,6 +509,7 @@ pub(crate) fn scan_edit_sse(body: &[u8], edit: UsageEdit) -> SseScan {
         saw_error,
         saw_usage,
         upstream_cached_tokens: upstream,
+        billing_stats,
     }
 }
 
@@ -468,8 +531,8 @@ fn sse_data_json(line: &str) -> Option<Value> {
 /// Inject the cache stats into the terminal usage frame of an SSE body. `None` if no usage
 /// frame is found. (Thin wrapper over [`scan_edit_sse`]; the streaming path uses the
 /// scan directly to also collect the commit-gate signals.)
-pub fn inject_into_sse_body(body: &[u8], stats: &CacheStats) -> Option<Bytes> {
-    scan_edit_sse(body, UsageEdit::Inject(stats)).rewritten
+pub fn inject_into_sse_body(body: &[u8], stats: &CacheStats, allow_implicit: bool) -> Option<Bytes> {
+    scan_edit_sse(body, UsageEdit::Inject { stats, allow_implicit }).rewritten
 }
 
 /// Scrub provider cache fields from the terminal usage frame of an SSE body. `None` when the
@@ -484,7 +547,12 @@ pub fn scrub_sse_body(body: &[u8]) -> Option<Bytes> {
 /// can't be buffered becomes a structured 5xx with a `false` gate. Streaming responses are handled
 /// separately by the cache layer, which defers the classify-await into the SSE stream so it never
 /// holds the first token.
-pub async fn inject_into_response_nonstreaming(response: Response, stats: &CacheStats, capture: &UpstreamCachedTokens) -> (Response, bool) {
+pub async fn inject_into_response_nonstreaming(
+    response: Response,
+    stats: &CacheStats,
+    capture: &UpstreamCachedTokens,
+    allow_implicit: bool,
+) -> (Response, bool) {
     let status_ok = response.status().is_success();
 
     // Only JSON can carry a chat-completion `usage`; don't buffer explicitly non-JSON bodies
@@ -528,8 +596,11 @@ pub async fn inject_into_response_nonstreaming(response: Response, stats: &Cache
     if let Some(v) = read_upstream_cached_tokens_json(&body_bytes) {
         capture.set(v);
     }
-    match inject_into_usage_json(&body_bytes, stats) {
-        Some(rewritten) => {
+    match inject_into_usage_json(&body_bytes, stats, allow_implicit) {
+        Some((rewritten, billed)) => {
+            if let Some(capture) = parts.extensions.get::<CacheBilling>() {
+                capture.set(billed);
+            }
             let len = rewritten.len();
             parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
             // We emit plain JSON (parse succeeded), so drop any stale Content-Encoding.
@@ -645,6 +716,14 @@ mod tests {
         cell.set(9);
         assert_eq!(cell.get(), Some(5));
         assert_eq!(cell.clone().get(), Some(5), "clones share the cell");
+    }
+
+    /// A billed split whose read came from the module (the pre-passthrough expectation).
+    fn module_billed(stats: CacheStats) -> BilledCache {
+        BilledCache {
+            read_source: (stats.read > 0).then_some(CacheReadSource::Module),
+            stats,
+        }
     }
 
     fn stats() -> CacheStats {
@@ -853,7 +932,8 @@ mod tests {
     #[test]
     fn inject_non_streaming_adds_cache_fields() {
         let body = serde_json::json!({"usage":{"prompt_tokens":2000,"completion_tokens":5}}).to_string();
-        let out = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false).unwrap();
+        assert_eq!(billed, module_billed(stats()));
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["prompt_tokens"], 2000, "total preserved");
         assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 1024);
@@ -868,7 +948,8 @@ mod tests {
         // the engine's prompt_tokens (1000). The customer must never see an impossible
         // split — the read is capped to fit, mirroring the billing cap exactly.
         let body = serde_json::json!({"usage":{"prompt_tokens":1000,"completion_tokens":5}}).to_string();
-        let out = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false).unwrap();
+        assert_eq!(billed, module_billed(CacheStats { read: 940, ..stats() }));
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["prompt_tokens"], 1000, "engine total preserved");
         assert_eq!(v["usage"]["cache_read_input_tokens"], 940, "read capped to prompt - creations");
@@ -882,7 +963,8 @@ mod tests {
         // list price, so the reported usage shows no cache activity either — the two views
         // must agree.
         let body = serde_json::json!({"usage":{"prompt_tokens":50,"completion_tokens":5}}).to_string();
-        let out = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &stats(), false).unwrap();
+        assert_eq!(billed, BilledCache::default());
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["usage"]["cache_read_input_tokens"], 0);
         assert_eq!(v["usage"]["cache_creation_input_tokens"], 0);
@@ -893,7 +975,217 @@ mod tests {
     #[test]
     fn inject_non_streaming_none_when_no_usage() {
         let body = serde_json::json!({"choices":[]}).to_string();
-        assert!(inject_into_usage_json(body.as_bytes(), &stats()).is_none());
+        assert!(inject_into_usage_json(body.as_bytes(), &stats(), false).is_none());
+    }
+
+    #[test]
+    fn streaming_billing_metadata_matches_emitted_capped_usage() {
+        for (prompt, expected) in [
+            (2000, module_billed(stats())),
+            (1000, module_billed(CacheStats { read: 940, ..stats() })),
+            (50, BilledCache::default()),
+        ] {
+            let sse = format!("data: {{\"usage\":{{\"prompt_tokens\":{prompt}}}}}\n\ndata: [DONE]\n\n");
+            let scan = scan_edit_sse(
+                sse.as_bytes(),
+                UsageEdit::Inject {
+                    stats: &stats(),
+                    allow_implicit: false,
+                },
+            );
+            assert_eq!(scan.billing_stats, Some(expected));
+            let body = String::from_utf8(scan.rewritten.unwrap().to_vec()).unwrap();
+            let usage = sse_data_json(body.lines().next().unwrap()).unwrap()["usage"].clone();
+            assert_eq!(usage["cache_read_input_tokens"], expected.stats.read);
+            assert_eq!(usage["cache_creation_input_tokens"], expected.stats.creation_total());
+            assert!(scan_edit_sse(sse.as_bytes(), UsageEdit::Scrub).billing_stats.is_none());
+        }
+        assert!(
+            scan_edit_sse(
+                b"data: {\"choices\":[]}\n\n",
+                UsageEdit::Inject {
+                    stats: &stats(),
+                    allow_implicit: false
+                }
+            )
+            .billing_stats
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn engine_passthrough_bills_the_upstream_hit_on_unmarked_requests() {
+        // Zero module stats (unmarked request on a tariffed model) + an engine-reported
+        // hit → the hit becomes the billed, customer-visible read; no creations.
+        let body = serde_json::json!({"usage":{
+            "prompt_tokens": 1000,
+            "prompt_tokens_details": {"cached_tokens": 687}
+        }})
+        .to_string();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true).unwrap();
+        assert_eq!(billed.stats.read, 687);
+        assert_eq!(billed.stats.creation_total(), 0);
+        assert_eq!(billed.read_source, Some(CacheReadSource::Engine));
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 687);
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 687);
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 0);
+    }
+
+    #[test]
+    fn armed_requests_stay_on_module_stats_never_mixed_with_engine() {
+        // One paradigm per request: a module read (explicit caching in action) is
+        // deterministic and final, even when the engine reports a LARGER hit (e.g. a
+        // marker pinned on a short prefix while the engine cached the whole
+        // conversation). Predictable beats occasionally-bigger.
+        let module = CacheStats {
+            read: 200,
+            ..Default::default()
+        };
+        let body = serde_json::json!({"usage":{
+            "prompt_tokens": 1000,
+            "prompt_tokens_details": {"cached_tokens": 800}
+        }})
+        .to_string();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &module, false).unwrap();
+        assert_eq!((billed.stats.read, billed.read_source), (200, Some(CacheReadSource::Module)));
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 200, "customer sees the module read");
+
+        // Engine smaller than the module read → module, trivially.
+        let module = CacheStats {
+            read: 500,
+            ..Default::default()
+        };
+        let body = serde_json::json!({"usage":{
+            "prompt_tokens": 1000,
+            "prompt_tokens_details": {"cached_tokens": 200}
+        }})
+        .to_string();
+        let (_, billed) = inject_into_usage_json(body.as_bytes(), &module, false).unwrap();
+        assert_eq!((billed.stats.read, billed.read_source), (500, Some(CacheReadSource::Module)));
+    }
+
+    #[test]
+    fn write_legs_are_explicit_and_never_mixed_with_engine_reads() {
+        // A write leg (module creation, read 0) IS explicit caching in action — the
+        // customer pays the write premium for a guaranteed read next time. The engine's
+        // own hit on the same request is ignored: granting it would mix paradigms.
+        let module = CacheStats {
+            creation_1h: 300,
+            ..Default::default()
+        };
+        let body = serde_json::json!({"usage":{
+            "prompt_tokens": 1000,
+            "prompt_tokens_details": {"cached_tokens": 900}
+        }})
+        .to_string();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &module, false).unwrap();
+        assert_eq!(billed.stats.read, 0, "no engine read on an explicit write leg");
+        assert_eq!(billed.stats.creation_1h, 300, "the write bills as normal");
+        assert_eq!(billed.read_source, None);
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 0);
+        assert_eq!(v["usage"]["cache_creation_input_tokens"], 300);
+        assert_eq!(
+            v["usage"]["prompt_tokens_details"]["cached_tokens"], 0,
+            "engine hit not shown either"
+        );
+    }
+
+    #[test]
+    fn engine_passthrough_distrusts_nonsense_and_needs_a_prompt_count() {
+        // An engine value above the prompt is upstream nonsense → capped to the prompt.
+        let body = serde_json::json!({"usage":{
+            "prompt_tokens": 100,
+            "prompt_tokens_details": {"cached_tokens": 5000}
+        }})
+        .to_string();
+        let (_, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true).unwrap();
+        assert_eq!((billed.stats.read, billed.read_source), (100, Some(CacheReadSource::Engine)));
+
+        // No `prompt_tokens` to bound it → no passthrough (module split unchanged).
+        let body = serde_json::json!({"usage":{
+            "completion_tokens": 5,
+            "prompt_tokens_details": {"cached_tokens": 687}
+        }})
+        .to_string();
+        let (_, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true).unwrap();
+        assert_eq!((billed.stats.read, billed.read_source), (0, None));
+    }
+
+    #[test]
+    fn provider_dialect_cache_fields_are_scrubbed_and_never_read() {
+        // Every upstream we serve through speaks the standard shape; a provider-dialect
+        // field (e.g. a flat `prompt_cache_hit_tokens`) is deleted from the customer
+        // body by the scrub AND ignored by the passthrough — one interface throughout.
+        let body = serde_json::json!({"usage":{
+            "prompt_tokens": 1000,
+            "prompt_cache_hit_tokens": 400
+        }})
+        .to_string();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), true).unwrap();
+        assert_eq!((billed.stats.read, billed.read_source), (0, None));
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert!(v["usage"].get("prompt_cache_hit_tokens").is_none(), "dialect field scrubbed");
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 0);
+    }
+
+    #[test]
+    fn armed_requests_with_nothing_cacheable_stay_deterministically_zero() {
+        // The confusion case the paradigm split exists for: markers sent, but nothing
+        // was cacheable (below the minimum prefix, tokenizer not onboarded, degraded
+        // classify — all reach here as zero module stats but allow_implicit = false). The answer
+        // stays "no caching: your prefix is below the minimum" — deterministic zeros,
+        // NOT an engine hit that comes and goes with scheduling.
+        let body = serde_json::json!({"usage":{
+            "prompt_tokens": 1000,
+            "prompt_tokens_details": {"cached_tokens": 687}
+        }})
+        .to_string();
+        let (out, billed) = inject_into_usage_json(body.as_bytes(), &CacheStats::default(), false).unwrap();
+        assert_eq!((billed.stats.read, billed.read_source), (0, None));
+        let v: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(v["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+        assert_eq!(v["usage"]["cache_read_input_tokens"], 0);
+    }
+
+    #[test]
+    fn corrupt_module_split_stays_on_explicit_list_price_semantics() {
+        // Write counts alone exceed the prompt → the module split is distrusted and
+        // zeroed (list-price semantics). The request was ARMED, so the engine's report
+        // does not kick in — explicit stays explicit even when its split collapses.
+        let module = CacheStats {
+            read: 10,
+            creation_1h: 200,
+            ..Default::default()
+        };
+        let body = serde_json::json!({"usage":{
+            "prompt_tokens": 50,
+            "prompt_tokens_details": {"cached_tokens": 40}
+        }})
+        .to_string();
+        let (_, billed) = inject_into_usage_json(body.as_bytes(), &module, false).unwrap();
+        assert_eq!(billed.stats.creation_total(), 0, "corrupt module writes zeroed");
+        assert_eq!((billed.stats.read, billed.read_source), (0, None));
+    }
+
+    #[test]
+    fn streaming_engine_passthrough_edits_the_terminal_frame() {
+        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"usage\":{\"prompt_tokens\":1000,\"prompt_tokens_details\":{\"cached_tokens\":687}}}\n\ndata: [DONE]\n\n";
+        let scan = scan_edit_sse(
+            sse.as_bytes(),
+            UsageEdit::Inject {
+                stats: &CacheStats::default(),
+                allow_implicit: true,
+            },
+        );
+        let billed = scan.billing_stats.unwrap();
+        assert_eq!((billed.stats.read, billed.read_source), (687, Some(CacheReadSource::Engine)));
+        let body = String::from_utf8(scan.rewritten.unwrap().to_vec()).unwrap();
+        assert!(body.contains("\"cache_read_input_tokens\":687"), "got: {body}");
+        assert!(body.contains("\"cached_tokens\":687"), "got: {body}");
+        assert!(body.contains("data: [DONE]"));
     }
 
     #[test]
@@ -901,7 +1193,7 @@ mod tests {
         // CRLF-framed stream: the rewritten usage frame must keep its trailing '\r' so the
         // '\r\n\r\n' event boundary stays intact (no lone '\n' amid CRLF).
         let sse = "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\r\n\r\ndata: [DONE]\r\n\r\n";
-        let out = inject_into_sse_body(sse.as_bytes(), &stats()).unwrap();
+        let out = inject_into_sse_body(sse.as_bytes(), &stats(), false).unwrap();
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cache_read_input_tokens\":1024"), "got: {s}");
         // The injected frame is still terminated by CRLF, not a bare LF.
@@ -912,7 +1204,7 @@ mod tests {
     #[test]
     fn inject_sse_edits_only_terminal_usage_frame() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata: [DONE]\n\n";
-        let out = inject_into_sse_body(sse.as_bytes(), &stats()).unwrap();
+        let out = inject_into_sse_body(sse.as_bytes(), &stats(), false).unwrap();
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cached_tokens\":1024"));
         assert!(s.contains("\"cache_read_input_tokens\":1024"));
@@ -925,14 +1217,14 @@ mod tests {
     #[test]
     fn inject_sse_none_when_no_usage_frame() {
         let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
-        assert!(inject_into_sse_body(sse.as_bytes(), &stats()).is_none());
+        assert!(inject_into_sse_body(sse.as_bytes(), &stats(), false).is_none());
     }
 
     #[test]
     fn inject_sse_handles_data_prefix_without_space() {
         // `data:{…}` (no space after the colon) is valid SSE and must still be injected.
         let sse = "data:{\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata:[DONE]\n\n";
-        let out = inject_into_sse_body(sse.as_bytes(), &stats()).expect("no-space data: frame is injected");
+        let out = inject_into_sse_body(sse.as_bytes(), &stats(), false).expect("no-space data: frame is injected");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cache_read_input_tokens\":1024"), "got: {s}");
     }
@@ -943,7 +1235,7 @@ mod tests {
         // deltas and `[DONE]` untouched. (The streaming orchestration — deferred classify resolve
         // + the commit gate — is exercised end-to-end in the layer tests.)
         let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000}}\n\ndata: [DONE]\n\n";
-        let out = inject_into_sse_body(body, &stats()).expect("usage frame present → edited");
+        let out = inject_into_sse_body(body, &stats(), false).expect("usage frame present → edited");
         let s = std::str::from_utf8(&out).unwrap();
         assert!(s.contains("\"cached_tokens\":1024"), "got: {s}");
         assert!(s.contains("data: [DONE]"), "DONE preserved");
@@ -953,7 +1245,10 @@ mod tests {
     #[test]
     fn inject_into_sse_body_none_without_usage() {
         let body = b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n";
-        assert!(inject_into_sse_body(body, &stats()).is_none(), "no usage frame → nothing to edit");
+        assert!(
+            inject_into_sse_body(body, &stats(), false).is_none(),
+            "no usage frame → nothing to edit"
+        );
     }
 
     #[tokio::test]
@@ -965,7 +1260,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(serde_json::json!({"error":{"message":"bad request"}}).to_string()))
             .unwrap();
-        let (_out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default()).await;
+        let (_out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default(), false).await;
         assert!(!billing_ok, "error body → no commit");
     }
 
@@ -977,7 +1272,7 @@ mod tests {
             .header("content-type", "application/json")
             .body(Body::from(serde_json::json!({"usage":{"prompt_tokens":2000}}).to_string()))
             .unwrap();
-        let (out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default()).await;
+        let (out, billing_ok) = inject_into_response_nonstreaming(resp, &stats(), &UpstreamCachedTokens::default(), false).await;
         assert!(billing_ok, "2xx with usage → commit allowed");
         let collected = axum::body::to_bytes(out.into_body(), usize::MAX).await.unwrap();
         let s = std::str::from_utf8(&collected).unwrap();
@@ -1034,7 +1329,7 @@ mod tests {
             "cache_discount": 0.5
         }})
         .to_string();
-        let out = inject_into_usage_json(body.as_bytes(), &stats()).unwrap();
+        let (out, _) = inject_into_usage_json(body.as_bytes(), &stats(), false).unwrap();
         let v: Value = serde_json::from_slice(&out).unwrap();
         let usage = v["usage"].as_object().unwrap();
         assert!(!usage.contains_key("prompt_cache_hit_tokens"));

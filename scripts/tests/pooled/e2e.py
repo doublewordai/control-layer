@@ -26,6 +26,12 @@ from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 
+from schema_change import (
+    characterize_stale_plans,
+    characterize_returning_and_type_changes,
+    verify_models_schema_change,
+)
+
 LEADER_LOCK = 0x4457435450524F42
 
 
@@ -247,8 +253,7 @@ def verify_scoped_identity(direct, pooled_dsn, main_role):
         ).fetchone()[0],
         "Fusillade does not own its schema",
     )
-    drift = direct.execute(
-        """
+    drift = direct.execute("""
         SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace
         WHERE n.nspname='fusillade' AND c.relowner <> current_user::regrole
         UNION ALL
@@ -257,8 +262,7 @@ def verify_scoped_identity(direct, pooled_dsn, main_role):
         UNION ALL
         SELECT t.typname FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace
         WHERE n.nspname='fusillade' AND t.typowner <> current_user::regrole
-        """
-    ).fetchall()
+        """).fetchall()
     check(not drift, f"Fusillade object ownership drift: {drift}")
     check(
         direct.execute("SELECT count(*) FROM fusillade._sqlx_migrations").fetchone()[0]
@@ -864,6 +868,25 @@ ignore_startup_parameters=extra_float_digits
             "PASS: shared application role retains public schema without CREATEROLE",
             flush=True,
         )
+        # Keep the hostile reset mode above for session-routing regressions. This
+        # second phase models production prepared statements surviving clients.
+        ini.write_text(
+            ini.read_text().replace(
+                "server_reset_query_always=1", "server_reset_query_always=0"
+            )
+        )
+        pool_admin.execute("RELOAD")
+        eventually(
+            "pooler retains prepared statements between transactions",
+            lambda: any(
+                row["key"] == "server_reset_query_always" and row["value"] == "0"
+                for row in pool_admin.execute("SHOW CONFIG").fetchall()
+            ),
+        )
+        characterize_stale_plans(direct, dsn(roles[0], True))
+        characterize_returning_and_type_changes(direct, dsn(roles[0], True))
+        verify_models_schema_change(app, direct)
+
     print("PASS: all pooled application E2E checks", flush=True)
 
 

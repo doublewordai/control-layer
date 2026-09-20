@@ -60,6 +60,21 @@ pub(crate) struct CacheTariffRow {
     pub valid_until: Option<DateTime<Utc>>,
 }
 
+/// An engine-sourced (implicit) cache read must never bill above list price: the customer
+/// sent no markers and never opted into cache pricing, so a read multiplier above 1 —
+/// accepted by tariff validation but a misconfiguration in practice (a surcharge for a
+/// cache hit) — clamps to 1 for these reads only. Module-sourced (explicit) reads keep
+/// the configured multiplier untouched. Shared by the live batcher and the recompute
+/// audit path so both price implicit reads identically.
+pub(crate) fn clamp_implicit_read_multiplier(mults: Option<CacheMultipliers>, read_source: Option<&str>) -> Option<CacheMultipliers> {
+    match (mults, read_source) {
+        (Some(m), Some(s)) if s == crate::prompt_cache::CacheReadSource::Engine.as_str() && m.read > Decimal::ONE => {
+            Some(CacheMultipliers { read: Decimal::ONE, ..m })
+        }
+        _ => mults,
+    }
+}
+
 /// The cache multipliers resolved for one request at a point in time.
 #[derive(Clone, Copy)]
 pub(crate) struct CacheMultipliers {
@@ -119,10 +134,13 @@ pub(crate) struct TariffInfo {
 /// resolving as-of a request's time yields the exact multipliers the live path billed
 /// with — and both callers must load it the same way or their answers drift. Models with
 /// no tariff history simply don't appear.
-pub(crate) async fn lookup_cache_tariffs(
-    pool: &sqlx::PgPool,
+pub(crate) async fn lookup_cache_tariffs<'e, E>(
+    executor: E,
     aliases: &[String],
-) -> Result<std::collections::HashMap<String, Vec<CacheTariffRow>>, sqlx::Error> {
+) -> Result<std::collections::HashMap<String, Vec<CacheTariffRow>>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     struct Row {
         alias: String,
         write_multiplier_5m: Decimal,
@@ -151,7 +169,7 @@ pub(crate) async fn lookup_cache_tariffs(
         "#,
         aliases
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
 
     let mut map: std::collections::HashMap<String, Vec<CacheTariffRow>> = std::collections::HashMap::new();

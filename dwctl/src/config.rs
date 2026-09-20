@@ -142,6 +142,9 @@ pub struct Config {
     pub model_sources: Vec<ModelSource>,
     /// Declarative model catalog applied transactionally during startup.
     pub model_provisioning: ModelProvisioningConfig,
+    /// Whether this process applies schema migrations at startup or only
+    /// verifies that the database is compatible. See [`MigrationsConfig`].
+    pub migrations: MigrationsConfig,
     /// Frontend metadata displayed in the UI
     pub metadata: Metadata,
     /// Payment provider configuration (Stripe, PayPal, etc.)
@@ -1187,13 +1190,43 @@ impl Default for RequestLimitsConfig {
 /// Onwards AI proxy configuration.
 ///
 /// Controls behavior of the onwards routing layer used for AI proxy requests.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OnwardsConfig {
+    /// Maximum pending bytes of an unfinished SSE event in the proxy, cache, and continuation layers.
+    /// Complete events are forwarded first.
+    /// Increase for providers that emit large tool-call events. Default: 65536.
+    pub sse_buffer_limit: usize,
     /// Enable strict mode with schema validation and typed handlers.
     /// When false (default), all requests are passed through transparently.
     /// When true, only known OpenAI API paths are accepted and validated.
     pub strict_mode: bool,
+    /// Public message returned for upstream 429 responses, including exhausted
+    /// retries. Does not affect local request or concurrency limit messages.
+    pub upstream_rate_limit_message: String,
+    /// Failover deadline for the first token of a realtime streamed response,
+    /// in milliseconds. While a model still has another provider to fail over
+    /// to, an attempt that hasn't produced response headers and (in strict
+    /// mode) a first SSE frame within this window is abandoned and the next
+    /// provider tried. The final attempt is never cut off, and fusillade daemon
+    /// traffic (batch, flex, background) is exempt. Default: 20000. AIMD's
+    /// separate 10-second latency budget records a later first token as a
+    /// breach without cutting it off; once breaches exceed the controller's
+    /// target rate, later requests shift to the alternates. Set to 0 to disable.
+    pub first_token_timeout_ms: u64,
+}
+
+impl Default for OnwardsConfig {
+    fn default() -> Self {
+        Self {
+            sse_buffer_limit: onwards::sse::DEFAULT_SSE_BUFFER_LIMIT,
+            strict_mode: false,
+            upstream_rate_limit_message:
+                "This is a shared best-effort endpoint, rate limited under load – retry with backoff. For production workloads that aren't latency-sensitive, try our async or batch tiers (https://docs.doubleword.ai/inference-api/batch-inference); for a dedicated real-time endpoint with SLAs, higher rate limits, and volume pricing, contact support@doubleword.ai."
+                    .to_string(),
+            first_token_timeout_ms: 20_000,
+        }
+    }
 }
 
 /// Cached-input pricing — the dwctl-owned cache tower layer. All cache configuration lives
@@ -2865,28 +2898,18 @@ impl Default for CreditsConfig {
     }
 }
 
-/// Analytics batching configuration.
-///
-/// The batcher uses a write-through strategy:
-/// 1. Block until at least one record arrives
-/// 2. Drain all available records (up to batch_size)
-/// 3. Write immediately (with retry on failure)
-///
-/// This minimizes latency at low load while getting batching efficiency at high load.
+/// Analytics outbox projection configuration.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AnalyticsConfig {
     /// Maximum number of records to write in a single batch.
-    /// At high load, records queue while writing, naturally forming larger batches.
+    /// Raw records are already durable before this batch is formed.
     /// Default: 100
     pub batch_size: usize,
-    /// Maximum number of retry attempts for failed batch writes.
-    /// After all retries are exhausted, the batch is dropped and an error is logged.
-    /// Default: 3
+    /// Deprecated and unused. Direct outbox inserts report failures immediately;
+    /// durable rows remain available for projector retries.
     pub max_retries: u32,
-    /// Base delay in milliseconds for exponential backoff between retries.
-    /// Actual delay is: base_delay * 2^attempt (e.g., 100ms, 200ms, 400ms for base=100).
-    /// Default: 100
+    /// Deprecated and unused. Kept so existing configuration still parses.
     pub retry_base_delay_ms: u64,
     /// Deprecated and unused: balance depletion notifications are now
     /// edge-triggered (one per zero crossing, sent by the charging writers),
@@ -3022,6 +3045,7 @@ impl Default for Config {
             secret_key: None,
             model_sources: vec![],
             model_provisioning: ModelProvisioningConfig::default(),
+            migrations: MigrationsConfig::default(),
             metadata: Metadata::default(),
             payment: None,
             auth: AuthConfig::default(),
@@ -3061,6 +3085,34 @@ impl Default for ModelSource {
             default_models: None,
         }
     }
+}
+
+/// What a process does about schema migrations when it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MigrationsMode {
+    /// Apply pending migrations before serving (local development, single
+    /// instance installs, tests). This is what every version before the
+    /// migration Job did.
+    #[default]
+    Run,
+    /// Never execute DDL. Verify that every migration this binary ships is
+    /// recorded in the database with a matching checksum, and refuse to start
+    /// otherwise. Migrations the database has *beyond* this binary are
+    /// accepted: that is what lets an older replica keep serving while a
+    /// newer release's additive migration is applied ahead of its rollout.
+    Check,
+}
+
+/// Schema migration policy for the serving process.
+///
+/// Deployments that run `dwctl migrate` as a pre-rollout Job set `mode:
+/// check` on the application pods so that a pod never runs DDL and a pod of
+/// the new release cannot become Ready before the migration Job succeeded.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct MigrationsConfig {
+    pub mode: MigrationsMode,
 }
 
 /// Startup model provisioning configuration.
@@ -4281,6 +4333,14 @@ auth:
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_onwards_sse_buffer_limit_config() {
+        let defaults: OnwardsConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaults.sse_buffer_limit, 65536);
+        let configured: OnwardsConfig = serde_json::from_str(r#"{"sse_buffer_limit":1048576}"#).unwrap();
+        assert_eq!(configured.sse_buffer_limit, 1048576);
     }
 
     #[test]

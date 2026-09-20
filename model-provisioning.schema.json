@@ -303,6 +303,17 @@
             "format": "int32"
           }
         },
+        "realtime_on_status": {
+          "description": "Extra statuses that fail over realtime traffic only. Omit to keep the\nvalue already stored for the model.",
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "integer",
+            "format": "int32"
+          }
+        },
         "with_replacement": {
           "type": "boolean",
           "default": false

@@ -22,7 +22,11 @@ fn test_balance_eligibility_reads_read_model_and_filters_deleted_users() {
 
     // Key deletion is not implied by user deletion, so the deleted-user guard
     // on the balance arm is load-bearing in both queries.
-    assert_eq!(source.matches("u.is_deleted = false AND EXISTS").count(), 2);
+    assert_eq!(source.matches("u.is_deleted = false AND (EXISTS (").count(), 2);
+    // Bulk sync must expose the flag lookup to the planner, rather than call
+    // the single-account function for every model/key pair.
+    assert_eq!(source.matches("FROM user_feature_flags f").count(), 2);
+    assert!(!source.contains("user_has_feature("));
 }
 
 // Helper function to create a test target
@@ -41,6 +45,7 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         fallback_enabled: false,
         fallback_on_rate_limit: false,
         fallback_on_status: Vec::new(),
+        fallback_realtime_on_status: Vec::new(),
         fallback_with_replacement: false,
         fallback_max_attempts: None,
         backoff_enabled: false,
@@ -49,6 +54,8 @@ fn create_test_target(model_name: &str, alias: &str, endpoint_url: &str) -> Onwa
         backoff_factor: 2.0,
         backoff_jitter: "full".to_string(),
         backoff_max_total_ms: None,
+        first_token_timeout_ms: None,
+        aimd: None,
         endpoint_api_key: None,
         auth_header_name: "Authorization".to_string(),
         auth_header_prefix: "Bearer ".to_string(),
@@ -550,6 +557,10 @@ async fn test_cache_shape_zero_data_retention_label_reflects_owner(pool: sqlx::P
         "ZDR-enabled owner's key must be labelled true"
     );
     assert_eq!(key_a_labels.get("purpose"), Some(&"realtime".to_string()));
+    assert_eq!(
+        key_a_labels.get("api_key_id"),
+        Some(&"20000000-0000-0000-0000-0000000000a1".to_string())
+    );
 
     let key_b_labels = targets.key_labels.get(KEY_B_SECRET).expect("user B's key should carry labels");
     assert_eq!(
@@ -621,6 +632,103 @@ async fn test_balance_change_toggles_paid_access_on_reload(pool: sqlx::PgPool) {
         pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_A_SECRET),
         "restored user regains paid-model access"
     );
+}
+
+// Contracted accounts retain paid access, but disabling the flag restores enforcement.
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
+async fn test_allow_negative_balance_toggles_paid_access(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+
+    let user_a: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
+    let tiers = RateLimitTiersConfig::default();
+    // Also meter a composite so both sync queries are exercised.
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id, name, input_price_per_token, output_price_per_token) SELECT id, 'contract-test', 1, 1 FROM deployed_models WHERE alias = 'composite-priority'")
+        .execute(&pool).await.unwrap();
+    sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1")
+        .bind(user_a)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let mut listener = sqlx::postgres::PgListener::connect_with(&pool).await.unwrap();
+    listener.listen("auth_config_changed").await.unwrap();
+    for state in [None, Some(true), Some(false), Some(true), None] {
+        let enabled = state.unwrap_or(false);
+        if let Some(value) = state {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(user_a).bind(value).execute(&pool).await.unwrap();
+        } else {
+            sqlx::query("DELETE FROM user_feature_flags WHERE user_id = $1")
+                .bind(user_a)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let notification = timeout(Duration::from_secs(5), listener.recv()).await.unwrap().unwrap();
+        assert!(notification.payload().starts_with("user_feature_flags:"));
+        let mut conn = pool.acquire().await.unwrap();
+        let keys = ApiKeys::new(&mut conn)
+            .get_api_keys_for_deployment_with_sufficient_credit("40000000-0000-0000-0000-000000000003".parse().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(keys.iter().any(|key| key.secret == KEY_A_SECRET), enabled);
+        let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+        for alias in ["metered-public", "composite-priority"] {
+            assert_eq!(
+                pool_has_key(targets.targets.get(alias).unwrap().value(), KEY_A_SECRET),
+                enabled,
+                "{alias}: flag={enabled}"
+            );
+            assert!(!pool_has_key(targets.targets.get(alias).unwrap().value(), KEY_B_SECRET));
+        }
+    }
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
+async fn test_allow_negative_balance_preserves_access_restrictions(pool: sqlx::PgPool) {
+    let tiers = RateLimitTiersConfig::default();
+    sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) SELECT id, 'ALLOW_NEGATIVE_BALANCE', true FROM users WHERE username = 'cache_user_b'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_B_SECRET));
+    assert!(!pool_has_key(targets.targets.get("regular-private").unwrap().value(), KEY_B_SECRET));
+
+    sqlx::query("UPDATE api_keys SET spend_limit = 1 WHERE secret = $1")
+        .bind(KEY_B_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO api_key_spend_checkpoints (api_key_id, total_spend, window_spend) SELECT id, 1, 1 FROM api_keys WHERE secret = $1",
+    )
+    .bind(KEY_B_SECRET)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(!pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_B_SECRET));
+
+    sqlx::query("UPDATE api_keys SET spend_limit = NULL, is_deleted = true WHERE secret = $1")
+        .bind(KEY_B_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(!pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_B_SECRET));
+
+    sqlx::query("UPDATE api_keys SET is_deleted = false WHERE secret = $1")
+        .bind(KEY_B_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET is_deleted = true WHERE username = 'cache_user_b'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    assert!(!pool_has_key(targets.targets.get("metered-public").unwrap().value(), KEY_B_SECRET));
 }
 
 /// Spending-cap gate: an exhausted scope loses paid-model access as a unit
@@ -800,10 +908,9 @@ async fn test_completions_pool_forces_priority_strategy(pool: sqlx::PgPool) {
         .unwrap();
     sqlx::query(
         "INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, enabled, sort_order, pool)
-         SELECT composite_model_id, deployed_model_id, 1, true, 0, 'completions'
+         SELECT composite_model_id, deployed_model_id, 1, true, sort_order, 'completions'
          FROM deployed_model_components
-         WHERE composite_model_id = '50000000-0000-0000-0000-000000000001' AND pool = 'default'
-         LIMIT 1",
+         WHERE composite_model_id = '50000000-0000-0000-0000-000000000001' AND pool = 'default'",
     )
     .execute(&pool)
     .await
@@ -823,6 +930,10 @@ async fn test_completions_pool_forces_priority_strategy(pool: sqlx::PgPool) {
         OnwardsLoadBalanceStrategy::Priority,
         "the completions pool is a failover list regardless of the composite's strategy"
     );
+    let named = composite.value().resolve(RequestClass::Completions);
+    assert_eq!(named.len(), 2);
+    assert!(!named.fallback().unwrap().aimd.as_ref().unwrap().enabled);
+    assert!(composite.value().default_pool().fallback().unwrap().aimd.is_none());
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
@@ -847,6 +958,23 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
         fallback.on_status,
         vec![429, 503],
         "explicit stored statuses must remain authoritative"
+    );
+    assert!(!composite_pool.default_pool().should_fallback_on_realtime_status(529));
+
+    sqlx::query("UPDATE deployed_models SET fallback_realtime_on_status = '{529}' WHERE alias = 'composite-priority'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let reloaded = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let reloaded = reloaded.targets.get("composite-priority").unwrap();
+    let reloaded_pool = reloaded.value().default_pool();
+    assert!(reloaded_pool.should_fallback_on_realtime_status(529));
+    assert!(reloaded_pool.should_fallback_on_realtime_status(503));
+    assert!(
+        !reloaded_pool.should_fallback_on_status(529),
+        "dispatched traffic ignores realtime-only statuses"
     );
 
     // Composite model has no tariff in this fixture, so it's free.
@@ -1320,6 +1448,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             fallback_enabled: None,
             fallback_on_rate_limit: None,
             fallback_on_status: None,
+            fallback_realtime_on_status: None,
             fallback_with_replacement: None,
             fallback_max_attempts: None,
             backoff_enabled: false,
@@ -1328,6 +1457,8 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             backoff_factor: 2.0,
             backoff_jitter: "full".to_string(),
             backoff_max_total_ms: None,
+            first_token_timeout_ms: None,
+            aimd: None,
             sanitize_responses: true,
             trusted: false,
             reasoning_translation_overrides: None,
@@ -1542,6 +1673,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             fallback_enabled: None,
             fallback_on_rate_limit: None,
             fallback_on_status: None,
+            fallback_realtime_on_status: None,
             fallback_with_replacement: None,
             fallback_max_attempts: None,
             backoff_enabled: false,
@@ -1550,6 +1682,8 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             backoff_factor: 2.0,
             backoff_jitter: "full".to_string(),
             backoff_max_total_ms: None,
+            first_token_timeout_ms: None,
+            aimd: None,
             allowed_batch_completion_windows: None,
             metadata: None,
             sanitize_responses: true,
@@ -1585,6 +1719,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             fallback_enabled: Some(true),
             fallback_on_rate_limit: Some(true),
             fallback_on_status: Some(vec![429, 499, 500, 502, 503, 504]),
+            fallback_realtime_on_status: None,
             fallback_with_replacement: None,
             allowed_batch_completion_windows: None,
             fallback_max_attempts: None,
@@ -1594,6 +1729,8 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             backoff_factor: 2.0,
             backoff_jitter: "full".to_string(),
             backoff_max_total_ms: None,
+            first_token_timeout_ms: None,
+            aimd: None,
             metadata: None,
             sanitize_responses: true,
             trusted: false,
@@ -1938,4 +2075,70 @@ async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool
     let regular = targets.targets.get("regular-public").expect("regular-public should exist");
     assert_eq!(regular.value().pool_count(), 1);
     assert!(regular.value().resolved_name(onwards::target::RequestClass::Completions).is_none());
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn aimd_and_first_token_deadline_survive_database_sync(pool: sqlx::PgPool) {
+    let config = serde_json::json!({"enabled":true,"latency_budget_ms":100,"breach_rate_target":0.1,"window_samples":20,
+        "min_samples":5,"share_step":0.05,"share_decay":0.5,"share_floor":0.1,"dwell_ms":1000});
+    sqlx::query(
+        "UPDATE deployed_models SET aimd = $1, first_token_timeout_ms = 200, fallback_enabled = true WHERE alias = 'composite-priority'",
+    )
+    .bind(config.clone())
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE deployed_models SET first_token_timeout_ms = 300, fallback_enabled = true WHERE alias = 'regular-public'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], true, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").unwrap();
+    let fallback = composite.value().default_pool().fallback().unwrap();
+    assert_eq!(fallback.first_token_timeout_ms, Some(200));
+    // A stored override written before newer AIMD members existed still loads:
+    // the members it omits take their defaults.
+    assert_eq!(
+        fallback.aimd.as_ref().unwrap(),
+        &serde_json::from_value::<onwards::aimd::AimdConfig>(config).unwrap()
+    );
+    let standard = targets.targets.get("regular-public").unwrap();
+    assert_eq!(
+        standard.value().default_pool().fallback().unwrap().first_token_timeout_ms,
+        Some(300)
+    );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
+async fn test_deleted_keys_excluded_from_deployment_lookup(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+
+    sqlx::query("INSERT INTO api_keys (name, secret, user_id, created_by, purpose) VALUES ('revoked-system', 'sk-revoked-system', $1, $1, 'realtime')")
+        .bind(uuid::Uuid::nil()).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) SELECT id, 'ALLOW_NEGATIVE_BALANCE', true FROM users")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE user_balance_checkpoints SET balance = -100")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Exercise the private-group, public-group, and unconditional system arms.
+    for deleted in [false, true] {
+        sqlx::query("UPDATE api_keys SET is_deleted = $1")
+            .bind(deleted)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for id in ["40000000-0000-0000-0000-000000000002", "40000000-0000-0000-0000-000000000003"] {
+            let mut conn = pool.acquire().await.unwrap();
+            let keys = ApiKeys::new(&mut conn)
+                .get_api_keys_for_deployment_with_sufficient_credit(id.parse().unwrap())
+                .await
+                .unwrap();
+            assert_eq!(keys.is_empty(), deleted, "deployment {id}: deleted={deleted}");
+        }
+    }
 }

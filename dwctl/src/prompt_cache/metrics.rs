@@ -86,7 +86,9 @@ pub fn record_lookup_duration(seconds: f64) {
 }
 
 /// Why a cache-enabled request cached nothing. `reason` ∈ `no_markers` | `unparseable`
-/// | `tokenizer_unmapped` | `tokenize_failed` | `count_mismatch` | `below_floor`.
+/// | `tokenizer_unmapped` | `tokenize_failed` | `count_mismatch` | `below_floor` |
+/// `blockless_route` (a route with no module-cacheable blocks, e.g. plain /completions —
+/// classification short-circuits before the body is parsed).
 /// (Non-enabled models / missing keys are counted by `record_request_outcome{outcome="inactive"}`.)
 pub fn record_skip(reason: &'static str) {
     counter!("dwctl_cache_skip_total", "reason" => reason).increment(1);
@@ -203,7 +205,9 @@ pub fn record_markers_rejected(reason: &'static str) {
 /// injected into the body) | `body_field_wins` (body already had a non-null top-level
 /// `cache_control`; explicit wins) | `invalid` (unrecognized value → 400) | `not_json` /
 /// `not_an_object` (nowhere to inject; onwards rejects the body downstream) |
-/// `reserialize_failed` (defensive: forwarded un-injected). Adoption/rollout signal for the
+/// `reserialize_failed` (defensive: forwarded un-injected) | `non_chat_ignored` (the param
+/// arrived on a non-chat cacheable route — stripped from the URI, otherwise ignored).
+/// Adoption/rollout signal for the
 /// param, distinct from `marker_requests` which counts the injected marker as body adoption.
 pub fn record_query_breakpoint(outcome: &'static str) {
     counter!("dwctl_cache_query_breakpoint_total", "outcome" => outcome).increment(1);
