@@ -82,7 +82,16 @@ impl<'a> DeployedModelEnricher<'a> {
         let model_aliases: Vec<String> = models.iter().map(|m| m.alias.clone()).collect();
 
         // Fetch all includes in parallel for maximum performance
-        let (groups_result, status_map, metrics_map, endpoints_map, pricing_tariffs_map, cache_tariffs_map, components_map) = tokio::join!(
+        let (
+            groups_result,
+            status_map,
+            metrics_map,
+            endpoints_map,
+            pricing_tariffs_map,
+            cache_tariffs_map,
+            class_cache_prices,
+            components_map,
+        ) = tokio::join!(
             // Groups query
             async {
                 if self.include_groups {
@@ -220,6 +229,19 @@ impl<'a> DeployedModelEnricher<'a> {
                     Ok(None)
                 }
             },
+            // Class cache prices are independent of the other enrichment reads.
+            async {
+                if self.include_pricing && !self.can_read_pricing {
+                    if let Some(account) = self.pricing_account {
+                        let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+                        return CacheTariffs::new(&mut conn)
+                            .get_class_prices_bulk(&model_ids, account)
+                            .await
+                            .map_err(Error::from);
+                    }
+                }
+                Ok(HashMap::new())
+            },
             // Components query (for composite models)
             async {
                 if self.include_components && self.can_read_composite_info {
@@ -246,16 +268,7 @@ impl<'a> DeployedModelEnricher<'a> {
             None => (None, None),
         };
         let cache_tariffs_map = cache_tariffs_map?;
-        let class_cache_prices = if self.include_pricing && !self.can_read_pricing {
-            if let Some(account) = self.pricing_account {
-                let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-                CacheTariffs::new(&mut conn).get_class_prices_bulk(&model_ids, account).await?
-            } else {
-                HashMap::new()
-            }
-        } else {
-            HashMap::new()
-        };
+        let class_cache_prices = class_cache_prices?;
 
         // Build enriched responses
         let mut enriched_models = Vec::with_capacity(models.len());

@@ -735,6 +735,18 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     // Query API keys with access to composite models (uses deployment_groups since composites are in deployed_models)
     let api_key_rows = sqlx::query!(
         r#"
+        WITH purposes(purpose) AS (VALUES ('realtime'), ('batch'), ('playground'), ('continuation'), ('platform')),
+        general_paid AS MATERIALIZED (
+            SELECT m.id, p.purpose, model_has_effective_paid_tariff(m.id, NULL, p.purpose) AS paid
+            FROM deployed_models m CROSS JOIN purposes p WHERE m.deleted = FALSE
+        ), account_paid AS MATERIALIZED (
+            SELECT t.deployed_model_id AS id, t.user_id, p.purpose,
+                   model_has_effective_paid_tariff(t.deployed_model_id, t.user_id, p.purpose) AS paid
+            FROM (SELECT DISTINCT deployed_model_id, user_id FROM model_tariffs
+                  WHERE user_id IS NOT NULL AND valid_from <= NOW()
+                    AND (valid_until IS NULL OR valid_until > NOW())) t
+            CROSS JOIN purposes p
+        )
         SELECT
             cm.id as composite_model_id,
             ak.id as api_key_id,
@@ -802,7 +814,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
                 )))
                 OR (
-                    NOT model_has_effective_paid_tariff(cm.id, ak.user_id, ak.purpose)
+                    NOT COALESCE((SELECT paid FROM account_paid WHERE id = cm.id AND user_id = ak.user_id AND purpose = ak.purpose),
+                                 (SELECT paid FROM general_paid WHERE id = cm.id AND purpose = ak.purpose), FALSE)
                 )
             )
             AND ak.is_deleted = false
@@ -826,7 +839,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                       AND root.spend_limit IS NOT NULL
                       AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
                       AND ck.window_spend >= root.spend_limit
-                      AND model_has_effective_paid_tariff(cm.id, ak.user_id, ak.purpose)
+                      AND COALESCE((SELECT paid FROM account_paid WHERE id = cm.id AND user_id = ak.user_id AND purpose = ak.purpose),
+                                 (SELECT paid FROM general_paid WHERE id = cm.id AND purpose = ak.purpose), FALSE)
                 )
             )
             -- Inference data plane only: platform (management) keys must never
@@ -1530,6 +1544,18 @@ pub async fn load_targets_from_db(
     // Note: We pass escalation_models to grant batch API keys access to escalation models
     let rows = sqlx::query!(
         r#"
+        WITH purposes(purpose) AS (VALUES ('realtime'), ('batch'), ('playground'), ('continuation'), ('platform')),
+        general_paid AS MATERIALIZED (
+            SELECT m.id, p.purpose, model_has_effective_paid_tariff(m.id, NULL, p.purpose) AS paid
+            FROM deployed_models m CROSS JOIN purposes p WHERE m.deleted = FALSE
+        ), account_paid AS MATERIALIZED (
+            SELECT t.deployed_model_id AS id, t.user_id, p.purpose,
+                   model_has_effective_paid_tariff(t.deployed_model_id, t.user_id, p.purpose) AS paid
+            FROM (SELECT DISTINCT deployed_model_id, user_id FROM model_tariffs
+                  WHERE user_id IS NOT NULL AND valid_from <= NOW()
+                    AND (valid_until IS NULL OR valid_until > NOW())) t
+            CROSS JOIN purposes p
+        )
         SELECT
             dm.id as deployment_id,
             dm.model_name,
@@ -1629,7 +1655,8 @@ pub async fn load_targets_from_db(
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
                 )))
                 OR (
-                    NOT model_has_effective_paid_tariff(dm.id, ak.user_id, ak.purpose)
+                    NOT COALESCE((SELECT paid FROM account_paid WHERE id = dm.id AND user_id = ak.user_id AND purpose = ak.purpose),
+                                 (SELECT paid FROM general_paid WHERE id = dm.id AND purpose = ak.purpose), FALSE)
                 )
             )
             AND ak.is_deleted = false
@@ -1653,7 +1680,8 @@ pub async fn load_targets_from_db(
                       AND root.spend_limit IS NOT NULL
                       AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
                       AND ck.window_spend >= root.spend_limit
-                      AND model_has_effective_paid_tariff(dm.id, ak.user_id, ak.purpose)
+                      AND COALESCE((SELECT paid FROM account_paid WHERE id = dm.id AND user_id = ak.user_id AND purpose = ak.purpose),
+                                 (SELECT paid FROM general_paid WHERE id = dm.id AND purpose = ak.purpose), FALSE)
                 )
             )
             -- Inference data plane only: platform (management) keys must never

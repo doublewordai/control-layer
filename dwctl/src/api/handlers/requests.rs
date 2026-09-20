@@ -218,6 +218,9 @@ pub async fn get_usage<P: PoolProvider>(
     // Resolve the target user *before* building the cache key — different
     // targets must never share a cache entry.
     let target_user_id = resolve_usage_target(&state, &current_user, query.user_id).await?;
+    // Usage is attributed to the billed account (API key user_id), not the key's
+    // human creator. A member drill-down reads that member's personal usage;
+    // substituting the viewer's active organisation would quote another account.
 
     // Build cache key: truncate dates to midnight UTC so preset windows always hit cache.
     // Skip cache for ranges under 30 days — the data moves too fast to cache usefully.

@@ -161,3 +161,79 @@ fn cache_class_deals_require_a_general_enablement_row_and_respect_history() {
     );
     assert!(resolve_cache_multipliers(&rows, now - chrono::Duration::hours(2), Some(account), Some("interactive")).is_none());
 }
+
+#[sqlx::test]
+async fn quotes_keep_matched_classes_and_ownerless_estimates_use_general_prices(pool: PgPool) {
+    use crate::db::handlers::{Tariffs, analytics::get_realtime_tariffs};
+    let account: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('review-org','review@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
+    let model: Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('review-model','review-model',true,$1) RETURNING id").bind(account).fetch_one(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,'general',3,3,'realtime')").bind(model).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window) VALUES ($1,$2,'standard','batch-deal',1,1,'batch','24h')").bind(model).bind(account).execute(&pool).await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let mut tariffs = Tariffs::new(&mut conn);
+    let quotes = tariffs.list_effective_for_account(&[model], account).await.unwrap();
+    assert_eq!(quotes.len(), 2, "a batch class must not duplicate the general realtime quote");
+    let general = quotes.iter().find(|q| q.name == "general").unwrap();
+    assert_eq!(general.serving_class, None, "fallback must retain the matched price's class");
+    let own = tariffs
+        .get_effective_pricing_at_timestamp(model, Some(account), "batch", Some("24h"), Some("standard"), Utc::now())
+        .await
+        .unwrap();
+    let unknown_owner = tariffs
+        .get_effective_pricing_at_timestamp(model, None, "batch", Some("24h"), Some("standard"), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(own, Some((Decimal::ONE, Decimal::ONE)));
+    assert_eq!(unknown_owner, Some((Decimal::from(3), Decimal::from(3))));
+    drop(conn);
+    sqlx::query("UPDATE deployed_models SET deleted = TRUE WHERE id = $1")
+        .bind(model)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        get_realtime_tariffs(&pool, account).await.unwrap()["review-model"],
+        (Decimal::from(3), Decimal::from(3)),
+        "historical usage retains a price after model deletion"
+    );
+}
+
+#[sqlx::test]
+async fn customer_price_sort_keeps_legacy_and_class_only_prices(pool: PgPool) {
+    use crate::api::models::deployments::ModelSortField;
+    use crate::db::handlers::deployments::DeploymentFilter;
+    use crate::db::handlers::{Deployments, Repository};
+    let account: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (username,email,auth_source) VALUES ('sort-review','sort-review@example.com','test') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut models = Vec::new();
+    for alias in ["legacy", "class-only", "unpriced"] {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ($1,$1,true,$2) RETURNING id",
+        )
+        .bind(alias)
+        .bind(account)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        models.push(id);
+    }
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token) VALUES ($1,'legacy',1,1)")
+        .bind(models[0])
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,$2,'interactive','class',2,2,'realtime')").bind(models[1]).bind(account).execute(&pool).await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let mut filter = DeploymentFilter::new(0, 100);
+    filter.sort_field = Some(ModelSortField::PriceFrom);
+    filter.pricing_account = Some(account);
+    let listed = Deployments::new(&mut conn).list(&filter).await.unwrap();
+    assert_eq!(
+        listed.iter().map(|m| m.alias.as_str()).collect::<Vec<_>>(),
+        vec!["legacy", "class-only", "unpriced"]
+    );
+}

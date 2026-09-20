@@ -372,7 +372,8 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
             AND NOT EXISTS (SELECT 1 FROM UNNEST($2::uuid[], $3::uuid[]) AS d(user_id, deployed_model_id)
                 WHERE d.user_id = mo.user_id AND d.deployed_model_id = mo.deployed_model_id)";
         let future: bool = sqlx::query_scalar(&format!(
-            "SELECT EXISTS (SELECT 1 FROM {table} t WHERE t.valid_from > $4 AND EXISTS (SELECT 1 {omitted}))"
+            "SELECT EXISTS (SELECT 1 FROM {table} t WHERE t.valid_from > $4
+             AND (t.valid_until IS NULL OR t.valid_until > t.valid_from) AND EXISTS (SELECT 1 {omitted}))"
         ))
         .bind(format!("{SOURCE_PREFIX}%"))
         .bind(&org_ids)
@@ -798,6 +799,8 @@ models:
         assert_eq!(active, 1);
         sqlx::query("INSERT INTO model_overlays(user_id,deployed_model_id,self_hosted_only) VALUES ('00000000-0000-0000-0000-000000000000',$1,true)").bind(model).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,'00000000-0000-0000-0000-000000000000','hand',1,1,'realtime')").bind(model).execute(&pool).await.unwrap();
+        // A cancelled future version must not permanently block removing its file.
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose,valid_from,valid_until) VALUES ($1,$2,'cancelled',1,1,'realtime',NOW()+INTERVAL '1 day',NOW())").bind(model).bind(org).execute(&pool).await.unwrap();
         fs::remove_file(directory.path().join("org.yaml")).unwrap();
         apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
         for table in ["model_tariffs", "model_cache_tariffs"] {

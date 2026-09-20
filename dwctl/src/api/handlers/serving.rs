@@ -59,6 +59,8 @@ pub async fn get_organization_serving<P: PoolProvider>(
 ) -> Result<Json<OrganizationServingResponse>> {
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     require_current_platform_manager(&mut conn, user.id).await?;
+    drop(conn);
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let org = Users::new(&mut conn).get_by_id(id).await?.ok_or_else(|| Error::NotFound {
         resource: "Organization".to_string(),
         id: id.to_string(),
@@ -152,6 +154,8 @@ pub async fn list_model_overlays<P: PoolProvider>(
 ) -> Result<Json<Vec<OverlayResponse>>> {
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     require_current_platform_manager(&mut conn, user.id).await?;
+    drop(conn);
+    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM deployed_models WHERE id = $1 AND deleted = FALSE)")
         .bind(id)
         .fetch_one(&mut *conn)
