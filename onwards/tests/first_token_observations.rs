@@ -907,3 +907,55 @@ async fn aimd_unknown_outcomes_no_longer_block_later_decisions() {
     }
     assert_eq!(share(alias), Some(0.5));
 }
+
+#[tokio::test(start_paused = true)]
+async fn excluded_external_members_do_not_create_phantom_first_token_retries() {
+    LazyLock::force(&METRICS);
+    for eligible in [1, 2] {
+        let alias = format!("eligible-first-token-{eligible}");
+        let mut cfg = config(&alias, true);
+        let mut providers = vec![json!({"url":"https://preferred.example.com", "kind":"dynamo"})];
+        if eligible == 2 {
+            providers.push(json!({"url":"https://alternate.example.com", "kind":"hosted"}));
+        }
+        providers.push(json!({"url":"https://external.example.com", "kind":"external"}));
+        cfg["targets"][&alias]["providers"] = json!(providers);
+        let targets = Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap();
+        targets.key_labels.insert(
+            "private-key".into(),
+            HashMap::from([("account".into(), "private-account".into())]),
+        );
+        targets.accounts.insert(
+            "private-account".into(),
+            onwards::serving::AccountServing {
+                self_hosted_only: true,
+                ..Default::default()
+            },
+        );
+        let mock = MockHttpClient::new_timed_streaming_sequence(
+            StatusCode::OK,
+            (0..eligible)
+                .map(|_| vec![(Duration::from_millis(500), CONTENT.to_string())])
+                .collect(),
+        );
+        let server =
+            TestServer::new(build_router(AppState::with_client(targets, mock.clone()))).unwrap();
+        let response = server
+            .post("/v1/chat/completions")
+            .add_header("authorization", "Bearer private-key")
+            .json(&json!({"model":alias,"stream":true}))
+            .await;
+        response.assert_status_ok();
+        assert_eq!(
+            response.text(),
+            CONTENT,
+            "the final eligible stream must not be timed out"
+        );
+        assert_eq!(mock.get_requests().len(), eligible);
+        assert!(
+            mock.get_requests()
+                .iter()
+                .all(|request| !request.uri.contains("external.example.com"))
+        );
+    }
+}
