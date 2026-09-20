@@ -6,7 +6,7 @@ use crate::db::{
     errors::{DbError, Result},
     handlers::repository::Repository,
     models::deployments::{
-        DEFAULT_COMPONENT_POOL, DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse, DeploymentCreateDBRequest,
+        AimdConfig, DEFAULT_COMPONENT_POOL, DeploymentComponentCreateDBRequest, DeploymentComponentDBResponse, DeploymentCreateDBRequest,
         DeploymentDBResponse, DeploymentUpdateDBRequest, LoadBalancingStrategy, ModelStatus, ModelType, ProviderPricing,
         ProviderPricingFields, TrafficRuleAction, TrafficRuleDBRow,
     },
@@ -16,6 +16,7 @@ use crate::types::{DeploymentId, InferenceEndpointId, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sqlx::types::Json;
 use sqlx::{FromRow, PgConnection, Row, query_builder::QueryBuilder};
 use std::collections::HashMap;
 use tracing::instrument;
@@ -182,6 +183,7 @@ struct DeployedModel {
     pub fallback_enabled: Option<bool>,
     pub fallback_on_rate_limit: Option<bool>,
     pub fallback_on_status: Option<Vec<i32>>,
+    pub fallback_realtime_on_status: Vec<i32>,
     pub fallback_with_replacement: Option<bool>,
     pub fallback_max_attempts: Option<i32>,
     pub backoff_enabled: bool,
@@ -190,6 +192,8 @@ struct DeployedModel {
     pub backoff_factor: f64,
     pub backoff_jitter: String,
     pub backoff_max_total_ms: Option<i32>,
+    pub first_token_timeout_ms: Option<i64>,
+    pub aimd: Option<Json<AimdConfig>>,
     pub sanitize_responses: bool,
     pub trusted: bool,
     pub reasoning_translation_overrides: Option<serde_json::Value>,
@@ -197,6 +201,7 @@ struct DeployedModel {
     pub allowed_batch_completion_windows: Option<Vec<String>>,
     // Catalog metadata
     pub metadata: serde_json::Value,
+    pub provisioning_source: Option<String>,
 }
 
 pub struct Deployments<'c> {
@@ -247,6 +252,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             fallback_enabled: m.fallback_enabled.unwrap_or(true),
             fallback_on_rate_limit: m.fallback_on_rate_limit.unwrap_or(true),
             fallback_on_status: m.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
+            fallback_realtime_on_status: m.fallback_realtime_on_status,
             fallback_with_replacement: m.fallback_with_replacement.unwrap_or(false),
             fallback_max_attempts: m.fallback_max_attempts,
             backoff_enabled: m.backoff_enabled,
@@ -255,6 +261,8 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             backoff_factor: m.backoff_factor,
             backoff_jitter: m.backoff_jitter,
             backoff_max_total_ms: m.backoff_max_total_ms,
+            first_token_timeout_ms: m.first_token_timeout_ms,
+            aimd: m.aimd.map(|v| v.0),
             sanitize_responses: m.sanitize_responses,
             trusted: m.trusted,
             reasoning_translation_overrides: m.reasoning_translation_overrides.and_then(|value| {
@@ -264,6 +272,7 @@ impl From<(Option<ModelType>, DeployedModel)> for DeploymentDBResponse {
             }),
             allowed_batch_completion_windows: m.allowed_batch_completion_windows,
             metadata: m.metadata,
+            provisioning_source: m.provisioning_source,
         }
     }
 }
@@ -308,8 +317,7 @@ impl<'c> Repository for Deployments<'c> {
             .transpose()
             .map_err(anyhow::Error::from)?;
 
-        let model = sqlx::query_as!(
-            DeployedModel,
+        let model = sqlx::query_as::<_, DeployedModel>(
             r#"
             INSERT INTO deployed_models (
                 model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, created_at, updated_at,
@@ -321,50 +329,67 @@ impl<'c> Repository for Deployments<'c> {
                 sanitize_responses, trusted, allowed_batch_completion_windows,
                 metadata,
                 backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
-                reasoning_translation_overrides
+                reasoning_translation_overrides, first_token_timeout_ms, aimd, fallback_realtime_on_status
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38)
-            RETURNING *
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, COALESCE($41, '{}'))
+            RETURNING id, model_name, alias, display_name, description,
+                type, capabilities, created_by, hosted_on, status,
+                last_sync, deleted, created_at, updated_at, requests_per_second,
+                burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode,
+                downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
+                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement,
+                fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
+                backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, reasoning_translation_overrides,
+                allowed_batch_completion_windows, metadata, provisioning_source
             "#,
-            request.model_name.trim(),
-            request.alias.trim(),
-            request.display_name.as_deref(),
-            request.description,
-            model_type_str,
-            request.capabilities.as_ref().map(|caps| caps.as_slice()),
-            request.created_by,
-            request.hosted_on,
-            created_at,
-            updated_at,
-            request.requests_per_second,
-            request.burst_size,
-            request.capacity,
-            request.batch_capacity,
-            request.throughput,
-            pricing_fields.mode,
-            pricing_fields.input_price_per_token,
-            pricing_fields.output_price_per_token,
-            pricing_fields.hourly_rate,
-            pricing_fields.input_token_cost_ratio,
-            request.is_composite,
-            lb_strategy_str,
-            request.fallback_enabled,
-            request.fallback_on_rate_limit,
-            request.fallback_on_status.as_ref().map(|s| s.as_slice()),
-            request.fallback_with_replacement,
-            request.fallback_max_attempts,
-            request.sanitize_responses,
-            request.trusted,
-            request.allowed_batch_completion_windows.as_ref().map(|w| w.as_slice()),
-            request.metadata.as_ref().map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({}))).unwrap_or_else(|| serde_json::json!({})) as serde_json::Value,
-            request.backoff_enabled,                  // $32
-            request.backoff_initial_ms,               // $33
-            request.backoff_max_ms,                   // $34
-            request.backoff_factor,                   // $35
-            request.backoff_jitter.as_str(),          // $36
-            request.backoff_max_total_ms,             // $37
-            reasoning_translation_overrides,          // $38
         )
+        .bind(request.model_name.trim())
+        .bind(request.alias.trim())
+        .bind(request.display_name.as_deref())
+        .bind(request.description.as_deref())
+        .bind(model_type_str)
+        .bind(request.capabilities.as_deref())
+        .bind(request.created_by)
+        .bind(request.hosted_on)
+        .bind(created_at)
+        .bind(updated_at)
+        .bind(request.requests_per_second)
+        .bind(request.burst_size)
+        .bind(request.capacity)
+        .bind(request.batch_capacity)
+        .bind(request.throughput)
+        .bind(pricing_fields.mode)
+        .bind(pricing_fields.input_price_per_token)
+        .bind(pricing_fields.output_price_per_token)
+        .bind(pricing_fields.hourly_rate)
+        .bind(pricing_fields.input_token_cost_ratio)
+        .bind(request.is_composite)
+        .bind(lb_strategy_str)
+        .bind(request.fallback_enabled)
+        .bind(request.fallback_on_rate_limit)
+        .bind(request.fallback_on_status.as_deref())
+        .bind(request.fallback_with_replacement)
+        .bind(request.fallback_max_attempts)
+        .bind(request.sanitize_responses)
+        .bind(request.trusted)
+        .bind(request.allowed_batch_completion_windows.as_deref())
+        .bind(
+            request
+                .metadata
+                .as_ref()
+                .map(|metadata| serde_json::to_value(metadata).unwrap_or_else(|_| serde_json::json!({})))
+                .unwrap_or_else(|| serde_json::json!({})),
+        )
+        .bind(request.backoff_enabled)
+        .bind(request.backoff_initial_ms)
+        .bind(request.backoff_max_ms)
+        .bind(request.backoff_factor)
+        .bind(request.backoff_jitter.as_str())
+        .bind(request.backoff_max_total_ms)
+        .bind(reasoning_translation_overrides)
+        .bind(request.first_token_timeout_ms)
+        .bind(request.aimd.as_ref().map(Json))
+        .bind(request.fallback_realtime_on_status.as_deref())
         .fetch_one(&mut *self.db)
         .await?;
 
@@ -380,11 +405,10 @@ impl<'c> Repository for Deployments<'c> {
 
     #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
-        let model = sqlx::query_as!(
-            DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = $1",
-            id
+        let model = sqlx::query_as::<_, DeployedModel>(
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = $1",
         )
+            .bind(id)
             .fetch_optional(&mut *self.db)
             .await?;
 
@@ -392,6 +416,7 @@ impl<'c> Repository for Deployments<'c> {
             m.r#type.as_ref().and_then(|s| match s.as_str() {
                 "CHAT" => Some(ModelType::Chat),
                 "EMBEDDINGS" => Some(ModelType::Embeddings),
+                "RERANKER" => Some(ModelType::Reranker),
                 _ => None,
             })
         });
@@ -405,11 +430,10 @@ impl<'c> Repository for Deployments<'c> {
             return Ok(std::collections::HashMap::new());
         }
 
-        let deployments = sqlx::query_as!(
-            DeployedModel,
-            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides FROM deployed_models WHERE id = ANY($1)",
-            ids.as_slice()
+        let deployments = sqlx::query_as::<_, DeployedModel>(
+            "SELECT id, model_name, alias, display_name, description, type, capabilities, created_by, hosted_on, status, last_sync, deleted, created_at, updated_at, requests_per_second, burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode, downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite, lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement, fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, allowed_batch_completion_windows, metadata, reasoning_translation_overrides, provisioning_source FROM deployed_models WHERE id = ANY($1)",
         )
+            .bind(ids.as_slice())
             .fetch_all(&mut *self.db)
             .await?;
 
@@ -419,6 +443,7 @@ impl<'c> Repository for Deployments<'c> {
             let model_type = deployment.r#type.as_ref().and_then(|s| match s.as_str() {
                 "CHAT" => Some(ModelType::Chat),
                 "EMBEDDINGS" => Some(ModelType::Embeddings),
+                "RERANKER" => Some(ModelType::Reranker),
                 _ => None,
             });
             result.insert(deployment.id, DeploymentDBResponse::from((model_type, deployment)));
@@ -485,8 +510,7 @@ impl<'c> Repository for Deployments<'c> {
             request.burst_size
         );
 
-        let model = sqlx::query_as!(
-            DeployedModel,
+        let model = sqlx::query_as::<_, DeployedModel>(
             r#"
         UPDATE deployed_models SET
             model_name   = COALESCE($2, model_name),
@@ -606,82 +630,89 @@ impl<'c> Repository for Deployments<'c> {
                 ELSE reasoning_translation_overrides
             END,
 
+            first_token_timeout_ms = CASE WHEN $57 THEN $58 ELSE first_token_timeout_ms END,
+            aimd = CASE WHEN $59 THEN $60 ELSE aimd END,
+            fallback_realtime_on_status = COALESCE($61, fallback_realtime_on_status),
             updated_at = NOW()
         WHERE id = $1
-        RETURNING *
+        RETURNING id, model_name, alias, display_name, description,
+                type, capabilities, created_by, hosted_on, status,
+                last_sync, deleted, created_at, updated_at, requests_per_second,
+                burst_size, capacity, batch_capacity, throughput, downstream_pricing_mode,
+                downstream_input_price_per_token, downstream_output_price_per_token, downstream_hourly_rate, downstream_input_token_cost_ratio, is_composite,
+                lb_strategy, fallback_enabled, fallback_on_rate_limit, fallback_on_status, fallback_realtime_on_status, fallback_with_replacement,
+                fallback_max_attempts, backoff_enabled, backoff_initial_ms, backoff_max_ms, backoff_factor,
+                backoff_jitter, backoff_max_total_ms, first_token_timeout_ms, aimd, sanitize_responses, trusted, reasoning_translation_overrides,
+                allowed_batch_completion_windows, metadata, provisioning_source
         "#,
-            id,                                            // $1
-            request.model_name.as_ref().map(|s| s.trim()), // $2
-            request.alias.as_ref().map(|s| s.trim()),      // $3
-            // For description
-            request.description.is_some() as bool,                         // $4
-            request.description.as_ref().and_then(|inner| inner.as_ref()), // $5
-            // For model_type
-            request.model_type.is_some() as bool, // $6
-            model_type_str,                       // $7
-            // For capabilities
-            request.capabilities.is_some() as bool, // $8
-            capabilities_slice,                     // $9
-            status_str.as_deref(),                  // $10
-            // For last_sync
-            request.last_sync.is_some() as bool,                         // $11
-            request.last_sync.as_ref().and_then(|inner| inner.as_ref()), // $12
-            request.deleted,                                             // $13
-            // For rate limiting
-            request.requests_per_second.is_some() as bool,                         // $14
-            request.requests_per_second.as_ref().and_then(|inner| inner.as_ref()), // $15
-            request.burst_size.is_some() as bool,                                  // $16
-            request.burst_size.as_ref().and_then(|inner| inner.as_ref()),          // $17
-            // For capacity
-            request.capacity.is_some() as bool,                               // $18
-            request.capacity.as_ref().and_then(|inner| inner.as_ref()),       // $19
-            request.batch_capacity.is_some() as bool,                         // $20
-            request.batch_capacity.as_ref().and_then(|inner| inner.as_ref()), // $21
-            // For individual provider/downstream pricing fields
-            pricing_params.should_update_mode,   // $22
-            pricing_params.mode.as_deref(),      // $23
-            pricing_params.should_update_input,  // $24
-            pricing_params.input,                // $25
-            pricing_params.should_update_output, // $26
-            pricing_params.output,               // $27
-            pricing_params.should_update_hourly, // $28
-            pricing_params.hourly,               // $29
-            pricing_params.should_update_ratio,  // $30
-            pricing_params.ratio,                // $31
-            // For composite model fields
-            lb_strategy_str,                                                         // $32
-            request.fallback_enabled,                                                // $33
-            request.fallback_on_rate_limit,                                          // $34
-            request.fallback_on_status.as_ref().map(|s| s.as_slice()),               // $35
-            request.sanitize_responses,                                              // $36
-            request.throughput.is_some() as bool,                                    // $37
-            request.throughput.as_ref().and_then(|inner| inner.as_ref()),            // $38
-            request.fallback_with_replacement,                                       // $39
-            request.fallback_max_attempts.is_some() as bool,                         // $40
-            request.fallback_max_attempts.as_ref().and_then(|inner| inner.as_ref()), // $41
-            request.trusted,                                                         // $42
-            // Batch completion windows
-            request.allowed_batch_completion_windows.is_some() as bool, // $43
-            request.allowed_batch_completion_windows.as_ref().and_then(|inner| inner.as_deref()) as Option<&[String]>, // $44
-            // Catalog metadata
-            request.metadata.is_some() as bool, // $45
+        )
+        .bind(id)
+        .bind(request.model_name.as_deref().map(str::trim))
+        .bind(request.alias.as_deref().map(str::trim))
+        .bind(request.description.is_some())
+        .bind(request.description.as_ref().and_then(Option::as_deref))
+        .bind(request.model_type.is_some())
+        .bind(model_type_str)
+        .bind(request.capabilities.is_some())
+        .bind(capabilities_slice)
+        .bind(status_str.as_deref())
+        .bind(request.last_sync.is_some())
+        .bind(request.last_sync.as_ref().and_then(Option::as_ref))
+        .bind(request.deleted)
+        .bind(request.requests_per_second.is_some())
+        .bind(request.requests_per_second.as_ref().and_then(Option::as_ref))
+        .bind(request.burst_size.is_some())
+        .bind(request.burst_size.as_ref().and_then(Option::as_ref))
+        .bind(request.capacity.is_some())
+        .bind(request.capacity.as_ref().and_then(Option::as_ref))
+        .bind(request.batch_capacity.is_some())
+        .bind(request.batch_capacity.as_ref().and_then(Option::as_ref))
+        .bind(pricing_params.should_update_mode)
+        .bind(pricing_params.mode.as_deref())
+        .bind(pricing_params.should_update_input)
+        .bind(pricing_params.input)
+        .bind(pricing_params.should_update_output)
+        .bind(pricing_params.output)
+        .bind(pricing_params.should_update_hourly)
+        .bind(pricing_params.hourly)
+        .bind(pricing_params.should_update_ratio)
+        .bind(pricing_params.ratio)
+        .bind(lb_strategy_str)
+        .bind(request.fallback_enabled)
+        .bind(request.fallback_on_rate_limit)
+        .bind(request.fallback_on_status.as_deref())
+        .bind(request.sanitize_responses)
+        .bind(request.throughput.is_some())
+        .bind(request.throughput.as_ref().and_then(Option::as_ref))
+        .bind(request.fallback_with_replacement)
+        .bind(request.fallback_max_attempts.is_some())
+        .bind(request.fallback_max_attempts.as_ref().and_then(Option::as_ref))
+        .bind(request.trusted)
+        .bind(request.allowed_batch_completion_windows.is_some())
+        .bind(request.allowed_batch_completion_windows.as_ref().and_then(Option::as_deref))
+        .bind(request.metadata.is_some())
+        .bind(
             request
                 .metadata
                 .as_ref()
-                .map(|m| serde_json::to_value(m).unwrap_or_else(|_| serde_json::json!({})))
-                .unwrap_or_else(|| serde_json::json!({})) as serde_json::Value, // $46
-            request.display_name.as_deref(),    // $47
-            // Inter-attempt backoff
-            request.backoff_enabled,                                                // $48
-            request.backoff_initial_ms,                                             // $49
-            request.backoff_max_ms,                                                 // $50
-            request.backoff_factor,                                                 // $51
-            request.backoff_jitter.as_deref(),                                      // $52
-            request.backoff_max_total_ms.is_some() as bool,                         // $53
-            request.backoff_max_total_ms.as_ref().and_then(|inner| inner.as_ref()), // $54
-            request.reasoning_translation_overrides.is_some(),                      // $55
-            reasoning_translation_overrides,                                        // $56
+                .map(|metadata| serde_json::to_value(metadata).unwrap_or_else(|_| serde_json::json!({})))
+                .unwrap_or_else(|| serde_json::json!({})),
         )
+        .bind(request.display_name.as_deref())
+        .bind(request.backoff_enabled)
+        .bind(request.backoff_initial_ms)
+        .bind(request.backoff_max_ms)
+        .bind(request.backoff_factor)
+        .bind(request.backoff_jitter.as_deref())
+        .bind(request.backoff_max_total_ms.is_some())
+        .bind(request.backoff_max_total_ms.as_ref().and_then(Option::as_ref))
+        .bind(request.reasoning_translation_overrides.is_some())
+        .bind(reasoning_translation_overrides)
+        .bind(request.first_token_timeout_ms.is_some())
+        .bind(request.first_token_timeout_ms.flatten())
+        .bind(request.aimd.is_some())
+        .bind(request.aimd.as_ref().and_then(Option::as_ref).map(Json))
+        .bind(request.fallback_realtime_on_status.as_deref())
         .fetch_one(&mut *self.db)
         .await?;
 
@@ -698,9 +729,21 @@ impl<'c> Repository for Deployments<'c> {
 
     #[instrument(skip(self, filter), fields(limit = filter.limit, skip = filter.skip), err)]
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
-        // Use LEFT JOIN with inference_endpoints to enable searching by endpoint name
-        let mut query =
-            QueryBuilder::new("SELECT dm.* FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1");
+        // Explicit results keep prepared statements compatible with additive migrations,
+        // including server statements retained by a transaction pooler across clients.
+        // Use LEFT JOIN with inference_endpoints to enable searching by endpoint name.
+        let mut query = QueryBuilder::new(
+            "SELECT dm.id, dm.model_name, dm.alias, dm.display_name, dm.description,
+                dm.type, dm.capabilities, dm.created_by, dm.hosted_on, dm.status,
+                dm.last_sync, dm.deleted, dm.created_at, dm.updated_at, dm.requests_per_second,
+                dm.burst_size, dm.capacity, dm.batch_capacity, dm.throughput, dm.downstream_pricing_mode,
+                dm.downstream_input_price_per_token, dm.downstream_output_price_per_token, dm.downstream_hourly_rate, dm.downstream_input_token_cost_ratio, dm.is_composite,
+                dm.lb_strategy, dm.fallback_enabled, dm.fallback_on_rate_limit, dm.fallback_on_status, dm.fallback_realtime_on_status, dm.fallback_with_replacement,
+                dm.fallback_max_attempts, dm.backoff_enabled, dm.backoff_initial_ms, dm.backoff_max_ms, dm.backoff_factor,
+                dm.backoff_jitter, dm.backoff_max_total_ms, dm.first_token_timeout_ms, dm.aimd, dm.sanitize_responses, dm.trusted, dm.reasoning_translation_overrides,
+                dm.allowed_batch_completion_windows, dm.metadata, dm.provisioning_source
+             FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
+        );
 
         Self::apply_filters(&mut query, filter);
 
@@ -876,7 +919,7 @@ impl<'c> Deployments<'c> {
         // Build a CTE that selects the filtered model set (ignoring pagination,
         // sort, and search so facets reflect the full universe visible to this user).
         let mut query = QueryBuilder::new(
-            "WITH visible AS (SELECT dm.* FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
+            "WITH visible AS (SELECT dm.metadata, dm.capabilities, dm.type FROM deployed_models dm LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id WHERE 1=1",
         );
 
         let facets_filter = DeploymentFilter {
@@ -1744,8 +1787,8 @@ mod tests {
             .create(
                 &DeploymentCreateDBRequest::builder()
                     .created_by(user.id)
-                    .model_name("vendor/model-27b".to_string())
-                    .alias("vendor/model-27b".to_string())
+                    .model_name("Qwen/Qwen3.8-27B-FP8".to_string())
+                    .alias("Qwen/Qwen3.8-27B-FP8".to_string())
                     .display_name("Qwen3.8 27B".to_string())
                     .description("Optimized for multilingual retrieval".to_string())
                     .hosted_on(endpoint_id)
@@ -1754,12 +1797,14 @@ mod tests {
             .await
             .unwrap();
 
-        let results = repo
-            .list(&DeploymentFilter::new(0, 10).with_search("qwen3.8 27b".to_string()))
-            .await
-            .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].id, created.id);
+        for search in ["qwen3.8 27b", "qwen3.8-27b"] {
+            let results = repo
+                .list(&DeploymentFilter::new(0, 10).with_search(search.to_string()))
+                .await
+                .unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].id, created.id);
+        }
     }
 
     fn reasoning_translation_overrides() -> ReasoningTranslationOverrides {
@@ -4653,6 +4698,46 @@ mod tests {
         };
         tx.commit().await.unwrap();
         result
+    }
+
+    #[sqlx::test(migrations = false)]
+    async fn realtime_fallback_backfill_follows_server_error_failover(pool: PgPool) {
+        let migrator = crate::migrator();
+        let (before, backfill): (Vec<_>, Vec<_>) = migrator.iter().partition(|migration| migration.version < 145);
+        for migration in before {
+            sqlx::raw_sql(migration.sql.as_ref()).execute(&pool).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO deployed_models (model_name, alias, created_by, is_composite, fallback_on_status) VALUES
+                ('explicit', 'explicit', '00000000-0000-0000-0000-000000000000', TRUE, '{429,503}'),
+                ('class', 'class', '00000000-0000-0000-0000-000000000000', TRUE, '{5}'),
+                ('inherited', 'inherited', '00000000-0000-0000-0000-000000000000', TRUE, NULL),
+                ('no-5xx', 'no-5xx', '00000000-0000-0000-0000-000000000000', TRUE, '{429,499}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let backfill = backfill.first().expect("realtime fallback migration");
+        assert_eq!(backfill.version, 145);
+        sqlx::raw_sql(backfill.sql.as_ref()).execute(&pool).await.unwrap();
+
+        let statuses: BTreeMap<String, Vec<i32>> =
+            sqlx::query_as::<_, (String, Vec<i32>)>("SELECT alias, fallback_realtime_on_status FROM deployed_models")
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .collect();
+        let expected: BTreeMap<String, Vec<i32>> = [
+            ("class", vec![529]),
+            ("explicit", vec![529]),
+            ("inherited", vec![529]),
+            ("no-5xx", vec![]),
+        ]
+        .into_iter()
+        .map(|(alias, statuses)| (alias.to_string(), statuses))
+        .collect();
+        assert_eq!(statuses, expected);
     }
 
     #[sqlx::test]

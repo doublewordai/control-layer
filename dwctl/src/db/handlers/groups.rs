@@ -78,7 +78,7 @@ impl<'c> Repository for Groups<'c> {
             r#"
             INSERT INTO groups (name, description, created_by, source)
             VALUES ($1, $2, $3, 'native')
-            RETURNING *
+            RETURNING id, name, description, created_by, created_at, updated_at, source
             "#,
             request.name,
             request.description,
@@ -92,9 +92,13 @@ impl<'c> Repository for Groups<'c> {
 
     #[instrument(skip(self), fields(group_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
-        let group = sqlx::query_as!(Group, "SELECT * FROM groups WHERE id = $1", id)
-            .fetch_optional(&mut *self.db)
-            .await?;
+        let group = sqlx::query_as!(
+            Group,
+            "SELECT id, name, description, created_by, created_at, updated_at, source FROM groups WHERE id = $1",
+            id
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
 
         Ok(group.map(|g| GroupDBResponse {
             id: g.id,
@@ -145,7 +149,7 @@ impl<'c> Repository for Groups<'c> {
                 description = COALESCE($3, description),
                 updated_at = NOW()
             WHERE id = $1
-            RETURNING *
+            RETURNING id, name, description, created_by, created_at, updated_at, source
             "#,
             id,
             request.name,
@@ -162,7 +166,7 @@ impl<'c> Repository for Groups<'c> {
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         use sqlx::QueryBuilder;
 
-        let mut query = QueryBuilder::new("SELECT * FROM groups WHERE 1=1");
+        let mut query = QueryBuilder::new("SELECT id, name, description, created_by, created_at, updated_at, source FROM groups WHERE 1=1");
 
         // Add search filter if specified (case-insensitive substring match on name or description)
         if let Some(ref search) = filter.search {
@@ -198,9 +202,13 @@ impl<'c> Repository for Groups<'c> {
             return Ok(std::collections::HashMap::new());
         }
 
-        let groups = sqlx::query_as!(Group, "SELECT * FROM groups WHERE id = ANY($1)", ids.as_slice())
-            .fetch_all(&mut *self.db)
-            .await?;
+        let groups = sqlx::query_as!(
+            Group,
+            "SELECT id, name, description, created_by, created_at, updated_at, source FROM groups WHERE id = ANY($1)",
+            ids.as_slice()
+        )
+        .fetch_all(&mut *self.db)
+        .await?;
 
         let mut result = std::collections::HashMap::new();
 
@@ -274,7 +282,7 @@ impl<'c> Groups<'c> {
         let mut groups = sqlx::query_as!(
             Group,
             r#"
-            SELECT g.* FROM groups g
+            SELECT g.id, g.name, g.description, g.created_by, g.created_at, g.updated_at, g.source FROM groups g
             INNER JOIN user_groups ug ON g.id = ug.group_id
             WHERE ug.user_id = $1 AND g.id != '00000000-0000-0000-0000-000000000000'
             ORDER BY g.name
@@ -285,7 +293,7 @@ impl<'c> Groups<'c> {
         .await?;
 
         // Always add the Everyone group (it should always exist from migration)
-        let everyone_group = sqlx::query_as!(Group, "SELECT * FROM groups WHERE id = '00000000-0000-0000-0000-000000000000'")
+        let everyone_group = sqlx::query_as!(Group, "SELECT id, name, description, created_by, created_at, updated_at, source FROM groups WHERE id = '00000000-0000-0000-0000-000000000000'")
             .fetch_one(&mut *self.db)
             .await?;
 

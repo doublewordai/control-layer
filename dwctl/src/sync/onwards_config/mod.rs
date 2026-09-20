@@ -9,6 +9,7 @@ use std::{
 };
 
 use metrics::histogram;
+use onwards::aimd::AimdConfig;
 use onwards::target::{
     Auth, BackoffConfig as OnwardsBackoffConfig, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
     JitterStrategy as OnwardsJitterStrategy, KeyDefinition, LoadBalanceStrategy as OnwardsLoadBalanceStrategy, PoolSpec, PoolsSpec,
@@ -76,6 +77,7 @@ struct OnwardsTarget {
     fallback_enabled: bool,
     fallback_on_rate_limit: bool,
     fallback_on_status: Vec<i32>,
+    fallback_realtime_on_status: Vec<i32>,
     fallback_with_replacement: bool,
     fallback_max_attempts: Option<i32>,
     backoff_enabled: bool,
@@ -84,6 +86,8 @@ struct OnwardsTarget {
     backoff_factor: f64,
     backoff_jitter: String,
     backoff_max_total_ms: Option<i32>,
+    first_token_timeout_ms: Option<i64>,
+    aimd: Option<AimdConfig>,
 
     // Endpoint info
     endpoint_url: url::Url,
@@ -118,7 +122,11 @@ struct OnwardsApiKey {
 
 /// Manages the integration between onwards-pilot and the onwards proxy
 pub struct OnwardsConfigSync {
-    db: PgPool,
+    /// Query traffic (pooled endpoint when configured).
+    db: sqlx_pool_router::DynPools,
+    /// Direct connections for the LISTEN session; a transaction-mode pooler
+    /// cannot carry a subscription.
+    listener_db: sqlx_pool_router::DynPools,
     sender: watch::Sender<Targets>,
     /// Shared map of model batch capacity limits for the daemon
     daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
@@ -158,7 +166,7 @@ impl OnwardsConfigSync {
     #[cfg(test)]
     #[instrument(skip(db))]
     pub async fn new(db: PgPool) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
-        Self::new_with_daemon_limits(db, None, 10, Vec::new(), false, RateLimitTiersConfig::default()).await
+        Self::new_with_daemon_limits(db.clone(), db, None, 10, Vec::new(), false, RateLimitTiersConfig::default()).await
     }
 
     /// Creates a new OnwardsConfigSync with optional daemon capacity limits map and escalation models
@@ -168,26 +176,30 @@ impl OnwardsConfigSync {
     /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
     /// `strict_mode` - Enable strict mode with schema validation (only known OpenAI API paths accepted)
     /// `rate_limit_tiers` - Default rate limits applied per-key based on the owning user's `verified` flag.
-    #[instrument(skip(db, daemon_capacity_limits, escalation_models, rate_limit_tiers))]
+    /// `listener_db` - Direct (non-pooled) connections for the LISTEN session.
+    #[instrument(skip(db, listener_db, daemon_capacity_limits, escalation_models, rate_limit_tiers))]
     pub async fn new_with_daemon_limits(
-        db: PgPool,
+        db: impl sqlx_pool_router::PoolProvider,
+        listener_db: impl sqlx_pool_router::PoolProvider,
         daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
         default_batch_capacity: usize,
         escalation_models: Vec<String>,
         strict_mode: bool,
         rate_limit_tiers: RateLimitTiersConfig,
     ) -> Result<(Self, Targets, WatchTargetsStream), anyhow::Error> {
+        // Live provider (not a pinned pool): survives runtime pool swaps.
+        let db = sqlx_pool_router::DynPools::new(db);
         // Load initial configuration (including composite models)
-        let initial_targets = load_targets_from_db(&db, &escalation_models, strict_mode, &rate_limit_tiers).await?;
+        let initial_targets = load_targets_from_db(&db.write(), &escalation_models, strict_mode, &rate_limit_tiers).await?;
 
         // If daemon limits are provided, populate them
         if let Some(ref limits) = daemon_capacity_limits {
-            update_daemon_capacity_limits(&db, limits, default_batch_capacity).await?;
+            update_daemon_capacity_limits(&db.write(), limits, default_batch_capacity).await?;
         }
 
         // Populate cache info metrics on startup
         let mut cache_info_state = crate::metrics::CacheInfoState::new();
-        if let Err(e) = crate::metrics::update_cache_info_metrics(&db, &initial_targets, &mut cache_info_state).await {
+        if let Err(e) = crate::metrics::update_cache_info_metrics(&db.write(), &initial_targets, &mut cache_info_state).await {
             crate::background_error!(
                 ONWARDS_SYNC,
                 "cache_info_metrics",
@@ -202,6 +214,7 @@ impl OnwardsConfigSync {
 
         let integration = Self {
             db,
+            listener_db: sqlx_pool_router::DynPools::new(listener_db),
             sender,
             daemon_capacity_limits,
             default_batch_capacity,
@@ -242,7 +255,7 @@ impl OnwardsConfigSync {
             if let Some(tx) = &config.status_tx {
                 tx.send(SyncStatus::Connecting).await?;
             }
-            let mut listener = PgListener::connect_with(&self.db).await?;
+            let mut listener = PgListener::connect_with(&self.listener_db.write()).await?;
             // Listen to auth config changes
             listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await?;
 
@@ -393,23 +406,24 @@ impl OnwardsConfigSync {
     /// watch channel is closed (all receivers dropped); Err only for fatal
     /// DB errors (closed pool / connection).
     async fn full_reload(&mut self, source: &'static str) -> Result<bool, anyhow::Error> {
-        let new_targets = match load_targets_from_db(&self.db, &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
-            Ok(targets) => targets,
-            Err(e) => {
-                crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
-                if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
-                    error!("Database pool closed, exiting sync task");
-                    return Err(e);
+        let new_targets =
+            match load_targets_from_db(&self.db.write(), &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
+                Ok(targets) => targets,
+                Err(e) => {
+                    crate::background_error!(ONWARDS_SYNC, "load_targets", Error, "Failed to load targets from database: {}", e);
+                    if e.to_string().contains("closed pool") || e.to_string().contains("connection closed") {
+                        error!("Database pool closed, exiting sync task");
+                        return Err(e);
+                    }
+                    // Continue listening for other types of errors
+                    return Ok(true);
                 }
-                // Continue listening for other types of errors
-                return Ok(true);
-            }
-        };
+            };
         debug!("Loaded {} targets from database", new_targets.targets.len());
 
         // Update daemon capacity limits if configured
         if let Some(ref limits) = self.daemon_capacity_limits
-            && let Err(e) = update_daemon_capacity_limits(&self.db, limits, self.default_batch_capacity).await
+            && let Err(e) = update_daemon_capacity_limits(&self.db.write(), limits, self.default_batch_capacity).await
         {
             crate::background_error!(
                 ONWARDS_SYNC,
@@ -421,7 +435,7 @@ impl OnwardsConfigSync {
         }
 
         // Update cache info metrics
-        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db, &new_targets, &mut self.cache_info_state).await {
+        if let Err(e) = crate::metrics::update_cache_info_metrics(&self.db.write(), &new_targets, &mut self.cache_info_state).await {
             crate::background_error!(
                 ONWARDS_SYNC,
                 "cache_info_metrics",
@@ -478,6 +492,7 @@ struct OnwardsCompositeModel {
     fallback_on_rate_limit: bool,
     /// HTTP status codes that trigger fallback
     fallback_on_status: Vec<i32>,
+    fallback_realtime_on_status: Vec<i32>,
     /// Sample with replacement during weighted random failover
     fallback_with_replacement: bool,
     /// Maximum number of failover attempts
@@ -493,6 +508,8 @@ struct OnwardsCompositeModel {
     /// Independent of `backoff_enabled` semantics; only consulted when
     /// backoff is enabled.
     backoff_max_total_ms: Option<i32>,
+    first_token_timeout_ms: Option<i64>,
+    aimd: Option<AimdConfig>,
     /// Whether to sanitize/filter sensitive data from model responses
     sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode
@@ -615,7 +632,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     AND cm.alias = ANY($1::text[])
                 )
             )
-            -- Require positive balance OR free model (system user always passes)
+            -- Require positive balance, a contracted account, or a free model.
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
                 -- Positive balance read directly from the total
@@ -624,10 +641,18 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 -- is_deleted guard mirrors the old balance CTE, which only
                 -- contained non-deleted users; key deletion is not implied by
                 -- user deletion, so this check is load-bearing.
-                OR (u.is_deleted = false AND EXISTS (
+                -- Keep this lookup inline so PostgreSQL can build a hashed
+                -- set of enabled accounts once instead of calling a function
+                -- for every model/key pair. The outer guard excludes deleted users.
+                OR (u.is_deleted = false AND (EXISTS (
+                    SELECT 1 FROM user_feature_flags f
+                    WHERE f.user_id = u.id
+                      AND f.feature_flag = 'ALLOW_NEGATIVE_BALANCE'
+                      AND f.enabled
+                ) OR EXISTS (
                     SELECT 1 FROM user_balance_checkpoints ub
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
-                ))
+                )))
                 OR (
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
@@ -700,6 +725,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             fallback_enabled,
             fallback_on_rate_limit,
             fallback_on_status,
+            fallback_realtime_on_status,
             fallback_with_replacement,
             fallback_max_attempts,
             backoff_enabled,
@@ -708,6 +734,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             backoff_factor,
             backoff_jitter,
             backoff_max_total_ms,
+            first_token_timeout_ms,
+            aimd,
             sanitize_responses,
             trusted
         FROM deployed_models
@@ -739,6 +767,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
                 fallback_on_status: row.fallback_on_status.unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
+                fallback_realtime_on_status: row.fallback_realtime_on_status,
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 backoff_enabled: row.backoff_enabled,
@@ -747,6 +776,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 backoff_factor: row.backoff_factor,
                 backoff_jitter: row.backoff_jitter,
                 backoff_max_total_ms: row.backoff_max_total_ms,
+                first_token_timeout_ms: row.first_token_timeout_ms,
+                aimd: row.aimd.map(serde_json::from_value).transpose()?,
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
                 routing_rules: Vec::new(), // Populated from separate query below
@@ -794,6 +825,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     fallback_enabled: false,
                     fallback_on_rate_limit: false,
                     fallback_on_status: Vec::new(),
+                    fallback_realtime_on_status: Vec::new(),
                     fallback_with_replacement: false,
                     fallback_max_attempts: None,
                     backoff_enabled: false,
@@ -802,6 +834,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     backoff_factor: 2.0,
                     backoff_jitter: "full".to_string(),
                     backoff_max_total_ms: None,
+                    first_token_timeout_ms: None,
+                    aimd: None,
                     endpoint_url,
                     endpoint_api_key: row.endpoint_api_key.clone(),
                     auth_header_name: row.auth_header_name.clone(),
@@ -865,6 +899,7 @@ fn convert_composite_to_target_spec(
         };
 
         let mut labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
+        labels.insert("api_key_id".to_string(), api_key.id.to_string());
         // Surface the account's zero-data-retention flag to onwards as a label.
         // Always emitted ("true"/"false"); onwards does not act on it yet.
         labels.insert("zdr".to_string(), api_key.zero_data_retention.to_string());
@@ -941,12 +976,15 @@ fn convert_composite_to_target_spec(
             on_rate_limit: composite.fallback_on_rate_limit,
             // Convert i32 status codes to u16 for onwards
             on_status: composite.fallback_on_status.iter().map(|&s| s as u16).collect(),
+            realtime_on_status: composite.fallback_realtime_on_status.iter().map(|&s| s as u16).collect(),
             with_replacement: composite.fallback_with_replacement,
             max_attempts: composite
                 .fallback_max_attempts
                 .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
             backoff,
             max_total_backoff_ms,
+            first_token_timeout_ms: composite.first_token_timeout_ms.map(|ms| ms as u64),
+            aimd: composite.aimd.clone(),
         })
     } else {
         None
@@ -1051,7 +1089,16 @@ fn convert_composite_to_target_spec(
         keys: keys.clone(),
         rate_limit: rate_limit.clone(),
         concurrency_limit: concurrency_limit.clone(),
-        fallback: fallback.clone(),
+        fallback: fallback.clone().map(|mut config| {
+            if pool_name != DEFAULT_COMPONENT_POOL {
+                // Continuation pools must preserve their validated first hop.
+                config.aimd = Some(AimdConfig {
+                    enabled: false,
+                    ..AimdConfig::default()
+                });
+            }
+            config
+        }),
         // A named pool's ordering is a validated failover list (dynamo first,
         // the harness-validated continuation target behind it), never a
         // load-balancing surface: under the composite's own strategy (DB
@@ -1153,6 +1200,7 @@ fn convert_to_config_file(
 
                 // Build labels from API key purpose
                 let mut labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
+                labels.insert("api_key_id".to_string(), api_key.id.to_string());
                 // Surface the account's zero-data-retention flag as a label.
                 // Always emitted ("true"/"false"); onwards does not act on it yet.
                 labels.insert("zdr".to_string(), api_key.zero_data_retention.to_string());
@@ -1242,12 +1290,17 @@ fn convert_to_config_file(
                     enabled: true,
                     on_rate_limit: target.fallback_on_rate_limit,
                     on_status: target.fallback_on_status.iter().map(|&s| s as u16).collect(),
+                    realtime_on_status: target.fallback_realtime_on_status.iter().map(|&s| s as u16).collect(),
                     with_replacement: target.fallback_with_replacement,
                     max_attempts: target
                         .fallback_max_attempts
                         .and_then(|n| usize::try_from(n).ok().filter(|&v| v >= 1)),
                     backoff,
                     max_total_backoff_ms,
+                    // A single-provider pool never arms first-token failover
+                    // (there is no other provider to fail over to).
+                    first_token_timeout_ms: target.first_token_timeout_ms.map(|ms| ms as u64),
+                    aimd: target.aimd.clone(),
                 })
             } else {
                 None
@@ -1341,6 +1394,7 @@ pub async fn load_targets_from_db(
             dm.fallback_enabled,
             dm.fallback_on_rate_limit,
             dm.fallback_on_status,
+            dm.fallback_realtime_on_status,
             dm.fallback_with_replacement,
             dm.fallback_max_attempts,
             dm.backoff_enabled,
@@ -1349,6 +1403,8 @@ pub async fn load_targets_from_db(
             dm.backoff_factor,
             dm.backoff_jitter,
             dm.backoff_max_total_ms,
+            dm.first_token_timeout_ms,
+            dm.aimd,
             ie.id as endpoint_id,
             ie.url as "endpoint_url!",
             ie.api_key as endpoint_api_key,
@@ -1405,10 +1461,18 @@ pub async fn load_targets_from_db(
                 -- is_deleted guard mirrors the old balance CTE, which only
                 -- contained non-deleted users; key deletion is not implied by
                 -- user deletion, so this check is load-bearing.
-                OR (u.is_deleted = false AND EXISTS (
+                -- Keep this lookup inline so PostgreSQL can build a hashed
+                -- set of enabled accounts once instead of calling a function
+                -- for every model/key pair. The outer guard excludes deleted users.
+                OR (u.is_deleted = false AND (EXISTS (
+                    SELECT 1 FROM user_feature_flags f
+                    WHERE f.user_id = u.id
+                      AND f.feature_flag = 'ALLOW_NEGATIVE_BALANCE'
+                      AND f.enabled
+                ) OR EXISTS (
                     SELECT 1 FROM user_balance_checkpoints ub
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
-                ))
+                )))
                 OR (
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
@@ -1477,6 +1541,7 @@ pub async fn load_targets_from_db(
     let mut targets_map: HashMap<DeploymentId, OnwardsTarget> = HashMap::new();
     for row in rows {
         let deployment_id = row.deployment_id;
+        let aimd = row.aimd.map(serde_json::from_value).transpose()?;
         let target = targets_map.entry(deployment_id).or_insert_with(|| {
             OnwardsTarget {
                 model_name: row.model_name.clone(),
@@ -1495,6 +1560,7 @@ pub async fn load_targets_from_db(
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
                 fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
+                fallback_realtime_on_status: row.fallback_realtime_on_status.clone(),
                 fallback_with_replacement: row.fallback_with_replacement.unwrap_or(false),
                 fallback_max_attempts: row.fallback_max_attempts,
                 backoff_enabled: row.backoff_enabled,
@@ -1503,6 +1569,8 @@ pub async fn load_targets_from_db(
                 backoff_factor: row.backoff_factor,
                 backoff_jitter: row.backoff_jitter.clone(),
                 backoff_max_total_ms: row.backoff_max_total_ms,
+                first_token_timeout_ms: row.first_token_timeout_ms,
+                aimd,
                 endpoint_url: url::Url::parse(&row.endpoint_url).expect("Invalid URL in database"),
                 endpoint_api_key: row.endpoint_api_key.clone(),
                 auth_header_name: row.auth_header_name.clone(),

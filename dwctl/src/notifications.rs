@@ -28,7 +28,6 @@ use chrono::{DateTime, Utc};
 use fusillade_arsenal::PostgresRequestManager;
 use metrics::counter;
 use rust_decimal::prelude::ToPrimitive;
-use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 use sqlx_pool_router::DbPools;
 use tokio_util::sync::CancellationToken;
@@ -144,9 +143,13 @@ pub async fn run_notification_poller(
     config: NotificationsConfig,
     app_config: crate::config::Config,
     request_manager: Arc<PostgresRequestManager<DbPools>>,
-    dwctl_pool: PgPool,
+    dwctl_pool: impl sqlx_pool_router::PoolProvider,
+    listener_pool: impl sqlx_pool_router::PoolProvider,
     shutdown: CancellationToken,
 ) {
+    let dwctl_pool = sqlx_pool_router::DynPools::new(dwctl_pool);
+    // LISTEN needs a session: direct connections, never the pooled endpoint.
+    let listener_pool = sqlx_pool_router::DynPools::new(listener_pool);
     // Webhook dispatcher runs independently of email notifications
     let mut dispatcher = if config.webhooks.enabled {
         Some(WebhookDispatcher::spawn(dwctl_pool.clone(), &config.webhooks, shutdown.clone()))
@@ -174,7 +177,7 @@ pub async fn run_notification_poller(
 
     // Set up PG listener for platform webhook events (user.created, api_key.created)
     let mut listener = if dispatcher.is_some() {
-        match PgListener::connect_with(&dwctl_pool).await {
+        match PgListener::connect_with(&listener_pool.write()).await {
             Ok(mut l) => match l.listen(WEBHOOK_EVENT_CHANNEL).await {
                 Ok(()) => {
                     tracing::info!("Listening on PG channel '{WEBHOOK_EVENT_CHANNEL}' for platform webhook events");
@@ -250,7 +253,7 @@ pub async fn run_notification_poller(
         // Reconnect listener if disconnected
         if listener.is_none()
             && dispatcher.is_some()
-            && let Ok(mut l) = PgListener::connect_with(&dwctl_pool).await
+            && let Ok(mut l) = PgListener::connect_with(&listener_pool.write()).await
             && l.listen(WEBHOOK_EVENT_CHANNEL).await.is_ok()
         {
             tracing::info!("Reconnected webhook event listener");
@@ -259,7 +262,7 @@ pub async fn run_notification_poller(
 
         tracing::debug!("Notification poller tick");
 
-        let mut conn = match dwctl_pool.acquire().await {
+        let mut conn = match dwctl_pool.write().acquire().await {
             Ok(c) => c,
             Err(e) => {
                 crate::background_error!(NOTIFICATIONS, "db_acquire", Warning, error = %e, "Failed to acquire database connection for notification poller tick");
@@ -1230,9 +1233,8 @@ mod tests {
     use crate::config::{CreditsConfig, DummyConfig};
     use crate::payment_providers;
     use rust_decimal::Decimal;
-    use sqlx::PgPool;
 
-    async fn configure_auto_topup_decline_test_user(pool: &PgPool, user_id: Uuid, customer_id: &str, failure_count: i32) {
+    async fn configure_auto_topup_decline_test_user(pool: &sqlx::PgPool, user_id: Uuid, customer_id: &str, failure_count: i32) {
         sqlx::query!(
             r#"
             UPDATE users
@@ -1267,7 +1269,7 @@ mod tests {
     /// is the dummy provider's "this card always declines" customer, so if the
     /// branch leaked into the card path this would decline instead of crediting.
     #[sqlx::test]
-    async fn test_process_auto_topups_invoices_instead_of_charging(pool: PgPool) {
+    async fn test_process_auto_topups_invoices_instead_of_charging(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
         sqlx::query!("UPDATE users SET invoicing_enabled = true WHERE id = $1", user.id)
@@ -1303,7 +1305,7 @@ mod tests {
 
     /// The flag defaults false, so every existing account keeps the card path.
     #[sqlx::test]
-    async fn test_process_auto_topups_defaults_to_charging_a_card(pool: PgPool) {
+    async fn test_process_auto_topups_defaults_to_charging_a_card(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
 
@@ -1325,7 +1327,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_first_soft_decline_pauses_without_charging(pool: PgPool) {
+    async fn test_process_auto_topups_first_soft_decline_pauses_without_charging(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
 
@@ -1360,7 +1362,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_second_soft_decline_disables_without_charging(pool: PgPool) {
+    async fn test_process_auto_topups_second_soft_decline_disables_without_charging(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 1).await;
 
@@ -1380,7 +1382,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_hard_decline_disables_immediately(pool: PgPool) {
+    async fn test_process_auto_topups_hard_decline_disables_immediately(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_hard_decline", 0).await;
 
@@ -1400,7 +1402,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_provider_error_pauses_without_advancing_decline_state(pool: PgPool) {
+    async fn test_process_auto_topups_provider_error_pauses_without_advancing_decline_state(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_provider_error", 1).await;
 
@@ -1429,7 +1431,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_payment_method_lookup_error_pauses_without_advancing_decline_state(pool: PgPool) {
+    async fn test_process_auto_topups_payment_method_lookup_error_pauses_without_advancing_decline_state(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_payment_method_lookup_error", 0).await;
 
@@ -1448,7 +1450,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_without_payment_method_disables_auto_topup(pool: PgPool) {
+    async fn test_process_auto_topups_without_payment_method_disables_auto_topup(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_no_payment_method", 0).await;
 
@@ -1474,7 +1476,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_success_resets_soft_decline_state(pool: PgPool) {
+    async fn test_process_auto_topups_success_resets_soft_decline_state(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_success_after_decline", 1).await;
 
@@ -1589,7 +1591,7 @@ mod tests {
         async fn get_payment_session(&self, _: &str) -> crate::payment_providers::Result<crate::payment_providers::PaymentSession> {
             unimplemented!("not called by process_auto_topups")
         }
-        async fn process_payment_session(&self, _: &PgPool, _: &str, _: &CreditsConfig) -> crate::payment_providers::Result<()> {
+        async fn process_payment_session(&self, _: &sqlx::PgPool, _: &str, _: &CreditsConfig) -> crate::payment_providers::Result<()> {
             unimplemented!("not called by process_auto_topups")
         }
         async fn validate_webhook(
@@ -1601,7 +1603,7 @@ mod tests {
         }
         async fn process_webhook_event(
             &self,
-            _: &PgPool,
+            _: &sqlx::PgPool,
             _: &crate::payment_providers::WebhookEvent,
             _: &CreditsConfig,
         ) -> crate::payment_providers::Result<()> {
@@ -1628,7 +1630,7 @@ mod tests {
         }
         async fn process_auto_topup_session(
             &self,
-            _: &PgPool,
+            _: &sqlx::PgPool,
             _: &str,
         ) -> crate::payment_providers::Result<crate::payment_providers::AutoTopupSetupResult> {
             unimplemented!("not called by process_auto_topups")
@@ -1642,7 +1644,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_skips_when_charge_already_in_flight(pool: PgPool) {
+    async fn test_process_auto_topups_skips_when_charge_already_in_flight(pool: sqlx::PgPool) {
         // A concurrent sweep on another replica already owns this charge. We must
         // skip without crediting the user, rather than treating it as a failure.
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
@@ -1675,7 +1677,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_charges_below_threshold(pool: PgPool) {
+    async fn test_process_auto_topups_charges_below_threshold(pool: sqlx::PgPool) {
         // Create a test user with auto top-up configured
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
@@ -1713,7 +1715,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_skips_above_threshold(pool: PgPool) {
+    async fn test_process_auto_topups_skips_above_threshold(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
         // Set up auto top-up: threshold $5, amount $25
@@ -1763,7 +1765,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_idempotent(pool: PgPool) {
+    async fn test_process_auto_topups_idempotent(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
         sqlx::query!(
@@ -1804,7 +1806,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_respects_monthly_limit(pool: PgPool) {
+    async fn test_process_auto_topups_respects_monthly_limit(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
         // Set up auto top-up with a $50 monthly limit
@@ -1872,7 +1874,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_blocks_when_limit_exceeded(pool: PgPool) {
+    async fn test_process_auto_topups_blocks_when_limit_exceeded(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
         // Set up auto top-up with a $40 monthly limit
@@ -1944,7 +1946,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_process_auto_topups_skips_when_limit_fully_exhausted(pool: PgPool) {
+    async fn test_process_auto_topups_skips_when_limit_fully_exhausted(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
         // Set up auto top-up with a $25 monthly limit (exactly what we've already spent)

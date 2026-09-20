@@ -21,10 +21,10 @@ pub async fn main() -> anyhow::Result<()> {
     let result = run().await;
 
     // Flush pending spans before exit
-    if let Some(provider) = tracer_provider {
-        if let Err(e) = provider.shutdown() {
-            eprintln!("Failed to shutdown tracer provider: {e}");
-        }
+    if let Some(provider) = tracer_provider
+        && let Err(e) = provider.shutdown()
+    {
+        eprintln!("Failed to shutdown tracer provider: {e}");
     }
 
     result
@@ -63,7 +63,9 @@ async fn run() -> anyhow::Result<()> {
     };
 
     // Register the sanitizer globally - per-target sanitize_response flag controls when it's applied
-    let app_state = AppState::new(targets).with_response_transform(create_openai_sanitizer());
+    let app_state = AppState::new(targets)
+        .with_sse_buffer_limit(config.sse_buffer_limit)
+        .with_response_transform(create_openai_sanitizer());
 
     // Use strict router if strict_mode is enabled, otherwise use standard router
     let mut router = if strict_mode {

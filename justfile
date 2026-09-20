@@ -508,7 +508,10 @@ test target="" *args="":
                 fi
             else
                 echo "🚀 [$(date '+%H:%M:%S')] Starting docker services..."
-                docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --wait
+                if ! docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --wait; then
+                    docker compose -f docker-compose.yml -f docker-compose.test.yml logs --no-color --tail=100
+                    exit 1
+                fi
                 
                 echo "⏳ Waiting for control-layer service to be ready..."
                 MAX_WAIT=60  # 1 minute max wait for pre-built images
@@ -646,13 +649,15 @@ lint target *args="":
                 --package dwctl \
                 --package fusillade \
                 --package fusillade-core \
-                --package fusillade-arsenal
+                --package fusillade-arsenal \
+                --package openai-reassembler
             echo "Running cargo clippy..."
             cargo clippy \
                 --package dwctl \
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
+                --package openai-reassembler \
                 --all-features \
                 --no-deps \
                 {{args}}
@@ -662,6 +667,9 @@ lint target *args="":
                 fusillade/src \
                 fusillade-core/src \
                 fusillade-arsenal/src
+            echo "Checking stable SQL result projections..."
+            python3 -B scripts/tests/schema_migrations/test_projection_guard.py
+            python3 -B scripts/check_query_projections.py
             echo "Checking SQLx prepared queries..."
             cargo sqlx prepare --check --workspace
             echo "Checking local Rust workspace topology..."
@@ -713,6 +721,7 @@ fmt target *args="":
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
+                --package openai-reassembler \
                 {{args}}
             ;;
         *)

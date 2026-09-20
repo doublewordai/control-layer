@@ -595,12 +595,14 @@ pub async fn create_batch<P: PoolProvider>(
             operation: format!("get db connection for credit check: {}", e),
         })?;
         let balance = Credits::new(&mut conn)
-            .get_user_balance(balance_check_id)
+            .get_balance_for_admission(balance_check_id)
             .await
             .map_err(|e| Error::Internal {
                 operation: format!("check credit balance: {}", e),
             })?;
-        if balance < rust_decimal::Decimal::ZERO {
+        if let Some(balance) = balance
+            && balance < rust_decimal::Decimal::ZERO
+        {
             return Err(Error::InsufficientCredits {
                 current_balance: balance,
                 message: "Account balance too low. Please add credits to continue.".to_string(),
@@ -643,17 +645,19 @@ pub async fn create_batch<P: PoolProvider>(
         && let Ok(file_owner_id) = uuid::Uuid::parse_str(uploaded_by)
     {
         let file_owner_id = crate::types::UserId::from(file_owner_id);
-        if file_owner_id != current_user.id {
+        if file_owner_id != balance_check_id {
             let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
                 operation: format!("get db connection for file owner credit check: {}", e),
             })?;
             let owner_balance = Credits::new(&mut conn)
-                .get_user_balance(file_owner_id)
+                .get_balance_for_admission(file_owner_id)
                 .await
                 .map_err(|e| Error::Internal {
                     operation: format!("check file owner credit balance: {}", e),
                 })?;
-            if owner_balance < rust_decimal::Decimal::ZERO {
+            if let Some(owner_balance) = owner_balance
+                && owner_balance < rust_decimal::Decimal::ZERO
+            {
                 let owner_name = {
                     let mut users_repo = Users::new(&mut conn);
                     users_repo
@@ -805,6 +809,32 @@ pub async fn create_batch<P: PoolProvider>(
             .resolve_batch_execution_key(target_user_id, attribution_user_id, authenticating_key_id)
             .await
             .map_err(Error::Database)?;
+        // A capped authenticating key can resolve to a different billing
+        // account than the active organization. Check the execution key's
+        // owner independently; the organization's opt-in must not cover it.
+        let execution_account_id = ApiKeys::new(&mut conn)
+            .get_by_id(key_id)
+            .await
+            .map_err(Error::Database)?
+            .ok_or_else(|| Error::NotFound {
+                resource: "API key".to_string(),
+                id: key_id.to_string(),
+            })?
+            .user_id;
+        if execution_account_id != balance_check_id {
+            let balance = Credits::new(&mut conn)
+                .get_balance_for_admission(execution_account_id)
+                .await
+                .map_err(Error::Database)?;
+            if let Some(balance) = balance
+                && balance < rust_decimal::Decimal::ZERO
+            {
+                return Err(Error::InsufficientCredits {
+                    current_balance: balance,
+                    message: "Execution key account balance too low. Please add credits to continue.".to_string(),
+                });
+            }
+        }
         // Spending-cap pre-flight, beside the balance gate above: if the
         // execution key's cap scope is already exhausted, reject up front
         // instead of accepting a batch whose every request would be refused
@@ -814,8 +844,8 @@ pub async fn create_batch<P: PoolProvider>(
                 message: "The API key used for this batch has reached its spending cap. Raise or remove the cap, or wait for the cap window to reset, then resubmit.".to_string(),
             });
         }
-        // Resolve the creditor's verified flag on the same connection (the org in
-        // org context, else the user) for the volume cap below — no extra acquire.
+        // Verification and outstanding-volume accounting use the same active
+        // account. Execution-account balance admission is checked separately.
         let verified = Users::new(&mut conn).is_verified(target_user_id).await?;
         (secret, key_id, verified)
     };
@@ -976,8 +1006,8 @@ async fn load_and_validate_batch_models<P: PoolProvider>(
     file_id: Uuid,
 ) -> Result<(HashMap<String, i64>, BatchModelInfo)> {
     let file_model_counts = {
-        let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
-            operation: format!("get primary Fusillade connection for batch model counts: {e}"),
+        let mut templates_conn = state.request_manager.begin_write().await.map_err(|e| Error::Internal {
+            operation: format!("begin primary Fusillade transaction for batch model counts: {e}"),
         })?;
         BatchTemplates::new(&mut templates_conn)
             .get_model_counts(file_id)
@@ -1001,8 +1031,8 @@ async fn load_and_validate_batch_models<P: PoolProvider>(
         (batch_model_info, reasoning_policies)
     };
 
-    let mut templates_conn = state.request_manager.pool().acquire().await.map_err(|e| Error::Internal {
-        operation: format!("get primary Fusillade connection for batch request validation: {e}"),
+    let mut templates_conn = state.request_manager.begin_write().await.map_err(|e| Error::Internal {
+        operation: format!("begin primary Fusillade transaction for batch request validation: {e}"),
     })?;
     let mut templates = BatchTemplates::new(&mut templates_conn);
     let mut stream = templates.stream_reasoning_requests(file_id);
@@ -1155,7 +1185,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
 
     // Use the write pool for the reservation transaction
     let pool = state.db.write();
-    reserve_capacity(pool, &*state.request_manager, &input).await.map_err(|e| match e {
+    reserve_capacity(&pool, &*state.request_manager, &input).await.map_err(|e| match e {
         CapacityError::InsufficientCapacity { completion_window, models } => Error::TooManyRequests {
             message: format!(
                 "Insufficient capacity for {} completion window. The following models are currently at capacity: {}. Try again later or use a longer completion window.",
@@ -1167,7 +1197,7 @@ async fn reserve_capacity_for_batch<P: PoolProvider>(
 }
 
 async fn release_capacity_reservations<P: PoolProvider>(state: &AppState<P>, reservation_ids: &[Uuid]) -> Result<()> {
-    super::sla_capacity::release_reservations(state.db.write(), reservation_ids)
+    super::sla_capacity::release_reservations(&state.db.write(), reservation_ids)
         .await
         .map_err(|msg| Error::Internal { operation: msg })
 }
@@ -1379,7 +1409,7 @@ pub async fn get_batch_analytics<P: PoolProvider>(
     // hasn't been folded yet (brand new / no completed requests), not that data aged out, so
     // return a zero-valued payload rather than 404. Ownership/existence is already enforced
     // above, and platform managers expect to see metrics for any batch they can access.
-    let analytics = crate::db::handlers::analytics::get_batch_analytics(state.db.read(), &batch_id)
+    let analytics = crate::db::handlers::analytics::get_batch_analytics(&state.db.read(), &batch_id)
         .await
         .map_err(|e| Error::Internal {
             operation: format!("fetch batch analytics: {}", e),
@@ -1402,6 +1432,7 @@ Supports pagination via `limit` and `skip` query parameters, and filtering by `c
     responses(
         (status = 200, description = "Batch results as newline-delimited JSON. Check the `X-Incomplete` header to determine if more results exist.", content_type = "application/x-ndjson"),
         (status = 404, description = "Batch not found or you don't have access to it."),
+        (status = 410, description = "The batch's output or error file has been deleted, so its results are no longer available. Results whose input file was deleted are still returned, with `input_body` set to null."),
         (status = 500, description = "An unexpected error occurred. Retry the request or contact support if the issue persists.")
     ),
     params(
@@ -1436,6 +1467,32 @@ pub async fn get_batch_results<P: PoolProvider>(
         return Err(Error::NotFound {
             resource: "Batch".to_string(),
             id: batch_id_str.clone(),
+        });
+    }
+
+    // The output and error files are virtual and created with the batch, so a
+    // missing id can only mean the user deleted that file. Deleting a results
+    // file is the user's statement that those results should be gone, and this
+    // endpoint must not serve them through a side door. Report 410 and say which
+    // file went. (A deleted *input* file is different: the results still exist,
+    // they just come back without input bodies, so that case streams normally.)
+    let deleted_results_files: Vec<&str> = [
+        (batch.output_file_id.is_none(), "output file"),
+        (batch.error_file_id.is_none(), "error file"),
+    ]
+    .into_iter()
+    .filter_map(|(deleted, name)| deleted.then_some(name))
+    .collect();
+    if !deleted_results_files.is_empty() {
+        return Err(Error::Gone {
+            message: format!(
+                "Results for batch {} are no longer available: its {} deleted.",
+                batch_id_str,
+                match deleted_results_files.as_slice() {
+                    [one] => format!("{one} has been"),
+                    _ => "output and error files have been".to_string(),
+                }
+            ),
         });
     }
 
@@ -1620,7 +1677,7 @@ pub async fn cancel_batch<P: PoolProvider>(
     tracing::debug!("Batch {} cancelled", batch_id);
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
+    let creator_email = fetch_creator_email(&state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -1773,7 +1830,7 @@ pub async fn retry_failed_batch_requests<P: PoolProvider>(
         })?;
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
+    let creator_email = fetch_creator_email(&state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -1887,7 +1944,7 @@ pub async fn retry_specific_requests<P: PoolProvider>(
         })?;
 
     // Fetch creator email for the response
-    let creator_email = fetch_creator_email(state.db.read(), &batch).await;
+    let creator_email = fetch_creator_email(&state.db.read(), &batch).await;
     Ok(Json(to_batch_response_with_email(batch, creator_email.as_deref())))
 }
 
@@ -2104,7 +2161,7 @@ pub async fn list_batches<P: PoolProvider>(
 
     // Fetch analytics in bulk if requested
     let analytics_map: HashMap<Uuid, BatchAnalytics> = if include_analytics && !batches.is_empty() {
-        crate::db::handlers::analytics::get_batches_analytics_bulk(state.db.read(), &batch_ids)
+        crate::db::handlers::analytics::get_batches_analytics_bulk(&state.db.read(), &batch_ids)
             .await
             .map_err(|e| Error::Internal {
                 operation: format!("fetch bulk batch analytics: {}", e),
@@ -3441,6 +3498,212 @@ mod tests {
         // it was hidden before, so the logic is working.
     }
 
+    /// Give a hand-inserted batch the virtual output and error files that
+    /// create_batch would have made. The results endpoint treats a missing
+    /// output/error file id as "the user deleted it" and answers 410.
+    async fn attach_results_files(pool: &PgPool, batch_id: Uuid) -> (Uuid, Uuid) {
+        let output_file_id = Uuid::new_v4();
+        let error_file_id = Uuid::new_v4();
+        for (id, name) in [(output_file_id, "output.jsonl"), (error_file_id, "error.jsonl")] {
+            sqlx::query(
+                "INSERT INTO fusillade.files (id, name, status, created_at, updated_at) VALUES ($1, $2, 'processed', NOW(), NOW())",
+            )
+            .bind(id)
+            .bind(name)
+            .execute(pool)
+            .await
+            .expect("Failed to create results file");
+        }
+        sqlx::query("UPDATE fusillade.batches SET output_file_id = $2, error_file_id = $3 WHERE id = $1")
+            .bind(batch_id)
+            .bind(output_file_id)
+            .bind(error_file_id)
+            .execute(pool)
+            .await
+            .expect("Failed to attach results files");
+        (output_file_id, error_file_id)
+    }
+
+    /// Deleting a batch's input file unlinks the batch (file_id = NULL) and the
+    /// orphan-purge daemon later removes its templates. The results view used to
+    /// require the file and failed with a 500 ("Batch has no associated file_id").
+    /// Requests are self-contained, so results must still be served: every request
+    /// comes back with `input_body: null`, on both the paginated and the streaming
+    /// paths, and in a stable creation order.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_results_served_after_input_file_deleted(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+
+        let batch_id = Uuid::new_v4();
+        let num_requests = 3;
+        // A batch whose input file has been deleted and whose templates have been
+        // purged: file_id = NULL on the batch, template_id dangling on the requests.
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests, completed_at) VALUES ($1, $2, NULL, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), $3, NOW())",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .bind(num_requests as i32)
+        .execute(&pool)
+        .await
+        .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
+
+        for i in 0..num_requests {
+            let (state, response_body, error) = if i == 1 {
+                ("failed", None, Some("upstream said no"))
+            } else {
+                ("completed", Some(format!(r#"{{"id":"chatcmpl-{i}"}}"#)), None)
+            };
+            // completed rows need response_status/body/completed_at; failed rows
+            // need error/failed_at (check constraints on fusillade.requests).
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, error, custom_id, created_at, completed_at, failed_at) \
+                 VALUES ($1, $2, $3, 'test-model', $4, CASE WHEN $4 = 'completed' THEN 200 END, $5, $6, $7, NOW() + ($8 || ' seconds')::interval, \
+                         CASE WHEN $4 = 'completed' THEN NOW() END, CASE WHEN $4 = 'failed' THEN NOW() END)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(batch_id)
+            .bind(Uuid::new_v4())
+            .bind(state)
+            .bind(response_body)
+            .bind(error)
+            .bind(format!("req-{i}"))
+            .bind(i.to_string())
+            .execute(&pool)
+            .await
+            .expect("Failed to create request");
+        }
+
+        let auth = add_auth_headers(&user);
+
+        for path in [
+            format!("/ai/v1/batches/{}/results", batch_id),
+            format!("/ai/v1/batches/{}/results?limit=10", batch_id),
+        ] {
+            let response = app
+                .get(&path)
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .await;
+
+            response.assert_status(StatusCode::OK);
+            response.assert_header("X-Last-Line", &num_requests.to_string());
+            let lines: Vec<serde_json::Value> = response
+                .text()
+                .lines()
+                .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+                .collect();
+            assert_eq!(lines.len(), num_requests, "{path}: every request is returned");
+            let custom_ids: Vec<&str> = lines.iter().map(|l| l["custom_id"].as_str().unwrap()).collect();
+            assert_eq!(custom_ids, ["req-0", "req-1", "req-2"], "{path}: creation order");
+            for line in &lines {
+                assert!(line["input_body"].is_null(), "{path}: input body is gone with the file");
+            }
+            assert_eq!(lines[0]["status"], "completed");
+            assert_eq!(lines[0]["response_body"]["id"], "chatcmpl-0");
+            assert_eq!(lines[1]["status"], "failed");
+            assert_eq!(lines[1]["error"], "upstream said no");
+        }
+
+        // Filters still apply on this path.
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results?status=failed", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status(StatusCode::OK);
+        assert_eq!(response.text().lines().count(), 1);
+    }
+
+    /// The output and error files are virtual and exist from batch creation, so a
+    /// missing id means the user deleted that file. Deleting a results file is a
+    /// statement that those results are gone: the results endpoint must answer
+    /// 410 (naming the deleted file) rather than serve the same rows anyway,
+    /// on both the paginated and the streaming paths. The batch itself stays
+    /// readable.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_batch_results_gone_after_results_file_deleted(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let cases = [
+            ("output_file_id", "output file has been deleted"),
+            ("error_file_id", "error file has been deleted"),
+        ];
+        for (column, expected) in cases {
+            let batch_id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests, completed_at) VALUES ($1, $2, NULL, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), 1, NOW())",
+            )
+            .bind(batch_id)
+            .bind(user.id.to_string())
+            .execute(&pool)
+            .await
+            .expect("Failed to create batch");
+            attach_results_files(&pool, batch_id).await;
+            // A completed request still exists; the endpoint must not serve it.
+            sqlx::query(
+                "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, response_status, response_body, custom_id, created_at, completed_at) VALUES ($1, $2, $3, 'test-model', 'completed', 200, '{}', 'req-0', NOW(), NOW())",
+            )
+            .bind(Uuid::new_v4())
+            .bind(batch_id)
+            .bind(Uuid::new_v4())
+            .execute(&pool)
+            .await
+            .expect("Failed to create request");
+            // Mirror what delete_file does to the batch for that file.
+            sqlx::query(&format!("UPDATE fusillade.batches SET {column} = NULL WHERE id = $1"))
+                .bind(batch_id)
+                .execute(&pool)
+                .await
+                .expect("Failed to unlink results file");
+
+            for path in [
+                format!("/ai/v1/batches/{}/results", batch_id),
+                format!("/ai/v1/batches/{}/results?limit=10", batch_id),
+            ] {
+                let response = app
+                    .get(&path)
+                    .add_header(&auth[0].0, &auth[0].1)
+                    .add_header(&auth[1].0, &auth[1].1)
+                    .await;
+                response.assert_status(StatusCode::GONE);
+                let body = response.text();
+                assert!(body.contains(expected), "{path}: expected {expected:?} in {body:?}");
+            }
+
+            let response = app
+                .get(&format!("/ai/v1/batches/{}", batch_id))
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .await;
+            response.assert_status(StatusCode::OK);
+        }
+
+        // Both gone: the message names both.
+        let batch_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO fusillade.batches (id, created_by, file_id, endpoint, completion_window, expires_at, created_at, total_requests, completed_at) VALUES ($1, $2, NULL, '/v1/chat/completions', '24h', NOW() + interval '24 hours', NOW(), 0, NOW())",
+        )
+        .bind(batch_id)
+        .bind(user.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("Failed to create batch");
+        let response = app
+            .get(&format!("/ai/v1/batches/{}/results", batch_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status(StatusCode::GONE);
+        assert!(response.text().contains("output and error files have been deleted"));
+    }
+
     /// Regression test for streaming batch results.
     ///
     /// Previously, get_batch_results collected ALL results into memory before
@@ -3485,6 +3748,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
 
         for i in 0..num_requests {
             let template_id = Uuid::new_v4();
@@ -3622,6 +3886,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
 
         // Create completed requests
         for i in 0..num_completed {
@@ -4762,6 +5027,102 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_create_batch_allowed_with_negative_balance_flag(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+
+        // Create a deployment and add to group so user has access to the model
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        submit_one_request_batch(&app, &user, "24h")
+            .await
+            .assert_status(StatusCode::CREATED);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_negative_balance_org_flag_does_not_cover_personal_file(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, user.id).await;
+        let group = create_test_group(&pool).await;
+        add_user_to_group(&pool, user.id, group.id).await;
+        add_user_to_group(&pool, org.id, group.id).await;
+        let deployment = create_test_deployment(&pool, user.id, "gpt-4-model", "gpt-4").await;
+        add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
+        let auth = add_auth_headers(&user);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // Upload personally: request templates bill the personal account, even
+        // when the batch is subsequently submitted in organization context.
+        let jsonl = r#"{"custom_id":"request-1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"Hello"}]}}"#;
+        let multipart = axum_test::multipart::MultipartForm::new()
+            .add_part(
+                "file",
+                axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("personal.jsonl"),
+            )
+            .add_part("purpose", axum_test::multipart::Part::text("batch"));
+        let upload = app
+            .post("/ai/v1/files")
+            .multipart(multipart)
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        upload.assert_status(StatusCode::CREATED);
+        let file: serde_json::Value = upload.json();
+        let request = CreateBatchRequest {
+            input_file_id: file["id"].as_str().unwrap().to_owned(),
+            endpoint: "/v1/chat/completions".to_owned(),
+            completion_window: "24h".to_owned(),
+            metadata: None,
+            api_key_id: None,
+        };
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1 OR user_id = $2")
+            .bind(user.id)
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true)")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        for enabled in [false, true, false] {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(user.id).bind(enabled).execute(&pool).await.unwrap();
+            let response = app
+                .post("/ai/v1/batches")
+                .json(&request)
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .add_header("cookie", &org_cookie)
+                .await;
+            response.assert_status(if enabled {
+                StatusCode::CREATED
+            } else {
+                StatusCode::PAYMENT_REQUIRED
+            });
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_create_batch_in_org_context_checks_org_balance_not_user(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
 
@@ -4846,6 +5207,37 @@ mod tests {
             .await;
 
         resp.assert_status(StatusCode::CREATED);
+        // A personal exemption does not cover the organization's debt.
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+            .bind(user.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for enabled in [false, true, false] {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(org.id)
+                .bind(enabled)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let resp = app
+                .post("/ai/v1/batches")
+                .json(&create_req)
+                .add_header(&auth[0].0, &auth[0].1)
+                .add_header(&auth[1].0, &auth[1].1)
+                .add_header("cookie", &org_cookie)
+                .await;
+            resp.assert_status(if enabled {
+                StatusCode::CREATED
+            } else {
+                StatusCode::PAYMENT_REQUIRED
+            });
+        }
     }
 
     #[sqlx::test]
@@ -5057,6 +5449,7 @@ mod tests {
         .execute(&pool)
         .await
         .expect("Failed to create batch");
+        attach_results_files(&pool, batch_id).await;
 
         // Three requests with different reasoning token amounts
         let thinking_responses = vec![
@@ -5683,6 +6076,50 @@ mod tests {
             completion_window: "24h".to_string(),
             metadata: None,
             api_key_id,
+        }
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_negative_balance_checks_execution_account_in_org_context(pool: PgPool) {
+        let (app, _bg_services, owner, _member, org, file_id) = setup_org_batch_env(&pool).await;
+        let auth = add_auth_headers(&owner);
+        let response = app
+            .post(&format!("/admin/api/v1/users/{}/api-keys", owner.id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&serde_json::json!({"name": "Personal capped key", "purpose": "realtime", "spend_limit": "10"}))
+            .await;
+        response.assert_status(StatusCode::CREATED);
+        let key: serde_json::Value = response.json();
+        let secret = key["key"].as_str().unwrap();
+        sqlx::query("UPDATE user_balance_checkpoints SET balance = -100 WHERE user_id = $1 OR user_id = $2")
+            .bind(owner.id)
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', true)")
+            .bind(org.id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // The org owns the file and permits debt, but the execution key bills
+        // the personal account. Its opt-in must be checked independently.
+        for enabled in [false, true, false] {
+            sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) VALUES ($1, 'ALLOW_NEGATIVE_BALANCE', $2) ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled")
+                .bind(owner.id).bind(enabled).execute(&pool).await.unwrap();
+            app.post("/ai/v1/batches")
+                .json(&batch_req(&file_id, None))
+                .add_header("authorization", &format!("Bearer {secret}"))
+                .add_header("cookie", &format!("dw_active_org={}", org.id))
+                .await
+                .assert_status(if enabled {
+                    StatusCode::CREATED
+                } else {
+                    StatusCode::PAYMENT_REQUIRED
+                });
         }
     }
 

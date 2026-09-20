@@ -61,6 +61,8 @@ export interface FallbackConfig {
   enabled: boolean;
   on_rate_limit: boolean;
   on_status: number[];
+  /** Extra statuses that fail over realtime traffic only; batch traffic runs its own retries. */
+  realtime_on_status?: number[];
   with_replacement: boolean;
   max_attempts: number | null;
   /** Inter-attempt exponential backoff. `null` (or omitted) = no delay between retries. */
@@ -327,6 +329,7 @@ export interface Model {
   endpoint?: Endpoint; // only present when include=endpoints
   // Virtual model fields (is_composite maps to "virtual" in UI terminology)
   is_composite?: boolean; // true = virtual model, false = hosted model
+  provisioning_source?: string;
   lb_strategy?: LoadBalancingStrategy | null;
   fallback?: FallbackConfig | null;
   components?: ModelComponent[]; // only present when include=components
@@ -378,6 +381,7 @@ export interface VirtualModelCreate {
   fallback_enabled?: boolean;
   fallback_on_rate_limit?: boolean;
   fallback_on_status?: number[];
+  fallback_realtime_on_status?: number[];
   fallback_with_replacement?: boolean;
   fallback_max_attempts?: number | null;
   /** Inter-attempt backoff toggle; defaults to false (legacy zero-delay retry). */
@@ -547,7 +551,7 @@ export interface ModelsQuery {
   group?: string; // Filter by group IDs (comma-separated UUIDs)
   include?: ModelsInclude;
   accessible?: boolean; // Filter to only models the current user can access
-  search?: string; // Case-insensitive search across model names and endpoint names
+  search?: string; // Case-insensitive search across alias, model name, display name, and endpoint name
   is_composite?: boolean; // Filter by composite/virtual model status (true = virtual, false = hosted)
   provider?: string; // Filter by provider name (case-insensitive exact match)
   model_type?: ModelType; // Filter by model type (CHAT, EMBEDDINGS, RERANKER)
@@ -657,6 +661,7 @@ export interface ModelUpdateRequest {
   fallback_enabled?: boolean | null;
   fallback_on_rate_limit?: boolean | null;
   fallback_on_status?: number[] | null;
+  fallback_realtime_on_status?: number[] | null;
   fallback_with_replacement?: boolean | null;
   fallback_max_attempts?: number | null;
   /** Inter-attempt backoff toggle. `null` (or omitted) = no change. */

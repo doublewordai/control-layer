@@ -38,13 +38,16 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::HeaderMap;
 use axum::routing::{any, get};
 use axum_prometheus::{
-    GenericMetricLayer, Handle, PrometheusMetricLayerBuilder,
-    metrics_exporter_prometheus::PrometheusHandle,
+    AXUM_HTTP_REQUESTS_DURATION_SECONDS, GenericMetricLayer, Handle,
+    PREFIXED_HTTP_REQUESTS_DURATION_SECONDS, PrometheusMetricLayerBuilder,
+    metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle},
+    utils::SECONDS_DURATION_BUCKETS,
 };
 use std::borrow::Cow;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
+pub mod aimd;
 pub mod auth;
 pub mod client;
 pub mod config;
@@ -61,7 +64,7 @@ pub mod target;
 pub mod telemetry;
 
 use client::{HttpClient, HyperClient};
-pub use handlers::ServedBy;
+pub use handlers::{AuthenticatedApiKeyId, ServedBy};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
 
@@ -132,6 +135,8 @@ pub struct AppState<T: HttpClient> {
     pub http_client: T,
     pub targets: target::Targets,
     pub response_transform_fn: Option<ResponseTransformFn>,
+    /// Optional public message for upstream 429 responses; local limits are unaffected.
+    pub upstream_rate_limit_message: Option<String>,
     /// Header name whose value overrides the generated `id` in Responses API
     /// responses. When set, the handler reads this header from the incoming
     /// request and uses its value (prefixed with `resp_` if not already) as the
@@ -144,6 +149,17 @@ pub struct AppState<T: HttpClient> {
     /// `DefaultBodyLimit`, which rejects large (e.g. long-context or base64
     /// image) payloads with a 413. Defaults to [`DEFAULT_BODY_LIMIT`].
     pub body_limit: usize,
+    /// Maximum buffered bytes of an unfinished SSE event. Complete events are forwarded first.
+    pub sse_buffer_limit: usize,
+    /// Proxy-wide default for
+    /// [`FallbackConfig::first_token_timeout_ms`](target::FallbackConfig::first_token_timeout_ms),
+    /// applied to every pool with fallback enabled that doesn't set its own.
+    /// `None` (default) leaves the timeout off unless a pool opts in.
+    pub first_token_timeout: Option<std::time::Duration>,
+    /// Request header whose presence exempts a request from the first-token
+    /// failover timeout — e.g. a marker a batch dispatcher stamps on traffic
+    /// that tolerates latency and runs its own retry policy.
+    pub first_token_timeout_exempt_header: Option<String>,
 }
 
 /// Default maximum request body size (32 MB).
@@ -162,8 +178,18 @@ impl<T: HttpClient> std::fmt::Debug for AppState<T> {
                 "response_transform_fn",
                 &self.response_transform_fn.as_ref().map(|_| "<function>"),
             )
+            .field(
+                "upstream_rate_limit_message",
+                &self.upstream_rate_limit_message,
+            )
             .field("response_id_header", &self.response_id_header)
             .field("body_limit", &self.body_limit)
+            .field("sse_buffer_limit", &self.sse_buffer_limit)
+            .field("first_token_timeout", &self.first_token_timeout)
+            .field(
+                "first_token_timeout_exempt_header",
+                &self.first_token_timeout_exempt_header,
+            )
             .finish()
     }
 }
@@ -182,8 +208,12 @@ impl AppState<HyperClient> {
             http_client,
             targets,
             response_transform_fn: None,
+            upstream_rate_limit_message: None,
             response_id_header: None,
             body_limit: DEFAULT_BODY_LIMIT,
+            sse_buffer_limit: sse::DEFAULT_SSE_BUFFER_LIMIT,
+            first_token_timeout: None,
+            first_token_timeout_exempt_header: None,
         }
     }
 }
@@ -195,9 +225,19 @@ impl<T: HttpClient> AppState<T> {
             http_client,
             targets,
             response_transform_fn: None,
+            upstream_rate_limit_message: None,
             response_id_header: None,
             body_limit: DEFAULT_BODY_LIMIT,
+            sse_buffer_limit: sse::DEFAULT_SSE_BUFFER_LIMIT,
+            first_token_timeout: None,
+            first_token_timeout_exempt_header: None,
         }
+    }
+
+    /// Customize upstream rate-limit errors without exposing provider error bodies.
+    pub fn with_upstream_rate_limit_message(mut self, message: impl Into<String>) -> Self {
+        self.upstream_rate_limit_message = Some(message.into());
+        self
     }
 
     /// Set the header name whose value overrides the Responses API `id` field.
@@ -206,9 +246,30 @@ impl<T: HttpClient> AppState<T> {
         self
     }
 
+    /// Set the proxy-wide first-token failover timeout (builder pattern). A
+    /// pool's own `fallback.first_token_timeout_ms` takes precedence.
+    pub fn with_first_token_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.first_token_timeout = Some(timeout);
+        self
+    }
+
+    /// Set the header whose presence exempts a request from the first-token
+    /// failover timeout (builder pattern).
+    pub fn with_first_token_timeout_exempt_header(mut self, header: impl Into<String>) -> Self {
+        self.first_token_timeout_exempt_header = Some(header.into());
+        self
+    }
+
     /// Set the response transformation function (builder pattern)
     pub fn with_response_transform(mut self, transform_fn: ResponseTransformFn) -> Self {
         self.response_transform_fn = Some(transform_fn);
+        self
+    }
+
+    /// Set the maximum unfinished SSE event size in bytes.
+    /// This is neither a total response limit nor a limit on coalesced complete events.
+    pub fn with_sse_buffer_limit(mut self, limit: usize) -> Self {
+        self.sse_buffer_limit = limit;
         self
     }
 
@@ -403,6 +464,16 @@ pub fn build_metrics_router(handle: PrometheusHandle) -> Router {
     )
 }
 
+/// Histogram buckets for `onwards_first_token_seconds`, in seconds.
+///
+/// 10 is an exact edge because it is the default first-token deadline and AIMD
+/// latency budget: the share of first tokens beyond it is only exact at a
+/// bucket edge. Exported so embedders installing their own recorder can use
+/// the same buckets.
+pub const FIRST_TOKEN_SECONDS_BUCKETS: &[f64] = &[
+    0.1, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 7.5, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0,
+];
+
 type MetricsLayerAndHandle = (
     GenericMetricLayer<'static, PrometheusHandle, Handle>,
     PrometheusHandle,
@@ -472,7 +543,38 @@ pub fn build_metrics_layer_and_handle(
         .with_prefix(prefix)
         .enable_response_body_size(true)
         .with_endpoint_label_type(axum_prometheus::EndpointLabel::Exact)
-        .with_default_metrics()
+        // Same as `with_default_metrics`, plus real histogram buckets for the
+        // first-token latency: without them it renders as a per-process
+        // summary, whose quantiles cannot be aggregated across replicas.
+        .with_metrics_from_fn(|| {
+            let recorder = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Full(
+                        PREFIXED_HTTP_REQUESTS_DURATION_SECONDS
+                            .get()
+                            .map_or(AXUM_HTTP_REQUESTS_DURATION_SECONDS, |s| s.as_str())
+                            .to_string(),
+                    ),
+                    SECONDS_DURATION_BUCKETS,
+                )
+                .expect("valid HTTP duration buckets")
+                .set_buckets_for_metric(
+                    Matcher::Full("onwards_first_token_seconds".to_string()),
+                    FIRST_TOKEN_SECONDS_BUCKETS,
+                )
+                .expect("valid first-token buckets")
+                .build_recorder();
+            let handle = recorder.handle();
+            let upkeep = handle.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    upkeep.run_upkeep();
+                }
+            });
+            metrics::set_global_recorder(recorder).expect("Failed to set global recorder");
+            handle
+        })
         .build_pair()
 }
 
@@ -587,6 +689,41 @@ pub mod test_utils {
                     let stream = async_stream::stream! {
                         tokio::time::sleep(delay).await;
                         for chunk in chunks {
+                            yield Ok::<_, std::io::Error>(chunk.into_bytes());
+                        }
+                    };
+
+                    axum::response::Response::builder()
+                        .status(status)
+                        .header("content-type", "text/event-stream")
+                        .header("cache-control", "no-cache")
+                        .header("connection", "keep-alive")
+                        .body(Body::from_stream(stream))
+                        .unwrap()
+                }),
+            }
+        }
+
+        /// Like [`Self::new_delayed_streaming_sequence`], but each chunk carries
+        /// its own delay (slept before it is sent), so a stream can emit
+        /// keep-alive frames and then stall before its first real token.
+        pub fn new_timed_streaming_sequence(
+            status: StatusCode,
+            responses: Vec<Vec<(std::time::Duration, String)>>,
+        ) -> Self {
+            let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            Self {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                custom_headers: Arc::new(Mutex::new(Vec::new())),
+                response_builder: Arc::new(move || {
+                    use axum::body::Body;
+
+                    let idx = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let chunks = responses.get(idx).cloned().unwrap_or_default();
+
+                    let stream = async_stream::stream! {
+                        for (delay, chunk) in chunks {
+                            tokio::time::sleep(delay).await;
                             yield Ok::<_, std::io::Error>(chunk.into_bytes());
                         }
                     };
@@ -1001,23 +1138,35 @@ mod tests {
     /// exactly why the extension (not a header) carries this.
     #[tokio::test]
     async fn test_served_by_extension_set_on_success() {
+        use crate::auth::ConstantTimeString;
+        use std::collections::{HashMap, HashSet};
         use tower::ServiceExt;
 
+        let api_key_id = uuid::Uuid::new_v4();
+        let api_key = "test-api-key";
+        let mut keys = HashSet::new();
+        keys.insert(ConstantTimeString::from(api_key.to_string()));
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "gpt-4".to_string(),
             pool(
                 target::Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
+                    .keys(keys)
                     .onwards_model("gpt-4-upstream".to_string())
                     .build(),
             ),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            api_key.to_string(),
+            HashMap::from([("api_key_id".to_string(), api_key_id.to_string())]),
         );
         let targets = target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
+            key_labels,
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1032,6 +1181,7 @@ mod tests {
             .method("POST")
             .uri("/v1/chat/completions")
             .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {api_key}"))
             .body(axum::body::Body::from(
                 json!({
                     "model": "gpt-4",
@@ -1049,14 +1199,154 @@ mod tests {
             .expect("success response must carry ServedBy");
         assert_eq!(served_by.url, "https://api.openai.com/");
         assert_eq!(served_by.onwards_model.as_deref(), Some("gpt-4-upstream"));
+        assert_eq!(
+            response.extensions().get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authenticated_api_key_id_survives_models_and_strict_error() {
+        use crate::auth::ConstantTimeString;
+        use crate::target::{RateLimitExceeded, RateLimiter};
+        use std::collections::{HashMap, HashSet};
+        use tower::ServiceExt;
+
+        #[derive(Debug)]
+        struct BlockingRateLimiter;
+
+        impl RateLimiter for BlockingRateLimiter {
+            fn check(&self) -> Result<(), RateLimitExceeded> {
+                Err(RateLimitExceeded)
+            }
+        }
+
+        let api_key_id = uuid::Uuid::new_v4();
+        let api_key = "test-api-key";
+        let mut keys = HashSet::new();
+        keys.insert(ConstantTimeString::from(api_key.to_string()));
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "gpt-4".to_string(),
+            pool(
+                target::Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .keys(keys.clone())
+                    .build(),
+            ),
+        );
+        targets_map.insert(
+            "blocked-model".to_string(),
+            pool(
+                target::Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .keys(keys)
+                    .limiter(Arc::new(BlockingRateLimiter) as Arc<dyn RateLimiter>)
+                    .build(),
+            ),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            api_key.to_string(),
+            HashMap::from([("api_key_id".to_string(), api_key_id.to_string())]),
+        );
+        let targets = target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels,
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"provider detail"}}"#,
+        );
+        let router = build_router(AppState::with_client(targets, mock_client));
+
+        let models_request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", format!("Bearer {api_key}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let models_response = router.clone().oneshot(models_request).await.unwrap();
+        assert_eq!(
+            models_response
+                .extensions()
+                .get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
+
+        let chat_request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {api_key}"))
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let chat_response = router.clone().oneshot(chat_request).await.unwrap();
+        assert_eq!(chat_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            chat_response
+                .extensions()
+                .get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
+
+        let rejected_request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {api_key}"))
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "blocked-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let rejected_response = router.oneshot(rejected_request).await.unwrap();
+        assert_eq!(rejected_response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            rejected_response
+                .extensions()
+                .get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
     }
 
     /// Strict-mode `Targets` with one alias backed by a fallback pool of `n`
     /// identical providers (all hit the shared mock client), configured to retry
     /// on the given upstream `on_status` codes.
     fn fallback_targets(alias: &str, n: usize, on_status: Vec<u16>) -> target::Targets {
+        fallback_targets_with(
+            alias,
+            n,
+            target::FallbackConfig {
+                enabled: true,
+                on_status,
+                ..Default::default()
+            },
+        )
+    }
+
+    /// `n` priority-ordered providers (`p0`, `p1`, …) under an explicit
+    /// fallback config.
+    fn fallback_targets_with(
+        alias: &str,
+        n: usize,
+        fallback: target::FallbackConfig,
+    ) -> target::Targets {
         use crate::load_balancer::{Provider, ProviderPool};
-        use crate::target::{FallbackConfig, LoadBalanceStrategy, Target};
+        use crate::target::{LoadBalanceStrategy, Target};
 
         let providers = (0..n)
             .map(|i| {
@@ -1067,17 +1357,12 @@ mod tests {
                 Provider::new(t, 1)
             })
             .collect();
-        let fallback = Some(FallbackConfig {
-            enabled: true,
-            on_status,
-            ..Default::default()
-        });
         let pool = ProviderPool::with_config(
             providers,
             None,
             None,
             None,
-            fallback,
+            Some(fallback),
             LoadBalanceStrategy::Priority,
             false,
             Vec::new(),
@@ -1284,10 +1569,179 @@ mod tests {
     // tests exercise the embedded-error detection + retry in target_message_handler.
 
     #[tokio::test]
-    async fn test_streaming_embedded_error_retries_then_exhausts_to_503() {
+    async fn test_embedded_error_preserves_only_trusted_client_details() {
+        use crate::load_balancer::{Provider, ProviderPool};
+        use crate::target::LoadBalanceStrategy;
+
+        // A per-provider override must win over pool trust in both directions.
+        for (provider_trust, pool_trust, preserve) in [
+            (Some(true), false, true),
+            (Some(false), true, false),
+            (None, true, true),
+            (None, false, false),
+        ] {
+            for streaming in [false, true] {
+                let body = r#"{"error":{"code":400,"message":"image_url.detail must be auto, low or high","type":"invalid_image_error","param":"image_url.detail","metadata":{"private":"not part of the public error"}}}"#;
+                let mock = if streaming {
+                    MockHttpClient::new_streaming(
+                        StatusCode::OK,
+                        vec![": keep-alive\n\n".to_string(), format!("data:{body}\n\n")],
+                    )
+                } else {
+                    MockHttpClient::new(StatusCode::OK, body)
+                };
+                let target = Target::builder()
+                    .url("https://provider.example.com/".parse().unwrap())
+                    .maybe_trusted(provider_trust)
+                    .build();
+                let provider_pool = ProviderPool::with_config(
+                    vec![Provider::new(target, 1)],
+                    None,
+                    None,
+                    None,
+                    None,
+                    LoadBalanceStrategy::Priority,
+                    pool_trust,
+                    Vec::new(),
+                );
+                let targets = embedded_error_targets("gpt-4", 1);
+                targets
+                    .targets
+                    .insert("gpt-4".to_string(), provider_pool.into());
+                let server =
+                    TestServer::new(build_router(AppState::with_client(targets, mock.clone())))
+                        .unwrap();
+                let response = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({
+                        "model":"gpt-4", "stream":streaming,
+                        "messages":[{"role":"user","content":"hello"}]
+                    }))
+                    .await;
+                assert_eq!(response.status_code(), 400);
+                let error = response.json::<serde_json::Value>();
+                if preserve {
+                    assert_eq!(
+                        error["error"]["message"],
+                        "image_url.detail must be auto, low or high"
+                    );
+                    assert_eq!(error["error"]["param"], "image_url.detail");
+                    assert_eq!(error["error"]["code"], "400");
+                    assert_eq!(error["error"]["type"], "invalid_image_error");
+                } else {
+                    assert_eq!(
+                        error["error"]["message"],
+                        "The upstream provider rejected the request."
+                    );
+                    assert!(error["error"]["param"].is_null());
+                    assert_eq!(error["error"]["type"], "invalid_request_error");
+                }
+                assert!(error["error"].get("metadata").is_none());
+                assert_eq!(mock.get_requests().len(), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upstream_rate_limit_preserves_status_and_custom_message() {
+        for strict in [false, true] {
+            for embedded in [false, true] {
+                for streaming in [false, true] {
+                    for retry in [false, true] {
+                        let body = r#"{"error":{"code":429,"message":"private upstream details"}}"#;
+                        let status = if embedded {
+                            StatusCode::OK
+                        } else {
+                            StatusCode::TOO_MANY_REQUESTS
+                        };
+                        let mock = if streaming {
+                            MockHttpClient::new_streaming(status, vec![format!("data: {body}\n\n")])
+                        } else {
+                            MockHttpClient::new(status, body)
+                        };
+                        let targets =
+                            fallback_targets("gpt-4", 2, if retry { vec![429] } else { vec![] });
+                        let state = AppState::with_client(targets, mock.clone())
+                            .with_upstream_rate_limit_message(
+                                "Contact support for a dedicated deployment.",
+                            );
+                        let router = if strict {
+                            crate::strict::build_strict_router(state)
+                        } else {
+                            build_router(state)
+                        };
+                        let server = TestServer::new(router).unwrap();
+                        let response = server
+                            .post(if strict {
+                                "/chat/completions"
+                            } else {
+                                "/v1/chat/completions"
+                            })
+                            .json(&json!({
+                                "model": "gpt-4", "stream": streaming,
+                                "messages": [{"role": "user", "content": "Hello"}]
+                            }))
+                            .await;
+                        assert_eq!(
+                            response.status_code(),
+                            429,
+                            "strict={strict}, embedded={embedded}, streaming={streaming}, retry={retry}"
+                        );
+                        let error = response.json::<serde_json::Value>();
+                        assert_eq!(error["error"]["type"], "rate_limit_error");
+                        assert_eq!(error["error"]["code"], "upstream_rate_limit");
+                        assert_eq!(
+                            error["error"]["message"],
+                            "Contact support for a dedicated deployment."
+                        );
+                        assert!(!response.text().contains("private upstream details"));
+                        assert_eq!(mock.get_requests().len(), if retry { 2 } else { 1 });
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_trusted_embedded_error_keeps_server_and_rate_limit_details_private() {
+        for code in [429, 500, 501, 503] {
+            for streaming in [false, true] {
+                let body =
+                    json!({"error":{"code":code,"message":"private upstream failure"}}).to_string();
+                let mock = if streaming {
+                    MockHttpClient::new_streaming(StatusCode::OK, vec![format!("data: {body}\n\n")])
+                } else {
+                    MockHttpClient::new(StatusCode::OK, &body)
+                };
+                let targets = embedded_error_targets("gpt-4", 1);
+                targets.targets.insert(
+                    "gpt-4".to_string(),
+                    pool(
+                        Target::builder()
+                            .url("https://provider.example.com/".parse().unwrap())
+                            .trusted(true)
+                            .build(),
+                    ),
+                );
+                let server =
+                    TestServer::new(build_router(AppState::with_client(targets, mock))).unwrap();
+                let response = server
+                    .post("/v1/chat/completions")
+                    .json(&json!({
+                        "model":"gpt-4", "stream":streaming,
+                        "messages":[{"role":"user","content":"hello"}]
+                    }))
+                    .await;
+                assert_eq!(response.status_code(), if code == 429 { 429 } else { 503 });
+                assert!(!response.text().contains("private upstream failure"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_streaming_embedded_error_retries_then_exhausts_to_429() {
         // 200 stream whose first frame is a `429` error envelope. onwards must
-        // retry across providers and, when exhausted, return a sanitized 503 —
-        // never the upstream 429.
+        // retry across providers and, when exhausted, return a sanitized 429.
         let error_frame =
             "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
                 .to_string();
@@ -1305,8 +1759,8 @@ mod tests {
 
         assert_eq!(
             response.status_code(),
-            503,
-            "exhausted retries must surface a sanitized 503, not the upstream 429"
+            429,
+            "exhausted retries must preserve the upstream 429"
         );
         assert_eq!(
             mock.get_requests().len(),
@@ -1352,8 +1806,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unary_embedded_error_collapses_to_503() {
-        // The same envelope on a non-streaming 200 body collapses to a 503.
+    async fn test_unary_embedded_rate_limit_preserves_429() {
+        // The same envelope on a non-streaming 200 body surfaces as a 429.
         let body = r#"{"error":{"code":429,"message":"Provider returned error"}}"#;
         let mock = MockHttpClient::new(StatusCode::OK, body);
         let app_state = AppState::with_client(embedded_error_targets("gpt-4", 2), mock.clone());
@@ -1367,7 +1821,7 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(response.status_code(), 503);
+        assert_eq!(response.status_code(), 429);
         assert_eq!(
             mock.get_requests().len(),
             2,
@@ -1378,7 +1832,7 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_keepalive_before_error_is_still_detected() {
         // A keep-alive comment precedes the error frame; the peek must skip it
-        // and still detect the 429, retry, and exhaust to 503.
+        // and still detect the 429, retry, and exhaust to 429.
         let keepalive = ": keep-alive\n\n".to_string();
         let error_frame =
             "data: {\"error\":{\"code\":429,\"message\":\"Provider returned error\"}}\n\n"
@@ -1397,7 +1851,7 @@ mod tests {
 
         assert_eq!(
             response.status_code(),
-            503,
+            429,
             "an error after a keep-alive frame must still be detected"
         );
         assert_eq!(mock.get_requests().len(), 2);
@@ -1484,6 +1938,278 @@ mod tests {
             2,
             "slow empty stream must trigger a retry"
         );
+    }
+
+    /// Two priority providers (`p0`, `p1`) with a 100ms first-token failover
+    /// default. `max_attempts` is unset, so attempt 1 is armed and attempt 2 —
+    /// the last — is not.
+    fn first_token_app(mock: MockHttpClient) -> AppState<MockHttpClient> {
+        AppState::with_client(fallback_targets("gpt-4", 2, vec![502]), mock)
+            .with_first_token_timeout(std::time::Duration::from_millis(100))
+    }
+
+    fn chat_request(stream: bool) -> serde_json::Value {
+        json!({
+            "model": "gpt-4", "stream": stream,
+            "messages": [{"role": "user", "content": "Hello"}]
+        })
+    }
+
+    /// A stream that is 200 OK immediately but produces its content only after
+    /// `delay` — the shape of a provider that accepts a request and stalls.
+    fn slow_stream(delay: std::time::Duration) -> (std::time::Duration, Vec<String>) {
+        (delay, vec![OK_CONTENT_FRAME.to_string()])
+    }
+
+    #[tokio::test]
+    async fn test_first_token_timeout_fails_over_stalled_stream() {
+        // Provider 0 sends headers and then nothing; provider 1 is healthy. The
+        // stall must be abandoned at the deadline, not forwarded to the client.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                slow_stream(std::time::Duration::from_secs(30)),
+                slow_stream(std::time::Duration::ZERO),
+            ],
+        );
+        let server = TestServer::new(build_router(first_token_app(mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            response.text().contains("hi"),
+            "served by the healthy provider"
+        );
+        let requests = mock.get_requests();
+        assert_eq!(requests.len(), 2, "the stalled stream must fail over");
+        assert!(
+            requests[1].uri.starts_with("https://p1.example.com/"),
+            "failover goes to the next provider, got {}",
+            requests[1].uri
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_token_timeout_ignores_keep_alive_comments() {
+        // A stalled provider may keep the connection warm with SSE comments.
+        // Those are not a first token, so they must not defuse the deadline.
+        let keep_alive = |ms: u64| {
+            (
+                std::time::Duration::from_millis(ms),
+                ": keep-alive\n\n".to_string(),
+            )
+        };
+        let mock = MockHttpClient::new_timed_streaming_sequence(
+            StatusCode::OK,
+            vec![
+                vec![
+                    keep_alive(0),
+                    keep_alive(20),
+                    keep_alive(20),
+                    keep_alive(20),
+                    keep_alive(20),
+                    (
+                        std::time::Duration::from_secs(30),
+                        OK_CONTENT_FRAME.to_string(),
+                    ),
+                ],
+                vec![(std::time::Duration::ZERO, OK_CONTENT_FRAME.to_string())],
+            ],
+        );
+        let server = TestServer::new(build_router(first_token_app(mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(response.text().contains("hi"));
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "keep-alive comments alone must not count as a first token"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_token_timeout_spares_the_final_attempt() {
+        // Both providers are slower than the deadline. The first is abandoned,
+        // but the last attempt is left to finish: failover may reroute a slow
+        // request, never fail one that would otherwise have succeeded.
+        let slow = slow_stream(std::time::Duration::from_millis(300));
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![slow.clone(), slow],
+        );
+        let server = TestServer::new(build_router(first_token_app(mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(
+            response.text().contains("hi"),
+            "the final attempt is served"
+        );
+        assert_eq!(mock.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_first_token_timeout_exempt_header_opts_out() {
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![slow_stream(std::time::Duration::from_millis(300))],
+        );
+        let app = first_token_app(mock.clone())
+            .with_first_token_timeout_exempt_header("x-fusillade-batch-created-at");
+        let server = TestServer::new(build_router(app)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .add_header("x-fusillade-batch-created-at", "2026-09-15T00:00:00Z")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert!(response.text().contains("hi"));
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "a request carrying the exempt header is never failed over on time"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_token_timeout_leaves_non_streaming_alone() {
+        // Unary headers only arrive with the whole completion, so a slow
+        // non-streaming request must not be failed over.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![slow_stream(std::time::Duration::from_millis(300))],
+        );
+        let server = TestServer::new(build_router(first_token_app(mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(false))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(mock.get_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_done_sentinel_is_not_a_first_token_but_is_not_empty() {
+        // `[DONE]` is a data frame carrying no token. It must not count as a
+        // first token — and it must not be mistaken for an empty body either,
+        // since `saw_data` is what suppresses the retryable `EmptyBody` verdict.
+        // So: one attempt, forwarded to the client, no failover.
+        let mock =
+            MockHttpClient::new_streaming(StatusCode::OK, vec!["data: [DONE]\n\n".to_string()]);
+        let server = TestServer::new(build_router(first_token_app(mock.clone()))).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(
+            mock.get_requests().len(),
+            1,
+            "a [DONE]-only stream is not empty, so it must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_first_token_timeout_needs_a_different_provider() {
+        // A single-provider pool with a retry budget has attempts left but no
+        // other provider: re-running a slow prefill on the same backend would
+        // only waste it, so the deadline stays disarmed.
+        let mock = MockHttpClient::new_delayed_streaming_sequence(
+            StatusCode::OK,
+            vec![slow_stream(std::time::Duration::from_millis(300))],
+        );
+        let targets = fallback_targets_with(
+            "gpt-4",
+            1,
+            target::FallbackConfig {
+                enabled: true,
+                on_status: vec![502],
+                max_attempts: Some(3),
+                ..Default::default()
+            },
+        );
+        let app = AppState::with_client(targets, mock.clone())
+            .with_first_token_timeout(std::time::Duration::from_millis(100));
+        let server = TestServer::new(build_router(app)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await;
+
+        assert_eq!(response.status_code(), 200);
+        assert_eq!(mock.get_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_pool_first_token_timeout_overrides_default() {
+        let stalled_then_healthy = || {
+            MockHttpClient::new_delayed_streaming_sequence(
+                StatusCode::OK,
+                vec![
+                    slow_stream(std::time::Duration::from_millis(300)),
+                    slow_stream(std::time::Duration::ZERO),
+                ],
+            )
+        };
+        let pool_timeout = |ms: u64| {
+            fallback_targets_with(
+                "gpt-4",
+                2,
+                target::FallbackConfig {
+                    enabled: true,
+                    on_status: vec![502],
+                    first_token_timeout_ms: Some(ms),
+                    aimd: None,
+                    ..Default::default()
+                },
+            )
+        };
+
+        // A pool's own timeout arms failover with no proxy-wide default...
+        let mock = stalled_then_healthy();
+        let server = TestServer::new(build_router(AppState::with_client(
+            pool_timeout(100),
+            mock.clone(),
+        )))
+        .unwrap();
+        server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await
+            .assert_status_ok();
+        assert_eq!(mock.get_requests().len(), 2, "pool timeout arms failover");
+
+        // ...and `0` disarms it despite one.
+        let mock = stalled_then_healthy();
+        let app = AppState::with_client(pool_timeout(0), mock.clone())
+            .with_first_token_timeout(std::time::Duration::from_millis(100));
+        let server = TestServer::new(build_router(app)).unwrap();
+        server
+            .post("/v1/chat/completions")
+            .json(&chat_request(true))
+            .await
+            .assert_status_ok();
+        assert_eq!(mock.get_requests().len(), 1, "pool timeout of 0 disarms it");
     }
 
     #[tokio::test]

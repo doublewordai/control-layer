@@ -1,0 +1,166 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,\n                   is_admin, password_hash, external_user_id, payment_provider_id,\n                   is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,\n                   low_balance_notification_sent, low_balance_threshold,\n                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention\n            FROM users\n            WHERE (username = $1 OR username LIKE $1 || '~%')\n              AND user_type = 'organization'\n              -- A soft-deleted workspace must never receive join requests:\n              -- nobody is left to approve them, so the requester would sit on a\n              -- queue no one can see.\n              AND is_deleted = false\n              -- Same reasoning one level down: a workspace whose owners and\n              -- admins have all been deleted is still `is_deleted = false`, but\n              -- there is equally nobody home to approve anything.\n              --\n              -- `Users::delete` no longer creates these - it hands a workspace\n              -- to a successor or closes it - but it used to walk away from the\n              -- departing user's `user_organizations` rows, which stranded any\n              -- workspace whose only owner was deleted: still claiming the\n              -- domain, still offered to every colleague who signed up,\n              -- unadministrable. This covers those legacy rows, and anything\n              -- else that reaches the same state by a route we have not thought\n              -- of. `users` inside the subquery is the outer row - the inner one\n              -- is aliased.\n              AND EXISTS (\n                  SELECT 1\n                  FROM user_organizations uo\n                  JOIN users admin ON admin.id = uo.user_id\n                  WHERE uo.organization_id = users.id\n                    AND uo.role IN ('owner', 'admin')\n                    AND uo.status = 'active'\n                    AND admin.is_deleted = false\n              )\n            ORDER BY created_at ASC\n            LIMIT 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "username",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "email",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "display_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "avatar_url",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 5,
+        "name": "auth_source",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "updated_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 8,
+        "name": "is_admin",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 9,
+        "name": "password_hash",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 10,
+        "name": "external_user_id",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 11,
+        "name": "payment_provider_id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 12,
+        "name": "is_deleted",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 13,
+        "name": "is_internal",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 14,
+        "name": "batch_notifications_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 15,
+        "name": "first_batch_email_sent",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 16,
+        "name": "low_balance_notification_sent",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 17,
+        "name": "low_balance_threshold",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 18,
+        "name": "auto_topup_amount",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 19,
+        "name": "auto_topup_threshold",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 20,
+        "name": "auto_topup_monthly_limit",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 21,
+        "name": "user_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 22,
+        "name": "verified",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 23,
+        "name": "invoicing_enabled",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 24,
+        "name": "zero_data_retention",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "a5b1b97a4a23b186fe9f86967580c1e48e0cf6eb1cd2e1cf62dc9496f1c70aef"
+}

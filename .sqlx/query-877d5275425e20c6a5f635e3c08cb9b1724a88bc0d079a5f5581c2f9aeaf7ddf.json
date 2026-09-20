@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT ak.user_id, ak.id as api_key_id, ak.purpose,\n                   CASE WHEN root.spend_limit IS NOT NULL THEN root.id END AS \"cap_scope_root?\"\n            FROM api_keys ak\n            JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)\n            WHERE ak.id = ANY($1)\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "api_key_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "purpose",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "cap_scope_root?",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "877d5275425e20c6a5f635e3c08cb9b1724a88bc0d079a5f5581c2f9aeaf7ddf"
+}

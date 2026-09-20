@@ -1,80 +1,57 @@
 //! Shared daemon configuration.
 
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::http::HttpResponse;
+
+/// Optional leaking for queued batches on unavailable models.
+/// Async/flex claims retain `DaemonConfig::leaks_per_window`.
+/// Kept separate from `DaemonConfig` to preserve downstream struct literals.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct LeakConfig {
+    /// Enable batch leaking outside the deadline ramp. False restores the live gate.
+    pub leak_enabled: bool,
+    /// Seconds between claims per user/model/window. Must be positive.
+    pub leak_interval_seconds: NonZeroU32,
+    /// Exact model aliases overriding the default interval.
+    pub model_leak_interval_seconds: HashMap<String, NonZeroU32>,
+}
+
+impl Default for LeakConfig {
+    fn default() -> Self {
+        Self {
+            leak_enabled: true,
+            leak_interval_seconds: NonZeroU32::new(60).unwrap(),
+            model_leak_interval_seconds: HashMap::new(),
+        }
+    }
+}
+
+impl LeakConfig {
+    pub(crate) fn interval(&self, model: &str) -> Duration {
+        let seconds = self
+            .model_leak_interval_seconds
+            .get(model)
+            .unwrap_or(&self.leak_interval_seconds);
+        Duration::from_secs(u64::from(seconds.get()))
+    }
+}
 
 /// Predicate function to determine if a response should be retried.
 pub type ShouldRetryFn = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
 
-/// Default retry predicate: retry on server errors, rate limits, timeouts, and not
-/// found, plus successful chat completions that carry reasoning but no final answer.
+/// Default retry predicate: retry on server errors, rate limits, timeouts, and
+/// not found. dwctl converts semantic and streamed failures to real HTTP errors
+/// before returning daemon responses.
 pub fn default_should_retry(response: &HttpResponse) -> bool {
-    if response.status >= 500
+    response.status >= 500
         || response.status == 429
         || response.status == 408
         || response.status == 404
-    {
-        return true;
-    }
-    (200..300).contains(&response.status) && is_reasoning_without_answer(&response.body)
-}
-
-/// A completed chat response whose message holds chain-of-thought but no answer:
-/// the engine emitted an end-of-sequence token mid-reasoning, so the whole output
-/// was filed as reasoning and `content` never arrived. The response looks
-/// successful (2xx, `finish_reason: "stop"`) but is useless to the caller, so it
-/// is classified as a failure and retried.
-///
-/// Detection must read the body, not usage counts: some engine builds omit the
-/// reasoning split from the usage frame (`reasoning_tokens: 0` despite real
-/// reasoning), so token-based predicates miss them.
-///
-/// `finish_reason: "length"` is deliberately excluded — hitting a token cap is a
-/// valid outcome under caller-controlled parameters, and retrying it can re-arm
-/// arbitrarily large generations.
-fn is_reasoning_without_answer(body: &str) -> bool {
-    // Non-reasoning responses can never match; skip parsing their bodies.
-    if !body.contains("\"reasoning") {
-        return false;
-    }
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(body) else {
-        return false;
-    };
-    let Some(choices) = v.get("choices").and_then(|c| c.as_array()) else {
-        return false;
-    };
-    choices.iter().any(|choice| {
-        if choice.get("finish_reason").and_then(|f| f.as_str()) != Some("stop") {
-            return false;
-        }
-        let Some(message) = choice.get("message") else {
-            return false;
-        };
-        // A tool invocation is a complete answer with legitimately empty content.
-        let has_tool_calls = message
-            .get("tool_calls")
-            .and_then(|t| t.as_array())
-            .is_some_and(|t| !t.is_empty())
-            || message.get("function_call").is_some_and(|f| !f.is_null());
-        if has_tool_calls {
-            return false;
-        }
-        let has_reasoning = ["reasoning_content", "reasoning"].iter().any(|key| {
-            message
-                .get(key)
-                .and_then(|r| r.as_str())
-                .is_some_and(|r| !r.is_empty())
-        });
-        let no_answer = match message.get("content") {
-            None | Some(serde_json::Value::Null) => true,
-            Some(serde_json::Value::String(s)) => s.is_empty(),
-            // Structured content parts are an answer even when unusual.
-            Some(_) => false,
-        };
-        has_reasoning && no_answer
-    })
 }
 
 fn default_should_retry_fn() -> ShouldRetryFn {
@@ -842,6 +819,29 @@ mod tests {
     }
 
     #[test]
+    fn fixed_leak_intervals_resolve_exact_model_overrides() {
+        let config: LeakConfig = serde_json::from_value(serde_json::json!({
+            "model_leak_interval_seconds": {"large/model": 10}
+        }))
+        .unwrap();
+        assert_eq!(config.interval("large/model").as_secs(), 10);
+        assert_eq!(config.interval("other/model").as_secs(), 60);
+        assert_eq!(config.interval("large/model-suffix").as_secs(), 60);
+        assert!(
+            serde_json::from_value::<LeakConfig>(serde_json::json!({
+                "leak_interval_seconds": 0
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<LeakConfig>(serde_json::json!({
+                "model_leak_interval_seconds": {"large/model": 0}
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
     fn retention_maintenance_defaults_are_safe_and_bounded() {
         let config = RetentionMaintenanceConfig::default();
 
@@ -959,93 +959,8 @@ mod tests {
             assert!(default_should_retry(&response(status, "")));
         }
 
-        for status in [200, 400, 401, 403, 422, 498, 499] {
+        for status in [200, 201, 204, 299, 400, 401, 403, 422, 498, 499] {
             assert!(!default_should_retry(&response(status, "")));
-        }
-    }
-
-    /// Builds a 2xx chat-completion body with the given message fields spliced in.
-    fn chat_completion(finish_reason: &str, message_fields: &str) -> String {
-        format!(
-            r#"{{"id":"cmpl-1","object":"chat.completion","choices":[{{"index":0,"finish_reason":"{finish_reason}","message":{{"role":"assistant"{message_fields}}}}}],"usage":{{"prompt_tokens":10,"completion_tokens":5}}}}"#
-        )
-    }
-
-    #[test]
-    fn reasoning_without_answer_is_retriable() {
-        // The premature end-of-sequence shape: reasoning present, content never
-        // arrived (absent, null, or empty) — regardless of which reasoning field
-        // the serving stack uses.
-        for message in [
-            r#","reasoning_content":"We need to assess the headnotes...""#,
-            r#","reasoning_content":"We need to assess...","content":null"#,
-            r#","reasoning_content":"We need to assess...","content":"""#,
-            r#","reasoning":"We need to assess...""#,
-        ] {
-            let body = chat_completion("stop", message);
-            assert!(
-                default_should_retry(&response(200, &body)),
-                "expected retry for {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn reasoning_with_answer_is_not_retriable() {
-        let body = chat_completion(
-            "stop",
-            r#","reasoning_content":"We need to assess...","content":"Headnote 1: ...""#,
-        );
-        assert!(!default_should_retry(&response(200, &body)));
-    }
-
-    #[test]
-    fn tool_calls_with_empty_content_are_not_retriable() {
-        // Tool invocations legitimately return no content alongside reasoning.
-        for message in [
-            r#","reasoning_content":"I should call the tool...","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"f","arguments":"{}"}}]"#,
-            r#","reasoning_content":"I should call the tool...","function_call":{"name":"f","arguments":"{}"}"#,
-        ] {
-            let body = chat_completion("stop", message);
-            assert!(
-                !default_should_retry(&response(200, &body)),
-                "expected no retry for {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn length_capped_reasoning_is_not_retriable() {
-        // Exhausting the caller's token budget mid-reasoning is the caller's
-        // signal to handle (finish_reason "length"), not a retriable fault.
-        let body = chat_completion("length", r#","reasoning_content":"We need to assess...""#);
-        assert!(!default_should_retry(&response(200, &body)));
-    }
-
-    #[test]
-    fn empty_content_without_reasoning_is_not_retriable() {
-        let body = chat_completion("stop", r#","content":"""#);
-        assert!(!default_should_retry(&response(200, &body)));
-    }
-
-    #[test]
-    fn structured_content_counts_as_an_answer() {
-        let body = chat_completion(
-            "stop",
-            r#","reasoning_content":"We need to assess...","content":[{"type":"text","text":"answer"}]"#,
-        );
-        assert!(!default_should_retry(&response(200, &body)));
-    }
-
-    #[test]
-    fn unparseable_or_non_chat_bodies_are_not_retriable() {
-        for body in [
-            "not json at all",
-            r#"{"reasoning_content":"orphaned"}"#,
-            r#"{"object":"list","data":[],"note":"reasoning"}"#,
-            r#"data: {"choices":[{"delta":{"reasoning_content":"sse frame"}}]}"#,
-        ] {
-            assert!(!default_should_retry(&response(200, body)));
         }
     }
 

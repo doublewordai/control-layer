@@ -1353,18 +1353,8 @@ pub trait Storage: Send + Sync {
         leak_cooldown: &std::collections::HashSet<(String, String, String)>,
     ) -> Result<Vec<Request<Claimed>>>;
 
-    /// Atomically claim pending requests that belong to live-model batches.
-    ///
-    /// The batch daemon owns this policy. Implementations should select
-    /// candidate batches before probing request rows, limit selected batches by
-    /// `batch_limit`, and gate on model liveness: models whose latest
-    /// `model_filters` event is `live` are always eligible; models with **no**
-    /// filter event (external / always-on providers that scouter does not
-    /// manage) are eligible unless `DaemonConfig::batch_claim_require_live` is
-    /// set; models whose latest event is `coming`/`absent` are eligible only
-    /// once the batch is within the deadline ramp (`claim_ramp_exponent`) —
-    /// the SLA escape hatch to fallback providers. No leaky-bucket trickle
-    /// applies to batched rows.
+    /// Claim batch rows using the live-model gate and deadline ramp, without leaking.
+    /// To opt into leaking, use [`Storage::claim_batch_requests_with_cooldown`].
     async fn claim_batch_requests(
         &self,
         limit: usize,
@@ -1388,6 +1378,33 @@ pub trait Storage: Send + Sync {
              (override it, or return false from supports_batch_claims to run \
              the daemon request-only)"
         )))
+    }
+
+    /// Claim batch rows with the same per-user/model/window cooldown as async
+    /// rows. Unavailable models outside their deadline ramp may leak one row
+    /// per bucket absent from `leak_cooldown`. Leaked rows must carry a stamp.
+    ///
+    /// The default delegates to the non-leaking batch claim method and ignores
+    /// cooldowns. Existing backends retain their behavior; implement this method
+    /// to opt into leaking and enforce the supplied cooldowns.
+    async fn claim_batch_requests_with_cooldown(
+        &self,
+        limit: usize,
+        batch_limit: usize,
+        daemon_id: DaemonId,
+        available_capacity: &std::collections::HashMap<String, usize>,
+        user_active_counts: &std::collections::HashMap<String, usize>,
+        leak_cooldown: &std::collections::HashSet<(String, String, String)>,
+    ) -> Result<Vec<Request<Claimed>>> {
+        let _ = leak_cooldown;
+        self.claim_batch_requests(
+            limit,
+            batch_limit,
+            daemon_id,
+            available_capacity,
+            user_active_counts,
+        )
+        .await
     }
 
     /// Whether this backend implements [`Storage::claim_batch_requests`].
@@ -1582,6 +1599,7 @@ pub trait Storage: Send + Sync {
         &self,
         request_id: RequestId,
         owner: DaemonId,
+        claimed_at: chrono::DateTime<chrono::Utc>,
         retry_attempt: u32,
         not_before: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<bool>;
@@ -1651,11 +1669,12 @@ pub trait Storage: Send + Sync {
     ///
     ///   * Background realtime: a `processing` row exists (created inline by
     ///     `create_realtime` before the 202 response). UPDATEd to `completed`.
-    ///   * Non-background realtime: no row exists. INSERTed (template + request)
-    ///     directly in `completed` state.
+    ///   * Non-background realtime: no row exists. Persisted directly in retained
+    ///     storage when the backend has a realtime retention policy and an active
+    ///     partition; otherwise inserted as a terminal live request and template.
     ///
-    /// Rows already in a terminal state (rare: duplicate enqueues, late
-    /// completions for flex slip-through) are left alone via `ON CONFLICT`.
+    /// Existing terminal identities are idempotent no-ops; the first terminal
+    /// result wins. Non-2xx responses are persisted in the failed state.
     ///
     /// All work runs in a single transaction so commit overhead amortises
     /// across the batch. An empty input is a no-op.

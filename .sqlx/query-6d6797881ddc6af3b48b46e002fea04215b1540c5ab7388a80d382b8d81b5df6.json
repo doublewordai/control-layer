@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT file_id, archive_bucket FROM batches WHERE id = $1 AND deleted_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "file_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "archive_bucket",
+        "type_info": "Date"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "6d6797881ddc6af3b48b46e002fea04215b1540c5ab7388a80d382b8d81b5df6"
+}

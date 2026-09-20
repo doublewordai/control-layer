@@ -497,6 +497,7 @@ mod tests {
             traffic_routing_rules: None,
             allowed_batch_completion_windows: None,
             metadata: None,
+            provisioning_source: None,
         }
     }
 
