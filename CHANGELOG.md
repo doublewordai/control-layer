@@ -1,5 +1,19 @@
 # Changelog
 
+## [12.1.1](https://github.com/doublewordai/control-layer/compare/v12.1.0...v12.1.1) (2026-09-20)
+
+
+### Bug Fixes
+
+* **credits:** one payment instrument verifies one account; verification Checkout offers cards only ([#1820](https://github.com/doublewordai/control-layer/issues/1820)) ([2619b7f](https://github.com/doublewordai/control-layer/commit/2619b7fc2a494d0c4377e4dfd1546f4942df3333))
+* **dashboard:** show clean error for empty-body 503/529 failures ([#1660](https://github.com/doublewordai/control-layer/issues/1660)) ([798870b](https://github.com/doublewordai/control-layer/commit/798870b355056b96b4e8ceef8d58f46d4d7d9985))
+* **keystore:** reject empty/whitespace wrap-key secrets at config load ([#1651](https://github.com/doublewordai/control-layer/issues/1651)) ([4562d9c](https://github.com/doublewordai/control-layer/commit/4562d9c4acadd83c092de780c4a99cb287a7d18c))
+
+
+### Documentation
+
+* correct model provisioning config to not require a non-empty directory ([#1760](https://github.com/doublewordai/control-layer/issues/1760)) ([e72c203](https://github.com/doublewordai/control-layer/commit/e72c20340ae1829f36866bccce4340249fcfd3f8))
+
 ## [12.1.0](https://github.com/doublewordai/control-layer/compare/v12.0.1...v12.1.0) (2026-09-18)
 
 
