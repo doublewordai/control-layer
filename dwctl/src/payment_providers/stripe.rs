@@ -357,8 +357,14 @@ impl StripeProvider {
             })
     }
 
-    /// Fulfil a completed `setup`-mode session: save the verified card, mark the
-    /// billing target verified, and pay out signup credits.
+    /// Fulfil a completed `setup`-mode session: save the payment method as the
+    /// customer's default, then, if it carries a fingerprint that no other
+    /// account has verified with, mark the billing target verified and pay out
+    /// signup credits.
+    ///
+    /// When the instrument is held by another account (or has no fingerprint),
+    /// a verification session fails and an auto top-up enrolment returns `Ok`
+    /// with only the payment method saved.
     ///
     /// No money moved, so there is no purchase to record - the only ledger entry
     /// is the (optional, once-per-target) verification grant.
