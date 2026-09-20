@@ -5,6 +5,33 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0](https://github.com/doublewordai/control-layer/compare/onwards-v1.1.0...onwards-v1.2.0) (2026-09-16)
+
+
+### Features
+
+* **onwards:** add default-on AIMD provider share control ([#1793](https://github.com/doublewordai/control-layer/issues/1793)) ([5e848a5](https://github.com/doublewordai/control-layer/commit/5e848a547c8f22218e3fcdd8335b3fcd7a982a1e))
+
+## [1.1.0](https://github.com/doublewordai/control-layer/compare/onwards-v1.0.1...onwards-v1.1.0) (2026-09-16)
+
+
+### Features
+
+* **onwards:** measure first-token latency per provider role ([#1790](https://github.com/doublewordai/control-layer/issues/1790)) ([adc080b](https://github.com/doublewordai/control-layer/commit/adc080b07f6b190876bf75f034297a8a21b4961b))
+
+## [1.0.1](https://github.com/doublewordai/control-layer/compare/onwards-v1.0.0...onwards-v1.0.1) (2026-09-15)
+
+
+### Bug Fixes
+
+* **onwards:** pass provider reasoning fields through non-strict gateways ([#1591](https://github.com/doublewordai/control-layer/issues/1591)) ([81e0d38](https://github.com/doublewordai/control-layer/commit/81e0d38b4ff98f1e1d0eb02ed523c19499a94e18))
+* **onwards:** preserve trusted embedded client error details ([#1714](https://github.com/doublewordai/control-layer/issues/1714)) ([e2bcc8e](https://github.com/doublewordai/control-layer/commit/e2bcc8ee0328994dc52fe4c1bd82488c9e3e077e))
+
+
+### Code Refactoring
+
+* bring response reassembly into the Rust workspace ([#1775](https://github.com/doublewordai/control-layer/issues/1775)) ([d75c262](https://github.com/doublewordai/control-layer/commit/d75c26220fbd2660bf19c3e7df11fec4eceed14a))
+
 ## [1.0.0](https://github.com/doublewordai/control-layer/compare/onwards-v0.38.1...onwards-v1.0.0) (2026-09-05)
 
 

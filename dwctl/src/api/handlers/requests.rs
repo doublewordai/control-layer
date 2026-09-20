@@ -86,7 +86,7 @@ pub async fn list_requests<P: PoolProvider>(
     };
 
     // Query the http_analytics table - use read replica for analytics
-    let entries = list_http_analytics(state.db.read(), skip, limit, query.order_desc.unwrap_or(true), filter).await?;
+    let entries = list_http_analytics(&state.db.read(), skip, limit, query.order_desc.unwrap_or(true), filter).await?;
 
     Ok(Json(ListAnalyticsResponse { entries }))
 }
@@ -118,7 +118,7 @@ pub async fn aggregate_requests<P: PoolProvider>(
     let model_filter = query.model.as_deref();
 
     // Get aggregated analytics data from http_analytics table - use read replica for analytics
-    let response = get_requests_aggregate(state.db.read(), time_range_start, time_range_end, model_filter).await?;
+    let response = get_requests_aggregate(&state.db.read(), time_range_start, time_range_end, model_filter).await?;
 
     Ok(Json(response))
 }
@@ -164,7 +164,7 @@ pub async fn aggregate_by_user<P: PoolProvider>(
     let start_date = query.start_date.unwrap_or_else(|| end_date - Duration::hours(24));
 
     // Get usage data from http_analytics table - use read replica for analytics
-    let usage_data = get_model_user_usage(state.db.read(), &model_alias, start_date, end_date).await?;
+    let usage_data = get_model_user_usage(&state.db.read(), &model_alias, start_date, end_date).await?;
 
     Ok(Json(usage_data))
 }
@@ -248,10 +248,11 @@ pub async fn get_usage<P: PoolProvider>(
         let max_start = end_date - Duration::days(180);
         let start_date = if start < max_start { max_start } else { start };
 
+        let db = state.db.read();
         tokio::try_join!(
-            get_user_batch_count_for_range(state.db.read(), target_user_id, start_date, end_date),
-            get_user_model_breakdown_for_range(state.db.read(), target_user_id, start_date, end_date),
-            get_realtime_tariffs(state.db.read()),
+            get_user_batch_count_for_range(&db, target_user_id, start_date, end_date),
+            get_user_model_breakdown_for_range(&db, target_user_id, start_date, end_date),
+            get_realtime_tariffs(&db),
         )?
     } else {
         // All-time usage combines two pre-aggregated tables:
@@ -279,12 +280,13 @@ pub async fn get_usage<P: PoolProvider>(
         // synchronous fold, and only when the caller explicitly asks via
         // ?refresh=true (otherwise the usage-refresh daemon keeps it current).
         if refresh {
-            refresh_user_model_usage_daily(state.db.write()).await?;
+            refresh_user_model_usage_daily(&state.db.write()).await?;
         }
+        let db = state.db.read();
         let (batch_stats, by_model, tariffs) = tokio::try_join!(
-            get_user_batch_counts(state.db.read(), target_user_id),
-            get_user_model_breakdown(state.db.read(), target_user_id),
-            get_realtime_tariffs(state.db.read()),
+            get_user_batch_counts(&db, target_user_id),
+            get_user_model_breakdown(&db, target_user_id),
+            get_realtime_tariffs(&db),
         )?;
         (batch_stats.0, by_model, tariffs)
     };

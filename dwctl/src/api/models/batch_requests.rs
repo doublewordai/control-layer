@@ -53,7 +53,26 @@ pub struct ResponseSummary {
     pub reasoning_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
     pub total_cost: Option<f64>,
+    /// Email of the **billing owner** — `fusillade.requests.created_by`, which
+    /// is `api_keys.user_id` and therefore the *organization* for every
+    /// org-scoped key. Useless for telling org members apart; the three
+    /// `api_key_*` fields below carry that.
     pub created_by_email: Option<String>,
+    /// The **visible** key that billed this request: the cap-scope root
+    /// (`COALESCE(parent_api_key_id, id)`) of the key `http_analytics`
+    /// recorded, so a request executed on a hidden cap-scope child points at
+    /// the key its holder actually manages.
+    pub api_key_id: Option<Uuid>,
+    /// Name of the visible key above.
+    pub api_key_name: Option<String>,
+    /// Email of `api_keys.created_by` — the holder the key was issued to,
+    /// which for an org key is the member, not the owner/admin who minted it.
+    ///
+    /// `None` (along with the two fields above) when the request has no
+    /// `http_analytics` row: it never billed, or the row aged out of
+    /// retention. Token counts go the same way, so a row with no tokens has
+    /// no key either.
+    pub api_key_holder_email: Option<String>,
 }
 
 /// Full response detail (batchless fusillade request) including input/output.
@@ -84,5 +103,15 @@ pub struct ResponseDetail {
     /// `created_by` for batchless rows. So a row reaching this struct came
     /// from a real attributed input.
     pub created_by: String,
+    /// Email of the billing owner (the organization, for org-scoped keys).
+    /// See the `api_key_*` fields for who actually made the call.
     pub created_by_email: Option<String>,
+    /// Visible (cap-scope root) key that billed this request. See
+    /// [`ResponseSummary::api_key_id`].
+    pub api_key_id: Option<Uuid>,
+    /// Name of the visible key above.
+    pub api_key_name: Option<String>,
+    /// Email of the key's holder (`api_keys.created_by`). See
+    /// [`ResponseSummary::api_key_holder_email`].
+    pub api_key_holder_email: Option<String>,
 }

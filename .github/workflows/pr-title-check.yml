@@ -16,6 +16,25 @@ jobs:
         uses: amannn/action-semantic-pull-request@v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Keep in sync with `changelog-sections` in release-please-config.json.
+          # Every type here except `release` produces a release: `feat` bumps
+          # minor, `!`/BREAKING CHANGE bumps major, everything else bumps patch.
+          # `release` is reserved for release-please's own release pull requests.
+          types: |
+            feat
+            fix
+            perf
+            refactor
+            revert
+            deps
+            docs
+            build
+            ci
+            chore
+            test
+            style
+            release
 
       - name: Skip pull request title validation for merge-group commits
         if: github.event_name == 'merge_group'

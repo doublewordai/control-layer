@@ -122,7 +122,7 @@ pub async fn recompute_usage<P: PoolProvider>(
     // Absent when caching is disabled, in which case rows simply carry no reconstruction.
     let cfg = state.current_config();
     let classifier = cfg.cache.enabled.then(|| {
-        let pool = state.db.read().clone();
+        let pool = state.db.read().into_inner();
         crate::prompt_cache::Classifier::new(
             crate::prompt_cache::PrincipalResolver::new(pool.clone()),
             crate::prompt_cache::ModelConfigResolver::new(pool.clone()),
@@ -145,7 +145,7 @@ pub async fn recompute_usage<P: PoolProvider>(
         (!cfg.cache.tokenizer_url.is_empty()).then(|| crate::prompt_cache::TokenizerClient::new(cfg.cache.tokenizer_url.clone()));
 
     // The read pool, deliberately: this path has no write handle at all.
-    let report = crate::recompute::recompute_corpus(state.db.read(), &filter, flat_tier, classifier.as_ref(), tokenizer.as_ref())
+    let report = crate::recompute::recompute_corpus(&state.db.read(), &filter, flat_tier, classifier.as_ref(), tokenizer.as_ref())
         .await
         .map_err(|e| Error::Internal {
             operation: format!("recompute usage: {e}"),

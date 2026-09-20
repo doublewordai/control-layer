@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH candidates AS MATERIALIZED (\n                SELECT id, previous_state, reason, daemon_id, claimed_at\n                FROM (\n                    SELECT DISTINCT ON (id)\n                        id, previous_state, reason, priority, daemon_id, claimed_at\n                    FROM (\n                    -- Explicit shutdown is authoritative and can be reclaimed immediately.\n                    SELECT r.id, r.state AS previous_state, 'explicitly_dead'::text AS reason,\n                           0 AS priority, r.daemon_id, r.claimed_at\n                    FROM requests r\n                    JOIN daemons d ON d.id = r.daemon_id\n                    WHERE r.state IN ('claimed', 'processing')\n                      AND d.status = 'dead'\n                    UNION\n                    -- A stale daemon self-fences locally at this same threshold.\n                    SELECT r.id, r.state AS previous_state, 'lease_expired'::text AS reason,\n                           1 AS priority, r.daemon_id, r.claimed_at\n                    FROM requests r\n                    JOIN daemons d ON d.id = r.daemon_id\n                    WHERE r.state IN ('claimed', 'processing')\n                      AND d.status = 'running'\n                      AND d.last_heartbeat < NOW() - ($3 || ' milliseconds')::INTERVAL\n                    UNION\n                    -- Time-based fallback: request stuck too long regardless of daemon state\n                    SELECT r.id, r.state AS previous_state, 'age_fallback'::text AS reason,\n                           2 AS priority, r.daemon_id, r.claimed_at\n                    FROM requests r\n                    WHERE\n                        (r.state = 'claimed' AND r.claimed_at < NOW() - ($1 || ' milliseconds')::INTERVAL)\n                        OR\n                        (r.state = 'processing' AND r.started_at < NOW() - ($2 || ' milliseconds')::INTERVAL)\n                    ) eligible\n                    ORDER BY id, priority\n                ) deduplicated\n                ORDER BY priority, id\n                LIMIT $4\n            ), updated AS (\n                UPDATE requests r\n                SET\n                    state = 'pending',\n                    daemon_id = NULL,\n                    claimed_at = NULL,\n                    started_at = NULL\n                FROM candidates c\n                WHERE r.id = c.id\n                  AND r.state = c.previous_state\n                  AND r.daemon_id = c.daemon_id\n                  AND r.claimed_at = c.claimed_at\n                RETURNING c.previous_state, c.reason\n            )\n            SELECT previous_state AS \"previous_state!\", reason AS \"reason!\"\n            FROM updated\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "previous_state!",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 1,
+        "name": "reason!",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "7ef1055acfac7b04c58d88ca406976517f1a51fac3d1f1225c7479aaec222671"
+}

@@ -366,6 +366,7 @@ pub async fn create_payment_setup<P: PoolProvider>(State(state): State<AppState<
     responses(
         (status = 200, description = "Payment processed successfully"),
         (status = 402, description = "Payment not completed yet"),
+        (status = 409, description = "The payment method saved by this verification session has already verified another account; the account is not verified. Verify with a different card or add credit."),
         (status = 400, description = "Invalid payment ID or missing data"),
         (status = 501, description = "Payment provider not configured"),
     ),
@@ -398,7 +399,7 @@ pub async fn process_payment<P: PoolProvider>(
     };
 
     // Process the payment session using the provider trait
-    match provider.process_payment_session(state.db.write(), &id, &config.credits).await {
+    match provider.process_payment_session(&state.db.write(), &id, &config.credits).await {
         Ok(()) => Ok(Json(json!({
             "message": "Payment processed successfully"
         }))
@@ -418,6 +419,13 @@ pub async fn process_payment<P: PoolProvider>(
                 }))
                 .into_response())
             }
+            payment_providers::PaymentError::InstrumentAlreadyUsed => Ok((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "message": "Sorry, this payment method has already been used for verification. Please top up your account or verify with a new payment method."
+                })),
+            )
+                .into_response()),
             _ => {
                 // Map the provider error to its real status. InvalidData / NoCustomerId are
                 // client 400s; hardcoding 500 here pages on a client's bad/expired session id.
@@ -489,7 +497,7 @@ pub async fn webhook_handler<P: PoolProvider>(
     tracing::trace!("Received webhook event: {}", event.event_type);
 
     // Process the webhook event
-    match provider.process_webhook_event(state.db.write(), &event, &config.credits).await {
+    match provider.process_webhook_event(&state.db.write(), &event, &config.credits).await {
         Ok(()) => {
             tracing::trace!("Successfully processed webhook event: {}", event.event_type);
             StatusCode::OK
@@ -520,6 +528,15 @@ pub async fn webhook_handler<P: PoolProvider>(
                 event_type = %event.event_type,
                 client_reference_id = %reference,
                 "Ignoring payment webhook for a user unknown to this plane (expected for another region's events)"
+            );
+            StatusCode::OK
+        }
+        Err(payment_providers::PaymentError::InstrumentAlreadyUsed) => {
+            // Expected outcome, not a fault: the front-channel caller was told
+            // (409). Nothing to retry, so ack it.
+            tracing::warn!(
+                event_type = %event.event_type,
+                "Setup session's payment method has already verified another account; acked"
             );
             StatusCode::OK
         }
@@ -753,7 +770,7 @@ pub async fn process_auto_topup<P: PoolProvider>(
         }
     };
 
-    let setup_result = match provider.process_auto_topup_session(state.db.write(), &id).await {
+    let setup_result = match provider.process_auto_topup_session(&state.db.write(), &id).await {
         Ok(result) => result,
         Err(e) => match e {
             payment_providers::PaymentError::PaymentNotCompleted => {

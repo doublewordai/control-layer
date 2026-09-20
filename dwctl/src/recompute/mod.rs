@@ -104,7 +104,9 @@
 //!   creations as reads, which under-bills, and must be labelled approximate.
 
 use crate::pricing::TokenCounts;
-use crate::request_logging::serializers::{TokenMetrics, extract_from_last_usage, parse_ai_response, raw_usage_tokens};
+use crate::request_logging::serializers::{
+    TokenMetrics, extract_engine_cached_tokens, extract_from_last_usage, parse_ai_response, raw_usage_tokens,
+};
 use outlet::{RequestData, ResponseData};
 
 pub mod cache_fields;
@@ -167,6 +169,8 @@ pub async fn recompute_corpus(
         }
     };
     let price = |row: &source::CorpusRow, usage: &RecomputedUsage, mults: Option<crate::pricing::CacheMultipliers>| {
+        // Same list-price ceiling for engine-sourced reads as the live batcher.
+        let mults = crate::pricing::clamp_implicit_read_multiplier(mults, row.cache_read_source.as_deref());
         crate::pricing::charged_cost(
             &usage.counts,
             row.model.as_deref(),
@@ -192,9 +196,28 @@ pub async fn recompute_corpus(
             continue;
         };
 
-        let replayed = exchange
-            .to_outlet_pair()
-            .and_then(|(req, resp)| recompute_from_stored_response(&req, &resp, flat_tier));
+        let replayed = exchange.to_outlet_pair().and_then(|(req, resp)| {
+            recompute_from_stored_response(&req, &resp, flat_tier).map(|mut usage| {
+                // Implicitly-billed row (`cache_read_source = 'engine'`): the raw upstream
+                // body carries no dwctl cache fields — the replay's split legitimately
+                // reads zero — so overlay the live rule (engine-reported hit, capped to
+                // the prompt, no creations). Without this every implicit row recomputes
+                // to list price and reports a phantom overcharge.
+                if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Engine.as_str())
+                    && let Some(engine) = extract_engine_cached_tokens(&resp)
+                {
+                    // Replace, never merge: live implicit billing ignored any provider
+                    // cache split the raw body carried (an Anthropic-shaped upstream can
+                    // report both) — read = capped engine hit, no creations.
+                    usage.counts.cache_read = engine.clamp(0, usage.counts.prompt);
+                    usage.counts.cache_creation_5m = 0;
+                    usage.counts.cache_creation_1h = 0;
+                    usage.counts.cache_creation_24h = 0;
+                    usage.cache_tier_inferred = false;
+                }
+                usage
+            })
+        });
 
         let report_row = match replayed {
             Ok(usage) => {
@@ -289,9 +312,21 @@ pub async fn recompute_corpus(
             if replay::is_zdr_envelope(Some(body)) {
                 continue;
             }
+            // An engine-sourced (implicit) row was billed from the upstream's own report,
+            // not the module's index — the classifier correctly reconstructs a zero split
+            // for its marker-less body, and comparing that against the stored engine read
+            // would flag every healthy implicit row as a billing disagreement. The read
+            // was already validated against the body by the replay overlay above.
+            if row.cache_read_source.as_deref() == Some(crate::prompt_cache::CacheReadSource::Engine.as_str()) {
+                continue;
+            }
 
+            // The stored endpoint is the caller's pre-translation path, so the rule is
+            // "not plain completions" (a /v1/messages or /v1/responses row DID have
+            // module blocks — it reached the cache layer as chat completions).
+            let route_has_blocks = !crate::prompt_cache::path_is_plain_completions(&exchange.endpoint);
             let historical = base.with_index(std::sync::Arc::new(cache_replay::HistoricalIndex::new(pool.clone(), row.timestamp)));
-            match cache_replay::reconstruct_split(&historical, model, body, principal, row.timestamp).await {
+            match cache_replay::reconstruct_split(&historical, model, body, principal, row.timestamp, route_has_blocks).await {
                 Ok(Some(split)) => {
                     report_row.reconstructed_cache = Some(report::ReconstructedCache::compare(&split, row));
                 }

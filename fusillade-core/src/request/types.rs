@@ -145,8 +145,8 @@ impl RequestState for Pending {}
 
 /// Leaky-bucket stamp for a request claimed via Source B (the not-live,
 /// before-ramp trickle). Carried on [`Claimed`] as `Some` iff the row was
-/// leaked; the daemon stamps `next_token_at = now + window_secs /
-/// leaks_per_window` for the `(created_by, window_class, model)` bucket. `None`
+/// leaked; the daemon stamps the next token using its configured interval
+/// for the `(created_by, window_class, model)` bucket. `None`
 /// for full-capacity (Source A) claims, which consume no token. The model is
 /// read from the request itself, so it is not carried on the stamp.
 #[derive(Debug, Clone, Serialize)]
@@ -154,8 +154,8 @@ pub struct LeakStamp {
     /// The bucket's window-class (a batch's `completion_window`, or a batchless
     /// row's `service_tier` defaulting to `'default'`).
     pub window_class: String,
-    /// The request's completion-window length in seconds (`W`); the daemon
-    /// divides it by `leaks_per_window` to get the leak interval.
+    /// The request's completion-window length in seconds (`W`), retained for
+    /// async/flex claims using the `leaks_per_window` policy.
     pub window_secs: f64,
 }
 
@@ -330,6 +330,10 @@ impl FailureReason {
 pub struct Failed {
     pub reason: FailureReason,
     pub failed_at: DateTime<Utc>,
+    /// Claim-generation fence for daemon-owned failures. System-generated
+    /// failures which never entered `claimed`/`processing` leave this unset.
+    #[serde(skip)]
+    pub claimed_at: Option<DateTime<Utc>>,
     /// Number of times this request has been attempted when it failed
     pub retry_attempt: u32,
     /// When the batch expires (carried over from Processing). `None` for background.
@@ -344,6 +348,10 @@ impl RequestState for Failed {}
 #[derive(Debug, Clone, Serialize)]
 pub struct Canceled {
     pub canceled_at: DateTime<Utc>,
+    /// Claim-generation fence for daemon-owned cancellation. Pending requests
+    /// have no owner and leave this unset.
+    #[serde(skip)]
+    pub claimed_at: Option<DateTime<Utc>>,
 }
 
 impl RequestState for Canceled {}

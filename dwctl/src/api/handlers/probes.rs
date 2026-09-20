@@ -42,7 +42,7 @@ pub async fn create_probe(
     _: RequiresPermission<resource::Probes, operation::CreateAll>,
     Json(probe): Json<CreateProbe>,
 ) -> Result<(StatusCode, Json<Probe>), Error> {
-    let created = ProbeManager::create_probe(&state.db, probe).await?;
+    let created = ProbeManager::create_probe(&state.db.write(), probe).await?;
     Ok((StatusCode::CREATED, Json(created)))
 }
 
@@ -74,8 +74,8 @@ pub async fn list_probes(
     Query(query): Query<ProbesQuery>,
 ) -> Result<Json<Vec<Probe>>, Error> {
     let probes = match query.status.as_deref() {
-        Some("active") => ProbeManager::list_active_probes(&state.db).await?,
-        _ => ProbeManager::list_probes(&state.db).await?,
+        Some("active") => ProbeManager::list_active_probes(&state.db.read()).await?,
+        _ => ProbeManager::list_probes(&state.db.read()).await?,
     };
     Ok(Json(probes))
 }
@@ -108,7 +108,8 @@ pub async fn get_probe(
     _: RequiresPermission<resource::Probes, operation::ReadAll>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Probe>, Error> {
-    let probe = ProbeManager::get_probe(&state.db, id).await?;
+    // Clients retrieve probes immediately after creation or an activation change.
+    let probe = ProbeManager::get_probe(&state.db.write(), id).await?;
     Ok(Json(probe))
 }
 
@@ -140,7 +141,7 @@ pub async fn delete_probe(
     _: RequiresPermission<resource::Probes, operation::DeleteAll>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, Error> {
-    ProbeManager::delete_probe(&state.db, id).await?;
+    ProbeManager::delete_probe(&state.db.write(), id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -172,7 +173,7 @@ pub async fn activate_probe(
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Probe>, Error> {
-    let probe = ProbeManager::activate_probe(&state.db, id).await?;
+    let probe = ProbeManager::activate_probe(&state.db.write(), id).await?;
     Ok(Json(probe))
 }
 
@@ -204,7 +205,7 @@ pub async fn deactivate_probe(
     _: RequiresPermission<resource::Probes, operation::UpdateAll>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Probe>, Error> {
-    let probe = ProbeManager::deactivate_probe(&state.db, id).await?;
+    let probe = ProbeManager::deactivate_probe(&state.db.write(), id).await?;
     Ok(Json(probe))
 }
 
@@ -239,7 +240,7 @@ pub async fn update_probe(
     Path(id): Path<Uuid>,
     Json(update): Json<UpdateProbeRequest>,
 ) -> Result<Json<Probe>, Error> {
-    let probe = ProbeManager::update_probe(&state.db, id, update).await?;
+    let probe = ProbeManager::update_probe(&state.db.write(), id, update).await?;
     Ok(Json(probe))
 }
 
@@ -272,7 +273,7 @@ pub async fn execute_probe(
     Path(id): Path<Uuid>,
 ) -> Result<(StatusCode, Json<ProbeResult>), Error> {
     let config = state.current_config();
-    let result = ProbeManager::execute_probe(&state.db, id, &config).await?;
+    let result = ProbeManager::execute_probe(&state.db.write(), id, &config).await?;
     Ok((StatusCode::CREATED, Json(result)))
 }
 
@@ -312,7 +313,7 @@ pub async fn test_probe(
         (None, None, None)
     };
 
-    let result = ProbeManager::test_probe(&state.db, deployment_id, &config, http_method, request_path, request_body).await?;
+    let result = ProbeManager::test_probe(&state.db.write(), deployment_id, &config, http_method, request_path, request_body).await?;
     Ok((StatusCode::OK, Json(result)))
 }
 
@@ -346,7 +347,7 @@ pub async fn get_probe_results(
     Path(id): Path<Uuid>,
     Query(query): Query<ResultsQuery>,
 ) -> Result<Json<Vec<ProbeResult>>, Error> {
-    let results = ProbeManager::get_probe_results(&state.db, id, query.start_time, query.end_time, query.limit).await?;
+    let results = ProbeManager::get_probe_results(&state.db.read(), id, query.start_time, query.end_time, query.limit).await?;
     Ok(Json(results))
 }
 
@@ -380,7 +381,7 @@ pub async fn get_statistics(
     Path(id): Path<Uuid>,
     Query(query): Query<StatsQuery>,
 ) -> Result<Json<ProbeStatistics>, Error> {
-    let stats = ProbeManager::get_statistics(&state.db, id, query.start_time, query.end_time).await?;
+    let stats = ProbeManager::get_statistics(&state.db.read(), id, query.start_time, query.end_time).await?;
     Ok(Json(stats))
 }
 
@@ -553,6 +554,44 @@ mod tests {
         let probe: Probe = response.json();
         assert_eq!(probe.id, created.id);
         assert_eq!(probe.name, "Test Probe");
+    }
+
+    #[sqlx::test]
+    async fn test_get_probe_after_create_with_lagging_replica(pool: PgPool) {
+        use sqlx::Executor;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let deployment_id = setup_test_deployment(&pool, user.id).await;
+        let application = crate::Application::new_with_pool(crate::test::utils::create_test_config(), Some(pool.clone()), None)
+            .await
+            .unwrap();
+        // Model a replica that has the schema and auth data, but has not replayed
+        // probe writes. No timing or physical replication is needed.
+        pool.execute("CREATE SCHEMA stale; CREATE TABLE stale.probes (LIKE public.probes INCLUDING ALL)")
+            .await
+            .unwrap();
+        let replica = sqlx::postgres::PgPoolOptions::new()
+            .connect_with(pool.connect_options().as_ref().clone().options([("search_path", "stale,public")]))
+            .await
+            .unwrap();
+        application.app_state.db.replace(pool.clone(), Some(replica.clone()));
+        let (app, _background) = application.into_test_server();
+        let headers = add_auth_headers(&user);
+        let response = app
+            .post("/admin/api/v1/probes")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&serde_json::json!({"name": "New probe", "deployment_id": deployment_id, "interval_seconds": 60}))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+        let created: Probe = response.json();
+        assert!(ProbeManager::get_probe(&replica, created.id).await.is_err());
+        let response = app
+            .get(&format!("/admin/api/v1/probes/{}", created.id))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        response.assert_status_ok();
+        assert_eq!(response.json::<Probe>().name, "New probe");
     }
 
     #[sqlx::test]

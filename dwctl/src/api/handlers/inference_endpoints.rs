@@ -260,7 +260,7 @@ pub async fn update_inference_endpoint<P: PoolProvider>(
         let endpoint = repo.update(id, &db_request).await?;
 
         // Perform background sync after successful update
-        match endpoint_sync::synchronize_endpoint(endpoint.id, state.db.write().clone()).await {
+        match endpoint_sync::synchronize_endpoint(endpoint.id, state.db.write().into_inner()).await {
             Ok(sync_result) => {
                 tracing::debug!(
                     "Auto-sync after endpoint {} update: {} changes made",
@@ -593,7 +593,7 @@ pub async fn synchronize_endpoint<P: PoolProvider>(
     _: RequiresPermission<resource::Endpoints, operation::UpdateAll>,
 ) -> Result<Json<endpoint_sync::EndpointSyncResponse>> {
     // Perform synchronization
-    let response = endpoint_sync::synchronize_endpoint(id, state.db.write().clone()).await?;
+    let response = endpoint_sync::synchronize_endpoint(id, state.db.write().into_inner()).await?;
 
     tracing::debug!("Successfully synchronized endpoint {} with {} changes", id, response.changes_made);
     Ok(Json(response))

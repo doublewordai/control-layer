@@ -42,7 +42,6 @@ use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::BodyExt;
 use serde_json::Value;
-use sqlx::PgPool;
 use tracing::{debug, warn};
 
 use crate::config::ContinuationConfig;
@@ -79,6 +78,8 @@ pub struct ContinuationState {
     /// Bound for buffering the request body, set to the same limit onwards
     /// enforces so this layer is never more restrictive than the entry point.
     pub body_limit: usize,
+    /// Pending SSE event bytes, shared with the core proxy's configured limit.
+    pub sse_buffer_limit: usize,
 }
 
 impl ContinuationState {
@@ -89,16 +90,17 @@ impl ContinuationState {
     pub async fn build(
         cfg: &ContinuationConfig,
         cache_tokenizer_url: &str,
-        pool: PgPool,
+        pools: sqlx_pool_router::DynPools,
         resume_target: Router,
         body_limit: usize,
+        sse_buffer_limit: usize,
     ) -> anyhow::Result<Self> {
-        let key_secret = super::provision_global_key(&pool).await?;
+        let key_secret = super::provision_global_key(&pools.write()).await?;
         let tokenizer_url = cfg.tokenizer_url.clone().unwrap_or_else(|| cache_tokenizer_url.to_string());
         let routes = Arc::new(ContinuationRoutes::new());
         // Seed synchronously so the first request after boot sees the real set
         // rather than waiting up to one poll interval.
-        if let Err(e) = routes.refresh(&pool).await {
+        if let Err(e) = routes.refresh(&pools.write()).await {
             crate::background_error!(
                 crate::metrics::errors::component::CONTINUATION,
                 "route_seed",
@@ -107,7 +109,7 @@ impl ContinuationState {
                 "Initial continuation route load failed; the poller will retry"
             );
         }
-        Arc::clone(&routes).spawn_poller(pool.clone());
+        Arc::clone(&routes).spawn_poller(pools.clone());
 
         Ok(Self {
             cfg: Arc::new(cfg.clone()),
@@ -115,9 +117,10 @@ impl ContinuationState {
             tokenizer: RenderClient::new(tokenizer_url, Duration::from_secs(cfg.resume_deadline_secs)),
             resume_target,
             routes,
-            purposes: PurposeResolver::new(pool),
+            purposes: PurposeResolver::new(pools),
             inflight: Arc::new(InflightLimiter::new(cfg.max_inflight_per_model)),
             body_limit,
+            sse_buffer_limit,
         })
     }
 
@@ -459,7 +462,7 @@ fn tee(response: Response, state: ContinuationState, ctx: RequestContext) -> Res
         // Which reconstructor this stream gets is a per-model capability lookup;
         // see `accumulate::for_model`.
         let mut acc: Box<dyn StreamAccumulator> = accumulate::for_model(&ctx.model, &state.cfg, &ctx.route);
-        let mut current: LegStream = Box::pin(SseBufferedStream::new(leg_one));
+        let mut current: LegStream = Box::pin(SseBufferedStream::with_limit(leg_one, state.sse_buffer_limit));
         // Is `current` a resume leg (text_completion chunks needing reframing)?
         let mut resuming = false;
         // Which upstream serves the CURRENT leg ("dynamo" / "external"),

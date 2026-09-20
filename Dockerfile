@@ -9,6 +9,7 @@ COPY fusillade/ fusillade/
 COPY fusillade-core/ fusillade-core/
 COPY fusillade-arsenal/ fusillade-arsenal/
 COPY onwards/ onwards/
+COPY openai-reassembler/ openai-reassembler/
 RUN cargo chef prepare --recipe-path recipe.json
 
 # Backend build stage
@@ -47,6 +48,7 @@ COPY fusillade/ fusillade/
 COPY fusillade-core/ fusillade-core/
 COPY fusillade-arsenal/ fusillade-arsenal/
 COPY onwards/ onwards/
+COPY openai-reassembler/ openai-reassembler/
 RUN rm -rf dwctl/static && cp -r dashboard/dist dwctl/static
 ENV SQLX_OFFLINE=true
 RUN cargo build --release -p dwctl
@@ -67,6 +69,7 @@ WORKDIR /app
 
 # Copy the binary from builder stage (frontend is already embedded in the binary)
 COPY --from=builder /app/target/release/dwctl /app/dwctl
+COPY --from=builder /app/target/release/dwctl-model-provisioning /app/dwctl-model-provisioning
 
 # Copy default email templates (can be overridden via volume mount)
 COPY dwctl/default_templates/ /app/default_templates/

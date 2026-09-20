@@ -14,12 +14,13 @@
 //!
 //! # Architecture
 //!
-//! The handler does minimal work per-request - it extracts raw metrics and sends them to a
-//! background batcher via a channel. The batcher handles:
+//! The handler extracts raw metrics and inserts them directly into the durable
+//! analytics outbox. The background projector handles:
 //! - Batch enrichment (user lookup, model/tariff lookup)
 //! - Transactional writes (analytics + credits in single transaction)
 //!
-//! This design keeps the hot path fast while ensuring data consistency.
+//! Outlet invokes the handler from its detached capture task, so the client response
+//! does not wait for the outbox insert.
 //!
 //! # Example
 //!
@@ -27,14 +28,14 @@
 //! use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 //! use dwctl::request_logging::{AnalyticsHandler, AnalyticsBatcher};
 //!
-//! // Create batcher and get sender
-//! let (batcher, sender) = AnalyticsBatcher::new(pool, config.analytics.clone());
+//! // Create projector and direct outbox writer
+//! let (batcher, writer) = AnalyticsBatcher::new(pool, config.analytics.clone());
 //!
 //! // Spawn batcher background task
 //! tokio::spawn(batcher.run(cancellation_token));
 //!
-//! // Create handler with sender
-//! let analytics = AnalyticsHandler::new(sender, instance_id, config, metrics_recorder);
+//! // Create handler with writer
+//! let analytics = AnalyticsHandler::new(writer, instance_id, config, metrics_recorder);
 //!
 //! // Use with MultiHandler for composition
 //! let handler = MultiHandler::new()
@@ -44,12 +45,18 @@
 //! let layer = RequestLoggerLayer::new(outlet_config, handler);
 //! ```
 
+use std::collections::HashMap;
+
 use crate::config::Config;
 use crate::metrics::errors::component::ANALYTICS;
-use crate::request_logging::batcher::{AnalyticsSender, RawAnalyticsRecord};
-use crate::request_logging::models::AiResponse;
-use crate::request_logging::serializers::{Auth, UsageMetrics, parse_ai_response};
+use crate::request_logging::batcher::{AnalyticsOutboxWriter, RawAnalyticsRecord};
+use crate::request_logging::models::{AiResponse, ChatCompletionChunk};
+use crate::request_logging::serializers::{UsageMetrics, parse_ai_response};
 use crate::request_logging::utils::{extract_header_as_string, extract_header_as_uuid};
+use axum::http::StatusCode;
+use onwards::AuthenticatedApiKeyId;
+use onwards::strict::schemas::chat_completions::MessageContent;
+use openai_reassembler::CompletionEvidence;
 use outlet::{RequestData, RequestHandler, ResponseData};
 use tracing::{Instrument, info_span};
 use uuid::Uuid;
@@ -64,6 +71,59 @@ fn zdr_safe_parse_error(err: &(dyn std::error::Error + Send + Sync + 'static)) -
     match err.downcast_ref::<serde_json::Error>() {
         Some(e) => format!("json parse error ({:?}) at line {} column {}", e.classify(), e.line(), e.column()),
         None => "parse error".to_string(),
+    }
+}
+
+/// Uses the shared reassembler classifier on the response Analytics already
+/// parsed for usage, rather than deserializing the body again.
+fn is_reasoning_without_answer(response: &AiResponse) -> bool {
+    match response {
+        AiResponse::ChatCompletions(response) => response.choices.iter().any(|choice| {
+            let message = &choice.message;
+            let has_reasoning = [message.reasoning_content.as_deref(), message.reasoning.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|text| !text.is_empty());
+            let has_answer = match &message.content {
+                Some(MessageContent::Text(text)) => !text.is_empty(),
+                Some(MessageContent::Parts(_)) => true,
+                None => false,
+            };
+            let has_tool_call = message.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty())
+                || message
+                    .extra
+                    .as_ref()
+                    .and_then(|extra| extra.get("function_call"))
+                    .is_some_and(|call| !call.is_null());
+
+            let mut evidence = CompletionEvidence::default();
+            evidence.observe(choice.finish_reason.as_deref(), has_reasoning, has_answer, has_tool_call);
+            evidence.is_reasoning_without_answer()
+        }),
+        AiResponse::ChatCompletionsStream(chunks) => {
+            let mut choices: HashMap<u32, CompletionEvidence> = HashMap::new();
+            for chunk in chunks {
+                let ChatCompletionChunk::Chunk(chunk) = chunk else {
+                    continue;
+                };
+                for choice in &chunk.choices {
+                    let has_reasoning = [choice.delta.reasoning_content.as_deref(), choice.delta.reasoning.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .any(|text| !text.is_empty());
+                    let has_answer = choice.delta.content.as_deref().is_some_and(|text| !text.is_empty());
+                    let has_tool_call = choice.delta.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty());
+                    choices.entry(choice.index).or_default().observe(
+                        choice.finish_reason.as_deref(),
+                        has_reasoning,
+                        has_answer,
+                        has_tool_call,
+                    );
+                }
+            }
+            choices.values().any(CompletionEvidence::is_reasoning_without_answer)
+        }
+        _ => false,
     }
 }
 
@@ -98,19 +158,19 @@ fn resolve_user_agent(request_data: &RequestData) -> Option<String> {
         .map(|ua| ua.chars().take(256).collect())
 }
 
-/// A request handler that sends analytics data to a background batcher.
+/// A request handler that writes analytics data to the durable outbox.
 ///
 /// This handler implements [`outlet::RequestHandler`] and can be used standalone or composed
 /// with other handlers using [`outlet::MultiHandler`].
 ///
 /// The handler does minimal work per-request:
 /// 1. Parses the AI response to extract token usage
-/// 2. Extracts raw data from request headers (bearer token, fusillade metadata)
-/// 3. Sends `RawAnalyticsRecord` to the batcher via channel
+/// 2. Extracts raw data from response extensions and request headers
+/// 3. Inserts `RawAnalyticsRecord` into `analytics_outbox`
 ///
-/// All database operations (enrichment, writes) happen in the background batcher.
+/// Enrichment and final analytics/billing writes happen in the background projector.
 pub struct AnalyticsHandler {
-    sender: AnalyticsSender,
+    outbox_writer: AnalyticsOutboxWriter,
     instance_id: Uuid,
     config: Config,
 }
@@ -120,12 +180,12 @@ impl AnalyticsHandler {
     ///
     /// # Arguments
     ///
-    /// * `sender` - Channel sender to the analytics batcher
+    /// * `outbox_writer` - Direct writer for the analytics outbox
     /// * `instance_id` - Unique identifier for this service instance
     /// * `config` - Application configuration
-    pub fn new(sender: AnalyticsSender, instance_id: Uuid, config: Config) -> Self {
+    pub fn new(outbox_writer: AnalyticsOutboxWriter, instance_id: Uuid, config: Config) -> Self {
         Self {
-            sender,
+            outbox_writer,
             instance_id,
             config,
         }
@@ -142,11 +202,11 @@ impl RequestHandler for AnalyticsHandler {
     ///
     /// This method does minimal work per-request:
     /// 1. Parses the AI response to extract token usage
-    /// 2. Extracts raw data from headers (bearer token, fusillade metadata)
-    /// 3. Sends `RawAnalyticsRecord` to batcher via channel
+    /// 2. Extracts raw data from response extensions and request headers
+    /// 3. Inserts `RawAnalyticsRecord` into the durable outbox
     ///
-    /// All database work (enrichment, writes, credit deduction) happens in the batcher.
-    async fn handle_response(&self, request_data: RequestData, response_data: ResponseData) {
+    /// Enrichment and credit deduction happen later in the projector.
+    async fn handle_response(&self, request_data: RequestData, mut response_data: ResponseData) {
         let correlation_id = request_data.correlation_id;
         let span = info_span!(
             "dwctl.analytics_handler",
@@ -185,12 +245,19 @@ impl RequestHandler for AnalyticsHandler {
             // no-usage path did; keep going so the row (status, duration) still lands.
             let parsed = parsed.unwrap_or(AiResponse::Other(serde_json::Value::Null));
 
+            // The reassembler turns this shape into a 502 for queued requests.
+            // Apply its shared decision to Analytics' private response copy so
+            // realtime requests are not billed either. This does not alter the
+            // response on the wire or parse the body again.
+            if response_data.status.is_success() && is_reasoning_without_answer(&parsed) {
+                response_data.status = StatusCode::BAD_GATEWAY;
+            }
+
             // Extract basic metrics - captures status_code, duration, model from request, tokens, etc.
             let metrics = UsageMetrics::extract(self.instance_id, &request_data, &response_data, &parsed, &self.config);
 
-            // Gate on the (possibly reclassified) status from metrics, not the raw upstream
-            // status — streams that opened 200 but ended with an embedded error frame have
-            // already been rewritten to 500 by UsageMetrics::extract and shouldn't trip this.
+            // Gate on the effective status from metrics: it also reclassifies a
+            // 2xx stream that ended with an embedded error frame.
             if (200..300).contains(&metrics.status_code) && metrics.total_tokens == 0 && usage_bearing {
                 crate::background_error!(
                     ANALYTICS, "missing_usage", Error,
@@ -202,9 +269,6 @@ impl RequestHandler for AnalyticsHandler {
                     "Successful generative response recorded zero tokens"
                 );
             }
-
-            // Extract auth information from headers
-            let auth = Auth::from_request(&request_data, &self.config);
 
             // Extract fusillade batch metadata from headers
             let fusillade_batch_id = extract_header_as_uuid(&request_data, "x-fusillade-batch-id");
@@ -218,11 +282,7 @@ impl RequestHandler for AnalyticsHandler {
             let batch_created_at = extract_header_as_string(&request_data, "x-fusillade-batch-created-at")
                 .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok());
 
-            // Extract bearer token from auth
-            let bearer_token = match &auth {
-                Auth::ApiKey { bearer_token } => Some(bearer_token.clone()),
-                Auth::None => None,
-            };
+            let api_key_id = response_data.extensions.get::<AuthenticatedApiKeyId>().map(|id| id.0);
 
             // Build the raw record (no DB enrichment)
             // Note: request_origin is computed in the batcher after api_key_purpose is resolved
@@ -251,11 +311,12 @@ impl RequestHandler for AnalyticsHandler {
                 // is one, else whoever is on the wire. See `resolve_user_agent`.
                 user_agent: resolve_user_agent(&request_data),
                 engine_cached_tokens: metrics.engine_cached_tokens,
+                cache_read_source: metrics.cache_read_source.clone(),
                 request_params: metrics.request_params,
                 server_address: metrics.server_address,
                 server_port: metrics.server_port,
                 served_by: metrics.served_by,
-                bearer_token,
+                api_key_id,
                 fusillade_batch_id,
                 fusillade_request_id,
                 custom_id,
@@ -265,14 +326,16 @@ impl RequestHandler for AnalyticsHandler {
                 trace_id: request_data.trace_id.clone(),
             };
 
-            // Send to batcher (non-blocking, just puts in channel)
-            if let Err(e) = self.sender.send(record).await {
+            // The first handoff is durable: write the raw record directly to
+            // the outbox. Enrichment and final writes happen in the projector.
+            if let Err(e) = self.outbox_writer.publish(record).await {
                 crate::background_error!(
-                    ANALYTICS, "send_failed", Error,
+                    ANALYTICS, "outbox_publish", Error,
                     correlation_id = correlation_id,
                     error = %e,
-                    "Failed to send analytics record to batcher - channel may be full or closed"
+                    "Failed to publish analytics record to the durable outbox"
                 );
+                metrics::counter!("dwctl_analytics_outbox_publish_failures_total").increment(1);
             }
         }
         .instrument(span)
@@ -382,7 +445,7 @@ mod tests {
         let config = Config::default();
 
         // Verify the handler can be constructed
-        let _handler = AnalyticsHandler::new(tx, Uuid::new_v4(), config);
+        let _handler = AnalyticsHandler::new(AnalyticsOutboxWriter::for_test(tx), Uuid::new_v4(), config);
     }
 
     #[test]
@@ -399,15 +462,89 @@ mod tests {
         assert_eq!(data.status, StatusCode::OK);
     }
 
+    #[test]
+    fn detects_reasoning_without_an_answer_in_a_blocking_response() {
+        let response: AiResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "thinking"
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+
+        assert!(is_reasoning_without_answer(&response));
+    }
+
+    #[test]
+    fn detects_reasoning_without_an_answer_in_an_already_parsed_stream() {
+        let response = AiResponse::ChatCompletionsStream(
+            [
+                serde_json::json!({
+                    "id": "chatcmpl-1", "object": "chat.completion.chunk",
+                    "created": 1, "model": "model",
+                    "choices": [{"index": 0, "delta": {"reasoning_content": "thinking"}}]
+                }),
+                serde_json::json!({
+                    "id": "chatcmpl-1", "object": "chat.completion.chunk",
+                    "created": 1, "model": "model",
+                    "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+                }),
+            ]
+            .into_iter()
+            .map(|value| ChatCompletionChunk::Chunk(serde_json::from_value(value).unwrap()))
+            .collect(),
+        );
+
+        assert!(is_reasoning_without_answer(&response));
+    }
+
+    #[test]
+    fn reasoning_with_a_tool_call_is_a_valid_completion() {
+        let response: AiResponse = serde_json::from_value(serde_json::json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "model",
+            "choices": [{
+                "index": 0,
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "thinking",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "lookup", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "stop"
+            }]
+        }))
+        .unwrap();
+
+        assert!(!is_reasoning_without_answer(&response));
+    }
+
     #[tokio::test]
     async fn test_handler_sends_to_channel() {
         let (tx, mut rx) = mpsc::channel::<RawAnalyticsRecord>(100);
         let config = Config::default();
-        let handler = AnalyticsHandler::new(tx, Uuid::new_v4(), config);
+        let handler = AnalyticsHandler::new(AnalyticsOutboxWriter::for_test(tx), Uuid::new_v4(), config);
+        let api_key_id = Uuid::new_v4();
 
         // Call handle_response
         let request_data = create_test_request_data();
-        let response_data = create_test_response_data();
+        let mut response_data = create_test_response_data();
+        response_data.extensions.insert(AuthenticatedApiKeyId(api_key_id));
         handler.handle_response(request_data, response_data).await;
 
         // Verify record was sent to channel
@@ -415,6 +552,7 @@ mod tests {
         assert_eq!(record.correlation_id, 123);
         assert_eq!(record.method, "POST");
         assert!(record.uri.contains("chat/completions"));
+        assert_eq!(record.api_key_id, Some(api_key_id));
     }
 
     /// `resolve_user_agent` being correct is not the same as it being CALLED. This drives
@@ -424,7 +562,7 @@ mod tests {
     #[tokio::test]
     async fn a_dispatched_batch_request_reports_the_batchs_creator_as_its_client() {
         let (tx, mut rx) = mpsc::channel::<RawAnalyticsRecord>(100);
-        let handler = AnalyticsHandler::new(tx, Uuid::new_v4(), Config::default());
+        let handler = AnalyticsHandler::new(AnalyticsOutboxWriter::for_test(tx), Uuid::new_v4(), Config::default());
 
         handler
             .handle_response(

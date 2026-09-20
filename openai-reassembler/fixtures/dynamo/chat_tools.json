@@ -1,0 +1,106 @@
+{
+  "chunks": [
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": null,
+            "function_call": null,
+            "reasoning_content": null,
+            "refusal": null,
+            "role": "assistant",
+            "tool_calls": null
+          },
+          "finish_reason": "stop",
+          "index": 0
+        }
+      ],
+      "created": 1775560915,
+      "id": "chatcmpl-b6b105f3-d922-40eb-a3dc-d48a688ed6e9",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "nvext": {
+        "timing": {
+          "request_received_ms": 1775560915086,
+          "total_time_ms": 345.05386599999997
+        }
+      },
+      "object": "chat.completion.chunk",
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": null
+    },
+    {
+      "choices": [],
+      "created": 1775560915,
+      "id": "chatcmpl-b6b105f3-d922-40eb-a3dc-d48a688ed6e9",
+      "model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8",
+      "object": "chat.completion.chunk",
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": {
+        "completion_tokens": 20,
+        "prompt_tokens": 125,
+        "prompt_tokens_details": {
+          "audio_tokens": null,
+          "cached_tokens": 64
+        },
+        "total_tokens": 145
+      }
+    },
+    {
+      "choices": [
+        {
+          "delta": {
+            "content": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\"}}\n</tool_call>",
+            "function_call": null,
+            "reasoning_content": null,
+            "refusal": null,
+            "role": "assistant",
+            "tool_calls": null
+          },
+          "index": 0
+        }
+      ],
+      "created": 0,
+      "id": "stream-end",
+      "model": "unknown",
+      "object": "chat.completion.chunk",
+      "service_tier": null,
+      "system_fingerprint": null,
+      "usage": null
+    },
+    "[DONE]"
+  ],
+  "expected": {
+    "choices": [
+      {
+        "finish_reason": "stop",
+        "index": 0,
+        "message": {
+          "content": "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris\"}}\n</tool_call>",
+          "reasoning_content": null,
+          "role": "assistant"
+        }
+      }
+    ],
+    "created": 0,
+    "id": "stream-end",
+    "model": "unknown",
+    "nvext": {
+      "timing": {
+        "request_received_ms": 1775560914587,
+        "total_time_ms": 373.621637
+      }
+    },
+    "object": "chat.completion",
+    "usage": {
+      "completion_tokens": 20,
+      "prompt_tokens": 125,
+      "prompt_tokens_details": {
+        "audio_tokens": null,
+        "cached_tokens": 64
+      },
+      "total_tokens": 145
+    }
+  }
+}

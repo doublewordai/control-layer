@@ -4,7 +4,8 @@ use sqlx_pool_router::PoolProvider;
 
 use crate::api::models::deployments::{ModelFacets, ModelListResponse, TrafficRoutingAction, TrafficRoutingRule};
 use crate::db::models::deployments::{
-    LoadBalancingStrategy, MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS, ModelCatalogMetadata, TrafficRuleAction,
+    AimdConfig, LoadBalancingStrategy, MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS, ModelCatalogMetadata,
+    TrafficRuleAction,
 };
 use crate::db::models::tariffs::TariffCreateDBRequest;
 use crate::{
@@ -32,6 +33,7 @@ use axum::{
     extract::{Path, Query, State},
     response::Json,
 };
+use onwards::aimd::AimdConfig as OnwardsAimdConfig;
 use sqlx::Acquire;
 
 fn validate_reasoning_translation_overrides(overrides: Option<&ReasoningTranslationOverrides>) -> Result<()> {
@@ -39,6 +41,43 @@ fn validate_reasoning_translation_overrides(overrides: Option<&ReasoningTranslat
         overrides.validate().map_err(|error| Error::BadRequest {
             message: error.to_string(),
         })?;
+    }
+    Ok(())
+}
+
+/// Realtime-only failover statuses use the same patterns as `fallback_on_status`:
+/// an exact 4xx/5xx code, a decade (`52` = 520-529) or a class (`5` = 5xx).
+fn validate_realtime_fallback_statuses(statuses: Option<&[i32]>) -> Result<()> {
+    if statuses.is_some_and(|statuses| statuses.iter().any(|status| !matches!(status, 4..=5 | 40..=59 | 400..=599))) {
+        return Err(Error::BadRequest {
+            message: "fallback_realtime_on_status entries must be 4xx/5xx status codes or 4, 5, 40-59 patterns".into(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_aimd(timeout: Option<i64>, config: Option<&AimdConfig>, composite: bool, priority: bool, fallback: bool) -> Result<()> {
+    if timeout.is_some_and(|ms| !(0..=3_600_000).contains(&ms)) {
+        return Err(Error::BadRequest {
+            message: "first_token_timeout_ms must be between 0 and 3600000".into(),
+        });
+    }
+    if let Some(config) = config {
+        let config: OnwardsAimdConfig = config.clone().into();
+        config.validate().map_err(|message| Error::BadRequest { message: message.into() })?;
+        if !config.enabled {
+            return Ok(());
+        }
+        if !composite || !priority || !fallback {
+            return Err(Error::BadRequest {
+                message: "AIMD requires a priority composite model with fallback enabled".into(),
+            });
+        }
+        if !timeout.is_some_and(|ms| ms == 0 || ms as u64 >= config.latency_budget_ms) {
+            return Err(Error::BadRequest {
+                message: "AIMD requires an explicit first_token_timeout_ms of 0 or at least latency_budget_ms".into(),
+            });
+        }
     }
     Ok(())
 }
@@ -451,7 +490,7 @@ pub async fn list_deployed_models<P: PoolProvider>(
 
     // Use ModelEnricher to add requested data
     let enricher = DeployedModelEnricher {
-        db: state.db.read(),
+        db: &state.db.read(),
         include_groups,
         include_metrics,
         include_status,
@@ -606,6 +645,19 @@ pub async fn create_deployed_model<P: PoolProvider>(
         DeployedModelCreate::Composite(c) => (c.backoff_initial_ms, c.backoff_max_ms, c.backoff_factor, c.backoff_max_total_ms),
     };
     validate_backoff(Some(b_initial), Some(b_max), Some(b_factor), b_total)?;
+    if let DeployedModelCreate::Composite(c) = &create {
+        validate_realtime_fallback_statuses(Some(&c.fallback_realtime_on_status))?;
+    }
+    match &create {
+        DeployedModelCreate::Standard(s) => validate_aimd(s.first_token_timeout_ms, s.aimd.as_ref(), false, false, s.backoff_enabled)?,
+        DeployedModelCreate::Composite(c) => validate_aimd(
+            c.first_token_timeout_ms,
+            c.aimd.as_ref(),
+            true,
+            c.lb_strategy == LoadBalancingStrategy::Priority,
+            c.fallback_enabled,
+        )?,
+    }
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
 
@@ -742,7 +794,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
     // We also keep the current row so we can (a) validate the *merged* backoff
     // state — not just the fields in this PATCH — and (b) derive the
     // standard-model fallback invariant below.
-    let (model_alias, is_composite, prev_lb_strategy, cur_initial, cur_max, cur_factor, cur_total) = {
+    let (model_alias, is_composite, prev_lb_strategy, cur_initial, cur_max, cur_factor, cur_total, cur_timeout, cur_aimd, cur_fallback) = {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         match repo.get_by_id(deployment_id).await {
             Ok(Some(model)) => {
@@ -760,6 +812,9 @@ pub async fn update_deployed_model<P: PoolProvider>(
                     model.backoff_max_ms,
                     model.backoff_factor,
                     model.backoff_max_total_ms,
+                    model.first_token_timeout_ms,
+                    model.aimd,
+                    model.fallback_enabled,
                 )
             }
             Ok(None) => {
@@ -771,6 +826,15 @@ pub async fn update_deployed_model<P: PoolProvider>(
             Err(e) => return Err(e.into()),
         }
     };
+
+    validate_realtime_fallback_statuses(update.fallback_realtime_on_status.as_deref())?;
+    validate_aimd(
+        update.first_token_timeout_ms.unwrap_or(cur_timeout),
+        update.aimd.as_ref().map(|v| v.as_ref()).unwrap_or(cur_aimd.as_ref()),
+        is_composite,
+        update.lb_strategy.as_ref().unwrap_or(&prev_lb_strategy) == &LoadBalancingStrategy::Priority,
+        update.fallback_enabled.unwrap_or(cur_fallback),
+    )?;
 
     if is_composite && update.reasoning_translation_overrides.is_some() {
         return Err(Error::BadRequest {
@@ -1071,7 +1135,7 @@ pub async fn get_deployed_model<P: PoolProvider>(
 
     // Use ModelEnricher to add related data
     let enricher = DeployedModelEnricher {
-        db: state.db.read(),
+        db: &state.db.read(),
         include_groups,
         include_metrics,
         include_status,
@@ -1413,6 +1477,147 @@ mod tests {
     };
     use serde_json::json;
     use sqlx::PgPool;
+
+    #[sqlx::test]
+    async fn aimd_api_create_patch_clear_and_validate(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&user);
+        let config = json!({"latency_budget_ms":100,"breach_rate_target":0.1,"window_samples":20,
+            "min_samples":5,"share_step":0.05,"share_decay":0.5,"share_floor":0.1,"dwell_ms":1000});
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"type":"composite","model_name":"aimd-model","lb_strategy":"priority",
+                "fallback_enabled":true,"first_token_timeout_ms":200,"aimd":config}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert_eq!(model.fallback.as_ref().unwrap().first_token_timeout_ms, Some(200));
+        assert!(model.fallback.unwrap().aimd.is_some());
+        let path = format!("/admin/api/v1/models/{}", model.id);
+        // Malformed overrides are rejected by typed deserialization before persistence.
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"first_token_timeout_ms":0,"aimd":{"enabled":true,"latency_budget_ms":null}}))
+            .await
+            .assert_status_unprocessable_entity();
+
+        for patch in [
+            json!({"first_token_timeout_ms":50}),
+            json!({"first_token_timeout_ms":null}),
+            json!({"lb_strategy":"weighted_random"}),
+            json!({"fallback_enabled":false}),
+            json!({"first_token_timeout_ms":-1}),
+        ] {
+            app.patch(&path)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&patch)
+                .await
+                .assert_status_bad_request();
+        }
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"description":"unchanged settings"}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert!(model.fallback.unwrap().aimd.is_some());
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"aimd":null,"first_token_timeout_ms":null,"lb_strategy":"weighted_random"}))
+            .await
+            .assert_status_ok();
+        let response = app
+            .get(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        let fallback = model.fallback.unwrap();
+        assert!(fallback.aimd.is_none());
+        assert!(fallback.first_token_timeout_ms.is_none());
+        // Explicit opt-out survives persistence; null restores inheritance.
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"aimd":{"enabled":false}}))
+            .await;
+        response.assert_status_ok();
+        let disabled: DeployedModelResponse = response.json();
+        assert!(!disabled.fallback.unwrap().aimd.unwrap().enabled);
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"aimd":null}))
+            .await
+            .assert_status_ok();
+        let mut conn = pool.acquire().await.unwrap();
+        let stored = Deployments::new(&mut conn).get_by_id(model.id).await.unwrap().unwrap();
+        assert!(stored.aimd.is_none());
+        assert!(stored.first_token_timeout_ms.is_none());
+    }
+
+    #[sqlx::test]
+    async fn realtime_fallback_statuses_default_patch_and_validate(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&user);
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"type":"composite","model_name":"realtime-fallback-model"}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert_eq!(model.fallback.unwrap().realtime_on_status, vec![529]);
+        let path = format!("/admin/api/v1/models/{}", model.id);
+
+        for statuses in [json!([200]), json!([600]), json!([-529])] {
+            app.patch(&path)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"fallback_realtime_on_status": statuses}))
+                .await
+                .assert_status_bad_request();
+        }
+
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"fallback_realtime_on_status": []}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert!(model.fallback.unwrap().realtime_on_status.is_empty());
+
+        // Omitting the field leaves the stored statuses untouched.
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"fallback_realtime_on_status": [529]}))
+            .await
+            .assert_status_ok();
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"fallback_on_status": [500]}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert_eq!(model.fallback.unwrap().realtime_on_status, vec![529]);
+    }
 
     /// Helper function to find a model by ID in a paginated response
     fn get_model_by_id(id: DeploymentId, response: &PaginatedResponse<DeployedModelResponse>) -> Option<&DeployedModelResponse> {

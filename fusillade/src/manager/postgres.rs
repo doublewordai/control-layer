@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use crate::daemon::{Daemon, DaemonConfig, DaemonMode, RetentionMaintenanceConfig};
+use crate::daemon::{Daemon, DaemonConfig, DaemonMode, LeakConfig, RetentionMaintenanceConfig};
 use crate::http::{HttpClient, ReqwestHttpClient};
 use crate::processor::RequestProcessor;
 
@@ -25,6 +25,7 @@ where
     http_client: Arc<H>,
     config: DaemonConfig,
     retention_maintenance: RetentionMaintenanceConfig,
+    leak_config: Option<LeakConfig>,
     processor: OnceLock<Arc<dyn RequestProcessor<PostgresStore<P>, H>>>,
 }
 
@@ -115,6 +116,7 @@ where
             http_client,
             config,
             retention_maintenance: RetentionMaintenanceConfig::default(),
+            leak_config: None,
             processor: OnceLock::new(),
         }
     }
@@ -122,6 +124,12 @@ where
     /// Install retained-response maintenance controls on the daemon runtime.
     pub fn with_retention_maintenance(mut self, config: RetentionMaintenanceConfig) -> Self {
         self.retention_maintenance = config;
+        self
+    }
+
+    /// Opt into configurable batch leaking; async/flex rates are unchanged.
+    pub fn with_leak_config(mut self, config: LeakConfig) -> Self {
+        self.leak_config = Some(config);
         self
     }
 
@@ -185,6 +193,9 @@ where
             shutdown_token,
         )
         .with_retention_maintenance(self.retention_maintenance.clone());
+        if let Some(config) = &self.leak_config {
+            daemon = daemon.with_leak_config(config.clone());
+        }
         if let Some(processor) = self.processor.get().cloned() {
             daemon = daemon.with_processor(processor);
         }

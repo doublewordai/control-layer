@@ -220,6 +220,7 @@ fn state(pool: PgPool, fake: &Fake, tokenizer_url: String, cfg: ContinuationConf
         routes: Arc::new(ContinuationRoutes::with_models([MODEL.to_string()])),
         purposes: PurposeResolver::new(pool),
         body_limit: 8 * 1024 * 1024,
+        sse_buffer_limit: onwards::sse::DEFAULT_SSE_BUFFER_LIMIT,
     }
 }
 
@@ -278,6 +279,35 @@ fn usage_frames(frames: &[Value]) -> Vec<&Value> {
 }
 
 // ── mode 1: cut between frames → resumed ─────────────────────────────────────
+
+#[sqlx::test]
+async fn configured_sse_limit_accepts_fragmented_events_on_both_legs(pool: PgPool) {
+    fn fragmented(chunk: Chunk) -> Vec<Chunk> {
+        let Chunk::Data(data) = chunk else { unreachable!() };
+        data.as_bytes()
+            .chunks(8192)
+            .map(|bytes| Chunk::Data(String::from_utf8(bytes.to_vec()).unwrap()))
+            .collect()
+    }
+
+    let text = "x".repeat(512 * 1024);
+    let first = fragmented(content("chatcmpl-large", &text));
+    let mut second = fragmented(leg_text(&text, Some("stop")));
+    second.extend([leg_usage(1012, 8), done()]);
+    let fake = Fake::new(first, vec![second]);
+    let tokenizer = render_stub(vec![1, 2, 3], 1012, 12).await;
+    let mut st = state(pool, &fake, tokenizer.uri(), test_config());
+    st.sse_buffer_limit = 1024 * 1024;
+
+    let response = app(&fake, st).oneshot(chat_request(streaming_body())).await.unwrap();
+    let payloads = collect_payloads(response).await;
+    let frames = parsed(&payloads);
+    assert_eq!(contents(&frames), text.repeat(2));
+    assert_eq!(payloads.last().unwrap(), "[DONE]");
+    assert_eq!(fake.resume_requests().len(), 1);
+    assert_eq!(usage_frames(&frames).len(), 1);
+    assert!(frames.iter().any(|f| f["choices"][0]["finish_reason"] == "stop"));
+}
 
 /// The headline case. Leg 1 dies after two content deltas with no finish_reason
 /// and no `[DONE]`; the resume leg finishes the sentence. The client sees one

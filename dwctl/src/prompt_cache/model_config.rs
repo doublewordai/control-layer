@@ -11,7 +11,6 @@
 use std::time::Duration;
 
 use moka::future::Cache;
-use sqlx::PgPool;
 
 use super::index::CacheResult;
 use super::metrics as cache_metrics;
@@ -36,18 +35,22 @@ impl ModelCacheConfig {
 /// Resolves a virtual model (alias) to its [`ModelCacheConfig`], read-through cached.
 #[derive(Clone)]
 pub struct ModelConfigResolver {
-    pool: PgPool,
+    /// Live provider (not a pinned pool): survives runtime pool swaps.
+    pool: sqlx_pool_router::DynPools,
     cache: Cache<String, ModelCacheConfig>,
 }
 
 impl ModelConfigResolver {
-    pub fn new(pool: PgPool) -> Self {
+    pub fn new(pool: impl sqlx_pool_router::PoolProvider) -> Self {
         let cache = Cache::builder()
             .max_capacity(10_000)
             // Short — config is mutable (an operator can expire / insert a tariff version).
             .time_to_live(Duration::from_secs(60))
             .build();
-        Self { pool, cache }
+        Self {
+            pool: sqlx_pool_router::DynPools::new(pool),
+            cache,
+        }
     }
 
     /// Resolve the cache config for `virtual_model` (the `deployed_models.alias`).
@@ -96,7 +99,7 @@ mod tests {
     use crate::test::utils::{create_test_endpoint, create_test_model, create_test_user};
 
     /// Insert a one-row cache tariff (all tiers present) for a model, optionally expired.
-    async fn add_tariff(pool: &PgPool, model_id: uuid::Uuid, min_prefix: i32, expired: bool) {
+    async fn add_tariff(pool: &sqlx::PgPool, model_id: uuid::Uuid, min_prefix: i32, expired: bool) {
         sqlx::query!(
             r#"INSERT INTO model_cache_tariffs
                  (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens, valid_until)
@@ -111,7 +114,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn disabled_without_tariff_and_unknown_model(pool: PgPool) {
+    async fn disabled_without_tariff_and_unknown_model(pool: sqlx::PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
         let _ = create_test_model(&pool, "m1", "alias-default", endpoint, user.id).await;
@@ -124,7 +127,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn active_tariff_enables_with_its_floor(pool: PgPool) {
+    async fn active_tariff_enables_with_its_floor(pool: sqlx::PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
         let id = create_test_model(&pool, "m2", "alias-on", endpoint, user.id).await;
@@ -136,7 +139,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn expired_tariff_is_disabled(pool: PgPool) {
+    async fn expired_tariff_is_disabled(pool: sqlx::PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
         let id = create_test_model(&pool, "m3", "alias-expired", endpoint, user.id).await;

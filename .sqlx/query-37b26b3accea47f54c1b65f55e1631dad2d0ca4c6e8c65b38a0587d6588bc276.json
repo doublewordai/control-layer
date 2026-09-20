@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    SELECT uo.user_id\n                    FROM user_organizations uo\n                    JOIN users u ON u.id = uo.user_id\n                    WHERE uo.organization_id = $1\n                      AND uo.user_id <> $2\n                      AND uo.status = 'active'\n                      AND u.is_deleted = false\n                    ORDER BY CASE uo.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END, uo.created_at ASC, uo.user_id ASC\n                    LIMIT 1\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "37b26b3accea47f54c1b65f55e1631dad2d0ca4c6e8c65b38a0587d6588bc276"
+}

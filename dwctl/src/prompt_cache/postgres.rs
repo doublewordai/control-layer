@@ -19,7 +19,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rand::RngExt;
-use sqlx::PgPool;
 use tracing::instrument;
 
 use super::index::{CacheEntry, CacheError, CacheIndex, CacheMatch, CacheResult, IndexScope, PrefixHash, TtlTier};
@@ -28,14 +27,18 @@ use super::metrics as cache_metrics;
 /// Postgres-backed prefix index over `prompt_cache_entries`.
 #[derive(Clone)]
 pub struct PostgresIndex {
-    pool: PgPool,
+    /// Live provider (not a pinned pool): survives runtime pool swaps.
+    pool: sqlx_pool_router::DynPools,
     /// Connection-error retries per op (`cache.index_conn_retries`; 0 = never retry).
     conn_retries: u32,
 }
 
 impl PostgresIndex {
-    pub fn new(pool: PgPool, conn_retries: u32) -> Self {
-        Self { pool, conn_retries }
+    pub fn new(pool: impl sqlx_pool_router::PoolProvider, conn_retries: u32) -> Self {
+        Self {
+            pool: sqlx_pool_router::DynPools::new(pool),
+            conn_retries,
+        }
     }
 }
 
@@ -197,7 +200,6 @@ impl CacheIndex for PostgresIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sqlx::PgPool;
 
     fn scope() -> IndexScope {
         IndexScope {
@@ -218,7 +220,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn write_then_lookup_returns_match(pool: PgPool) {
+    async fn write_then_lookup_returns_match(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
         idx.write(&entry(&s, b"hash-a", 1024, TtlTier::OneHour)).await.unwrap();
@@ -231,7 +233,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn lookup_excludes_expired_and_other_scopes(pool: PgPool) {
+    async fn lookup_excludes_expired_and_other_scopes(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
 
@@ -251,7 +253,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn refresh_slides_expiry(pool: PgPool) {
+    async fn refresh_slides_expiry(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
         let mut e = entry(&s, b"refreshable", 7, TtlTier::FiveMinutes);
@@ -268,7 +270,7 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn write_upserts_on_conflict(pool: PgPool) {
+    async fn write_upserts_on_conflict(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
         idx.write(&entry(&s, b"dup", 100, TtlTier::FiveMinutes)).await.unwrap();

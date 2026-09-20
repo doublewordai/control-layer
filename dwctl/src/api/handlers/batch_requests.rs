@@ -133,7 +133,8 @@ pub async fn list_batch_requests<P: PoolProvider>(
                 prompt_tokens,
                 completion_tokens,
                 reasoning_tokens,
-                total_tokens
+                total_tokens,
+                api_key_id
             FROM http_analytics
             WHERE fusillade_request_id = ANY($1)
             ORDER BY fusillade_request_id, timestamp DESC
@@ -195,6 +196,18 @@ pub async fn list_batch_requests<P: PoolProvider>(
 
     let email_map: std::collections::HashMap<String, String> = emails.into_iter().map(|e| (e.user_id, e.email)).collect();
 
+    // Resolve each row's key to its holder. Read replica: unlike the creator
+    // emails above, nothing here is written moments before the read — keys
+    // exist long before the requests they authenticate — so replica lag can't
+    // produce a miss.
+    let api_key_ids: Vec<Uuid> = analytics_map
+        .values()
+        .filter_map(|a| a.api_key_id)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let holder_map = fetch_api_key_holders(state.db.read(), &api_key_ids).await;
+
     // Combine fusillade data with analytics enrichment
     let data: Vec<ResponseSummary> = result
         .data
@@ -202,6 +215,7 @@ pub async fn list_batch_requests<P: PoolProvider>(
         .map(|r| {
             let a = analytics_map.get(&r.id);
             let email: Option<String> = email_map.get(&r.created_by).cloned();
+            let holder = a.and_then(|a| a.api_key_id).and_then(|id| holder_map.get(&id));
             ResponseSummary {
                 id: r.id,
                 batch_id: r.batch_id,
@@ -219,6 +233,9 @@ pub async fn list_batch_requests<P: PoolProvider>(
                 total_tokens: a.and_then(|a| a.total_tokens),
                 total_cost: cost_map.get(&r.id).copied(),
                 created_by_email: email,
+                api_key_id: holder.map(|h| h.root_api_key_id),
+                api_key_name: holder.map(|h| h.api_key_name.clone()),
+                api_key_holder_email: holder.and_then(|h| h.api_key_holder_email.clone()),
             }
         })
         .collect();
@@ -293,7 +310,8 @@ pub async fn get_batch_request<P: PoolProvider>(
             prompt_tokens,
             completion_tokens,
             reasoning_tokens,
-            total_tokens
+            total_tokens,
+            api_key_id
         FROM http_analytics
         WHERE fusillade_request_id = $1
         ORDER BY fusillade_request_id, timestamp DESC
@@ -338,6 +356,13 @@ pub async fn get_batch_request<P: PoolProvider>(
         None
     };
 
+    // The key that billed the request, and its holder — the only per-member
+    // attribution a response carries (`created_by` above is the org).
+    let holder = match analytics.as_ref().and_then(|a| a.api_key_id) {
+        Some(api_key_id) => fetch_api_key_holders(state.db.read(), &[api_key_id]).await.remove(&api_key_id),
+        None => None,
+    };
+
     // ZDR bodies are stored as `dwzdr1:` ciphertext (and a failed request's
     // error carries an encrypted body inside it). This detail view is a plain
     // read - no keystore, so it never decrypts or shreds, and a dashboard GET
@@ -367,6 +392,9 @@ pub async fn get_batch_request<P: PoolProvider>(
         error: if is_zdr { None } else { detail.error },
         created_by: detail.created_by,
         created_by_email,
+        api_key_id: holder.as_ref().map(|h| h.root_api_key_id),
+        api_key_name: holder.as_ref().map(|h| h.api_key_name.clone()),
+        api_key_holder_email: holder.and_then(|h| h.api_key_holder_email),
     }))
 }
 
@@ -462,6 +490,69 @@ struct AnalyticsRow {
     completion_tokens: Option<i64>,
     reasoning_tokens: Option<i64>,
     total_tokens: Option<i64>,
+    /// The key that authenticated the request. Nullable: rows written before
+    /// migration 074 added the column don't have one.
+    api_key_id: Option<Uuid>,
+}
+
+/// The visible API key behind a response, and the member holding it.
+///
+/// This is the per-member attribution the Responses view was missing.
+/// `requests.created_by` is `api_keys.user_id` — the billing owner, which is
+/// the *organization* for every org-scoped key — so it renders identically for
+/// every member of an org. `api_keys.created_by` is the holder the key was
+/// issued to, which is the person who actually made the call.
+///
+/// `root` collapses hidden cap-scope children (migration 122) onto the visible
+/// key their holder manages, so a flex/batch request executed on a child shows
+/// the parent's name rather than "Internal batch key (cap scope <uuid>)".
+#[derive(sqlx::FromRow)]
+struct ApiKeyHolderRow {
+    /// The key id as recorded in http_analytics — the map key, not the id we
+    /// return. `root_api_key_id` is what callers get.
+    api_key_id: Uuid,
+    root_api_key_id: Uuid,
+    api_key_name: String,
+    /// `None` when the holder's user row is gone (hard-deleted account).
+    api_key_holder_email: Option<String>,
+}
+
+/// Resolve `http_analytics.api_key_id` values to the visible key and its holder.
+///
+/// Best-effort: a failure logs and yields an empty map rather than failing the
+/// page, matching how creator emails are already treated. Hidden keys are
+/// deliberately NOT filtered out — the shared playground/batch keys are exactly
+/// the ones whose holder the caller can't otherwise determine — but their
+/// secrets never leave the database, only id/name/holder.
+async fn fetch_api_key_holders<'a, E>(executor: E, api_key_ids: &[Uuid]) -> std::collections::HashMap<Uuid, ApiKeyHolderRow>
+where
+    E: sqlx::Executor<'a, Database = sqlx::Postgres>,
+{
+    if api_key_ids.is_empty() {
+        return std::collections::HashMap::new();
+    }
+    sqlx::query_as::<_, ApiKeyHolderRow>(
+        r#"
+        SELECT ak.id      AS api_key_id,
+               root.id    AS root_api_key_id,
+               root.name  AS api_key_name,
+               holder.email AS api_key_holder_email
+        FROM api_keys ak
+        JOIN api_keys root ON root.id = COALESCE(ak.parent_api_key_id, ak.id)
+        LEFT JOIN users holder ON holder.id = ak.created_by
+        WHERE ak.id = ANY($1)
+        "#,
+    )
+    .bind(api_key_ids)
+    .fetch_all(executor)
+    .await
+    .unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to resolve API key holders for responses");
+        vec![]
+    })
+    .into_iter()
+    .map(|row| (row.api_key_id, row))
+    .collect()
 }
 
 /// Per-request cost from the credits ledger, keyed by the denormalized fusillade_request_id
@@ -681,6 +772,173 @@ mod tests {
         let body: serde_json::Value = response.json();
         assert_eq!(body["id"], request_id.to_string());
         assert_eq!(body["created_by_email"], user.email);
+    }
+
+    /// The org-member attribution case, end to end.
+    ///
+    /// An org owner issues a key to a member (`api_keys.user_id` = the org so
+    /// billing lands on the org, `api_keys.created_by` = the member who holds
+    /// it). Every request that key makes is written with
+    /// `requests.created_by` = the *org*, so `created_by_email` renders the
+    /// org's contact email — which, because an org's email defaults to its
+    /// founder's, looks exactly like the owner made the call themselves. That
+    /// is the bug this enrichment fixes: `api_key_holder_email` names the
+    /// member.
+    ///
+    /// Also covers the cap-scope indirection: the request is billed to a
+    /// hidden child key (migration 122), and the caller must still be told the
+    /// *visible* parent's id and name, not "Internal batch key (cap scope …)".
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_responses_surface_api_key_holder_not_just_billing_owner(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let member = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let org = create_test_org(&pool, owner.id).await;
+        add_org_member(&pool, org.id, member.id, "member").await;
+        let auth = add_auth_headers(&owner);
+        let org_cookie = format!("dw_active_org={}", org.id);
+
+        // The visible key the owner issued to the member, and the hidden
+        // cap-scope child that actually executes its flex/batch traffic.
+        let visible_key_id = uuid::Uuid::new_v4();
+        let child_key_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by, hidden) VALUES ($1, 'Member key', $2, 'realtime', $3, $4, false)",
+        )
+        .bind(visible_key_id)
+        .bind(format!("sk-visible-{}", visible_key_id.simple()))
+        .bind(org.id)
+        .bind(member.id)
+        .execute(&pool)
+        .await
+        .expect("insert visible key");
+        sqlx::query(
+            "INSERT INTO api_keys (id, name, secret, purpose, user_id, created_by, hidden, parent_api_key_id) VALUES ($1, 'Internal batch key (cap scope)', $2, 'batch', $3, $4, true, $5)",
+        )
+        .bind(child_key_id)
+        .bind(format!("sk-child-{}", child_key_id.simple()))
+        .bind(org.id)
+        .bind(member.id)
+        .bind(visible_key_id)
+        .execute(&pool)
+        .await
+        .expect("insert child key");
+
+        // A batchless response owned by the ORG — this is what ingest writes
+        // for an org-scoped key (`lookup_created_by` reads `api_keys.user_id`).
+        let template_id = uuid::Uuid::new_v4();
+        let request_id = uuid::Uuid::new_v4();
+        let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]});
+        sqlx::query(
+            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, NULL, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $2, NULL, 'POST')",
+        )
+        .bind(template_id)
+        .bind(serde_json::to_string(&body).unwrap())
+        .execute(&pool)
+        .await
+        .expect("insert template");
+        sqlx::query(
+            "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at, created_by) VALUES ($1, NULL, $2, 'test-model', 'pending', NOW(), $3)",
+        )
+        .bind(request_id)
+        .bind(template_id)
+        .bind(org.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert request");
+
+        // The only place the acting key is recorded (migration 074).
+        sqlx::query(
+            "INSERT INTO http_analytics (instance_id, correlation_id, timestamp, method, uri, fusillade_request_id, api_key_id) VALUES ($1, 1, NOW(), 'POST', '/ai/v1/responses', $2, $3)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(request_id)
+        .bind(child_key_id)
+        .execute(&pool)
+        .await
+        .expect("insert analytics");
+
+        let expect_attribution = |row: &serde_json::Value| {
+            assert_eq!(
+                row["created_by_email"], org.email,
+                "billing owner stays the org — this is the field that reads as the owner's own address",
+            );
+            assert_eq!(
+                row["api_key_id"],
+                visible_key_id.to_string(),
+                "cap-scope child must resolve to the visible key its holder manages",
+            );
+            assert_eq!(row["api_key_name"], "Member key");
+            assert_eq!(
+                row["api_key_holder_email"], member.email,
+                "the holder is the member the key was issued to, not the owner who minted it",
+            );
+        };
+
+        let list = app
+            .get("/admin/api/v1/batches/requests")
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        list.assert_status_ok();
+        let list_body: serde_json::Value = list.json();
+        let rows = list_body["data"].as_array().expect("data array");
+        assert_eq!(rows.len(), 1);
+        expect_attribution(&rows[0]);
+
+        let detail = app
+            .get(&format!("/admin/api/v1/batches/requests/{}", request_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .add_header("cookie", &org_cookie)
+            .await;
+        detail.assert_status_ok();
+        expect_attribution(&detail.json::<serde_json::Value>());
+    }
+
+    /// A response with no `http_analytics` row — never billed, or the row aged
+    /// out of retention — must still render, with the key fields null rather
+    /// than a 500 or a fabricated holder.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_response_without_analytics_row_has_null_api_key_fields(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&user);
+
+        let template_id = uuid::Uuid::new_v4();
+        let request_id = uuid::Uuid::new_v4();
+        let body = serde_json::json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]});
+        sqlx::query(
+            "INSERT INTO fusillade.request_templates (id, file_id, model, api_key, endpoint, path, body, custom_id, method) VALUES ($1, NULL, 'test-model', 'test-key', 'http://test', '/v1/chat/completions', $2, NULL, 'POST')",
+        )
+        .bind(template_id)
+        .bind(serde_json::to_string(&body).unwrap())
+        .execute(&pool)
+        .await
+        .expect("insert template");
+        sqlx::query(
+            "INSERT INTO fusillade.requests (id, batch_id, template_id, model, state, created_at, created_by) VALUES ($1, NULL, $2, 'test-model', 'pending', NOW(), $3)",
+        )
+        .bind(request_id)
+        .bind(template_id)
+        .bind(user.id.to_string())
+        .execute(&pool)
+        .await
+        .expect("insert request");
+
+        let response = app
+            .get(&format!("/admin/api/v1/batches/requests/{}", request_id))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .await;
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+        assert!(body["api_key_id"].is_null());
+        assert!(body["api_key_name"].is_null());
+        assert!(body["api_key_holder_email"].is_null());
     }
 
     #[sqlx::test]

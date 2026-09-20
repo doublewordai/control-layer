@@ -127,6 +127,23 @@ async fn partition_maintenance_pool_rejects_any_shape_except_max_one_min_zero(po
 }
 
 #[sqlx::test]
+async fn changing_query_schema_invalidates_maintenance_attestation(pool: PgPool) {
+    let manager = retirement_manager(&pool).await;
+    assert!(manager.supports_retained_response_partition_retirement());
+    let manager = manager.with_query_schema("public");
+    assert!(!manager.supports_retained_response_partition_retirement());
+    let manager = manager.attest_partition_maintenance_pool().await.unwrap();
+    assert!(manager.supports_retained_response_partition_retirement());
+    sqlx::query("CREATE SCHEMA other_component")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let manager = manager.with_query_schema("other_component");
+    assert!(!manager.supports_retained_response_partition_retirement());
+    assert!(manager.attest_partition_maintenance_pool().await.is_err());
+}
+
+#[sqlx::test]
 async fn maintenance_pool_attestation_rejects_a_different_schema(pool: PgPool) {
     sqlx::query("CREATE SCHEMA wrong_retirement_target")
         .execute(&pool)
@@ -1259,4 +1276,476 @@ async fn expired_fence_cleanup_validates_its_bound(pool: PgPool) {
     let manager = retirement_manager(&pool).await;
     assert!(manager.cleanup_expired_response_fences(-1).await.is_err());
     assert_eq!(manager.cleanup_expired_response_fences(0).await.unwrap(), 0);
+}
+
+const REQUEST_ROUTE_CLEANUP: &str =
+    include_str!("../src/postgres/retained_response_request_route_cleanup.sql");
+const GROUP_ROUTE_CLEANUP: &str =
+    include_str!("../src/postgres/retained_response_group_route_cleanup.sql");
+
+async fn utc_today(pool: &PgPool) -> chrono::NaiveDate {
+    sqlx::query_scalar("SELECT (statement_timestamp() AT TIME ZONE 'UTC')::date")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Retires `days` consecutive daily buckets ending today and returns their
+/// dates in ascending order.
+async fn retire_days(
+    pool: &PgPool,
+    manager: &PostgresRequestManager<TestDbPools>,
+    days: u64,
+) -> Vec<chrono::NaiveDate> {
+    let today = utc_today(pool).await;
+    let dates: Vec<chrono::NaiveDate> = (0..days)
+        .rev()
+        .map(|back| today - chrono::Days::new(back))
+        .collect();
+    for date in &dates {
+        ensure_partition(pool, *date).await;
+    }
+    while manager
+        .retire_expired_response_partition(true)
+        .await
+        .unwrap()
+        == RetainedResponseRetirementOutcome::Retired
+    {}
+    let retired: Vec<chrono::NaiveDate> = sqlx::query_scalar(
+        "SELECT delete_on FROM retained_response_buckets \
+         WHERE state = 'retired' AND delete_on = ANY($1) ORDER BY delete_on",
+    )
+    .bind(&dates)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    assert_eq!(retired, dates, "every fixture day must be retired");
+    dates
+}
+
+async fn insert_group_routes(pool: &PgPool, routes: &[(Uuid, chrono::NaiveDate)]) {
+    sqlx::query(
+        "INSERT INTO retained_response_group_routes (group_id, delete_on) \
+         SELECT * FROM UNNEST($1::uuid[], $2::date[])",
+    )
+    .bind(routes.iter().map(|(group, _)| *group).collect::<Vec<_>>())
+    .bind(routes.iter().map(|(_, day)| *day).collect::<Vec<_>>())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn insert_request_routes(pool: &PgPool, routes: &[(Uuid, Uuid, chrono::NaiveDate)]) {
+    sqlx::query(
+        "INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) \
+         SELECT * FROM UNNEST($1::uuid[], $2::uuid[], $3::date[])",
+    )
+    .bind(
+        routes
+            .iter()
+            .map(|(request, _, _)| *request)
+            .collect::<Vec<_>>(),
+    )
+    .bind(
+        routes
+            .iter()
+            .map(|(_, group, _)| *group)
+            .collect::<Vec<_>>(),
+    )
+    .bind(routes.iter().map(|(_, _, day)| *day).collect::<Vec<_>>())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn remaining_routes(pool: &PgPool, table: &str, key: &str) -> Vec<(chrono::NaiveDate, Uuid)> {
+    sqlx::query_as(&format!(
+        "SELECT delete_on, {key} FROM {table} ORDER BY delete_on, {key}"
+    ))
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+async fn remaining_group_routes(pool: &PgPool) -> Vec<(chrono::NaiveDate, Uuid)> {
+    remaining_routes(pool, "retained_response_group_routes", "group_id").await
+}
+
+async fn remaining_request_routes(pool: &PgPool) -> Vec<(chrono::NaiveDate, Uuid)> {
+    remaining_routes(pool, "retained_response_request_routes", "request_id").await
+}
+
+fn sorted_ids(count: usize) -> Vec<Uuid> {
+    let mut ids: Vec<Uuid> = (0..count).map(|_| Uuid::new_v4()).collect();
+    ids.sort();
+    ids
+}
+
+#[derive(Debug)]
+struct RouteAccess {
+    relation: String,
+    node_type: String,
+}
+
+/// Every plan node that reads a route table, plus every index condition in
+/// the plan keyed by the index it applies to.
+fn route_accesses(
+    plan: &serde_json::Value,
+    accesses: &mut Vec<RouteAccess>,
+    index_conditions: &mut Vec<(String, String)>,
+) {
+    match plan {
+        serde_json::Value::Object(node) => {
+            // A delete node names its target table but reads it through its
+            // child scan; only the scans decide how the table is reached.
+            if let Some(relation) = node.get("Relation Name").and_then(|v| v.as_str())
+                && matches!(
+                    relation,
+                    "retained_response_group_routes" | "retained_response_request_routes"
+                )
+                && node["Node Type"].as_str() != Some("ModifyTable")
+            {
+                accesses.push(RouteAccess {
+                    relation: relation.to_string(),
+                    node_type: node["Node Type"].as_str().unwrap_or_default().to_string(),
+                });
+            }
+            if let (Some(index), Some(condition)) = (
+                node.get("Index Name").and_then(|v| v.as_str()),
+                node.get("Index Cond").and_then(|v| v.as_str()),
+            ) {
+                index_conditions.push((index.to_string(), condition.to_string()));
+            }
+            for child in node.values() {
+                route_accesses(child, accesses, index_conditions);
+            }
+        }
+        serde_json::Value::Array(children) => {
+            for child in children {
+                route_accesses(child, accesses, index_conditions);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Production holds tens of millions of routes on live days and none on the
+/// retired days the purge inspects. Joining the route tables straight to the
+/// bucket metadata let the planner scan every route to prove absence on each
+/// run, and once a batch was large the delete step hashed the whole table.
+/// Both statements must reach the route tables only through their indexes,
+/// in the generic plan a pooled prepared statement settles on and in a plan
+/// bound with the production batch size.
+#[sqlx::test]
+async fn route_cleanup_reaches_every_route_through_an_index(pool: PgPool) {
+    let manager = retirement_manager(&pool).await;
+    let retired = retire_days(&pool, &manager, 2).await;
+    let first_live_day = retired[1] + chrono::Days::new(1);
+    for ahead in 0..10 {
+        ensure_partition(&pool, first_live_day + chrono::Days::new(ahead)).await;
+    }
+    sqlx::query(
+        "INSERT INTO retained_response_group_routes (group_id, delete_on) \
+         SELECT md5('g' || i)::uuid, $1::date + (i % 10) FROM generate_series(1, 100000) i",
+    )
+    .bind(first_live_day)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) \
+         SELECT md5('r' || i)::uuid, md5('g' || i)::uuid, $1::date + (i % 10) \
+         FROM generate_series(1, 100000) i",
+    )
+    .bind(first_live_day)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // A slice of leftovers on the older retired day keeps the batch estimate
+    // large enough to tempt the planner into hashing the whole table.
+    sqlx::query(
+        "INSERT INTO retained_response_group_routes (group_id, delete_on) \
+         SELECT md5('lg' || i)::uuid, $1 FROM generate_series(1, 2000) i",
+    )
+    .bind(retired[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO retained_response_request_routes (request_id, group_id, delete_on) \
+         SELECT md5('lr' || i)::uuid, md5('lg' || i)::uuid, $1 FROM generate_series(1, 1000) i",
+    )
+    .bind(retired[0])
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::raw_sql(
+        "ANALYZE retained_response_buckets; ANALYZE retention_partition_retirements; \
+         ANALYZE retained_response_group_routes; ANALYZE retained_response_request_routes",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    for (name, query, day_index) in [
+        (
+            "request",
+            REQUEST_ROUTE_CLEANUP,
+            "idx_retained_response_request_routes_bucket",
+        ),
+        (
+            "group",
+            GROUP_ROUTE_CLEANUP,
+            "idx_retained_response_group_routes_bucket_group",
+        ),
+    ] {
+        let generic: serde_json::Value =
+            sqlx::query_scalar(&format!("EXPLAIN (GENERIC_PLAN, FORMAT JSON) {query}"))
+                .bind(50_000_i64)
+                .bind(3_600_i64)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let bound: serde_json::Value =
+            sqlx::query_scalar(&format!("EXPLAIN (FORMAT JSON) {query}"))
+                .bind(50_000_i64)
+                .bind(3_600_i64)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        for (mode, plan) in [("generic", generic), ("bound", bound)] {
+            let mut accesses = Vec::new();
+            let mut index_conditions = Vec::new();
+            route_accesses(&plan, &mut accesses, &mut index_conditions);
+            assert!(
+                !accesses.is_empty(),
+                "the {name} purge ({mode}) must read a route table"
+            );
+            for access in &accesses {
+                assert!(
+                    matches!(
+                        access.node_type.as_str(),
+                        "Index Scan" | "Index Only Scan" | "Bitmap Heap Scan"
+                    ),
+                    "the {name} purge ({mode}) must reach {} through an index: {access:?}\n{plan}",
+                    access.relation
+                );
+            }
+            assert!(
+                index_conditions
+                    .iter()
+                    .any(|(index, condition)| index == day_index
+                        && condition.contains("delete_on = retired.delete_on")),
+                "the {name} purge ({mode}) must probe each retired day: {index_conditions:?}"
+            );
+            if name == "group" {
+                assert!(
+                    index_conditions
+                        .iter()
+                        .any(|(index, _)| index == "idx_retained_response_request_routes_group"),
+                    "the group purge ({mode}) must check request routes by group: {index_conditions:?}"
+                );
+            }
+        }
+    }
+
+    // The leftover request routes go first; every leftover group is then
+    // request-free within the same transaction.
+    assert_eq!(
+        manager
+            .cleanup_retained_response_routes(50_000)
+            .await
+            .unwrap(),
+        3000
+    );
+    assert_eq!(
+        manager
+            .cleanup_retained_response_routes(50_000)
+            .await
+            .unwrap(),
+        0
+    );
+    let live: (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT COUNT(*) FROM retained_response_group_routes), \
+                (SELECT COUNT(*) FROM retained_response_request_routes)",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, (100_000, 100_000), "live days must be left alone");
+}
+
+#[sqlx::test]
+async fn route_cleanup_keeps_a_group_until_its_last_request_route_is_gone(pool: PgPool) {
+    let manager = retirement_manager(&pool).await;
+    let retired = retire_days(&pool, &manager, 1).await[0];
+    let live = retired + chrono::Days::new(1);
+    ensure_partition(&pool, live).await;
+    let group = Uuid::new_v4();
+    let retired_request = Uuid::new_v4();
+    let live_request = Uuid::new_v4();
+    insert_group_routes(&pool, &[(group, retired)]).await;
+    insert_request_routes(
+        &pool,
+        &[
+            (retired_request, group, retired),
+            (live_request, group, live),
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        manager.cleanup_retained_response_routes(100).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        remaining_request_routes(&pool).await,
+        vec![(live, live_request)]
+    );
+    assert_eq!(remaining_group_routes(&pool).await, vec![(retired, group)]);
+    assert_eq!(
+        manager.cleanup_retained_response_routes(100).await.unwrap(),
+        0,
+        "a group with a surviving request route must stay routable"
+    );
+
+    sqlx::query("DELETE FROM retained_response_request_routes WHERE request_id = $1")
+        .bind(live_request)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.cleanup_retained_response_routes(100).await.unwrap(),
+        1
+    );
+    assert!(remaining_group_routes(&pool).await.is_empty());
+    let fenced: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT object_id, reason FROM retained_response_resurrection_fences ORDER BY object_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let mut expected = vec![
+        (group, "retired".to_string()),
+        (retired_request, "retired".to_string()),
+    ];
+    expected.sort();
+    assert_eq!(fenced, expected);
+}
+
+#[sqlx::test]
+async fn route_cleanup_shares_its_bound_in_day_then_identifier_order(pool: PgPool) {
+    let manager = retirement_manager(&pool).await;
+    let days = retire_days(&pool, &manager, 2).await;
+    let (older, newer) = (days[0], days[1]);
+    let older_groups = sorted_ids(2);
+    let newer_groups = sorted_ids(2);
+    let older_requests = sorted_ids(2);
+    let newer_requests = sorted_ids(2);
+    insert_group_routes(
+        &pool,
+        &[
+            (older_groups[0], older),
+            (older_groups[1], older),
+            (newer_groups[0], newer),
+            (newer_groups[1], newer),
+        ],
+    )
+    .await;
+    insert_request_routes(
+        &pool,
+        &[
+            (older_requests[0], older_groups[0], older),
+            (older_requests[1], older_groups[1], older),
+            (newer_requests[0], newer_groups[0], newer),
+            (newer_requests[1], newer_groups[1], newer),
+        ],
+    )
+    .await;
+
+    // Request routes come first: the whole older day, then the smallest
+    // identifier of the newer day. No group is touched with the bound spent.
+    assert_eq!(
+        manager.cleanup_retained_response_routes(3).await.unwrap(),
+        3
+    );
+    assert_eq!(
+        remaining_request_routes(&pool).await,
+        vec![(newer, newer_requests[1])]
+    );
+    assert_eq!(remaining_group_routes(&pool).await.len(), 4);
+
+    // The last request route, then the two request-free groups of the older day.
+    assert_eq!(
+        manager.cleanup_retained_response_routes(3).await.unwrap(),
+        3
+    );
+    assert!(remaining_request_routes(&pool).await.is_empty());
+    assert_eq!(
+        remaining_group_routes(&pool).await,
+        vec![(newer, newer_groups[0]), (newer, newer_groups[1])]
+    );
+
+    assert_eq!(
+        manager.cleanup_retained_response_routes(1).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        remaining_group_routes(&pool).await,
+        vec![(newer, newer_groups[1])]
+    );
+    assert_eq!(
+        manager.cleanup_retained_response_routes(10).await.unwrap(),
+        1
+    );
+    assert_eq!(
+        manager.cleanup_retained_response_routes(10).await.unwrap(),
+        0
+    );
+}
+
+#[sqlx::test]
+async fn route_cleanup_skips_routes_locked_by_a_concurrent_transaction(pool: PgPool) {
+    let manager = retirement_manager(&pool).await;
+    let retired = retire_days(&pool, &manager, 1).await[0];
+    let groups = sorted_ids(2);
+    let requests = sorted_ids(2);
+    insert_group_routes(&pool, &[(groups[0], retired), (groups[1], retired)]).await;
+    insert_request_routes(
+        &pool,
+        &[
+            (requests[0], groups[0], retired),
+            (requests[1], groups[1], retired),
+        ],
+    )
+    .await;
+
+    // A concurrent reader pins the first request route. SKIP LOCKED must pass
+    // over it, and its group must survive because the route still exists.
+    let mut holder = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM retained_response_request_routes WHERE request_id = $1 FOR UPDATE")
+        .bind(requests[0])
+        .fetch_one(&mut *holder)
+        .await
+        .unwrap();
+    assert_eq!(
+        manager.cleanup_retained_response_routes(10).await.unwrap(),
+        2
+    );
+    assert_eq!(
+        remaining_request_routes(&pool).await,
+        vec![(retired, requests[0])]
+    );
+    assert_eq!(
+        remaining_group_routes(&pool).await,
+        vec![(retired, groups[0])]
+    );
+    holder.commit().await.unwrap();
+
+    assert_eq!(
+        manager.cleanup_retained_response_routes(10).await.unwrap(),
+        2
+    );
+    assert!(remaining_request_routes(&pool).await.is_empty());
+    assert!(remaining_group_routes(&pool).await.is_empty());
 }

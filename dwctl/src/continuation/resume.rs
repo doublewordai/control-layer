@@ -224,7 +224,7 @@ pub async fn attempt(state: &ContinuationState, ctx: &RequestContext, continuati
     let body = BodyExt::into_data_stream(response.into_body()).map(|r| r.map_err(std::io::Error::other));
     Ok(Leg {
         render,
-        stream: Box::pin(SseBufferedStream::new(body)),
+        stream: Box::pin(SseBufferedStream::with_limit(body, state.sse_buffer_limit)),
         deadline,
     })
 }

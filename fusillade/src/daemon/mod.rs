@@ -31,8 +31,8 @@ use crate::processor::{DefaultRequestProcessor, RequestProcessor};
 use crate::request::{Claimed, DaemonId, FailureReason, Request, RequestCompletionResult};
 
 pub use config::{
-    DaemonConfig, DaemonMode, ModelEscalationConfig, RetentionMaintenanceConfig, ShouldRetryFn,
-    default_should_retry,
+    DaemonConfig, DaemonMode, LeakConfig, ModelEscalationConfig, RetentionMaintenanceConfig,
+    ShouldRetryFn, default_should_retry,
 };
 pub use fusillade_core::daemon_record::{
     AnyDaemonRecord, DaemonData, DaemonRecord, DaemonState, DaemonStats, DaemonStatus, Dead,
@@ -345,6 +345,20 @@ async fn with_query_timeout<T>(
             timeout.as_millis()
         ))),
     }
+}
+
+/// Advance the local heartbeat lease only when the write completed before the
+/// existing lease expired. The renewed lease is anchored at write start,
+/// matching the timestamp stored by `DaemonRecord::heartbeat` before it awaits
+/// Postgres; anchoring it at completion would let local ownership outlive the
+/// heartbeat visible to reclaimers by the database wait time.
+fn renewed_heartbeat_lease_anchor(
+    current_anchor: std::time::Instant,
+    heartbeat_started_at: std::time::Instant,
+    completed_at: std::time::Instant,
+    lease_duration: Duration,
+) -> Option<std::time::Instant> {
+    (completed_at < current_anchor + lease_duration).then_some(heartbeat_started_at)
 }
 
 /// Run maintenance work only while the daemon remains live. Dropping the
@@ -960,6 +974,11 @@ async fn run_batch_archive_phase<S>(
     }
 }
 
+/// Runs one batchless archive pass. Returns `true` when the pass proved more
+/// eligible work remains (`may_have_more`), so the worker can go straight
+/// into its next pass instead of sleeping out the tick interval. A failed or
+/// cancelled pass returns `false`: it keeps the metric raised, but a hot loop
+/// on a failing pass would only amplify the failure.
 async fn run_batchless_archive_phase<S>(
     storage: &S,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -967,7 +986,8 @@ async fn run_batchless_archive_phase<S>(
     retention_policy: &RetentionPolicy,
     cutoffs: &RetainedResponseArchiveCutoffs,
     tick: ArchiveMoverTick,
-) where
+) -> bool
+where
     S: DaemonStorage,
 {
     let started = std::time::Instant::now();
@@ -1054,8 +1074,9 @@ async fn run_batchless_archive_phase<S>(
                     "Retained-response archive phase completed"
                 );
             }
+            outcome.may_have_more
         }
-        Ok(None) => {}
+        Ok(None) => false,
         Err(error) => {
             // A failed pass has not proven the queue empty: keep the
             // "may have more" signal raised so a drain operator never reads a
@@ -1070,10 +1091,13 @@ async fn run_batchless_archive_phase<S>(
                 error = %error,
                 "Failed to archive retained-response graphs"
             );
+            false
         }
     }
 }
 
+/// Runs one mover tick. Returns `true` when the batchless phase reported
+/// more eligible work, which the worker loop treats as "run again now".
 async fn run_archive_mover_tick<S>(
     storage: Arc<S>,
     shutdown: &tokio_util::sync::CancellationToken,
@@ -1081,13 +1105,15 @@ async fn run_archive_mover_tick<S>(
     retention_policy: &RetentionPolicy,
     tick: ArchiveMoverTick,
     retained_runway_ready: &AtomicBool,
-) where
+) -> bool
+where
     S: DaemonStorage + 'static,
 {
     let observed_at = chrono::Utc::now();
     if tick.batch_enabled {
         run_batch_archive_phase(storage.clone(), shutdown, query_timeout, tick).await;
     }
+    let mut more_work = false;
     if tick.batchless_enabled {
         let index_ready = match maintenance_query(
             shutdown,
@@ -1112,7 +1138,7 @@ async fn run_archive_mover_tick<S>(
         };
         if !index_ready || !retained_runway_ready.load(Ordering::Acquire) {
             gauge!("fusillade_retained_response_archive_ready", "worker" => tick.worker).set(0.0);
-            return;
+            return false;
         }
         gauge!("fusillade_retained_response_archive_ready", "worker" => tick.worker).set(1.0);
         let cutoffs = match retained_archive_cutoffs_at(
@@ -1129,10 +1155,10 @@ async fn run_archive_mover_tick<S>(
                     error = %error,
                     "Archive mover could not resolve immutable cutoffs"
                 );
-                return;
+                return false;
             }
         };
-        run_batchless_archive_phase(
+        more_work = run_batchless_archive_phase(
             storage.as_ref(),
             shutdown,
             query_timeout,
@@ -1142,6 +1168,7 @@ async fn run_archive_mover_tick<S>(
         )
         .await;
     }
+    more_work
 }
 
 fn supervise_daemon_handles(
@@ -1527,12 +1554,27 @@ fn validate_daemon_intervals(config: &DaemonConfig) -> Result<()> {
             )));
         }
     }
+    if config.stale_daemon_threshold_ms == 0 {
+        return Err(FusilladeError::ValidationError(
+            "stale_daemon_threshold_ms must be positive".to_string(),
+        ));
+    }
+    // Keep at least one full heartbeat interval available for the database
+    // query after a scheduled tick. Merely requiring a positive remainder
+    // permits configurations such as 4_999ms/5_000ms, which guarantee a
+    // near-zero query timeout and make a healthy daemon self-fence.
+    if config.heartbeat_interval_ms > config.stale_daemon_threshold_ms / 2 {
+        return Err(FusilladeError::ValidationError(format!(
+            "heartbeat_interval_ms ({}) must be at most half of stale_daemon_threshold_ms ({})",
+            config.heartbeat_interval_ms, config.stale_daemon_threshold_ms
+        )));
+    }
     Ok(())
 }
 
 /// Daemon responsible for batchless pending requests.
 ///
-/// This loop owns the leaky-bucket/deadline-ramp policy for async/flex rows.
+/// This loop shares the leaky-bucket/deadline-ramp policy with batch claims.
 pub struct RequestDaemon<S, H>
 where
     S: Storage + DaemonStorage,
@@ -1555,10 +1597,10 @@ where
     }
 }
 
-/// Daemon responsible for live-model batch requests.
+/// Daemon responsible for batch requests.
 ///
-/// This loop selects batches first, then claims rows from those batches. It does
-/// not use the request daemon's leaky-bucket fallback.
+/// This loop selects batches first, then claims rows from those batches. It
+/// uses the same leaky-bucket fallback as the request daemon.
 pub struct BatchDaemon<S, H>
 where
     S: Storage + DaemonStorage,
@@ -1645,6 +1687,7 @@ where
     http_client: Arc<H>,
     config: DaemonConfig,
     retention_maintenance: RetentionMaintenanceConfig,
+    leak_config: Option<LeakConfig>,
     /// Per-claim processing hook. Defaults to [`DefaultRequestProcessor`],
     /// which preserves the existing fire-and-store pipeline byte-for-byte.
     /// Override via [`Daemon::with_processor`] to inject custom orchestration
@@ -1669,9 +1712,9 @@ where
     /// Each entry's value is `next_token_at`: the earliest `Instant` the bucket
     /// may leak its next request. Before a claim cycle the daemon derives the
     /// cooldown set (triples with `next_token_at > now`) and passes it to
-    /// `claim_requests`; after a claim it stamps `next_token_at = now + W /
-    /// leaks_per_window` for each leaked row's triple. Stale entries are pruned on
-    /// read to bound the map. See `leaks_per_window`.
+    /// both foreground claim methods; after a claim it stamps the next token
+    /// using the configured interval. Stale entries are pruned on read. State
+    /// remains process-local, as in the original async throttle.
     leak_buckets: Arc<dashmap::DashMap<(String, String, String), std::time::Instant>>,
     /// Per-user throughput counters for periodic OTel emission.
     user_throughput: Arc<dashmap::DashMap<String, UserThroughputStats>>,
@@ -1747,6 +1790,7 @@ where
             http_client,
             config,
             retention_maintenance: RetentionMaintenanceConfig::default(),
+            leak_config: None,
             processor: Arc::new(DefaultRequestProcessor),
             requests_in_flight: Arc::new(dashmap::DashMap::new()),
             adaptive_concurrency,
@@ -1784,6 +1828,13 @@ where
     /// source-compatible serialized daemon configuration.
     pub fn with_retention_maintenance(mut self, config: RetentionMaintenanceConfig) -> Self {
         self.retention_maintenance = config;
+        self
+    }
+
+    /// Configure batch leaking. Without this opt-in, batches retain the live gate.
+    /// Async/flex claims always retain `DaemonConfig::leaks_per_window`.
+    pub fn with_leak_config(mut self, config: LeakConfig) -> Self {
+        self.leak_config = Some(config);
         self
     }
 
@@ -1969,27 +2020,37 @@ where
         leak_cooldown
     }
 
-    fn stamp_leaks(&self, claimed: &[Request<Claimed>]) {
+    fn stamp_leaks(
+        &self,
+        claimed: &[Request<Claimed>],
+        kind: ClaimLoopKind,
+        loop_name: &'static str,
+    ) {
         let stamp_now = std::time::Instant::now();
         let leaks_per_window = self.config.leaks_per_window.max(f64::MIN_POSITIVE);
         let mut leaked_count = 0u64;
         for request in claimed {
             if let Some(stamp) = &request.state.leak {
-                let interval = std::time::Duration::from_secs_f64(
-                    (stamp.window_secs / leaks_per_window).max(0.0),
-                );
+                let interval = self
+                    .leak_config
+                    .as_ref()
+                    .filter(|_| matches!(kind, ClaimLoopKind::Batch))
+                    .map_or_else(
+                        || Duration::from_secs_f64((stamp.window_secs / leaks_per_window).max(0.0)),
+                        |config| config.interval(&request.data.model),
+                    );
                 let key = (
                     request.data.created_by.clone(),
                     stamp.window_class.clone(),
                     request.data.model.clone(),
                 );
                 self.leak_buckets.insert(key, stamp_now + interval);
+                counter!("fusillade_leaky_bucket_leaks_total", "daemon" => loop_name, "model" => request.data.model.clone()).increment(1);
                 leaked_count += 1;
             }
         }
 
         if leaked_count > 0 {
-            counter!("fusillade_leaky_bucket_leaks_total").increment(leaked_count);
             tracing::debug!(
                 leaked_count,
                 "Stamped leaky-bucket tokens for leaked claims"
@@ -2212,11 +2273,7 @@ where
             gauge!("fusillade_claim_capacity", "daemon" => loop_name).set(total_capacity as f64);
 
             let user_active_counts = self.user_active_counts();
-            let leak_cooldown = if kind == ClaimLoopKind::Request {
-                self.leak_cooldown()
-            } else {
-                std::collections::HashSet::new()
-            };
+            let leak_cooldown = self.leak_cooldown();
 
             let claim_start = std::time::Instant::now();
             let claim_timeout = Duration::from_millis(self.config.claim_query_timeout_ms);
@@ -2236,17 +2293,34 @@ where
                     .await
                 }
                 ClaimLoopKind::Batch => {
-                    with_query_timeout(
-                        "batch claim query",
-                        claim_timeout,
-                        self.storage.claim_batch_requests(
-                            kind.claim_size(&self.config),
-                            self.config.batch_claim_batch_size,
-                            self.daemon_id,
-                            &available_capacity,
-                            &user_active_counts,
-                        ),
-                    )
+                    with_query_timeout("batch claim query", claim_timeout, async {
+                        if self
+                            .leak_config
+                            .as_ref()
+                            .is_some_and(|config| config.leak_enabled)
+                        {
+                            self.storage
+                                .claim_batch_requests_with_cooldown(
+                                    kind.claim_size(&self.config),
+                                    self.config.batch_claim_batch_size,
+                                    self.daemon_id,
+                                    &available_capacity,
+                                    &user_active_counts,
+                                    &leak_cooldown,
+                                )
+                                .await
+                        } else {
+                            self.storage
+                                .claim_batch_requests(
+                                    kind.claim_size(&self.config),
+                                    self.config.batch_claim_batch_size,
+                                    self.daemon_id,
+                                    &available_capacity,
+                                    &user_active_counts,
+                                )
+                                .await
+                        }
+                    })
                     .await
                 }
                 _ => unreachable!("background kind passed to foreground claim loop"),
@@ -2310,9 +2384,7 @@ where
                 "Claimed requests from storage"
             );
 
-            if kind == ClaimLoopKind::Request {
-                self.stamp_leaks(&claimed);
-            }
+            self.stamp_leaks(&claimed, kind, loop_name);
 
             self.grow_saturated_models(&claimed, &available_capacity);
 
@@ -2609,6 +2681,7 @@ where
                     let batch_expires_at = request.state.batch_expires_at;
                     let retry_attempt_at_completion = request.state.retry_attempt;
                     let owning_daemon_id = request.state.daemon_id;
+                    let request_claimed_at = request.state.claimed_at;
 
                     let cancellation: crate::processor::CancellationFuture = Box::pin(async move {
                         tokio::select! {
@@ -2692,6 +2765,7 @@ where
                                             .reschedule_for_retry(
                                                 request_id,
                                                 owning_daemon_id,
+                                                request_claimed_at,
                                                 pending.state.retry_attempt,
                                                 pending.state.not_before,
                                             )
@@ -2738,7 +2812,25 @@ where
                                         return Ok(());
                                     }
                                     Err(failed) => {
-                                        storage.persist(&*failed).await?;
+                                        match storage.persist(&*failed).await {
+                                            Err(FusilladeError::LostOwnership(_)) => {
+                                                counter!(
+                                                    "fusillade_terminal_lost_ownership_total",
+                                                    "state" => "failed",
+                                                    "model" => model_clone.clone(),
+                                                )
+                                                .increment(1);
+                                                tracing::warn!(
+                                                    request_id = %request_id,
+                                                    batch_id = ?batch_id,
+                                                    "request.terminal_failure_skipped_lost_ownership"
+                                                );
+                                                return Ok(());
+                                            }
+                                            result => {
+                                                result?;
+                                            }
+                                        }
                                         requests_failed.fetch_add(1, Ordering::Relaxed);
                                         user_throughput.entry(user_id.clone()).or_insert_with(|| UserThroughputStats {
                                             completed: AtomicU64::new(0),
@@ -2815,6 +2907,21 @@ where
                             tracing::Span::current().record("outcome", "shutdown");
                             Ok(())
                         }
+                        Err(FusilladeError::LostOwnership(_)) => {
+                            tracing::Span::current().record("outcome", "lost_ownership");
+                            counter!(
+                                "fusillade_terminal_lost_ownership_total",
+                                "state" => "completion",
+                                "model" => model_clone.clone(),
+                            )
+                            .increment(1);
+                            tracing::warn!(
+                                request_id = %request_id,
+                                batch_id = ?batch_id,
+                                "request.completion_skipped_lost_ownership"
+                            );
+                            Ok(())
+                        }
                         Err(e) => {
                             tracing::Span::current().record("outcome", "error");
                             Err(e)
@@ -2869,7 +2976,15 @@ where
                 hostname: get_hostname(),
                 pid: get_pid(),
                 version: get_version(),
-                config_snapshot: daemon_config_snapshot(&self.config, &self.retention_maintenance),
+                config_snapshot: {
+                    let mut snapshot =
+                        daemon_config_snapshot(&self.config, &self.retention_maintenance);
+                    if let Some(config) = &self.leak_config {
+                        snapshot["leak"] =
+                            serde_json::to_value(config).expect("leak config is serializable");
+                    }
+                    snapshot
+                },
             },
             state: Initializing {
                 started_at: chrono::Utc::now(),
@@ -2916,15 +3031,38 @@ where
         let requests_failed = self.requests_failed.clone();
         let daemon_id = self.daemon_id;
         let heartbeat_interval_ms = self.config.heartbeat_interval_ms;
-        let heartbeat_query_timeout =
-            Duration::from_millis(heartbeat_interval_ms.saturating_mul(4));
+        // Leave enough of the lease after each scheduled tick for the query to
+        // finish. The startup invariant guarantees at least one full heartbeat
+        // interval of query budget; the deadline check below remains the final
+        // authority at the boundary.
+        let heartbeat_query_timeout = Duration::from_millis(
+            heartbeat_interval_ms
+                .saturating_mul(4)
+                .min(self.config.stale_daemon_threshold_ms - heartbeat_interval_ms),
+        );
+        let heartbeat_lease_duration = Duration::from_millis(self.config.stale_daemon_threshold_ms);
         let shutdown_signal = self.shutdown_token.clone();
 
         let heartbeat_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(heartbeat_interval_ms));
             let mut daemon_record = running_record;
+            let mut lease_anchor = std::time::Instant::now();
+            let handle_lease_loss = || {
+                counter!("fusillade_heartbeat_lease_lost_total").increment(1);
+                crate::background_error!(
+                    "heartbeat_lease_lost", Error,
+                    daemon_id = %daemon_id,
+                    lease_ms = heartbeat_lease_duration.as_millis() as u64,
+                    "Heartbeat lease expired; cancelling in-flight work and stopping daemon"
+                );
+                // Every processing task selects on this token and aborts its
+                // downstream HTTP request when ownership may be reclaimed.
+                shutdown_signal.cancel();
+            };
 
             loop {
+                let lease_deadline =
+                    tokio::time::Instant::from_std(lease_anchor + heartbeat_lease_duration);
                 tokio::select! {
                     _ = interval.tick() => {
                         let stats = DaemonStats {
@@ -2936,23 +3074,44 @@ where
                         // Clone the record so we preserve it if heartbeat fails
                         let current = daemon_record.clone();
                         let heartbeat_start = std::time::Instant::now();
-                        match with_query_timeout(
+                        let heartbeat = with_query_timeout(
                             "heartbeat query",
                             heartbeat_query_timeout,
                             current.heartbeat(stats, storage.as_ref()),
-                        )
-                        .await
-                        {
-                            Ok(updated) => {
+                        );
+                        tokio::pin!(heartbeat);
+                        let heartbeat_result = tokio::select! {
+                            result = &mut heartbeat => Some(result),
+                            _ = tokio::time::sleep_until(lease_deadline) => None,
+                            _ = shutdown_signal.cancelled() => break,
+                        };
+
+                        match heartbeat_result {
+                            None => {
+                                handle_lease_loss();
+                                break;
+                            }
+                            Some(Ok(updated)) => {
+                                let completed_at = std::time::Instant::now();
+                                let Some(renewed_anchor) = renewed_heartbeat_lease_anchor(
+                                    lease_anchor,
+                                    heartbeat_start,
+                                    completed_at,
+                                    heartbeat_lease_duration,
+                                ) else {
+                                    handle_lease_loss();
+                                    break;
+                                };
                                 histogram!("fusillade_heartbeat_duration_seconds")
                                     .record(heartbeat_start.elapsed().as_secs_f64());
                                 daemon_record = updated;
+                                lease_anchor = renewed_anchor;
                                 tracing::trace!(
                                     daemon_id = %daemon_id,
                                     "Heartbeat sent"
                                 );
                             }
-                            Err(e) => {
+                            Some(Err(e)) => {
                                 histogram!("fusillade_heartbeat_duration_seconds")
                                     .record(heartbeat_start.elapsed().as_secs_f64());
                                 crate::background_error!(
@@ -2965,24 +3124,31 @@ where
                             }
                         }
                     }
-                    _ = shutdown_signal.cancelled() => {
-                        // Mark daemon as dead on shutdown
-                        tracing::info!("Shutting down heartbeat task");
-                        if let Err(e) = with_query_timeout(
-                            "daemon shutdown query",
-                            heartbeat_query_timeout,
-                            daemon_record.shutdown(storage.as_ref()),
-                        ).await {
-                            crate::background_error!(
-                                "shutdown_mark_failed", Error,
-                                daemon_id = %daemon_id,
-                                error = %e,
-                                "Failed to mark daemon as dead during shutdown"
-                            );
-                        }
+                    _ = tokio::time::sleep_until(lease_deadline) => {
+                        handle_lease_loss();
                         break;
                     }
+                    _ = shutdown_signal.cancelled() => break,
                 }
+            }
+
+            // Mark daemon as dead on either operator shutdown or local lease
+            // loss. The query is best-effort: reclamation also handles stale
+            // heartbeats after the grace window when the database is unavailable.
+            tracing::info!("Shutting down heartbeat task");
+            if let Err(e) = with_query_timeout(
+                "daemon shutdown query",
+                heartbeat_query_timeout,
+                daemon_record.shutdown(storage.as_ref()),
+            )
+            .await
+            {
+                crate::background_error!(
+                    "shutdown_mark_failed", Error,
+                    daemon_id = %daemon_id,
+                    error = %e,
+                    "Failed to mark daemon as dead during shutdown"
+                );
             }
         });
         daemon_handles.push(("heartbeat", heartbeat_handle));
@@ -3451,12 +3617,26 @@ where
                         batchless_enabled,
                         "Archive mover started"
                     );
+                    // The interval paces an idle worker. While a pass keeps
+                    // proving there is more to move, the next pass starts
+                    // straight away: sleeping a full interval between
+                    // back-to-back passes of a multi-day drain is pure idle
+                    // time on the critical path. Errors and empty passes fall
+                    // back to the interval, so a failing pass never hot-loops.
+                    let mut more_work = false;
                     loop {
-                        tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {},
-                            _ = shutdown.cancelled() => break,
+                        if more_work {
+                            if shutdown.is_cancelled() {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        } else {
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => {},
+                                _ = shutdown.cancelled() => break,
+                            }
                         }
-                        run_archive_mover_tick(
+                        more_work = run_archive_mover_tick(
                             storage.clone(),
                             &shutdown,
                             query_timeout,
@@ -3820,6 +4000,8 @@ mod tests {
         fail_route_cleanup: std::sync::atomic::AtomicBool,
         batchless_cutoffs: std::sync::Mutex<Vec<RetainedResponseArchiveCutoffs>>,
         overdue_concurrency: std::sync::Mutex<Vec<usize>>,
+        batchless_may_have_more: std::sync::atomic::AtomicBool,
+        fail_batchless: std::sync::atomic::AtomicBool,
         fail_weekly: std::sync::atomic::AtomicBool,
         fail_retained: std::sync::atomic::AtomicBool,
         block_retained: std::sync::atomic::AtomicBool,
@@ -3851,6 +4033,8 @@ mod tests {
                 fail_route_cleanup: std::sync::atomic::AtomicBool::new(false),
                 batchless_cutoffs: std::sync::Mutex::new(Vec::new()),
                 overdue_concurrency: std::sync::Mutex::new(Vec::new()),
+                batchless_may_have_more: std::sync::atomic::AtomicBool::new(false),
+                fail_batchless: std::sync::atomic::AtomicBool::new(false),
                 fail_weekly: std::sync::atomic::AtomicBool::new(false),
                 fail_retained: std::sync::atomic::AtomicBool::new(false),
                 block_retained: std::sync::atomic::AtomicBool::new(false),
@@ -3873,6 +4057,18 @@ mod tests {
 
         fn record(&self, event: &'static str) {
             self.events.lock().unwrap().push(event);
+        }
+
+        fn batchless_outcome(&self) -> Result<crate::RetainedResponseArchiveOutcome> {
+            if self.fail_batchless.load(Ordering::SeqCst) {
+                return Err(FusilladeError::Other(anyhow::anyhow!(
+                    "batchless archive failed"
+                )));
+            }
+            Ok(crate::RetainedResponseArchiveOutcome {
+                may_have_more: self.batchless_may_have_more.load(Ordering::SeqCst),
+                ..Default::default()
+            })
         }
     }
 
@@ -3926,7 +4122,7 @@ mod tests {
             self.batchless_calls.fetch_add(1, Ordering::SeqCst);
             self.batchless_cutoffs.lock().unwrap().push(*cutoffs);
             self.record("batchless_move");
-            Ok(crate::RetainedResponseArchiveOutcome::default())
+            self.batchless_outcome()
         }
 
         async fn archive_overdue_batchless_responses(
@@ -3941,7 +4137,7 @@ mod tests {
             self.batchless_cutoffs.lock().unwrap().push(*cutoffs);
             self.overdue_concurrency.lock().unwrap().push(concurrency);
             self.record("batchless_overdue_move");
-            Ok(crate::RetainedResponseArchiveOutcome::default())
+            self.batchless_outcome()
         }
 
         async fn ensure_retained_response_partitions(
@@ -4592,6 +4788,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn tick_reports_more_work_only_when_the_pass_proved_it() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let policy = configured_batchless_maintenance().policy().clone();
+        let mut tick = mover_tick(false, true);
+        tick.worker = "backfill";
+        tick.include_overdue = true;
+        let ready = std::sync::atomic::AtomicBool::new(true);
+
+        let run = |storage: Arc<FakeMaintenanceStorage>| {
+            run_archive_mover_tick(
+                storage,
+                &shutdown,
+                Duration::from_secs(1),
+                &policy,
+                tick,
+                &ready,
+            )
+        };
+
+        assert!(
+            !run(storage.clone()).await,
+            "an empty pass paces the worker on its interval"
+        );
+
+        storage
+            .batchless_may_have_more
+            .store(true, Ordering::SeqCst);
+        assert!(
+            run(storage.clone()).await,
+            "a pass that proved more work asks for an immediate next pass"
+        );
+
+        storage.fail_batchless.store(true, Ordering::SeqCst);
+        assert!(
+            !run(storage.clone()).await,
+            "a failing pass must never hot-loop, whatever the queue held"
+        );
+
+        storage.fail_batchless.store(false, Ordering::SeqCst);
+        storage.index_ready.store(false, Ordering::SeqCst);
+        assert!(
+            !run(storage.clone()).await,
+            "a pass skipped for a missing index is not more work"
+        );
+    }
+
     #[test]
     fn backfill_concurrency_must_be_positive_only_while_backfill_is_enabled() {
         let validate = |config: &RetentionMaintenanceConfig| {
@@ -5123,6 +5367,103 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn batch_leak_config_preserves_async_refill_intervals(pool: sqlx::PgPool) {
+        use crate::request::{Claimed, LeakStamp, Request, RequestData};
+
+        let storage = Arc::new(fusillade_arsenal::PostgresRequestManager::new(
+            fusillade_arsenal::TestDbPools::new(pool).await.unwrap(),
+            fusillade_arsenal::PostgresStorageConfig::default(),
+        ));
+        let daemon = Daemon::new(
+            storage,
+            Arc::new(crate::MockHttpClient::new()),
+            DaemonConfig::default(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .with_leak_config(LeakConfig {
+            model_leak_interval_seconds: HashMap::from([("large".into(), 10.try_into().unwrap())]),
+            ..Default::default()
+        });
+        for (kind, loop_name, window, seconds, model, expected) in [
+            (
+                ClaimLoopKind::Request,
+                "request_daemon",
+                "default",
+                86400.0,
+                "large",
+                1440,
+            ),
+            (
+                ClaimLoopKind::Request,
+                "request_daemon",
+                "flex",
+                3600.0,
+                "large",
+                60,
+            ),
+            (
+                ClaimLoopKind::Batch,
+                "batch_daemon",
+                "24h",
+                86400.0,
+                "large",
+                10,
+            ),
+            (
+                ClaimLoopKind::Batch,
+                "batch_daemon",
+                "1h",
+                3600.0,
+                "other",
+                60,
+            ),
+        ] {
+            let request = Request {
+                data: RequestData {
+                    id: uuid::Uuid::new_v4().into(),
+                    batch_id: None,
+                    template_id: uuid::Uuid::new_v4().into(),
+                    custom_id: None,
+                    endpoint: String::new(),
+                    method: "POST".into(),
+                    path: "/test".into(),
+                    body: "{}".into(),
+                    model: model.into(),
+                    api_key: String::new(),
+                    created_by: "alice".into(),
+                    batch_metadata: HashMap::new(),
+                },
+                state: Claimed {
+                    daemon_id: daemon.daemon_id,
+                    claimed_at: chrono::Utc::now(),
+                    retry_attempt: 0,
+                    batch_expires_at: None,
+                    leak: Some(LeakStamp {
+                        window_class: window.into(),
+                        window_secs: seconds,
+                    }),
+                },
+            };
+            let before = std::time::Instant::now();
+            daemon.stamp_leaks(&[request], kind, loop_name);
+            let after = std::time::Instant::now();
+            let key = ("alice".into(), window.into(), model.into());
+            let next = *daemon.leak_buckets.get(&key).unwrap();
+            let interval = Duration::from_secs(expected);
+            assert!(
+                next >= before + interval && next <= after + interval,
+                "incorrect refill interval for {loop_name}/{window}/{model}"
+            );
+            assert!(daemon.leak_cooldown().contains(&key));
+            daemon
+                .leak_buckets
+                .insert(key.clone(), before - Duration::from_secs(1));
+            assert!(!daemon.leak_cooldown().contains(&key));
+            assert!(!daemon.leak_buckets.contains_key(&key));
+        }
+    }
+
+    #[sqlx::test]
     async fn request_only_daemon_ignores_a_shared_retirement_flag_without_a_ddl_pool(
         pool: sqlx::PgPool,
     ) {
@@ -5407,6 +5748,49 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_daemon_intervals(&config).is_ok());
+    }
+
+    #[test]
+    fn heartbeat_cadence_must_fit_inside_lease() {
+        let mut config = DaemonConfig {
+            stale_daemon_threshold_ms: 0,
+            ..Default::default()
+        };
+        assert!(validate_daemon_intervals(&config).is_err());
+
+        config.stale_daemon_threshold_ms = 5_000;
+        config.heartbeat_interval_ms = 5_000;
+        assert!(validate_daemon_intervals(&config).is_err());
+
+        config.heartbeat_interval_ms = 4_999;
+        assert!(validate_daemon_intervals(&config).is_err());
+
+        config.heartbeat_interval_ms = 2_500;
+        assert!(validate_daemon_intervals(&config).is_ok());
+    }
+
+    #[test]
+    fn heartbeat_lease_renews_from_write_start_not_completion() {
+        let current_anchor = std::time::Instant::now();
+        let write_started = current_anchor + Duration::from_millis(100);
+        let completed_at = current_anchor + Duration::from_millis(900);
+        let lease = Duration::from_secs(1);
+
+        let renewed =
+            renewed_heartbeat_lease_anchor(current_anchor, write_started, completed_at, lease);
+        assert_eq!(renewed, Some(write_started));
+        assert_ne!(renewed, Some(completed_at));
+
+        assert_eq!(
+            renewed_heartbeat_lease_anchor(
+                current_anchor,
+                write_started,
+                current_anchor + lease,
+                lease,
+            ),
+            None,
+            "a write completing at the old deadline must not renew ownership"
+        );
     }
 
     #[tokio::test]
