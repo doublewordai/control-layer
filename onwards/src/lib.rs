@@ -64,7 +64,7 @@ pub mod target;
 pub mod telemetry;
 
 use client::{HttpClient, HyperClient};
-pub use handlers::ServedBy;
+pub use handlers::{AuthenticatedApiKeyId, ServedBy};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
 
@@ -1138,23 +1138,35 @@ mod tests {
     /// exactly why the extension (not a header) carries this.
     #[tokio::test]
     async fn test_served_by_extension_set_on_success() {
+        use crate::auth::ConstantTimeString;
+        use std::collections::{HashMap, HashSet};
         use tower::ServiceExt;
 
+        let api_key_id = uuid::Uuid::new_v4();
+        let api_key = "test-api-key";
+        let mut keys = HashSet::new();
+        keys.insert(ConstantTimeString::from(api_key.to_string()));
         let targets_map = Arc::new(DashMap::new());
         targets_map.insert(
             "gpt-4".to_string(),
             pool(
                 target::Target::builder()
                     .url("https://api.openai.com".parse().unwrap())
+                    .keys(keys)
                     .onwards_model("gpt-4-upstream".to_string())
                     .build(),
             ),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            api_key.to_string(),
+            HashMap::from([("api_key_id".to_string(), api_key_id.to_string())]),
         );
         let targets = target::Targets {
             targets: targets_map,
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
-            key_labels: Arc::new(DashMap::new()),
+            key_labels,
             strict_mode: false,
             http_pool_config: None,
         };
@@ -1169,6 +1181,7 @@ mod tests {
             .method("POST")
             .uri("/v1/chat/completions")
             .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {api_key}"))
             .body(axum::body::Body::from(
                 json!({
                     "model": "gpt-4",
@@ -1186,6 +1199,128 @@ mod tests {
             .expect("success response must carry ServedBy");
         assert_eq!(served_by.url, "https://api.openai.com/");
         assert_eq!(served_by.onwards_model.as_deref(), Some("gpt-4-upstream"));
+        assert_eq!(
+            response.extensions().get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_authenticated_api_key_id_survives_models_and_strict_error() {
+        use crate::auth::ConstantTimeString;
+        use crate::target::{RateLimitExceeded, RateLimiter};
+        use std::collections::{HashMap, HashSet};
+        use tower::ServiceExt;
+
+        #[derive(Debug)]
+        struct BlockingRateLimiter;
+
+        impl RateLimiter for BlockingRateLimiter {
+            fn check(&self) -> Result<(), RateLimitExceeded> {
+                Err(RateLimitExceeded)
+            }
+        }
+
+        let api_key_id = uuid::Uuid::new_v4();
+        let api_key = "test-api-key";
+        let mut keys = HashSet::new();
+        keys.insert(ConstantTimeString::from(api_key.to_string()));
+        let targets_map = Arc::new(DashMap::new());
+        targets_map.insert(
+            "gpt-4".to_string(),
+            pool(
+                target::Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .keys(keys.clone())
+                    .build(),
+            ),
+        );
+        targets_map.insert(
+            "blocked-model".to_string(),
+            pool(
+                target::Target::builder()
+                    .url("https://api.openai.com".parse().unwrap())
+                    .keys(keys)
+                    .limiter(Arc::new(BlockingRateLimiter) as Arc<dyn RateLimiter>)
+                    .build(),
+            ),
+        );
+        let key_labels = Arc::new(DashMap::new());
+        key_labels.insert(
+            api_key.to_string(),
+            HashMap::from([("api_key_id".to_string(), api_key_id.to_string())]),
+        );
+        let targets = target::Targets {
+            targets: targets_map,
+            key_rate_limiters: Arc::new(DashMap::new()),
+            key_concurrency_limiters: Arc::new(DashMap::new()),
+            key_labels,
+            strict_mode: true,
+            http_pool_config: None,
+        };
+        let mock_client = MockHttpClient::new(
+            StatusCode::BAD_REQUEST,
+            r#"{"error":{"message":"provider detail"}}"#,
+        );
+        let router = build_router(AppState::with_client(targets, mock_client));
+
+        let models_request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .header("authorization", format!("Bearer {api_key}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let models_response = router.clone().oneshot(models_request).await.unwrap();
+        assert_eq!(
+            models_response
+                .extensions()
+                .get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
+
+        let chat_request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {api_key}"))
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let chat_response = router.clone().oneshot(chat_request).await.unwrap();
+        assert_eq!(chat_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            chat_response
+                .extensions()
+                .get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
+
+        let rejected_request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {api_key}"))
+            .body(axum::body::Body::from(
+                json!({
+                    "model": "blocked-model",
+                    "messages": [{"role": "user", "content": "Hello"}]
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let rejected_response = router.oneshot(rejected_request).await.unwrap();
+        assert_eq!(rejected_response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            rejected_response
+                .extensions()
+                .get::<crate::AuthenticatedApiKeyId>(),
+            Some(&crate::AuthenticatedApiKeyId(api_key_id))
+        );
     }
 
     /// Strict-mode `Targets` with one alias backed by a fallback pool of `n`

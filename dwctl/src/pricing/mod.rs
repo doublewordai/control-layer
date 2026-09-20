@@ -134,10 +134,13 @@ pub(crate) struct TariffInfo {
 /// resolving as-of a request's time yields the exact multipliers the live path billed
 /// with — and both callers must load it the same way or their answers drift. Models with
 /// no tariff history simply don't appear.
-pub(crate) async fn lookup_cache_tariffs(
-    pool: &sqlx::PgPool,
+pub(crate) async fn lookup_cache_tariffs<'e, E>(
+    executor: E,
     aliases: &[String],
-) -> Result<std::collections::HashMap<String, Vec<CacheTariffRow>>, sqlx::Error> {
+) -> Result<std::collections::HashMap<String, Vec<CacheTariffRow>>, sqlx::Error>
+where
+    E: sqlx::Executor<'e, Database = sqlx::Postgres>,
+{
     struct Row {
         alias: String,
         write_multiplier_5m: Decimal,
@@ -166,7 +169,7 @@ pub(crate) async fn lookup_cache_tariffs(
         "#,
         aliases
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
 
     let mut map: std::collections::HashMap<String, Vec<CacheTariffRow>> = std::collections::HashMap::new();

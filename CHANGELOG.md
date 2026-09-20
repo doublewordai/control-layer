@@ -1,5 +1,18 @@
 # Changelog
 
+## [12.1.0](https://github.com/doublewordai/control-layer/compare/v12.0.1...v12.1.0) (2026-09-18)
+
+
+### Features
+
+* **accounts:** add feature flags with negative-balance opt-in ([#1817](https://github.com/doublewordai/control-layer/issues/1817)) ([dc3bb30](https://github.com/doublewordai/control-layer/commit/dc3bb30e9416c1697d356ddc5fc89e3a4873d111))
+
+
+### Bug Fixes
+
+* **analytics:** checkpoint records before enrichment ([#1789](https://github.com/doublewordai/control-layer/issues/1789)) ([7ed4000](https://github.com/doublewordai/control-layer/commit/7ed4000159b0ea8ef496e84437517c7511a0bce6))
+* **fusillade:** fence reclaimed request ownership ([#1804](https://github.com/doublewordai/control-layer/issues/1804)) ([14a53f9](https://github.com/doublewordai/control-layer/commit/14a53f9cfe6efc02051467ec33f08b622c967a5e))
+
 ## [12.0.1](https://github.com/doublewordai/control-layer/compare/v12.0.0...v12.0.1) (2026-09-18)
 
 

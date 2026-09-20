@@ -185,3 +185,52 @@ This is expected for up to N milliseconds (rate limit + fallback interval). The 
 **Why in-memory rate limiting?** Adding database queries to the hot path (analytics batcher) would add latency and load. In-memory tracking is fast and works well enough in multi-instance setups.
 
 **Why allow multi-instance redundancy?** Coordinating rate limiting across instances adds complexity and failure modes. Sending ~3x notifications is acceptable since cache reloads are idempotent and cheap.
+
+## Account feature flags
+
+`user_feature_flags` stores account-level opt-ins without adding a column to
+`users` for each feature. Its primary key is `(user_id, feature_flag)`. Names use
+uppercase letters, digits, and underscores. A missing row and `enabled = false`
+both mean disabled. `created_at` records insertion and `updated_at` is maintained
+by a database trigger. Physically deleting an account cascades to its flags.
+Soft-deleted accounts retain their flag rows, but those flags do not grant access.
+
+Rust callers use `FeatureFlags::has_feature(account_id, FeatureFlag::...)`.
+SQL callers use `user_has_feature(account_id, flag_name)`. Both resolve against
+the same table and return false for soft-deleted or nonexistent accounts.
+New flags need a typed Rust enum variant and consumers, but no schema migration.
+An unused flag name has no effect on existing consumers.
+
+Choose the account explicitly: organization-owned keys use the organization's
+`users` row, while personal keys use the individual account. Features do not
+inherit across organization membership. Background onwards queries and batch
+file-owner admission checks use the same lookup without requiring an
+authenticated request. Insert, update, and delete operations send
+`auth_config_changed` notifications and trigger an onwards reload.
+
+Flags are managed directly in the database; there is no self-service mutation
+API. Existing ZDR, invoicing, and auto-join fields retain their current storage.
+
+### Contracted accounts with negative balances
+
+Enable `ALLOW_NEGATIVE_BALANCE` to let an account continue using paid models at
+zero or negative balance, and submitting batches at negative balance. Batch
+submission already permits zero balance without this flag:
+
+```sql
+INSERT INTO user_feature_flags (user_id, feature_flag, enabled)
+VALUES ('<billing-account-uuid>', 'ALLOW_NEGATIVE_BALANCE', true)
+ON CONFLICT (user_id, feature_flag) DO UPDATE SET enabled = EXCLUDED.enabled;
+```
+
+Setting `enabled = false` or deleting the row restores normal balance enforcement:
+
+```sql
+DELETE FROM user_feature_flags
+WHERE user_id = '<billing-account-uuid>' AND feature_flag = 'ALLOW_NEGATIVE_BALANCE';
+```
+
+Group/model permissions, deleted-key checks, and explicit API-key spending caps
+still apply. Usage charges and balance accounting continue normally, so debt
+remains visible for settlement. This flag does not schedule top-ups or invoices
+and is independent of `invoicing_enabled`, which controls payment collection.
