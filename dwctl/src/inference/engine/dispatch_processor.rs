@@ -89,10 +89,12 @@ impl DispatchProcessor {
     /// Build a terminal `Failed` request with a generic client-facing reason.
     /// The real cause is logged for operators, never surfaced to the caller.
     fn failed(request: Request<Claimed>, reason: FailureReason) -> Request<Failed> {
+        let claimed_at = request.state.claimed_at;
         Request {
             state: Failed {
                 reason,
                 failed_at: chrono::Utc::now(),
+                claimed_at: Some(claimed_at),
                 retry_attempt: request.state.retry_attempt,
                 batch_expires_at: request.state.batch_expires_at,
                 routed_model: request.data.model.clone(),

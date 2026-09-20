@@ -497,6 +497,7 @@ where
         let model = request.data.model.clone();
         let retry_attempt = request.state.retry_attempt;
         let batch_expires_at = request.state.batch_expires_at;
+        let claimed_at = request.state.claimed_at;
         let failed = Request {
             data: request.data,
             state: Failed {
@@ -505,6 +506,7 @@ where
                     body: "synthetic test failure".into(),
                 },
                 failed_at: chrono::Utc::now(),
+                claimed_at: Some(claimed_at),
                 retry_attempt,
                 batch_expires_at,
                 routed_model: model,
@@ -536,6 +538,10 @@ async fn custom_processor_can_synthesize_terminal_failure(pool: sqlx::PgPool) {
     let AnyRequest::Failed(req) = fetch_any_request(&manager, request_id).await else {
         panic!("expected Failed variant");
     };
+    assert!(
+        req.state.claimed_at.is_some(),
+        "daemon-owned failure must persist the claim-generation fence"
+    );
 
     // The synthesized failure reason still carries the upstream body (it is
     // persisted), proving the custom processor's terminal outcome propagated.

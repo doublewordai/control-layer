@@ -10,6 +10,7 @@ use axum::{
 use bon::Builder;
 use hyper::StatusCode;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::reasoning::ReasoningError;
 
@@ -29,6 +30,7 @@ pub struct OnwardsErrorResponse {
     /// Attached to the response as an extension so analytics records the
     /// class for failed requests too.
     pub serving_outcome: Option<crate::serving::ServingClassOutcome>,
+    pub(crate) authenticated_api_key_id: Option<Uuid>,
 }
 
 impl OnwardsErrorResponse {
@@ -43,6 +45,7 @@ impl OnwardsErrorResponse {
             status: StatusCode::from_u16(error.status_code())
                 .expect("reasoning errors use valid HTTP status codes"),
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -58,6 +61,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::NOT_FOUND,
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -71,6 +75,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -87,6 +92,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -100,6 +106,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -113,6 +120,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::INTERNAL_SERVER_ERROR,
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -126,6 +134,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::BAD_GATEWAY,
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -139,6 +148,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::SERVICE_UNAVAILABLE,
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -153,6 +163,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::GATEWAY_TIMEOUT,
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -168,6 +179,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::PAYLOAD_TOO_LARGE,
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -181,6 +193,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::UNPROCESSABLE_ENTITY,
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -198,6 +211,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::BAD_REQUEST,
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -211,6 +225,7 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::FORBIDDEN,
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
     }
 
@@ -225,7 +240,13 @@ impl OnwardsErrorResponse {
             }),
             status: StatusCode::UNAUTHORIZED,
             serving_outcome: None,
+            authenticated_api_key_id: None,
         }
+    }
+
+    pub(crate) fn with_authenticated_api_key_id(mut self, api_key_id: Option<Uuid>) -> Self {
+        self.authenticated_api_key_id = api_key_id;
+        self
     }
 }
 
@@ -243,6 +264,11 @@ impl IntoResponse for OnwardsErrorResponse {
         };
         if let Some(outcome) = self.serving_outcome {
             response.extensions_mut().insert(outcome);
+        }
+        if let Some(api_key_id) = self.authenticated_api_key_id {
+            response
+                .extensions_mut()
+                .insert(crate::AuthenticatedApiKeyId(api_key_id));
         }
         response
     }

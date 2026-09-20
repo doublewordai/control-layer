@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                            UPDATE requests SET\n                                state = 'canceled',\n                                canceled_at = $2\n                            WHERE id = $1\n                              AND (\n                                  ($3::timestamptz IS NOT NULL\n                                   AND state IN ('claimed', 'processing', 'canceled')\n                                   AND claimed_at = $3)\n                                  OR\n                                  ($3::timestamptz IS NULL\n                                   AND state NOT IN ('completed', 'failed'))\n                              )\n                            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aa0db55a390061fb78b2bd7ba6776ef117c20a0f28cd6d8ec9f0d2daca71b823"
+}

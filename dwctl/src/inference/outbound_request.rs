@@ -128,9 +128,9 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
 
     let path = parts.uri.path();
     // `/chat/completions` also ends with `/completions`; both take the stream flags.
-    if !path.ends_with("/completions") {
-        // Nothing to edit (e.g. /responses, /embeddings, /models), but a marked
-        // dispatch still gets its response reassembled.
+    let stream_usage = path.ends_with("/completions");
+    if parts.method != axum::http::Method::POST {
+        // Read-only endpoints have no inference body to sanitize.
         let response = next.run(Request::from_parts(parts, body)).await;
         return if force_stream {
             reassemble_stream(response, cfg.timeouts).await
@@ -146,7 +146,7 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
         Err(_) => return (StatusCode::BAD_REQUEST, "failed to read request body").into_response(),
     };
 
-    let response = match transform(&bytes, force_stream) {
+    let response = match transform(&bytes, force_stream, stream_usage) {
         Some(edited) => {
             // The body changed size, so the inbound Content-Length is now stale.
             // Drop it (as the Anthropic translator does) so it is recomputed
@@ -169,13 +169,21 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
 /// Inject the streaming usage flags into a JSON body, returning `Some(new_bytes)`
 /// only when something changed. A body that is not a JSON object (or fails to
 /// parse) is left untouched (`None`) - onwards still validates and rejects it.
-fn transform(bytes: &Bytes, force_stream: bool) -> Option<Vec<u8>> {
+fn transform(bytes: &Bytes, force_stream: bool, stream_usage: bool) -> Option<Vec<u8>> {
     let mut value = serde_json::from_slice::<Value>(bytes).ok()?;
     let obj = value.as_object_mut()?;
     let mut changed = false;
 
+    // This is the last DWCTL boundary before Onwards resolves and stamps
+    // trusted targets. Also covers previously stored batch bodies that skipped
+    // ingress sanitization. Keep server-assigned deadline/continuation priority;
+    // only the router's timing targets are always recomputed downstream.
+    if let Some(nvext) = obj.get_mut("nvext").and_then(Value::as_object_mut) {
+        changed |= onwards::serving::scrub_router_targets(nvext);
+    }
+
     let request_streaming = obj.get("stream").and_then(Value::as_bool) == Some(true) || force_stream;
-    if request_streaming {
+    if stream_usage && request_streaming {
         // Force stream:true when fusillade asked for it via header.
         if force_stream && obj.get("stream").and_then(Value::as_bool) != Some(true) {
             obj.insert("stream".to_string(), Value::Bool(true));
@@ -426,13 +434,12 @@ fn json_body_response(mut parts: axum::http::response::Parts, status: StatusCode
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::Request as HttpRequest;
     use std::convert::Infallible;
     use std::time::Duration;
 
     fn run(body: &serde_json::Value, fusillade: bool) -> Option<serde_json::Value> {
         let bytes = Bytes::from(serde_json::to_vec(body).unwrap());
-        transform(&bytes, fusillade).map(|b| serde_json::from_slice(&b).unwrap())
+        transform(&bytes, fusillade, true).map(|b| serde_json::from_slice(&b).unwrap())
     }
 
     #[test]

@@ -28,6 +28,12 @@ pub enum FusilladeError {
         expected: &'static str,
     },
 
+    /// The request still exists, but this worker's claim generation is no
+    /// longer authoritative. This is an expected race during reclamation and
+    /// must not be reported as a missing request or a daemon task failure.
+    #[error("Request ownership lost: {0}")]
+    LostOwnership(RequestId),
+
     /// Cancelled request
     #[error("Request cancelled: {0}")]
     RequestCancelled(RequestId),

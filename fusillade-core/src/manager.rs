@@ -1599,6 +1599,7 @@ pub trait Storage: Send + Sync {
         &self,
         request_id: RequestId,
         owner: DaemonId,
+        claimed_at: chrono::DateTime<chrono::Utc>,
         retry_attempt: u32,
         not_before: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<bool>;
