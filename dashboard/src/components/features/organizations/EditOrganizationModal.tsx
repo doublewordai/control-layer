@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { useUpdateOrganization } from "@/api/control-layer/hooks";
-import type { Organization } from "@/api/control-layer/types";
+import type { Organization, ServingClassName } from "@/api/control-layer/types";
 import {
   Dialog,
   DialogContent,
@@ -38,8 +38,8 @@ export function EditOrganizationModal({
   const [email, setEmail] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [zeroDataRetention, setZeroDataRetention] = useState(false);
-  const [grantedClasses, setGrantedClasses] = useState<string[]>([]);
-  const [defaultClass, setDefaultClass] = useState<string>("standard");
+  const [grantedClasses, setGrantedClasses] = useState<ServingClassName[]>([]);
+  const [defaultClass, setDefaultClass] = useState<ServingClassName | "standard">("standard");
   const [selfHostedOnly, setSelfHostedOnly] = useState(false);
   const updateOrg = useUpdateOrganization();
 
@@ -210,7 +210,7 @@ export function EditOrganizationModal({
                     id="edit-default-class"
                     className="h-9 rounded-md border border-input bg-transparent px-3 text-sm"
                     value={defaultClass}
-                    onChange={(e) => setDefaultClass(e.target.value)}
+                    onChange={(e) => setDefaultClass(e.target.value as ServingClassName | "standard")}
                   >
                     <option value="standard">standard</option>
                     <option value="interactive">interactive</option>

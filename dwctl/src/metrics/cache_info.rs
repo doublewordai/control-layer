@@ -105,7 +105,7 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
             EXISTS(
                 SELECT 1 FROM model_tariffs mt
                 WHERE mt.deployed_model_id = dm.id
-                  AND mt.valid_until IS NULL
+                  AND mt.valid_until IS NULL AND mt.user_id IS NULL
                   AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
             ) as "is_metered!",
             (
@@ -135,7 +135,7 @@ pub async fn update_cache_info_metrics(pool: &PgPool, targets: &Targets, state: 
                     'output_price', mt.output_price_per_token::float8
                 ))::text
                 FROM model_tariffs mt
-                WHERE mt.deployed_model_id = dm.id AND mt.valid_until IS NULL
+                WHERE mt.deployed_model_id = dm.id AND mt.valid_until IS NULL AND mt.user_id IS NULL
             ) as "tariffs_json?"
         FROM deployed_models dm
         LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id

@@ -160,16 +160,17 @@ impl<'a> DeployedModelEnricher<'a> {
                 if self.include_pricing {
                     use crate::{api::models::tariffs::TariffResponse, db::handlers::Tariffs};
 
-                    let mut tariffs_map: HashMap<DeploymentId, Vec<TariffResponse>> = HashMap::new();
+                    let mut tariffs_map: HashMap<DeploymentId, Vec<TariffResponse>> =
+                        model_ids.iter().map(|id| (*id, Vec::new())).collect();
 
                     if self.can_read_pricing {
-                        // Operators: every scope, organisation rows marked.
-                        for model_id in &model_ids {
-                            let mut tariffs_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
-                            let mut tariffs_repo = Tariffs::new(&mut tariffs_conn);
-                            if let Ok(tariffs) = tariffs_repo.list_current_by_model_all_scopes(*model_id).await {
-                                tariffs_map.insert(*model_id, tariffs.into_iter().map(TariffResponse::from).collect());
-                            }
+                        let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
+                        let tariffs = Tariffs::new(&mut conn).list_current_all_scopes_bulk(&model_ids).await.ok()?;
+                        for tariff in tariffs {
+                            tariffs_map
+                                .entry(tariff.deployed_model_id)
+                                .or_default()
+                                .push(TariffResponse::from(tariff));
                         }
                     } else if let Some(account) = self.pricing_account {
                         // Customers: what they actually pay, in one query.
@@ -207,8 +208,9 @@ impl<'a> DeployedModelEnricher<'a> {
                     // A customer's organisation multipliers sit over the general ones; caching
                     // itself stays gated on the general row, so only override where one exists.
                     if let Some(account) = self.pricing_account.filter(|_| !self.can_read_pricing) {
-                        for (model_id, own) in repo.get_active_for_account_bulk(&model_ids, account).await? {
-                            if active.contains_key(&model_id) {
+                        for (model_id, mut own) in repo.get_active_for_account_bulk(&model_ids, account).await? {
+                            if let Some(general) = active.get(&model_id) {
+                                own.min_prefix_tokens = general.min_prefix_tokens;
                                 active.insert(model_id, own);
                             }
                         }
@@ -244,6 +246,16 @@ impl<'a> DeployedModelEnricher<'a> {
             None => (None, None),
         };
         let cache_tariffs_map = cache_tariffs_map?;
+        let class_cache_prices = if self.include_pricing && !self.can_read_pricing {
+            if let Some(account) = self.pricing_account {
+                let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+                CacheTariffs::new(&mut conn).get_class_prices_bulk(&model_ids, account).await?
+            } else {
+                HashMap::new()
+            }
+        } else {
+            HashMap::new()
+        };
 
         // Build enriched responses
         let mut enriched_models = Vec::with_capacity(models.len());
@@ -273,6 +285,18 @@ impl<'a> DeployedModelEnricher<'a> {
             if self.include_pricing {
                 model_response = Self::apply_tariffs(model_response, &pricing_tariffs_map);
                 model_response = Self::apply_cache_pricing(model_response, &cache_tariffs_map);
+                model_response.cache_pricing_by_class = Some(
+                    class_cache_prices
+                        .get(&model_response.id)
+                        .map(|prices| {
+                            prices
+                                .iter()
+                                .map(|(class, price)| (class.clone(), CachePricingResponse::from(price.clone())))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                );
+
                 // Hide pricing for purposes that the model denies via a
                 // traffic-routing rule. Run after `apply_tariffs` so it
                 // operates on the freshly-attached set; no-op if no tariffs.
@@ -520,6 +544,7 @@ mod tests {
             metrics: None,
             status: None,
             provider_pricing: None,
+            cache_pricing_by_class: None,
             cache_pricing: None,
             endpoint: None,
             tariffs: None,
@@ -765,6 +790,7 @@ mod tests {
         tariffs_map.insert(
             model_id,
             vec![TariffResponse {
+                serving_class: None,
                 id: Uuid::new_v4(),
                 deployed_model_id: model_id,
                 name: "Standard Tariff".to_string(),
@@ -816,6 +842,7 @@ mod tests {
         use std::str::FromStr;
 
         crate::api::models::tariffs::TariffResponse {
+            serving_class: None,
             id: Uuid::new_v4(),
             deployed_model_id: Uuid::new_v4(),
             name: format!("Tariff {:?} {:?}", purpose, window.unwrap_or("none")),

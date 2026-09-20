@@ -10,11 +10,11 @@
 //! references a model.
 //!
 //! Rows written here are owned by the file (`provisioning_source`) and are
-//! rewritten on every start, exactly like the model catalog; a row the
-//! catalog does not mention is left alone.
+//! rewritten on every start, exactly like the model catalog. Removed catalog
+//! entries retire their deals; independently managed rows are left alone.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::Path,
 };
@@ -39,6 +39,7 @@ const ORG_OVERLAYS_LOCK: i64 = 0x4457_4f52_474f_564c;
 #[derive(Debug, Clone)]
 pub struct OrgCatalog {
     pub(crate) orgs: Vec<OrgCatalogEntry>,
+    managed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -57,6 +58,57 @@ pub struct OrgDocument {
     /// account settings unchanged.
     #[serde(default)]
     pub models: Vec<OrgModelOverlay>,
+}
+
+/// Billing follows the resolved outcome, including operator-authored custom targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingClass {
+    Standard,
+    Interactive,
+    Throughput,
+    Custom,
+}
+impl PricingClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Interactive => "interactive",
+            Self::Throughput => "throughput",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+/// Organization cache deals change prices only. The model owns enablement and
+/// the minimum prefix length used by the classifier.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CachePrices {
+    pub write_multiplier_5m: String,
+    pub write_multiplier_1h: String,
+    pub write_multiplier_24h: String,
+    pub read_multiplier: String,
+}
+impl CachePrices {
+    fn as_tariff(&self) -> CacheTariff {
+        CacheTariff {
+            write_multiplier_5m: self.write_multiplier_5m.clone(),
+            write_multiplier_1h: self.write_multiplier_1h.clone(),
+            write_multiplier_24h: self.write_multiplier_24h.clone(),
+            read_multiplier: self.read_multiplier.clone(),
+            min_prefix_tokens: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClassPrices {
+    #[serde(default)]
+    pub tariffs: Vec<Tariff>,
+    #[serde(default)]
+    pub cache_tariff: Option<CachePrices>,
 }
 
 /// The organisation's overrides on one virtual model.
@@ -80,26 +132,28 @@ pub struct OrgModelOverlay {
     pub self_hosted_only: Option<bool>,
     /// The organisation's own prices on this model, per purpose and completion
     /// window, same shape as the model catalog's `tariffs`. Billing uses these
-    /// where they exist and the model's general price otherwise. Omitting a
-    /// purpose here means the general price for that purpose.
+    /// through the full purpose/window fallback before the model's general prices.
     #[serde(default)]
     pub tariffs: Vec<Tariff>,
     /// The organisation's own prompt-cache multipliers on this model. Caching
     /// itself is enabled by the model's general cache tariff; this only
     /// changes the multipliers this organisation pays.
     #[serde(default)]
-    pub cache_tariff: Option<CacheTariff>,
+    pub cache_tariff: Option<CachePrices>,
+    /// Optional prices for a resolved class, falling back to the general deal.
+    #[serde(default)]
+    pub class_pricing: BTreeMap<PricingClass, ClassPrices>,
 }
 
 impl OrgModelOverlay {
-    /// The models this entry prices; the applier reconciles even an empty list
-    /// (the file is the source, so a removed deal closes the organisation's rows).
+    /// Whether this entry changes any serving or pricing field.
     fn overrides_something(&self) -> bool {
         self.default_class.is_some()
             || self.targets.is_some()
             || self.self_hosted_only.is_some()
             || !self.tariffs.is_empty()
             || self.cache_tariff.is_some()
+            || !self.class_pricing.is_empty()
     }
 }
 
@@ -110,7 +164,10 @@ impl OrgCatalog {
     pub fn load(directory: impl AsRef<Path>) -> Result<Self> {
         let directory = directory.as_ref();
         if !directory.exists() {
-            return Ok(Self { orgs: Vec::new() });
+            return Ok(Self {
+                orgs: Vec::new(),
+                managed: false,
+            });
         }
         ensure!(directory.is_dir(), "org overlay path {} is not a directory", directory.display());
         let mut paths = fs::read_dir(directory)
@@ -127,7 +184,7 @@ impl OrgCatalog {
                 serde_yaml::from_str(&contents).with_context(|| format!("parse org overlay file {}", path.display()))?;
             orgs.push(OrgCatalogEntry { source, document });
         }
-        let catalog = Self { orgs };
+        let catalog = Self { orgs, managed: true };
         catalog.validate()?;
         Ok(catalog)
     }
@@ -160,13 +217,31 @@ impl OrgCatalog {
                 );
                 validate_tariffs(&model.tariffs, &format!("{source}: model {:?}", model.alias))?;
                 if let Some(cache) = &model.cache_tariff {
-                    validate_cache_tariff(cache, &format!("{source}: model {:?}", model.alias))?;
+                    validate_cache_tariff(&cache.as_tariff(), &format!("{source}: model {:?}", model.alias))?;
                 }
                 ensure!(
                     model.default_class.is_none() || model.targets.is_none(),
                     "{source}: overlay for model {:?} sets both default_class and targets; use one",
                     model.alias
                 );
+                for (class, prices) in &model.class_pricing {
+                    ensure!(
+                        !prices.tariffs.is_empty() || prices.cache_tariff.is_some(),
+                        "{source}: empty class pricing"
+                    );
+                    validate_tariffs(&prices.tariffs, source)?;
+                    ensure!(
+                        *class == PricingClass::Standard
+                            || prices.tariffs.iter().all(|t| !matches!(
+                                t.purpose,
+                                crate::model_provisioning::Purpose::Batch | crate::model_provisioning::Purpose::Continuation
+                            )),
+                        "{source}: async and continuation prices can only specialize standard"
+                    );
+                    if let Some(cache) = &prices.cache_tariff {
+                        validate_cache_tariff(&cache.as_tariff(), source)?;
+                    }
+                }
                 if let Some(targets) = &model.targets {
                     targets.validate(&format!("{source}: overlay targets for model {:?}", model.alias))?;
                 }
@@ -176,10 +251,10 @@ impl OrgCatalog {
     }
 }
 
-/// Apply the catalog in one transaction. An empty catalog is a no-op that
-/// leaves existing rows untouched, mirroring the model catalog.
+/// Apply the mounted catalog in one transaction. A missing directory is a
+/// no-op; an explicitly empty directory retires only catalog-owned deals.
 pub async fn apply(pool: &PgPool, catalog: &OrgCatalog) -> Result<()> {
-    if catalog.orgs.is_empty() {
+    if !catalog.managed {
         return Ok(());
     }
     let mut transaction = pool.begin().await.context("begin org overlay transaction")?;
@@ -220,13 +295,40 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
             // organisation, versioned exactly like the model catalog's general prices.
             let mut provisioning = ModelProvisioning::new(db);
             provisioning
-                .reconcile_tariffs(model_id, Some(org_id), &model.tariffs, effective_at)
+                .reconcile_tariffs(model_id, Some(org_id), None, &model.tariffs, effective_at)
                 .await
                 .with_context(|| format!("reconcile tariffs of org {:?} on {:?}", entry.document.org, model.alias))?;
             provisioning
-                .reconcile_cache_tariff(model_id, Some(org_id), model.cache_tariff.as_ref(), effective_at)
+                .reconcile_cache_tariff(
+                    model_id,
+                    Some(org_id),
+                    None,
+                    model.cache_tariff.as_ref().map(CachePrices::as_tariff).as_ref(),
+                    effective_at,
+                )
                 .await
                 .with_context(|| format!("reconcile cache tariff of org {:?} on {:?}", entry.document.org, model.alias))?;
+            for class in [
+                PricingClass::Standard,
+                PricingClass::Interactive,
+                PricingClass::Throughput,
+                PricingClass::Custom,
+            ] {
+                let prices = model.class_pricing.get(&class);
+                provisioning
+                    .reconcile_tariffs(
+                        model_id,
+                        Some(org_id),
+                        Some(class.as_str()),
+                        prices.map_or(&[], |p| p.tariffs.as_slice()),
+                        effective_at,
+                    )
+                    .await?;
+                let cache = prices.and_then(|p| p.cache_tariff.as_ref()).map(CachePrices::as_tariff);
+                provisioning
+                    .reconcile_cache_tariff(model_id, Some(org_id), Some(class.as_str()), cache.as_ref(), effective_at)
+                    .await?;
+            }
             sqlx::query(
                 r#"INSERT INTO model_overlays (user_id, deployed_model_id, default_serving_class, targets, self_hosted_only, provisioning_source)
                    VALUES ($1, $2, $3, $4, $5, $6)
@@ -262,6 +364,34 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
     // Rows this catalog owns but no longer declares are removed; hand rows
     // (NULL source) and rows owned by anything else are left alone.
     let (org_ids, model_ids): (Vec<Uuid>, Vec<Uuid>) = desired.into_iter().unzip();
+    // A removed file also retires its prices. Ownership comes from its overlay
+    // marker, so unrelated hand-authored organisation deals remain untouched.
+    for table in ["model_tariffs", "model_cache_tariffs"] {
+        let omitted = "FROM model_overlays mo WHERE mo.provisioning_source LIKE $1
+            AND mo.user_id = t.user_id AND mo.deployed_model_id = t.deployed_model_id
+            AND NOT EXISTS (SELECT 1 FROM UNNEST($2::uuid[], $3::uuid[]) AS d(user_id, deployed_model_id)
+                WHERE d.user_id = mo.user_id AND d.deployed_model_id = mo.deployed_model_id)";
+        let future: bool = sqlx::query_scalar(&format!(
+            "SELECT EXISTS (SELECT 1 FROM {table} t WHERE t.valid_from > $4 AND EXISTS (SELECT 1 {omitted}))"
+        ))
+        .bind(format!("{SOURCE_PREFIX}%"))
+        .bind(&org_ids)
+        .bind(&model_ids)
+        .bind(effective_at)
+        .fetch_one(&mut *db)
+        .await?;
+        ensure!(!future, "removed overlay has future-dated prices; resolve these before removing it");
+        sqlx::query(&format!(
+            "UPDATE {table} t SET valid_until = $4 WHERE t.valid_from <= $4
+            AND (t.valid_until IS NULL OR t.valid_until > $4) AND EXISTS (SELECT 1 {omitted})"
+        ))
+        .bind(format!("{SOURCE_PREFIX}%"))
+        .bind(&org_ids)
+        .bind(&model_ids)
+        .bind(effective_at)
+        .execute(&mut *db)
+        .await?;
+    }
     sqlx::query(
         r#"DELETE FROM model_overlays mo
            WHERE mo.provisioning_source LIKE $1
@@ -529,7 +659,7 @@ mod tests {
         write(
             directory.path(),
             "acme.yaml",
-            "org: acme\nmodels:\n  - alias: org/model\n    tariffs:\n      - {name: deal, purpose: realtime, input_per_million_tokens: \"0.50\", output_per_million_tokens: \"1.00\"}\n      - {name: deal-24h, purpose: batch, completion_window: 24h, input_per_million_tokens: \"0.25\", output_per_million_tokens: \"0.50\"}\n    cache_tariff: {write_multiplier_5m: \"1.1\", write_multiplier_1h: \"1.5\", write_multiplier_24h: \"2.0\", read_multiplier: \"0.05\", min_prefix_tokens: 512}\n",
+            "org: acme\nmodels:\n  - alias: org/model\n    tariffs:\n      - {name: deal, purpose: realtime, input_per_million_tokens: \"0.50\", output_per_million_tokens: \"1.00\"}\n      - {name: deal-24h, purpose: batch, completion_window: 24h, input_per_million_tokens: \"0.25\", output_per_million_tokens: \"0.50\"}\n    cache_tariff: {write_multiplier_5m: \"1.1\", write_multiplier_1h: \"1.5\", write_multiplier_24h: \"2.0\", read_multiplier: \"0.05\"}\n",
         );
         apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
         let org_rows: Vec<(String, Option<String>, Option<Uuid>)> = sqlx::query_as(
@@ -625,5 +755,68 @@ mod tests {
         assert_eq!(remaining.len(), 1);
         assert_ne!(remaining[0].0, org_id);
         assert_eq!(remaining[0].1, None);
+    }
+    #[sqlx::test]
+    async fn removing_last_catalog_file_retires_class_deals_but_preserves_hand_rows(pool: PgPool) {
+        let org: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('class-org','class-org@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
+        let model: Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('class-model','class-model',true,$1) RETURNING id").bind(org).fetch_one(&pool).await.unwrap();
+        let directory = tempdir().unwrap();
+        let yaml = r#"org: class-org
+models:
+  - alias: class-model
+    class_pricing:
+      interactive:
+        tariffs:
+          - {name: interactive, purpose: realtime, input_per_million_tokens: '0', output_per_million_tokens: '1'}
+        cache_tariff: {write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1', read_multiplier: '0'}
+"#;
+        write(directory.path(), "org.yaml", yaml);
+        let catalog = OrgCatalog::load(directory.path()).unwrap();
+        apply(&pool, &catalog).await.unwrap();
+        apply(&pool, &catalog).await.unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM model_tariffs WHERE user_id=$1")
+            .bind(org)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "identical startup must not create another price version");
+        let class: String = sqlx::query_scalar("SELECT serving_class FROM model_tariffs WHERE user_id=$1")
+            .bind(org)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(class, "interactive");
+        // A missing mount is a no-op, distinct from an explicitly empty mounted catalog.
+        apply(&pool, &OrgCatalog::load(directory.path().join("missing")).unwrap())
+            .await
+            .unwrap();
+        let active: i64 = sqlx::query_scalar("SELECT count(*) FROM model_tariffs WHERE user_id=$1 AND valid_until IS NULL")
+            .bind(org)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(active, 1);
+        sqlx::query("INSERT INTO model_overlays(user_id,deployed_model_id,self_hosted_only) VALUES ('00000000-0000-0000-0000-000000000000',$1,true)").bind(model).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,'00000000-0000-0000-0000-000000000000','hand',1,1,'realtime')").bind(model).execute(&pool).await.unwrap();
+        fs::remove_file(directory.path().join("org.yaml")).unwrap();
+        apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+        for table in ["model_tariffs", "model_cache_tariffs"] {
+            let active: i64 = sqlx::query_scalar(&format!("SELECT count(*) FROM {table} WHERE user_id=$1 AND valid_until IS NULL"))
+                .bind(org)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(active, 0, "removed file must retire {table}");
+        }
+        let names: Vec<String> = sqlx::query_scalar("SELECT name FROM model_tariffs WHERE valid_until IS NULL")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(names, vec!["hand"]);
+        let owners: Vec<Uuid> = sqlx::query_scalar("SELECT user_id FROM model_overlays")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(owners, vec![Uuid::nil()]);
     }
 }

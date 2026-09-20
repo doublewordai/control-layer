@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT dm.alias, t.input_price_per_token as \"input_price_per_token!\", t.output_price_per_token as \"output_price_per_token!\"\n        FROM deployed_models dm\n        CROSS JOIN LATERAL effective_model_tariff(dm.id, $1, 'realtime', NULL, 'standard', NOW()) t\n        WHERE dm.deleted = FALSE\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "input_price_per_token!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 2,
+        "name": "output_price_per_token!",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "f9026b66948373914470c937b4b04aa78858264f05620151aad0cd3e4c347711"
+}

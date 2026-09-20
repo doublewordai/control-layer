@@ -2509,7 +2509,7 @@ const ModelInfo: React.FC = () => {
                             <div className="space-y-3">
                               {generalTariffs.map((tariff) => (
                                 <div
-                                  key={tariff.id}
+                                  key={`${tariff.id}:${tariff.api_key_purpose}:${tariff.completion_window}:${tariff.serving_class ?? "all"}`}
                                   className="bg-gray-50 rounded-lg p-3"
                                 >
                                   <div className="flex items-center gap-2 mb-2">
@@ -2576,12 +2576,13 @@ const ModelInfo: React.FC = () => {
                               <div className="space-y-2">
                                 {organisationTariffs.map((tariff) => (
                                   <div
-                                    key={tariff.id}
+                                    key={`${tariff.id}:${tariff.api_key_purpose}:${tariff.completion_window}:${tariff.serving_class ?? "all"}`}
                                     className="bg-gray-50 rounded-lg p-3 text-sm flex flex-wrap items-center gap-x-4 gap-y-1"
                                   >
                                     <span className="font-mono text-xs">
                                       {tariff.organization_id}
                                     </span>
+                                    <span>{tariff.serving_class ?? "All classes"}</span>
                                     <span className="font-medium">
                                       {getTariffDisplayName(
                                         tariff.api_key_purpose,
@@ -2639,7 +2640,7 @@ const ModelInfo: React.FC = () => {
                                   <p className="text-xs text-gray-500 mt-1 tabular-nums">
                                     TTFT {preset.ttft_ms} ms · ITL {preset.itl_ms}{" "}
                                     ms
-                                    {preset.priority
+                                    {preset.priority !== undefined
                                       ? ` · priority ${preset.priority}`
                                       : ""}
                                   </p>
@@ -2680,7 +2681,7 @@ const ModelInfo: React.FC = () => {
                                     <span className="tabular-nums">
                                       TTFT {o.targets.ttft_ms} ms · ITL{" "}
                                       {o.targets.itl_ms} ms
-                                      {o.targets.priority
+                                      {o.targets.priority !== undefined
                                         ? ` · priority ${o.targets.priority}`
                                         : ""}
                                     </span>

@@ -2883,6 +2883,19 @@ export const handlers = [
     });
   }),
 
+  http.get("/admin/api/v1/organizations/:id/serving", ({ params }) => {
+    const org = organizationsData.find((o) => o.id === params.id);
+    if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });
+    return HttpResponse.json({
+      organization_id: org.id,
+      granted_serving_classes: [],
+      self_hosted_only: false,
+      overlays: [],
+      tariffs: [],
+      cache_tariffs: [],
+    });
+  }),
+
   http.get("/admin/api/v1/organizations/:id", ({ params }) => {
     const org = organizationsData.find((o) => o.id === params.id);
     if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });

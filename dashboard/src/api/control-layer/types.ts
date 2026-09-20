@@ -211,6 +211,7 @@ export interface ModelTariff {
   is_active: boolean;
   /** Set on an organisation's own price (a deal); absent on the model's general price. */
   organization_id?: string | null;
+  serving_class?: ServingClassName | "standard" | "custom" | null;
 }
 
 // Cache pricing (Anthropic-style prompt-cache multipliers). Multipliers are decimal
@@ -362,7 +363,7 @@ export interface ServingOverlay {
   organization_name: string;
   deployed_model_id: string;
   alias: string;
-  default_serving_class?: string;
+  default_serving_class?: ServingClassName;
   targets?: ServingPreset;
   self_hosted_only?: boolean;
   provisioning_source?: string;
@@ -376,15 +377,15 @@ export interface OrganizationCacheTariff {
   write_multiplier_1h: string;
   write_multiplier_24h: string;
   read_multiplier: string;
-  min_prefix_tokens: number;
+  serving_class?: ServingClassName | "standard" | "custom";
   valid_from: string;
 }
 
 /** Everything serving-related about one organisation (platform managers only). */
 export interface OrganizationServing {
   organization_id: string;
-  granted_serving_classes: string[];
-  default_serving_class?: string;
+  granted_serving_classes: ServingClassName[];
+  default_serving_class?: ServingClassName;
   self_hosted_only: boolean;
   overlays: ServingOverlay[];
   tariffs: ModelTariff[];
@@ -515,8 +516,8 @@ export interface User {
   auto_topup_monthly_limit: number | null; // Monthly spending limit for auto top-ups (null = no limit)
   zero_data_retention: boolean; // Account-wide zero-data-retention flag
   // Serving account settings (platform managers only)
-  granted_serving_classes?: string[];
-  default_serving_class?: string | null;
+  granted_serving_classes?: ServingClassName[];
+  default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
@@ -694,8 +695,8 @@ export interface UserUpdateRequest {
   auto_topup_monthly_limit?: number | null; // Set a limit to cap, null to remove limit
   zero_data_retention?: boolean; // Users may update this for their own account
   // Serving account settings: platform managers only (dwctl rejects the whole request otherwise)
-  granted_serving_classes?: string[];
-  default_serving_class?: string | null;
+  granted_serving_classes?: ServingClassName[];
+  default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
 }
 
@@ -1837,8 +1838,8 @@ export interface OrganizationUpdateRequest {
   low_balance_threshold?: number | null;
   zero_data_retention?: boolean; // Account-wide zero-data-retention flag (admin-only)
   // Serving account settings: platform managers only
-  granted_serving_classes?: string[];
-  default_serving_class?: string | null;
+  granted_serving_classes?: ServingClassName[];
+  default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
 }
 

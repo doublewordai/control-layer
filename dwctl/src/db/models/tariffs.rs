@@ -28,6 +28,8 @@ pub struct ModelTariff {
     /// Organisation this tariff belongs to; `None` = the model's general price.
     /// Billing prefers the caller's organisation rows over the general rows.
     pub user_id: Option<Uuid>,
+    /// Resolved serving class; None applies to every class.
+    pub serving_class: Option<String>,
 }
 
 /// Request to create a new tariff

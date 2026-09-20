@@ -197,6 +197,13 @@ impl OpenAIBatchRequest {
             })?
             .to_string();
 
+        // Batches use deadline scheduling, so all serving-class suffixes
+        // are ignored. Resolve the base model before validating access.
+        let (model, _) = onwards::serving::split_model_suffix(&model).map_err(|error| Error::BadRequest {
+            message: error.to_string(),
+        })?;
+        let model = model.to_string();
+
         // Validate model access
         let accessible_model = accessible_models.get(&model).ok_or_else(|| Error::ModelAccessDenied {
             model_name: model.clone(),
@@ -220,17 +227,12 @@ impl OpenAIBatchRequest {
                 },
             })?;
 
-        // Strip 'priority' key from body if present (users shouldn't control priority)
+        // This is the untrusted batch ingress. Daemon loopback requests skip
+        // realtime ingress, so scrub before storing the template; dispatch adds
+        // its own deadline priority later.
         let mut sanitized_body = self.body.clone();
-        if sanitized_body.is_object()
-            && let Some(obj) = sanitized_body.as_object_mut()
-            && obj.remove("priority").is_some()
-        {
-            tracing::debug!(
-                custom_id = %self.custom_id,
-                "Stripped 'priority' field from request body"
-            );
-        }
+        sanitized_body["model"] = model.clone().into();
+        crate::inference::middleware::strip_scheduling_priority(&mut sanitized_body);
 
         // Serialize sanitized body back to string
         let body = serde_json::to_string(&sanitized_body).map_err(|e| Error::BadRequest {
@@ -2107,6 +2109,12 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
 
     // Use the completion_window from query params, defaulting to "24h"
     let completion_window = query.completion_window.as_deref().unwrap_or("24h");
+    // Operators may inspect another account's file; quote that account's deal.
+    let pricing_account = file
+        .uploaded_by
+        .as_deref()
+        .and_then(|owner| Uuid::parse_str(owner).ok())
+        .unwrap_or(current_user.active_organization.unwrap_or(current_user.id));
 
     for (model_alias, (request_count, input_tokens)) in model_stats {
         // Look up the deployment and historical average
@@ -2130,12 +2138,13 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
         let cost = if let Some(deployment) = deployment_opt {
             // Look up tariff pricing for Batch API key purpose, with fallback to realtime
             let pricing_result = tariffs_repo
-                .get_pricing_at_timestamp_with_fallback(
+                .get_effective_pricing_at_timestamp(
                     deployment.id,
-                    Some(&ApiKeyPurpose::Batch),
-                    &ApiKeyPurpose::Realtime,
-                    current_time,
+                    pricing_account,
+                    "batch",
                     Some(completion_window),
+                    Some("standard"),
+                    current_time,
                 )
                 .await
                 .map_err(Error::Database)?;
@@ -3072,7 +3081,7 @@ mod tests {
         add_deployment_to_group(&pool, deployment.id, group.id, user.id).await;
 
         // Upload file with priority field that user is trying to manipulate
-        let jsonl_content = r#"{"custom_id": "priority-hijack", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8", "messages": [{"role": "user", "content": "urgent"}], "priority": -999999}}"#;
+        let jsonl_content = r#"{"custom_id": "priority-hijack", "method": "POST", "url": "/v1/chat/completions", "body": {"model": "Qwen/Qwen3-VL-30B-A3B-Instruct-FP8", "messages": [{"role": "user", "content": "urgent"}], "priority": -999999, "nvext": {"router": {"ttft_target": 1, "itl_target": 2, "keep": true}, "agent_hints": {"priority": 999, "keep": true}, "keep": true}}}"#;
 
         let file_part = axum_test::multipart::Part::bytes(jsonl_content.as_bytes()).file_name("test-priority.jsonl");
 
@@ -3109,6 +3118,13 @@ mod tests {
         // Verify the body exists and doesn't contain priority
         let body = downloaded_json.get("body").expect("Should have body field");
         assert!(body.get("priority").is_none(), "Priority field should be stripped from body");
+
+        assert!(body["nvext"]["router"].get("ttft_target").is_none());
+        assert!(body["nvext"]["router"].get("itl_target").is_none());
+        assert!(body["nvext"]["agent_hints"].get("priority").is_none());
+        assert_eq!(body["nvext"]["router"]["keep"], true);
+        assert_eq!(body["nvext"]["agent_hints"]["keep"], true);
+        assert_eq!(body["nvext"]["keep"], true);
 
         // Verify other fields are preserved
         assert_eq!(

@@ -402,6 +402,10 @@ pub async fn list_deployed_models<P: PoolProvider>(
         filter = filter.with_realtime_availability(available_for_realtime);
     }
 
+    if !can_read_pricing {
+        filter.pricing_account = Some(current_user.active_organization.unwrap_or(current_user.id));
+    }
+
     // Apply sort if specified
     if let Some(sort_field) = query.sort {
         filter = filter.with_sort(sort_field, query.sort_direction);

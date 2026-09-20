@@ -41,12 +41,13 @@ pub struct DeploymentFilter {
     pub accessible_to: Option<UserId>, // None = show all deployments, Some(user_id) = show only deployments accessible to that user
     pub group_ids: Option<Vec<crate::types::GroupId>>, // None = show all, Some(group_ids) = show only models in any of these groups
     pub aliases: Option<Vec<String>>,
-    pub search: Option<String>,                // Case-insensitive substring search
-    pub is_composite: Option<bool>,            // None = show all, Some(true) = composite only, Some(false) = non-composite only
-    pub provider: Option<String>,              // Filter by metadata provider (case-insensitive exact match)
-    pub model_type: Option<ModelType>,         // Filter by model type column
-    pub capability: Option<String>,            // Filter to models that have this capability
-    pub available_for_realtime: Option<bool>,  // Filter by whether realtime traffic is denied
+    pub search: Option<String>,               // Case-insensitive substring search
+    pub is_composite: Option<bool>,           // None = show all, Some(true) = composite only, Some(false) = non-composite only
+    pub provider: Option<String>,             // Filter by metadata provider (case-insensitive exact match)
+    pub model_type: Option<ModelType>,        // Filter by model type column
+    pub capability: Option<String>,           // Filter to models that have this capability
+    pub available_for_realtime: Option<bool>, // Filter by whether realtime traffic is denied
+    pub pricing_account: Option<UserId>,
     pub sort_field: Option<ModelSortField>,    // Sort field (default: created_at)
     pub sort_direction: Option<SortDirection>, // Sort direction (default depends on field)
 }
@@ -68,8 +69,9 @@ impl DeploymentFilter {
             model_type: None,             // Default: no type filter
             capability: None,             // Default: no capability filter
             available_for_realtime: None, // Default: no realtime availability filter
-            sort_field: None,             // Default: created_at
-            sort_direction: None,         // Default: depends on field
+            pricing_account: None,
+            sort_field: None,     // Default: created_at
+            sort_direction: None, // Default: depends on field
         }
     }
 
@@ -775,7 +777,17 @@ impl<'c> Repository for Deployments<'c> {
             } else {
                 ""
             };
-        query.push(format!(" ORDER BY {sort_expr} {direction}{nulls_clause} LIMIT "));
+        if matches!(filter.sort_field, Some(ModelSortField::PriceFrom)) && filter.pricing_account.is_some() {
+            query.push(" ORDER BY (WITH relevant AS (SELECT api_key_purpose, completion_window, serving_class FROM model_tariffs WHERE deployed_model_id = dm.id AND (user_id IS NULL OR user_id = ");
+            query.push_bind(filter.pricing_account);
+            query.push(") AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW()) AND api_key_purpose IS NOT NULL), selectors AS (SELECT DISTINCT api_key_purpose, completion_window FROM relevant), classes AS (SELECT DISTINCT serving_class FROM relevant UNION SELECT NULL::text) SELECT MIN(t.input_price_per_token + t.output_price_per_token) FROM selectors s CROSS JOIN classes c CROSS JOIN LATERAL effective_model_tariff(dm.id, ");
+            query.push_bind(filter.pricing_account);
+            query.push(format!(
+                ", s.api_key_purpose, s.completion_window, CASE WHEN s.api_key_purpose IN ('batch','continuation') THEN 'standard' ELSE c.serving_class END, NOW()) t WHERE s.api_key_purpose NOT IN ('batch','continuation') OR c.serving_class IS NULL) {direction} NULLS LAST, dm.id LIMIT "
+            ));
+        } else {
+            query.push(format!(" ORDER BY {sort_expr} {direction}{nulls_clause} LIMIT "));
+        }
         query.push_bind(filter.limit);
         query.push(" OFFSET ");
         query.push_bind(filter.skip);

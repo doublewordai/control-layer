@@ -786,6 +786,7 @@ const UsersGroups: React.FC = () => {
         onClose={() => setEditingOrg(null)}
         organization={editingOrg}
         canEditZdr={isPlatformManager}
+        canEditServing={isPlatformManager}
       />
       <Dialog
         open={!!deletingOrg}

@@ -149,6 +149,7 @@ impl Request<Pending> {
             data: self.data,
             state: Canceled {
                 canceled_at: chrono::Utc::now(),
+                claimed_at: None,
             },
         };
         storage.persist(&request).await?;
@@ -175,6 +176,7 @@ impl Request<Claimed> {
             data: self.data,
             state: Canceled {
                 canceled_at: chrono::Utc::now(),
+                claimed_at: Some(self.state.claimed_at),
             },
         };
         storage.persist(&request).await?;
@@ -382,6 +384,7 @@ impl Request<Processing> {
                     data: self.data,
                     state: Canceled {
                         canceled_at: chrono::Utc::now(),
+                        claimed_at: Some(self.state.claimed_at),
                     },
                 };
                 return Ok(RequestCompletionResult::Canceled(canceled));
@@ -409,6 +412,7 @@ impl Request<Processing> {
                             body: http_response.body.clone(),
                         },
                         failed_at: chrono::Utc::now(),
+                        claimed_at: Some(self.state.claimed_at),
                         retry_attempt: self.state.retry_attempt,
                         batch_expires_at: self.state.batch_expires_at,
                         routed_model: self.data.model.clone(),
@@ -427,6 +431,7 @@ impl Request<Processing> {
                             body: http_response.body.clone(),
                         },
                         failed_at: chrono::Utc::now(),
+                        claimed_at: Some(self.state.claimed_at),
                         retry_attempt: self.state.retry_attempt,
                         batch_expires_at: self.state.batch_expires_at,
                         routed_model: self.data.model.clone(),
@@ -476,6 +481,7 @@ impl Request<Processing> {
                 let failed_state = Failed {
                     reason,
                     failed_at: chrono::Utc::now(),
+                    claimed_at: Some(self.state.claimed_at),
                     retry_attempt: self.state.retry_attempt,
                     batch_expires_at: self.state.batch_expires_at,
                     routed_model: self.data.model.clone(),
@@ -491,6 +497,7 @@ impl Request<Processing> {
                 let failed_state = Failed {
                     reason: FailureReason::TaskTerminated,
                     failed_at: chrono::Utc::now(),
+                    claimed_at: Some(self.state.claimed_at),
                     retry_attempt: self.state.retry_attempt,
                     batch_expires_at: self.state.batch_expires_at,
                     routed_model: self.data.model.clone(),
@@ -513,6 +520,7 @@ impl Request<Processing> {
             data: self.data,
             state: Canceled {
                 canceled_at: chrono::Utc::now(),
+                claimed_at: Some(self.state.claimed_at),
             },
         };
         storage.persist(&request).await?;
@@ -546,6 +554,7 @@ mod background_tests {
             state: Failed {
                 reason: FailureReason::TaskTerminated,
                 failed_at: chrono::Utc::now(),
+                claimed_at: None,
                 retry_attempt: 0,
                 batch_expires_at: deadline,
                 routed_model: "model-a".to_string(),

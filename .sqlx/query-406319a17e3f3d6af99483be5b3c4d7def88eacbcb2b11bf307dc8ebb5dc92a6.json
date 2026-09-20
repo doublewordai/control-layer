@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE users\n            SET auto_topup_amount = 25.0,\n                auto_topup_threshold = 10.0,\n                auto_topup_monthly_limit = 100.0,\n                auto_topup_soft_failure_count = $2,\n                auto_topup_retry_after = CASE\n                    WHEN $2 = 0 THEN NULL\n                    ELSE NOW() - INTERVAL '1 minute'\n                END,\n                payment_provider_id = $3\n            WHERE id = $1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Varchar"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "406319a17e3f3d6af99483be5b3c4d7def88eacbcb2b11bf307dc8ebb5dc92a6"
+}

@@ -1,3 +1,4 @@
+import { formatTariffPrice } from "@/utils/formatters";
 import { useOrganizationServing } from "@/api/control-layer/hooks";
 import type {
   ModelTariff,
@@ -161,6 +162,7 @@ function TariffsTable({ tariffs }: { tariffs: ModelTariff[] }) {
             <thead className="text-left text-xs uppercase tracking-wide text-gray-500">
               <tr>
                 <th className="py-1 pr-4">Model</th>
+                <th className="py-1 pr-4">Class</th>
                 <th className="py-1 pr-4">Tier</th>
                 <th className="py-1 pr-4">Input / 1M</th>
                 <th className="py-1 pr-4">Output / 1M</th>
@@ -173,6 +175,7 @@ function TariffsTable({ tariffs }: { tariffs: ModelTariff[] }) {
                   <td className="py-1.5 pr-4 font-mono text-xs">
                     {t.deployed_model_id}
                   </td>
+                  <td className="py-1.5 pr-4">{t.serving_class ?? "All classes"}</td>
                   <td className="py-1.5 pr-4">
                     {getTariffDisplayName(
                       t.api_key_purpose,
@@ -180,10 +183,10 @@ function TariffsTable({ tariffs }: { tariffs: ModelTariff[] }) {
                     )}
                   </td>
                   <td className="py-1.5 pr-4 tabular-nums">
-                    ${(parseFloat(t.input_price_per_token) * 1_000_000).toFixed(2)}
+                    {formatTariffPrice(t.input_price_per_token)}
                   </td>
                   <td className="py-1.5 pr-4 tabular-nums">
-                    ${(parseFloat(t.output_price_per_token) * 1_000_000).toFixed(2)}
+                    {formatTariffPrice(t.output_price_per_token)}
                   </td>
                   <td className="py-1.5 text-xs text-gray-500">
                     {new Date(t.valid_from).toLocaleDateString()}
@@ -216,18 +219,18 @@ function CacheTariffsTable({ rows }: { rows: OrganizationCacheTariff[] }) {
               <th className="py-1 pr-4">Write 5m</th>
               <th className="py-1 pr-4">Write 1h</th>
               <th className="py-1 pr-4">Write 24h</th>
-              <th className="py-1">Min prefix</th>
+              <th className="py-1">Class</th>
             </tr>
           </thead>
           <tbody className="divide-y">
             {rows.map((r) => (
-              <tr key={r.deployed_model_id}>
+              <tr key={`${r.deployed_model_id}:${r.serving_class ?? "all"}`}>
                 <td className="py-1.5 pr-4 font-mono text-xs">{r.alias}</td>
                 <td className="py-1.5 pr-4 tabular-nums">{r.read_multiplier}×</td>
                 <td className="py-1.5 pr-4 tabular-nums">{r.write_multiplier_5m}×</td>
                 <td className="py-1.5 pr-4 tabular-nums">{r.write_multiplier_1h}×</td>
                 <td className="py-1.5 pr-4 tabular-nums">{r.write_multiplier_24h}×</td>
-                <td className="py-1.5 tabular-nums">{r.min_prefix_tokens}</td>
+                <td className="py-1.5 tabular-nums">{r.serving_class ?? "All classes"}</td>
               </tr>
             ))}
           </tbody>
@@ -242,6 +245,6 @@ function formatTargets(t: {
   itl_ms: number;
   priority: number;
 }): string {
-  const priority = t.priority ? `, priority ${t.priority}` : "";
+  const priority = t.priority !== undefined ? `, priority ${t.priority}` : "";
   return `TTFT ${t.ttft_ms} ms, ITL ${t.itl_ms} ms${priority}`;
 }
