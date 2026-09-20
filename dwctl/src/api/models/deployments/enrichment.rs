@@ -231,14 +231,15 @@ impl<'a> DeployedModelEnricher<'a> {
             },
             // Class cache prices are independent of the other enrichment reads.
             async {
-                if self.include_pricing && !self.can_read_pricing {
-                    if let Some(account) = self.pricing_account {
-                        let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-                        return CacheTariffs::new(&mut conn)
-                            .get_class_prices_bulk(&model_ids, account)
-                            .await
-                            .map_err(Error::from);
-                    }
+                if self.include_pricing
+                    && !self.can_read_pricing
+                    && let Some(account) = self.pricing_account
+                {
+                    let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+                    return CacheTariffs::new(&mut conn)
+                        .get_class_prices_bulk(&model_ids, account)
+                        .await
+                        .map_err(Error::from);
                 }
                 Ok(HashMap::new())
             },
