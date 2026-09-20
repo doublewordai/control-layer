@@ -2724,6 +2724,36 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn test_instrument_claim_rolled_back_frees_the_instrument(pool: PgPool) {
+        // The claim is made inside the transaction that also sets the verified
+        // flag, so a failure after the claim rolls it back and the instrument
+        // is unclaimed again rather than held by an account that was never
+        // verified.
+        let first = create_test_user(&pool).await;
+        let second = create_test_user(&pool).await;
+
+        let mut tx = pool.begin().await.unwrap();
+        assert_eq!(
+            Credits::new(&mut tx)
+                .claim_verification_instrument("fp_abandoned", first)
+                .await
+                .unwrap(),
+            first
+        );
+        tx.rollback().await.unwrap();
+
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            Credits::new(&mut conn)
+                .claim_verification_instrument("fp_abandoned", second)
+                .await
+                .unwrap(),
+            second,
+            "a rolled-back claim must not hold the instrument"
+        );
+    }
+
+    #[sqlx::test]
     async fn test_instrument_claims_are_independent(pool: PgPool) {
         let first = create_test_user(&pool).await;
         let second = create_test_user(&pool).await;

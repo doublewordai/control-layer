@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use sqlx::PgPool;
+use sqlx::{Connection, PgPool};
 use std::collections::HashMap;
 use stripe::{ApiErrorsCode, Client};
 use stripe_billing::billing_portal_session::CreateBillingPortalSession;
@@ -491,11 +491,16 @@ impl StripeProvider {
                 SetupPurpose::AutoTopup => Ok(()),
             };
         };
-        let owner = Credits::new(&mut *conn)
-            .claim_verification_instrument(fingerprint, target_id)
-            .await?;
+        // The claim and the verified flag land together: a claim without the
+        // flag would leave the account holding an instrument it was never
+        // verified by, and a concurrent second claimant waits on this commit
+        // rather than on a bare insert. A losing claim is rolled back, though
+        // there is nothing of ours to undo in that case.
+        let mut tx = conn.begin().await?;
+        let owner = Credits::new(&mut tx).claim_verification_instrument(fingerprint, target_id).await?;
         let claimed_by_other = (owner != target_id).then_some(owner);
         if let Some(owner) = claimed_by_other {
+            tx.rollback().await?;
             tracing::warn!(
                 session_id,
                 target_id = %target_id,
@@ -514,7 +519,8 @@ impl StripeProvider {
 
         // A verified card clears the unverified rate-limit tier in onwards,
         // same as a completed purchase does.
-        crate::db::handlers::users::Users::new(&mut *conn).set_verified(target_id).await?;
+        crate::db::handlers::users::Users::new(&mut tx).set_verified(target_id).await?;
+        tx.commit().await?;
 
         // Signup credits. Best-effort by the same reasoning as the first-payment
         // match: verification is the thing that must stick, and a failed freebie
