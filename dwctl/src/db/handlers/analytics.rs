@@ -1200,14 +1200,15 @@ pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
 /// Returns a map of model alias → (input_price_per_token, output_price_per_token).
 /// This is a tiny table (~12 rows) so it's efficient to load entirely.
 #[instrument(skip(pool), err)]
-pub async fn get_realtime_tariffs(pool: &PgPool) -> Result<HashMap<String, (Decimal, Decimal)>> {
+pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid) -> Result<HashMap<String, (Decimal, Decimal)>> {
     let rows = sqlx::query!(
         r#"
-        SELECT dm.alias, t.input_price_per_token, t.output_price_per_token
-        FROM model_tariffs t
-        JOIN deployed_models dm ON dm.id = t.deployed_model_id
-        WHERE t.api_key_purpose = 'realtime' AND t.valid_until IS NULL AND t.user_id IS NULL
-        "#
+        SELECT dm.alias, t.input_price_per_token as "input_price_per_token!", t.output_price_per_token as "output_price_per_token!"
+        FROM deployed_models dm
+        CROSS JOIN LATERAL effective_model_tariff(dm.id, $1, 'realtime', NULL, 'standard', NOW()) t
+        WHERE dm.deleted = FALSE
+        "#,
+        account
     )
     .fetch_all(pool)
     .await?;

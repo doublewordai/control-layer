@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT DISTINCT ON (deployed_model_id, api_key_purpose, completion_window)\n                   id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                   valid_from, valid_until, api_key_purpose as \"api_key_purpose: _\", completion_window, user_id\n            FROM model_tariffs\n            WHERE deployed_model_id = ANY($1) AND valid_until IS NULL\n              AND (user_id IS NULL OR user_id = $2)\n            ORDER BY deployed_model_id, api_key_purpose, completion_window, user_id ASC NULLS LAST, name ASC\n            ",
+  "query": "\n            SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                   valid_from, valid_until, api_key_purpose as \"api_key_purpose: _\", completion_window, user_id, serving_class\n            FROM model_tariffs\n            WHERE id = $1\n            ",
   "describe": {
     "columns": [
       {
@@ -52,11 +52,15 @@
         "ordinal": 9,
         "name": "user_id",
         "type_info": "Uuid"
+      },
+      {
+        "ordinal": 10,
+        "name": "serving_class",
+        "type_info": "Text"
       }
     ],
     "parameters": {
       "Left": [
-        "UuidArray",
         "Uuid"
       ]
     },
@@ -70,8 +74,9 @@
       true,
       true,
       true,
+      true,
       true
     ]
   },
-  "hash": "7a73e2aa022a57268ca1b6dc60d5c036c00b5bccccd71e79260d4bee28a77220"
+  "hash": "d6bbf7047ecafae9b1221f8843a04dc12818defb8fdb46de9fe5aae88038226c"
 }

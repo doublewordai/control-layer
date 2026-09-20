@@ -252,7 +252,7 @@ pub async fn get_usage<P: PoolProvider>(
         tokio::try_join!(
             get_user_batch_count_for_range(&db, target_user_id, start_date, end_date),
             get_user_model_breakdown_for_range(&db, target_user_id, start_date, end_date),
-            get_realtime_tariffs(&db),
+            get_realtime_tariffs(&db, target_user_id),
         )?
     } else {
         // All-time usage combines two pre-aggregated tables:
@@ -286,7 +286,7 @@ pub async fn get_usage<P: PoolProvider>(
         let (batch_stats, by_model, tariffs) = tokio::try_join!(
             get_user_batch_counts(&db, target_user_id),
             get_user_model_breakdown(&db, target_user_id),
-            get_realtime_tariffs(&db),
+            get_realtime_tariffs(&db, target_user_id),
         )?;
         (batch_stats.0, by_model, tariffs)
     };

@@ -2109,6 +2109,12 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
 
     // Use the completion_window from query params, defaulting to "24h"
     let completion_window = query.completion_window.as_deref().unwrap_or("24h");
+    // Operators may inspect another account's file; quote that account's deal.
+    let pricing_account = file
+        .uploaded_by
+        .as_deref()
+        .and_then(|owner| Uuid::parse_str(owner).ok())
+        .unwrap_or(current_user.active_organization.unwrap_or(current_user.id));
 
     for (model_alias, (request_count, input_tokens)) in model_stats {
         // Look up the deployment and historical average
@@ -2132,12 +2138,13 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
         let cost = if let Some(deployment) = deployment_opt {
             // Look up tariff pricing for Batch API key purpose, with fallback to realtime
             let pricing_result = tariffs_repo
-                .get_pricing_at_timestamp_with_fallback(
+                .get_effective_pricing_at_timestamp(
                     deployment.id,
-                    Some(&ApiKeyPurpose::Batch),
-                    &ApiKeyPurpose::Realtime,
-                    current_time,
+                    pricing_account,
+                    "batch",
                     Some(completion_window),
+                    Some("standard"),
+                    current_time,
                 )
                 .await
                 .map_err(Error::Database)?;

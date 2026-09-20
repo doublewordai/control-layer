@@ -43,6 +43,8 @@ pub struct TariffResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
     pub organization_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub serving_class: Option<String>,
 }
 
 impl From<ModelTariff> for TariffResponse {
@@ -57,8 +59,9 @@ impl From<ModelTariff> for TariffResponse {
             completion_window: tariff.completion_window,
             valid_from: tariff.valid_from,
             valid_until: tariff.valid_until,
-            is_active: tariff.valid_until.is_none(),
+            is_active: tariff.valid_from <= Utc::now() && tariff.valid_until.is_none_or(|until| until > Utc::now()),
             organization_id: tariff.user_id,
+            serving_class: tariff.serving_class,
         }
     }
 }

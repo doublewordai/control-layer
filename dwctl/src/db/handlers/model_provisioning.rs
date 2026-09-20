@@ -87,8 +87,9 @@ impl<'c> ModelProvisioning<'c> {
         for model in &catalog.models {
             let model_id = ids[&model.clay.alias];
             self.reconcile_components(model_id, model, &ids).await?;
-            self.reconcile_tariffs(model_id, None, &model.clay.tariffs, effective_at).await?;
-            self.reconcile_cache_tariff(model_id, None, model.clay.cache_tariff.as_ref(), effective_at)
+            self.reconcile_tariffs(model_id, None, None, &model.clay.tariffs, effective_at)
+                .await?;
+            self.reconcile_cache_tariff(model_id, None, None, model.clay.cache_tariff.as_ref(), effective_at)
                 .await?;
             self.reconcile_groups(model_id, &model.clay.access_groups, &groups).await?;
             self.reconcile_traffic_rules(model_id, &model.clay.traffic_rules, &redirect_ids)
@@ -532,6 +533,7 @@ impl<'c> ModelProvisioning<'c> {
         &mut self,
         model_id: Uuid,
         account: Option<Uuid>,
+        serving_class: Option<&str>,
         desired: &[Tariff],
         effective_at: DateTime<Utc>,
     ) -> Result<()> {
@@ -541,6 +543,7 @@ impl<'c> ModelProvisioning<'c> {
                FROM model_tariffs
                WHERE deployed_model_id = $1
                  AND user_id IS NOT DISTINCT FROM $3
+                 AND serving_class IS NOT DISTINCT FROM $4
                  AND valid_from <= $2
                  AND (valid_until IS NULL OR valid_until > $2)
                ORDER BY valid_from DESC"#,
@@ -548,6 +551,7 @@ impl<'c> ModelProvisioning<'c> {
         .bind(model_id)
         .bind(effective_at)
         .bind(account)
+        .bind(serving_class)
         .fetch_all(&mut *self.db)
         .await
         .context("read active model tariffs")?;
@@ -598,8 +602,8 @@ impl<'c> ModelProvisioning<'c> {
             sqlx::query(
                 r#"INSERT INTO model_tariffs (
                        deployed_model_id, name, input_price_per_token, output_price_per_token,
-                       valid_from, api_key_purpose, completion_window, user_id
-                   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"#,
+                       valid_from, api_key_purpose, completion_window, user_id, serving_class
+                   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)"#,
             )
             .bind(model_id)
             .bind(&tariff.name)
@@ -609,6 +613,7 @@ impl<'c> ModelProvisioning<'c> {
             .bind(tariff.purpose.as_db_str())
             .bind(&tariff.completion_window)
             .bind(account)
+            .bind(serving_class)
             .execute(&mut *self.db)
             .await
             .with_context(|| format!("insert replacement tariff {:?}", tariff.name))?;
@@ -634,6 +639,7 @@ impl<'c> ModelProvisioning<'c> {
         &mut self,
         model_id: Uuid,
         account: Option<Uuid>,
+        serving_class: Option<&str>,
         desired: Option<&CacheTariff>,
         effective_at: DateTime<Utc>,
     ) -> Result<()> {
@@ -643,6 +649,7 @@ impl<'c> ModelProvisioning<'c> {
                FROM model_cache_tariffs
                WHERE deployed_model_id = $1
                  AND user_id IS NOT DISTINCT FROM $3
+                 AND serving_class IS NOT DISTINCT FROM $4
                  AND valid_from <= $2
                  AND (valid_until IS NULL OR valid_until > $2)
                ORDER BY valid_from DESC"#,
@@ -650,6 +657,7 @@ impl<'c> ModelProvisioning<'c> {
         .bind(model_id)
         .bind(effective_at)
         .bind(account)
+        .bind(serving_class)
         .fetch_all(&mut *self.db)
         .await
         .context("read active cache tariffs")?;
@@ -690,8 +698,8 @@ impl<'c> ModelProvisioning<'c> {
         sqlx::query(
             r#"INSERT INTO model_cache_tariffs (
                    deployed_model_id, write_multiplier_5m, write_multiplier_1h,
-                   write_multiplier_24h, read_multiplier, min_prefix_tokens, valid_from, user_id
-               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)"#,
+                   write_multiplier_24h, read_multiplier, min_prefix_tokens, valid_from, user_id, serving_class
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)"#,
         )
         .bind(model_id)
         .bind(write_5m)
@@ -701,6 +709,7 @@ impl<'c> ModelProvisioning<'c> {
         .bind(desired.min_prefix_tokens)
         .bind(effective_at)
         .bind(account)
+        .bind(serving_class)
         .execute(&mut *self.db)
         .await
         .context("insert replacement cache tariff")?;

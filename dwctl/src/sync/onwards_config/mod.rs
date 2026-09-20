@@ -802,13 +802,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
                 )))
                 OR (
-                    NOT EXISTS (
-                        SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = cm.id
-                          AND mt.valid_until IS NULL
-                          AND mt.user_id IS NULL
-                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
-                    )
+                    NOT model_has_effective_paid_tariff(cm.id, ak.user_id, ak.purpose)
                 )
             )
             AND ak.is_deleted = false
@@ -832,13 +826,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                       AND root.spend_limit IS NOT NULL
                       AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
                       AND ck.window_spend >= root.spend_limit
-                      AND EXISTS (
-                          SELECT 1 FROM model_tariffs mt
-                          WHERE mt.deployed_model_id = cm.id
-                            AND mt.valid_until IS NULL
-                            AND mt.user_id IS NULL
-                            AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
-                      )
+                      AND model_has_effective_paid_tariff(cm.id, ak.user_id, ak.purpose)
                 )
             )
             -- Inference data plane only: platform (management) keys must never
@@ -1641,13 +1629,7 @@ pub async fn load_targets_from_db(
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
                 )))
                 OR (
-                    NOT EXISTS (
-                        SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id
-                          AND mt.valid_until IS NULL
-                          AND mt.user_id IS NULL
-                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
-                    )
+                    NOT model_has_effective_paid_tariff(dm.id, ak.user_id, ak.purpose)
                 )
             )
             AND ak.is_deleted = false
@@ -1671,13 +1653,7 @@ pub async fn load_targets_from_db(
                       AND root.spend_limit IS NOT NULL
                       AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
                       AND ck.window_spend >= root.spend_limit
-                      AND EXISTS (
-                          SELECT 1 FROM model_tariffs mt
-                          WHERE mt.deployed_model_id = dm.id
-                            AND mt.valid_until IS NULL
-                            AND mt.user_id IS NULL
-                            AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
-                      )
+                      AND model_has_effective_paid_tariff(dm.id, ak.user_id, ak.purpose)
                 )
             )
             -- Inference data plane only: platform (management) keys must never

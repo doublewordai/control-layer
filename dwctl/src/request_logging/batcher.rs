@@ -580,6 +580,7 @@ where
                         raw.batch_completion_window.as_deref(),
                         pricing_timestamp,
                         user_id,
+                        raw.resolved_serving_class.as_deref(),
                     );
 
                     (Some(model_info.provider_name.clone()), input, output)
@@ -599,7 +600,7 @@ where
                 .request_model
                 .as_deref()
                 .and_then(|alias| cache_tariff_map.get(alias))
-                .and_then(|rows| resolve_cache_multipliers(rows, pricing_timestamp, user_id));
+                .and_then(|rows| resolve_cache_multipliers(rows, pricing_timestamp, user_id, raw.resolved_serving_class.as_deref()));
 
             // dwctl only injects cache tokens when a tariff is active, so if no tariff was valid
             // at inference yet the response still carries cache_* tokens, those are the upstream
@@ -719,6 +720,7 @@ where
             tariff_output_price: Option<Decimal>,
             tariff_completion_window: Option<String>,
             tariff_account: Option<Uuid>,
+            tariff_class: Option<String>,
         }
 
         // Query models with ALL their tariffs (including expired) for historical pricing
@@ -735,7 +737,8 @@ where
                 mt.input_price_per_token as "tariff_input_price?",
                 mt.output_price_per_token as "tariff_output_price?",
                 mt.completion_window as "tariff_completion_window?",
-                mt.user_id as "tariff_account?"
+                mt.user_id as "tariff_account?",
+                mt.serving_class as "tariff_class?"
             FROM deployed_models dm
             LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
             LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id
@@ -763,6 +766,7 @@ where
                 row.tariff_output_price,
             ) {
                 entry.tariffs.push(TariffInfo {
+                    serving_class: row.tariff_class,
                     purpose: parse_api_key_purpose(&purpose),
                     effective_from: valid_from,
                     valid_until: row.tariff_valid_until,

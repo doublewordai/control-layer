@@ -294,3 +294,38 @@ async fn dispatch_clears_stored_targets_but_preserves_deadline_priority(pool: Pg
     assert_eq!(body["nvext"]["agent_hints"]["priority"], -1700000000);
     assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
 }
+
+#[sqlx::test]
+async fn resolved_class_selects_the_billed_organisation_price(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    sqlx::query(
+        "UPDATE users SET granted_serving_classes=ARRAY['interactive','throughput'],default_serving_class='interactive' WHERE id=$1",
+    )
+    .bind(f.user)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token) SELECT id,$1,c.class,'org-deal','realtime',c.price,c.price FROM deployed_models CROSS JOIN (VALUES (NULL::text,0.002::numeric),('interactive',0.003::numeric)) c(class,price) WHERE alias='policy'")
+        .bind(f.user).execute(&pool).await.unwrap();
+    f.services.sync_onwards_config(&pool).await.unwrap();
+    for model in ["policy", "policy:throughput", "policy:standard"] {
+        f.post("chat/completions", model, false).await.assert_status_ok();
+    }
+    let rows = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let rows: Vec<(String, String, Decimal)> = sqlx::query_as("SELECT model,resolved_serving_class,total_cost FROM http_analytics WHERE user_id=$1 AND model='policy' AND status_code=200 ORDER BY resolved_serving_class")
+                .bind(f.user).fetch_all(&pool).await.unwrap();
+            if rows.len() == 3 { break rows; }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }).await.expect("three priced analytics rows must be persisted");
+    assert_eq!(
+        rows,
+        vec![
+            ("policy".to_owned(), "interactive".to_owned(), Decimal::new(45, 3)),
+            ("policy".to_owned(), "standard".to_owned(), Decimal::new(30, 3)),
+            ("policy".to_owned(), "throughput".to_owned(), Decimal::new(30, 3)),
+        ]
+    );
+    f.services.shutdown().await;
+}

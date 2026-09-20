@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                   valid_from, valid_until, api_key_purpose as \"api_key_purpose: _\", completion_window\n            FROM model_tariffs\n            WHERE deployed_model_id = $1\n            ORDER BY valid_from DESC, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC\n            ",
+  "query": "\n            INSERT INTO model_tariffs (\n                deployed_model_id, name, input_price_per_token, output_price_per_token,\n                api_key_purpose, completion_window, valid_from, user_id\n            )\n            VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()), $8)\n            RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                      valid_from, valid_until, api_key_purpose as \"api_key_purpose: _\", completion_window, user_id, serving_class\n            ",
   "describe": {
     "columns": [
       {
@@ -47,10 +47,27 @@
         "ordinal": 8,
         "name": "completion_window",
         "type_info": "Varchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 10,
+        "name": "serving_class",
+        "type_info": "Text"
       }
     ],
     "parameters": {
       "Left": [
+        "Uuid",
+        "Varchar",
+        "Numeric",
+        "Numeric",
+        "Varchar",
+        "Varchar",
+        "Timestamptz",
         "Uuid"
       ]
     },
@@ -63,8 +80,10 @@
       false,
       true,
       true,
+      true,
+      true,
       true
     ]
   },
-  "hash": "89a2fb9275fcd4c0e65c78df980024410709fe0aef058d3bc115bc2efc0dc4fb"
+  "hash": "aefaa65c79f6d9223e24277fe7368019624b680c5c62b10372d1f10c8696ec83"
 }

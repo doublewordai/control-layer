@@ -488,7 +488,7 @@ export const EditEndpointModal: React.FC<EditEndpointModalProps> = ({
         auth_header_prefix: data.authHeaderPrefix.trim(),
       }),
       reasoning_translation: reasoningTranslation,
-      ...(data.kind && { kind: data.kind }),
+      ...(form.formState.dirtyFields.kind && data.kind && { kind: data.kind }),
     };
 
     try {

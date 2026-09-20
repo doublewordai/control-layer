@@ -225,7 +225,14 @@ pub async fn recompute_corpus(
                     .model
                     .as_deref()
                     .and_then(|alias| cache_tariffs.get(alias))
-                    .and_then(|versions| crate::pricing::resolve_cache_multipliers(versions, row.pricing_timestamp(), row.user_id));
+                    .and_then(|versions| {
+                        crate::pricing::resolve_cache_multipliers(
+                            versions,
+                            row.pricing_timestamp(),
+                            row.user_id,
+                            row.resolved_serving_class.as_deref(),
+                        )
+                    });
                 rows_tariff_unresolvable_count(row, &cache_mults);
                 let cost = price(row, &usage, cache_mults);
                 let mut report_row = report::ReportRow::replayed(row, &usage, cost);
@@ -268,7 +275,14 @@ pub async fn recompute_corpus(
                             .model
                             .as_deref()
                             .and_then(|alias| cache_tariffs.get(alias))
-                            .and_then(|versions| crate::pricing::resolve_cache_multipliers(versions, row.pricing_timestamp(), row.user_id));
+                            .and_then(|versions| {
+                                crate::pricing::resolve_cache_multipliers(
+                                    versions,
+                                    row.pricing_timestamp(),
+                                    row.user_id,
+                                    row.resolved_serving_class.as_deref(),
+                                )
+                            });
                         rows_tariff_unresolvable_count(row, &cache_mults);
                         let cost = price(row, &usage, cache_mults);
                         let mut report_row = report::ReportRow::replayed(row, &usage, cost);

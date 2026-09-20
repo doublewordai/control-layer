@@ -44,7 +44,7 @@ impl<'c> Tariffs<'c> {
             )
             VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, NOW()), $8)
             RETURNING id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                      valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
+                      valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id, serving_class
             "#,
             request.deployed_model_id,
             request.name,
@@ -68,7 +68,7 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id, serving_class
             FROM model_tariffs
             WHERE id = $1
             "#,
@@ -88,9 +88,9 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id, serving_class
             FROM model_tariffs
-            WHERE deployed_model_id = $1 AND valid_until IS NULL AND user_id IS NULL
+            WHERE deployed_model_id = $1 AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW()) AND user_id IS NULL
             ORDER BY api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
             deployed_model_id
@@ -109,9 +109,9 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id, serving_class
             FROM model_tariffs
-            WHERE deployed_model_id = $1 AND valid_until IS NULL
+            WHERE deployed_model_id = $1 AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())
             ORDER BY user_id ASC NULLS FIRST, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
             deployed_model_id
@@ -122,6 +122,20 @@ impl<'c> Tariffs<'c> {
         Ok(tariffs)
     }
 
+    /// Load all current price scopes for a model list in one round trip.
+    pub async fn list_current_all_scopes_bulk(&mut self, model_ids: &[DeploymentId]) -> Result<Vec<TariffDBResponse>> {
+        Ok(sqlx::query_as::<_, ModelTariff>(
+            "SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
+                    valid_from, valid_until, api_key_purpose, completion_window, user_id, serving_class
+             FROM model_tariffs WHERE deployed_model_id = ANY($1)
+               AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())
+             ORDER BY deployed_model_id, user_id NULLS FIRST, api_key_purpose, completion_window, name",
+        )
+        .bind(model_ids)
+        .fetch_all(&mut *self.db)
+        .await?)
+    }
+
     /// List one organisation's current (active) tariffs across every model.
     #[instrument(skip(self), err)]
     pub async fn list_current_by_account(&mut self, user_id: Uuid) -> Result<Vec<TariffDBResponse>> {
@@ -129,9 +143,10 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id, serving_class
             FROM model_tariffs
-            WHERE user_id = $1 AND valid_until IS NULL
+            WHERE user_id = $1 AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())
+              AND EXISTS (SELECT 1 FROM deployed_models dm WHERE dm.id = model_tariffs.deployed_model_id AND dm.deleted = FALSE)
             ORDER BY deployed_model_id ASC, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
             user_id
@@ -154,13 +169,27 @@ impl<'c> Tariffs<'c> {
         let tariffs = sqlx::query_as!(
             ModelTariff,
             r#"
-            SELECT DISTINCT ON (deployed_model_id, api_key_purpose, completion_window)
-                   id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
-            FROM model_tariffs
-            WHERE deployed_model_id = ANY($1) AND valid_until IS NULL
-              AND (user_id IS NULL OR user_id = $2)
-            ORDER BY deployed_model_id, api_key_purpose, completion_window, user_id ASC NULLS LAST, name ASC
+            WITH relevant AS (
+                SELECT deployed_model_id, api_key_purpose, completion_window, serving_class
+                FROM model_tariffs
+                WHERE deployed_model_id = ANY($1) AND (user_id IS NULL OR user_id = $2)
+                  AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())
+                  AND api_key_purpose IS NOT NULL
+            ), selectors AS (
+                SELECT DISTINCT deployed_model_id, api_key_purpose, completion_window FROM relevant
+            ), classes AS (
+                SELECT DISTINCT deployed_model_id, serving_class FROM relevant
+                UNION SELECT DISTINCT deployed_model_id, NULL::text FROM relevant
+            )
+            SELECT t.id as "id!", t.deployed_model_id as "deployed_model_id!", t.name as "name!",
+                   t.input_price_per_token as "input_price_per_token!", t.output_price_per_token as "output_price_per_token!",
+                   t.valid_from as "valid_from!", t.valid_until, s.api_key_purpose as "api_key_purpose: _",
+                   s.completion_window, t.user_id, c.serving_class
+            FROM selectors s JOIN classes c USING (deployed_model_id)
+            CROSS JOIN LATERAL effective_model_tariff(s.deployed_model_id, $2, s.api_key_purpose,
+                s.completion_window, CASE WHEN s.api_key_purpose IN ('batch','continuation') THEN 'standard' ELSE c.serving_class END, NOW()) t
+            WHERE s.api_key_purpose NOT IN ('batch','continuation') OR c.serving_class IS NULL
+            ORDER BY t.deployed_model_id, c.serving_class NULLS FIRST, s.api_key_purpose, s.completion_window
             "#,
             deployed_model_ids,
             account
@@ -171,6 +200,28 @@ impl<'c> Tariffs<'c> {
         Ok(tariffs)
     }
 
+    pub async fn get_effective_pricing_at_timestamp(
+        &mut self,
+        model: DeploymentId,
+        account: Uuid,
+        purpose: &str,
+        window: Option<&str>,
+        class: Option<&str>,
+        timestamp: DateTime<Utc>,
+    ) -> Result<Option<(Decimal, Decimal)>> {
+        Ok(sqlx::query_as::<_, (Decimal, Decimal)>(
+            "SELECT input_price_per_token, output_price_per_token FROM effective_model_tariff($1,$2,$3,$4,$5,$6)",
+        )
+        .bind(model)
+        .bind(account)
+        .bind(purpose)
+        .bind(window)
+        .bind(class)
+        .bind(timestamp)
+        .fetch_optional(&mut *self.db)
+        .await?)
+    }
+
     /// List all tariffs (including historical) for a deployed model
     #[instrument(skip(self), err)]
     pub async fn list_all_by_model(&mut self, deployed_model_id: DeploymentId) -> Result<Vec<TariffDBResponse>> {
@@ -178,7 +229,7 @@ impl<'c> Tariffs<'c> {
             ModelTariff,
             r#"
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
-                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id
+                   valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id, serving_class
             FROM model_tariffs
             WHERE deployed_model_id = $1 AND user_id IS NULL
             ORDER BY valid_from DESC, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC

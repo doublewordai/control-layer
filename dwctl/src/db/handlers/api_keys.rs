@@ -975,13 +975,7 @@ impl<'c> ApiKeys<'c> {
                 OR (
                     -- Free models are accessible to all users (zero balance OK)
                     -- A model is free if it has no active tariffs or all active tariffs are zero-priced
-                    NOT EXISTS (
-                        SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id
-                        AND mt.valid_until IS NULL
-                        AND mt.user_id IS NULL
-                        AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
-                    )
+                    NOT model_has_effective_paid_tariff(dm.id, ak.user_id, ak.purpose)
                 )
             )
 
@@ -1024,13 +1018,7 @@ impl<'c> ApiKeys<'c> {
                 OR (
                     -- Free models are accessible to all users (zero balance OK)
                     -- A model is free if it has no active tariffs or all active tariffs are zero-priced
-                    NOT EXISTS (
-                        SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id
-                        AND mt.valid_until IS NULL
-                        AND mt.user_id IS NULL
-                        AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
-                    )
+                    NOT model_has_effective_paid_tariff(dm.id, ak.user_id, ak.purpose)
                 )
             )
             "#,

@@ -62,6 +62,57 @@ impl<'c> CacheTariffs<'c> {
         Self { db }
     }
 
+    /// Current class-specific cache prices for the billed account. The model's
+    /// general row owns enablement and the classifier's minimum prefix length.
+    pub async fn get_class_prices_bulk(
+        &mut self,
+        ids: &[DeploymentId],
+        account: uuid::Uuid,
+    ) -> Result<HashMap<DeploymentId, HashMap<String, ActiveTariff>>> {
+        #[derive(sqlx::FromRow)]
+        struct Row {
+            deployed_model_id: DeploymentId,
+            serving_class: String,
+            write_multiplier_5m: Decimal,
+            write_multiplier_1h: Decimal,
+            write_multiplier_24h: Decimal,
+            read_multiplier: Decimal,
+            min_prefix_tokens: i32,
+            valid_from: DateTime<Utc>,
+            valid_until: Option<DateTime<Utc>>,
+        }
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT DISTINCT ON (own.deployed_model_id, own.serving_class)
+                own.deployed_model_id, own.serving_class, own.write_multiplier_5m, own.write_multiplier_1h,
+                own.write_multiplier_24h, own.read_multiplier, general.min_prefix_tokens, own.valid_from, own.valid_until
+             FROM model_cache_tariffs own JOIN model_cache_tariffs general ON general.deployed_model_id = own.deployed_model_id
+                AND general.user_id IS NULL AND general.valid_from <= NOW() AND (general.valid_until IS NULL OR general.valid_until > NOW())
+             WHERE own.deployed_model_id = ANY($1) AND own.user_id = $2 AND own.serving_class IS NOT NULL
+                AND own.valid_from <= NOW() AND (own.valid_until IS NULL OR own.valid_until > NOW())
+             ORDER BY own.deployed_model_id, own.serving_class, own.valid_from DESC, general.valid_from DESC",
+        )
+        .bind(ids)
+        .bind(account)
+        .fetch_all(&mut *self.db)
+        .await?;
+        let mut result: HashMap<DeploymentId, HashMap<String, ActiveTariff>> = HashMap::new();
+        for r in rows {
+            result.entry(r.deployed_model_id).or_default().insert(
+                r.serving_class,
+                ActiveTariff {
+                    write_multiplier_5m: r.write_multiplier_5m,
+                    write_multiplier_1h: r.write_multiplier_1h,
+                    write_multiplier_24h: r.write_multiplier_24h,
+                    read_multiplier: r.read_multiplier,
+                    min_prefix_tokens: r.min_prefix_tokens,
+                    valid_from: r.valid_from,
+                    valid_until: r.valid_until,
+                },
+            );
+        }
+        Ok(result)
+    }
+
     /// Enable (or re-price) caching for a model: expire the current active version, then
     /// insert a new one from `defaults` + `overrides`. Idempotent in spirit — calling it
     /// again just supersedes the previous version, keeping the old one for audit.
@@ -165,7 +216,7 @@ impl<'c> CacheTariffs<'c> {
                       read_multiplier, min_prefix_tokens, valid_from, valid_until
                FROM model_cache_tariffs
                WHERE deployed_model_id = ANY($1)
-                 AND user_id = $2
+                 AND user_id = $2 AND serving_class IS NULL
                  AND valid_from <= now()
                  AND (valid_until IS NULL OR valid_until > now())
                ORDER BY deployed_model_id, valid_from DESC"#,

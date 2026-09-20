@@ -2299,3 +2299,76 @@ async fn test_deleted_keys_excluded_from_deployment_lookup(pool: sqlx::PgPool) {
         }
     }
 }
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_balance_user_a_positive")))]
+async fn organisation_prices_gate_balance_and_capped_root_and_child(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+    let owner: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
+    let key_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret=$1")
+        .bind(KEY_A_SECRET)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let child = {
+        let mut db = pool.acquire().await.unwrap();
+        ApiKeys::new(&mut db).get_or_create_child_hidden_key(key_id).await.unwrap().0
+    };
+    // These aliases are generally free: only this customer's deal is paid.
+    sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose) SELECT id,$1,'org-paid',1,1,'realtime' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
+        .bind(owner).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE user_balance_checkpoints SET balance=0 WHERE user_id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let tiers = RateLimitTiersConfig::default();
+    for phase in 0..4 {
+        match phase {
+            1 => {
+                sqlx::query("UPDATE user_balance_checkpoints SET balance=10 WHERE user_id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            2 => {
+                sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE id=$1")
+                    .bind(key_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO api_key_spend_checkpoints(api_key_id,total_spend,window_spend) VALUES ($1,1,1)")
+                    .bind(key_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            3 => {
+                sqlx::query("UPDATE model_tariffs SET input_price_per_token=0,output_price_per_token=0 WHERE user_id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let allowed = phase == 1 || phase == 3;
+        let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+        for alias in ["regular-public", "composite-priority"] {
+            let target = targets.targets.get(alias).unwrap();
+            assert_eq!(pool_has_key(target.value(), KEY_A_SECRET), allowed, "root {alias} phase {phase}");
+            assert_eq!(pool_has_key(target.value(), &child), allowed, "child {alias} phase {phase}");
+        }
+        let model: uuid::Uuid = sqlx::query_scalar("SELECT id FROM deployed_models WHERE alias='regular-public'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mut db = pool.acquire().await.unwrap();
+        let keys = ApiKeys::new(&mut db)
+            .get_api_keys_for_deployment_with_sufficient_credit(model)
+            .await
+            .unwrap();
+        // This repository method covers balance, while Onwards additionally covers caps.
+        assert_eq!(keys.iter().any(|key| key.secret == KEY_A_SECRET), phase != 0);
+    }
+}

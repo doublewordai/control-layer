@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { User, Info } from "lucide-react";
 import { useUpdateUser } from "../../../api/control-layer";
-import type { Role } from "../../../api/control-layer/types";
+import type { Role, ServingClassName } from "../../../api/control-layer/types";
 import { AVAILABLE_ROLES, SUBSET_ROLES, getRoleDisplayName } from "../../../utils/roles";
 import {
   Dialog,
@@ -28,8 +28,8 @@ interface EditUserModalProps {
     avatar?: string;
     roles: Role[];
     zero_data_retention: boolean;
-    granted_serving_classes?: string[];
-    default_serving_class?: string | null;
+    granted_serving_classes?: ServingClassName[];
+    default_serving_class?: ServingClassName | null;
     self_hosted_only?: boolean;
   };
   /** Whether the current user may toggle zero data retention (admins only). */
@@ -53,7 +53,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
     roles: currentUser.roles,
     zero_data_retention: currentUser.zero_data_retention,
     granted_serving_classes: currentUser.granted_serving_classes ?? [],
-    default_serving_class: currentUser.default_serving_class ?? "standard",
+    default_serving_class: (currentUser.default_serving_class ?? "standard") as ServingClassName | "standard",
     self_hosted_only: currentUser.self_hosted_only ?? false,
   });
   const [error, setError] = useState<string | null>(null);
@@ -329,7 +329,7 @@ export const EditUserModal: React.FC<EditUserModalProps> = ({
                     onChange={(e) =>
                       setFormData((prev) => ({
                         ...prev,
-                        default_serving_class: e.target.value,
+                        default_serving_class: e.target.value as ServingClassName | "standard",
                       }))
                     }
                   >

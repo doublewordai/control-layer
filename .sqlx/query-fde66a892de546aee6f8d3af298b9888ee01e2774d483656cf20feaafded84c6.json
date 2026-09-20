@@ -1,0 +1,83 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            WITH relevant AS (\n                SELECT deployed_model_id, api_key_purpose, completion_window, serving_class\n                FROM model_tariffs\n                WHERE deployed_model_id = ANY($1) AND (user_id IS NULL OR user_id = $2)\n                  AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())\n                  AND api_key_purpose IS NOT NULL\n            ), selectors AS (\n                SELECT DISTINCT deployed_model_id, api_key_purpose, completion_window FROM relevant\n            ), classes AS (\n                SELECT DISTINCT deployed_model_id, serving_class FROM relevant\n                UNION SELECT DISTINCT deployed_model_id, NULL::text FROM relevant\n            )\n            SELECT t.id as \"id!\", t.deployed_model_id as \"deployed_model_id!\", t.name as \"name!\",\n                   t.input_price_per_token as \"input_price_per_token!\", t.output_price_per_token as \"output_price_per_token!\",\n                   t.valid_from as \"valid_from!\", t.valid_until, s.api_key_purpose as \"api_key_purpose: _\",\n                   s.completion_window, t.user_id, c.serving_class\n            FROM selectors s JOIN classes c USING (deployed_model_id)\n            CROSS JOIN LATERAL effective_model_tariff(s.deployed_model_id, $2, s.api_key_purpose,\n                s.completion_window, CASE WHEN s.api_key_purpose IN ('batch','continuation') THEN 'standard' ELSE c.serving_class END, NOW()) t\n            WHERE s.api_key_purpose NOT IN ('batch','continuation') OR c.serving_class IS NULL\n            ORDER BY t.deployed_model_id, c.serving_class NULLS FIRST, s.api_key_purpose, s.completion_window\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 1,
+        "name": "deployed_model_id!",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "name!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "input_price_per_token!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 4,
+        "name": "output_price_per_token!",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 5,
+        "name": "valid_from!",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 6,
+        "name": "valid_until",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 7,
+        "name": "api_key_purpose: _",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 8,
+        "name": "completion_window",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 9,
+        "name": "user_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 10,
+        "name": "serving_class",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      true,
+      true,
+      null,
+      null
+    ]
+  },
+  "hash": "fde66a892de546aee6f8d3af298b9888ee01e2774d483656cf20feaafded84c6"
+}

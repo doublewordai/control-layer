@@ -50,7 +50,8 @@ pub struct OrganizationCacheTariffResponse {
     pub write_multiplier_24h: Decimal,
     #[schema(value_type = String)]
     pub read_multiplier: Decimal,
-    pub min_prefix_tokens: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serving_class: Option<String>,
     pub valid_from: DateTime<Utc>,
 }
 
