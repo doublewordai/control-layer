@@ -1206,7 +1206,6 @@ pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid) -> Result<HashMa
         SELECT dm.alias, t.input_price_per_token as "input_price_per_token!", t.output_price_per_token as "output_price_per_token!"
         FROM deployed_models dm
         CROSS JOIN LATERAL effective_model_tariff(dm.id, $1, 'realtime', NULL, 'standard', NOW()) t
-        WHERE dm.deleted = FALSE
         "#,
         account
     )

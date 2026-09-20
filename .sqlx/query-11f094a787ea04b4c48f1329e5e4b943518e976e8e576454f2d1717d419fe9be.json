@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT dm.alias, t.input_price_per_token as \"input_price_per_token!\", t.output_price_per_token as \"output_price_per_token!\"\n        FROM deployed_models dm\n        CROSS JOIN LATERAL effective_model_tariff(dm.id, $1, 'realtime', NULL, 'standard', NOW()) t\n        WHERE dm.deleted = FALSE\n        ",
+  "query": "\n        SELECT dm.alias, t.input_price_per_token as \"input_price_per_token!\", t.output_price_per_token as \"output_price_per_token!\"\n        FROM deployed_models dm\n        CROSS JOIN LATERAL effective_model_tariff(dm.id, $1, 'realtime', NULL, 'standard', NOW()) t\n        ",
   "describe": {
     "columns": [
       {
@@ -30,5 +30,5 @@
       null
     ]
   },
-  "hash": "f9026b66948373914470c937b4b04aa78858264f05620151aad0cd3e4c347711"
+  "hash": "11f094a787ea04b4c48f1329e5e4b943518e976e8e576454f2d1717d419fe9be"
 }

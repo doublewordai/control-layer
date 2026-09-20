@@ -2110,11 +2110,7 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
     // Use the completion_window from query params, defaulting to "24h"
     let completion_window = query.completion_window.as_deref().unwrap_or("24h");
     // Operators may inspect another account's file; quote that account's deal.
-    let pricing_account = file
-        .uploaded_by
-        .as_deref()
-        .and_then(|owner| Uuid::parse_str(owner).ok())
-        .unwrap_or(current_user.active_organization.unwrap_or(current_user.id));
+    let pricing_account = file.uploaded_by.as_deref().and_then(|owner| Uuid::parse_str(owner).ok());
 
     for (model_alias, (request_count, input_tokens)) in model_stats {
         // Look up the deployment and historical average

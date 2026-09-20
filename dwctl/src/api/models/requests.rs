@@ -382,7 +382,9 @@ pub struct UserBatchUsageResponse {
     pub total_batch_count: i64,
     pub avg_requests_per_batch: f64,
     pub total_cost: String,
-    /// Estimated cost if all tokens were charged at realtime tariff rates.
+    /// Counterfactual cost at this billing account's current standard-class realtime
+    /// rates. This comparison does not reprice historical requests in their original
+    /// classes; total_cost contains the charges actually incurred.
     pub estimated_realtime_cost: String,
     pub by_model: Vec<ModelBreakdownEntry>,
 }

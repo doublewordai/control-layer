@@ -34,7 +34,7 @@ pub struct TariffResponse {
     pub completion_window: Option<String>,
     pub valid_from: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
-    /// Indicates if this tariff is currently active (valid_until IS NULL)
+    /// True once valid_from is reached and before valid_until, if an end is set.
     #[serde(default)]
     pub is_active: bool,
     /// Set when this is an organisation's own price rather than the model's general

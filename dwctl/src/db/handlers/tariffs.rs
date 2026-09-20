@@ -181,15 +181,15 @@ impl<'c> Tariffs<'c> {
                 SELECT DISTINCT deployed_model_id, serving_class FROM relevant
                 UNION SELECT DISTINCT deployed_model_id, NULL::text FROM relevant
             )
-            SELECT t.id as "id!", t.deployed_model_id as "deployed_model_id!", t.name as "name!",
+            SELECT DISTINCT t.id as "id!", t.deployed_model_id as "deployed_model_id!", t.name as "name!",
                    t.input_price_per_token as "input_price_per_token!", t.output_price_per_token as "output_price_per_token!",
                    t.valid_from as "valid_from!", t.valid_until, s.api_key_purpose as "api_key_purpose: _",
-                   s.completion_window, t.user_id, c.serving_class
+                   s.completion_window, t.user_id, t.serving_class
             FROM selectors s JOIN classes c USING (deployed_model_id)
             CROSS JOIN LATERAL effective_model_tariff(s.deployed_model_id, $2, s.api_key_purpose,
                 s.completion_window, CASE WHEN s.api_key_purpose IN ('batch','continuation') THEN 'standard' ELSE c.serving_class END, NOW()) t
             WHERE s.api_key_purpose NOT IN ('batch','continuation') OR c.serving_class IS NULL
-            ORDER BY t.deployed_model_id, c.serving_class NULLS FIRST, s.api_key_purpose, s.completion_window
+            ORDER BY "deployed_model_id!", t.serving_class NULLS FIRST, "api_key_purpose: _", s.completion_window
             "#,
             deployed_model_ids,
             account
@@ -203,7 +203,7 @@ impl<'c> Tariffs<'c> {
     pub async fn get_effective_pricing_at_timestamp(
         &mut self,
         model: DeploymentId,
-        account: Uuid,
+        account: Option<Uuid>,
         purpose: &str,
         window: Option<&str>,
         class: Option<&str>,

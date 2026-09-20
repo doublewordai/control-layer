@@ -386,6 +386,35 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn organization_prices_do_not_leak_into_global_model_metrics(pool: sqlx::PgPool) {
+        let handle = ensure_recorder();
+        let org = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let alias = format!("private-price-metric-{}", uuid::Uuid::new_v4());
+        let model: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ($1,$1,true,$2) RETURNING id",
+        )
+        .bind(&alias)
+        .bind(org.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,$2,'private-price',7,7,'realtime')").bind(model).bind(org.id).execute(&pool).await.unwrap();
+        let targets = load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
+            .await
+            .unwrap();
+        super::update_cache_info_metrics(&pool, &targets, &mut super::CacheInfoState::new())
+            .await
+            .unwrap();
+        let output = handle.render();
+        let own: Vec<_> = output.lines().filter(|line| line.contains(&alias)).collect();
+        assert!(
+            own.iter()
+                .any(|line| line.starts_with("dwctl_model_info{") && line.contains("is_metered=\"false\""))
+        );
+        assert!(!own.iter().any(|line| line.starts_with("dwctl_model_tariff{")));
+    }
+
+    #[sqlx::test]
     async fn test_model_info_and_group_metrics(pool: sqlx::PgPool) {
         let handle = ensure_recorder();
         let mut state = super::CacheInfoState::new();
