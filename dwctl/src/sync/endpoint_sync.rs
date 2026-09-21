@@ -797,6 +797,7 @@ mod tests {
                 allowed_batch_completion_windows: None,
                 metadata: serde_json::Value::Object(serde_json::Map::new()),
                 provisioning_source: mock.provisioning_source,
+                serving_classes: serde_json::json!({}),
             }
         }
     }
@@ -1000,6 +1001,7 @@ mod tests {
             created_by: uuid::Uuid::nil(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            kind: Default::default(),
         }
     }
 

@@ -3,7 +3,7 @@
 use crate::db::errors::{DbError, Result};
 use crate::db::handlers::repository::Repository;
 use crate::db::models::inference_endpoints::{
-    InferenceEndpointCreateDBRequest, InferenceEndpointDBResponse, InferenceEndpointUpdateDBRequest,
+    EndpointKind, InferenceEndpointCreateDBRequest, InferenceEndpointDBResponse, InferenceEndpointUpdateDBRequest,
 };
 use crate::types::{InferenceEndpointId, UserId, abbrev_uuid};
 use chrono::{DateTime, Utc};
@@ -37,6 +37,7 @@ struct InferenceEndpoint {
     pub auth_header_prefix: String,
     pub reasoning_translation: Option<serde_json::Value>,
     pub accepts_scheduling_priority: bool,
+    pub kind: String,
     pub created_by: UserId,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -57,6 +58,7 @@ impl TryFrom<InferenceEndpoint> for InferenceEndpointDBResponse {
             auth_header_prefix: src.auth_header_prefix,
             reasoning_translation: src.reasoning_translation.map(serde_json::from_value).transpose()?,
             accepts_scheduling_priority: src.accepts_scheduling_priority,
+            kind: EndpointKind::from_db_str(&src.kind).ok_or_else(|| anyhow::anyhow!("unknown endpoint kind {:?}", src.kind))?,
             created_by: src.created_by,
             created_at: src.created_at,
             updated_at: src.updated_at,
@@ -88,9 +90,9 @@ impl<'c> Repository for InferenceEndpoints<'c> {
         let endpoint = sqlx::query_as!(
             InferenceEndpoint,
             r#"
-            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by, reasoning_translation, accepts_scheduling_priority)
-            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8, $9, $10)
-            RETURNING name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority
+            INSERT INTO inference_endpoints (name, description, url, api_key, model_filter, auth_header_name, auth_header_prefix, created_by, reasoning_translation, accepts_scheduling_priority, kind)
+            VALUES ($1, $2, $3, $4, $5, COALESCE($6, 'Authorization'), COALESCE($7, 'Bearer '), $8, $9, $10, $11)
+            RETURNING name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority, kind
             "#,
             request.name,
             request.description,
@@ -101,7 +103,8 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             request.auth_header_prefix,
             request.created_by,
             reasoning_translation,
-            request.accepts_scheduling_priority
+            request.accepts_scheduling_priority,
+            request.kind.as_db_str()
         )
         .fetch_one(&mut *self.db)
         .await?;
@@ -111,7 +114,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
 
     #[instrument(skip(self), fields(endpoint_id = %abbrev_uuid(&id)), err)]
     async fn get_by_id(&mut self, id: Self::Id) -> Result<Option<Self::Response>> {
-        let endpoint = sqlx::query_as!(InferenceEndpoint, "SELECT name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority FROM inference_endpoints WHERE id = $1", id)
+        let endpoint = sqlx::query_as!(InferenceEndpoint, "SELECT name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority, kind FROM inference_endpoints WHERE id = $1", id)
             .fetch_optional(&mut *self.db)
             .await?;
 
@@ -127,7 +130,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             return Ok(std::collections::HashMap::new());
         }
 
-        let rows = sqlx::query!("SELECT name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority FROM inference_endpoints WHERE id = ANY($1)", &ids)
+        let rows = sqlx::query!("SELECT name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority, kind FROM inference_endpoints WHERE id = ANY($1)", &ids)
             .fetch_all(&mut *self.db)
             .await?;
 
@@ -144,6 +147,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
                 auth_header_prefix: row.auth_header_prefix,
                 reasoning_translation: row.reasoning_translation,
                 accepts_scheduling_priority: row.accepts_scheduling_priority,
+                kind: row.kind,
                 created_by: row.created_by,
                 created_at: row.created_at,
                 updated_at: row.updated_at,
@@ -202,9 +206,10 @@ impl<'c> Repository for InferenceEndpoints<'c> {
                     ELSE reasoning_translation
                 END,
                 accepts_scheduling_priority = COALESCE($11, accepts_scheduling_priority),
+                kind = COALESCE($12, kind),
                 updated_at = NOW()
             WHERE id = $1
-            RETURNING name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority
+            RETURNING name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority, kind
             "#,
             id,
             request.name,
@@ -216,7 +221,8 @@ impl<'c> Repository for InferenceEndpoints<'c> {
             request.auth_header_prefix,
             request.reasoning_translation.is_some(),
             reasoning_translation,
-            request.accepts_scheduling_priority
+            request.accepts_scheduling_priority,
+            request.kind.map(EndpointKind::as_db_str)
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -229,7 +235,7 @@ impl<'c> Repository for InferenceEndpoints<'c> {
     async fn list(&mut self, filter: &Self::Filter) -> Result<Vec<Self::Response>> {
         let endpoints = sqlx::query_as!(
             InferenceEndpoint,
-            "SELECT name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority FROM inference_endpoints ORDER BY created_at DESC LIMIT $1 OFFSET $2",
+            "SELECT name, description, url, created_by, created_at, updated_at, model_filter, api_key, id, auth_header_name, auth_header_prefix, reasoning_translation, accepts_scheduling_priority, kind FROM inference_endpoints ORDER BY created_at DESC LIMIT $1 OFFSET $2",
             filter.limit,
             filter.skip
         )
@@ -295,6 +301,7 @@ mod tests {
             reasoning_translation: None,
             accepts_scheduling_priority: false,
             created_by,
+            kind: Default::default(),
         }
     }
 
@@ -362,6 +369,7 @@ mod tests {
                     auth_header_prefix: None,
                     reasoning_translation: Some(None),
                     accepts_scheduling_priority: None,
+                    kind: Default::default(),
                 },
             )
             .await
@@ -517,6 +525,7 @@ mod tests {
             auth_header_prefix: None,
             reasoning_translation: None,
             accepts_scheduling_priority: None,
+            kind: Default::default(),
         };
 
         // Apply update
@@ -543,6 +552,46 @@ mod tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_endpoint_kind_round_trips_through_create_and_update(pool: PgPool) {
+        let user = create_test_user(&pool).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let mut repo = InferenceEndpoints::new(&mut conn);
+
+        let mut request = create_test_endpoint_request(user.id, "dynamo-endpoint");
+        request.kind = EndpointKind::Dynamo;
+        let created = repo.create(&request).await.unwrap();
+        assert_eq!(created.kind, EndpointKind::Dynamo);
+        assert_eq!(repo.get_by_id(created.id).await.unwrap().unwrap().kind, EndpointKind::Dynamo);
+
+        let updated = repo
+            .update(
+                created.id,
+                &InferenceEndpointUpdateDBRequest {
+                    kind: Some(EndpointKind::Hosted),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(updated.kind, EndpointKind::Hosted);
+        assert_eq!(updated.name, created.name, "an update touching only the kind changes nothing else");
+
+        // Omitting the kind on an update leaves it unchanged.
+        let untouched = repo
+            .update(
+                created.id,
+                &InferenceEndpointUpdateDBRequest {
+                    description: Some("renamed".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(untouched.kind, EndpointKind::Hosted);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_apply_update_partial_fields(pool: PgPool) {
         let user = create_test_user(&pool).await;
         let mut conn = pool.acquire().await.unwrap();
@@ -563,6 +612,7 @@ mod tests {
             auth_header_prefix: None,
             reasoning_translation: None,
             accepts_scheduling_priority: None,
+            kind: Default::default(),
         };
 
         // Apply update
@@ -635,6 +685,7 @@ mod tests {
             created_by: uuid::Uuid::new_v4(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            kind: Default::default(),
         };
 
         // Test ApplyUpdate trait directly
@@ -648,6 +699,7 @@ mod tests {
             auth_header_prefix: None,
             reasoning_translation: None,
             accepts_scheduling_priority: None,
+            kind: Default::default(),
         };
 
         let updated_response = mock_coalesce_update(update_request, original_response.clone());
@@ -688,6 +740,7 @@ mod tests {
             created_by: uuid::Uuid::new_v4(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now() - chrono::Duration::seconds(1),
+            kind: Default::default(),
         };
 
         // Test ApplyUpdate with empty update (all None fields)
@@ -701,6 +754,7 @@ mod tests {
             auth_header_prefix: None,
             reasoning_translation: None,
             accepts_scheduling_priority: None,
+            kind: Default::default(),
         };
 
         let updated_response = mock_coalesce_update(update_request, original_response.clone());
@@ -736,6 +790,7 @@ mod tests {
             auth_header_prefix: None,
             reasoning_translation: None,
             accepts_scheduling_priority: None,
+            kind: Default::default(),
         };
 
         let result = repo.update(fake_id, &update_request).await;

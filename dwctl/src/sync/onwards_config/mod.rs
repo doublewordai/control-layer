@@ -2,6 +2,7 @@
 
 use crate::db::models::deployments::DEFAULT_COMPONENT_POOL;
 use crate::metrics::errors::component::ONWARDS_SYNC;
+use crate::types::UserId;
 use std::{
     collections::{BTreeMap, HashMap},
     num::NonZeroU32,
@@ -16,6 +17,7 @@ use onwards::target::{
     ProviderSpec, RateLimitParameters, RoutingAction, RoutingRule, TargetSpecOrList, Targets, WatchTargetsStream,
     inheritable_routing_rules,
 };
+use onwards::{AccountServing, ProviderKind, ServingClass, ServingOverlay, ServingPresets, ServingTargets};
 use sqlx::{PgPool, postgres::PgListener};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -69,6 +71,9 @@ struct OnwardsTarget {
     reasoning_translation: Option<ReasoningTranslationConfig>,
     /// Traffic routing rules from the model_traffic_rules table
     routing_rules: Vec<RoutingRule>,
+    /// Serving classes this alias offers, each a preset of targets
+    /// (`deployed_models.serving_classes`).
+    serving_classes: ServingPresets,
 
     // Fallback / backoff config. Standard (single-provider) models only retry
     // when fallback is on AND `with_replacement` is true (otherwise the
@@ -98,6 +103,10 @@ struct OnwardsTarget {
     /// body field (dynamo). Onwards strips the field from named-pool attempts
     /// to members without it, regardless of position.
     endpoint_accepts_scheduling_priority: bool,
+    /// What kind of server the endpoint is (`inference_endpoints.kind`): only
+    /// `dynamo` receives the serving-class envelope; `external` is skipped for
+    /// self-hosted-only accounts.
+    endpoint_kind: ProviderKind,
 
     // API keys that have access to this deployment
     api_keys: Vec<OnwardsApiKey>,
@@ -118,6 +127,140 @@ struct OnwardsApiKey {
     /// Account-wide zero-data-retention flag on the api_key's owning user.
     /// Surfaced to onwards as a "zdr" key label; onwards does not act on it yet.
     zero_data_retention: bool,
+    /// The owning account (`api_keys.user_id`): the org for org keys. Emitted
+    /// as the key's `account` label, through which onwards finds the
+    /// account's serving settings and an alias's overlay for it.
+    user_id: UserId,
+}
+
+/// Every alias's overlays, keyed by alias then by account id (as a string,
+/// the value of the key's `account` label), as read from `model_overlays`.
+type OverlaysByAlias = HashMap<String, HashMap<String, ServingOverlay>>;
+
+/// Serving account settings per account id, for accounts that have any.
+type AccountsById = HashMap<String, AccountServing>;
+
+/// Parse a stored class name; the CHECK constraints guarantee the set, so an
+/// unknown value is a schema drift worth a warning rather than a crash.
+fn parse_stored_class(value: Option<&str>) -> Option<ServingClass> {
+    let value = value?;
+    match value.parse::<ServingClass>() {
+        Ok(class) => Some(class),
+        Err(err) => {
+            warn!(%err, "ignoring unknown serving class stored in the database");
+            None
+        }
+    }
+}
+
+/// Parse a stored endpoint kind; the CHECK constraint guarantees the set.
+fn parse_provider_kind(value: &str) -> ProviderKind {
+    value.parse().unwrap_or_else(|err: String| {
+        warn!(%err, "ignoring unknown endpoint kind stored in the database; treating as external");
+        ProviderKind::External
+    })
+}
+
+fn parse_stored_classes(values: &[String]) -> Vec<ServingClass> {
+    values.iter().filter_map(|v| parse_stored_class(Some(v))).collect()
+}
+
+/// Parse a model's stored presets (`deployed_models.serving_classes`, JSONB
+/// object class → targets). The catalog writes them, so a malformed value is
+/// a schema drift worth a warning; the model then offers nothing.
+fn parse_stored_presets(value: &serde_json::Value, alias: &str) -> ServingPresets {
+    match serde_json::from_value(value.clone()) {
+        Ok(presets) => presets,
+        Err(err) => {
+            warn!(%err, alias, "ignoring malformed serving class presets stored in the database");
+            ServingPresets::new()
+        }
+    }
+}
+
+/// Parse an overlay's stored explicit targets (`model_overlays.targets`).
+fn parse_stored_targets(value: Option<serde_json::Value>) -> Option<ServingTargets> {
+    let value = value?;
+    match serde_json::from_value(value) {
+        Ok(targets) => Some(targets),
+        Err(err) => {
+            warn!(%err, "ignoring malformed overlay targets stored in the database");
+            None
+        }
+    }
+}
+
+/// Loads every alias's overlays, keyed by alias then account id.
+async fn load_overlays_from_db(db: &PgPool) -> Result<OverlaysByAlias, anyhow::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT mo.user_id, dm.alias, mo.default_serving_class, mo.targets, mo.self_hosted_only
+        FROM model_overlays mo
+        INNER JOIN deployed_models dm ON dm.id = mo.deployed_model_id
+        INNER JOIN users u ON u.id = mo.user_id
+        WHERE dm.deleted = FALSE
+          AND u.is_deleted = FALSE
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    let mut overlays: OverlaysByAlias = HashMap::new();
+    for row in rows {
+        overlays.entry(row.alias).or_default().insert(
+            row.user_id.to_string(),
+            ServingOverlay {
+                default_class: parse_stored_class(row.default_serving_class.as_deref()),
+                targets: parse_stored_targets(row.targets),
+                self_hosted_only: row.self_hosted_only,
+            },
+        );
+    }
+    Ok(overlays)
+}
+
+/// Loads the serving account settings of every account that has any. An
+/// account with nothing set is absent, so the config for everyone else is
+/// byte-identical to before serving classes existed.
+async fn load_accounts_from_db(db: &PgPool) -> Result<AccountsById, anyhow::Error> {
+    let rows = sqlx::query!(
+        r#"
+        SELECT id, granted_serving_classes, default_serving_class, self_hosted_only
+        FROM users
+        WHERE is_deleted = FALSE
+          AND (granted_serving_classes <> '{}' OR default_serving_class IS NOT NULL OR self_hosted_only)
+        "#
+    )
+    .fetch_all(db)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| {
+            (
+                row.id.to_string(),
+                AccountServing {
+                    granted: parse_stored_classes(&row.granted_serving_classes),
+                    default_class: parse_stored_class(row.default_serving_class.as_deref()),
+                    self_hosted_only: row.self_hosted_only,
+                },
+            )
+        })
+        .collect())
+}
+
+/// The labels every key carries: its purpose, the account's ZDR flag, and the
+/// account itself so onwards can find the account's serving settings and an
+/// alias's overlay for it.
+fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
+    HashMap::from([
+        ("purpose".to_string(), api_key.purpose.clone()),
+        // Surface the account's zero-data-retention flag to onwards as a label.
+        // Always emitted ("true"/"false"); onwards does not act on it yet.
+        ("zdr".to_string(), api_key.zero_data_retention.to_string()),
+        (onwards::serving::ACCOUNT_LABEL.to_string(), api_key.user_id.to_string()),
+        ("api_key_id".to_string(), api_key.id.to_string()),
+    ])
 }
 
 /// Manages the integration between onwards-pilot and the onwards proxy
@@ -517,6 +660,8 @@ struct OnwardsCompositeModel {
     trusted: bool,
     /// Traffic routing rules from the database
     routing_rules: Vec<RoutingRule>,
+    /// Serving classes this alias offers, each a preset of targets.
+    serving_classes: ServingPresets,
     components: Vec<CompositeModelComponent>,
     // API keys that have access to this composite model
     api_keys: Vec<OnwardsApiKey>,
@@ -566,7 +711,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ie.api_key as endpoint_api_key,
             ie.auth_header_name,
             ie.auth_header_prefix,
-            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority
+            ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,
+            ie.kind as endpoint_kind
         FROM deployed_models cm
         INNER JOIN deployed_model_components dmc ON cm.id = dmc.composite_model_id
         INNER JOIN deployed_models dm ON dmc.deployed_model_id = dm.id
@@ -597,7 +743,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             ak.requests_per_second,
             ak.burst_size,
             ak.user_verified,
-            ak.user_zero_data_retention
+            ak.user_zero_data_retention,
+            ak.user_id
         FROM deployed_models cm
         CROSS JOIN LATERAL (
             SELECT DISTINCT
@@ -606,6 +753,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 ak.purpose,
                 ak.requests_per_second,
                 ak.burst_size,
+                ak.user_id,
                 u.verified as user_verified,
                 u.zero_data_retention as user_zero_data_retention
             FROM api_keys ak
@@ -737,7 +885,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             first_token_timeout_ms,
             aimd,
             sanitize_responses,
-            trusted
+            trusted,
+            serving_classes
         FROM deployed_models
         WHERE is_composite = TRUE
           AND deleted = FALSE
@@ -755,6 +904,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             .and_then(LoadBalancingStrategy::try_parse)
             .unwrap_or_default();
 
+        let presets = parse_stored_presets(&row.serving_classes, &row.alias);
         composite_map.insert(
             row.composite_model_id,
             OnwardsCompositeModel {
@@ -781,6 +931,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
                 routing_rules: Vec::new(), // Populated from separate query below
+                serving_classes: presets,
                 components: Vec::new(),
                 api_keys: Vec::new(),
             },
@@ -818,7 +969,8 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                         row.model_reasoning_translation_overrides,
                         &row.deployment_alias,
                     ),
-                    routing_rules: Vec::new(), // Components don't have their own routing rules
+                    routing_rules: Vec::new(),              // Components don't have their own routing rules
+                    serving_classes: ServingPresets::new(), // Activation is the composite's, not a member's
                     // Components don't surface their own fallback/backoff —
                     // the composite's PoolSpec.fallback drives retries across
                     // the whole pool.
@@ -841,6 +993,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     auth_header_name: row.auth_header_name.clone(),
                     auth_header_prefix: row.auth_header_prefix.clone(),
                     endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
+                    endpoint_kind: parse_provider_kind(&row.endpoint_kind),
                     api_keys: Vec::new(),
                 },
             });
@@ -860,6 +1013,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     burst_size: row.burst_size,
                     user_verified: row.user_verified,
                     zero_data_retention: row.user_zero_data_retention,
+                    user_id: row.user_id,
                 });
             }
         }
@@ -883,6 +1037,7 @@ fn convert_composite_to_target_spec(
     composite: &OnwardsCompositeModel,
     key_definitions: &mut HashMap<String, KeyDefinition>,
     rate_limit_tiers: &RateLimitTiersConfig,
+    overlays: &OverlaysByAlias,
 ) -> (String, TargetSpecOrList) {
     // Add this composite model's API keys to key_definitions
     for api_key in &composite.api_keys {
@@ -898,19 +1053,13 @@ fn convert_composite_to_target_spec(
             )
         };
 
-        let mut labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
-        labels.insert("api_key_id".to_string(), api_key.id.to_string());
-        // Surface the account's zero-data-retention flag to onwards as a label.
-        // Always emitted ("true"/"false"); onwards does not act on it yet.
-        labels.insert("zdr".to_string(), api_key.zero_data_retention.to_string());
-
         key_definitions.insert(
             api_key.id.to_string(),
             KeyDefinition {
                 key: api_key.secret.clone(),
                 rate_limit,
                 concurrency_limit: None,
-                labels,
+                labels: key_labels(api_key),
             },
         );
     }
@@ -1054,6 +1203,7 @@ fn convert_composite_to_target_spec(
                     propagate_trace_context: None,
                     reasoning_translation: target.reasoning_translation.clone().map(Into::into),
                     accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
+                    kind: target.endpoint_kind,
                 }
             }
         };
@@ -1118,6 +1268,18 @@ fn convert_composite_to_target_spec(
         } else {
             inheritable_routing_rules(&composite.routing_rules)
         },
+        // Offered classes and per-account overlays are properties of the
+        // alias, declared on its default pool.
+        serving_classes: if pool_name == DEFAULT_COMPONENT_POOL {
+            composite.serving_classes.clone()
+        } else {
+            ServingPresets::new()
+        },
+        overlays: if pool_name == DEFAULT_COMPONENT_POOL {
+            overlays.get(&composite.alias).cloned().unwrap_or_default()
+        } else {
+            HashMap::new()
+        },
     };
 
     let mut pools: HashMap<String, PoolSpec> = pool_providers
@@ -1177,6 +1339,8 @@ fn convert_to_config_file(
     composites: Vec<OnwardsCompositeModel>,
     strict_mode: bool,
     rate_limit_tiers: &RateLimitTiersConfig,
+    overlays: &OverlaysByAlias,
+    accounts: AccountsById,
 ) -> ConfigFile {
     let mut key_definitions = HashMap::new();
 
@@ -1198,20 +1362,13 @@ fn convert_to_config_file(
                     )
                 };
 
-                // Build labels from API key purpose
-                let mut labels = HashMap::from([("purpose".to_string(), api_key.purpose.clone())]);
-                labels.insert("api_key_id".to_string(), api_key.id.to_string());
-                // Surface the account's zero-data-retention flag as a label.
-                // Always emitted ("true"/"false"); onwards does not act on it yet.
-                labels.insert("zdr".to_string(), api_key.zero_data_retention.to_string());
-
                 key_definitions.insert(
                     api_key.id.to_string(),
                     KeyDefinition {
                         key: api_key.secret.clone(),
                         rate_limit,
                         concurrency_limit: None,
-                        labels,
+                        labels: key_labels(api_key),
                     },
                 );
             }
@@ -1269,6 +1426,7 @@ fn convert_to_config_file(
                 propagate_trace_context: None,
                 reasoning_translation: target.reasoning_translation.clone().map(Into::into),
                 accepts_scheduling_priority: target.endpoint_accepts_scheduling_priority,
+                kind: target.endpoint_kind,
             };
 
             // Build fallback configuration. For single-provider (standard)
@@ -1318,6 +1476,8 @@ fn convert_to_config_file(
                 sanitize_response: target.sanitize_responses,
                 trusted: false,
                 routing_rules: target.routing_rules,
+                serving_classes: target.serving_classes,
+                overlays: overlays.get(&target.alias).cloned().unwrap_or_default(),
             };
 
             (target.alias, TargetSpecOrList::Pool(pool_spec))
@@ -1336,7 +1496,7 @@ fn convert_to_config_file(
             );
         }
 
-        let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions, rate_limit_tiers);
+        let (alias, spec) = convert_composite_to_target_spec(&composite, &mut key_definitions, rate_limit_tiers, overlays);
         target_specs.insert(alias, spec);
     }
 
@@ -1356,6 +1516,7 @@ fn convert_to_config_file(
         auth,
         strict_mode,
         http_pool: None,
+        accounts,
     }
 }
 
@@ -1411,13 +1572,16 @@ pub async fn load_targets_from_db(
             ie.auth_header_name,
             ie.auth_header_prefix,
             ie.accepts_scheduling_priority as endpoint_accepts_scheduling_priority,
+            ie.kind as endpoint_kind,
             ak.id as "api_key_id?",
             ak.secret as "api_key_secret?",
             ak.purpose as "api_key_purpose?",
             ak.requests_per_second as api_key_requests_per_second,
             ak.burst_size as api_key_burst_size,
             ak.user_verified as "api_key_user_verified?",
-            ak.user_zero_data_retention as "api_key_user_zero_data_retention?"
+            ak.user_zero_data_retention as "api_key_user_zero_data_retention?",
+            ak.user_id as "api_key_user_id?",
+            dm.serving_classes
         FROM deployed_models dm
         INNER JOIN inference_endpoints ie ON dm.hosted_on = ie.id
         LEFT JOIN LATERAL (
@@ -1427,6 +1591,7 @@ pub async fn load_targets_from_db(
                 ak.purpose,
                 ak.requests_per_second,
                 ak.burst_size,
+                ak.user_id,
                 u.verified as user_verified,
                 u.zero_data_retention as user_zero_data_retention
             FROM api_keys ak
@@ -1557,6 +1722,7 @@ pub async fn load_targets_from_db(
                     &row.alias,
                 ),
                 routing_rules: Vec::new(), // Populated from separate query below
+                serving_classes: parse_stored_presets(&row.serving_classes, &row.alias),
                 fallback_enabled: row.fallback_enabled.unwrap_or(true),
                 fallback_on_rate_limit: row.fallback_on_rate_limit.unwrap_or(true),
                 fallback_on_status: row.fallback_on_status.clone().unwrap_or_else(|| vec![429, 499, 500, 502, 503, 504]),
@@ -1576,6 +1742,7 @@ pub async fn load_targets_from_db(
                 auth_header_name: row.auth_header_name.clone(),
                 auth_header_prefix: row.auth_header_prefix.clone(),
                 endpoint_accepts_scheduling_priority: row.endpoint_accepts_scheduling_priority,
+                endpoint_kind: parse_provider_kind(&row.endpoint_kind),
                 api_keys: Vec::new(),
             }
         });
@@ -1585,12 +1752,20 @@ pub async fn load_targets_from_db(
         // tie it to the same "row materialised" check as the other api_key columns
         // so a future schema/SQL change can't silently demote keys to the
         // unverified tier.
-        if let (Some(api_key_id), Some(api_key_secret), Some(api_key_purpose), Some(user_verified), Some(zero_data_retention)) = (
+        if let (
+            Some(api_key_id),
+            Some(api_key_secret),
+            Some(api_key_purpose),
+            Some(user_verified),
+            Some(zero_data_retention),
+            Some(user_id),
+        ) = (
             row.api_key_id,
             row.api_key_secret,
             row.api_key_purpose,
             row.api_key_user_verified,
             row.api_key_user_zero_data_retention,
+            row.api_key_user_id,
         ) {
             target.api_keys.push(OnwardsApiKey {
                 id: api_key_id,
@@ -1600,6 +1775,7 @@ pub async fn load_targets_from_db(
                 burst_size: row.api_key_burst_size,
                 user_verified,
                 zero_data_retention,
+                user_id,
             });
         }
     }
@@ -1662,7 +1838,11 @@ pub async fn load_targets_from_db(
         .collect();
 
     // Convert to ConfigFile format
-    let config = convert_to_config_file(targets, composites, strict_mode, rate_limit_tiers);
+    // Per-alias overlays and per-account serving settings, each loaded once.
+    let overlays = load_overlays_from_db(db).await?;
+    let accounts = load_accounts_from_db(db).await?;
+
+    let config = convert_to_config_file(targets, composites, strict_mode, rate_limit_tiers, &overlays, accounts);
 
     // Convert ConfigFile to Targets
     Targets::from_config(config)

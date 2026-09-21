@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO credits_transactions\n               (user_id, transaction_type, amount, source_id, description, fusillade_batch_id, service_tier)\n               VALUES ($1, 'usage', $2, $3, 'usage correction', NULL, 'batch')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Numeric",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "1f923b73f61c4ee149e66dfb894cf76a3c7fe924b2e3183144baeba2967ed1b0"
+}

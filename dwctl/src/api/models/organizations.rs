@@ -44,6 +44,22 @@ pub struct OrganizationUpdate {
     /// organization, or by a platform manager holding UpdateAll on
     /// organizations — an org admin is refused. Omit to leave unchanged.
     pub zero_data_retention: Option<bool>,
+    /// Account setting: elevated serving classes this organisation holds
+    /// (`interactive`, `throughput`). A request naming a class not held is
+    /// refused. Platform managers only (UpdateAll on organizations): never
+    /// the organisation itself, whatever its role. Omit to leave unchanged;
+    /// an empty list revokes all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub granted_serving_classes: Option<Vec<String>>,
+    /// Account setting: serving class this organisation's realtime requests
+    /// ask for when the request names none (`interactive` or `throughput`);
+    /// applies where the organisation holds it and the model offers it.
+    /// Platform managers only. Omit to leave unchanged; null clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub default_serving_class: Option<Option<String>>,
+    /// Account setting: never fall over to an external provider. Platform
+    /// managers only. Omit to leave unchanged.
+    pub self_hosted_only: Option<bool>,
     /// Admit signups from this workspace's claimed email domain as members
     /// automatically. Same gate as `zero_data_retention` above — an **owner**
     /// or a platform manager with UpdateAll, never an org admin: it decides

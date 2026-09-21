@@ -71,12 +71,14 @@ Created on first startup if it doesn't exist. The admin user has the `PlatformMa
 model_provisioning:
   enabled: true
   directory: /app/model-provisioning.d
+  org_overlays_directory: /app/org-overlays.d
 ```
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `enabled` | boolean | `false` | Apply the declarative model catalog during startup. |
 | `directory` | path | `/app/model-provisioning.d` | Directory containing one `.yaml` or `.yml` document per canonical model. |
+| `org_overlays_directory` | path | `/app/org-overlays.d` | Directory containing one `.yaml` or `.yml` document per organisation with per-model serving overrides (`default_class` or explicit `targets`, `self_hosted_only`). Applied after the model catalog when `enabled` is set. A missing directory is an empty catalog, so a deployment that does not mount one applies no overlays; an existing path that is not a directory fails startup. |
 
 When enabled, the directory must exist. Startup fails before any provisioning
 writes if loading, validation, or a referenced endpoint/group lookup fails.

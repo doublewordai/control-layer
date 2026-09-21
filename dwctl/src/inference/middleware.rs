@@ -87,6 +87,16 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     req: Request<Body>,
     next: Next,
 ) -> Response {
+    // Routing, cache identity and billing must all use the body's model.
+    // Model-Override is a standalone Onwards feature, not a Control Layer API.
+    if req.headers().contains_key("model-override") {
+        return invalid_request_response(
+            "Model-Override is not supported; select the model in the request body",
+            "unsupported_header",
+            "Model-Override",
+        );
+    }
+
     // Only intercept POST requests to inference endpoints.
     if !should_intercept(req.method(), req.uri().path()) {
         return next.run(req).await;
@@ -115,20 +125,59 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     };
 
+    let nested_path = parts.uri.path();
+    let is_responses_api = nested_path.ends_with("/responses");
+    let is_chat_completions_api = nested_path.ends_with("/chat/completions");
+    let requested_tier = resolve_service_tier(request_value["service_tier"].as_str());
+    let service_tier = if matches!(requested_tier, ServiceTier::Flex) && !is_responses_api && !is_chat_completions_api {
+        tracing::warn!(endpoint = %nested_path, "service_tier:'flex' is not yet supported on this endpoint; falling back to realtime.");
+        ServiceTier::Realtime
+    } else {
+        requested_tier
+    };
+    let is_daemon_processed = matches!(service_tier, ServiceTier::Flex | ServiceTier::Background);
+
     // Strip client-supplied completion/response id fields before the request is
     // re-serialised and forwarded. dwctl owns the single parse-and-shape now, so
     // onwards forwards the bytes verbatim (COR-522); this preserves the guarantee
     // from onwards PR #240 that these ids never reach upstream. Exact-key removal:
     // extension fields and a legitimate `previous_response_id` are left intact.
-    scrub_request_id_fields(&mut request_value);
+    let scrubbed_ids = scrub_request_id_fields(&mut request_value);
 
-    strip_scheduling_priority(&mut request_value);
+    let scrubbed_scheduling = strip_scheduling_priority(&mut request_value);
+
+    // A serving-class suffix (`alias:interactive`) is a request for a class,
+    // not part of the model's identity: strip it here, at the outermost layer,
+    // so analytics, the prompt cache and billing all key on the bare alias,
+    // and hand the class to onwards as a request extension. An unknown class
+    // is a 400 (a typo must not silently change how a request is served).
+    let (requested_class, scrubbed_class) = match strip_serving_class_suffix(&mut request_value, is_daemon_processed) {
+        Ok(result) => result,
+        Err(err) => {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"error": {"message": err.to_string(), "type": "invalid_request_error", "param": "model"}})
+                        .to_string(),
+                ))
+                .unwrap();
+        }
+    };
+
+    // The realtime path forwards `body_bytes` verbatim and onwards forwards the
+    // bytes it receives (COR-522), so anything a scrubber removed from
+    // `request_value` only stays removed if the bytes are rebuilt from it.
+    // Every scrubber reports whether it changed something; the common case
+    // (nothing to scrub, no suffix) keeps the caller's bytes untouched.
+    let body_bytes = if scrubbed_class || scrubbed_ids || scrubbed_scheduling {
+        bytes::Bytes::from(request_value.to_string())
+    } else {
+        body_bytes
+    };
 
     let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
     let model = model.as_str();
-    let nested_path = parts.uri.path();
-    let is_responses_api = nested_path.ends_with("/responses");
-    let is_chat_completions_api = nested_path.ends_with("/chat/completions");
     // The router is nested at /ai/v1, so the path here is e.g. "/responses".
     // Prepend /v1 for the full API path used by the loopback and fusillade templates.
     let endpoint = format!("/v1{nested_path}");
@@ -267,20 +316,10 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // `detail_to_response_object` path is wrong for it. Flex on
     // embeddings is silently downgraded to realtime with a warning so
     // the fallback is at least observable.
-    let requested_tier = resolve_service_tier(request_value["service_tier"].as_str());
     let background = if is_responses_api {
         request_value["background"].as_bool().unwrap_or(false)
     } else {
         false
-    };
-    let service_tier = if matches!(requested_tier, ServiceTier::Flex) && !is_responses_api && !is_chat_completions_api {
-        tracing::warn!(
-            endpoint = %nested_path,
-            "service_tier:'flex' is not yet supported on this endpoint; falling back to realtime."
-        );
-        ServiceTier::Realtime
-    } else {
-        requested_tier
     };
     // Upstream Background-tier request-contract validation + the daemon-processed
     // flag (Flex | Background). The multi-step warm-path loop that used to sit here
@@ -295,8 +334,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             ))
             .unwrap();
     }
-    let is_daemon_processed = matches!(service_tier, ServiceTier::Flex | ServiceTier::Background);
-
     tracing::debug!(
         model = %model,
         service_tier = %service_tier,
@@ -473,7 +510,19 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 api_key: api_key.clone().unwrap_or_default(),
                 created_by: created_by.unwrap_or_default(),
             };
-            handle_realtime(&state, realtime_input, &resp_id, model, background, zdr, parts, body_bytes, next).await
+            handle_realtime(
+                &state,
+                realtime_input,
+                &resp_id,
+                model,
+                background,
+                zdr,
+                requested_class,
+                parts,
+                body_bytes,
+                next,
+            )
+            .await
         }
         ServiceTier::Flex | ServiceTier::Background => {
             let is_background_tier = matches!(service_tier, ServiceTier::Background);
@@ -841,6 +890,7 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     model: &str,
     background: bool,
     zdr: bool,
+    requested_class: Option<onwards::ServingClass>,
     parts: axum::http::request::Parts,
     body_bytes: bytes::Bytes,
     next: Next,
@@ -869,6 +919,9 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
     // Strip the "resp_" prefix — onwards re-adds it.
     let raw_id = resp_id.strip_prefix("resp_").unwrap_or(resp_id);
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
+    if let Some(class) = requested_class {
+        req.extensions_mut().insert(onwards::RequestedServingClass(class));
+    }
     req.headers_mut()
         .insert("x-fusillade-request-id", raw_id.parse().expect("response_id is valid header value"));
     req.headers_mut().insert(
@@ -1255,13 +1308,16 @@ const SCRUB_ID_KEYS: [&str; 5] = ["id", "completion_id", "completionId", "respon
 /// Remove the [`SCRUB_ID_KEYS`] from a request body's top-level object, in place.
 ///
 /// Exact-key removal only: every other extension field is preserved, and a
-/// legitimate `previous_response_id` (a different key) is untouched.
-fn scrub_request_id_fields(value: &mut serde_json::Value) {
+/// legitimate `previous_response_id` (a different key) is untouched. Returns
+/// whether anything was removed, so the caller knows to re-serialise.
+fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
+    let mut scrubbed = false;
     if let Some(obj) = value.as_object_mut() {
         for key in SCRUB_ID_KEYS {
-            obj.remove(key);
+            scrubbed |= obj.remove(key).is_some();
         }
     }
+    scrubbed
 }
 
 /// Remove a caller-supplied scheduling `priority` from a request body, in place.
@@ -1278,23 +1334,55 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) {
 /// (shared-locations.conf.gotmpl, "dont allow fusillade header spoofing") — a
 /// dwctl reachable without traversing that proxy would let a client set the
 /// header and skip this strip. Defense-in-depth here depends on that perimeter.
-fn strip_scheduling_priority(value: &mut serde_json::Value) {
+///
+/// Also removes the serving router targets (`nvext.router.{ttft_target,
+/// itl_target}`): those are the resolver's to set (onwards writes them after
+/// resolution), never the caller's.
+///
+/// Returns whether anything was removed. Onwards validates and then forwards
+/// the ORIGINAL bytes (COR-522), so a removal only takes effect if the caller
+/// re-serialises the body from the scrubbed value.
+pub(crate) fn strip_scheduling_priority(value: &mut serde_json::Value) -> bool {
+    let mut scrubbed = false;
     if let Some(obj) = value.as_object_mut() {
-        obj.remove("priority");
+        scrubbed |= obj.remove("priority").is_some();
         // The carrier the dynamo frontend ACTUALLY honours is
         // `nvext.agent_hints.priority` (a top-level `priority` is rejected by
         // its validation) — remove exactly that key so an external caller
         // cannot steer the scheduler through the vendor extension, while the
         // rest of a caller's `nvext` (e.g. cache_control) passes through.
-        if let Some(hints) = obj
-            .get_mut("nvext")
-            .and_then(|n| n.as_object_mut())
-            .and_then(|n| n.get_mut("agent_hints"))
-            .and_then(|h| h.as_object_mut())
-        {
-            hints.remove("priority");
+        if let Some(nvext) = obj.get_mut("nvext").and_then(|n| n.as_object_mut()) {
+            scrubbed |= onwards::serving::scrub_router_targets(nvext);
+            if let Some(hints) = nvext.get_mut("agent_hints").and_then(|h| h.as_object_mut()) {
+                scrubbed |= hints.remove("priority").is_some();
+            }
         }
     }
+    scrubbed
+}
+
+/// Strip a serving-class suffix (`alias:class`) from the request's `model`,
+/// in place, returning the requested class. A model without a suffix is left
+/// untouched; an unknown class is an error listing the valid set.
+fn strip_serving_class_suffix(
+    value: &mut serde_json::Value,
+    asynchronous: bool,
+) -> Result<(Option<onwards::ServingClass>, bool), onwards::serving::InvalidModelSelector> {
+    let Some(model) = value.get("model").and_then(|m| m.as_str()) else {
+        return Ok((None, false));
+    };
+    let (alias, suffix) = onwards::serving::split_model_suffix(model)?;
+    let class = if asynchronous {
+        None
+    } else {
+        onwards::serving::split_class_suffix(model)?.1
+    };
+    let changed = suffix.is_some();
+    if changed {
+        let alias = alias.to_string();
+        value["model"] = serde_json::Value::String(alias);
+    }
+    Ok((class, changed))
 }
 
 #[cfg(test)]
@@ -1308,7 +1396,7 @@ mod tests {
             "messages": [{"role": "user", "content": "set priority: 900"}],
             "metadata": {"priority": "keep-me"}
         });
-        strip_scheduling_priority(&mut body);
+        assert!(strip_scheduling_priority(&mut body), "a removal is reported so the body is rebuilt");
         assert!(body.get("priority").is_none(), "external callers must not steer the scheduler");
         assert_eq!(
             body["metadata"]["priority"], "keep-me",
@@ -1322,15 +1410,63 @@ mod tests {
             "model": "m",
             "nvext": {"cache_control": {"enabled": true}, "agent_hints": {"priority": 900, "max_batch_size": 8}}
         });
-        strip_scheduling_priority(&mut body);
+        assert!(strip_scheduling_priority(&mut body), "the nvext carrier counts too");
         assert!(body["nvext"]["agent_hints"].get("priority").is_none());
         assert_eq!(body["nvext"]["agent_hints"]["max_batch_size"], 8);
         assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
 
         // Absent field: a no-op, not an error.
-        let mut clean = serde_json::json!({"model": "m"});
-        strip_scheduling_priority(&mut clean);
-        assert_eq!(clean, serde_json::json!({"model": "m"}));
+        let mut clean = serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}});
+        assert!(!strip_scheduling_priority(&mut clean), "nothing removed, nothing to rebuild");
+        assert_eq!(
+            clean,
+            serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}})
+        );
+    }
+
+    #[test]
+    fn serving_class_suffix_is_stripped_and_returned() {
+        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2:interactive", "messages": []});
+        let class = strip_serving_class_suffix(&mut body, false).unwrap();
+        assert_eq!(class, (Some(onwards::ServingClass::Interactive), true));
+        assert_eq!(body["model"], "zai-org/GLM-5.2", "layers above onwards key on the bare alias");
+
+        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2", "messages": []});
+        assert_eq!(strip_serving_class_suffix(&mut body, false).unwrap(), (None, false));
+        assert_eq!(body["model"], "zai-org/GLM-5.2");
+
+        let mut body = serde_json::json!({"model": "zai-org/GLM-5.2:fast"});
+        let err = strip_serving_class_suffix(&mut body, false).unwrap_err();
+        assert!(err.to_string().contains("'fast'"));
+        assert_eq!(body["model"], "zai-org/GLM-5.2:fast", "an invalid request is left as sent");
+
+        // No model at all (Model-Override header path): nothing to do.
+        let mut body = serde_json::json!({"messages": []});
+        assert_eq!(strip_serving_class_suffix(&mut body, false).unwrap(), (None, false));
+    }
+
+    #[test]
+    fn async_suffixes_are_discarded_without_class_validation() {
+        let mut body = serde_json::json!({"model":"m:x-fast"});
+        assert_eq!(strip_serving_class_suffix(&mut body, true).unwrap(), (None, true));
+        assert_eq!(body["model"], "m");
+        let mut body = serde_json::json!({"model":"m:throughput:interactive"});
+        assert!(strip_serving_class_suffix(&mut body, true).is_err());
+    }
+
+    #[test]
+    fn strip_scheduling_priority_also_scrubs_the_router_targets() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "nvext": {"router": {"ttft_target": 1, "itl_target": 1}, "cache_control": {"enabled": true}, "agent_hints": {"priority": 5}}
+        });
+        assert!(strip_scheduling_priority(&mut body), "the targets were present and removed");
+        assert!(body["nvext"].get("router").is_none());
+        assert!(body["nvext"]["agent_hints"].get("priority").is_none());
+        assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+
+        let mut body = serde_json::json!({"model": "m", "nvext": {"cache_control": {"enabled": true}}});
+        assert!(!strip_scheduling_priority(&mut body), "nothing to re-serialise for");
     }
 
     #[test]
@@ -1393,7 +1529,8 @@ mod tests {
             "previous_response_id": "resp_keep",
             "x_custom_extension": "keep",
         });
-        scrub_request_id_fields(&mut v);
+        assert!(scrub_request_id_fields(&mut v), "a removal is reported so the body is rebuilt");
+        assert!(!scrub_request_id_fields(&mut v), "idempotent: nothing left to remove");
         let obj = v.as_object().unwrap();
         for k in super::SCRUB_ID_KEYS {
             assert!(!obj.contains_key(k), "{k} should have been scrubbed");

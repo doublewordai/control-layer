@@ -8,6 +8,9 @@ use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
 use crate::models::ListModelResponse;
+use crate::serving::{
+    self, ProviderKind, RequestedServingClass, ServingClassOutcome, ServingResolution,
+};
 use crate::sse::SseBufferedStream;
 use crate::target::{ConcurrencyGuard, RequestClass, RoutingAction, Target};
 use axum::{
@@ -327,6 +330,24 @@ pub struct ServedBy {
     pub onwards_model: Option<String>,
 }
 
+/// Rewrite the request body's `model` to the bare alias after a class suffix
+/// was stripped. Bodies that do not parse (or carry no `model`) are returned
+/// untouched: the `Model-Override` header path has no body model to rewrite.
+fn rewrite_body_model(body: axum::body::Bytes, alias: &str) -> axum::body::Bytes {
+    if body.is_empty() {
+        return body;
+    }
+    let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return body;
+    };
+    match parsed.get_mut("model") {
+        Some(model) if model.is_string() => {
+            *model = serde_json::Value::String(alias.to_string());
+            serde_json::to_vec(&parsed).map(Into::into).unwrap_or(body)
+        }
+        _ => body,
+    }
+}
 /// Stable identity of the API key accepted for this request. This is carried
 /// only in the in-process response extensions and is never sent to the client.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -458,6 +479,8 @@ pub async fn target_message_handler<T: HttpClient>(
         otel.name = "onwards.request",
         gen_ai.request.model = tracing::field::Empty,
         http.response.status_code = tracing::field::Empty,
+        onwards.serving.requested = tracing::field::Empty,
+        onwards.serving.resolved = tracing::field::Empty,
     );
 
     // Extract W3C trace context (traceparent + tracestate) from inbound headers
@@ -511,6 +534,35 @@ pub async fn target_message_handler<T: HttpClient>(
         }
     };
 
+    // A class suffix requests a serving class on the base alias. DWCTL strips
+    // it and hands it over as an extension; standalone callers are parsed here.
+    // Unknown class suffixes are a 400.
+    let suffix_class = req.extensions().get::<RequestedServingClass>().map(|c| c.0);
+    // DWCTL has already split the body selector once. Do not reinterpret its
+    // base alias (e.g. turn nonexistent `model:interactive` into `model`). A
+    // Model-Override header is a separate selector and still needs resolution.
+    let has_model_override = req.headers().get("model-override").and_then(|value| value.to_str().ok()).is_some();
+    let selected_model = if suffix_class.is_some() && !has_model_override {
+        Ok((model_name.as_str(), None))
+    } else {
+        serving::split_class_suffix(&model_name)
+    };
+    let (model_name, suffix_class, body_bytes) = match selected_model {
+        Ok((_, None)) => (model_name, suffix_class, body_bytes),
+        Ok((alias, Some(class))) => {
+            let alias = alias.to_string();
+            let body_bytes = rewrite_body_model(body_bytes, &alias);
+            // The suffix on the selected model string wins over the
+            // extension: the string is the source that took precedence
+            // (a `Model-Override` header over the body), so its class does too.
+            (alias, Some(class), body_bytes)
+        }
+        Err(unknown) => {
+            record_response_status(400);
+            return Err(OnwardsErrorResponse::bad_request(&unknown.to_string(), Some("model")));
+        }
+    };
+
     // Record model in span for trace correlation
     tracing::Span::current().record("gen_ai.request.model", &model_name);
 
@@ -539,7 +591,9 @@ pub async fn target_message_handler<T: HttpClient>(
     // the map guard so only the chosen pool is cloned: KeySets are owned, so a
     // whole-TargetPools clone would deep-copy every pool's keys per request.
     let request_class = RequestClass::from_path(&canonical_request_path);
-    let (mut resolved_pool_name, mut pool) = match state.targets.targets.get(&model_name) {
+    // The alias's serving policy (presets, overlays) is declared on its
+    // default pool and applies whichever pool serves this request's class.
+    let (mut resolved_pool_name, mut pool, mut alias_serving) = match state.targets.targets.get(&model_name) {
         Some(pools) => {
             // Now that the model is known to be a configured target, tag the
             // in-flight guard so `onwards_model_inflight{model=…}` tracks this
@@ -550,7 +604,11 @@ pub async fn target_message_handler<T: HttpClient>(
             if let Some(guard) = inflight_guard.as_mut() {
                 guard.set_model(&model_name);
             }
-            (pools.resolved_name(request_class), pools.resolve(request_class).clone())
+            (
+                pools.resolved_name(request_class),
+                pools.resolve(request_class).clone(),
+                pools.default_pool().alias_serving().clone(),
+            )
         }
         None => {
             debug!("No target found for model: {}", model_name);
@@ -647,6 +705,7 @@ pub async fn target_message_handler<T: HttpClient>(
                             // actually serves, not the source alias's.
                             Some(p) => {
                                 resolved_pool_name = p.resolved_name(request_class);
+                                alias_serving = p.default_pool().alias_serving().clone();
                                 p.resolve(request_class).clone()
                             }
                             None => {
@@ -663,6 +722,73 @@ pub async fn target_message_handler<T: HttpClient>(
             }
         // If no bearer token, no labels to match — rules are skipped (allow by default)
     }
+
+    // Resolve the serving class: one flat field from the request's suffix,
+    // the owning account's settings (found through the key's `account`
+    // label), the account's overlay on THIS alias and the classes the alias
+    // offers. Done after routing rules so a redirected request is resolved
+    // against the pool that will serve it. Strict: a class named on the
+    // request that the account does not hold, or the alias does not offer,
+    // is refused rather than quietly downgraded.
+    let serving_resolution: ServingResolution = {
+        let (account_id, key_purpose) = bearer_token
+            .as_ref()
+            .and_then(|token| state.targets.key_labels.get(token))
+            .map(|labels| {
+                (
+                    labels.get(serving::ACCOUNT_LABEL).cloned(),
+                    labels.get("purpose").cloned(),
+                )
+            })
+            .unwrap_or((None, None));
+        let account = account_id
+            .as_deref()
+            .and_then(|id| state.targets.accounts.get(id).map(|r| r.value().clone()));
+        let overlay = account_id
+            .as_deref()
+            .and_then(|id| alias_serving.overlays().get(id).cloned());
+        let resolution = match serving::resolve(
+            suffix_class,
+            account.as_ref(),
+            overlay.as_ref(),
+            &model_name,
+            alias_serving.presets(),
+            key_purpose.as_deref(),
+        ) {
+            Ok(resolution) => resolution,
+            Err(rejection) => {
+                debug!("Serving class refused for model '{}': {}", model_name, rejection);
+                metrics::counter!(
+                    "onwards_serving_class_rejections_total",
+                    "model" => model_name.to_string(),
+                )
+                .increment(1);
+                record_response_status(403);
+                return Err(OnwardsErrorResponse::builder()
+                    .body(ErrorResponseBody {
+                        message: rejection.to_string(),
+                        r#type: "invalid_request_error".to_string(),
+                        param: Some("model".to_string()),
+                        code: "serving_class_unavailable".to_string(),
+                    })
+                    .status(StatusCode::FORBIDDEN)
+                    .build());
+            }
+        };
+        let span = tracing::Span::current();
+        if let Some(requested) = resolution.requested {
+            span.record("onwards.serving.requested", requested.as_str());
+        }
+        span.record("onwards.serving.resolved", resolution.resolved.as_str());
+        metrics::counter!(
+            "onwards_serving_class_requests_total",
+            "model" => model_name.to_string(),
+            "requested" => resolution.requested.map(|c| c.as_str()).unwrap_or(""),
+            "resolved" => resolution.resolved.as_str(),
+        )
+        .increment(1);
+        resolution
+    };
 
     let canonical_reasoning = if let Some(reasoning) = req
         .extensions()
@@ -792,6 +918,36 @@ pub async fn target_message_handler<T: HttpClient>(
     // distinction that matters for backpressure is gone.
     let mut last_upstream_status: Option<u16> = None;
 
+    // A self-hosted-only account never reaches an external member: the
+    // composite's eligible set is narrowed to its non-external providers for
+    // this request, whatever the alias's own failover list says, BEFORE the
+    // attempt budget is spent, so the budget goes to eligible members under
+    // every strategy and a pool of [dynamo, external] ends with a dynamo
+    // outcome rather than an external one.
+    let ineligible_members: Vec<usize> = if serving_resolution.self_hosted_only {
+        pool.providers()
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| provider.target.kind == ProviderKind::External)
+            .map(|(idx, _)| idx)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !ineligible_members.is_empty() {
+        debug!(
+            "Excluding {} external provider(s) for a self-hosted-only account",
+            ineligible_members.len()
+        );
+        metrics::counter!(
+            "onwards_self_hosted_only_skips_total",
+            "model" => model_name.to_string(),
+        )
+        .increment(ineligible_members.len() as u64);
+    }
+    let no_eligible_member = !pool.is_empty() && ineligible_members.len() == pool.len();
+    let eligible_member_count = pool.len() - ineligible_members.len();
+
     // Iterate through providers (with fallback support).
     // select_iter() uses weighted least connections: picks the provider with the
     // lowest active_connections/weight ratio, skipping providers at their
@@ -799,7 +955,11 @@ pub async fn target_message_handler<T: HttpClient>(
     let mut any_attempted = false;
     let mut attempt_number: u32 = 0;
     let mut total_backoff_ms: u64 = 0;
-    let pool_max_attempts = pool.fallback_max_attempts();
+    let pool_max_attempts = if pool.fallback().is_some_and(|f| f.with_replacement) {
+        pool.fallback_max_attempts()
+    } else {
+        pool.fallback_max_attempts().min(eligible_member_count)
+    };
 
     // First-token failover: bound how long a streamed attempt may go without
     // producing its first frame before it is abandoned for another provider.
@@ -827,7 +987,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 .or(state.first_token_timeout)
         })
         .filter(|timeout| {
-            !timeout.is_zero() && pool.len() > 1 && is_realtime && requests_stream(&body_bytes)
+            !timeout.is_zero() && eligible_member_count > 1 && is_realtime && requests_stream(&body_bytes)
         });
     // A status triggers failover when the pool lists it, or when it is one of
     // the pool's realtime-only fallback statuses, this request is realtime and
@@ -838,12 +998,12 @@ pub async fn target_message_handler<T: HttpClient>(
     let realtime_failover_attempts = if pool.fallback().is_some_and(|f| f.with_replacement) {
         pool_max_attempts
     } else {
-        pool_max_attempts.min(pool.len())
+        pool_max_attempts.min(eligible_member_count)
     };
     let fails_over_on = |status: u16, attempt_number: u32| {
         pool.should_fallback_on_status(status)
             || (is_realtime
-                && pool.len() > 1
+                && eligible_member_count > 1
                 && (attempt_number as usize) < realtime_failover_attempts
                 && pool.should_fallback_on_realtime_status(status))
     };
@@ -853,7 +1013,10 @@ pub async fn target_message_handler<T: HttpClient>(
         && state.targets.strict_mode
         && requests_stream(&body_bytes)
         && is_realtime;
-    for (member_idx, target, connection_guard) in pool.select_iter_aimd(aimd_eligible, &model_name, resolved_pool_name.unwrap_or("default")) {
+    let mut providers = pool
+        .select_iter_aimd(aimd_eligible, &model_name, resolved_pool_name.unwrap_or("default"))
+        .excluding_members(ineligible_members.iter().copied());
+    while let Some((member_idx, target, connection_guard)) = providers.next() {
         any_attempted = true;
         attempt_number += 1;
         // First-token observations are attributed to the provider actually
@@ -867,9 +1030,10 @@ pub async fn target_message_handler<T: HttpClient>(
         };
         let attempt_start = tokio::time::Instant::now();
         let observation = pool.observe(aimd_eligible, member_idx, &model_name, resolved_pool_name.unwrap_or("default"), attempt_start);
-        // This attempt's first-frame deadline; `None` on the final attempt.
+        // A failover deadline needs both remaining budget and an available
+        // alternative. Configured members at capacity cannot rescue this stream.
         let first_token_deadline = first_token_timeout
-            .filter(|_| (attempt_number as usize) < pool_max_attempts)
+            .filter(|_| (attempt_number as usize) < pool_max_attempts && providers.has_available_alternative(member_idx))
             .map(|timeout| attempt_start + timeout);
 
         let attempt_span = tracing::info_span!(
@@ -1019,6 +1183,39 @@ pub async fn target_message_handler<T: HttpClient>(
                 Ok(bytes) => axum::body::Bytes::from(bytes),
                 Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
             };
+        }
+
+        // Send the resolved serving targets to a member of kind `dynamo`, the
+        // only serving stack that reads them, as `nvext.router` targets plus
+        // (when the preset carries one) `nvext.agent_hints.priority`. A
+        // resolution without targets — no policy, `standard` on a model with
+        // no standard preset, the daemon legs — sends nothing, so the body is
+        // byte-identical to today and a partial rollout is safe. Values
+        // already present are overwritten, never removed: this same crate runs
+        // again as the hop inside the serving namespace, with no key policy of
+        // its own, and must forward what the first hop set. Client-supplied
+        // targets are scrubbed at dwctl's ingress, alongside the body priority
+        // (the same perimeter the priority strip relies on).
+        if target.kind == ProviderKind::Dynamo
+            && let Some(targets) = serving_resolution.targets
+            && !attempt_body.is_empty()
+        {
+            let mut body: serde_json::Value = match serde_json::from_slice(&attempt_body) {
+                Ok(body) => body,
+                Err(_) => {
+                    return LoopAction::Done(Err(OnwardsErrorResponse::bad_request(
+                        "Request body must be valid JSON.",
+                        None,
+                    )))
+                }
+            };
+            if let Some(object) = body.as_object_mut() {
+                targets.stamp(object);
+                attempt_body = match serde_json::to_vec(&body) {
+                    Ok(bytes) => axum::body::Bytes::from(bytes),
+                    Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
+                };
+            }
         }
 
         // Build the upstream URI for this target
@@ -1790,6 +1987,9 @@ pub async fn target_message_handler<T: HttpClient>(
             url: target.url.to_string(),
             onwards_model: target.onwards_model.clone(),
         });
+        response
+            .extensions_mut()
+            .insert::<ServingClassOutcome>(serving_resolution.outcome());
         if let Some(api_key_id) = authenticated_api_key_id {
             response
                 .extensions_mut()
@@ -1880,7 +2080,32 @@ pub async fn target_message_handler<T: HttpClient>(
         )
         .increment(1);
         record_response_status(status);
+        // The outcome rides on the error too: analytics records what the
+        // request resolved to whether or not the upstream served it.
+        let mut final_error = final_error;
+        final_error.serving_outcome = Some(serving_resolution.outcome());
         Err(final_error)
+    } else if no_eligible_member {
+        // Every member is external and the account never uses those: not a
+        // capacity condition, and nothing to retry.
+        metrics::counter!(
+            "onwards_upstream_failed_total",
+            "reason" => "no_eligible_provider",
+            "status" => "503",
+            "model" => model_name.to_string(),
+        )
+        .increment(1);
+        record_response_status(503);
+        Err(OnwardsErrorResponse::builder()
+            .body(ErrorResponseBody {
+                message: format!("Model '{model_name}' has no self-hosted provider available to this account."),
+                r#type: "server_error".to_string(),
+                param: Some("model".to_string()),
+                code: "no_eligible_provider".to_string(),
+            })
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .serving_outcome(serving_resolution.outcome())
+            .build())
     } else if !pool.is_empty() {
         // Pool has providers but select_iter() yielded nothing — all at capacity
         metrics::counter!(
@@ -2806,6 +3031,7 @@ mod tests {
                 key_rate_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
                 key_concurrency_limiters: std::sync::Arc::new(dashmap::DashMap::new()),
                 key_labels: std::sync::Arc::new(dashmap::DashMap::new()),
+                accounts: std::sync::Arc::new(dashmap::DashMap::new()),
                 strict_mode: false,
                 http_pool_config: None,
             },
@@ -2900,6 +3126,7 @@ mod tests {
             propagate_trace_context,
             reasoning_translation: None,
             accepts_scheduling_priority: false,
+            kind: Default::default(),
         }
     }
 

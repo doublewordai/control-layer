@@ -455,7 +455,11 @@ pub async fn list_deployed_models<P: PoolProvider>(
         .into_iter()
         .map(|model| {
             let provider_pricing = if can_read_pricing { model.provider_pricing.clone() } else { None };
-            DeployedModelResponse::from(model).with_provider_pricing(provider_pricing)
+            // Serving presets are an operator detail, never a customer one.
+            let serving_classes = can_read_all_models.then(|| model.serving_classes.clone());
+            DeployedModelResponse::from(model)
+                .with_provider_pricing(provider_pricing)
+                .with_serving_classes(serving_classes)
         })
         .collect();
 
@@ -1125,7 +1129,10 @@ pub async fn get_deployed_model<P: PoolProvider>(
     } else {
         None
     };
-    let mut response = DeployedModelResponse::from(model).with_provider_pricing(provider_pricing);
+    let serving_classes = can_read_all_models.then(|| model.serving_classes.clone());
+    let mut response = DeployedModelResponse::from(model)
+        .with_provider_pricing(provider_pricing)
+        .with_serving_classes(serving_classes);
 
     // Fetch and attach traffic rules
     {

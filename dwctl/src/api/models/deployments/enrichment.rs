@@ -498,6 +498,7 @@ mod tests {
             allowed_batch_completion_windows: None,
             metadata: None,
             provisioning_source: None,
+            serving_classes: None,
         }
     }
 
@@ -680,6 +681,7 @@ mod tests {
                 created_by: Uuid::new_v4(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
+                kind: Default::default(),
             },
         );
 

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO model_cache_tariffs\n                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, read_multiplier, min_prefix_tokens)\n               VALUES ($1, 1.25, 2.0, 2.5, 0.1, 1024)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a552a27b0522377777fcff3582c15fcd8410a3ce493d122c645ca64436bfa97b"
+}

@@ -406,6 +406,7 @@ mod tests {
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
+                kind: Default::default(),
             })
             .await
             .unwrap();
@@ -564,6 +565,7 @@ mod tests {
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
+                kind: Default::default(),
             })
             .await
             .unwrap();
@@ -721,6 +723,7 @@ mod tests {
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
+                kind: Default::default(),
             })
             .await
             .unwrap();
@@ -825,6 +828,7 @@ mod tests {
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
+                kind: Default::default(),
             })
             .await
             .unwrap();
@@ -979,6 +983,7 @@ mod tests {
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
+                kind: Default::default(),
             })
             .await
             .unwrap();
@@ -1168,6 +1173,7 @@ mod tests {
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
+                kind: Default::default(),
             })
             .await
             .unwrap();
@@ -1304,6 +1310,7 @@ mod tests {
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
+                kind: Default::default(),
             })
             .await
             .unwrap();

@@ -143,7 +143,8 @@ impl<'c> Organizations<'c> {
                    is_admin, password_hash, external_user_id, payment_provider_id,
                    is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                    low_balance_notification_sent, low_balance_threshold,
-                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention
+                   auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,
+                   granted_serving_classes, default_serving_class, self_hosted_only
             FROM users
             WHERE (username = $1 OR username LIKE $1 || '~%')
               AND user_type = 'organization'
@@ -213,6 +214,9 @@ impl<'c> Organizations<'c> {
                     verified: r.verified,
                     invoicing_enabled: r.invoicing_enabled,
                     zero_data_retention: r.zero_data_retention,
+                    granted_serving_classes: r.granted_serving_classes,
+                    default_serving_class: r.default_serving_class,
+                    self_hosted_only: r.self_hosted_only,
                 }))
             }
             None => Ok(None),
@@ -283,7 +287,8 @@ impl<'c> Organizations<'c> {
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       is_deleted, is_internal, batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,
+                   granted_serving_classes, default_serving_class, self_hosted_only
             "#,
             org_id,
             request.name,
@@ -344,6 +349,9 @@ impl<'c> Organizations<'c> {
             verified: row.verified,
             invoicing_enabled: row.invoicing_enabled,
             zero_data_retention: row.zero_data_retention,
+            granted_serving_classes: row.granted_serving_classes,
+            default_serving_class: row.default_serving_class,
+            self_hosted_only: row.self_hosted_only,
         })
     }
 
@@ -381,13 +389,20 @@ impl<'c> Organizations<'c> {
                     ELSE low_balance_notification_sent
                 END,
                 zero_data_retention = COALESCE($8, zero_data_retention),
+                default_serving_class = CASE
+                    WHEN $9::boolean THEN $10
+                    ELSE default_serving_class
+                END,
+                self_hosted_only = COALESCE($11, self_hosted_only),
+                granted_serving_classes = COALESCE($12, granted_serving_classes),
                 updated_at = NOW()
             WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
             RETURNING id, username, email, display_name, avatar_url, auth_source, created_at, updated_at,
                       is_admin, password_hash, external_user_id, payment_provider_id,
                       batch_notifications_enabled, first_batch_email_sent,
                       low_balance_notification_sent, low_balance_threshold,
-                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention
+                      auto_topup_amount, auto_topup_threshold, auto_topup_monthly_limit, user_type, verified, invoicing_enabled, zero_data_retention,
+                   granted_serving_classes, default_serving_class, self_hosted_only
             "#,
             id,
             request.display_name,
@@ -397,6 +412,10 @@ impl<'c> Organizations<'c> {
             request.low_balance_threshold.is_some() as bool,
             request.low_balance_threshold.flatten(),
             request.zero_data_retention,
+            request.default_serving_class.is_some(),
+            request.default_serving_class.clone().flatten(),
+            request.self_hosted_only,
+            request.granted_serving_classes.as_deref(),
         )
         .fetch_optional(&mut *self.db)
         .await?
@@ -432,6 +451,9 @@ impl<'c> Organizations<'c> {
             verified: row.verified,
             invoicing_enabled: row.invoicing_enabled,
             zero_data_retention: row.zero_data_retention,
+            granted_serving_classes: row.granted_serving_classes,
+            default_serving_class: row.default_serving_class,
+            self_hosted_only: row.self_hosted_only,
         })
     }
 
@@ -1518,6 +1540,9 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: None,
                     zero_data_retention: None,
+                    default_serving_class: None,
+                    self_hosted_only: None,
+                    granted_serving_classes: Default::default(),
                 },
             )
             .await
@@ -1561,6 +1586,9 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: None,
                     zero_data_retention: None,
+                    default_serving_class: None,
+                    self_hosted_only: None,
+                    granted_serving_classes: Default::default(),
                 },
             )
             .await
@@ -1607,6 +1635,9 @@ mod tests {
                     batch_notifications_enabled: Some(true),
                     low_balance_threshold: Some(Some(10.0)),
                     zero_data_retention: None,
+                    default_serving_class: None,
+                    self_hosted_only: None,
+                    granted_serving_classes: Default::default(),
                 },
             )
             .await
@@ -1627,6 +1658,9 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: Some(Some(25.0)),
                     zero_data_retention: None,
+                    default_serving_class: None,
+                    self_hosted_only: None,
+                    granted_serving_classes: Default::default(),
                 },
             )
             .await
@@ -1648,6 +1682,9 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: Some(None),
                     zero_data_retention: None,
+                    default_serving_class: None,
+                    self_hosted_only: None,
+                    granted_serving_classes: Default::default(),
                 },
             )
             .await
@@ -1667,6 +1704,9 @@ mod tests {
                     batch_notifications_enabled: None,
                     low_balance_threshold: None,
                     zero_data_retention: None,
+                    default_serving_class: None,
+                    self_hosted_only: None,
+                    granted_serving_classes: Default::default(),
                 },
             )
             .await
