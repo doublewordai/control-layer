@@ -324,6 +324,7 @@ impl RequestHandler for AnalyticsHandler {
                 batch_created_at,
                 batch_request_source,
                 trace_id: request_data.trace_id.clone(),
+                gateway_span_id: request_data.span_id.clone(),
             };
 
             // The first handoff is durable: write the raw record directly to

@@ -1,0 +1,80 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO http_analytics (\n                instance_id, correlation_id, timestamp, method, uri, model,\n                status_code, duration_ms, duration_to_first_byte_ms, prompt_tokens, completion_tokens,\n                reasoning_tokens, total_tokens, response_type, user_id, access_source,\n                input_price_per_token, output_price_per_token, fusillade_batch_id, fusillade_request_id, custom_id,\n                request_origin, batch_sla, batch_request_source, api_key_id, trace_id,\n                cache_read_input_tokens, cache_creation_input_tokens,\n                cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,\n                total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at,\n                engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count,\n                cache_read_source, gateway_span_id\n            )\n            SELECT * FROM UNNEST(\n                $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],\n                $7::int[], $8::bigint[], $9::bigint[], $10::bigint[], $11::bigint[],\n                $12::bigint[], $13::bigint[], $14::text[], $15::uuid[], $16::text[],\n                $17::numeric[], $18::numeric[], $19::uuid[], $20::uuid[], $21::text[],\n                $22::text[], $23::text[], $24::text[], $25::uuid[], $26::text[],\n                $27::bigint[], $28::bigint[],\n                $29::bigint[], $30::bigint[], $31::bigint[],\n                $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],\n                $37::timestamptz[],\n                $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[],\n                $46::text[], $47::text[]\n            )\n            ON CONFLICT DO NOTHING\n            RETURNING id, instance_id, correlation_id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "instance_id",
+        "type_info": "Uuid"
+      },
+      {
+        "ordinal": 2,
+        "name": "correlation_id",
+        "type_info": "Int8"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Int8Array",
+        "TimestamptzArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "Int4Array",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "TextArray",
+        "UuidArray",
+        "TextArray",
+        "NumericArray",
+        "NumericArray",
+        "UuidArray",
+        "UuidArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "UuidArray",
+        "TextArray",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "Int8Array",
+        "NumericArray",
+        "NumericArray",
+        "TextArray",
+        "TextArray",
+        "TextArray",
+        "TimestamptzArray",
+        "Int8Array",
+        "BoolArray",
+        "Int8Array",
+        "Float4Array",
+        "Float4Array",
+        "Int4Array",
+        "Int4Array",
+        "Int4Array",
+        "TextArray",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "2ffee933e1a214c44a84fd4dbd73cae7809ffa16a4a15bcb9f8f55e24df4bc5a"
+}

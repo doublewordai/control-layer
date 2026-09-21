@@ -441,6 +441,11 @@ fn filter_headers_for_upstream(headers: &mut HeaderMap, target: &Target) {
     headers.insert("x-forwarded-proto", "https".parse().unwrap());
 }
 
+/// The embedding server has already extracted the remote parent into a local request span.
+/// An in-process marker; never inferred from a customer header.
+#[derive(Clone, Copy, Debug)]
+pub struct InheritedTraceContext;
+
 /// The main handler responsible for forwarding requests to targets
 /// TODO(fergus): Better error messages beyond raw status codes.
 pub async fn target_message_handler<T: HttpClient>(
@@ -460,10 +465,12 @@ pub async fn target_message_handler<T: HttpClient>(
         http.response.status_code = tracing::field::Empty,
     );
 
-    // Extract W3C trace context (traceparent + tracestate) from inbound headers
-    // BEFORE the span is first entered. This stitches cross-service traces (e.g.
-    // remote onwards receiving requests from local onwards).
-    if req.headers().contains_key("traceparent") {
+    // Standalone Onwards extracts the remote W3C parent before entering the span.
+    // Embedded Onwards must inherit the local gateway span: re-extracting the
+    // customer parent would place attempts outside the captured gateway subtree.
+    if req.extensions().get::<InheritedTraceContext>().is_none()
+        && req.headers().contains_key("traceparent")
+    {
         let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
         let parent_ctx = propagator.extract(&HeaderExtractor(req.headers()));
         use tracing_opentelemetry::OpenTelemetrySpanExt;

@@ -1360,3 +1360,5 @@ async fn test_realtime_zdr_suppresses_stored_bodies(pool: PgPool) {
         "ZDR realtime request_templates.body must be blank at rest"
     );
 }
+
+mod trace_binding;

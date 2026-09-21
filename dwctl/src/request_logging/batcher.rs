@@ -131,6 +131,9 @@ pub struct RawAnalyticsRecord {
     // === Tracing ===
     /// OpenTelemetry trace ID for correlation with Tempo
     pub trace_id: Option<String>,
+    /// Enclosing gateway span captured by Outlet; pair with trace_id for exact ancestry.
+    #[serde(default)]
+    pub gateway_span_id: Option<String>,
 }
 
 /// Enriched data resolved during batch processing
@@ -846,6 +849,7 @@ where
 
         let mut api_key_ids: Vec<Option<Uuid>> = Vec::with_capacity(records.len());
         let mut trace_ids: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut gateway_span_ids: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut cache_read_vec: Vec<i64> = Vec::with_capacity(records.len());
         let mut cache_creation_total_vec: Vec<i64> = Vec::with_capacity(records.len());
         let mut cache_5m_vec: Vec<i64> = Vec::with_capacity(records.len());
@@ -898,6 +902,7 @@ where
 
             api_key_ids.push(record.api_key_id);
             trace_ids.push(record.raw.trace_id.clone());
+            gateway_span_ids.push(record.raw.gateway_span_id.clone());
 
             let c5 = record.raw.cache_creation_5m_input_tokens;
             let c1 = record.raw.cache_creation_1h_input_tokens;
@@ -940,7 +945,7 @@ where
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
                 total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at,
                 engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count,
-                cache_read_source
+                cache_read_source, gateway_span_id
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -953,7 +958,7 @@ where
                 $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],
                 $37::timestamptz[],
                 $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[],
-                $46::text[]
+                $46::text[], $47::text[]
             )
             ON CONFLICT DO NOTHING
             RETURNING id, instance_id, correlation_id
@@ -1004,6 +1009,7 @@ where
             &tool_count_vec as &[Option<i32>],
             &message_count_vec as &[Option<i32>],
             &cache_read_source_vec as &[Option<String>],
+            &gateway_span_ids as &[Option<String>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1772,6 +1778,7 @@ mod tests {
             batch_created_at: None,
             batch_request_source: "".to_string(),
             trace_id: None,
+            gateway_span_id: None,
         };
 
         assert_eq!(record.correlation_id, 123);
@@ -1828,6 +1835,7 @@ mod tests {
             batch_created_at: None,
             batch_request_source: String::new(),
             trace_id: None,
+            gateway_span_id: None,
         }
     }
 
@@ -2005,7 +2013,8 @@ mod integration_tests {
                 api_key_purpose: Some(api_key_purpose),
                 input_price_per_token: input_price,
                 output_price_per_token: output_price,
-                valid_from: None,
+                // Capture timestamps use the host clock; PostgreSQL may run in a VM.
+                valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
                 completion_window,
             })
             .await
@@ -2102,6 +2111,7 @@ mod integration_tests {
             batch_created_at: None,
             batch_request_source: String::new(),
             trace_id: None,
+            gateway_span_id: None,
         }
     }
 
@@ -2115,6 +2125,97 @@ mod integration_tests {
         }
 
         while batcher.project_outbox_batch().await.unwrap() > 0 {}
+    }
+
+    #[sqlx::test]
+    async fn gateway_anchor_outbox_compatibility_and_replay(pool: sqlx::PgPool) {
+        create_test_model(&pool, "cor678").await;
+        let config = crate::test::utils::create_test_config();
+        let (batcher, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let mut new = create_raw_record("cor678", None, 10, 5);
+        new.trace_id = Some("11111111111111111111111111111111".into());
+        new.gateway_span_id = Some("2222222222222222".into());
+        writer.publish(new.clone()).await.unwrap();
+        let payload: serde_json::Value = sqlx::query_scalar("SELECT payload FROM analytics_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(payload["gateway_span_id"], "2222222222222222");
+        let old_raw = create_raw_record("cor678", None, 1, 1);
+        let old_enriched = create_raw_record("cor678", None, 2, 2);
+        let mut tx = pool.begin().await.unwrap();
+        let enriched = batcher
+            .enrich_batch(&mut tx, std::slice::from_ref(&old_enriched))
+            .await
+            .unwrap()
+            .remove(0);
+        tx.rollback().await.unwrap();
+        let mut legacy_raw = serde_json::to_value(&old_raw).unwrap();
+        legacy_raw.as_object_mut().unwrap().remove("gateway_span_id");
+        let mut legacy_enriched = serde_json::to_value(enriched).unwrap();
+        legacy_enriched["raw"].as_object_mut().unwrap().remove("gateway_span_id");
+        legacy_enriched["raw"].as_object_mut().unwrap().remove("api_key_id");
+        for (record, payload) in [(&old_raw, legacy_raw), (&old_enriched, legacy_enriched)] {
+            sqlx::query("INSERT INTO analytics_outbox (instance_id, correlation_id, payload) VALUES ($1,$2,$3)")
+                .bind(record.instance_id)
+                .bind(record.correlation_id)
+                .bind(payload)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 3);
+        let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as("SELECT trace_id,gateway_span_id FROM http_analytics")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.iter().filter(|(_, s)| s.is_none()).count(), 2);
+        assert!(rows.contains(&(new.trace_id.clone(), new.gateway_span_id.clone())));
+        writer.publish(new.clone()).await.unwrap();
+        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 1);
+        // Historical replay must not clear the anchor; conflicting metadata must
+        // not manufacture a pair combining two different span contexts.
+        for conflicting in [false, true] {
+            let mut replay = new.clone();
+            replay.trace_id = conflicting.then(|| "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+            replay.gateway_span_id = conflicting.then(|| "bbbbbbbbbbbbbbbb".into());
+            writer.publish(replay).await.unwrap();
+            assert_eq!(batcher.project_outbox_batch().await.unwrap(), 1);
+            let stored: (Option<String>, Option<String>) =
+                sqlx::query_as("SELECT trace_id,gateway_span_id FROM http_analytics WHERE instance_id=$1 AND correlation_id=$2")
+                    .bind(new.instance_id)
+                    .bind(new.correlation_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(stored, (new.trace_id.clone(), new.gateway_span_id.clone()));
+        }
+        // A legacy receipt wins even if a later replay carries a span. This must
+        // not turn the insert gate into an upsert or change billing eligibility.
+        let mut late = old_raw.clone();
+        late.trace_id = new.trace_id.clone();
+        late.gateway_span_id = new.gateway_span_id.clone();
+        writer.publish(late).await.unwrap();
+        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 1);
+        let legacy: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT trace_id,gateway_span_id FROM http_analytics WHERE instance_id=$1 AND correlation_id=$2")
+                .bind(old_raw.instance_id)
+                .bind(old_raw.correlation_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(legacy, (None, None));
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM http_analytics")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 3);
+        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM analytics_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(pending, 0);
     }
 
     #[sqlx::test]
@@ -2313,6 +2414,15 @@ mod integration_tests {
         .execute(&pool)
         .await
         .unwrap();
+
+        // Keep this fixture valid for host-clock captures even when the DB clock
+        // is slightly ahead. This test is about discounts, not validity boundaries.
+        sqlx::query("UPDATE model_cache_tariffs SET valid_from=$1 WHERE deployed_model_id=$2")
+            .bind(Utc::now() - chrono::Duration::minutes(1))
+            .bind(model_id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let initial_balance = Decimal::from_str("10.00").unwrap();
         let user_id = setup_user_with_balance(&pool, initial_balance).await;
@@ -2591,6 +2701,9 @@ mod integration_tests {
         first.batch_completion_window = Some("24h".to_string());
         first.fusillade_batch_id = Some(batch_id);
         first.fusillade_request_id = Some(request_id);
+        first.trace_id = Some("11111111111111111111111111111111".into());
+        first.gateway_span_id = Some("2222222222222222".into());
+        let expected_anchor = (first.trace_id.clone(), first.gateway_span_id.clone());
 
         // A second successful physical attempt has a different gateway
         // identity but the same logical Fusillade request identity.
@@ -2598,9 +2711,20 @@ mod integration_tests {
         duplicate.batch_completion_window = Some("24h".to_string());
         duplicate.fusillade_batch_id = Some(batch_id);
         duplicate.fusillade_request_id = Some(request_id);
+        duplicate.trace_id = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        duplicate.gateway_span_id = Some("bbbbbbbbbbbbbbbb".into());
 
         run_batcher_with_records(&pool, vec![failed]).await;
         run_batcher_with_records(&pool, vec![first, duplicate]).await;
+
+        let anchor: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT trace_id, gateway_span_id FROM http_analytics WHERE fusillade_request_id=$1 AND status_code BETWEEN 200 AND 299",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(anchor, expected_anchor, "the retained success keeps its own context");
 
         let analytics_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM http_analytics WHERE fusillade_request_id = $1")
             .bind(request_id)

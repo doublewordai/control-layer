@@ -212,7 +212,9 @@ use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
 pub use config::Config;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
+use opentelemetry::propagation::{Extractor, TextMapPropagator};
 use opentelemetry::trace::TraceContextExt;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
 use outlet_postgres::PostgresHandler;
 use request_logging::{AiResponse, ParsedAIRequest};
@@ -2743,27 +2745,9 @@ pub async fn build_router(
                 // If parsing fails at any point we silently fall through and the
                 // span starts a fresh trace — this is fine for requests that don't
                 // carry trace context (e.g. direct API calls from users).
-                if let Some(traceparent) = request.headers().get("traceparent")
-                    && let Ok(tp) = traceparent.to_str()
-                {
-                    let parts: Vec<&str> = tp.split('-').collect();
-                    if parts.len() == 4
-                        && let (Ok(trace_id), Ok(span_id)) = (
-                            opentelemetry::trace::TraceId::from_hex(parts[1]),
-                            opentelemetry::trace::SpanId::from_hex(parts[2]),
-                        )
-                    {
-                        let flags = u8::from_str_radix(parts[3], 16).unwrap_or(1);
-                        let parent_ctx = opentelemetry::trace::SpanContext::new(
-                            trace_id,
-                            span_id,
-                            opentelemetry::trace::TraceFlags::new(flags),
-                            true, // remote: this span context came from another process
-                            opentelemetry::trace::TraceState::default(),
-                        );
-                        let parent = opentelemetry::Context::new().with_remote_span_context(parent_ctx);
-                        let _ = span.set_parent(parent);
-                    }
+                let parent = TraceContextPropagator::new().extract(&TraceHeaders(request.headers()));
+                if parent.span().span_context().is_valid() {
+                    let _ = span.set_parent(parent);
                 }
 
                 span.set_attribute("otel.kind", "Server");
@@ -2806,13 +2790,27 @@ pub async fn build_router(
     Ok(router)
 }
 
+/// Header adapter for W3C context extraction at the HTTP boundary.
+struct TraceHeaders<'a>(&'a http::HeaderMap);
+
+impl Extractor for TraceHeaders<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key)?.to_str().ok()
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|key| key.as_str()).collect()
+    }
+}
+
 /// Middleware that records the OpenTelemetry trace ID on the current span,
 /// making it visible in fmt log output for Loki → Tempo correlation.
-async fn inject_trace_id(request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
+async fn inject_trace_id(mut request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
     let span = tracing::Span::current();
     let sc = span.context().span().span_context().clone();
     if sc.is_valid() {
         span.record("trace_id", tracing::field::display(sc.trace_id()));
+        request.extensions_mut().insert(onwards::InheritedTraceContext);
     }
     next.run(request).await
 }

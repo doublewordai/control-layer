@@ -120,6 +120,10 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
     req: Request<Body>,
 ) -> Response {
     let headers = req.headers().clone();
+    let trace_context = req
+        .extensions()
+        .get::<crate::InheritedTraceContext>()
+        .copied();
     let body_bytes = match axum::body::to_bytes(req.into_body(), state.body_limit).await {
         Ok(bytes) => bytes,
         Err(_) => return OnwardsErrorResponse::payload_too_large(state.body_limit).into_response(),
@@ -153,7 +157,14 @@ pub async fn chat_completions_handler<T: HttpClient + Clone + Send + Sync + 'sta
         trusted,
         authenticated_api_key_id,
         internal_error,
-    } = forward_request(state, headers, "/chat/completions", body_bytes.to_vec()).await;
+    } = forward_request(
+        state,
+        headers,
+        "/chat/completions",
+        body_bytes.to_vec(),
+        trace_context,
+    )
+    .await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -206,6 +217,10 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         return chat_completions_handler(State(state), req).await;
     }
 
+    let trace_context = req
+        .extensions()
+        .get::<crate::InheritedTraceContext>()
+        .copied();
     let request: ResponsesRequest = match axum::extract::Json::from_request(req, &state).await {
         Ok(Json(r)) => r,
         Err(e) => {
@@ -291,7 +306,14 @@ pub async fn responses_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         trusted,
         authenticated_api_key_id,
         internal_error,
-    } = forward_request(state.clone(), headers, "/responses", body_bytes).await;
+    } = forward_request(
+        state.clone(),
+        headers,
+        "/responses",
+        body_bytes,
+        trace_context,
+    )
+    .await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -329,6 +351,10 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     req: Request<Body>,
 ) -> Response {
     let headers = req.headers().clone();
+    let trace_context = req
+        .extensions()
+        .get::<crate::InheritedTraceContext>()
+        .copied();
     let body_bytes = match axum::body::to_bytes(req.into_body(), state.body_limit).await {
         Ok(bytes) => bytes,
         Err(_) => return OnwardsErrorResponse::payload_too_large(state.body_limit).into_response(),
@@ -354,7 +380,14 @@ pub async fn embeddings_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         trusted,
         authenticated_api_key_id,
         internal_error,
-    } = forward_request(state, headers, "/embeddings", body_bytes.to_vec()).await;
+    } = forward_request(
+        state,
+        headers,
+        "/embeddings",
+        body_bytes.to_vec(),
+        trace_context,
+    )
+    .await;
 
     // Success responses are always sanitized (model rewriting, extra field removal)
     // Error responses are only sanitized for untrusted providers
@@ -379,6 +412,10 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
     req: Request<Body>,
 ) -> Response {
     let headers = req.headers().clone();
+    let trace_context = req
+        .extensions()
+        .get::<crate::InheritedTraceContext>()
+        .copied();
     let body_bytes = match axum::body::to_bytes(req.into_body(), state.body_limit).await {
         Ok(bytes) => bytes,
         Err(_) => return OnwardsErrorResponse::payload_too_large(state.body_limit).into_response(),
@@ -434,7 +471,14 @@ pub async fn completions_handler<T: HttpClient + Clone + Send + Sync + 'static>(
         trusted,
         authenticated_api_key_id,
         internal_error,
-    } = forward_request(state, headers, "/completions", body_bytes.to_vec()).await;
+    } = forward_request(
+        state,
+        headers,
+        "/completions",
+        body_bytes.to_vec(),
+        trace_context,
+    )
+    .await;
 
     let response = if response.status().is_success() {
         let response_is_sse = response_is_sse(&response);
@@ -465,6 +509,7 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
     mut headers: HeaderMap,
     path: &str,
     body_bytes: Vec<u8>,
+    trace_context: Option<crate::InheritedTraceContext>,
 ) -> ForwardResult {
     // Ensure content-type is set
     headers.insert(
@@ -477,6 +522,11 @@ async fn forward_request<T: HttpClient + Clone + Send + Sync + 'static>(
 
     // Build the request to forward
     let mut request_builder = Request::builder().method("POST").uri(path);
+    // Rebuilding the request must preserve the embedding server's local ancestry;
+    // otherwise forwarding would re-extract the original remote parent.
+    if let Some(context) = trace_context {
+        request_builder = request_builder.extension(context);
+    }
 
     // Copy headers to the request
     for (name, value) in headers.iter() {
