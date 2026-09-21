@@ -708,6 +708,15 @@ pub async fn create_deployed_model<P: PoolProvider>(
     if let Some(tariff_defs) = tariffs {
         let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         for tariff_def in tariff_defs {
+            if tariff_def
+                .api_key_purpose
+                .as_ref()
+                .is_some_and(|purpose| !purpose.is_customer_billing())
+            {
+                return Err(Error::BadRequest {
+                    message: "Tariffs support only realtime, batch and playground customer inference".to_string(),
+                });
+            }
             let tariff_request = TariffCreateDBRequest {
                 deployed_model_id: model.id,
                 name: tariff_def.name,
@@ -963,6 +972,15 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
         // Create new or changed tariffs (skip those that already exist unchanged)
         for tariff_def in tariff_defs {
+            if tariff_def
+                .api_key_purpose
+                .as_ref()
+                .is_some_and(|purpose| !purpose.is_customer_billing())
+            {
+                return Err(Error::BadRequest {
+                    message: "Tariffs support only realtime, batch and playground customer inference".to_string(),
+                });
+            }
             // Skip if this tariff already exists with the same values
             if current_tariffs.iter().any(|existing| tariff_matches(existing, &tariff_def)) {
                 continue;
@@ -2254,6 +2272,48 @@ mod tests {
         response.assert_status_ok();
         let updated_model: DeployedModelResponse = response.json();
         assert_eq!(updated_model.alias, "updated-after-deletion");
+    }
+
+    #[sqlx::test]
+    async fn internal_tariffs_are_rejected_on_create_and_update(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+        let endpoint = get_test_endpoint_id(&pool).await;
+        let existing = create_test_deployment(&pool, admin.id, "original", "original").await;
+        for purpose in ["continuation", "platform"] {
+            let tariffs = json!([{"name":"invalid", "api_key_purpose":purpose,
+                "input_price_per_token":"1", "output_price_per_token":"2"}]);
+            app.post("/admin/api/v1/models")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"type":"standard", "model_name":"invalid", "alias":"invalid", "hosted_on":endpoint, "tariffs":tariffs}))
+                .await
+                .assert_status_bad_request();
+            app.patch(&format!("/admin/api/v1/models/{}", existing.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"alias":"must-rollback", "tariffs":tariffs}))
+                .await
+                .assert_status_bad_request();
+        }
+        let alias: String = sqlx::query_scalar("SELECT alias FROM deployed_models WHERE id=$1")
+            .bind(existing.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(alias, "original");
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM deployed_models WHERE alias='invalid'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM model_tariffs WHERE deployed_model_id=$1")
+            .bind(existing.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[sqlx::test]

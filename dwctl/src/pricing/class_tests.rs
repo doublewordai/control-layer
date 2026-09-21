@@ -51,6 +51,7 @@ async fn sql_and_billing_agree_on_class_scope_window_and_history(pool: PgPool) {
                 (ApiKeyPurpose::Batch, "batch"),
                 (ApiKeyPurpose::Playground, "playground"),
                 (ApiKeyPurpose::Continuation, "continuation"),
+                (ApiKeyPurpose::Platform, "platform"),
             ] {
                 for window in [None, Some("24h"), Some("1h")] {
                     for timestamp in [now - chrono::Duration::hours(3), now, now + chrono::Duration::hours(2)] {
@@ -236,4 +237,119 @@ async fn customer_price_sort_keeps_legacy_and_class_only_prices(pool: PgPool) {
         listed.iter().map(|m| m.alias.as_str()).collect::<Vec<_>>(),
         vec!["legacy", "class-only", "unpriced"]
     );
+}
+
+#[sqlx::test]
+async fn internal_purposes_never_resolve_customer_prices_or_quotes(pool: PgPool) {
+    use crate::db::handlers::Tariffs;
+    let account: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('internal-price-test','internal-price@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
+    let model: Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('internal-price','internal-price',true,$1) RETURNING id").bind(account).fetch_one(&pool).await.unwrap();
+    for scope in [None, Some(account)] {
+        for purpose in ["realtime", "continuation", "platform"] {
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,$2,$3,1,2,$3)").bind(model).bind(scope).bind(purpose).execute(&pool).await.unwrap();
+        }
+    }
+    let mut conn = pool.acquire().await.unwrap();
+    let mut repo = Tariffs::new(&mut conn);
+    for (purpose, name) in [(ApiKeyPurpose::Continuation, "continuation"), (ApiKeyPurpose::Platform, "platform")] {
+        assert_eq!(
+            repo.get_pricing_at_timestamp(model, &purpose, Utc::now(), None).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            repo.get_pricing_at_timestamp_with_fallback(model, Some(&purpose), &ApiKeyPurpose::Realtime, Utc::now(), None)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            repo.get_effective_pricing_at_timestamp(model, Some(account), name, None, Some("interactive"), Utc::now())
+                .await
+                .unwrap(),
+            None
+        );
+        let paid: bool = sqlx::query_scalar("SELECT model_has_effective_paid_tariff($1,$2,$3)")
+            .bind(model)
+            .bind(account)
+            .bind(name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!paid);
+        let row = TariffInfo {
+            account: Some(account),
+            serving_class: None,
+            purpose: purpose.clone(),
+            completion_window: None,
+            input_price_per_token: Decimal::ONE,
+            output_price_per_token: Decimal::ONE,
+            effective_from: Utc::now() - chrono::Duration::hours(1),
+            valid_until: None,
+        };
+        assert_eq!(
+            find_best_tariff(&[row], Some(&purpose), None, Utc::now(), Some(account), None),
+            (None, None)
+        );
+    }
+    for rows in [
+        repo.list_current_by_model(model).await.unwrap(),
+        repo.list_current_by_model_all_scopes(model).await.unwrap(),
+        repo.list_current_all_scopes_bulk(&[model]).await.unwrap(),
+        repo.list_current_by_account(account).await.unwrap(),
+        repo.list_effective_for_account(&[model], account).await.unwrap(),
+    ] {
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|r| r.api_key_purpose == Some(ApiKeyPurpose::Realtime)));
+    }
+    assert_eq!(
+        repo.list_all_by_model(model).await.unwrap().len(),
+        3,
+        "General historical rows remain readable"
+    );
+}
+
+#[sqlx::test]
+async fn general_price_sort_uses_current_windows_and_includes_free_prices(pool: PgPool) {
+    use crate::api::models::deployments::ModelSortField;
+    use crate::db::handlers::deployments::DeploymentFilter;
+    use crate::db::handlers::{Deployments, Repository};
+    let owner: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (username,email,auth_source) VALUES ('general-sort','general-sort@example.com','test') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut models = Vec::new();
+    for alias in ["free", "finite", "open", "future-only", "internal-only"] {
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ($1,$1,true,$2) RETURNING id",
+        )
+        .bind(alias)
+        .bind(owner)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        models.push(id);
+    }
+    for (index, purpose, price, from, until) in [
+        (0, "realtime", 0, -2, None),
+        (1, "realtime", 1, -2, Some(1)),
+        (1, "realtime", 9, 1, None),
+        (2, "realtime", 2, -2, None),
+        (2, "playground", 0, -4, Some(-1)),
+        (3, "realtime", 1, 1, None),
+        (4, "continuation", 0, -2, None),
+        (4, "platform", 0, -2, None),
+    ] {
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from,valid_until) VALUES ($1,'sort',$2,$3,$3,NOW()+$4*INTERVAL '1 hour',CASE WHEN $5::int IS NULL THEN NULL ELSE NOW()+$5*INTERVAL '1 hour' END)").bind(models[index]).bind(purpose).bind(Decimal::from(price)).bind(from as f64).bind(until).execute(&pool).await.unwrap();
+    }
+    let mut conn = pool.acquire().await.unwrap();
+    let mut filter = DeploymentFilter::new(0, 100);
+    filter.sort_field = Some(ModelSortField::PriceFrom);
+    let listed = Deployments::new(&mut conn).list(&filter).await.unwrap();
+    assert_eq!(
+        listed[..3].iter().map(|m| m.alias.as_str()).collect::<Vec<_>>(),
+        vec!["free", "finite", "open"]
+    );
+    assert_eq!(listed.len(), 5);
 }

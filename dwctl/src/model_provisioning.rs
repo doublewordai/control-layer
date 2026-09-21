@@ -342,11 +342,30 @@ fn default_weight() -> i32 {
 #[serde(deny_unknown_fields)]
 pub struct Tariff {
     pub name: String,
-    pub purpose: Purpose,
+    pub purpose: TariffPurpose,
     #[serde(default)]
     pub completion_window: Option<String>,
     pub input_per_million_tokens: String,
     pub output_per_million_tokens: String,
+}
+
+/// Customer inference pricing is independent of internal key purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TariffPurpose {
+    Realtime,
+    Batch,
+    Playground,
+}
+
+impl TariffPurpose {
+    pub(crate) fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Realtime => "realtime",
+            Self::Batch => "batch",
+            Self::Playground => "playground",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
@@ -554,7 +573,7 @@ pub(crate) fn validate_tariffs(tariffs: &[Tariff], source: &str) -> Result<()> {
     for tariff in tariffs {
         ensure_nonempty(&tariff.name, source, "tariff.name")?;
         match tariff.purpose {
-            Purpose::Batch => ensure!(
+            TariffPurpose::Batch => ensure!(
                 tariff.completion_window.as_deref().is_some_and(|value| !value.trim().is_empty()),
                 "{source}: batch tariff {:?} requires completion_window",
                 tariff.name
@@ -724,6 +743,19 @@ mod tests {
 
     fn write(directory: &Path, name: &str, contents: &str) {
         fs::write(directory.join(name), contents).unwrap();
+    }
+
+    #[test]
+    fn tariffs_accept_only_customer_inference_purposes() {
+        for purpose in ["realtime", "batch", "playground", "continuation", "platform"] {
+            let value = serde_json::json!({"name":"price", "purpose":purpose,
+                "input_per_million_tokens":"1", "output_per_million_tokens":"2"});
+            assert_eq!(
+                serde_json::from_value::<Tariff>(value).is_ok(),
+                matches!(purpose, "realtime" | "batch" | "playground"),
+                "{purpose}"
+            );
+        }
     }
 
     #[test]

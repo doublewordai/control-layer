@@ -90,7 +90,7 @@ impl<'c> Tariffs<'c> {
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
                    valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id, serving_class
             FROM model_tariffs
-            WHERE deployed_model_id = $1 AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW()) AND user_id IS NULL
+            WHERE deployed_model_id = $1 AND (api_key_purpose IS NULL OR api_key_purpose IN ('realtime','batch','playground')) AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW()) AND user_id IS NULL
             ORDER BY api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
             deployed_model_id
@@ -111,7 +111,7 @@ impl<'c> Tariffs<'c> {
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
                    valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id, serving_class
             FROM model_tariffs
-            WHERE deployed_model_id = $1 AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())
+            WHERE deployed_model_id = $1 AND (api_key_purpose IS NULL OR api_key_purpose IN ('realtime','batch','playground')) AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())
             ORDER BY user_id ASC NULLS FIRST, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
             deployed_model_id
@@ -128,7 +128,7 @@ impl<'c> Tariffs<'c> {
             "SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
                     valid_from, valid_until, api_key_purpose, completion_window, user_id, serving_class
              FROM model_tariffs WHERE deployed_model_id = ANY($1)
-               AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())
+               AND (api_key_purpose IS NULL OR api_key_purpose IN ('realtime','batch','playground')) AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())
              ORDER BY deployed_model_id, user_id NULLS FIRST, api_key_purpose, completion_window, name",
         )
         .bind(model_ids)
@@ -145,7 +145,7 @@ impl<'c> Tariffs<'c> {
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
                    valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id, serving_class
             FROM model_tariffs
-            WHERE user_id = $1 AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())
+            WHERE user_id = $1 AND (api_key_purpose IS NULL OR api_key_purpose IN ('realtime','batch','playground')) AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())
               AND EXISTS (SELECT 1 FROM deployed_models dm WHERE dm.id = model_tariffs.deployed_model_id AND dm.deleted = FALSE)
             ORDER BY deployed_model_id ASC, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
@@ -174,7 +174,7 @@ impl<'c> Tariffs<'c> {
                 FROM model_tariffs
                 WHERE deployed_model_id = ANY($1) AND (user_id IS NULL OR user_id = $2)
                   AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())
-                  AND api_key_purpose IS NOT NULL
+                  AND api_key_purpose IN ('realtime','batch','playground')
             ), selectors AS (
                 SELECT DISTINCT deployed_model_id, api_key_purpose, completion_window FROM relevant
             ), classes AS (
@@ -187,8 +187,8 @@ impl<'c> Tariffs<'c> {
                    s.completion_window, t.user_id, t.serving_class
             FROM selectors s JOIN classes c USING (deployed_model_id)
             CROSS JOIN LATERAL effective_model_tariff(s.deployed_model_id, $2, s.api_key_purpose,
-                s.completion_window, CASE WHEN s.api_key_purpose IN ('batch','continuation') THEN 'standard' ELSE c.serving_class END, NOW()) t
-            WHERE s.api_key_purpose NOT IN ('batch','continuation') OR c.serving_class IS NULL
+                s.completion_window, CASE WHEN s.api_key_purpose = 'batch' THEN 'standard' ELSE c.serving_class END, NOW()) t
+            WHERE s.api_key_purpose <> 'batch' OR c.serving_class IS NULL
             ORDER BY "deployed_model_id!", t.serving_class NULLS FIRST, "api_key_purpose: _", s.completion_window
             "#,
             deployed_model_ids,
@@ -265,6 +265,9 @@ impl<'c> Tariffs<'c> {
         timestamp: DateTime<Utc>,
         completion_window: Option<&str>,
     ) -> Result<Option<(Decimal, Decimal)>> {
+        if preferred_purpose.is_some_and(|purpose| !purpose.is_customer_billing()) {
+            return Ok(None);
+        }
         // Try preferred purpose first if specified
         if let Some(preferred) = preferred_purpose
             && let Some(pricing) = self
@@ -297,6 +300,9 @@ impl<'c> Tariffs<'c> {
         timestamp: DateTime<Utc>,
         completion_window: Option<&str>,
     ) -> Result<Option<(Decimal, Decimal)>> {
+        if !api_key_purpose.is_customer_billing() {
+            return Ok(None);
+        }
         // Convert enum to string for database query
         let purpose_str = match api_key_purpose {
             crate::db::models::api_keys::ApiKeyPurpose::Realtime => "realtime",

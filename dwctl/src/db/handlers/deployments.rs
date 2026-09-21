@@ -760,7 +760,7 @@ impl<'c> Repository for Deployments<'c> {
             Some(ModelSortField::ContextWindow) => ("(dm.metadata->>'context_window')::bigint", "DESC"),
             Some(ModelSortField::Provider) => ("dm.metadata->>'provider'", "ASC"),
             Some(ModelSortField::PriceFrom) => (
-                "(SELECT MIN(mt.input_price_per_token + mt.output_price_per_token) FROM model_tariffs mt WHERE mt.deployed_model_id = dm.id AND mt.valid_until IS NULL AND mt.user_id IS NULL AND (mt.input_price_per_token + mt.output_price_per_token) > 0)",
+                "(SELECT MIN(mt.input_price_per_token + mt.output_price_per_token) FROM model_tariffs mt WHERE mt.deployed_model_id = dm.id AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW()) AND mt.user_id IS NULL AND (mt.api_key_purpose IS NULL OR mt.api_key_purpose IN ('realtime','batch','playground')))",
                 "ASC",
             ),
             Some(ModelSortField::CreatedAt) | None => ("dm.created_at", "DESC"),
@@ -780,9 +780,9 @@ impl<'c> Repository for Deployments<'c> {
         if matches!(filter.sort_field, Some(ModelSortField::PriceFrom)) && filter.pricing_account.is_some() {
             query.push(" ORDER BY COALESCE((WITH relevant AS (SELECT api_key_purpose, completion_window, serving_class FROM model_tariffs WHERE deployed_model_id = dm.id AND (user_id IS NULL OR user_id = ");
             query.push_bind(filter.pricing_account);
-            query.push(") AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW()) AND api_key_purpose IS NOT NULL), selectors AS (SELECT DISTINCT api_key_purpose, completion_window FROM relevant), classes AS (SELECT DISTINCT serving_class FROM relevant UNION SELECT NULL::text) SELECT MIN(t.input_price_per_token + t.output_price_per_token) FROM selectors s CROSS JOIN classes c CROSS JOIN LATERAL effective_model_tariff(dm.id, ");
+            query.push(") AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW()) AND api_key_purpose IN ('realtime','batch','playground')), selectors AS (SELECT DISTINCT api_key_purpose, completion_window FROM relevant), classes AS (SELECT DISTINCT serving_class FROM relevant UNION SELECT NULL::text) SELECT MIN(t.input_price_per_token + t.output_price_per_token) FROM selectors s CROSS JOIN classes c CROSS JOIN LATERAL effective_model_tariff(dm.id, ");
             query.push_bind(filter.pricing_account);
-            query.push(", s.api_key_purpose, s.completion_window, CASE WHEN s.api_key_purpose IN ('batch','continuation') THEN 'standard' ELSE c.serving_class END, NOW()) t WHERE s.api_key_purpose NOT IN ('batch','continuation') OR c.serving_class IS NULL), (SELECT MIN(input_price_per_token + output_price_per_token) FROM model_tariffs legacy WHERE legacy.deployed_model_id = dm.id AND legacy.api_key_purpose IS NULL AND legacy.user_id IS NULL AND legacy.valid_from <= NOW() AND (legacy.valid_until IS NULL OR legacy.valid_until > NOW())))");
+            query.push(", s.api_key_purpose, s.completion_window, CASE WHEN s.api_key_purpose = 'batch' THEN 'standard' ELSE c.serving_class END, NOW()) t WHERE s.api_key_purpose <> 'batch' OR c.serving_class IS NULL), (SELECT MIN(input_price_per_token + output_price_per_token) FROM model_tariffs legacy WHERE legacy.deployed_model_id = dm.id AND legacy.api_key_purpose IS NULL AND legacy.user_id IS NULL AND legacy.valid_from <= NOW() AND (legacy.valid_until IS NULL OR legacy.valid_until > NOW())))");
             query.push(format!(" {direction} NULLS LAST, dm.id LIMIT "));
         } else {
             query.push(format!(" ORDER BY {sort_expr} {direction}{nulls_clause} LIMIT "));

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                   valid_from, valid_until, api_key_purpose as \"api_key_purpose: _\", completion_window, user_id, serving_class\n            FROM model_tariffs\n            WHERE user_id = $1 AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())\n              AND EXISTS (SELECT 1 FROM deployed_models dm WHERE dm.id = model_tariffs.deployed_model_id AND dm.deleted = FALSE)\n            ORDER BY deployed_model_id ASC, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC\n            ",
+  "query": "\n            SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,\n                   valid_from, valid_until, api_key_purpose as \"api_key_purpose: _\", completion_window, user_id, serving_class\n            FROM model_tariffs\n            WHERE deployed_model_id = $1 AND (api_key_purpose IS NULL OR api_key_purpose IN ('realtime','batch','playground')) AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())\n            ORDER BY user_id ASC NULLS FIRST, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -78,5 +78,5 @@
       true
     ]
   },
-  "hash": "7c0b281f1468132b6d7b69917d14cb5339e689dd54f9a9c7fbfcf7cf71fb5e86"
+  "hash": "a06206e8aec908c9ee6083fa0a6d96692597ad85a1e2981cf3d28795cdb04dc3"
 }

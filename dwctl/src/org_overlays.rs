@@ -232,11 +232,11 @@ impl OrgCatalog {
                     validate_tariffs(&prices.tariffs, source)?;
                     ensure!(
                         *class == PricingClass::Standard
-                            || prices.tariffs.iter().all(|t| !matches!(
-                                t.purpose,
-                                crate::model_provisioning::Purpose::Batch | crate::model_provisioning::Purpose::Continuation
-                            )),
-                        "{source}: async and continuation prices can only specialize standard"
+                            || prices
+                                .tariffs
+                                .iter()
+                                .all(|t| !matches!(t.purpose, crate::model_provisioning::TariffPurpose::Batch)),
+                        "{source}: batch prices can only specialize standard"
                     );
                     if let Some(cache) = &prices.cache_tariff {
                         validate_cache_tariff(&cache.as_tariff(), source)?;
@@ -476,6 +476,20 @@ mod tests {
 
     fn write(directory: &Path, name: &str, contents: &str) {
         fs::write(directory.join(name), contents).unwrap();
+    }
+
+    #[test]
+    fn internal_purposes_are_rejected_in_general_and_class_deals() {
+        for purpose in ["continuation", "platform"] {
+            let tariff = serde_json::json!({"name":"deal", "purpose":purpose,
+                "input_per_million_tokens":"1", "output_per_million_tokens":"2"});
+            for model in [
+                serde_json::json!({"alias":"m", "tariffs":[tariff.clone()]}),
+                serde_json::json!({"alias":"m", "class_pricing":{"interactive":{"tariffs":[tariff.clone()]}}}),
+            ] {
+                assert!(serde_json::from_value::<OrgDocument>(serde_json::json!({"org":"acme","models":[model]})).is_err());
+            }
+        }
     }
 
     #[test]

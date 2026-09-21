@@ -662,7 +662,7 @@
           "type": "string"
         },
         "purpose": {
-          "$ref": "#/$defs/Purpose"
+          "$ref": "#/$defs/TariffPurpose"
         }
       },
       "additionalProperties": false,
@@ -671,6 +671,15 @@
         "purpose",
         "input_per_million_tokens",
         "output_per_million_tokens"
+      ]
+    },
+    "TariffPurpose": {
+      "description": "Customer inference pricing is independent of internal key purposes.",
+      "type": "string",
+      "enum": [
+        "realtime",
+        "batch",
+        "playground"
       ]
     },
     "TrafficRule": {

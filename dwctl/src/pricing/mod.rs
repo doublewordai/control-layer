@@ -259,6 +259,9 @@ pub(crate) fn find_best_tariff(
     account: Option<uuid::Uuid>,
     serving_class: Option<&str>,
 ) -> (Option<Decimal>, Option<Decimal>) {
+    if api_key_purpose.is_some_and(|purpose| !purpose.is_customer_billing()) {
+        return (None, None);
+    }
     let scopes = [(account, serving_class), (account, None), (None, None)];
     for (index, (scope_account, scope_class)) in scopes.iter().copied().enumerate() {
         if scopes[..index].contains(&(scope_account, scope_class)) {
