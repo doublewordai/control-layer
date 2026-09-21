@@ -444,6 +444,36 @@ background_services:
         allowed_states: ["pending", "claimed"]
 ```
 
+### Task Retention
+
+Deletes expired Underway background tasks in bounded batches. Every task carries
+a `ttl` (14 days by default); nothing else removes finished tasks, so without this
+daemon the task table grows for the life of the installation and slows every
+task claim.
+
+```yaml
+background_services:
+  task_retention:
+    enabled: true
+    interval_seconds: 300
+    batch_size: 1000
+    batch_pause_milliseconds: 200
+    min_age_days: 14
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `true` | Run the retention daemon. |
+| `interval_seconds` | integer | `300` | Seconds between sweeps. |
+| `batch_size` | integer | `1000` | Rows deleted per statement; each batch is its own short transaction. |
+| `batch_pause_milliseconds` | integer | `200` | Pause between batches of one sweep, to throttle a large backlog. |
+| `min_age_days` | integer | `14` | Tasks younger than this are never considered. A task's own longer `ttl` is still honoured. |
+
+Every instance runs the daemon; an advisory lock collapses concurrent sweeps to
+one. Tasks that are `in_progress` are never deleted. For a very large existing
+backlog, run `scripts/purge_underway_tasks.sh` once beforehand so the first
+sweeps stay short.
+
 ### Leader Election
 
 For multi-instance deployments:
