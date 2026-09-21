@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT\n                dm.alias,\n                ie.name as \"provider_name?\",\n                mt.api_key_purpose as \"tariff_purpose?\",\n                mt.valid_from as \"tariff_valid_from?\",\n                mt.valid_until as \"tariff_valid_until?\",\n                mt.input_price_per_token as \"tariff_input_price?\",\n                mt.output_price_per_token as \"tariff_output_price?\",\n                mt.completion_window as \"tariff_completion_window?\",\n                mt.user_id as \"tariff_account?\",\n                mt.serving_class as \"tariff_class?\"\n            FROM deployed_models dm\n            LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id\n            LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id\n            WHERE dm.alias = ANY($1)\n            ORDER BY dm.alias, mt.valid_from DESC\n            ",
+  "query": "\n            SELECT\n                dm.alias,\n                ie.name as \"provider_name?\",\n                mt.api_key_purpose as \"tariff_purpose?\",\n                mt.valid_from as \"tariff_valid_from?\",\n                mt.valid_until as \"tariff_valid_until?\",\n                mt.input_price_per_token as \"tariff_input_price?\",\n                mt.output_price_per_token as \"tariff_output_price?\",\n                mt.completion_window as \"tariff_completion_window?\",\n                mt.user_id as \"tariff_account?\",\n                mt.serving_class as \"tariff_class?\"\n            FROM deployed_models dm\n            LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id\n            LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id\n                AND (mt.user_id IS NULL OR mt.user_id = ANY($2))\n            WHERE dm.alias = ANY($1)\n            ORDER BY dm.alias, mt.valid_from DESC\n            ",
   "describe": {
     "columns": [
       {
@@ -56,7 +56,8 @@
     ],
     "parameters": {
       "Left": [
-        "TextArray"
+        "TextArray",
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -72,5 +73,5 @@
       true
     ]
   },
-  "hash": "519859a606a0073de93bf14499771d49ad025cd06112d52014842510732680e5"
+  "hash": "b7d049e2c8746e3406b7ce10e634b817f85ed5db48c8879d30e0548f812aea74"
 }

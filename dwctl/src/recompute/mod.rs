@@ -147,7 +147,10 @@ pub async fn recompute_corpus(
     let mut aliases: Vec<String> = corpus.iter().filter_map(|r| r.model.clone()).collect();
     aliases.sort();
     aliases.dedup();
-    let cache_tariffs = crate::pricing::lookup_cache_tariffs(pool, &aliases).await?;
+    let mut accounts: Vec<_> = corpus.iter().filter_map(|r| r.user_id).collect();
+    accounts.sort();
+    accounts.dedup();
+    let cache_tariffs = crate::pricing::lookup_cache_tariffs(pool, &aliases, &accounts).await?;
     // Rows that recorded cache tokens but whose tariff history no longer resolves (e.g. the
     // deployed model was deleted, cascading its tariffs away). Those re-price at list rate,
     // which is NOT what the live path charged — the report must say so rather than present

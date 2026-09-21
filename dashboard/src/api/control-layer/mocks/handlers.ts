@@ -2883,6 +2883,12 @@ export const handlers = [
     });
   }),
 
+  http.get("/admin/api/v1/models/:id/overlays", ({ params }) => {
+    const model = modelsData.find((m) => m.id === params.id);
+    if (!model) return HttpResponse.json({ error: "Not found" }, { status: 404 });
+    return HttpResponse.json([]);
+  }),
+
   http.get("/admin/api/v1/organizations/:id/serving", ({ params }) => {
     const org = organizationsData.find((o) => o.id === params.id);
     if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });

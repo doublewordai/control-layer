@@ -524,16 +524,25 @@ where
             HashMap::new()
         };
 
+        // Only these key owners can be billed by this batch. Keep general prices
+        // but avoid loading every other customer's historical deals.
+        let accounts: Vec<Uuid> = key_map
+            .values()
+            .map(|key| key.user_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
         // Batch lookup: model alias → (model_id, provider_name, tariffs)
         let model_map = if !models.is_empty() {
-            self.batch_lookup_models_with_tariffs(tx, &models).await?
+            self.batch_lookup_models_with_tariffs(tx, &models, &accounts).await?
         } else {
             HashMap::new()
         };
 
         // Batch lookup: model alias → cache tariffs (per tier), for the cache multipliers.
         let cache_tariff_map = if !models.is_empty() {
-            self.batch_lookup_cache_tariffs(tx, &models).await?
+            self.batch_lookup_cache_tariffs(tx, &models, &accounts).await?
         } else {
             HashMap::new()
         };
@@ -700,13 +709,14 @@ where
 
     /// Batch lookup model info with tariffs.
     ///
-    /// Fetches ALL tariffs (including expired ones) to support historical pricing
-    /// for batch requests that may have been created in the past.
+    /// Fetches general tariffs and the billed accounts' tariffs, including expired
+    /// versions for batch requests that may have been created in the past.
     #[tracing::instrument(skip_all)]
     async fn batch_lookup_models_with_tariffs(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         aliases: &[&str],
+        accounts: &[Uuid],
     ) -> Result<HashMap<String, ModelInfo>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
 
@@ -723,7 +733,7 @@ where
             tariff_class: Option<String>,
         }
 
-        // Query models with ALL their tariffs (including expired) for historical pricing
+        // Keep all historical versions within the requested account scopes.
         // Note: Column aliases use "?" suffix to force nullable for LEFT JOIN columns
         let rows: Vec<ModelRow> = sqlx::query_as!(
             ModelRow,
@@ -742,10 +752,12 @@ where
             FROM deployed_models dm
             LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
             LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id
+                AND (mt.user_id IS NULL OR mt.user_id = ANY($2))
             WHERE dm.alias = ANY($1)
             ORDER BY dm.alias, mt.valid_from DESC
             "#,
-            &aliases_vec
+            &aliases_vec,
+            accounts
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -784,17 +796,18 @@ where
 
     /// Batch lookup cache tariffs (per model, per tier) for the given aliases.
     ///
-    /// Fetches ALL rows (including expired) so batch requests price as of their creation
-    /// time, exactly like `batch_lookup_models_with_tariffs`. Models without cache tariffs
+    /// Fetches general and billed-account rows (including expired) so requests price as
+    /// of their creation time, like `batch_lookup_models_with_tariffs`. Models without cache tariffs
     /// simply don't appear (the resolver then falls back to safe defaults).
     #[tracing::instrument(skip_all)]
     async fn batch_lookup_cache_tariffs(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         aliases: &[&str],
+        accounts: &[Uuid],
     ) -> Result<HashMap<String, Vec<CacheTariffRow>>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
-        let map = crate::pricing::lookup_cache_tariffs(&mut **tx, &aliases_vec).await?;
+        let map = crate::pricing::lookup_cache_tariffs(&mut **tx, &aliases_vec, accounts).await?;
         trace!(count = map.len(), "Batch lookup cache tariffs completed");
         Ok(map)
     }
@@ -2146,6 +2159,100 @@ mod integration_tests {
         }
 
         while batcher.project_outbox_batch().await.unwrap() > 0 {}
+    }
+
+    #[sqlx::test]
+    async fn tariff_lookups_scope_accounts_without_losing_history_or_unpriced_models(pool: sqlx::PgPool) {
+        let model = create_test_model(&pool, "scoped-history").await;
+        let private_only = create_test_model(&pool, "other-account-only").await;
+        let a = create_test_user(&pool, Role::StandardUser).await.id;
+        let b = create_test_user(&pool, Role::StandardUser).await.id;
+        let other = create_test_user(&pool, Role::StandardUser).await.id;
+        let now = Utc::now();
+        let boundary = now - chrono::Duration::days(1);
+        let historical = now - chrono::Duration::days(2);
+
+        // Both expired and current versions, including bespoke class prices and
+        // an unrelated customer's deals on the same models.
+        for (account, class, cents, read) in [
+            (None, None, 1, 5),
+            (Some(a), None, 2, 4),
+            (Some(a), Some("interactive"), 3, 2),
+            (Some(b), Some("throughput"), 4, 3),
+            (Some(other), Some("interactive"), 9, 9),
+        ] {
+            for (start, end, factor) in [(now - chrono::Duration::days(3), Some(boundary), 1), (boundary, None, 10)] {
+                sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from,valid_until) VALUES ($1,$2,$3,'history','realtime',$4,$4,$5,$6)")
+                    .bind(model).bind(account).bind(class).bind(Decimal::new(cents * factor, 2)).bind(start).bind(end)
+                    .execute(&pool).await.unwrap();
+                sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,user_id,serving_class,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,read_multiplier,min_prefix_tokens,valid_from,valid_until) VALUES ($1,$2,$3,1.25,2,2.5,$4,1,$5,$6)")
+                    .bind(model).bind(account).bind(class).bind(Decimal::new(read, 1)).bind(start).bind(end)
+                    .execute(&pool).await.unwrap();
+            }
+        }
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,$2,'private','realtime',1,1)")
+            .bind(private_only).bind(other).execute(&pool).await.unwrap();
+
+        let config = crate::test::utils::create_test_config();
+        let (batcher, _writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let mut tx = pool.begin().await.unwrap();
+        for (accounts, count) in [(vec![], 2), (vec![a], 6), (vec![a, b], 8)] {
+            let models = batcher
+                .batch_lookup_models_with_tariffs(&mut tx, &["scoped-history", "other-account-only"], &accounts)
+                .await
+                .unwrap();
+            assert_eq!(models["scoped-history"].tariffs.len(), count);
+            assert!(
+                models["scoped-history"]
+                    .tariffs
+                    .iter()
+                    .all(|t| t.account.is_none_or(|id| accounts.contains(&id)))
+            );
+            assert!(
+                models["other-account-only"].tariffs.is_empty(),
+                "LEFT JOIN must retain models with no applicable price"
+            );
+            let cache = batcher
+                .batch_lookup_cache_tariffs(&mut tx, &["scoped-history"], &accounts)
+                .await
+                .unwrap();
+            assert_eq!(cache["scoped-history"].len(), count);
+            assert!(
+                cache["scoped-history"]
+                    .iter()
+                    .all(|t| t.account.is_none_or(|id| accounts.contains(&id)))
+            );
+        }
+
+        // Exercise the real key-owner extraction, including a batch-purpose key,
+        // multiple accounts and an unknown key that must use general prices.
+        let a_key = create_api_key_for_user(&pool, a, ApiKeyPurpose::Realtime).await;
+        let a_batch_key = create_api_key_for_user(&pool, a, ApiKeyPurpose::Batch).await;
+        let b_key = create_api_key_for_user(&pool, b, ApiKeyPurpose::Realtime).await;
+        let cases = [
+            (Some(a_key), "interactive", Some(a), Decimal::new(18, 1)),
+            (Some(a_batch_key), "standard", Some(a), Decimal::new(14, 1)),
+            (Some(b_key), "throughput", Some(b), Decimal::new(26, 1)),
+            (Some(Uuid::new_v4()), "standard", None, Decimal::new(75, 2)),
+            (None, "standard", None, Decimal::new(75, 2)),
+        ];
+        for (timestamp, factor) in [(historical, Decimal::ONE), (now, Decimal::TEN)] {
+            let records: Vec<_> = cases
+                .iter()
+                .map(|(key, class, _, _)| {
+                    let mut record = create_raw_record("scoped-history", *key, 100, 0);
+                    record.batch_created_at = Some(timestamp);
+                    record.resolved_serving_class = Some((*class).to_string());
+                    record.cache_read_input_tokens = 50;
+                    record
+                })
+                .collect();
+            let priced = batcher.enrich_batch(&mut tx, &records).await.unwrap();
+            for (record, (_, _, account, expected)) in priced.iter().zip(cases) {
+                assert_eq!(record.user_id, account);
+                assert_eq!(record.total_cost, Some(expected * factor));
+            }
+        }
     }
 
     #[sqlx::test]

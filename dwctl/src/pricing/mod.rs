@@ -132,8 +132,9 @@ pub(crate) struct TariffInfo {
     pub serving_class: Option<String>,
 }
 
-/// Load the full cache-tariff history (including expired versions) for a set of model
-/// aliases: alias → versions, ready for [`resolve_cache_multipliers`] at any timestamp.
+/// Load cache-tariff history (including expired versions) for the requested models
+/// and billed accounts, plus general prices. Unrelated accounts are never loaded.
+/// Returns alias → versions for [`resolve_cache_multipliers`] at any timestamp.
 ///
 /// Shared by the live batcher and the recompute for the same reason the arithmetic is:
 /// the ledger is temporal (`valid_from` / `valid_until`, closed rather than updated), so
@@ -143,6 +144,7 @@ pub(crate) struct TariffInfo {
 pub(crate) async fn lookup_cache_tariffs<'e, E>(
     executor: E,
     aliases: &[String],
+    accounts: &[uuid::Uuid],
 ) -> Result<std::collections::HashMap<String, Vec<CacheTariffRow>>, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
@@ -175,9 +177,11 @@ where
         FROM deployed_models dm
         JOIN model_cache_tariffs mct ON mct.deployed_model_id = dm.id
         WHERE dm.alias = ANY($1)
+          AND (mct.user_id IS NULL OR mct.user_id = ANY($2))
         ORDER BY dm.alias, mct.valid_from DESC
         "#,
-        aliases
+        aliases,
+        accounts
     )
     .fetch_all(executor)
     .await?;
