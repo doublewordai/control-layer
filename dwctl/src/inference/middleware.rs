@@ -96,7 +96,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
 
     // Skip if this is a fusillade daemon request (already tracked)
     if let Some(request_id) = req.headers().get("x-fusillade-request-id") {
-        if let Ok(request_id) = request_id.to_str().unwrap_or("").parse::<uuid::Uuid>() {
+        if let Some(request_id) = request_id.to_str().ok().and_then(|s| s.parse::<uuid::Uuid>().ok()) {
             tracing::Span::current().set_attribute("doubleword.request_id", request_id.to_string());
         }
         return next.run(req).await;
@@ -919,7 +919,7 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
                 let (_parts, body) = response.into_parts();
                 let _ = axum::body::to_bytes(body, usize::MAX).await;
             }
-            .instrument(tracing::Span::current()),
+            .in_current_span(),
         );
 
         (StatusCode::ACCEPTED, Json(response_body)).into_response()

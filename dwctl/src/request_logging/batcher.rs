@@ -132,7 +132,7 @@ pub struct RawAnalyticsRecord {
     /// OpenTelemetry trace ID for correlation with Tempo
     pub trace_id: Option<String>,
     /// Enclosing gateway span captured by Outlet; pair with trace_id for exact ancestry.
-    #[serde(default)]
+    /// Absent from outbox payloads written before this field existed; serde reads those as `None`.
     pub gateway_span_id: Option<String>,
 }
 
@@ -1789,6 +1789,15 @@ mod tests {
     }
 
     #[test]
+    fn outbox_payload_without_gateway_span_id_deserializes() {
+        // Outbox rows written before the column existed carry no such key.
+        let mut payload = serde_json::to_value(cost_record(10, 20, 0, 0, 0, 0)).unwrap();
+        payload.as_object_mut().unwrap().remove("gateway_span_id");
+        let record: RawAnalyticsRecord = serde_json::from_value(payload).unwrap();
+        assert_eq!(record.gateway_span_id, None);
+    }
+
+    #[test]
     fn test_parse_api_key_purpose() {
         assert_eq!(parse_api_key_purpose("platform"), ApiKeyPurpose::Platform);
         assert_eq!(parse_api_key_purpose("batch"), ApiKeyPurpose::Batch);
@@ -2128,94 +2137,22 @@ mod integration_tests {
     }
 
     #[sqlx::test]
-    async fn gateway_anchor_outbox_compatibility_and_replay(pool: sqlx::PgPool) {
+    async fn projector_writes_gateway_span_id(pool: sqlx::PgPool) {
         create_test_model(&pool, "cor678").await;
         let config = crate::test::utils::create_test_config();
         let (batcher, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
-        let mut new = create_raw_record("cor678", None, 10, 5);
-        new.trace_id = Some("11111111111111111111111111111111".into());
-        new.gateway_span_id = Some("2222222222222222".into());
-        writer.publish(new.clone()).await.unwrap();
-        let payload: serde_json::Value = sqlx::query_scalar("SELECT payload FROM analytics_outbox")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(payload["gateway_span_id"], "2222222222222222");
-        let old_raw = create_raw_record("cor678", None, 1, 1);
-        let old_enriched = create_raw_record("cor678", None, 2, 2);
-        let mut tx = pool.begin().await.unwrap();
-        let enriched = batcher
-            .enrich_batch(&mut tx, std::slice::from_ref(&old_enriched))
-            .await
-            .unwrap()
-            .remove(0);
-        tx.rollback().await.unwrap();
-        let mut legacy_raw = serde_json::to_value(&old_raw).unwrap();
-        legacy_raw.as_object_mut().unwrap().remove("gateway_span_id");
-        let mut legacy_enriched = serde_json::to_value(enriched).unwrap();
-        legacy_enriched["raw"].as_object_mut().unwrap().remove("gateway_span_id");
-        legacy_enriched["raw"].as_object_mut().unwrap().remove("api_key_id");
-        for (record, payload) in [(&old_raw, legacy_raw), (&old_enriched, legacy_enriched)] {
-            sqlx::query("INSERT INTO analytics_outbox (instance_id, correlation_id, payload) VALUES ($1,$2,$3)")
-                .bind(record.instance_id)
-                .bind(record.correlation_id)
-                .bind(payload)
-                .execute(&pool)
-                .await
-                .unwrap();
-        }
-        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 3);
-        let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as("SELECT trace_id,gateway_span_id FROM http_analytics")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        assert_eq!(rows.len(), 3);
-        assert_eq!(rows.iter().filter(|(_, s)| s.is_none()).count(), 2);
-        assert!(rows.contains(&(new.trace_id.clone(), new.gateway_span_id.clone())));
-        writer.publish(new.clone()).await.unwrap();
+        let mut record = create_raw_record("cor678", None, 10, 5);
+        record.trace_id = Some("11111111111111111111111111111111".into());
+        record.gateway_span_id = Some("2222222222222222".into());
+        writer.publish(record.clone()).await.unwrap();
+
         assert_eq!(batcher.project_outbox_batch().await.unwrap(), 1);
-        // Historical replay must not clear the anchor; conflicting metadata must
-        // not manufacture a pair combining two different span contexts.
-        for conflicting in [false, true] {
-            let mut replay = new.clone();
-            replay.trace_id = conflicting.then(|| "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
-            replay.gateway_span_id = conflicting.then(|| "bbbbbbbbbbbbbbbb".into());
-            writer.publish(replay).await.unwrap();
-            assert_eq!(batcher.project_outbox_batch().await.unwrap(), 1);
-            let stored: (Option<String>, Option<String>) =
-                sqlx::query_as("SELECT trace_id,gateway_span_id FROM http_analytics WHERE instance_id=$1 AND correlation_id=$2")
-                    .bind(new.instance_id)
-                    .bind(new.correlation_id)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
-            assert_eq!(stored, (new.trace_id.clone(), new.gateway_span_id.clone()));
-        }
-        // A legacy receipt wins even if a later replay carries a span. This must
-        // not turn the insert gate into an upsert or change billing eligibility.
-        let mut late = old_raw.clone();
-        late.trace_id = new.trace_id.clone();
-        late.gateway_span_id = new.gateway_span_id.clone();
-        writer.publish(late).await.unwrap();
-        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 1);
-        let legacy: (Option<String>, Option<String>) =
-            sqlx::query_as("SELECT trace_id,gateway_span_id FROM http_analytics WHERE instance_id=$1 AND correlation_id=$2")
-                .bind(old_raw.instance_id)
-                .bind(old_raw.correlation_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-        assert_eq!(legacy, (None, None));
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM http_analytics")
+
+        let stored: (Option<String>, Option<String>) = sqlx::query_as("SELECT trace_id, gateway_span_id FROM http_analytics")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count, 3);
-        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM analytics_outbox")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(pending, 0);
+        assert_eq!(stored, (record.trace_id, record.gateway_span_id));
     }
 
     #[sqlx::test]

@@ -51,7 +51,7 @@ async fn captures(pool: &sqlx::PgPool, expected: usize) -> Vec<Capture> {
             if rows.len() >= expected {
                 return rows;
             }
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     })
     .await

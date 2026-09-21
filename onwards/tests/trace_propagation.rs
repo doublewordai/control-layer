@@ -38,13 +38,13 @@ fn console_only() -> Dispatch {
     )
 }
 
+// An embedded request: dwctl has already consumed and stripped the customer's
+// W3C headers at its edge, so Onwards sees none and nests under the gateway span.
 fn request() -> Request {
     Request::builder()
         .method("POST")
         .uri("/v1/chat/completions")
         .header("content-type", "application/json")
-        .header("traceparent", TRACEPARENT)
-        .header("tracestate", TRACESTATE)
         .body(Body::from(r#"{"model":"test-model"}"#))
         .unwrap()
 }
@@ -141,9 +141,7 @@ async fn gateway_fallback_attempts_keep_distinct_parent_ids_through_untraced_hop
         )
         .unwrap();
         let anchor = span.context().span().span_context().span_id().to_string();
-        let mut req = request();
-        req.extensions_mut().insert(onwards::InheritedTraceContext);
-        (gateway.oneshot(req).instrument(span).await.unwrap(), anchor)
+        (gateway.oneshot(request()).instrument(span).await.unwrap(), anchor)
     }
     .with_subscriber(dispatch)
     .await;
@@ -215,7 +213,7 @@ fn is_descendant(spans: &[SpanData], child: &str, ancestor: &str) -> bool {
 #[case("/v1/embeddings", r#"{"model":"test-model","input":"hello"}"#)]
 #[case("/v1/completions", r#"{"model":"test-model","prompt":"hello"}"#)]
 #[tokio::test]
-async fn strict_handler_preserves_embedded_context_marker(#[case] path: &str, #[case] body: &str) {
+async fn strict_handler_keeps_gateway_ancestry(#[case] path: &str, #[case] body: &str) {
     let (dispatch, provider, spans) = traced();
     let recorder = FallbackRecorder::default();
     let mut targets = Targets::from_config(
@@ -237,7 +235,6 @@ async fn strict_handler_preserves_embedded_context_marker(#[case] path: &str, #[
         .unwrap();
         let anchor = span.context().span().span_context().span_id().to_string();
         let mut req = request();
-        req.extensions_mut().insert(onwards::InheritedTraceContext);
         *req.uri_mut() = path.parse().unwrap();
         *req.body_mut() = Body::from(body.to_owned());
         let response = app.oneshot(req).instrument(span).await.unwrap();

@@ -540,7 +540,6 @@ Trace context must be propagated on every required forwarding hop. Propagation
 does not itself enable span export: correlation also depends on the connecting
 spans being sampled, exported, and retained. Stored IDs can therefore refer to
 unavailable spans, and older analytics records may have no gateway span ID.
-Trace context is diagnostic information, not an authorization identity.
 
 ## Sample Files
 

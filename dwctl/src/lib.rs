@@ -212,7 +212,7 @@ use axum_prometheus::PrometheusMetricLayerBuilder;
 use bon::Builder;
 pub use config::Config;
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
-use opentelemetry::propagation::{Extractor, TextMapPropagator};
+use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::TraceContextExt;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use outlet::{MultiHandler, RequestLoggerConfig, RequestLoggerLayer};
@@ -2745,7 +2745,7 @@ pub async fn build_router(
                 // If parsing fails at any point we silently fall through and the
                 // span starts a fresh trace — this is fine for requests that don't
                 // carry trace context (e.g. direct API calls from users).
-                let parent = TraceContextPropagator::new().extract(&TraceHeaders(request.headers()));
+                let parent = TraceContextPropagator::new().extract(&onwards::HeaderExtractor(request.headers()));
                 if parent.span().span_context().is_valid() {
                     let _ = span.set_parent(parent);
                 }
@@ -2790,27 +2790,23 @@ pub async fn build_router(
     Ok(router)
 }
 
-/// Header adapter for W3C context extraction at the HTTP boundary.
-struct TraceHeaders<'a>(&'a http::HeaderMap);
-
-impl Extractor for TraceHeaders<'_> {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key)?.to_str().ok()
-    }
-
-    fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(|key| key.as_str()).collect()
-    }
-}
-
 /// Middleware that records the OpenTelemetry trace ID on the current span,
 /// making it visible in fmt log output for Loki → Tempo correlation.
+///
+/// When a valid local OTel context exists, it strips the inbound W3C trace-context
+/// headers. Otherwise, it preserves them for downstream propagation. The request span
+/// created by `TraceLayer` has already adopted them as its remote parent, and
+/// everything below (embedded onwards included) must nest under that span
+/// rather than re-extract the customer's parent and detach from the gateway
+/// capture. Onwards injects its own outbound context per provider attempt, so
+/// nothing downstream needs the original headers.
 async fn inject_trace_id(mut request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
     let span = tracing::Span::current();
     let sc = span.context().span().span_context().clone();
     if sc.is_valid() {
         span.record("trace_id", tracing::field::display(sc.trace_id()));
-        request.extensions_mut().insert(onwards::InheritedTraceContext);
+        request.headers_mut().remove("traceparent");
+        request.headers_mut().remove("tracestate");
     }
     next.run(request).await
 }
