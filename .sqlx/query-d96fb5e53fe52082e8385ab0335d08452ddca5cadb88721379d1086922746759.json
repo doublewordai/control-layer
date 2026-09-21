@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO deployed_model_components (composite_model_id, deployed_model_id, weight, sort_order, enabled)\n             VALUES ($1, $2, 80, 0, TRUE)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d96fb5e53fe52082e8385ab0335d08452ddca5cadb88721379d1086922746759"
+}

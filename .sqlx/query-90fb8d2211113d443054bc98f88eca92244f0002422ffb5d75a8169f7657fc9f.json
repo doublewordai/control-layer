@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT auto_topup_amount, auto_topup_soft_failure_count, auto_topup_retry_after FROM users WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "auto_topup_amount",
+        "type_info": "Float4"
+      },
+      {
+        "ordinal": 1,
+        "name": "auto_topup_soft_failure_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 2,
+        "name": "auto_topup_retry_after",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "90fb8d2211113d443054bc98f88eca92244f0002422ffb5d75a8169f7657fc9f"
+}

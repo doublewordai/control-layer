@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT amount FROM credits_transactions WHERE user_id = $1 AND source_id LIKE 'verification-credits:%'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "amount",
+        "type_info": "Numeric"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c5492c7b3b7bf2d17a0c27e1b97e19ef00432ed53a63156ea7064fef37680e34"
+}

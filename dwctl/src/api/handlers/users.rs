@@ -437,6 +437,28 @@ pub async fn update_user<P: PoolProvider>(
         });
     }
 
+    // The serving account settings change how the account's traffic is routed
+    // and prioritised fleet-wide: an operator decision, never self-service.
+    if !can_update_all_users
+        && (user_data.granted_serving_classes.is_some()
+            || user_data.default_serving_class.is_some()
+            || user_data.self_hosted_only.is_some())
+    {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Users, Operation::UpdateAll),
+            action: Operation::UpdateAll,
+            resource: "serving settings".to_string(),
+        });
+    }
+    if let Some(Some(class)) = &user_data.default_serving_class {
+        super::validate_elevated_serving_class(class)?;
+    }
+    if let Some(classes) = &user_data.granted_serving_classes {
+        for class in classes {
+            super::validate_elevated_serving_class(class)?;
+        }
+    }
+
     // Validate auto-topup fields if provided
     if let Some(Some(amount)) = &user_data.auto_topup_amount
         && *amount <= 0.0
@@ -1306,6 +1328,59 @@ mod tests {
         assert_eq!(updated_user.id, user.id);
         assert_eq!(updated_user.display_name.as_deref(), Some("My New Display Name"));
         assert_eq!(updated_user.avatar_url.as_deref(), Some("https://example.com/my-avatar.jpg"));
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_users_cannot_touch_their_own_serving_settings_only_platform_managers(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+
+        // Grants, default class and routing preference are operated by
+        // platform managers only; a user gets a 403 even mixed with a field
+        // they may edit, and nothing is applied.
+        for body in [
+            json!({ "granted_serving_classes": ["interactive"] }),
+            json!({ "default_serving_class": "throughput" }),
+            json!({ "self_hosted_only": true }),
+            json!({ "display_name": "Renamed", "self_hosted_only": true }),
+        ] {
+            let response = app
+                .patch(&format!("/admin/api/v1/users/{}", user.id))
+                .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+                .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+                .json(&body)
+                .await;
+            response.assert_status_forbidden();
+        }
+        let response = app
+            .get(&format!("/admin/api/v1/users/{}", user.id))
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status_ok();
+        let current: UserResponse = response.json();
+        assert!(current.granted_serving_classes.is_empty());
+        assert_eq!(current.default_serving_class, None);
+        assert!(!current.self_hosted_only);
+        assert_ne!(current.display_name.as_deref(), Some("Renamed"));
+
+        let response = app
+            .patch(&format!("/admin/api/v1/users/{}", user.id))
+            .add_header(&add_auth_headers(&admin)[0].0, &add_auth_headers(&admin)[0].1)
+            .add_header(&add_auth_headers(&admin)[1].0, &add_auth_headers(&admin)[1].1)
+            .json(&json!({
+                "granted_serving_classes": ["interactive", "throughput"],
+                "default_serving_class": "interactive",
+                "self_hosted_only": true
+            }))
+            .await;
+        response.assert_status_ok();
+        let updated: UserResponse = response.json();
+        assert_eq!(updated.granted_serving_classes, vec!["interactive", "throughput"]);
+        assert_eq!(updated.default_serving_class.as_deref(), Some("interactive"));
+        assert!(updated.self_hosted_only);
     }
 
     #[sqlx::test]

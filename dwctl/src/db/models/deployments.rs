@@ -862,6 +862,9 @@ pub struct DeploymentDBResponse {
     pub metadata: serde_json::Value,
     /// Declarative source reapplied during startup, or None for manually managed rows.
     pub provisioning_source: Option<String>,
+    /// Serving classes this model offers, keyed by class name, each a preset
+    /// of targets (`{ttft_ms, itl_ms, priority}`; migration 149).
+    pub serving_classes: serde_json::Value,
 }
 
 /// DB action for a traffic routing rule (used at the repository layer)

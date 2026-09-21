@@ -111,6 +111,14 @@ pub struct RawAnalyticsRecord {
     /// URL of the upstream that served the request (onwards `ServedBy`
     /// extension) — per-component attribution for composite models.
     pub served_by: Option<String>,
+    /// Serving class the request asked for / was served under (onwards
+    /// `ServingClassOutcome` extension). See `serializers::UsageMetrics`.
+    /// Defaulted so outbox rows written before these fields existed still
+    /// deserialise after a deploy.
+    #[serde(default)]
+    pub requested_serving_class: Option<String>,
+    #[serde(default)]
+    pub resolved_serving_class: Option<String>,
 
     // === Auth ===
     /// Stable key identity attached by Onwards after successful authentication.
@@ -857,6 +865,8 @@ where
         let mut total_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut uncached_cost_vec: Vec<Option<Decimal>> = Vec::with_capacity(records.len());
         let mut served_by_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut requested_class_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut resolved_class_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut finish_reason_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut user_agent_vec: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut submitted_at_vec: Vec<Option<DateTime<Utc>>> = Vec::with_capacity(records.len());
@@ -915,6 +925,8 @@ where
             total_cost_vec.push(record.total_cost);
             uncached_cost_vec.push(record.uncached_cost);
             served_by_vec.push(record.raw.served_by.clone());
+            requested_class_vec.push(record.raw.requested_serving_class.clone());
+            resolved_class_vec.push(record.raw.resolved_serving_class.clone());
             finish_reason_vec.push(record.raw.finish_reason.clone());
             user_agent_vec.push(record.raw.user_agent.clone());
             // Already carried for batch-creation pricing; now also persisted, so the
@@ -944,7 +956,7 @@ where
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
                 total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at,
                 engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count,
-                cache_read_source, gateway_span_id
+                cache_read_source, requested_serving_class, resolved_serving_class, gateway_span_id
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -957,7 +969,7 @@ where
                 $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],
                 $37::timestamptz[],
                 $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[],
-                $46::text[], $47::text[]
+                $46::text[], $47::text[], $48::text[], $49::text[]
             )
             ON CONFLICT DO NOTHING
             RETURNING id, instance_id, correlation_id
@@ -1008,6 +1020,8 @@ where
             &tool_count_vec as &[Option<i32>],
             &message_count_vec as &[Option<i32>],
             &cache_read_source_vec as &[Option<String>],
+            &requested_class_vec as &[Option<String>],
+            &resolved_class_vec as &[Option<String>],
             &gateway_span_ids as &[Option<String>],
         )
         .fetch_all(&mut **tx)
@@ -1743,6 +1757,8 @@ mod tests {
         let api_key_id = Uuid::new_v4();
         let record = RawAnalyticsRecord {
             served_by: None,
+            requested_serving_class: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 123,
             timestamp: chrono::Utc::now(),
@@ -1808,6 +1824,8 @@ mod tests {
     fn cost_record(prompt: i64, completion: i64, read: i64, c5: i64, c1: i64, c24: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
             served_by: None,
+            requested_serving_class: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: 1,
             timestamp: chrono::Utc::now(),
@@ -1940,6 +1958,7 @@ mod integration_tests {
                 auth_header_prefix: Some("Bearer ".to_string()),
                 reasoning_translation: None,
                 accepts_scheduling_priority: false,
+                kind: Default::default(),
             })
             .await
             .unwrap();
@@ -2084,6 +2103,8 @@ mod integration_tests {
     fn create_raw_record(model: &str, api_key_id: Option<Uuid>, prompt_tokens: i64, completion_tokens: i64) -> RawAnalyticsRecord {
         RawAnalyticsRecord {
             served_by: None,
+            requested_serving_class: None,
+            resolved_serving_class: None,
             instance_id: Uuid::new_v4(),
             correlation_id: rand::random::<i64>().abs(),
             timestamp: chrono::Utc::now(),
@@ -2142,15 +2163,26 @@ mod integration_tests {
         let mut record = create_raw_record("cor678", None, 10, 5);
         record.trace_id = Some("11111111111111111111111111111111".into());
         record.gateway_span_id = Some("2222222222222222".into());
+        record.requested_serving_class = Some("interactive".into());
+        record.resolved_serving_class = Some("standard".into());
         writer.publish(record.clone()).await.unwrap();
 
         assert_eq!(batcher.project_outbox_batch().await.unwrap(), 1);
 
-        let stored: (Option<String>, Option<String>) = sqlx::query_as("SELECT trace_id, gateway_span_id FROM http_analytics")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert_eq!(stored, (record.trace_id, record.gateway_span_id));
+        let stored: (Option<String>, Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT trace_id, gateway_span_id, requested_serving_class, resolved_serving_class FROM http_analytics")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored,
+            (
+                record.trace_id,
+                record.gateway_span_id,
+                record.requested_serving_class,
+                record.resolved_serving_class
+            )
+        );
     }
 
     #[sqlx::test]

@@ -1,0 +1,94 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT transaction_count, total_requests, total_amount,\n                   total_prompt_tokens, total_completion_tokens, total_reasoning_tokens, total_tokens,\n                   sum_duration_ms, count_duration_ms, sum_ttfb_ms, count_ttfb_ms,\n                   total_list_cost, analytics_backfilled_at\n            FROM batch_aggregates WHERE fusillade_batch_id = $1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "transaction_count",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 1,
+        "name": "total_requests",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 2,
+        "name": "total_amount",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 3,
+        "name": "total_prompt_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 4,
+        "name": "total_completion_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 5,
+        "name": "total_reasoning_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 6,
+        "name": "total_tokens",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 7,
+        "name": "sum_duration_ms",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 8,
+        "name": "count_duration_ms",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 9,
+        "name": "sum_ttfb_ms",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 10,
+        "name": "count_ttfb_ms",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 11,
+        "name": "total_list_cost",
+        "type_info": "Numeric"
+      },
+      {
+        "ordinal": 12,
+        "name": "analytics_backfilled_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "79524909632004ba4e53ac661145a46c016ffb2f5164b0752a0ebc2e331c7a4d"
+}

@@ -75,6 +75,66 @@ pub struct ClayModel {
     pub access_groups: Vec<String>,
     #[serde(default)]
     pub traffic_rules: Vec<TrafficRule>,
+    /// The serving classes this model offers, each a preset of targets the
+    /// serving stack's router maps onto a pool. Declaring `interactive` or
+    /// `throughput` is what makes an organisation that holds that class get
+    /// it on this model; declare them once the serving side has pools for the
+    /// model. A `standard` preset is optional and pins what unclassed traffic
+    /// asks for; without one, standard sends no targets. Empty = standard only.
+    #[serde(default)]
+    pub serving_classes: BTreeMap<PresetClass, ServingPreset>,
+}
+
+/// The two elevated serving classes a model can activate and an org can be
+/// granted. `standard` is the absence of a choice and is never granted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ServingClassName {
+    Interactive,
+    Throughput,
+}
+
+/// The classes a model can declare a preset for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PresetClass {
+    Interactive,
+    Throughput,
+    Standard,
+}
+
+/// The objective targets a class maps to on a model, or an organisation's
+/// explicit targets on one model. Milliseconds; `priority` is the serving
+/// stack's scheduling priority (higher wins, 0 = today's realtime value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ServingPreset {
+    /// Time-to-first-token target, milliseconds.
+    #[schemars(range(min = 1))]
+    pub ttft_ms: u32,
+    /// Inter-token-latency target, milliseconds.
+    #[schemars(range(min = 1))]
+    pub itl_ms: u32,
+    /// Scheduling priority; omit for 0.
+    #[serde(default)]
+    pub priority: i32,
+}
+
+impl ServingPreset {
+    pub(crate) fn validate(&self, context: &str) -> Result<()> {
+        ensure!(self.ttft_ms > 0, "{context}: ttft_ms must be positive");
+        ensure!(self.itl_ms > 0, "{context}: itl_ms must be positive");
+        Ok(())
+    }
+}
+
+impl ServingClassName {
+    pub(crate) fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Throughput => "throughput",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema)]
@@ -492,6 +552,11 @@ impl Catalog {
             }
 
             ensure_unique_strings(&model.clay.access_groups, &model.source, "access group")?;
+
+            for (class, preset) in &model.clay.serving_classes {
+                preset.validate(&format!("{}: serving class {class:?} preset", model.source))?;
+            }
+
             let mut purposes = HashSet::new();
             for rule in &model.clay.traffic_rules {
                 ensure!(
@@ -728,6 +793,122 @@ clay:
                 .to_string()
                 .contains("case-insensitively")
         );
+    }
+
+    fn classes_catalog_yaml(serving_classes: &str) -> String {
+        format!(
+            r#"
+model: org/model
+clay:
+  alias: org/model
+  deployments:
+    - alias: provider-org-model
+      model_name: org/model
+      endpoint: onwards
+  routing:
+    pools:
+      default:
+        - deployment: provider-org-model
+  tariffs:
+    - name: general
+      purpose: realtime
+      input_per_million_tokens: "0.50"
+      output_per_million_tokens: "1.50"
+  serving_classes:
+{serving_classes}
+"#
+        )
+    }
+
+    const BOTH_PRESETS: &str = "    interactive: {ttft_ms: 500, itl_ms: 20, priority: 200}\n    throughput: {ttft_ms: 5000, itl_ms: 100}";
+
+    #[test]
+    fn serving_classes_are_validated() {
+        let directory = tempdir().unwrap();
+        write(
+            directory.path(),
+            "model.yaml",
+            &classes_catalog_yaml("    interactive: {ttft_ms: 0, itl_ms: 20}"),
+        );
+        let err = Catalog::load(directory.path()).unwrap_err().to_string();
+        assert!(err.contains("ttft_ms must be positive"), "{err}");
+
+        write(
+            directory.path(),
+            "model.yaml",
+            &classes_catalog_yaml("    fast: {ttft_ms: 1, itl_ms: 1}"),
+        );
+        assert!(
+            Catalog::load(directory.path()).is_err(),
+            "unknown class names are rejected by the schema"
+        );
+        write(
+            directory.path(),
+            "model.yaml",
+            &classes_catalog_yaml("    interactive: {ttft_ms: 1, itl_ms: 1, pool: x}"),
+        );
+        assert!(Catalog::load(directory.path()).is_err(), "unknown preset fields are rejected");
+
+        write(directory.path(), "model.yaml", &classes_catalog_yaml(BOTH_PRESETS));
+        let catalog = Catalog::load(directory.path()).unwrap();
+        let presets = &catalog.models[0].clay.serving_classes;
+        assert_eq!(
+            presets[&PresetClass::Interactive],
+            ServingPreset {
+                ttft_ms: 500,
+                itl_ms: 20,
+                priority: 200
+            }
+        );
+        assert_eq!(presets[&PresetClass::Throughput].priority, 0, "priority defaults to 0");
+    }
+
+    #[sqlx::test]
+    async fn apply_materialises_offered_classes(pool: PgPool) {
+        sqlx::query(
+            "INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let directory = tempdir().unwrap();
+        write(directory.path(), "model.yaml", &classes_catalog_yaml(BOTH_PRESETS));
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+
+        let presets: serde_json::Value = sqlx::query_scalar("SELECT serving_classes FROM deployed_models WHERE alias = 'org/model'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            presets,
+            serde_json::json!({
+                "interactive": {"ttft_ms": 500, "itl_ms": 20, "priority": 200},
+                "throughput": {"ttft_ms": 5000, "itl_ms": 100, "priority": 0}
+            })
+        );
+        let physical_presets: serde_json::Value =
+            sqlx::query_scalar("SELECT serving_classes FROM deployed_models WHERE alias = 'provider-org-model'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            physical_presets,
+            serde_json::json!({}),
+            "a physical member never offers classes of its own"
+        );
+
+        // The file is the source: dropping a class removes it on the next apply.
+        write(
+            directory.path(),
+            "model.yaml",
+            &classes_catalog_yaml("    interactive: {ttft_ms: 500, itl_ms: 20, priority: 200}"),
+        );
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        let presets: serde_json::Value = sqlx::query_scalar("SELECT serving_classes FROM deployed_models WHERE alias = 'org/model'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(presets.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["interactive"]);
     }
 
     #[test]

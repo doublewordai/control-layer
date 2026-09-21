@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO model_cache_tariffs\n                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens)\n               SELECT id, 1.25, 2.0, 2.5, 1024 FROM deployed_models WHERE alias = 'cache-test'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "2cc9bf8d465d3839229774587955693929e5a25e46d3e1c6ba864c01b4a79872"
+}
