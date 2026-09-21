@@ -55,7 +55,7 @@ pub struct InferenceEndpointCreateDBRequest {
     /// The endpoint's serving stack understands the scheduling `priority`
     /// request field (dynamo frontend). See migration 136.
     pub accepts_scheduling_priority: bool,
-    /// What kind of server this is. See migration 147.
+    /// What kind of server this is. See migration 149.
     pub kind: EndpointKind,
 }
 

@@ -1013,10 +1013,10 @@ pub async fn target_message_handler<T: HttpClient>(
         && state.targets.strict_mode
         && requests_stream(&body_bytes)
         && is_realtime;
-    for (member_idx, target, connection_guard) in pool
+    let mut providers = pool
         .select_iter_aimd(aimd_eligible, &model_name, resolved_pool_name.unwrap_or("default"))
-        .excluding_members(ineligible_members.iter().copied())
-    {
+        .excluding_members(ineligible_members.iter().copied());
+    while let Some((member_idx, target, connection_guard)) = providers.next() {
         any_attempted = true;
         attempt_number += 1;
         // First-token observations are attributed to the provider actually
@@ -1030,9 +1030,10 @@ pub async fn target_message_handler<T: HttpClient>(
         };
         let attempt_start = tokio::time::Instant::now();
         let observation = pool.observe(aimd_eligible, member_idx, &model_name, resolved_pool_name.unwrap_or("default"), attempt_start);
-        // This attempt's first-frame deadline; `None` on the final attempt.
+        // A failover deadline needs both remaining budget and an available
+        // alternative. Configured members at capacity cannot rescue this stream.
         let first_token_deadline = first_token_timeout
-            .filter(|_| (attempt_number as usize) < pool_max_attempts)
+            .filter(|_| (attempt_number as usize) < pool_max_attempts && providers.has_available_alternative(member_idx))
             .map(|timeout| attempt_start + timeout);
 
         let attempt_span = tracing::info_span!(
