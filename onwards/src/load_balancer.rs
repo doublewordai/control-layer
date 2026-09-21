@@ -659,6 +659,25 @@ impl SelectIter<'_> {
     fn exclusions(&self) -> HashSet<usize> {
         self.excluded.union(&self.ineligible).copied().collect()
     }
+
+    /// Whether a different, untried member can currently accept a failover.
+    /// This is a capacity snapshot, not a reservation: normal selection still
+    /// acquires its slot atomically. Do not abort a slow stream merely to retry
+    /// the same provider when the other eligible members are already full.
+    pub(crate) fn has_available_alternative(&self, current_member: usize) -> bool {
+        self.attempts < self.max_attempts
+            && self
+                .pool
+                .providers
+                .iter()
+                .enumerate()
+                .any(|(index, provider)| {
+                    index != current_member
+                        && !self.ineligible.contains(&index)
+                        && !self.excluded.contains(&index)
+                        && !provider.limiter.at_capacity()
+                })
+    }
 }
 
 impl<'a> Iterator for SelectIter<'a> {

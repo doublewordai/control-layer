@@ -959,3 +959,86 @@ async fn excluded_external_members_do_not_create_phantom_first_token_retries() {
         );
     }
 }
+
+#[tokio::test(start_paused = true)]
+async fn saturated_alternatives_do_not_abort_the_only_available_stream() {
+    LazyLock::force(&METRICS);
+    for strategy in ["priority", "weighted_random"] {
+        for busy_member in [0, 1] {
+            let alias = format!("saturated-first-token-{strategy}-{busy_member}");
+            let mut cfg = config(&alias, true);
+            cfg["targets"][&alias]["strategy"] = json!(strategy);
+            for member in [0, 1] {
+                cfg["targets"][&alias]["providers"][member]["concurrency_limit"] =
+                    json!({"max_concurrent_requests": 1});
+            }
+            let targets = Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap();
+            let pool = targets.targets.get(&alias).unwrap().default_pool().clone();
+            let (selected, _, busy_guard) = pool
+                .select_iter()
+                .excluding_members([1 - busy_member])
+                .next()
+                .unwrap();
+            assert_eq!(selected, busy_member);
+            let mock = MockHttpClient::new_timed_streaming_sequence(
+                StatusCode::OK,
+                vec![
+                    vec![(Duration::from_millis(500), CONTENT.to_string())],
+                    vec![(Duration::from_millis(500), CONTENT.to_string())],
+                    vec![(Duration::ZERO, CONTENT.to_string())],
+                ],
+            );
+            let server =
+                TestServer::new(build_router(AppState::with_client(targets, mock.clone())))
+                    .unwrap();
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({"model":alias,"stream":true}))
+                .await;
+            response.assert_status_ok();
+            assert_eq!(response.text(), CONTENT);
+            assert_eq!(
+                mock.get_requests().len(),
+                1,
+                "do not abort and retry the same provider when its alternate is saturated"
+            );
+            drop(busy_guard);
+
+            // Capacity returning must re-enable normal first-token failover.
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({"model":alias,"stream":true}))
+                .await;
+            response.assert_status_ok();
+            assert_eq!(response.text(), CONTENT);
+            assert_eq!(mock.get_requests().len(), 3);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn saturated_alternative_does_not_abort_the_only_available_header_wait() {
+    LazyLock::force(&METRICS);
+    let alias = "saturated-header-wait";
+    let mut cfg = config(alias, true);
+    cfg["targets"][alias]["providers"][1]["concurrency_limit"] =
+        json!({"max_concurrent_requests": 1});
+    let targets = Targets::from_config(serde_json::from_value(cfg).unwrap()).unwrap();
+    let pool = targets.targets.get(alias).unwrap().default_pool().clone();
+    let (_, _, busy_guard) = pool.select_iter().excluding_members([0]).next().unwrap();
+    let mock = MockHttpClient::new_streaming(StatusCode::OK, vec![CONTENT.to_string()]);
+    let client = HeaderClient {
+        mock: mock.clone(),
+        network_error: false,
+        header_delay: Some(Duration::from_millis(500)),
+    };
+    let server = TestServer::new(build_router(AppState::with_client(targets, client))).unwrap();
+    let response = server
+        .post("/v1/chat/completions")
+        .json(&json!({"model":alias,"stream":true}))
+        .await;
+    response.assert_status_ok();
+    assert_eq!(response.text(), CONTENT);
+    assert_eq!(mock.get_requests().len(), 1);
+    drop(busy_guard);
+}
