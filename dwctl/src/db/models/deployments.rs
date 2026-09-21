@@ -863,7 +863,7 @@ pub struct DeploymentDBResponse {
     /// Declarative source reapplied during startup, or None for manually managed rows.
     pub provisioning_source: Option<String>,
     /// Serving classes this model offers, keyed by class name, each a preset
-    /// of targets (`{ttft_ms, itl_ms, priority}`; migration 147).
+    /// of targets (`{ttft_ms, itl_ms, priority}`; migration 149).
     pub serving_classes: serde_json::Value,
 }
 
