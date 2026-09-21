@@ -911,8 +911,8 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
             "output": [],
         });
 
-        // Keep detached dispatch under the captured gateway span even after
-        // returning 202; spawned tasks do not automatically inherit that span.
+        // Spawned tasks do not inherit the current span; keep the background
+        // dispatch under the gateway span so its provider attempts stay in the trace.
         tokio::spawn(
             async move {
                 let response = next.run(req).await;

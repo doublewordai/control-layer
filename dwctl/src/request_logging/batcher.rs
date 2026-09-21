@@ -131,8 +131,7 @@ pub struct RawAnalyticsRecord {
     // === Tracing ===
     /// OpenTelemetry trace ID for correlation with Tempo
     pub trace_id: Option<String>,
-    /// Enclosing gateway span captured by Outlet; pair with trace_id for exact ancestry.
-    /// Absent from outbox payloads written before this field existed; serde reads those as `None`.
+    /// Gateway span captured by Outlet; pair with `trace_id` to locate the request's trace subtree.
     pub gateway_span_id: Option<String>,
 }
 
@@ -1790,7 +1789,6 @@ mod tests {
 
     #[test]
     fn outbox_payload_without_gateway_span_id_deserializes() {
-        // Outbox rows written before the column existed carry no such key.
         let mut payload = serde_json::to_value(cost_record(10, 20, 0, 0, 0, 0)).unwrap();
         payload.as_object_mut().unwrap().remove("gateway_span_id");
         let record: RawAnalyticsRecord = serde_json::from_value(payload).unwrap();
@@ -2352,8 +2350,7 @@ mod integration_tests {
         .await
         .unwrap();
 
-        // Keep this fixture valid for host-clock captures even when the DB clock
-        // is slightly ahead. This test is about discounts, not validity boundaries.
+        // Host-clock capture timestamps must fall inside the tariff's validity window.
         sqlx::query("UPDATE model_cache_tariffs SET valid_from=$1 WHERE deployed_model_id=$2")
             .bind(Utc::now() - chrono::Duration::minutes(1))
             .bind(model_id)

@@ -2793,13 +2793,12 @@ pub async fn build_router(
 /// Middleware that records the OpenTelemetry trace ID on the current span,
 /// making it visible in fmt log output for Loki → Tempo correlation.
 ///
-/// When a valid local OTel context exists, it strips the inbound W3C trace-context
-/// headers. Otherwise, it preserves them for downstream propagation. The request span
-/// created by `TraceLayer` has already adopted them as its remote parent, and
-/// everything below (embedded onwards included) must nest under that span
-/// rather than re-extract the customer's parent and detach from the gateway
-/// capture. Onwards injects its own outbound context per provider attempt, so
-/// nothing downstream needs the original headers.
+/// With a valid local OTel context, the request span has already adopted the
+/// inbound W3C headers as its remote parent, so they are stripped: everything
+/// below (embedded onwards included) must nest under that span rather than
+/// re-extract the caller's parent, and onwards injects its own outbound context
+/// per provider attempt. Without a local OTel context the headers are left in
+/// place so dwctl remains a transparent hop for the caller's trace.
 async fn inject_trace_id(mut request: axum::extract::Request, next: middleware::Next) -> axum::response::Response {
     let span = tracing::Span::current();
     let sc = span.context().span().span_context().clone();

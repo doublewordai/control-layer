@@ -1,5 +1,5 @@
-//! COR-678: exercise the real routing/forwarding path without an OTLP server.
-//! The downstream is a header recorder, not a Dynamo/engine implementation.
+//! Trace-context propagation through the real routing and forwarding path,
+//! using an in-memory span exporter and a header-recording downstream.
 
 use std::sync::{Arc, Mutex};
 
@@ -38,8 +38,8 @@ fn console_only() -> Dispatch {
     )
 }
 
-// An embedded request: dwctl has already consumed and stripped the customer's
-// W3C headers at its edge, so Onwards sees none and nests under the gateway span.
+// Embedded requests carry no W3C headers: the embedding gateway strips them
+// once its own request span has adopted them.
 fn request() -> Request {
     Request::builder()
         .method("POST")
@@ -141,7 +141,10 @@ async fn gateway_fallback_attempts_keep_distinct_parent_ids_through_untraced_hop
         )
         .unwrap();
         let anchor = span.context().span().span_context().span_id().to_string();
-        (gateway.oneshot(request()).instrument(span).await.unwrap(), anchor)
+        (
+            gateway.oneshot(request()).instrument(span).await.unwrap(),
+            anchor,
+        )
     }
     .with_subscriber(dispatch)
     .await;

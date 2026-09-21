@@ -462,9 +462,9 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Extract W3C trace context (traceparent + tracestate) from inbound headers
     // BEFORE the span is first entered. This stitches cross-service traces (e.g.
-    // remote onwards receiving requests from local onwards). When embedded in
-    // dwctl these headers have already been consumed and stripped at the edge,
-    // so this span simply nests under the gateway's request span.
+    // remote onwards receiving requests from local onwards). An embedding
+    // gateway that has already adopted these headers strips them first, so
+    // this span then nests under its request span instead.
     if req.headers().contains_key("traceparent") {
         let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
         let parent_ctx = propagator.extract(&HeaderExtractor(req.headers()));

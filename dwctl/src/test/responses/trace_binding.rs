@@ -58,12 +58,10 @@ async fn captures(pool: &sqlx::PgPool, expected: usize) -> Vec<Capture> {
     .expect("analytics captures did not arrive")
 }
 
-// Full Application / router, actual Outlet 0.11 handler, durable outbox and
-// projector, database-backed routing configuration, and a local fake provider.
 #[sqlx::test]
 async fn gateway_capture_anchors(pool: sqlx::PgPool) {
-    // Application tasks run on multiple threads. Give this test its own process-wide
-    // subscriber without competing with test-log or other parallel tests.
+    // The app spawns tasks that only see the process-wide subscriber. Re-exec so
+    // this test owns the global default without affecting parallel tests.
     const CHILD: &str = "DWCTL_TRACE_BINDING_TEST_CHILD";
     if std::env::var_os(CHILD).is_none() {
         pool.close().await;
@@ -106,8 +104,8 @@ async fn gateway_capture_anchors(pool: sqlx::PgPool) {
     let auth = format!("Bearer {key}");
     let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
     let body = json!({"model":"gpt-4o", "messages":[{"role":"user","content":"hello"}]});
-    // Verify the trace actually sent downstream belongs to the stored gateway
-    // capture, including when a customer supplied a different remote parent.
+    // A caller-supplied remote parent must not detach the downstream trace
+    // from the stored gateway capture.
     server
         .post("/ai/v1/chat/completions")
         .add_header("Authorization", &auth)
@@ -190,8 +188,6 @@ async fn gateway_capture_anchors(pool: sqlx::PgPool) {
                 1
             );
         }
-        // Match each outgoing W3C parent to the exported attempt and its exact
-        // persisted gateway ancestor, rather than just checking header presence.
         let mut sent_parents = HashSet::new();
         for request in upstream {
             let parent: Vec<_> = request.headers["traceparent"].to_str().unwrap().split('-').collect();
@@ -214,5 +210,35 @@ async fn gateway_capture_anchors(pool: sqlx::PgPool) {
             );
         }
     }
+    bg.shutdown().await;
+}
+
+// Without a local OTel context dwctl is a transparent hop: the caller's W3C
+// headers reach a trusted upstream unchanged.
+#[sqlx::test]
+async fn trace_headers_pass_through_without_local_tracing(pool: sqlx::PgPool) {
+    let mock = wiremock::MockServer::start().await;
+    super::mount_chat_completions_mock(&mock).await;
+    let (server, key, bg) = super::setup_ai_test(pool.clone(), &mock, false).await;
+    sqlx::query("UPDATE deployed_models SET trusted=true WHERE alias='gpt-4o'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    bg.sync_onwards_config(&pool).await.unwrap();
+    let traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+    server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", &format!("Bearer {key}"))
+        .add_header("traceparent", traceparent)
+        .add_header("tracestate", "vendor=value")
+        .json(&json!({"model":"gpt-4o", "messages":[{"role":"user","content":"hello"}]}))
+        .await
+        .assert_status_ok();
+
+    let upstream = mock.received_requests().await.unwrap();
+    assert_eq!(upstream.len(), 1);
+    assert_eq!(upstream[0].headers["traceparent"], traceparent);
+    assert_eq!(upstream[0].headers["tracestate"], "vendor=value");
     bg.shutdown().await;
 }
