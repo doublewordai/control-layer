@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.2.0](https://github.com/doublewordai/control-layer/compare/v12.1.1...v12.2.0) (2026-09-21)
+
+
+### Features
+
+* serving classes v1 ([#1774](https://github.com/doublewordai/control-layer/issues/1774)) ([e1c9275](https://github.com/doublewordai/control-layer/commit/e1c92756cbe16953360aa4055cf1011992c55767))
+
 ## [12.1.1](https://github.com/doublewordai/control-layer/compare/v12.1.0...v12.1.1) (2026-09-20)
 
 
