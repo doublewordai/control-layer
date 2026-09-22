@@ -1239,7 +1239,7 @@ const costApi = {
   async addFunds(data: AddFundsRequest): Promise<AddFundsResponse> {
     const payload = {
       user_id: data.user_id,
-      transaction_type: data.transaction_type ?? "admin_grant",
+      transaction_type: "admin_grant",
       amount: data.amount,
       source_id: data.source_id,
       description: data.description,
@@ -1251,9 +1251,7 @@ const costApi = {
       body: JSON.stringify(payload),
     });
     if (!response.ok) {
-      const verb =
-        payload.transaction_type === "admin_removal" ? "remove" : "add";
-      throw new Error(`Failed to ${verb} funds: ${response.status}`);
+      throw new Error(`Failed to add funds: ${response.status}`);
     }
     return response.json();
   },
