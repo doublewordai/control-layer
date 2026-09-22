@@ -2724,6 +2724,54 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_batchless_flex_success_index_gates_billing(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "flex-billing-idempotency").await;
+        setup_tariff(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00005").unwrap(),
+            Decimal::from_str("0.00010").unwrap(),
+            ApiKeyPurpose::Batch,
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let request_id = Uuid::new_v4();
+
+        let mut first = create_raw_record("flex-billing-idempotency", Some(batch_key.clone()), 1000, 500);
+        first.batch_completion_window = Some("1h".to_string());
+        first.fusillade_request_id = Some(request_id);
+
+        let mut duplicate = create_raw_record("flex-billing-idempotency", Some(batch_key), 1000, 500);
+        duplicate.batch_completion_window = Some("1h".to_string());
+        duplicate.fusillade_request_id = Some(request_id);
+
+        run_batcher_with_records(&pool, vec![first, duplicate]).await;
+
+        let analytics_rows = sqlx::query!(
+            "SELECT request_origin FROM http_analytics \
+             WHERE fusillade_request_id = $1 AND status_code BETWEEN 200 AND 299",
+            request_id,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let charge_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM credits_transactions \
+             WHERE fusillade_request_id = $1 AND transaction_type = 'usage'",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(analytics_rows.len(), 1, "batchless flex must retain one canonical success");
+        assert_eq!(analytics_rows[0].request_origin, "fusillade");
+        assert_eq!(charge_count, 1, "batchless flex must produce one debit");
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_legacy_fusillade_duplicates_remain_reconcilable_during_rollout(pool: sqlx::PgPool) {
         let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
         let batch_key_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
@@ -2789,8 +2837,10 @@ mod integration_tests {
 
         let mut first = create_raw_record("spoofed-fusillade-id", Some(first_key), 1000, 500);
         first.fusillade_request_id = Some(spoofed_request_id);
+        first.batch_completion_window = Some("1h".to_string());
         let mut second = create_raw_record("spoofed-fusillade-id", Some(second_key), 1000, 500);
         second.fusillade_request_id = Some(spoofed_request_id);
+        second.batch_completion_window = Some("1h".to_string());
 
         run_batcher_with_records(&pool, vec![first, second]).await;
 
@@ -2802,7 +2852,7 @@ mod integration_tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(rows.len(), 2, "an untrusted header must not deduplicate billing");
+        assert_eq!(rows.len(), 2, "untrusted request-id and SLA headers must not deduplicate billing");
         assert!(
             rows.iter().all(|row| row.fusillade_request_id == Some(spoofed_request_id)),
             "the shared realtime correlation id is retained without suppressing either charge"

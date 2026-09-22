@@ -3,4 +3,10 @@
 -- Repair an interrupted concurrent build from migration 153. PostgreSQL leaves
 -- an invalid index behind when CREATE INDEX CONCURRENTLY is interrupted; a
 -- plain IF NOT EXISTS retry would otherwise skip that invalid index.
+--
+-- This repairs cancellation/interruption, not dirty source data. If either the
+-- CREATE or this REINDEX reports a uniqueness violation, reconcile the reported
+-- duplicate successes (retaining one row per request) and rerun the migration.
+-- An invalid index that reached `indisready` remains maintained meanwhile and
+-- prevents new conflicts; check the catalog rather than assuming that phase ran.
 REINDEX INDEX CONCURRENTLY uq_http_analytics_fusillade_success;
