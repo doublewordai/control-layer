@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use axum::{Router, body::Body, extract::Request, http::HeaderMap, response::Response};
-use onwards::{AppState, build_router, client::HttpClient, target::Targets};
+use onwards::{
+    AppState, build_router, client::HttpClient, strict::build_strict_router, target::Targets,
+};
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::{TraceContextExt, TracerProvider};
 use opentelemetry_sdk::{
@@ -227,7 +229,10 @@ async fn strict_handler_keeps_gateway_ancestry(#[case] path: &str, #[case] body:
     )
     .unwrap();
     targets.strict_mode = true;
-    let app = build_router(AppState::with_client(targets, recorder.clone()));
+    let app = Router::new().nest(
+        "/v1",
+        build_strict_router(AppState::with_client(targets, recorder.clone())),
+    );
     let anchor = async {
         let span = tracing::info_span!("gateway_request");
         let headers =
