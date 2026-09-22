@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.2.1](https://github.com/doublewordai/control-layer/compare/v12.2.0...v12.2.1) (2026-09-22)
+
+
+### Bug Fixes
+
+* **responses:** accept encrypted reasoning projection as a no-op ([#1829](https://github.com/doublewordai/control-layer/issues/1829)) ([87efcc3](https://github.com/doublewordai/control-layer/commit/87efcc3f19283fcfa90097d948c126d63785e217))
+
 ## [12.2.0](https://github.com/doublewordai/control-layer/compare/v12.1.1...v12.2.0) (2026-09-21)
 
 
