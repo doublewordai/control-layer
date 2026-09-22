@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { toast } from "sonner";
@@ -45,8 +45,12 @@ describe("AddFundsModal", () => {
     } as never);
   });
 
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
   const renderModal = (onClose = vi.fn(), onSuccess = vi.fn()) => {
-    render(
+    const { rerender } = render(
       <AddFundsModal
         isOpen
         onClose={onClose}
@@ -54,7 +58,17 @@ describe("AddFundsModal", () => {
         onSuccess={onSuccess}
       />,
     );
-    return { onClose, onSuccess };
+    // Mirrors the parent, which keeps the modal mounted and toggles `isOpen`.
+    const setOpen = (isOpen: boolean) =>
+      rerender(
+        <AddFundsModal
+          isOpen={isOpen}
+          onClose={onClose}
+          targetUser={targetUser}
+          onSuccess={onSuccess}
+        />,
+      );
+    return { onClose, onSuccess, setOpen };
   };
 
   // The dialog renders through a portal, so queries use `screen`.
@@ -186,7 +200,7 @@ describe("AddFundsModal", () => {
     const user = userEvent.setup();
     mutateAsync.mockRejectedValue(new Error("boom"));
     vi.spyOn(console, "error").mockImplementation(() => {});
-    const { onClose } = renderModal();
+    const { onClose, onSuccess } = renderModal();
 
     await user.click(screen.getByRole("tab", { name: "Remove funds" }));
     await user.click(
@@ -198,6 +212,48 @@ describe("AddFundsModal", () => {
         "Failed to remove funds. Please try again.",
       ),
     );
+    expect(onSuccess).not.toHaveBeenCalled();
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("resets to Add funds after cancelling in Remove mode", async () => {
+    const user = userEvent.setup();
+    const { onClose, setOpen } = renderModal();
+
+    await user.click(screen.getByRole("tab", { name: "Remove funds" }));
+    const amount = screen.getByLabelText("Amount (USD)");
+    await user.clear(amount);
+    await user.type(amount, "99");
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    setOpen(false);
+    setOpen(true);
+
+    expect(screen.getByRole("tab", { name: "Add funds" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(
+      screen.getByRole("heading", { name: "Add to Credit Balance" }),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Amount (USD)")).toHaveValue(10);
+  });
+
+  it("resets to Add funds after dismissing the dialog with Escape", async () => {
+    const user = userEvent.setup();
+    const { onClose, setOpen } = renderModal();
+
+    await user.click(screen.getByRole("tab", { name: "Remove funds" }));
+    await user.keyboard("{Escape}");
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    setOpen(false);
+    setOpen(true);
+
+    expect(screen.getByRole("tab", { name: "Add funds" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
   });
 });

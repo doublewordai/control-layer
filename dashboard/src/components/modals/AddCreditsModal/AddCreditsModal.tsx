@@ -58,6 +58,21 @@ export function AddFundsModal({
     setError(null);
   };
 
+  // The parent keeps this component mounted and only toggles `isOpen`, so
+  // every close path must reset the form. Otherwise cancelling after picking
+  // "Remove" would silently reopen in removal mode next time.
+  const resetForm = () => {
+    setMode("add");
+    setAmount("10.00");
+    setDescription("");
+    setError(null);
+  };
+
+  const handleClose = () => {
+    resetForm();
+    onClose();
+  };
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
 
@@ -97,12 +112,7 @@ export function AddFundsModal({
           : `Successfully added $${sentAmount} to ${targetLabel}`,
       );
       onSuccess?.();
-      onClose();
-
-      // Reset form
-      setMode("add");
-      setAmount("10.00");
-      setDescription("");
+      handleClose();
     } catch (error) {
       setError(`Failed to ${verb} funds. Please try again.`);
       console.error(`Failed to ${verb} funds:`, error);
@@ -110,7 +120,7 @@ export function AddFundsModal({
   };
 
   return (
-    <Dialog open={isOpen} onOpenChange={onClose}>
+    <Dialog open={isOpen} onOpenChange={(open) => !open && handleClose()}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="text-2xl">
@@ -183,7 +193,7 @@ export function AddFundsModal({
             <Button
               type="button"
               variant="outline"
-              onClick={onClose}
+              onClick={handleClose}
               disabled={addFundsMutation.isPending}
             >
               Cancel
