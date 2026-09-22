@@ -2628,19 +2628,7 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_future_fusillade_success_index_gates_billing_and_aggregation(pool: sqlx::PgPool) {
-        // This preparation release does not ship the index: production history
-        // must be reconciled first. Install its intended definition in this
-        // isolated test database to prove the application is ready for it.
-        sqlx::query(
-            "CREATE UNIQUE INDEX test_http_analytics_fusillade_success_unique \
-             ON http_analytics (fusillade_request_id) \
-             WHERE fusillade_request_id IS NOT NULL AND status_code BETWEEN 200 AND 299",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
+    async fn test_fusillade_success_index_gates_billing_and_aggregation(pool: sqlx::PgPool) {
         let model_id = create_test_model(&pool, "fusillade-billing-idempotency").await;
         setup_tariff(
             &pool,
@@ -2817,7 +2805,7 @@ mod integration_tests {
         assert_eq!(rows.len(), 2, "an untrusted header must not deduplicate billing");
         assert!(
             rows.iter().all(|row| row.fusillade_request_id == Some(spoofed_request_id)),
-            "without the future analytics index, the shared correlation id is retained for reconciliation"
+            "the shared realtime correlation id is retained without suppressing either charge"
         );
     }
 
