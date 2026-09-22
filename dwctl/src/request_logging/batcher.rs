@@ -725,6 +725,7 @@ where
         struct ModelRow {
             alias: String,
             provider_name: Option<String>,
+            tariff_id: Option<Uuid>,
             tariff_purpose: Option<String>,
             tariff_valid_from: Option<DateTime<Utc>>,
             tariff_valid_until: Option<DateTime<Utc>>,
@@ -743,6 +744,7 @@ where
             SELECT
                 dm.alias,
                 ie.name as "provider_name?",
+                mt.id as "tariff_id?",
                 mt.api_key_purpose as "tariff_purpose?",
                 mt.valid_from as "tariff_valid_from?",
                 mt.valid_until as "tariff_valid_until?",
@@ -773,13 +775,15 @@ where
             });
 
             // Add tariff if present
-            if let (Some(purpose), Some(valid_from), Some(input_price), Some(output_price)) = (
+            if let (Some(id), Some(purpose), Some(valid_from), Some(input_price), Some(output_price)) = (
+                row.tariff_id,
                 row.tariff_purpose,
                 row.tariff_valid_from,
                 row.tariff_input_price,
                 row.tariff_output_price,
             ) {
                 entry.tariffs.push(TariffInfo {
+                    id,
                     serving_class: row.tariff_class,
                     purpose: parse_api_key_purpose(&purpose),
                     effective_from: valid_from,
@@ -2948,6 +2952,67 @@ mod integration_tests {
             rows.iter().all(|row| row.fusillade_request_id == Some(spoofed_request_id)),
             "without the future analytics index, the shared correlation id is retained for reconciliation"
         );
+    }
+
+    #[sqlx::test]
+    async fn playground_customer_fallback_matches_quotes_admission_and_actual_charges(pool: sqlx::PgPool) {
+        use crate::db::handlers::Tariffs;
+        for (alias, class, rate, org_playground) in [
+            ("playground-org", None, 5, false),
+            ("playground-class", Some("interactive"), 2, true),
+            ("playground-free", None, 0, false),
+        ] {
+            let model = create_test_model(&pool, alias).await;
+            setup_tariff(&pool, model, Decimal::new(20, 6), Decimal::new(40, 6), ApiKeyPurpose::Playground).await;
+            let account = setup_user_with_balance(&pool, Decimal::from(100)).await;
+            let input = Decimal::new(rate, 6);
+            let output = input * Decimal::from(2);
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,$2,$3,'customer','realtime',$4,$5,NOW()-INTERVAL '1 hour')")
+                .bind(model).bind(account).bind(class).bind(input).bind(output).execute(&pool).await.unwrap();
+            if org_playground {
+                sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,$2,'org-playground','playground',0.000009,0.000018,NOW()-INTERVAL '1 hour')")
+                    .bind(model).bind(account).execute(&pool).await.unwrap();
+            }
+            let key = create_api_key_for_user(&pool, account, ApiKeyPurpose::Playground).await;
+            let mut record = create_raw_record(alias, Some(key), 1000, 500);
+            record.resolved_serving_class = Some("interactive".to_string());
+            run_batcher_with_records(&pool, vec![record]).await;
+            let expected = input * Decimal::from(1000) + output * Decimal::from(500);
+            let mut conn = pool.acquire().await.unwrap();
+            assert_eq!(
+                Credits::new(&mut conn).get_user_balance(account).await.unwrap(),
+                Decimal::from(100) - expected,
+                "{alias}"
+            );
+            let cost: Option<Decimal> = sqlx::query_scalar("SELECT total_cost FROM http_analytics WHERE api_key_id=$1")
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(cost, Some(expected), "zero is a price, not unresolved: {alias}");
+            let mut repo = Tariffs::new(&mut conn);
+            assert_eq!(
+                repo.get_effective_pricing_at_timestamp(model, Some(account), "playground", None, Some("interactive"), Utc::now())
+                    .await
+                    .unwrap(),
+                Some((input, output))
+            );
+            let quotes = repo.list_effective_for_account(&[model], account).await.unwrap();
+            assert!(
+                quotes.iter().all(|q| q.user_id == Some(account)),
+                "general playground must not bypass an account deal"
+            );
+            assert!(quotes.iter().any(|q| q.api_key_purpose == Some(ApiKeyPurpose::Realtime)
+                && q.input_price_per_token == input
+                && q.serving_class.as_deref() == class));
+            let paid: bool = sqlx::query_scalar("SELECT model_has_effective_paid_tariff($1,$2,'playground')")
+                .bind(model)
+                .bind(account)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(paid, rate > 0, "admission must respect a zero all-class customer fallback: {alias}");
+        }
     }
 
     #[sqlx::test]

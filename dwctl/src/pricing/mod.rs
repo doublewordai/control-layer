@@ -121,6 +121,8 @@ pub(crate) struct ModelInfo {
 /// Tariff info for pricing lookup.
 #[derive(Debug, Clone)]
 pub(crate) struct TariffInfo {
+    /// Stable final tie-breaker shared with the SQL resolver.
+    pub id: uuid::Uuid,
     pub purpose: ApiKeyPurpose,
     pub effective_from: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
@@ -244,9 +246,10 @@ pub(crate) fn resolve_cache_multipliers(
     })
 }
 
-/// Resolve a price within the requested purpose/window before considering scope.
-/// Playground may use realtime prices; batch never borrows a realtime price or
-/// another batch window. Iterate references once: no per-request row clones.
+/// Resolve eligible prices by account/class scope first. Within each scope,
+/// playground prefers its own purpose then realtime. Batch only matches its exact
+/// window and never borrows realtime. Zero stops fallback. Newer valid rows win,
+/// then the lowest tariff ID, matching SQL. Iterate references without cloning.
 pub(crate) fn find_best_tariff(
     tariffs: &[TariffInfo],
     api_key_purpose: Option<&ApiKeyPurpose>,
@@ -292,7 +295,7 @@ pub(crate) fn find_best_tariff(
                 (None, None) => 2,
                 _ => return None,
             };
-            Some(((purpose_rank, scope_rank, std::cmp::Reverse(t.effective_from)), t))
+            Some(((scope_rank, purpose_rank, std::cmp::Reverse(t.effective_from), t.id), t))
         })
         .min_by_key(|(rank, _)| *rank)
         .map(|(_, t)| (Some(t.input_price_per_token), Some(t.output_price_per_token)))
@@ -649,6 +652,7 @@ mod tests {
         completion_window: Option<&str>,
     ) -> TariffInfo {
         TariffInfo {
+            id: uuid::Uuid::new_v4(),
             serving_class: None,
             purpose,
             effective_from,

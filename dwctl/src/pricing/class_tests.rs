@@ -17,6 +17,7 @@ async fn sql_and_billing_agree_on_class_scope_window_and_history(pool: PgPool) {
     let mut tariffs = Vec::new();
     for (scope, class, purpose, window, price, from, until) in [
         (None, None, ApiKeyPurpose::Realtime, None, 3, -2, None),
+        (None, None, ApiKeyPurpose::Playground, None, 8, -2, None),
         (None, None, ApiKeyPurpose::Batch, Some("24h"), 1, -2, None),
         (Some(account), None, ApiKeyPurpose::Realtime, None, 2, -2, None),
         (Some(account), Some("interactive"), ApiKeyPurpose::Realtime, None, 0, -2, Some(1)),
@@ -28,12 +29,14 @@ async fn sql_and_billing_agree_on_class_scope_window_and_history(pool: PgPool) {
         let price = Decimal::from(price);
         let purpose_name = match purpose {
             ApiKeyPurpose::Batch => "batch",
+            ApiKeyPurpose::Playground => "playground",
             _ => "realtime",
         };
-        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window,user_id,serving_class,valid_from,valid_until) VALUES ($1,'test',$2,$2,$3,$4,$5,$6,$7,$8)")
+        let id: Uuid = sqlx::query_scalar("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window,user_id,serving_class,valid_from,valid_until) VALUES ($1,'test',$2,$2,$3,$4,$5,$6,$7,$8) RETURNING id")
             .bind(model).bind(price).bind(purpose_name).bind(window).bind(scope).bind(class).bind(valid_from).bind(valid_until)
-            .execute(&pool).await.unwrap();
+            .fetch_one(&pool).await.unwrap();
         tariffs.push(TariffInfo {
+            id,
             account: scope,
             serving_class: class.map(str::to_owned),
             purpose,
@@ -54,7 +57,13 @@ async fn sql_and_billing_agree_on_class_scope_window_and_history(pool: PgPool) {
                 (ApiKeyPurpose::Platform, "platform"),
             ] {
                 for window in [None, Some("24h"), Some("1h")] {
-                    for timestamp in [now - chrono::Duration::hours(3), now, now + chrono::Duration::hours(2)] {
+                    for timestamp in [
+                        now - chrono::Duration::hours(3),
+                        now - chrono::Duration::hours(2),
+                        now,
+                        now + chrono::Duration::hours(1),
+                        now + chrono::Duration::hours(2),
+                    ] {
                         let sql: Option<(Decimal, Decimal)> = sqlx::query_as(
                             "SELECT input_price_per_token,output_price_per_token FROM effective_model_tariff($1,$2,$3,$4,$5,$6)",
                         )
@@ -277,6 +286,7 @@ async fn internal_purposes_never_resolve_customer_prices_or_quotes(pool: PgPool)
             .unwrap();
         assert!(!paid);
         let row = TariffInfo {
+            id: Uuid::new_v4(),
             account: Some(account),
             serving_class: None,
             purpose: purpose.clone(),
@@ -364,4 +374,137 @@ async fn realtime_admission_ignores_windowed_rows(pool: PgPool) {
         .await
         .unwrap();
     assert!(!paid, "admission must not invent a realtime completion window");
+}
+
+/// Exhaust every combination of the six eligible playground candidates. The
+/// ordered fixture is the business contract, independent of either resolver's
+/// implementation. Deliberately make the most specific realtime deal free.
+#[sqlx::test]
+async fn playground_exhausts_each_customer_scope_before_general_prices(pool: PgPool) {
+    let account: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('playground-deal','playground-deal@example.com','test','organization') RETURNING id")
+        .fetch_one(&pool).await.unwrap();
+    let model: Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('playground-deal','playground-deal',true,$1) RETURNING id")
+        .bind(account).fetch_one(&pool).await.unwrap();
+    let now = Utc::now();
+    let candidates = [
+        (Some(account), Some("interactive"), ApiKeyPurpose::Playground, 11),
+        (Some(account), Some("interactive"), ApiKeyPurpose::Realtime, 0),
+        (Some(account), None, ApiKeyPurpose::Playground, 13),
+        (Some(account), None, ApiKeyPurpose::Realtime, 14),
+        (None, None, ApiKeyPurpose::Playground, 15),
+        (None, None, ApiKeyPurpose::Realtime, 16),
+    ];
+    for mask in 0..64 {
+        sqlx::query("DELETE FROM model_tariffs WHERE deployed_model_id=$1")
+            .bind(model)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut rows = Vec::new();
+        for (index, (owner, class, purpose, price)) in candidates.iter().enumerate() {
+            if mask & (1 << index) == 0 {
+                continue;
+            }
+            let name = if *purpose == ApiKeyPurpose::Playground {
+                "playground"
+            } else {
+                "realtime"
+            };
+            let price = Decimal::from(*price);
+            let id: Uuid = sqlx::query_scalar("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,$2,$3,'precedence',$4,$5,$5,$6) RETURNING id")
+                .bind(model).bind(owner).bind(class).bind(name).bind(price).bind(now-chrono::Duration::hours(1)).fetch_one(&pool).await.unwrap();
+            rows.push(TariffInfo {
+                id,
+                account: *owner,
+                serving_class: class.map(str::to_owned),
+                purpose: purpose.clone(),
+                completion_window: None,
+                input_price_per_token: price,
+                output_price_per_token: price,
+                effective_from: now - chrono::Duration::hours(1),
+                valid_until: None,
+            });
+        }
+        // Reverse input order: ledger/query iteration order must not select the winner.
+        rows.reverse();
+        for (purpose, purpose_name) in [(ApiKeyPurpose::Playground, "playground"), (ApiKeyPurpose::Realtime, "realtime")] {
+            for (owner, class) in [
+                (Some(account), Some("interactive")),
+                (Some(account), Some("throughput")),
+                (None, Some("interactive")),
+                (Some(Uuid::new_v4()), Some("interactive")),
+            ] {
+                let expected = candidates
+                    .iter()
+                    .enumerate()
+                    .find(|(index, (scope, c, p, _))| {
+                        mask & (1 << index) != 0
+                            && (scope.is_none() || *scope == owner)
+                            && (c.is_none() || *c == class)
+                            && (purpose == ApiKeyPurpose::Playground || *p == ApiKeyPurpose::Realtime)
+                    })
+                    .map(|(_, (_, _, _, price))| (Decimal::from(*price), Decimal::from(*price)));
+                let sql: Option<(Decimal, Decimal)> =
+                    sqlx::query_as("SELECT input_price_per_token,output_price_per_token FROM effective_model_tariff($1,$2,$3,NULL,$4,$5)")
+                        .bind(model)
+                        .bind(owner)
+                        .bind(purpose_name)
+                        .bind(class)
+                        .bind(now)
+                        .fetch_optional(&pool)
+                        .await
+                        .unwrap();
+                let rust = find_best_tariff(&rows, Some(&purpose), None, now, owner, class);
+                assert_eq!(
+                    sql, expected,
+                    "SQL mask={mask} purpose={purpose_name} owner={owner:?} class={class:?}"
+                );
+                assert_eq!(
+                    rust,
+                    expected.map(|(i, o)| (Some(i), Some(o))).unwrap_or((None, None)),
+                    "Rust mask={mask} purpose={purpose_name} owner={owner:?} class={class:?}"
+                );
+            }
+        }
+    }
+}
+
+#[sqlx::test]
+async fn equal_timestamp_tariffs_use_the_same_stable_id_in_sql_and_billing(pool: PgPool) {
+    let model: Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('tie-test','tie-test',true,'00000000-0000-0000-0000-000000000000') RETURNING id").fetch_one(&pool).await.unwrap();
+    let now = Utc::now();
+    let mut rows = Vec::new();
+    // Deliberately overlapping, finite historical versions with identical start
+    // times are legal in the ledger. Query/iteration order must not affect cost.
+    for number in [2, 1] {
+        let id = Uuid::from_u128(number);
+        let price = Decimal::from(number as u64);
+        sqlx::query("INSERT INTO model_tariffs (id,deployed_model_id,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from,valid_until) VALUES ($1,$2,'tie','realtime',$3,$3,$4,$5)")
+            .bind(id).bind(model).bind(price).bind(now-chrono::Duration::hours(1)).bind(now+chrono::Duration::hours(1)).execute(&pool).await.unwrap();
+        rows.push(TariffInfo {
+            id,
+            account: None,
+            serving_class: None,
+            purpose: ApiKeyPurpose::Realtime,
+            completion_window: None,
+            input_price_per_token: price,
+            output_price_per_token: price,
+            effective_from: now - chrono::Duration::hours(1),
+            valid_until: Some(now + chrono::Duration::hours(1)),
+        });
+    }
+    let selected: Uuid = sqlx::query_scalar("SELECT id FROM effective_model_tariff($1,NULL,'playground',NULL,NULL,$2)")
+        .bind(model)
+        .bind(now)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(selected, Uuid::from_u128(1));
+    for _ in 0..2 {
+        assert_eq!(
+            find_best_tariff(&rows, Some(&ApiKeyPurpose::Playground), None, now, None, None),
+            (Some(Decimal::ONE), Some(Decimal::ONE))
+        );
+        rows.reverse();
+    }
 }

@@ -50,6 +50,49 @@ If a model has no tariff, requests to that model are free.
 
 Tariffs are time-versioned, so you can change pricing without affecting how historical transactions are displayed. The system records which tariff was active when each charge occurred.
 
+### Organisation and serving-class price precedence
+
+For the requested model, billing uses the API key's owning account and the
+**resolved** serving class. A routing overlay or a price does not itself grant
+access to a class. An existing private alias keeps its own prices; there is no
+implicit pricing fallback between model aliases.
+
+First discard tariffs outside their validity interval or for another account,
+class, purpose or batch window. Then choose the first eligible entry below:
+
+| Priority | Realtime | Playground | Batch/flex, completion window W |
+|---|---|---|---|
+| 1 | Account + class, realtime | Account + class, playground | Account + standard, batch W |
+| 2 | Account all-class, realtime | Account + class, realtime | Account all-class, batch W |
+| 3 | General model, realtime | Account all-class, playground | General model, batch W |
+| 4 | — | Account all-class, realtime | — |
+| 5 | — | General model, playground | — |
+| 6 | — | General model, realtime | — |
+
+Playground's realtime fallback is evaluated **within each scope** before moving
+to the next scope. An organisation's realtime deal therefore beats a general
+playground price. Realtime never substitutes for batch, and a 1h batch price
+never substitutes for 24h. Realtime/playground use no completion window.
+Continuation and platform purposes do not select customer prices.
+
+A selected row supplies both input and output prices. Zero is an explicit price
+and stops fallback; the resolver never chooses the cheapest row or combines
+fields from different rows. If no eligible price exists, analytics cost remains
+NULL and no usage debit is created. This avoids an invented charge, but missing
+batch tiers can underbill: configure every supported completion window.
+
+Validity is `valid_from <= time < valid_until` (an absent end is unbounded).
+Batch pricing uses batch creation time; other pricing uses the captured request
+time. Within the same scope/purpose/window, the latest valid start wins, then
+ascending tariff ID breaks exact ties. SQL quotes and Rust billing use the same
+rules. Quotes retain the matched tariff's actual purpose and class.
+
+Cache multipliers are selected independently by account + resolved class →
+account all-class → general model, at the same timestamp. They have no
+purpose/window dimension. A general cache tariff is required for Control Layer
+cache pricing to apply; an organisation override alone cannot enable it.
+Applicable cache-read/write multipliers adjust the selected input token rate.
+
 ## The Transaction Ledger
 
 All credit movements are recorded in an append-only transaction ledger. Transactions are never modified or deleted — this creates a complete audit trail.
