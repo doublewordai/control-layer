@@ -12,13 +12,14 @@
 //! to evaluate the per-row `ttl`. Tasks that set a longer `ttl` are still kept for as long
 //! as they ask.
 //!
-//! Every pod runs the daemon; the sweep takes a transaction-scoped advisory lock, so
-//! concurrent sweeps collapse to one and the rest wait for the next tick. `SKIP LOCKED`
-//! keeps the sweep off rows a worker is claiming at that moment.
+//! Every pod runs the daemon. A sweep holds a session-level advisory lock on a dedicated
+//! connection for its whole duration, so concurrent sweeps collapse to one while each
+//! delete batch still commits on its own. `SKIP LOCKED` keeps the sweep off rows a worker
+//! is claiming at that moment.
 
 use std::time::Duration;
 
-use sqlx::PgConnection;
+use sqlx::{Connection, PgPool};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, instrument};
 
@@ -28,13 +29,15 @@ use crate::metrics::errors::component::TASK_RETENTION;
 /// Advisory lock key shared by every sweep. Distinct from leader election's key.
 const SWEEP_LOCK_KEY: i64 = 0x7a5b_5265_7465_6e74; // "zRetent"
 
-/// Delete one batch of expired tasks. Returns the number of rows deleted.
+/// Delete one batch of expired tasks in its own transaction. Returns the number of rows
+/// deleted.
 ///
-/// Runs in its own transaction: the batch is selected `FOR UPDATE SKIP LOCKED` so it never
-/// contends with a worker claiming a task, and `task_attempt` rows follow through the
-/// dependency's `ON DELETE CASCADE`.
-#[instrument(skip(conn), fields(batch_size, min_age_days = min_age.as_secs() / 86_400))]
-pub async fn purge_expired_batch(conn: &mut PgConnection, batch_size: i64, min_age: Duration) -> Result<u64, sqlx::Error> {
+/// The batch is selected `FOR UPDATE SKIP LOCKED` so it never contends with a worker
+/// claiming a task, and `task_attempt` rows follow through the dependency's
+/// `ON DELETE CASCADE`.
+#[instrument(skip(pool), fields(batch_size, min_age_days = min_age.as_secs() / 86_400))]
+pub async fn purge_expired_batch(pool: &PgPool, batch_size: i64, min_age: Duration) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
     let result = sqlx::query(
         r#"
         WITH victims AS (
@@ -55,17 +58,43 @@ pub async fn purge_expired_batch(conn: &mut PgConnection, batch_size: i64, min_a
     )
     .bind(batch_size)
     .bind(min_age.as_secs_f64())
-    .execute(conn)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected())
 }
 
 /// One sweep: repeat batches until a batch comes back short, pausing between them.
 ///
-/// Returns the total rows deleted, or `None` when another sweep held the lock.
-async fn sweep(pool: &sqlx::PgPool, config: &TaskRetentionConfig, shutdown: &CancellationToken) -> Result<Option<u64>, sqlx::Error> {
-    let batch_size = config.batch_size.max(1) as i64;
-    let min_age = Duration::from_secs(config.min_age_days * 86_400);
+/// Returns the total rows deleted, or `None` when another sweep held the lock. The lock is
+/// session-level on a detached connection that is closed on every exit path, so it can
+/// neither leak back into the pool nor outlive the sweep.
+async fn sweep(pool: &PgPool, config: &TaskRetentionConfig, shutdown: &CancellationToken) -> Result<Option<u64>, sqlx::Error> {
+    let mut guard = pool.acquire().await?.detach();
+    let locked: bool = match sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+        .bind(SWEEP_LOCK_KEY)
+        .fetch_one(&mut guard)
+        .await
+    {
+        Ok(locked) => locked,
+        Err(e) => {
+            let _ = guard.close().await;
+            return Err(e);
+        }
+    };
+    if !locked {
+        let _ = guard.close().await;
+        return Ok(None);
+    }
+    let result = sweep_batches(pool, config, shutdown).await;
+    // Closing the session releases the advisory lock whatever happened above.
+    let _ = guard.close().await;
+    result.map(Some)
+}
+
+async fn sweep_batches(pool: &PgPool, config: &TaskRetentionConfig, shutdown: &CancellationToken) -> Result<u64, sqlx::Error> {
+    let batch_size = i64::from(config.batch_size.max(1));
+    let min_age = config.min_age();
     let pause = Duration::from_millis(config.batch_pause_milliseconds);
 
     let mut total = 0u64;
@@ -73,17 +102,7 @@ async fn sweep(pool: &sqlx::PgPool, config: &TaskRetentionConfig, shutdown: &Can
         if shutdown.is_cancelled() {
             break;
         }
-        let mut tx = pool.begin().await?;
-        let locked: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock($1)")
-            .bind(SWEEP_LOCK_KEY)
-            .fetch_one(&mut *tx)
-            .await?;
-        if !locked {
-            tx.rollback().await?;
-            return Ok(None);
-        }
-        let deleted = purge_expired_batch(&mut tx, batch_size, min_age).await?;
-        tx.commit().await?;
+        let deleted = purge_expired_batch(pool, batch_size, min_age).await?;
         total += deleted;
         if deleted < batch_size as u64 {
             break;
@@ -94,7 +113,7 @@ async fn sweep(pool: &sqlx::PgPool, config: &TaskRetentionConfig, shutdown: &Can
             _ = tokio::time::sleep(pause) => {}
         }
     }
-    Ok(Some(total))
+    Ok(total)
 }
 
 /// Run the retention daemon until `shutdown` is cancelled.
@@ -185,8 +204,7 @@ mod tests {
         // Past the crate's default ttl but under the configured floor: kept.
         let under_floor = insert(&pool, "succeeded", 20, 14).await;
 
-        let mut conn = pool.acquire().await.unwrap();
-        let deleted = purge_expired_batch(&mut conn, 100, Duration::from_secs(21 * 86_400)).await.unwrap();
+        let deleted = purge_expired_batch(&pool, 100, Duration::from_secs(21 * 86_400)).await.unwrap();
         assert_eq!(deleted, 3, "old succeeded, failed and pending rows expire");
 
         let left = remaining(&pool).await;
@@ -205,10 +223,9 @@ mod tests {
         let middle = insert(&pool, "succeeded", 30, 14).await;
         let newest = insert(&pool, "succeeded", 20, 14).await;
 
-        let mut conn = pool.acquire().await.unwrap();
-        assert_eq!(purge_expired_batch(&mut conn, 2, Duration::ZERO).await.unwrap(), 2);
+        assert_eq!(purge_expired_batch(&pool, 2, Duration::ZERO).await.unwrap(), 2);
         assert_eq!(remaining(&pool).await, vec![newest]);
-        assert_eq!(purge_expired_batch(&mut conn, 2, Duration::ZERO).await.unwrap(), 1);
+        assert_eq!(purge_expired_batch(&pool, 2, Duration::ZERO).await.unwrap(), 1);
         assert!(remaining(&pool).await.is_empty());
         let _ = (oldest, middle);
     }
@@ -223,8 +240,7 @@ mod tests {
             .await
             .unwrap();
 
-        let mut conn = pool.acquire().await.unwrap();
-        assert_eq!(purge_expired_batch(&mut conn, 10, Duration::ZERO).await.unwrap(), 1);
+        assert_eq!(purge_expired_batch(&pool, 10, Duration::ZERO).await.unwrap(), 1);
         let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM underway.task_attempt")
             .fetch_one(&pool)
             .await
@@ -299,15 +315,51 @@ mod tests {
     async fn sweep_yields_when_another_sweep_holds_the_lock(pool: PgPool) {
         setup(&pool).await;
         insert(&pool, "succeeded", 30, 14).await;
-        let mut holder = pool.begin().await.unwrap();
-        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        let mut holder = pool.acquire().await.unwrap().detach();
+        sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(SWEEP_LOCK_KEY)
-            .execute(&mut *holder)
+            .execute(&mut holder)
             .await
             .unwrap();
         let config = TaskRetentionConfig::default();
         assert_eq!(sweep(&pool, &config, &CancellationToken::new()).await.unwrap(), None);
         assert_eq!(remaining(&pool).await.len(), 1);
-        holder.rollback().await.unwrap();
+        holder.close().await.unwrap();
+        // With the lock released the sweep proceeds, and it releases its own lock when
+        // done: a second sweep is not refused.
+        assert_eq!(sweep(&pool, &config, &CancellationToken::new()).await.unwrap(), Some(1));
+        assert_eq!(sweep(&pool, &config, &CancellationToken::new()).await.unwrap(), Some(0));
+    }
+
+    #[sqlx::test]
+    async fn sweep_holds_its_lock_across_batches(pool: PgPool) {
+        // While a multi-batch sweep runs, a competing sweep must be refused even between
+        // batches (the lock is session-level, not per delete transaction). Probe from a
+        // pause-length window by making the pause long and the batch small.
+        setup(&pool).await;
+        for _ in 0..4 {
+            insert(&pool, "succeeded", 30, 14).await;
+        }
+        let config = TaskRetentionConfig {
+            enabled: true,
+            interval_seconds: 60,
+            batch_size: 1,
+            batch_pause_milliseconds: 300,
+            min_age_days: 14,
+        };
+        let sweeper = {
+            let pool = pool.clone();
+            let config = config.clone();
+            tokio::spawn(async move { sweep(&pool, &config, &CancellationToken::new()).await })
+        };
+        // Wait until the first batch has landed, i.e. the sweep is inside its first pause.
+        loop {
+            if remaining(&pool).await.len() < 4 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sweep(&pool, &config, &CancellationToken::new()).await.unwrap(), None);
+        assert_eq!(sweeper.await.unwrap().unwrap(), Some(4));
     }
 }

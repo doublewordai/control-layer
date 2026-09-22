@@ -32,7 +32,7 @@
 # Usage:
 #   DATABASE_URL=postgres://...  ./scripts/purge_underway_tasks.sh
 # Optional env:
-#   BATCH_SIZE      rows per batch (default 2000)
+#   BATCH_SIZE      rows per batch (default 2000, must be >= 1)
 #   SLEEP_SECONDS   pause between batches (default 0.2)
 #   MIN_AGE_DAYS    ignore tasks younger than this (default 14)
 #   QUEUES          comma-separated queue names to restrict to (default: all)
@@ -57,26 +57,55 @@ psql_q() {
     psql "$DATABASE_URL" -X -q -v ON_ERROR_STOP=1 -At "$@"
 }
 
-queue_filter=""
-if [[ -n "$QUEUES" ]]; then
-    # 'a,b' -> 'a','b'
-    list=$(printf "'%s'," "${QUEUES//,/\' \'}" | sed "s/' '/','/g; s/,$//")
-    queue_filter="AND task_queue_name IN ($list)"
-fi
+# Run one SQL string with the per-statement guards. The SQL goes in on stdin,
+# not -c, because psql only interpolates :'var' in scripts; the queue filter
+# is a psql variable so names never get pasted into the statement text.
+run_sql() {
+    printf "SET lock_timeout = '%s';\nSET statement_timeout = '%s';\n%s\n" \
+        "$LOCK_TIMEOUT" "$STATEMENT_TIMEOUT" "$1" \
+        | psql_q -v "queues=${QUEUES}"
+}
 
+is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
+is_uint "$BATCH_SIZE"   || { echo "BATCH_SIZE must be a non-negative integer" >&2; exit 2; }
+is_uint "$MIN_AGE_DAYS" || { echo "MIN_AGE_DAYS must be a non-negative integer" >&2; exit 2; }
+is_uint "$MAX_BATCHES"  || { echo "MAX_BATCHES must be a non-negative integer" >&2; exit 2; }
+(( BATCH_SIZE > 0 ))    || { echo "BATCH_SIZE must be at least 1" >&2; exit 2; }
+[[ "$SLEEP_SECONDS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "SLEEP_SECONDS must be a number" >&2; exit 2; }
+[[ "$LOCK_TIMEOUT" =~ ^[0-9]+(ms|s|min)?$ && "$STATEMENT_TIMEOUT" =~ ^[0-9]+(ms|s|min)?$ ]] \
+    || { echo "LOCK_TIMEOUT / STATEMENT_TIMEOUT must be a Postgres duration such as 5s or 500ms" >&2; exit 2; }
+
+# The queue filter reaches SQL only as a psql variable interpolated with :'queues'
+# (a properly quoted literal), never by pasting names into the statement text.
+# An empty variable means no filter.
 predicate="state <> 'in_progress'
       AND created_at < now() - make_interval(days => ${MIN_AGE_DAYS})
       AND created_at + ttl < now()
-      ${queue_filter}"
+      AND (:'queues' = '' OR task_queue_name = ANY (string_to_array(:'queues', ',')))"
 
-if [[ "$(psql_q -c "SELECT to_regclass('underway.idx_task_created_at') IS NOT NULL")" != "t" ]]; then
-    echo "underway.idx_task_created_at is missing; deploy the release that adds it before purging" >&2
+# Refuse to run without a usable retention index: not just a relation of that
+# name (an interrupted CONCURRENTLY build leaves an invalid one), but a valid,
+# ready btree on exactly (created_at), as the validation migration requires.
+index_ok=$(psql_q -c "SELECT EXISTS (
+    SELECT 1 FROM pg_index i
+    JOIN pg_class c ON c.oid = i.indexrelid
+    JOIN pg_am am ON am.oid = c.relam
+    WHERE i.indexrelid = to_regclass('underway.idx_task_created_at')
+      AND i.indrelid = 'underway.task'::regclass
+      AND am.amname = 'btree'
+      AND i.indisvalid AND i.indisready AND NOT i.indisunique
+      AND i.indnkeyatts = 1 AND i.indnatts = 1
+      AND pg_get_indexdef(i.indexrelid, 1, true) = 'created_at'
+      AND i.indoption::text = '0'
+      AND i.indpred IS NULL AND i.indexprs IS NULL)")
+if [[ "$index_ok" != "t" ]]; then
+    echo "underway.idx_task_created_at is missing or not a valid (created_at) btree; deploy the release that adds it (and let its migration finish) before purging" >&2
     exit 1
 fi
 
 if [[ "$DRY_RUN" == "1" ]]; then
-    echo "Rows qualifying for deletion (may take a while on a large table):"
-    psql_q -c "SELECT task_queue_name, state, count(*) FROM underway.task WHERE ${predicate} GROUP BY 1, 2 ORDER BY 3 DESC"
+    echo "Rows qualifying for deletion (bounded by STATEMENT_TIMEOUT=${STATEMENT_TIMEOUT}; raise it for a very large backlog):"
+    run_sql "SELECT task_queue_name, state, count(*) FROM underway.task WHERE ${predicate} GROUP BY 1, 2 ORDER BY 3 DESC"
     exit 0
 fi
 
@@ -86,9 +115,7 @@ total=0
 batch=0
 while :; do
     batch=$((batch + 1))
-    deleted=$(psql_q -c "SET lock_timeout = '${LOCK_TIMEOUT}'" \
-                     -c "SET statement_timeout = '${STATEMENT_TIMEOUT}'" \
-                     -c "WITH victims AS (
+    deleted=$(run_sql "WITH victims AS (
                              SELECT task_queue_name, id
                              FROM underway.task
                              WHERE ${predicate}
