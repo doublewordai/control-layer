@@ -21,6 +21,8 @@
 //!   spare capacity with no deadline.
 
 use std::sync::Arc;
+use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use axum::{
     Json,
@@ -103,7 +105,10 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     }
 
     // Skip if this is a fusillade daemon request (already tracked)
-    if req.headers().get("x-fusillade-request-id").is_some() {
+    if let Some(request_id) = req.headers().get("x-fusillade-request-id") {
+        if let Some(request_id) = request_id.to_str().ok().and_then(|s| s.parse::<uuid::Uuid>().ok()) {
+            tracing::Span::current().set_attribute("doubleword.request_id", request_id.to_string());
+        }
         return next.run(req).await;
     }
 
@@ -341,6 +346,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // proxying. Used as `x-fusillade-request-id` on the proxied request so
     // the outlet handler can locate the row to update.
     let request_id = uuid::Uuid::new_v4();
+    tracing::Span::current().set_attribute("doubleword.request_id", request_id.to_string());
     let resp_id = format!("resp_{request_id}");
 
     // Validate API keys for daemon-processed requests (realtime is validated
@@ -953,11 +959,16 @@ async fn handle_realtime<P: PoolProvider + Clone + Send + Sync + 'static>(
             "output": [],
         });
 
-        tokio::spawn(async move {
-            let response = next.run(req).await;
-            let (_parts, body) = response.into_parts();
-            let _ = axum::body::to_bytes(body, usize::MAX).await;
-        });
+        // Spawned tasks do not inherit the current span; keep the background
+        // dispatch under the gateway span so its provider attempts stay in the trace.
+        tokio::spawn(
+            async move {
+                let response = next.run(req).await;
+                let (_parts, body) = response.into_parts();
+                let _ = axum::body::to_bytes(body, usize::MAX).await;
+            }
+            .in_current_span(),
+        );
 
         (StatusCode::ACCEPTED, Json(response_body)).into_response()
     } else {
