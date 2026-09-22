@@ -9,7 +9,7 @@
 # daemon's small batches would take a long time to catch up.
 #
 # What it deletes, oldest first, one short transaction per batch:
-#   * tasks that are not `in_progress`
+#   * tasks in `succeeded` or `failed` state
 #   * created more than MIN_AGE_DAYS ago (bounds the index range scan)
 #   * whose own `created_at + ttl` has passed
 # Optionally restricted to QUEUES (comma-separated queue names), e.g. queues
@@ -32,25 +32,25 @@
 # Usage:
 #   DATABASE_URL=postgres://...  ./scripts/purge_underway_tasks.sh
 # Optional env:
-#   BATCH_SIZE      rows per batch (default 2000, must be >= 1)
-#   SLEEP_SECONDS   pause between batches (default 0.2)
+#   BATCH_SIZE      rows per batch (default 1000, must be >= 1)
+#   SLEEP_SECONDS   pause between batches (default 2)
 #   MIN_AGE_DAYS    ignore tasks younger than this (default 14)
 #   QUEUES          comma-separated queue names to restrict to (default: all)
 #   MAX_BATCHES     stop after this many batches (default: unlimited)
-#   LOCK_TIMEOUT    per-batch lock timeout (default 5s)
-#   STATEMENT_TIMEOUT per-batch statement timeout (default 60s)
+#   LOCK_TIMEOUT    per-batch lock timeout (default 2s)
+#   STATEMENT_TIMEOUT per-batch statement timeout (default 30s)
 #   DRY_RUN=1       report how many rows qualify and exit
 
 set -euo pipefail
 
 : "${DATABASE_URL:?DATABASE_URL is required}"
-BATCH_SIZE="${BATCH_SIZE:-2000}"
-SLEEP_SECONDS="${SLEEP_SECONDS:-0.2}"
+BATCH_SIZE="${BATCH_SIZE:-1000}"
+SLEEP_SECONDS="${SLEEP_SECONDS:-2}"
 MIN_AGE_DAYS="${MIN_AGE_DAYS:-14}"
 QUEUES="${QUEUES:-}"
 MAX_BATCHES="${MAX_BATCHES:-0}"
-LOCK_TIMEOUT="${LOCK_TIMEOUT:-5s}"
-STATEMENT_TIMEOUT="${STATEMENT_TIMEOUT:-60s}"
+LOCK_TIMEOUT="${LOCK_TIMEOUT:-2s}"
+STATEMENT_TIMEOUT="${STATEMENT_TIMEOUT:-30s}"
 DRY_RUN="${DRY_RUN:-0}"
 
 psql_q() {
@@ -78,7 +78,7 @@ is_uint "$MAX_BATCHES"  || { echo "MAX_BATCHES must be a non-negative integer" >
 # The queue filter reaches SQL only as a psql variable interpolated with :'queues'
 # (a properly quoted literal), never by pasting names into the statement text.
 # An empty variable means no filter.
-predicate="state <> 'in_progress'
+predicate="state IN ('succeeded', 'failed')
       AND created_at < now() - make_interval(days => ${MIN_AGE_DAYS})
       AND created_at + ttl < now()
       AND (:'queues' = '' OR task_queue_name = ANY (string_to_array(:'queues', ',')))"

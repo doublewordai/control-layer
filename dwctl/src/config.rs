@@ -2691,7 +2691,7 @@ pub struct TaskRetentionConfig {
     pub interval_seconds: u64,
     /// Rows deleted per statement (default: 1000). Each batch is its own transaction.
     pub batch_size: u32,
-    /// Pause between consecutive batches of one sweep in milliseconds (default: 200).
+    /// Pause between consecutive batches of one sweep in milliseconds (default: 2000).
     /// Throttles the sweep while a large backlog drains.
     pub batch_pause_milliseconds: u64,
     /// Minimum task age in days before a task is considered for deletion (default: 14,
@@ -2706,7 +2706,7 @@ impl Default for TaskRetentionConfig {
             enabled: true,
             interval_seconds: 300,
             batch_size: 1000,
-            batch_pause_milliseconds: 200,
+            batch_pause_milliseconds: 2000,
             min_age_days: 14,
         }
     }

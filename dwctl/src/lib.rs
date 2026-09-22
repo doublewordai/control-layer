@@ -3824,7 +3824,8 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
     // Start the task-retention daemon: bounded, oldest-first deletion of expired
     // Underway tasks. Without it the task table only ever grows.
     if config.background_services.task_retention.enabled {
-        let daemon_pool = dyn_pools.clone();
+        // Retention holds a session advisory lock, which requires a direct connection.
+        let daemon_pool = direct_pools.clone();
         let daemon_config = config.background_services.task_retention.clone();
         let daemon_shutdown = shutdown_token.clone();
         background_tasks.spawn("task-retention", async move {
