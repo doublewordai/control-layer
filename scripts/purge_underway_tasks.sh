@@ -66,10 +66,10 @@ run_sql() {
         | psql_q -v "queues=${QUEUES}"
 }
 
-is_uint() { [[ "$1" =~ ^[0-9]+$ ]]; }
-is_uint "$BATCH_SIZE"   || { echo "BATCH_SIZE must be a non-negative integer" >&2; exit 2; }
-is_uint "$MIN_AGE_DAYS" || { echo "MIN_AGE_DAYS must be a non-negative integer" >&2; exit 2; }
-is_uint "$MAX_BATCHES"  || { echo "MAX_BATCHES must be a non-negative integer" >&2; exit 2; }
+is_uint() { [[ "$1" =~ ^(0|[1-9][0-9]*)$ ]]; }
+is_uint "$BATCH_SIZE"   || { echo "BATCH_SIZE must be a non-negative integer without leading zeros" >&2; exit 2; }
+is_uint "$MIN_AGE_DAYS" || { echo "MIN_AGE_DAYS must be a non-negative integer without leading zeros" >&2; exit 2; }
+is_uint "$MAX_BATCHES"  || { echo "MAX_BATCHES must be a non-negative integer without leading zeros" >&2; exit 2; }
 (( BATCH_SIZE > 0 ))    || { echo "BATCH_SIZE must be at least 1" >&2; exit 2; }
 [[ "$SLEEP_SECONDS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo "SLEEP_SECONDS must be a number" >&2; exit 2; }
 [[ "$LOCK_TIMEOUT" =~ ^[0-9]+(ms|s|min)?$ && "$STATEMENT_TIMEOUT" =~ ^[0-9]+(ms|s|min)?$ ]] \
