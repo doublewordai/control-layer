@@ -1182,10 +1182,13 @@ async fn test_encrypted_reasoning_include_is_a_noop(pool: PgPool) {
             let requests = mock_server.received_requests().await.unwrap();
             let forwarded: serde_json::Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
             assert!(forwarded.get("include").is_none());
-            assert_eq!(
-                forwarded["logprobs"].as_bool(),
-                (include.as_array().unwrap().len() == 2).then_some(true)
-            );
+            if include.as_array().unwrap().len() == 2 {
+                assert_eq!(forwarded.get("logprobs"), Some(&serde_json::json!(true)));
+                assert_eq!(forwarded.get("top_logprobs"), Some(&serde_json::json!(3)));
+            } else {
+                assert!(forwarded.get("logprobs").is_none());
+                assert!(forwarded.get("top_logprobs").is_none());
+            }
         }
     }
 }
