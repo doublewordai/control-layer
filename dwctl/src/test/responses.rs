@@ -1147,43 +1147,51 @@ async fn test_output_logprobs_include_is_accepted(pool: PgPool) {
     assert_eq!(response.status_code(), 200);
 }
 
-/// Encrypted reasoning replay needs a durable sealing-key lifecycle that is
-/// distinct from the response key shredded on ZDR retrieval. Until that
-/// contract exists, reject the projection before any request state is created.
+/// Clients may request encrypted reasoning as a compatibility projection even
+/// though this service does not emit encrypted state.
 #[sqlx::test]
 #[test_log::test]
-async fn test_encrypted_reasoning_include_returns_contract_400_before_lifecycle_creation(pool: PgPool) {
+async fn test_encrypted_reasoning_include_is_a_noop(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
     mount_chat_completions_mock(&mock_server).await;
 
     let (server, api_key, bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
-    enable_zdr_for_key(&pool, &bg, &api_key).await;
+    for zdr in [false, true] {
+        if zdr {
+            enable_zdr_for_key(&pool, &bg, &api_key).await;
+        }
+        for include in [
+            serde_json::json!(["reasoning.encrypted_content"]),
+            serde_json::json!(["reasoning.encrypted_content", "message.output_text.logprobs"]),
+        ] {
+            let response = server
+                .post("/ai/v1/responses")
+                .add_header("Authorization", &format!("Bearer {}", api_key))
+                .add_header("Content-Type", "application/json")
+                .json(&serde_json::json!({
+                    "model": "gpt-4o",
+                    "input": "reason about this",
+                    "include": include,
+                    "top_logprobs": 3
+                }))
+                .await;
 
-    let response = server
-        .post("/ai/v1/responses")
-        .add_header("Authorization", &format!("Bearer {}", api_key))
-        .add_header("Content-Type", "application/json")
-        .json(&serde_json::json!({
-            "model": "gpt-4o",
-            "input": "reason about this",
-            "include": ["reasoning.encrypted_content"]
-        }))
-        .await;
-
-    assert_eq!(response.status_code(), 400);
-    let body: serde_json::Value = response.json();
-    assert_eq!(body["error"]["code"], "unsupported_parameter");
-    assert_eq!(body["error"]["param"], "include");
-
-    let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fusillade.requests")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(stored, 0);
+            assert_eq!(response.status_code(), 200, "include={include}, zdr={zdr}");
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["output"][0]["content"][0]["text"], "Hello from the test!");
+            let requests = mock_server.received_requests().await.unwrap();
+            let forwarded: serde_json::Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+            assert!(forwarded.get("include").is_none());
+            assert_eq!(
+                forwarded["logprobs"].as_bool(),
+                (include.as_array().unwrap().len() == 2).then_some(true)
+            );
+        }
+    }
 }
 
-/// Client-carried encrypted reasoning items are the continuation half of the
-/// same unsupported feature and must also fail before lifecycle creation.
+/// Accepting the projection does not enable encrypted state replay. Client-carried
+/// encrypted reasoning must still fail before lifecycle creation.
 #[sqlx::test]
 #[test_log::test]
 async fn test_encrypted_reasoning_replay_returns_contract_400_before_lifecycle_creation(pool: PgPool) {
