@@ -139,6 +139,8 @@ pub struct RawAnalyticsRecord {
     // === Tracing ===
     /// OpenTelemetry trace ID for correlation with Tempo
     pub trace_id: Option<String>,
+    /// Gateway span captured by Outlet; pair with `trace_id` to locate the request's trace subtree.
+    pub gateway_span_id: Option<String>,
 }
 
 /// Enriched data resolved during batch processing
@@ -854,6 +856,7 @@ where
 
         let mut api_key_ids: Vec<Option<Uuid>> = Vec::with_capacity(records.len());
         let mut trace_ids: Vec<Option<String>> = Vec::with_capacity(records.len());
+        let mut gateway_span_ids: Vec<Option<String>> = Vec::with_capacity(records.len());
         let mut cache_read_vec: Vec<i64> = Vec::with_capacity(records.len());
         let mut cache_creation_total_vec: Vec<i64> = Vec::with_capacity(records.len());
         let mut cache_5m_vec: Vec<i64> = Vec::with_capacity(records.len());
@@ -908,6 +911,7 @@ where
 
             api_key_ids.push(record.api_key_id);
             trace_ids.push(record.raw.trace_id.clone());
+            gateway_span_ids.push(record.raw.gateway_span_id.clone());
 
             let c5 = record.raw.cache_creation_5m_input_tokens;
             let c1 = record.raw.cache_creation_1h_input_tokens;
@@ -952,7 +956,7 @@ where
                 cache_creation_5m_input_tokens, cache_creation_1h_input_tokens, cache_creation_24h_input_tokens,
                 total_cost, uncached_cost, served_by, finish_reason, user_agent, submitted_at,
                 engine_cached_tokens, stream, max_tokens, temperature, top_p, n, tool_count, message_count,
-                cache_read_source, requested_serving_class, resolved_serving_class
+                cache_read_source, requested_serving_class, resolved_serving_class, gateway_span_id
             )
             SELECT * FROM UNNEST(
                 $1::uuid[], $2::bigint[], $3::timestamptz[], $4::text[], $5::text[], $6::text[],
@@ -965,7 +969,7 @@ where
                 $32::numeric[], $33::numeric[], $34::text[], $35::text[], $36::text[],
                 $37::timestamptz[],
                 $38::bigint[], $39::boolean[], $40::bigint[], $41::real[], $42::real[], $43::int[], $44::int[], $45::int[],
-                $46::text[], $47::text[], $48::text[]
+                $46::text[], $47::text[], $48::text[], $49::text[]
             )
             ON CONFLICT DO NOTHING
             RETURNING id, instance_id, correlation_id
@@ -1018,6 +1022,7 @@ where
             &cache_read_source_vec as &[Option<String>],
             &requested_class_vec as &[Option<String>],
             &resolved_class_vec as &[Option<String>],
+            &gateway_span_ids as &[Option<String>],
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -1788,6 +1793,7 @@ mod tests {
             batch_created_at: None,
             batch_request_source: "".to_string(),
             trace_id: None,
+            gateway_span_id: None,
         };
 
         assert_eq!(record.correlation_id, 123);
@@ -1795,6 +1801,14 @@ mod tests {
         let payload = serde_json::to_value(&record).unwrap();
         let restored: RawAnalyticsRecord = serde_json::from_value(payload).unwrap();
         assert_eq!(restored.api_key_id, Some(api_key_id));
+    }
+
+    #[test]
+    fn outbox_payload_without_gateway_span_id_deserializes() {
+        let mut payload = serde_json::to_value(cost_record(10, 20, 0, 0, 0, 0)).unwrap();
+        payload.as_object_mut().unwrap().remove("gateway_span_id");
+        let record: RawAnalyticsRecord = serde_json::from_value(payload).unwrap();
+        assert_eq!(record.gateway_span_id, None);
     }
 
     #[test]
@@ -1846,6 +1860,7 @@ mod tests {
             batch_created_at: None,
             batch_request_source: String::new(),
             trace_id: None,
+            gateway_span_id: None,
         }
     }
 
@@ -2024,7 +2039,8 @@ mod integration_tests {
                 api_key_purpose: Some(api_key_purpose),
                 input_price_per_token: input_price,
                 output_price_per_token: output_price,
-                valid_from: None,
+                // Capture timestamps use the host clock; PostgreSQL may run in a VM.
+                valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
                 completion_window,
             })
             .await
@@ -2123,6 +2139,7 @@ mod integration_tests {
             batch_created_at: None,
             batch_request_source: String::new(),
             trace_id: None,
+            gateway_span_id: None,
         }
     }
 
@@ -2136,6 +2153,36 @@ mod integration_tests {
         }
 
         while batcher.project_outbox_batch().await.unwrap() > 0 {}
+    }
+
+    #[sqlx::test]
+    async fn projector_writes_gateway_span_id(pool: sqlx::PgPool) {
+        create_test_model(&pool, "cor678").await;
+        let config = crate::test::utils::create_test_config();
+        let (batcher, writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let mut record = create_raw_record("cor678", None, 10, 5);
+        record.trace_id = Some("11111111111111111111111111111111".into());
+        record.gateway_span_id = Some("2222222222222222".into());
+        record.requested_serving_class = Some("interactive".into());
+        record.resolved_serving_class = Some("standard".into());
+        writer.publish(record.clone()).await.unwrap();
+
+        assert_eq!(batcher.project_outbox_batch().await.unwrap(), 1);
+
+        let stored: (Option<String>, Option<String>, Option<String>, Option<String>) =
+            sqlx::query_as("SELECT trace_id, gateway_span_id, requested_serving_class, resolved_serving_class FROM http_analytics")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored,
+            (
+                record.trace_id,
+                record.gateway_span_id,
+                record.requested_serving_class,
+                record.resolved_serving_class
+            )
+        );
     }
 
     #[sqlx::test]
@@ -2334,6 +2381,14 @@ mod integration_tests {
         .execute(&pool)
         .await
         .unwrap();
+
+        // Host-clock capture timestamps must fall inside the tariff's validity window.
+        sqlx::query("UPDATE model_cache_tariffs SET valid_from=$1 WHERE deployed_model_id=$2")
+            .bind(Utc::now() - chrono::Duration::minutes(1))
+            .bind(model_id)
+            .execute(&pool)
+            .await
+            .unwrap();
 
         let initial_balance = Decimal::from_str("10.00").unwrap();
         let user_id = setup_user_with_balance(&pool, initial_balance).await;
@@ -2612,6 +2667,9 @@ mod integration_tests {
         first.batch_completion_window = Some("24h".to_string());
         first.fusillade_batch_id = Some(batch_id);
         first.fusillade_request_id = Some(request_id);
+        first.trace_id = Some("11111111111111111111111111111111".into());
+        first.gateway_span_id = Some("2222222222222222".into());
+        let expected_anchor = (first.trace_id.clone(), first.gateway_span_id.clone());
 
         // A second successful physical attempt has a different gateway
         // identity but the same logical Fusillade request identity.
@@ -2619,9 +2677,20 @@ mod integration_tests {
         duplicate.batch_completion_window = Some("24h".to_string());
         duplicate.fusillade_batch_id = Some(batch_id);
         duplicate.fusillade_request_id = Some(request_id);
+        duplicate.trace_id = Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into());
+        duplicate.gateway_span_id = Some("bbbbbbbbbbbbbbbb".into());
 
         run_batcher_with_records(&pool, vec![failed]).await;
         run_batcher_with_records(&pool, vec![first, duplicate]).await;
+
+        let anchor: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT trace_id, gateway_span_id FROM http_analytics WHERE fusillade_request_id=$1 AND status_code BETWEEN 200 AND 299",
+        )
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(anchor, expected_anchor, "the retained success keeps its own context");
 
         let analytics_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM http_analytics WHERE fusillade_request_id = $1")
             .bind(request_id)

@@ -65,7 +65,7 @@ pub mod target;
 pub mod telemetry;
 
 use client::{HttpClient, HyperClient};
-pub use handlers::{AuthenticatedApiKeyId, ServedBy};
+pub use handlers::{AuthenticatedApiKeyId, HeaderExtractor, ServedBy};
 use handlers::{models as models_handler, target_message_handler};
 use models::ExtractedModel;
 pub use serving::{
