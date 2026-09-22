@@ -200,21 +200,16 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         if let Some(include) = request_value.get("include")
             && !include.is_null()
         {
-            let Ok(include) = serde_json::from_value::<Vec<crate::inference::translation::responses::types::Include>>(include.clone())
-            else {
+            let Ok(_) = serde_json::from_value::<Vec<crate::inference::translation::responses::types::Include>>(include.clone()) else {
                 return invalid_request_response(
                     "include must contain only supported Responses API projection values",
                     "invalid_parameter",
                     "include",
                 );
             };
-            if include.contains(&crate::inference::translation::responses::types::Include::ReasoningEncryptedContent) {
-                return invalid_request_response(
-                    "reasoning.encrypted_content is not supported by this Responses API implementation",
-                    "unsupported_parameter",
-                    "include",
-                );
-            }
+            // Accept reasoning.encrypted_content as a compatibility no-op. The
+            // Responses translator only projects logprobs and emits no encrypted
+            // state; clients may request this option without replaying any state.
         }
 
         let has_encrypted_reasoning_replay = request_value
