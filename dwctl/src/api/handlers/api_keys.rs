@@ -1300,6 +1300,9 @@ mod tests {
             })
             .await
             .unwrap();
+        // Both purposes need their own price: batch no longer borrows realtime.
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,api_key_purpose,completion_window,input_price_per_token,output_price_per_token) VALUES ($1,'batch','batch','24h',0.00001,0.00003)")
+            .bind(deployment_id).execute(&mut *conn).await.unwrap();
         Credits::new(&mut conn)
             .create_transaction(&CreditTransactionCreateDBRequest {
                 user_id: user.id,

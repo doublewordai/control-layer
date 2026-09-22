@@ -2226,6 +2226,15 @@ mod integration_tests {
 
         // Exercise the real key-owner extraction, including a batch-purpose key,
         // multiple accounts and an unknown key that must use general prices.
+        // The batch-purpose key needs an explicit price for its SLA, with the
+        // same historical versions so owner extraction is exercised for both.
+        for (start, end, rate) in [
+            (now - chrono::Duration::days(3), Some(boundary), Decimal::new(2, 2)),
+            (boundary, None, Decimal::new(2, 1)),
+        ] {
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,completion_window,input_price_per_token,output_price_per_token,valid_from,valid_until) VALUES ($1,$2,'batch-history','batch','24h',$3,$3,$4,$5)")
+                .bind(model).bind(a).bind(rate).bind(start).bind(end).execute(&mut *tx).await.unwrap();
+        }
         let a_key = create_api_key_for_user(&pool, a, ApiKeyPurpose::Realtime).await;
         let a_batch_key = create_api_key_for_user(&pool, a, ApiKeyPurpose::Batch).await;
         let b_key = create_api_key_for_user(&pool, b, ApiKeyPurpose::Realtime).await;
@@ -2241,6 +2250,9 @@ mod integration_tests {
                 .iter()
                 .map(|(key, class, _, _)| {
                     let mut record = create_raw_record("scoped-history", *key, 100, 0);
+                    if *key == Some(a_batch_key) {
+                        record.batch_completion_window = Some("24h".to_string());
+                    }
                     record.batch_created_at = Some(timestamp);
                     record.resolved_serving_class = Some((*class).to_string());
                     record.cache_read_input_tokens = 50;
@@ -2870,8 +2882,28 @@ mod integration_tests {
     }
 
     #[sqlx::test]
+    async fn realtime_org_deal_leaves_batch_charges_at_the_model_batch_price(pool: sqlx::PgPool) {
+        let model = create_test_model(&pool, "purpose-isolation").await;
+        setup_tariff(&pool, model, Decimal::new(10, 6), Decimal::new(20, 6), ApiKeyPurpose::Realtime).await;
+        setup_tariff(&pool, model, Decimal::new(1, 6), Decimal::new(2, 6), ApiKeyPurpose::Batch).await;
+        let account = setup_user_with_balance(&pool, Decimal::from(100)).await;
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,$2,'deal','realtime',0.000005,0.000010)").bind(model).bind(account).execute(&pool).await.unwrap();
+        let key = create_api_key_for_user(&pool, account, ApiKeyPurpose::Batch).await;
+        let mut record = create_raw_record("purpose-isolation", Some(key), 1000, 500);
+        record.batch_completion_window = Some("24h".to_string());
+        run_batcher_with_records(&pool, vec![record]).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let balance = Credits::new(&mut conn).get_user_balance(account).await.unwrap();
+        assert_eq!(
+            balance,
+            Decimal::from(100) - Decimal::new(2, 3),
+            "charge the model's 24h batch rate, not the customer's realtime rate"
+        );
+    }
+
+    #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_fallback_to_realtime_when_batch_tariff_missing(pool: sqlx::PgPool) {
+    async fn test_batcher_does_not_charge_realtime_when_batch_tariff_missing(pool: sqlx::PgPool) {
         // Setup: Create model with ONLY realtime tariff
         let model_id = create_test_model(&pool, "gpt-4-fallback-test").await;
         let realtime_input = Decimal::from_str("0.00015").unwrap();
@@ -2888,19 +2920,18 @@ mod integration_tests {
         // Run batcher
         run_batcher_with_records(&pool, vec![record]).await;
 
-        // Expected: Should fall back to realtime pricing
-        // Cost: (1000 * 0.00015) + (500 * 0.00030) = 0.15 + 0.15 = 0.30
-        let expected_cost = Decimal::from_str("0.30").unwrap();
-
-        // Verify
         let mut conn = pool.acquire().await.unwrap();
         let mut credits = Credits::new(&mut conn);
-        let final_balance = credits.get_user_balance(user_id).await.unwrap();
-        let expected_balance = Decimal::from_str("100.00").unwrap() - expected_cost;
         assert_eq!(
-            final_balance, expected_balance,
-            "Batch request should fall back to realtime pricing"
+            credits.get_user_balance(user_id).await.unwrap(),
+            Decimal::from(100),
+            "Missing batch pricing must not invent a realtime charge"
         );
+        let cost: Option<Decimal> = sqlx::query_scalar("SELECT total_cost FROM http_analytics WHERE model='gpt-4-fallback-test'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cost, None, "the request remains recorded with unresolved pricing");
     }
 
     #[sqlx::test]

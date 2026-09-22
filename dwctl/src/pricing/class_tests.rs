@@ -78,7 +78,7 @@ async fn sql_and_billing_agree_on_class_scope_window_and_history(pool: PgPool) {
             }
         }
     }
-    // A class-agnostic org realtime deal outranks a general batch-specific price.
+    // A realtime-only organization deal must not override the model batch tariff.
     assert_eq!(
         find_best_tariff(
             &tariffs,
@@ -89,7 +89,7 @@ async fn sql_and_billing_agree_on_class_scope_window_and_history(pool: PgPool) {
             Some("standard")
         )
         .0,
-        Some(Decimal::from(2))
+        Some(Decimal::ONE)
     );
     assert_eq!(
         find_best_tariff(
@@ -185,7 +185,7 @@ async fn quotes_keep_matched_classes_and_ownerless_estimates_use_general_prices(
         .await
         .unwrap();
     assert_eq!(own, Some((Decimal::ONE, Decimal::ONE)));
-    assert_eq!(unknown_owner, Some((Decimal::from(3), Decimal::from(3))));
+    assert_eq!(unknown_owner, None, "missing batch price must not borrow realtime");
     drop(conn);
     sqlx::query("UPDATE deployed_models SET deleted = TRUE WHERE id = $1")
         .bind(model)
@@ -193,7 +193,7 @@ async fn quotes_keep_matched_classes_and_ownerless_estimates_use_general_prices(
         .await
         .unwrap();
     assert_eq!(
-        get_realtime_tariffs(&pool, account).await.unwrap()["review-model"],
+        get_realtime_tariffs(&pool, account, &["review-model".to_string()]).await.unwrap()["review-model"],
         (Decimal::from(3), Decimal::from(3)),
         "historical usage retains a price after model deletion"
     );
@@ -352,4 +352,16 @@ async fn general_price_sort_uses_current_windows_and_includes_free_prices(pool: 
         vec!["free", "finite", "open"]
     );
     assert_eq!(listed.len(), 5);
+}
+
+#[sqlx::test]
+async fn realtime_admission_ignores_windowed_rows(pool: PgPool) {
+    let model: Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('window-test','window-test',true,'00000000-0000-0000-0000-000000000000') RETURNING id").fetch_one(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,api_key_purpose,completion_window,input_price_per_token,output_price_per_token) VALUES ($1,'misconfigured','realtime','24h',1,2)").bind(model).execute(&pool).await.unwrap();
+    let paid: bool = sqlx::query_scalar("SELECT model_has_effective_paid_tariff($1,NULL,'realtime')")
+        .bind(model)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!paid, "admission must not invent a realtime completion window");
 }

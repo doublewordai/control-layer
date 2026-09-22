@@ -183,13 +183,13 @@ impl<'c> Tariffs<'c> {
             )
             SELECT DISTINCT t.id as "id!", t.deployed_model_id as "deployed_model_id!", t.name as "name!",
                    t.input_price_per_token as "input_price_per_token!", t.output_price_per_token as "output_price_per_token!",
-                   t.valid_from as "valid_from!", t.valid_until, s.api_key_purpose as "api_key_purpose: _",
-                   s.completion_window, t.user_id, t.serving_class
+                   t.valid_from as "valid_from!", t.valid_until, t.api_key_purpose as "api_key_purpose: _",
+                   t.completion_window, t.user_id, t.serving_class
             FROM selectors s JOIN classes c USING (deployed_model_id)
             CROSS JOIN LATERAL effective_model_tariff(s.deployed_model_id, $2, s.api_key_purpose,
                 s.completion_window, CASE WHEN s.api_key_purpose = 'batch' THEN 'standard' ELSE c.serving_class END, NOW()) t
             WHERE s.api_key_purpose <> 'batch' OR c.serving_class IS NULL
-            ORDER BY "deployed_model_id!", t.serving_class NULLS FIRST, "api_key_purpose: _", s.completion_window
+            ORDER BY "deployed_model_id!", t.serving_class NULLS FIRST, "api_key_purpose: _", t.completion_window
             "#,
             deployed_model_ids,
             account
@@ -242,20 +242,8 @@ impl<'c> Tariffs<'c> {
         Ok(tariffs)
     }
 
-    /// Get pricing with fallback support
-    ///
-    /// Tries to get pricing for the preferred API key purpose, falling back to the
-    /// fallback purpose if the preferred one is not found.
-    ///
-    /// # Arguments
-    /// * `deployed_model_id` - The model to get pricing for
-    /// * `preferred_purpose` - Optional preferred API key purpose
-    /// * `fallback_purpose` - Fallback API key purpose to use if preferred is not found
-    /// * `timestamp` - The timestamp to get pricing for (for historical accuracy)
-    ///
-    /// # Returns
-    /// * `Ok(Some((input_price, output_price)))` - Found pricing
-    /// * `Ok(None)` - Neither preferred nor fallback tariff found
+    /// Compatibility wrapper: playground may fall back to realtime; batch stays
+    /// within its purpose and window. All callers share the effective resolver.
     #[instrument(skip(self), err)]
     pub async fn get_pricing_at_timestamp_with_fallback(
         &mut self,
@@ -265,33 +253,16 @@ impl<'c> Tariffs<'c> {
         timestamp: DateTime<Utc>,
         completion_window: Option<&str>,
     ) -> Result<Option<(Decimal, Decimal)>> {
-        if preferred_purpose.is_some_and(|purpose| !purpose.is_customer_billing()) {
-            return Ok(None);
-        }
-        // Try preferred purpose first if specified
-        if let Some(preferred) = preferred_purpose
-            && let Some(pricing) = self
-                .get_pricing_at_timestamp(deployed_model_id, preferred, timestamp, completion_window)
-                .await?
-        {
-            return Ok(Some(pricing));
-        }
-
-        // Fall back to fallback purpose (completion_window not relevant for fallback)
-        self.get_pricing_at_timestamp(deployed_model_id, fallback_purpose, timestamp, None)
-            .await
+        self.get_pricing_at_timestamp(
+            deployed_model_id,
+            preferred_purpose.unwrap_or(fallback_purpose),
+            timestamp,
+            completion_window,
+        )
+        .await
     }
 
-    /// Get the pricing for a specific API key purpose that was valid at a given timestamp
-    /// This is used for historical chargeback calculations
-    ///
-    /// For batch tariffs, optionally filters by completion_window (SLA) to match the specific
-    /// batch pricing tier.
-    ///
-    /// Uses an optimized two-step lookup:
-    /// 1. First checks the current (active) tariff (WHERE valid_until IS NULL)
-    /// 2. If the timestamp is >= current tariff's valid_from, uses it (fast path)
-    /// 3. Otherwise, does a full historical lookup with temporal constraints
+    /// Resolve the general model price at the request's original timestamp.
     #[instrument(skip(self), err)]
     pub async fn get_pricing_at_timestamp(
         &mut self,
@@ -300,70 +271,15 @@ impl<'c> Tariffs<'c> {
         timestamp: DateTime<Utc>,
         completion_window: Option<&str>,
     ) -> Result<Option<(Decimal, Decimal)>> {
-        if !api_key_purpose.is_customer_billing() {
-            return Ok(None);
-        }
-        // Convert enum to string for database query
-        let purpose_str = match api_key_purpose {
-            crate::db::models::api_keys::ApiKeyPurpose::Realtime => "realtime",
-            crate::db::models::api_keys::ApiKeyPurpose::Batch => "batch",
-            crate::db::models::api_keys::ApiKeyPurpose::Playground => "playground",
-            crate::db::models::api_keys::ApiKeyPurpose::Platform => "platform",
-            crate::db::models::api_keys::ApiKeyPurpose::Continuation => "continuation",
+        use crate::db::models::api_keys::ApiKeyPurpose;
+        let purpose = match api_key_purpose {
+            ApiKeyPurpose::Realtime => "realtime",
+            ApiKeyPurpose::Batch => "batch",
+            ApiKeyPurpose::Playground => "playground",
+            ApiKeyPurpose::Platform | ApiKeyPurpose::Continuation => return Ok(None),
         };
-
-        // Step 1: Check current (active) tariff - this is the fast path for recent requests
-        // For batch tariffs with completion_window specified, filter by it
-        let current_tariff = sqlx::query!(
-            r#"
-            SELECT input_price_per_token, output_price_per_token, valid_from
-            FROM model_tariffs
-            WHERE deployed_model_id = $1
-              AND api_key_purpose = $2
-              AND valid_until IS NULL
-              AND user_id IS NULL
-              AND ($3::VARCHAR IS NULL OR completion_window = $3 OR api_key_purpose != 'batch')
-            LIMIT 1
-            "#,
-            deployed_model_id,
-            purpose_str,
-            completion_window
-        )
-        .fetch_optional(&mut *self.db)
-        .await?;
-
-        // Step 2: If current tariff exists and request is after its valid_from, use it
-        if let Some(current) = current_tariff
-            && timestamp >= current.valid_from
-        {
-            // Fast path - use current pricing
-            return Ok(Some((current.input_price_per_token, current.output_price_per_token)));
-        }
-
-        // Step 3: Either no current tariff exists, or request is older than current tariff
-        // Do full historical lookup
-        let result = sqlx::query!(
-            r#"
-            SELECT input_price_per_token, output_price_per_token
-            FROM model_tariffs
-            WHERE deployed_model_id = $1
-              AND api_key_purpose = $2
-              AND user_id IS NULL
-              AND valid_from <= $3
-              AND (valid_until IS NULL OR valid_until > $3)
-              AND ($4::VARCHAR IS NULL OR completion_window = $4 OR api_key_purpose != 'batch')
-            ORDER BY valid_from DESC
-            LIMIT 1
-            "#,
-            deployed_model_id,
-            purpose_str,
-            timestamp,
-            completion_window
-        )
-        .fetch_optional(&mut *self.db)
-        .await?;
-
-        Ok(result.map(|r| (r.input_price_per_token, r.output_price_per_token)))
+        self.get_effective_pricing_at_timestamp(deployed_model_id, None, purpose, completion_window, None, timestamp)
+            .await
     }
 
     /// Close multiple tariffs by setting valid_until to the current time

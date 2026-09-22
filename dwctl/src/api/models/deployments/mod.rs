@@ -159,7 +159,7 @@ pub struct TariffDefinition {
     /// Output price per token (sent/returned as string to preserve precision)
     #[schema(value_type = String)]
     pub output_price_per_token: rust_decimal::Decimal,
-    /// Optional API key purpose this tariff applies to (realtime, batch, playground)
+    /// Required for new prices: realtime, batch or playground. Missing/null is rejected.
     pub api_key_purpose: Option<crate::db::models::api_keys::ApiKeyPurpose>,
     /// Optional completion window (priority) for batch tariffs (e.g., "24h", "1h")
     /// Required when api_key_purpose is Batch to support multiple pricing tiers per priority

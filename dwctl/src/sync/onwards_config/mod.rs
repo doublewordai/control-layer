@@ -735,17 +735,20 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
     // Query API keys with access to composite models (uses deployment_groups since composites are in deployed_models)
     let api_key_rows = sqlx::query!(
         r#"
-        WITH purposes(purpose) AS (VALUES ('realtime'), ('batch'), ('playground'), ('continuation'), ('platform')),
+        WITH purposes(purpose) AS (VALUES ('realtime'), ('batch'), ('playground')),
         general_paid AS MATERIALIZED (
             SELECT m.id, p.purpose, model_has_effective_paid_tariff(m.id, NULL, p.purpose) AS paid
             FROM deployed_models m CROSS JOIN purposes p WHERE m.deleted = FALSE
         ), account_paid AS MATERIALIZED (
-            SELECT t.deployed_model_id AS id, t.user_id, p.purpose,
-                   model_has_effective_paid_tariff(t.deployed_model_id, t.user_id, p.purpose) AS paid
-            FROM (SELECT DISTINCT deployed_model_id, user_id FROM model_tariffs
-                  WHERE user_id IS NOT NULL AND valid_from <= NOW()
-                    AND (valid_until IS NULL OR valid_until > NOW())) t
-            CROSS JOIN purposes p
+            SELECT t.deployed_model_id AS id, t.user_id, k.purpose,
+                   model_has_effective_paid_tariff(t.deployed_model_id, t.user_id, k.purpose) AS paid
+            FROM (SELECT DISTINCT mt.deployed_model_id, mt.user_id FROM model_tariffs mt
+                  JOIN deployed_models dm ON dm.id = mt.deployed_model_id AND dm.deleted = FALSE
+                  WHERE mt.user_id IS NOT NULL AND mt.valid_from <= NOW()
+                    AND (mt.valid_until IS NULL OR mt.valid_until > NOW())) t
+            JOIN (SELECT DISTINCT ak.user_id, ak.purpose FROM api_keys ak
+                  WHERE ak.is_deleted = FALSE AND ak.purpose IN ('realtime','batch','playground')) k
+              ON k.user_id = t.user_id
         )
         SELECT
             cm.id as composite_model_id,
@@ -1544,17 +1547,20 @@ pub async fn load_targets_from_db(
     // Note: We pass escalation_models to grant batch API keys access to escalation models
     let rows = sqlx::query!(
         r#"
-        WITH purposes(purpose) AS (VALUES ('realtime'), ('batch'), ('playground'), ('continuation'), ('platform')),
+        WITH purposes(purpose) AS (VALUES ('realtime'), ('batch'), ('playground')),
         general_paid AS MATERIALIZED (
             SELECT m.id, p.purpose, model_has_effective_paid_tariff(m.id, NULL, p.purpose) AS paid
             FROM deployed_models m CROSS JOIN purposes p WHERE m.deleted = FALSE
         ), account_paid AS MATERIALIZED (
-            SELECT t.deployed_model_id AS id, t.user_id, p.purpose,
-                   model_has_effective_paid_tariff(t.deployed_model_id, t.user_id, p.purpose) AS paid
-            FROM (SELECT DISTINCT deployed_model_id, user_id FROM model_tariffs
-                  WHERE user_id IS NOT NULL AND valid_from <= NOW()
-                    AND (valid_until IS NULL OR valid_until > NOW())) t
-            CROSS JOIN purposes p
+            SELECT t.deployed_model_id AS id, t.user_id, k.purpose,
+                   model_has_effective_paid_tariff(t.deployed_model_id, t.user_id, k.purpose) AS paid
+            FROM (SELECT DISTINCT mt.deployed_model_id, mt.user_id FROM model_tariffs mt
+                  JOIN deployed_models dm ON dm.id = mt.deployed_model_id AND dm.deleted = FALSE
+                  WHERE mt.user_id IS NOT NULL AND mt.valid_from <= NOW()
+                    AND (mt.valid_until IS NULL OR mt.valid_until > NOW())) t
+            JOIN (SELECT DISTINCT ak.user_id, ak.purpose FROM api_keys ak
+                  WHERE ak.is_deleted = FALSE AND ak.purpose IN ('realtime','batch','playground')) k
+              ON k.user_id = t.user_id
         )
         SELECT
             dm.id as deployment_id,

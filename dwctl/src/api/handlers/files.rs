@@ -2132,7 +2132,7 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
         };
 
         let cost = if let Some(deployment) = deployment_opt {
-            // Look up tariff pricing for Batch API key purpose, with fallback to realtime
+            // Resolve the owner's batch price for this exact completion window.
             let pricing_result = tariffs_repo
                 .get_effective_pricing_at_timestamp(
                     deployment.id,

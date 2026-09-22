@@ -711,10 +711,21 @@ pub async fn create_deployed_model<P: PoolProvider>(
             if tariff_def
                 .api_key_purpose
                 .as_ref()
-                .is_some_and(|purpose| !purpose.is_customer_billing())
+                .is_none_or(|purpose| !purpose.is_customer_billing())
             {
                 return Err(Error::BadRequest {
                     message: "Tariffs support only realtime, batch and playground customer inference".to_string(),
+                });
+            }
+            if tariff_def.api_key_purpose == Some(ApiKeyPurpose::Batch) {
+                if tariff_def.completion_window.as_deref().is_none_or(|w| w.trim().is_empty()) {
+                    return Err(Error::BadRequest {
+                        message: "Batch tariffs require a completion window".to_string(),
+                    });
+                }
+            } else if tariff_def.completion_window.is_some() {
+                return Err(Error::BadRequest {
+                    message: "Only batch tariffs may specify a completion window".to_string(),
                 });
             }
             let tariff_request = TariffCreateDBRequest {
@@ -975,7 +986,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
             if tariff_def
                 .api_key_purpose
                 .as_ref()
-                .is_some_and(|purpose| !purpose.is_customer_billing())
+                .is_none_or(|purpose| !purpose.is_customer_billing())
             {
                 return Err(Error::BadRequest {
                     message: "Tariffs support only realtime, batch and playground customer inference".to_string(),
@@ -986,6 +997,17 @@ pub async fn update_deployed_model<P: PoolProvider>(
                 continue;
             }
 
+            if tariff_def.api_key_purpose == Some(ApiKeyPurpose::Batch) {
+                if tariff_def.completion_window.as_deref().is_none_or(|w| w.trim().is_empty()) {
+                    return Err(Error::BadRequest {
+                        message: "Batch tariffs require a completion window".to_string(),
+                    });
+                }
+            } else if tariff_def.completion_window.is_some() {
+                return Err(Error::BadRequest {
+                    message: "Only batch tariffs may specify a completion window".to_string(),
+                });
+            }
             let tariff_request = TariffCreateDBRequest {
                 deployed_model_id: deployment_id,
                 name: tariff_def.name,
@@ -2275,14 +2297,20 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn internal_tariffs_are_rejected_on_create_and_update(pool: PgPool) {
+    async fn invalid_tariffs_are_rejected_atomically_on_create_and_update(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
         let headers = add_auth_headers(&admin);
         let endpoint = get_test_endpoint_id(&pool).await;
         let existing = create_test_deployment(&pool, admin.id, "original", "original").await;
-        for purpose in ["continuation", "platform"] {
-            let tariffs = json!([{"name":"invalid", "api_key_purpose":purpose,
+        for (purpose, window) in [
+            (Some("continuation"), None),
+            (Some("platform"), None),
+            (None, None),
+            (Some("realtime"), Some("24h")),
+            (Some("batch"), None),
+        ] {
+            let tariffs = json!([{"name":"invalid", "api_key_purpose":purpose, "completion_window":window,
                 "input_price_per_token":"1", "output_price_per_token":"2"}]);
             app.post("/admin/api/v1/models")
                 .add_header(&headers[0].0, &headers[0].1)

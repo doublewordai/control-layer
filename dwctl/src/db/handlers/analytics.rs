@@ -1198,16 +1198,18 @@ pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
 
 /// Load current realtime tariff rates keyed by model alias.
 /// Returns a map of model alias → (input_price_per_token, output_price_per_token).
-/// This is a tiny table (~12 rows) so it's efficient to load entirely.
+/// Only resolve models present in this usage response, including retired models.
 #[instrument(skip(pool), err)]
-pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid) -> Result<HashMap<String, (Decimal, Decimal)>> {
+pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid, models: &[String]) -> Result<HashMap<String, (Decimal, Decimal)>> {
     let rows = sqlx::query!(
         r#"
         SELECT dm.alias, t.input_price_per_token as "input_price_per_token!", t.output_price_per_token as "output_price_per_token!"
         FROM deployed_models dm
         CROSS JOIN LATERAL effective_model_tariff(dm.id, $1, 'realtime', NULL, 'standard', NOW()) t
+        WHERE dm.alias = ANY($2)
         "#,
-        account
+        account,
+        models
     )
     .fetch_all(pool)
     .await?;

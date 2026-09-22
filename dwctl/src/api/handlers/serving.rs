@@ -239,7 +239,7 @@ mod tests {
                 .collect()
         };
 
-        // The organization realtime fallback also determines its batch quote.
+        // The realtime deal does not replace the general batch quote.
         let resp = get(&server, &path, &deal_holder).await;
         resp.assert_status_ok();
         let mut seen = tariffs(resp.json());
@@ -248,7 +248,7 @@ mod tests {
             seen,
             vec![
                 ("deal".to_string(), Some(deal_holder.id.to_string())),
-                ("deal".to_string(), Some(deal_holder.id.to_string()))
+                ("general-24h".to_string(), None)
             ]
         );
 
@@ -390,5 +390,30 @@ mod tests {
         get(&server, &format!("/admin/api/v1/organizations/{}/serving", member.id), &admin)
             .await
             .assert_status_not_found();
+    }
+    #[sqlx::test]
+    async fn pricing_lookup_errors_are_not_successful_empty_quotes(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let customer = create_test_user(&pool, Role::StandardUser).await;
+        let endpoint = create_test_endpoint(&pool, "price-error", admin.id).await;
+        let model = create_test_model(&pool, "price-error", "price-error", endpoint, admin.id).await;
+        sqlx::query(
+            "INSERT INTO deployment_groups (deployment_id,group_id,granted_by) VALUES ($1,'00000000-0000-0000-0000-000000000000',$2)",
+        )
+        .bind(model)
+        .bind(admin.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,'price','realtime',1,2)").bind(model).execute(&pool).await.unwrap();
+        let path = format!("/admin/api/v1/models/{model}?include=pricing");
+        get(&server, &path, &customer).await.assert_status_ok();
+        // A database-side failure in only the token-pricing query must surface.
+        sqlx::query("CREATE OR REPLACE FUNCTION effective_model_tariff(model_id UUID, account_id UUID, purpose TEXT, completion_window TEXT, resolved_class TEXT, at_time TIMESTAMPTZ) RETURNS SETOF model_tariffs LANGUAGE plpgsql STABLE AS $$ BEGIN RAISE EXCEPTION 'simulated tariff lookup failure'; END $$").execute(&pool).await.unwrap();
+        get(&server, &path, &customer).await.assert_status_internal_server_error();
+        get(&server, &format!("/admin/api/v1/models/{model}"), &customer)
+            .await
+            .assert_status_ok();
     }
 }

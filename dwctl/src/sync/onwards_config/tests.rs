@@ -2316,13 +2316,15 @@ async fn organisation_prices_gate_balance_and_capped_root_and_child(pool: sqlx::
     // These aliases are generally free: only this customer's deal is paid.
     sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose) SELECT id,$1,'org-paid',1,1,'realtime' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
         .bind(owner).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window) SELECT id,$1,'org-paid-batch',1,1,'batch','24h' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
+        .bind(owner).execute(&pool).await.unwrap();
     sqlx::query("UPDATE user_balance_checkpoints SET balance=0 WHERE user_id=$1")
         .bind(owner)
         .execute(&pool)
         .await
         .unwrap();
     let tiers = RateLimitTiersConfig::default();
-    for phase in 0..4 {
+    for phase in 0..5 {
         match phase {
             1 => {
                 sqlx::query("UPDATE user_balance_checkpoints SET balance=10 WHERE user_id=$1")
@@ -2350,6 +2352,20 @@ async fn organisation_prices_gate_balance_and_capped_root_and_child(pool: sqlx::
                     .await
                     .unwrap();
             }
+            4 => {
+                // Deleting the owner does not itself delete its keys. Do not
+                // drop its paid deal and accidentally use a free model fallback.
+                sqlx::query("UPDATE model_tariffs SET input_price_per_token=1,output_price_per_token=1 WHERE user_id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE users SET is_deleted=true WHERE id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
             _ => {}
         }
         let allowed = phase == 1 || phase == 3;
@@ -2368,7 +2384,8 @@ async fn organisation_prices_gate_balance_and_capped_root_and_child(pool: sqlx::
             .get_api_keys_for_deployment_with_sufficient_credit(model)
             .await
             .unwrap();
-        // This repository method covers balance, while Onwards additionally covers caps.
+        // This repository method covers balance only; Onwards also applies the
+        // spend cap and deleted-owner guard checked above.
         assert_eq!(keys.iter().any(|key| key.secret == KEY_A_SECRET), phase != 0);
     }
 }

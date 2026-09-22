@@ -276,7 +276,7 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
         .await
         .context("read org overlay effective timestamp")?;
     for entry in &catalog.orgs {
-        ModelProvisioning::new(db)
+        ModelProvisioning::for_org_catalog(db)
             .preflight_future_account_tariffs(orgs[entry.document.org.trim()], effective_at)
             .await
             .with_context(|| format!("{}: organisation {:?}", entry.source, entry.document.org))?;
@@ -286,14 +286,12 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
     for entry in &catalog.orgs {
         let org_id = orgs[entry.document.org.trim()];
         let source = format!("{SOURCE_PREFIX}{}", entry.source);
-        let mut declared_models: Vec<Uuid> = Vec::new();
         for model in &entry.document.models {
             let model_id = aliases[&model.alias];
             desired.push((org_id, model_id));
-            declared_models.push(model_id);
             // The organisation's prices on this model: a temporal ledger scoped to the
             // organisation, versioned exactly like the model catalog's general prices.
-            let mut provisioning = ModelProvisioning::new(db);
+            let mut provisioning = ModelProvisioning::for_org_catalog(db);
             provisioning
                 .reconcile_tariffs(model_id, Some(org_id), None, &model.tariffs, effective_at)
                 .await
@@ -353,29 +351,21 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
             .await
             .with_context(|| format!("upsert overlay for org {:?} on {:?}", entry.document.org, model.alias))?;
         }
-        // A deal on a model the file no longer mentions is over: close the
-        // organisation's rows there. Other organisations are untouched.
-        ModelProvisioning::new(db)
-            .close_account_tariffs_except(org_id, &declared_models, effective_at)
-            .await
-            .with_context(|| format!("close undeclared tariffs of org {:?}", entry.document.org))?;
     }
 
     // Rows this catalog owns but no longer declares are removed; hand rows
     // (NULL source) and rows owned by anything else are left alone.
     let (org_ids, model_ids): (Vec<Uuid>, Vec<Uuid>) = desired.into_iter().unzip();
-    // A removed file also retires its prices. Ownership comes from its overlay
-    // marker, so unrelated hand-authored organisation deals remain untouched.
+    // Price ownership is independent of routing overlays. Omission only retires
+    // prices written by this catalog; manual prices survive even on owned models.
     for table in ["model_tariffs", "model_cache_tariffs"] {
-        let omitted = "FROM model_overlays mo WHERE mo.provisioning_source LIKE $1
-            AND mo.user_id = t.user_id AND mo.deployed_model_id = t.deployed_model_id
-            AND NOT EXISTS (SELECT 1 FROM UNNEST($2::uuid[], $3::uuid[]) AS d(user_id, deployed_model_id)
-                WHERE d.user_id = mo.user_id AND d.deployed_model_id = mo.deployed_model_id)";
+        let omitted = "t.provisioning_source = 'org-overlays' AND NOT EXISTS (
+            SELECT 1 FROM UNNEST($1::uuid[], $2::uuid[]) AS d(user_id, deployed_model_id)
+            WHERE d.user_id = t.user_id AND d.deployed_model_id = t.deployed_model_id)";
         let future: bool = sqlx::query_scalar(&format!(
-            "SELECT EXISTS (SELECT 1 FROM {table} t WHERE t.valid_from > $4
-             AND (t.valid_until IS NULL OR t.valid_until > t.valid_from) AND EXISTS (SELECT 1 {omitted}))"
+            "SELECT EXISTS (SELECT 1 FROM {table} t WHERE t.valid_from > $3
+             AND (t.valid_until IS NULL OR t.valid_until > t.valid_from) AND {omitted})"
         ))
-        .bind(format!("{SOURCE_PREFIX}%"))
         .bind(&org_ids)
         .bind(&model_ids)
         .bind(effective_at)
@@ -383,10 +373,9 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
         .await?;
         ensure!(!future, "removed overlay has future-dated prices; resolve these before removing it");
         sqlx::query(&format!(
-            "UPDATE {table} t SET valid_until = $4 WHERE t.valid_from <= $4
-            AND (t.valid_until IS NULL OR t.valid_until > $4) AND EXISTS (SELECT 1 {omitted})"
+            "UPDATE {table} t SET valid_until = $3 WHERE t.valid_from <= $3
+             AND (t.valid_until IS NULL OR t.valid_until > $3) AND {omitted}"
         ))
-        .bind(format!("{SOURCE_PREFIX}%"))
         .bind(&org_ids)
         .bind(&model_ids)
         .bind(effective_at)
@@ -835,5 +824,72 @@ models:
             .await
             .unwrap();
         assert_eq!(owners, vec![Uuid::nil()]);
+    }
+    #[sqlx::test]
+    async fn catalog_preserves_manual_prices_on_the_same_org_and_rejects_takeover(pool: PgPool) {
+        let org: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('manual-org','manual@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
+        let mut models = Vec::new();
+        for alias in ["manual-model", "omitted-model"] {
+            let model: Uuid = sqlx::query_scalar(
+                "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ($1,$1,true,$2) RETURNING id",
+            )
+            .bind(alias)
+            .bind(org)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            models.push(model);
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,$2,'manual','realtime',1,2)").bind(model).bind(org).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,user_id,read_multiplier,min_prefix_tokens,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h) VALUES ($1,$2,0.5,1,1,1,1)").bind(model).bind(org).execute(&pool).await.unwrap();
+        }
+        let directory = tempdir().unwrap();
+        // A routing-only declaration neither takes over same-model prices nor
+        // closes deals on omitted models of the same organization.
+        write(
+            directory.path(),
+            "org.yaml",
+            "org: manual-org\nmodels:\n  - alias: manual-model\n    self_hosted_only: true\n",
+        );
+        apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+        // A distinct batch tier can coexist with manual realtime/cache prices.
+        let batch = "org: manual-org\nmodels:\n  - alias: manual-model\n    tariffs:\n      - {name: batch, purpose: batch, completion_window: 24h, input_per_million_tokens: '1', output_per_million_tokens: '2'}\n";
+        write(directory.path(), "org.yaml", batch);
+        apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+        // A conflicting price refuses the transaction, preserving the deal.
+        write(
+            directory.path(),
+            "org.yaml",
+            "org: manual-org\nmodels:\n  - alias: manual-model\n    tariffs:\n      - {name: replacement, purpose: realtime, input_per_million_tokens: '3', output_per_million_tokens: '4'}\n",
+        );
+        let err = apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("manually managed tariff"));
+        write(
+            directory.path(),
+            "org.yaml",
+            "org: manual-org\nmodels:\n  - alias: manual-model\n    cache_tariff: {write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1', read_multiplier: '0'}\n",
+        );
+        let err = apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap_err();
+        assert!(format!("{err:#}").contains("manually managed cache tariff"));
+        // Removing the file closes only catalog-owned batch prices.
+        std::fs::remove_file(directory.path().join("org.yaml")).unwrap();
+        apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+        for table in ["model_tariffs", "model_cache_tariffs"] {
+            let n: i64 = sqlx::query_scalar(&format!(
+                "SELECT count(*) FROM {table} WHERE user_id=$1 AND valid_until IS NULL AND provisioning_source IS NULL"
+            ))
+            .bind(org)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(n, 2, "manual {table} prices must survive routing, omission, conflict and removal");
+        }
+        let active_owned: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM model_tariffs WHERE user_id=$1 AND provisioning_source='org-overlays' AND valid_until IS NULL",
+        )
+        .bind(org)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(active_owned, 0);
     }
 }

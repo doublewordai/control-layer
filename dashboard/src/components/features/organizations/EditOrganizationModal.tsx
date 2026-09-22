@@ -44,7 +44,7 @@ export function EditOrganizationModal({
   const updateOrg = useUpdateOrganization();
 
   useEffect(() => {
-    if (organization) {
+    if (isOpen && organization) {
       setEmail(organization.email || "");
       setDisplayName(organization.display_name || "");
       setZeroDataRetention(organization.zero_data_retention ?? false);
@@ -52,7 +52,7 @@ export function EditOrganizationModal({
       setDefaultClass(organization.default_serving_class ?? "standard");
       setSelfHostedOnly(organization.self_hosted_only ?? false);
     }
-  }, [organization]);
+  }, [organization, isOpen]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

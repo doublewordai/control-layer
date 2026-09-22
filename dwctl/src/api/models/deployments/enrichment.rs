@@ -173,8 +173,8 @@ impl<'a> DeployedModelEnricher<'a> {
                         model_ids.iter().map(|id| (*id, Vec::new())).collect();
 
                     if self.can_read_pricing {
-                        let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
-                        let tariffs = Tariffs::new(&mut conn).list_current_all_scopes_bulk(&model_ids).await.ok()?;
+                        let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+                        let tariffs = Tariffs::new(&mut conn).list_current_all_scopes_bulk(&model_ids).await?;
                         for tariff in tariffs {
                             tariffs_map
                                 .entry(tariff.deployed_model_id)
@@ -183,29 +183,27 @@ impl<'a> DeployedModelEnricher<'a> {
                         }
                     } else if let Some(account) = self.pricing_account {
                         // Customers: what they actually pay, in one query.
-                        let mut tariffs_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
+                        let mut tariffs_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
                         let mut tariffs_repo = Tariffs::new(&mut tariffs_conn);
-                        if let Ok(tariffs) = tariffs_repo.list_effective_for_account(&model_ids, account).await {
-                            for tariff in tariffs {
-                                tariffs_map
-                                    .entry(tariff.deployed_model_id)
-                                    .or_default()
-                                    .push(TariffResponse::from(tariff));
-                            }
+                        let tariffs = tariffs_repo.list_effective_for_account(&model_ids, account).await?;
+                        for tariff in tariffs {
+                            tariffs_map
+                                .entry(tariff.deployed_model_id)
+                                .or_default()
+                                .push(TariffResponse::from(tariff));
                         }
                     } else {
                         for model_id in &model_ids {
-                            let mut tariffs_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
+                            let mut tariffs_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
                             let mut tariffs_repo = Tariffs::new(&mut tariffs_conn);
-                            if let Ok(tariffs) = tariffs_repo.list_current_by_model(*model_id).await {
-                                tariffs_map.insert(*model_id, tariffs.into_iter().map(TariffResponse::from).collect());
-                            }
+                            let tariffs = tariffs_repo.list_current_by_model(*model_id).await?;
+                            tariffs_map.insert(*model_id, tariffs.into_iter().map(TariffResponse::from).collect());
                         }
                     }
 
-                    Some(tariffs_map)
+                    Ok::<_, Error>(Some(tariffs_map))
                 } else {
-                    None
+                    Ok(None)
                 }
             },
             // Active prompt-cache tariffs query
@@ -263,6 +261,8 @@ impl<'a> DeployedModelEnricher<'a> {
                 }
             }
         );
+
+        let pricing_tariffs_map = pricing_tariffs_map?;
 
         let (model_groups_map, groups_map) = match groups_result {
             Some((model_groups_map, groups_map)) => (Some(model_groups_map), Some(groups_map)),

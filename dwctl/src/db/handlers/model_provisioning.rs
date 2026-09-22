@@ -19,6 +19,7 @@ const MODEL_PROVISIONING_LOCK: i64 = 0x4457_4d4f_4445_4c50;
 
 pub struct ModelProvisioning<'c> {
     db: &'c mut PgConnection,
+    tariff_source: Option<&'static str>,
 }
 
 #[derive(Debug, Clone)]
@@ -31,7 +32,15 @@ struct DesiredModel<'a> {
 
 impl<'c> ModelProvisioning<'c> {
     pub fn new(db: &'c mut PgConnection) -> Self {
-        Self { db }
+        Self { db, tariff_source: None }
+    }
+
+    /// Organization catalogs may only replace prices they created themselves.
+    pub(crate) fn for_org_catalog(db: &'c mut PgConnection) -> Self {
+        Self {
+            db,
+            tariff_source: Some("org-overlays"),
+        }
     }
 
     pub async fn apply(&mut self, catalog: &Catalog) -> Result<()> {
@@ -143,32 +152,13 @@ impl<'c> ModelProvisioning<'c> {
         Ok(())
     }
 
-    /// Close every active tariff and cache tariff of `account` on models NOT in
-    /// `keep`: an organisation's deal on a model its file no longer declares.
-    pub(crate) async fn close_account_tariffs_except(&mut self, account: Uuid, keep: &[Uuid], effective_at: DateTime<Utc>) -> Result<()> {
-        for table in ["model_tariffs", "model_cache_tariffs"] {
-            sqlx::query(&format!(
-                "UPDATE {table} SET valid_until = $3
-                 WHERE user_id = $1 AND NOT (deployed_model_id = ANY($2))
-                   AND valid_from <= $3 AND (valid_until IS NULL OR valid_until > $3)"
-            ))
-            .bind(account)
-            .bind(keep)
-            .bind(effective_at)
-            .execute(&mut *self.db)
-            .await
-            .with_context(|| format!("close {table} rows of an organisation on undeclared models"))?;
-        }
-        Ok(())
-    }
-
     /// Refuse to reconcile an organisation whose rows carry a future `valid_from`:
     /// startup provisioning has no scheduling semantics (same rule as the model catalog).
     pub(crate) async fn preflight_future_account_tariffs(&mut self, account: Uuid, effective_at: DateTime<Utc>) -> Result<()> {
         for table in ["model_tariffs", "model_cache_tariffs"] {
             let future: Option<DateTime<Utc>> = sqlx::query_scalar(&format!(
                 "SELECT valid_from FROM {table}
-                 WHERE user_id = $1 AND valid_from > $2 AND (valid_until IS NULL OR valid_until > valid_from)
+                 WHERE user_id = $1 AND provisioning_source = 'org-overlays' AND valid_from > $2 AND (valid_until IS NULL OR valid_until > valid_from)
                  ORDER BY valid_from LIMIT 1"
             ))
             .bind(account)
@@ -539,7 +529,7 @@ impl<'c> ModelProvisioning<'c> {
     ) -> Result<()> {
         let rows = sqlx::query(
             r#"SELECT id, name, input_price_per_token, output_price_per_token,
-                      api_key_purpose, completion_window, valid_until
+                      api_key_purpose, completion_window, valid_until, provisioning_source
                FROM model_tariffs
                WHERE deployed_model_id = $1
                  AND user_id IS NOT DISTINCT FROM $3
@@ -562,6 +552,18 @@ impl<'c> ModelProvisioning<'c> {
             let id: Uuid = row.try_get("id")?;
             let purpose: Option<String> = row.try_get("api_key_purpose")?;
             let window: Option<String> = row.try_get("completion_window")?;
+            if let Some(source) = self.tariff_source {
+                let owner: Option<String> = row.try_get("provisioning_source")?;
+                if owner.as_deref() != Some(source) {
+                    ensure!(
+                        !desired
+                            .iter()
+                            .any(|t| Some(t.purpose.as_db_str()) == purpose.as_deref() && t.completion_window == window),
+                        "organization catalog conflicts with a manually managed tariff on model {model_id}; explicitly retire or transfer its ownership first"
+                    );
+                    continue;
+                }
+            }
             if let Some(purpose) = purpose {
                 if active.contains_key(&(purpose.clone(), window.clone())) {
                     legacy_or_duplicate.push(id);
@@ -602,8 +604,8 @@ impl<'c> ModelProvisioning<'c> {
             sqlx::query(
                 r#"INSERT INTO model_tariffs (
                        deployed_model_id, name, input_price_per_token, output_price_per_token,
-                       valid_from, api_key_purpose, completion_window, user_id, serving_class
-                   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)"#,
+                       valid_from, api_key_purpose, completion_window, user_id, serving_class, provisioning_source
+                   ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)"#,
             )
             .bind(model_id)
             .bind(&tariff.name)
@@ -614,6 +616,7 @@ impl<'c> ModelProvisioning<'c> {
             .bind(&tariff.completion_window)
             .bind(account)
             .bind(serving_class)
+            .bind(self.tariff_source)
             .execute(&mut *self.db)
             .await
             .with_context(|| format!("insert replacement tariff {:?}", tariff.name))?;
@@ -645,7 +648,7 @@ impl<'c> ModelProvisioning<'c> {
     ) -> Result<()> {
         let rows = sqlx::query(
             r#"SELECT id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h,
-                      read_multiplier, min_prefix_tokens, valid_until
+                      read_multiplier, min_prefix_tokens, valid_until, provisioning_source
                FROM model_cache_tariffs
                WHERE deployed_model_id = $1
                  AND user_id IS NOT DISTINCT FROM $3
@@ -661,7 +664,21 @@ impl<'c> ModelProvisioning<'c> {
         .fetch_all(&mut *self.db)
         .await
         .context("read active cache tariffs")?;
-        let mut rows = rows.into_iter();
+        let mut owned = Vec::new();
+        for row in rows {
+            if let Some(source) = self.tariff_source {
+                let owner: Option<String> = row.try_get("provisioning_source")?;
+                if owner.as_deref() != Some(source) {
+                    ensure!(
+                        desired.is_none(),
+                        "organization catalog conflicts with a manually managed cache tariff on model {model_id}; explicitly retire or transfer its ownership first"
+                    );
+                    continue;
+                }
+            }
+            owned.push(row);
+        }
+        let mut rows = owned.into_iter();
         let active = rows.next();
         let overlapping: Vec<Uuid> = rows.map(|row| row.try_get("id")).collect::<Result<_, sqlx::Error>>()?;
         if !overlapping.is_empty() {
@@ -698,8 +715,8 @@ impl<'c> ModelProvisioning<'c> {
         sqlx::query(
             r#"INSERT INTO model_cache_tariffs (
                    deployed_model_id, write_multiplier_5m, write_multiplier_1h,
-                   write_multiplier_24h, read_multiplier, min_prefix_tokens, valid_from, user_id, serving_class
-               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)"#,
+                   write_multiplier_24h, read_multiplier, min_prefix_tokens, valid_from, user_id, serving_class, provisioning_source
+               ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)"#,
         )
         .bind(model_id)
         .bind(write_5m)
@@ -710,6 +727,7 @@ impl<'c> ModelProvisioning<'c> {
         .bind(effective_at)
         .bind(account)
         .bind(serving_class)
+        .bind(self.tariff_source)
         .execute(&mut *self.db)
         .await
         .context("insert replacement cache tariff")?;

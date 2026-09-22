@@ -382,9 +382,10 @@ pub struct UserBatchUsageResponse {
     pub total_batch_count: i64,
     pub avg_requests_per_batch: f64,
     pub total_cost: String,
-    /// Counterfactual cost at this billing account's current standard-class realtime
+    /// Counterfactual cost at this billing account's standard-class realtime
     /// rates. This comparison does not reprice historical requests in their original
-    /// classes; total_cost contains the charges actually incurred.
+    /// classes; total_cost contains the charges actually incurred. Rates are captured
+    /// when computed; cached responses can be up to 60 minutes old.
     pub estimated_realtime_cost: String,
     pub by_model: Vec<ModelBreakdownEntry>,
 }

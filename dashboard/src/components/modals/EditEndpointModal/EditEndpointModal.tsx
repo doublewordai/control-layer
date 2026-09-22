@@ -23,6 +23,7 @@ import {
 import {
   Form,
   FormControl,
+  FormDescription,
   FormField,
   FormItem,
   FormLabel,
@@ -875,10 +876,10 @@ const ConnectionStep: React.FC<ConnectionStepProps> = ({
                     <option value="dynamo">dynamo (self-hosted, behind the dynamo frontend)</option>
                   </select>
                 </FormControl>
-                <p className="text-xs text-gray-500">
+                <FormDescription>
                   Only a dynamo endpoint receives serving-class targets; an
                   external one is skipped for self-hosted-only organisations.
-                </p>
+                </FormDescription>
               </FormItem>
             )}
           />
