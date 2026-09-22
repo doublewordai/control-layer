@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.2.2](https://github.com/doublewordai/control-layer/compare/v12.2.1...v12.2.2) (2026-09-22)
+
+
+### Bug Fixes
+
+* Correctly handle otel tracing through onwards ([#1827](https://github.com/doublewordai/control-layer/issues/1827)) ([107d619](https://github.com/doublewordai/control-layer/commit/107d619195a55c5b0cac65801aaffad06256668a))
+
 ## [12.2.1](https://github.com/doublewordai/control-layer/compare/v12.2.0...v12.2.1) (2026-09-22)
 
 
