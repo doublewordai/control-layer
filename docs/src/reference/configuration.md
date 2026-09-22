@@ -532,6 +532,17 @@ enable_otel_export: false
 
 Exports traces via OTLP. Configure the exporter endpoint with standard OpenTelemetry environment variables (`OTEL_EXPORTER_OTLP_ENDPOINT`, etc.).
 
+When request analytics and tracing are enabled, the pair `http_analytics.trace_id`
+and `gateway_span_id` identifies the gateway span for a captured request. Follow
+its descendant `onwards.provider_attempt` spans to the downstream serving spans.
+The gateway span's `doubleword.request_id` attribute holds the logical request
+UUID for reverse lookup in request records.
+
+Trace context must be propagated on every required forwarding hop. Propagation
+does not itself enable span export: correlation also depends on the connecting
+spans being sampled, exported, and retained. Stored IDs can therefore refer to
+unavailable spans, and older analytics records may have no gateway span ID.
+
 ## Sample Files
 
 Generate sample JSONL files for new users:

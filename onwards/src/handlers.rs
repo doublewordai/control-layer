@@ -29,7 +29,7 @@ use tracing::{Instrument, debug, error, instrument, trace, warn};
 use uuid::Uuid;
 
 /// Adapter to extract W3C trace context from an axum HeaderMap.
-struct HeaderExtractor<'a>(&'a HeaderMap);
+pub struct HeaderExtractor<'a>(pub &'a HeaderMap);
 
 impl Extractor for HeaderExtractor<'_> {
     fn get(&self, key: &str) -> Option<&str> {
@@ -485,7 +485,9 @@ pub async fn target_message_handler<T: HttpClient>(
 
     // Extract W3C trace context (traceparent + tracestate) from inbound headers
     // BEFORE the span is first entered. This stitches cross-service traces (e.g.
-    // remote onwards receiving requests from local onwards).
+    // remote onwards receiving requests from local onwards). An embedding
+    // gateway that has already adopted these headers strips them first, so
+    // this span then nests under its request span instead.
     if req.headers().contains_key("traceparent") {
         let propagator = opentelemetry_sdk::propagation::TraceContextPropagator::new();
         let parent_ctx = propagator.extract(&HeaderExtractor(req.headers()));

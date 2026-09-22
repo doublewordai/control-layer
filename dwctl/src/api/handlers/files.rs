@@ -2189,6 +2189,7 @@ mod tests {
     use crate::api::models::users::Role;
     use crate::db::models::api_keys::ApiKeyPurpose;
     use crate::test::utils::*;
+    use chrono::Utc;
     use sqlx::PgPool;
     use std::sync::{Arc, Mutex};
     use uuid::Uuid;
@@ -2716,7 +2717,8 @@ mod tests {
                 output_price_per_token: Decimal::from_str("0.00006").unwrap(), // $0.06 per 1K tokens
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
                 completion_window: Some("24h".to_string()),
-                valid_from: None,
+                // Estimates use the host clock; the database may run in a VM.
+                valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
                 user_id: None,
             })
             .await
@@ -2731,7 +2733,8 @@ mod tests {
                 output_price_per_token: Decimal::from_str("0.000002").unwrap(), // $0.002 per 1K tokens
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
                 completion_window: Some("24h".to_string()),
-                valid_from: None,
+                // Estimates use the host clock; the database may run in a VM.
+                valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
                 user_id: None,
             })
             .await
@@ -2848,7 +2851,8 @@ mod tests {
                 output_price_per_token: Decimal::from_str("0.00006").unwrap(), // $0.06 per 1K tokens
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
                 completion_window: Some("24h".to_string()),
-                valid_from: None,
+                // Estimates use the host clock; the database may run in a VM.
+                valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
                 user_id: None,
             })
             .await
@@ -2863,7 +2867,8 @@ mod tests {
                 output_price_per_token: Decimal::from_str("0.00012").unwrap(), // $0.12 per 1K tokens (2x)
                 api_key_purpose: Some(ApiKeyPurpose::Batch),
                 completion_window: Some("1h".to_string()),
-                valid_from: None,
+                // Estimates use the host clock; the database may run in a VM.
+                valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
                 user_id: None,
             })
             .await
