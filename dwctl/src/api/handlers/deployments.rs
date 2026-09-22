@@ -705,7 +705,14 @@ pub async fn create_deployed_model<P: PoolProvider>(
     }
 
     // Create tariffs if provided
-    if let Some(tariff_defs) = tariffs {
+    if let Some(mut tariff_defs) = tariffs {
+        // Normalize before comparison as well as persistence, so resubmitting a
+        // padded batch window neither creates a dead tariff nor versions a no-op.
+        for tariff in &mut tariff_defs {
+            if tariff.api_key_purpose == Some(ApiKeyPurpose::Batch) {
+                tariff.completion_window = tariff.completion_window.take().map(|window| window.trim().to_owned());
+            }
+        }
         let mut tariffs_repo = Tariffs::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         for tariff_def in tariff_defs {
             if tariff_def
@@ -952,7 +959,14 @@ pub async fn update_deployed_model<P: PoolProvider>(
     }
 
     // Handle tariff replacement if provided
-    if let Some(tariff_defs) = tariffs {
+    if let Some(mut tariff_defs) = tariffs {
+        // Normalize before comparison as well as persistence, so resubmitting a
+        // padded batch window neither creates a dead tariff nor versions a no-op.
+        for tariff in &mut tariff_defs {
+            if tariff.api_key_purpose == Some(ApiKeyPurpose::Batch) {
+                tariff.completion_window = tariff.completion_window.take().map(|window| window.trim().to_owned());
+            }
+        }
         let tariff_conn = tx.acquire().await.map_err(|e| Error::Database(e.into()))?;
         let mut tariffs_repo = Tariffs::new(tariff_conn);
 
@@ -983,6 +997,11 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
         // Create new or changed tariffs (skip those that already exist unchanged)
         for tariff_def in tariff_defs {
+            // Preserve unchanged legacy rows when editing model metadata. New or
+            // changed prices must satisfy the current customer-billing contract.
+            if current_tariffs.iter().any(|existing| tariff_matches(existing, &tariff_def)) {
+                continue;
+            }
             if tariff_def
                 .api_key_purpose
                 .as_ref()
@@ -992,11 +1011,6 @@ pub async fn update_deployed_model<P: PoolProvider>(
                     message: "Tariffs support only realtime, batch and playground customer inference".to_string(),
                 });
             }
-            // Skip if this tariff already exists with the same values
-            if current_tariffs.iter().any(|existing| tariff_matches(existing, &tariff_def)) {
-                continue;
-            }
-
             if tariff_def.api_key_purpose == Some(ApiKeyPurpose::Batch) {
                 if tariff_def.completion_window.as_deref().is_none_or(|w| w.trim().is_empty()) {
                     return Err(Error::BadRequest {
@@ -1517,6 +1531,7 @@ pub async fn remove_model_component<P: PoolProvider>(
 
 #[cfg(test)]
 mod tests {
+    use rust_decimal::Decimal;
 
     use crate::{
         api::{
@@ -2309,6 +2324,7 @@ mod tests {
             (None, None),
             (Some("realtime"), Some("24h")),
             (Some("batch"), None),
+            (Some("batch"), Some("   ")),
         ] {
             let tariffs = json!([{"name":"invalid", "api_key_purpose":purpose, "completion_window":window,
                 "input_price_per_token":"1", "output_price_per_token":"2"}]);
@@ -2342,6 +2358,102 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
+    async fn customer_tariff_windows_are_normalized_on_create_and_update(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+        let endpoint = get_test_endpoint_id(&pool).await;
+        for (purpose, window, expected_window) in [("realtime", None, None), ("batch", Some(" 24h "), Some("24h"))] {
+            let tariff = json!({"name":"price", "api_key_purpose":purpose, "completion_window":window,
+                "input_price_per_token":"1", "output_price_per_token":"2"});
+            let response = app
+                .post("/admin/api/v1/models")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"type":"standard", "model_name":purpose, "alias":purpose, "hosted_on":endpoint, "tariffs":[tariff]}))
+                .await;
+            response.assert_status_ok();
+            let model: DeployedModelResponse = response.json();
+            let original: (uuid::Uuid, Option<String>) =
+                sqlx::query_as("SELECT id,completion_window FROM model_tariffs WHERE deployed_model_id=$1")
+                    .bind(model.id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(original.1.as_deref(), expected_window);
+            // An unchanged padded request must not add a historical version.
+            for output in ["2", "3"] {
+                let mut update = tariff.clone();
+                update["output_price_per_token"] = json!(output);
+                app.patch(&format!("/admin/api/v1/models/{}", model.id))
+                    .add_header(&headers[0].0, &headers[0].1)
+                    .add_header(&headers[1].0, &headers[1].1)
+                    .json(&json!({"tariffs":[update]}))
+                    .await
+                    .assert_status_ok();
+                let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM model_tariffs WHERE deployed_model_id=$1")
+                    .bind(model.id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                assert_eq!(rows, if output == "2" { 1 } else { 2 });
+                let selected: (uuid::Uuid, Option<String>, Decimal) = sqlx::query_as(
+                    "SELECT id,completion_window,output_price_per_token FROM effective_model_tariff($1,$2,$3,$4,'standard',clock_timestamp())")
+                    .bind(model.id).bind(admin.id).bind(purpose).bind(expected_window)
+                    .fetch_one(&pool).await.unwrap();
+                assert_eq!(selected.1.as_deref(), expected_window);
+                assert_eq!(selected.2, output.parse::<Decimal>().unwrap());
+                assert_eq!(selected.0 == original.0, output == "2");
+            }
+        }
+    }
+
+    #[sqlx::test]
+    async fn unchanged_legacy_tariff_allows_metadata_edits_but_not_repricing(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+        let model = create_test_deployment(&pool, admin.id, "legacy", "legacy").await;
+        let id: uuid::Uuid = sqlx::query_scalar("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,'legacy',1,2,NOW()-INTERVAL '1 day') RETURNING id")
+            .bind(model.id).fetch_one(&pool).await.unwrap();
+        let mut tariff = json!({"name":"legacy","api_key_purpose":null,"input_price_per_token":"1","output_price_per_token":"2"});
+        app.patch(&format!("/admin/api/v1/models/{}", model.id))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"description":"metadata edit", "tariffs":[tariff]}))
+            .await
+            .assert_status_ok();
+        tariff["output_price_per_token"] = json!("3");
+        app.patch(&format!("/admin/api/v1/models/{}", model.id))
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"description":"must roll back", "tariffs":[tariff]}))
+            .await
+            .assert_status_bad_request();
+        let description: String = sqlx::query_scalar("SELECT description FROM deployed_models WHERE id=$1")
+            .bind(model.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(description, "metadata edit");
+        let rows: Vec<(uuid::Uuid, Decimal)> =
+            sqlx::query_as("SELECT id,output_price_per_token FROM model_tariffs WHERE deployed_model_id=$1 AND valid_until IS NULL")
+                .bind(model.id)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(id, Decimal::from(2))]);
+        let billable: i64 = sqlx::query_scalar("SELECT count(*) FROM effective_model_tariff($1,$2,'realtime',NULL,'standard',NOW())")
+            .bind(model.id)
+            .bind(admin.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(billable, 0, "preserving legacy metadata must not make it billable");
     }
 
     #[sqlx::test]

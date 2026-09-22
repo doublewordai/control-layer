@@ -527,6 +527,9 @@ impl<'c> ModelProvisioning<'c> {
         desired: &[Tariff],
         effective_at: DateTime<Utc>,
     ) -> Result<()> {
+        // Also inspect future manual versions: the catalog writes an open-ended
+        // price, so it would overlap even a finite manual schedule. Cancelled
+        // versions (end <= start) do not reserve a pricing interval.
         let rows = sqlx::query(
             r#"SELECT id, name, input_price_per_token, output_price_per_token,
                       api_key_purpose, completion_window, valid_until, provisioning_source
@@ -534,14 +537,15 @@ impl<'c> ModelProvisioning<'c> {
                WHERE deployed_model_id = $1
                  AND user_id IS NOT DISTINCT FROM $3
                  AND serving_class IS NOT DISTINCT FROM $4
-                 AND valid_from <= $2
-                 AND (valid_until IS NULL OR valid_until > $2)
+                 AND (valid_from <= $2 OR ($5::TEXT IS NOT NULL AND provisioning_source IS DISTINCT FROM $5))
+                 AND (valid_until IS NULL OR valid_until > GREATEST(valid_from, $2))
                ORDER BY valid_from DESC"#,
         )
         .bind(model_id)
         .bind(effective_at)
         .bind(account)
         .bind(serving_class)
+        .bind(self.tariff_source)
         .fetch_all(&mut *self.db)
         .await
         .context("read active model tariffs")?;
@@ -646,6 +650,9 @@ impl<'c> ModelProvisioning<'c> {
         desired: Option<&CacheTariff>,
         effective_at: DateTime<Utc>,
     ) -> Result<()> {
+        // Also inspect future manual versions: the catalog writes an open-ended
+        // price, so it would overlap even a finite manual schedule. Cancelled
+        // versions (end <= start) do not reserve a pricing interval.
         let rows = sqlx::query(
             r#"SELECT id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h,
                       read_multiplier, min_prefix_tokens, valid_until, provisioning_source
@@ -653,14 +660,15 @@ impl<'c> ModelProvisioning<'c> {
                WHERE deployed_model_id = $1
                  AND user_id IS NOT DISTINCT FROM $3
                  AND serving_class IS NOT DISTINCT FROM $4
-                 AND valid_from <= $2
-                 AND (valid_until IS NULL OR valid_until > $2)
+                 AND (valid_from <= $2 OR ($5::TEXT IS NOT NULL AND provisioning_source IS DISTINCT FROM $5))
+                 AND (valid_until IS NULL OR valid_until > GREATEST(valid_from, $2))
                ORDER BY valid_from DESC"#,
         )
         .bind(model_id)
         .bind(effective_at)
         .bind(account)
         .bind(serving_class)
+        .bind(self.tariff_source)
         .fetch_all(&mut *self.db)
         .await
         .context("read active cache tariffs")?;

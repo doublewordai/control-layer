@@ -826,6 +826,87 @@ models:
         assert_eq!(owners, vec![Uuid::nil()]);
     }
     #[sqlx::test]
+    async fn catalog_rejects_future_manual_price_collisions_atomically(pool: PgPool) {
+        let org: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('future-org','future@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
+        let directory = tempdir().unwrap();
+        for class in [None, Some("interactive")] {
+            for finite in [false, true] {
+                for cache in [false, true] {
+                    let alias = format!("future-{}-{finite}-{cache}", class.unwrap_or("all"));
+                    let model: Uuid = sqlx::query_scalar(
+                        "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ($1,$1,true,$2) RETURNING id",
+                    )
+                    .bind(&alias)
+                    .bind(org)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    // Both ledgers have a legitimate manual schedule, either
+                    // open-ended or finite, in the exact scope being tested.
+                    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from,valid_until) VALUES ($1,$2,$3,'future','realtime',1,2,NOW()+INTERVAL '1 day',CASE WHEN $4 THEN NOW()+INTERVAL '2 days' ELSE NULL END)")
+                        .bind(model).bind(org).bind(class).bind(finite).execute(&pool).await.unwrap();
+                    sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,user_id,serving_class,read_multiplier,min_prefix_tokens,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,valid_from,valid_until) VALUES ($1,$2,$3,0.5,1,1,1,1,NOW()+INTERVAL '1 day',CASE WHEN $4 THEN NOW()+INTERVAL '2 days' ELSE NULL END)")
+                        .bind(model).bind(org).bind(class).bind(finite).execute(&pool).await.unwrap();
+                    let base = format!("org: future-org\nmodels:\n  - alias: {alias}\n    self_hosted_only: false\n");
+                    write(directory.path(), "org.yaml", &base);
+                    apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+                    let mut before = Vec::new();
+                    for table in ["model_tariffs", "model_cache_tariffs", "model_overlays"] {
+                        let snapshot: serde_json::Value =
+                            sqlx::query_scalar(&format!("SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text) FROM {table} t"))
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
+                        before.push(snapshot);
+                    }
+                    let price = if cache {
+                        "cache_tariff: {write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1', read_multiplier: '0'}".to_owned()
+                    } else {
+                        "tariffs:\n  - {name: replacement, purpose: realtime, input_per_million_tokens: '3', output_per_million_tokens: '4'}".to_owned()
+                    };
+                    let scope = if class.is_some() {
+                        "    class_pricing:\n      interactive:\n"
+                    } else {
+                        ""
+                    };
+                    let indent = if class.is_some() { "        " } else { "    " };
+                    let price = price.lines().map(|line| format!("{indent}{line}\n")).collect::<String>();
+                    let yaml = format!(
+                        "{}{scope}{price}",
+                        base.replace("self_hosted_only: false", "self_hosted_only: true")
+                    );
+                    write(directory.path(), "org.yaml", &yaml);
+                    let err = apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap_err();
+                    let expected = if cache {
+                        "manually managed cache tariff"
+                    } else {
+                        "manually managed tariff"
+                    };
+                    assert!(format!("{err:#}").contains(expected), "{alias}: {err:#}");
+                    for (table, before) in ["model_tariffs", "model_cache_tariffs", "model_overlays"].into_iter().zip(before) {
+                        let after: serde_json::Value =
+                            sqlx::query_scalar(&format!("SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text) FROM {table} t"))
+                                .fetch_one(&pool)
+                                .await
+                                .unwrap();
+                        assert_eq!(after, before, "{alias}: failed reconciliation must preserve {table}");
+                    }
+                    // Unrelated batch pricing can coexist with manual realtime
+                    // and cache schedules; preflight must not reject the org.
+                    write(
+                        directory.path(),
+                        "org.yaml",
+                        &format!(
+                            "{base}    tariffs:\n      - {{name: batch, purpose: batch, completion_window: 24h, input_per_million_tokens: '1', output_per_million_tokens: '2'}}\n"
+                        ),
+                    );
+                    apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+                }
+            }
+        }
+    }
+
+    #[sqlx::test]
     async fn catalog_preserves_manual_prices_on_the_same_org_and_rejects_takeover(pool: PgPool) {
         let org: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('manual-org','manual@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
         let mut models = Vec::new();

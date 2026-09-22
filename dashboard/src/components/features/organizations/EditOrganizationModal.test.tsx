@@ -302,7 +302,9 @@ describe("serving setting authorization and cancellation", () => {
     const user = userEvent.setup();
     const props = { onClose: vi.fn(), organization: mockOrg, canEditServing: true };
     const { rerender } = render(<EditOrganizationModal {...props} isOpen />, { wrapper: createWrapper() });
-    await user.click(within(screen.getByRole("dialog")).getByRole("checkbox", { name: "Grant interactive" }));
+    const checkbox = within(screen.getByRole("dialog")).getByRole("checkbox", { name: "Grant interactive" });
+    await user.click(checkbox);
+    expect(checkbox).toBeChecked();
     await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: /cancel/i }));
     rerender(<EditOrganizationModal {...props} isOpen={false} />);
     rerender(<EditOrganizationModal {...props} isOpen />);

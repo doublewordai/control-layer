@@ -87,6 +87,24 @@ time. Within the same scope/purpose/window, the latest valid start wins, then
 ascending tariff ID breaks exact ties. SQL quotes and Rust billing use the same
 rules. Quotes retain the matched tariff's actual purpose and class.
 
+The same SQL resolver also feeds effective-price sorting and the paid-model
+admission check used when configuring API keys. Migration 155 therefore changes
+those results on existing deals as well as quotes: an account's zero realtime
+deal beats a paid general playground tariff. The quote reflects the zero deal;
+if no other applicable class is paid, playground no longer requires a paid-model
+balance check. Model access permissions still apply. Admission remains a
+conservative model-level check, so another paid class can still require credit.
+Actual usage billing selects tariffs in Rust after bulk-loading the relevant
+histories; SQL/Rust parity tests protect the shared contract. Deploy the matching
+API and worker image throughout the fleet before activating customer deals.
+
+Batch tariff authoring normalizes surrounding completion-window whitespace.
+Unchanged legacy NULL-purpose rows may be preserved during model metadata edits,
+but cannot be created or repriced through the customer tariff API and are not
+billable fallback rows. Organisation catalog prices must not overlap manually
+managed prices in the same scope and purpose/window, including future schedules.
+Such conflicts fail reconciliation without taking ownership of the manual deal.
+
 Cache multipliers are selected independently by account + resolved class →
 account all-class → general model, at the same timestamp. They have no
 purpose/window dimension. A general cache tariff is required for Control Layer
