@@ -109,9 +109,9 @@ standard-class realtime deal, then the general realtime rate. Other classes are
 ignored. Actual usage totals and cap accounting remain actual resolved-class
 charges. The comparison can be cached for 60 minutes.
 
-Migration 155 changed effective billing, paid admission and the then-current
+Migration 160 changed effective billing, paid admission and the then-current
 catalogue selection on existing deals: an account's zero realtime deal beats a
-paid general playground tariff. Migration 156 separates customer display prices
+paid general playground tariff. Migration 161 separates customer display prices
 from class-aware billing and admission. Admission remains a conservative
 model-level check: another paid class may require credit/cap headroom even for a
 free-class request, including a class the account is not granted. Free class

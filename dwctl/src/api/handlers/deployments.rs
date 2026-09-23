@@ -706,8 +706,9 @@ pub async fn create_deployed_model<P: PoolProvider>(
 
     // Create tariffs if provided
     if let Some(mut tariff_defs) = tariffs {
-        // Normalize before comparison as well as persistence, so resubmitting a
-        // padded batch window neither creates a dead tariff nor versions a no-op.
+        // Normalize incoming windows before persistence and comparison. Repeating
+        // a padded request is a no-op once stored canonically. Do not trim stored
+        // legacy rows when comparing: replace them so exact-window billing works.
         for tariff in &mut tariff_defs {
             if tariff.api_key_purpose == Some(ApiKeyPurpose::Batch) {
                 tariff.completion_window = tariff.completion_window.take().map(|window| window.trim().to_owned());
@@ -960,8 +961,9 @@ pub async fn update_deployed_model<P: PoolProvider>(
 
     // Handle tariff replacement if provided
     if let Some(mut tariff_defs) = tariffs {
-        // Normalize before comparison as well as persistence, so resubmitting a
-        // padded batch window neither creates a dead tariff nor versions a no-op.
+        // Normalize incoming windows before persistence and comparison. Repeating
+        // a padded request is a no-op once stored canonically. Do not trim stored
+        // legacy rows when comparing: replace them so exact-window billing works.
         for tariff in &mut tariff_defs {
             if tariff.api_key_purpose == Some(ApiKeyPurpose::Batch) {
                 tariff.completion_window = tariff.completion_window.take().map(|window| window.trim().to_owned());

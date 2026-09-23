@@ -2045,18 +2045,35 @@ mod integration_tests {
         output_price: Decimal,
         api_key_purpose: ApiKeyPurpose,
     ) {
+        let completion_window = if api_key_purpose == ApiKeyPurpose::Batch {
+            Some("24h")
+        } else {
+            None
+        };
+        setup_tariff_with_window(
+            pool,
+            deployed_model_id,
+            input_price,
+            output_price,
+            api_key_purpose,
+            completion_window,
+        )
+        .await;
+    }
+
+    async fn setup_tariff_with_window(
+        pool: &sqlx::PgPool,
+        deployed_model_id: crate::types::DeploymentId,
+        input_price: Decimal,
+        output_price: Decimal,
+        api_key_purpose: ApiKeyPurpose,
+        completion_window: Option<&str>,
+    ) {
         use crate::db::handlers::Tariffs;
         use crate::db::models::tariffs::TariffCreateDBRequest;
 
         let mut conn = pool.acquire().await.unwrap();
         let mut tariffs_repo = Tariffs::new(&mut conn);
-
-        // Batch tariffs require a completion_window
-        let completion_window = if api_key_purpose == ApiKeyPurpose::Batch {
-            Some("24h".to_string())
-        } else {
-            None
-        };
 
         tariffs_repo
             .create(&TariffCreateDBRequest {
@@ -2067,7 +2084,7 @@ mod integration_tests {
                 output_price_per_token: output_price,
                 // Capture timestamps use the host clock; PostgreSQL may run in a VM.
                 valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
-                completion_window,
+                completion_window: completion_window.map(str::to_string),
                 user_id: None,
             })
             .await
@@ -2761,19 +2778,7 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_future_fusillade_success_index_gates_billing_and_aggregation(pool: sqlx::PgPool) {
-        // This preparation release does not ship the index: production history
-        // must be reconciled first. Install its intended definition in this
-        // isolated test database to prove the application is ready for it.
-        sqlx::query(
-            "CREATE UNIQUE INDEX test_http_analytics_fusillade_success_unique \
-             ON http_analytics (fusillade_request_id) \
-             WHERE fusillade_request_id IS NOT NULL AND status_code BETWEEN 200 AND 299",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-
+    async fn test_fusillade_success_index_gates_billing_and_aggregation(pool: sqlx::PgPool) {
         let model_id = create_test_model(&pool, "fusillade-billing-idempotency").await;
         setup_tariff(
             &pool,
@@ -2869,6 +2874,59 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
+    async fn test_batchless_flex_success_index_gates_billing(pool: sqlx::PgPool) {
+        let model_id = create_test_model(&pool, "flex-billing-idempotency").await;
+        setup_tariff_with_window(
+            &pool,
+            model_id,
+            Decimal::from_str("0.00005").unwrap(),
+            Decimal::from_str("0.00010").unwrap(),
+            ApiKeyPurpose::Batch,
+            Some("1h"),
+        )
+        .await;
+        let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
+        let batch_key = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
+        let request_id = Uuid::new_v4();
+
+        let mut first = create_raw_record("flex-billing-idempotency", Some(batch_key.clone()), 1000, 500);
+        first.batch_completion_window = Some("1h".to_string());
+        first.fusillade_request_id = Some(request_id);
+
+        let mut duplicate = create_raw_record("flex-billing-idempotency", Some(batch_key), 1000, 500);
+        duplicate.batch_completion_window = Some("1h".to_string());
+        duplicate.fusillade_request_id = Some(request_id);
+
+        run_batcher_with_records(&pool, vec![first, duplicate]).await;
+
+        let analytics_rows = sqlx::query!(
+            "SELECT request_origin FROM http_analytics \
+             WHERE fusillade_request_id = $1 AND status_code BETWEEN 200 AND 299",
+            request_id,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let charges: Vec<Decimal> = sqlx::query_scalar(
+            "SELECT amount FROM credits_transactions \
+             WHERE fusillade_request_id = $1 AND transaction_type = 'usage'",
+        )
+        .bind(request_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(analytics_rows.len(), 1, "batchless flex must retain one canonical success");
+        assert_eq!(analytics_rows[0].request_origin, "fusillade");
+        assert_eq!(
+            charges,
+            vec![Decimal::from_str("0.10").unwrap()],
+            "batchless flex must produce exactly one correctly priced debit"
+        );
+    }
+
+    #[sqlx::test]
+    #[test_log::test]
     async fn test_legacy_fusillade_duplicates_remain_reconcilable_during_rollout(pool: sqlx::PgPool) {
         let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
         let batch_key_id = create_api_key_for_user(&pool, user_id, ApiKeyPurpose::Batch).await;
@@ -2947,10 +3005,10 @@ mod integration_tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(rows.len(), 2, "an untrusted header must not deduplicate billing");
+        assert_eq!(rows.len(), 2, "an untrusted request-id header must not deduplicate billing");
         assert!(
             rows.iter().all(|row| row.fusillade_request_id == Some(spoofed_request_id)),
-            "without the future analytics index, the shared correlation id is retained for reconciliation"
+            "the shared realtime correlation id is retained without suppressing either charge"
         );
     }
 
