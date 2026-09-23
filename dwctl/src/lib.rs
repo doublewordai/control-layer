@@ -175,6 +175,7 @@ mod request_logging;
 pub mod sample_files;
 mod static_assets;
 mod sync;
+pub mod task_retention;
 pub mod tasks;
 pub mod telemetry;
 mod types;
@@ -3816,6 +3817,19 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         let daemon_shutdown = shutdown_token.clone();
         background_tasks.spawn("usage-refresh", async move {
             sync::usage_refresh::run_usage_refresh_daemon(daemon_pool, daemon_config, daemon_notify, daemon_shutdown).await;
+            Ok(())
+        });
+    }
+
+    // Start the task-retention daemon: bounded, oldest-first deletion of expired
+    // Underway tasks. Without it the task table only ever grows.
+    if config.background_services.task_retention.enabled {
+        // Retention holds a session advisory lock, which requires a direct connection.
+        let daemon_pool = direct_pools.clone();
+        let daemon_config = config.background_services.task_retention.clone();
+        let daemon_shutdown = shutdown_token.clone();
+        background_tasks.spawn("task-retention", async move {
+            task_retention::run_task_retention_daemon(daemon_pool, daemon_config, daemon_shutdown).await;
             Ok(())
         });
     }

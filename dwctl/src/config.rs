@@ -2673,6 +2673,65 @@ pub struct BackgroundServicesConfig {
     pub sync_workers: SyncWorkersConfig,
     /// Worker counts for core batch task processing (always run, not gated by sync)
     pub task_workers: TaskWorkersConfig,
+    /// Bounded deletion of expired Underway tasks
+    pub task_retention: TaskRetentionConfig,
+}
+
+/// Underway task retention daemon configuration.
+///
+/// Underway tasks carry a `ttl` (14 days by default) but nothing deletes them unless a
+/// deletion routine runs. This daemon deletes expired tasks oldest-first in bounded
+/// batches so the task table stops growing without long transactions or large locks.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TaskRetentionConfig {
+    /// Enable the retention daemon (default: true).
+    pub enabled: bool,
+    /// Seconds between sweeps (default: 300).
+    pub interval_seconds: u64,
+    /// Rows deleted per statement (default: 1000). Each batch is its own transaction.
+    pub batch_size: u32,
+    /// Pause between consecutive batches of one sweep in milliseconds (default: 2000).
+    /// Throttles the sweep while a large backlog drains.
+    pub batch_pause_milliseconds: u64,
+    /// Minimum task age in days before a task is considered for deletion (default: 14,
+    /// the crate's default `ttl`). Bounds the sweep's index range; a task's own `ttl` is
+    /// still honoured when it is longer.
+    pub min_age_days: u64,
+}
+
+impl Default for TaskRetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 300,
+            batch_size: 1000,
+            batch_pause_milliseconds: 2000,
+            min_age_days: 14,
+        }
+    }
+}
+
+impl TaskRetentionConfig {
+    /// Upper bound on `min_age_days` (a century): keeps the floor representable as a
+    /// `Duration`/`interval` and catches a unit mistake in configuration.
+    pub const MAX_MIN_AGE_DAYS: u64 = 36_500;
+
+    /// The age floor as a duration. `min_age_days` is bounded by [`Self::validate`], so
+    /// this cannot overflow.
+    pub fn min_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.min_age_days.min(Self::MAX_MIN_AGE_DAYS) * 86_400)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.batch_size == 0 {
+            return Err("batch_size must be at least 1".to_string());
+        }
+        if self.min_age_days > Self::MAX_MIN_AGE_DAYS {
+            return Err(format!("min_age_days must be at most {}", Self::MAX_MIN_AGE_DAYS));
+        }
+        Ok(())
+    }
 }
 
 /// Database pool metrics sampling configuration.
@@ -3351,6 +3410,11 @@ impl Config {
         if let Err(error) = self.background_services.batch_daemon.retention.validate() {
             return Err(Error::Internal {
                 operation: format!("Config validation: batch retention is invalid: {error}"),
+            });
+        }
+        if let Err(error) = self.background_services.task_retention.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: task retention is invalid: {error}"),
             });
         }
         if self.background_services.batch_daemon.retention.expire_files
