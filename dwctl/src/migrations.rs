@@ -937,8 +937,12 @@ mod tests {
         sqlx::raw_sql(
             "CREATE INDEX idx_task_queue_state ON underway.task(task_queue_name, state);
              CREATE INDEX idx_task_id ON underway.task(id);
+             CREATE INDEX idx_task_claim ON underway.task(task_queue_name, priority DESC, created_at, id)
+                 WHERE state IN ('pending', 'in_progress');
+             CREATE INDEX idx_task_created_at ON underway.task(created_at);
              UPDATE pg_index SET indisvalid = false
-             WHERE indexrelid IN ('underway.idx_task_queue_state'::regclass, 'underway.idx_task_id'::regclass);",
+             WHERE indexrelid IN ('underway.idx_task_queue_state'::regclass, 'underway.idx_task_id'::regclass,
+                                  'underway.idx_task_claim'::regclass, 'underway.idx_task_created_at'::regclass);",
         )
         .execute(&pool)
         .await
@@ -946,13 +950,50 @@ mod tests {
         apply_underway(&pool).await.unwrap();
         let valid: bool = sqlx::query_scalar(
             "SELECT bool_and(indisvalid AND indisready) FROM pg_index
-             WHERE indexrelid IN ('underway.idx_task_queue_state'::regclass, 'underway.idx_task_id'::regclass)",
+             WHERE indexrelid IN ('underway.idx_task_queue_state'::regclass, 'underway.idx_task_id'::regclass,
+                                  'underway.idx_task_claim'::regclass, 'underway.idx_task_created_at'::regclass)",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert!(valid);
         check_underway(&pool).await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn underway_extensions_reject_wrong_claim_index_definitions(pool: PgPool) {
+        // Each variant is a plausible mistake the validation must catch: wrong key
+        // order, missing DESC, a pending-only predicate, and no predicate at all.
+        for wrong in [
+            "CREATE INDEX idx_task_claim ON underway.task(task_queue_name, created_at, priority DESC, id) WHERE state IN ('pending', 'in_progress')",
+            "CREATE INDEX idx_task_claim ON underway.task(task_queue_name, priority, created_at, id) WHERE state IN ('pending', 'in_progress')",
+            "CREATE INDEX idx_task_claim ON underway.task(task_queue_name, priority DESC, created_at, id) WHERE state = 'pending'",
+            "CREATE INDEX idx_task_claim ON underway.task(task_queue_name, priority DESC, created_at, id)",
+        ] {
+            // Fresh dependency schema per variant so each wrong index is judged alone.
+            sqlx::raw_sql("DROP SCHEMA IF EXISTS underway CASCADE; DROP SCHEMA IF EXISTS underway_extensions CASCADE; CREATE SCHEMA underway_extensions;")
+                .execute(&pool)
+                .await
+                .unwrap();
+            underway::run_migrations(&pool).await.unwrap();
+            sqlx::query(wrong).execute(&pool).await.unwrap();
+            let error = apply_underway(&pool).await.unwrap_err();
+            assert!(format!("{error:#}").contains("idx_task_claim"), "{wrong}: {error:#}");
+            assert!(format!("{error:#}").contains("wrong definition"), "{wrong}: {error:#}");
+            assert!(check_underway(&pool).await.is_err(), "{wrong}");
+        }
+    }
+
+    #[sqlx::test]
+    async fn underway_extensions_reject_wrong_retention_index_definition(pool: PgPool) {
+        underway::run_migrations(&pool).await.unwrap();
+        sqlx::query("CREATE INDEX idx_task_created_at ON underway.task(created_at DESC)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = apply_underway(&pool).await.unwrap_err();
+        assert!(format!("{error:#}").contains("idx_task_created_at"), "{error:#}");
+        assert!(format!("{error:#}").contains("wrong definition"), "{error:#}");
     }
 
     #[sqlx::test]
@@ -976,7 +1017,9 @@ mod tests {
             .unwrap();
         let mut conn = pool.acquire().await.unwrap();
         // Explicit PREPARE + both cache modes exercise the parameterized enum
-        // predicates. A pending-only partial index cannot satisfy this query.
+        // predicates. A custom plan proves idx_task_claim's partial predicate
+        // and walks it in claim order; a generic plan cannot (the states are
+        // parameters) and must still be bounded by idx_task_queue_state.
         sqlx::raw_sql(&format!(
             "PREPARE claim(text, underway.task_state, underway.task_state) AS {}",
             include_str!("../tests/fixtures/underway_claim.sql")
@@ -986,13 +1029,16 @@ mod tests {
         .unwrap();
         sqlx::raw_sql("PREPARE complete(uuid, underway.task_state) AS UPDATE underway.task SET state=$2, updated_at=now(), completed_at=now() WHERE id=$1")
             .execute(&mut *conn).await.unwrap();
-        for mode in ["force_custom_plan", "force_generic_plan"] {
+        for (mode, claim_index) in [
+            ("force_custom_plan", "idx_task_claim"),
+            ("force_generic_plan", "idx_task_queue_state"),
+        ] {
             sqlx::raw_sql(&format!("SET plan_cache_mode = {mode}"))
                 .execute(&mut *conn)
                 .await
                 .unwrap();
             for (query, expected_index) in [
-                ("EXECUTE claim('create-batch', 'pending', 'in_progress')", "idx_task_queue_state"),
+                ("EXECUTE claim('create-batch', 'pending', 'in_progress')", claim_index),
                 (
                     "EXECUTE complete('00000000-0000-0000-0000-000000000000', 'succeeded')",
                     "idx_task_id",
