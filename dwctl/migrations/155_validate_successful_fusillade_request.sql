@@ -5,7 +5,7 @@ DO $$
 DECLARE
     index_row RECORD;
     expected_definition CONSTANT TEXT :=
-        'CREATE UNIQUE INDEX uq_http_analytics_fusillade_success ON public.http_analytics USING btree (fusillade_request_id) WHERE ((fusillade_request_id IS NOT NULL) AND ((status_code >= 200) AND (status_code <= 299)) AND (request_origin = ''fusillade''::text))';
+        'CREATE UNIQUE INDEX uq_http_analytics_fusillade_success ON public.http_analytics USING btree (fusillade_request_id) WHERE ((fusillade_request_id IS NOT NULL) AND ((status_code >= 200) AND (status_code <= 299)) AND ((request_origin = ''fusillade''::text) OR (batch_sla <> ''''::text)))';
 BEGIN
     SELECT
         index_catalog.indisvalid,
@@ -32,4 +32,4 @@ END
 $$;
 
 COMMENT ON INDEX uq_http_analytics_fusillade_success IS
-    'Allows one successful analytics row per trusted queued Fusillade request; realtime correlation IDs are excluded';
+    'Allows one successful analytics row per queued Fusillade request; realtime correlation IDs are excluded';

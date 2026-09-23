@@ -2855,10 +2855,8 @@ mod integration_tests {
 
         let mut first = create_raw_record("spoofed-fusillade-id", Some(first_key), 1000, 500);
         first.fusillade_request_id = Some(spoofed_request_id);
-        first.batch_completion_window = Some("1h".to_string());
         let mut second = create_raw_record("spoofed-fusillade-id", Some(second_key), 1000, 500);
         second.fusillade_request_id = Some(spoofed_request_id);
-        second.batch_completion_window = Some("1h".to_string());
 
         run_batcher_with_records(&pool, vec![first, second]).await;
 
@@ -2870,7 +2868,7 @@ mod integration_tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(rows.len(), 2, "untrusted request-id and SLA headers must not deduplicate billing");
+        assert_eq!(rows.len(), 2, "an untrusted request-id header must not deduplicate billing");
         assert!(
             rows.iter().all(|row| row.fusillade_request_id == Some(spoofed_request_id)),
             "the shared realtime correlation id is retained without suppressing either charge"

@@ -9,18 +9,18 @@
 -- unique index is therefore the database fence that makes a second successful
 -- physical attempt return no row. Non-2xx attempts remain unconstrained.
 --
--- `x-fusillade-request-id` and the SLA headers can both originate on the wire,
--- so neither is trusted queue provenance. `request_origin` is derived after the
--- API key purpose is resolved (or from a batch id), and covers batch, async and
--- batchless flex traffic while leaving realtime traffic unconstrained.
+-- `x-fusillade-request-id` is also stamped onto ordinary realtime requests for
+-- correlation, so the UUID alone is not proof that the request was queued. The
+-- request-origin/SLA predicate covers batch, async and batchless flex traffic
+-- while deliberately leaving realtime traffic unconstrained. External clients
+-- cannot spoof the SLA branch: sso-stack strips all `x-fusillade-*` headers at
+-- ingress before dwctl stamps trusted internal queue metadata.
 --
 -- Historical duplicate successes were reconciled before this migration was
--- introduced. Rows old enough to predate `request_origin` belong to completed
--- requests and are deliberately outside this future-attempt fence. Build
--- concurrently so continuous analytics inserts are not blocked while PostgreSQL
--- validates the historical table.
+-- introduced. Build concurrently so continuous analytics inserts are not
+-- blocked while PostgreSQL validates the historical table.
 CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS uq_http_analytics_fusillade_success
     ON http_analytics (fusillade_request_id)
     WHERE fusillade_request_id IS NOT NULL
       AND status_code BETWEEN 200 AND 299
-      AND request_origin = 'fusillade';
+      AND (request_origin = 'fusillade' OR batch_sla <> '');
