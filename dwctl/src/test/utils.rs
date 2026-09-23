@@ -377,6 +377,7 @@ pub fn create_test_config() -> crate::config::Config {
         openapi: Default::default(),
         cache: Default::default(),
         continuation: Default::default(),
+        request_validation: Default::default(),
         keystore: None,
     }
 }

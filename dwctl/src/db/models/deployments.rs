@@ -240,6 +240,9 @@ pub enum ModelDisplayCategory {
 pub const MODEL_CATALOG_METADATA_MAX_BYTES: usize = 16_384;
 /// Maximum number of keys allowed in the `extra` object.
 pub const MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS: usize = 50;
+/// Upper bound accepted for the `context_window` / `max_output_tokens`
+/// metadata token counts. Above this an engine cannot serve the request.
+pub const MODEL_TOKEN_LIMIT_MAX: i64 = 100_000_000;
 
 /// Catalog-style metadata for display purposes (stored as JSONB).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema, PartialEq)]
@@ -259,6 +262,12 @@ pub struct ModelCatalogMetadata {
     /// Context window size in tokens
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<i64>,
+
+    /// Maximum completion tokens the model may be asked for. Only used to
+    /// reject provably-doomed requests at ingress; a missing value disables
+    /// the rule.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<i64>,
 
     /// When the model was released by its provider
     #[serde(skip_serializing_if = "Option::is_none")]

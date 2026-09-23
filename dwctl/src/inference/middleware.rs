@@ -38,6 +38,7 @@ use sqlx_pool_router::PoolProvider;
 use super::image_normalizer_middleware::{normalize_error_response, normalize_value_to_tokens};
 use super::store::{self as response_store, ONWARDS_RESPONSE_ID_HEADER, OnwardsDaemonId};
 use super::streaming::{ReplayFrame, flex_stream_response};
+use super::validation::{Surface, envelope::malformed_body_response};
 use crate::db::{errors::DbError, handlers::api_keys::ApiKeys, models::api_keys::ApiKeyPurpose};
 use crate::image_normalizer::ImageNormalizer;
 
@@ -80,6 +81,11 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
     /// empty (every key reads as non-ZDR) when the sync is not wired.
     pub zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
+    /// Ingress request validation (`request_validation`). Runs once per
+    /// intercepted request, before the realtime/queued split, so a doomed
+    /// request is rejected before it is forwarded or enqueued. `None` when
+    /// disabled.
+    pub validation: Option<super::validation::ValidationStage>,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -118,19 +124,21 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         Ok(bytes) => bytes,
         Err(e) => {
             tracing::error!(error = %e, "Failed to read request body in inference middleware");
-            return Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
-        }
-    };
-
-    let mut request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::error!(error = %e, "Failed to parse request body in inference middleware");
-            return Response::builder().status(StatusCode::BAD_REQUEST).body(Body::empty()).unwrap();
+            return invalid_request_response("Failed to read the request body", "body_read_failed", "body");
         }
     };
 
     let nested_path = parts.uri.path();
+    let surface = Surface::from_path(nested_path);
+    let mut request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => {
+            // A client error, not ours: warn rather than error.
+            tracing::warn!(error = %e, "Failed to parse request body in inference middleware");
+            return malformed_body_response(surface, &e.to_string());
+        }
+    };
+
     let is_responses_api = nested_path.ends_with("/responses");
     let is_chat_completions_api = nested_path.ends_with("/chat/completions");
     let requested_tier = resolve_service_tier(request_value["service_tier"].as_str());
@@ -180,6 +188,14 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     } else {
         body_bytes
     };
+
+    // Validate on the bare alias (serving-class suffix already stripped) and
+    // before anything is persisted, forwarded or enqueued.
+    if let (Some(validation), Some(surface)) = (&state.validation, surface)
+        && let Some(rejection) = validation.check(surface, &request_value).await
+    {
+        return rejection;
+    }
 
     let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
     let model = model.as_str();

@@ -1,0 +1,38 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT dm.alias, dm.type AS model_type, dm.capabilities, dm.metadata\n        FROM deployed_models dm\n        WHERE dm.deleted = FALSE\n          AND (dm.is_composite = TRUE OR dm.hosted_on IS NOT NULL)\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "model_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "capabilities",
+        "type_info": "TextArray"
+      },
+      {
+        "ordinal": 3,
+        "name": "metadata",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "45070a43e7311f3f5b692b4c5d792425e72cc38ef0b2e1940ff750d492f7fdc2"
+}

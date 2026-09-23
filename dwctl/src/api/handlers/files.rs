@@ -28,6 +28,7 @@ use crate::db::{
 };
 use crate::errors::{Error, Result};
 use crate::image_normalizer::{ImageInput, ImageNormalizer, Mode as ImageNormalizerMode, walker as image_walker};
+use crate::inference::validation::{Source, Surface, ValidationStage};
 use crate::reasoning::ModelReasoningPolicy;
 use crate::types::Resource;
 use axum::{
@@ -142,11 +143,10 @@ fn validate_custom_id(custom_id: &str) -> Result<()> {
 /// For example, `/v1/embeddings` requires an `Embeddings` model, while
 /// `/v1/chat/completions` requires a `Chat` model.
 fn validate_endpoint_model_type(url: &str, model: &str, model_type: &ModelType) -> Result<()> {
-    let expected = match url {
-        "/v1/chat/completions" | "/v1/completions" | "/v1/responses" | "/v1/messages" => ModelType::Chat,
-        "/v1/embeddings" => ModelType::Embeddings,
-        // Unknown endpoints skip type validation
-        _ => return Ok(()),
+    // Same endpoint -> model type mapping as inference request validation.
+    // Unknown endpoints skip type validation.
+    let Some(expected) = Surface::from_path(url).and_then(Surface::expected_model_type) else {
+        return Ok(());
     };
 
     if *model_type != expected {
@@ -689,11 +689,36 @@ struct FileRequestContext {
     api_key: String,
     accessible_models: HashMap<String, AccessibleBatchModel>,
     allowed_url_paths: Vec<String>,
+    /// Inference request validation, applied to every line. `None` when disabled.
+    validation: Option<ValidationStage>,
 }
 
 struct AccessibleBatchModel {
     model_type: Option<ModelType>,
     reasoning_policy: ModelReasoningPolicy,
+}
+
+/// Run inference request validation on one parsed batch line, so a batch
+/// cannot enqueue a request the inference endpoints would reject.
+async fn validate_batch_line(
+    validation: Option<&ValidationStage>,
+    template: &fusillade::RequestTemplateInput,
+    line: u64,
+) -> std::result::Result<(), FileUploadError> {
+    let (Some(validation), Some(surface)) = (validation, Surface::from_path(&template.path)) else {
+        return Ok(());
+    };
+    // The template body was serialized from a parsed JSON value just above.
+    let Ok(body) = serde_json::from_str::<serde_json::Value>(&template.body) else {
+        return Ok(());
+    };
+    match validation.enforced_violation(surface, &body, Source::BatchFile).await {
+        Some(violation) => Err(FileUploadError::ValidationError {
+            line,
+            message: violation.message,
+        }),
+        None => Ok(()),
+    }
 }
 
 fn map_request_validation_error(error: &Error, line: u64) -> FileUploadError {
@@ -728,6 +753,7 @@ fn create_file_stream(
         api_key,
         accessible_models,
         allowed_url_paths,
+        validation,
     } = req_ctx;
     let normalizer = config.normalizer.clone();
     let normalizer_mode = config.normalizer_mode;
@@ -930,6 +956,12 @@ fn create_file_stream(
                                             match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths)
                                             {
                                                 Ok(mut template) => {
+                                                    if let Err(e) =
+                                                        validate_batch_line(validation.as_ref(), &template, line_count + 1).await
+                                                    {
+                                                        abort!(e);
+                                                    }
+
                                                     // Normalise image URLs in the per-template body
                                                     // before the size cap check, since substitution
                                                     // replaces (potentially large) HTTP URLs with
@@ -1021,6 +1053,10 @@ fn create_file_stream(
                                 Ok(openai_req) => {
                                     match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
                                         Ok(mut template) => {
+                                            if let Err(e) = validate_batch_line(validation.as_ref(), &template, line_count + 1).await {
+                                                abort!(e);
+                                            }
+
                                             // Normalise image URLs in the trailing line as well.
                                             if let Err(e) = normalize_template_body_in_place(
                                                 normalizer.as_ref(),
@@ -1262,6 +1298,7 @@ pub async fn upload_file<P: PoolProvider>(
             api_key: user_api_key,
             accessible_models,
             allowed_url_paths: config.batches.allowed_url_paths.clone(),
+            validation: state.request_validation.clone(),
         },
         Some(api_key_id),
     );

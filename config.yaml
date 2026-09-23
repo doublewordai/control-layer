@@ -934,6 +934,34 @@ background_services:
 #
 # Defaults are conservative — the feature is off until an operator
 # enables it and configures a backend bucket.
+
+# Ingress request validation: reject inference requests that are provably doomed
+# (unknown model, wrong endpoint for the model type, unsupported input modality,
+# invalid service_tier / max tokens, prompt over the context window) before they
+# are forwarded or enqueued, with the surface's own error envelope. The same
+# rules run on every line of an uploaded batch input file. Every rule fails open
+# when model metadata is missing.
+request_validation:
+  # Set via environment: DWCTL_REQUEST_VALIDATION__ENABLED=true
+  enabled: false
+  # off | shadow | enforce. Shadow records
+  # dwctl_request_validation_violations_total{rule,surface,model,mode} and
+  # forwards the request; enforce rejects it.
+  default_mode: shadow
+  # Per-rule overrides, e.g. DWCTL_REQUEST_VALIDATION__RULES__MODEL_NOT_FOUND=enforce
+  # Rules: model_not_found, model_type_mismatch, invalid_service_tier,
+  # invalid_max_tokens, max_tokens_exceeds_limit, unsupported_modality,
+  # context_length_exceeded.
+  rules: {}
+  # Exact prompt token counts via tokenizer-svc (cache.tokenizer_url), only for
+  # prompts larger in bytes than the context window. When enabled, context
+  # rejections are always backed by an exact count; on timeout the request passes.
+  exact_count_enabled: false
+  exact_count_deadline_ms: 2000
+  # Without exact counting: reject on size alone when bytes / this ratio
+  # already exceeds the window (heuristic).
+  reject_min_bytes_per_token: 12.0
+
 image_normalizer:
   enabled: false # Default: false; set to true after configuring a backend
   backend:

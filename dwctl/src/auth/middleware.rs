@@ -568,6 +568,7 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            request_validation: None,
         };
 
         let request = axum::http::Request::builder()
@@ -683,6 +684,7 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            request_validation: None,
         };
 
         let header_external_user_id = header_user.external_user_id.as_ref().unwrap_or(&header_user.username);
@@ -800,6 +802,7 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            request_validation: None,
         };
 
         // Request with JWT cookie - should be ignored since native auth is disabled
@@ -986,6 +989,7 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            request_validation: None,
         };
 
         let external_user_id = user.external_user_id.as_ref().unwrap_or(&user.username);
@@ -1103,6 +1107,7 @@ mod tests {
             response_store: state.response_store,
             image_normalizer: state.image_normalizer.clone(),
             keystore: state.keystore.clone(),
+            request_validation: None,
         };
 
         let request = axum::http::Request::builder()

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::db::handlers::ModelProvisioning;
+use crate::db::models::deployments::MODEL_TOKEN_LIMIT_MAX;
 
 const PER_MILLION: i64 = 1_000_000;
 
@@ -167,6 +168,16 @@ pub struct ModelSettings {
     pub sanitize_responses: bool,
     pub trusted: bool,
     pub allowed_batch_completion_windows: Option<Vec<String>>,
+    /// Free-form catalog metadata. `context_window` and `max_output_tokens`
+    /// are validated when present; unknown keys pass through untouched.
+    #[schemars(extend(
+        "type" = "object",
+        "properties" = {
+            "context_window": {"type": "integer", "minimum": 1, "maximum": MODEL_TOKEN_LIMIT_MAX},
+            "max_output_tokens": {"type": "integer", "minimum": 1, "maximum": MODEL_TOKEN_LIMIT_MAX}
+        },
+        "additionalProperties" = true
+    ))]
     pub metadata: serde_json::Value,
     pub reasoning_translation_overrides: Option<serde_json::Value>,
 }
@@ -638,7 +649,36 @@ fn validate_settings(settings: &ModelSettings, source: &str, field: &str) -> Res
         ensure!(value > 0.0, "{source}: {field}.throughput must be positive");
     }
     ensure!(settings.metadata.is_object(), "{source}: {field}.metadata must be an object");
+    let context_window = match settings.metadata.get("context_window") {
+        Some(value) => Some(parse_metadata_token_limit(value, source, field, "context_window")?),
+        None => None,
+    };
+    let max_output_tokens = match settings.metadata.get("max_output_tokens") {
+        Some(value) => Some(parse_metadata_token_limit(value, source, field, "max_output_tokens")?),
+        None => None,
+    };
+    if let (Some(max_output_tokens), Some(context_window)) = (max_output_tokens, context_window)
+        && max_output_tokens > context_window
+    {
+        bail!(
+            "{source}: {field}.metadata.max_output_tokens ({max_output_tokens}) must not exceed metadata.context_window ({context_window})"
+        );
+    }
     Ok(())
+}
+
+/// Validate an optional token-count field inside a model-provisioning metadata
+/// object. Absent is fine; a present value must be a positive integer at or
+/// below [`MODEL_TOKEN_LIMIT_MAX`].
+fn parse_metadata_token_limit(value: &serde_json::Value, source: &str, field: &str, key: &str) -> Result<i64> {
+    let value = value
+        .as_i64()
+        .with_context(|| format!("{source}: {field}.metadata.{key} must be a positive integer"))?;
+    ensure!(
+        value > 0 && value <= MODEL_TOKEN_LIMIT_MAX,
+        "{source}: {field}.metadata.{key} must be between 1 and {MODEL_TOKEN_LIMIT_MAX} (got {value})"
+    );
+    Ok(value)
 }
 
 fn validate_fallback(fallback: &Fallback, source: &str) -> Result<()> {
