@@ -2774,18 +2774,22 @@ mod integration_tests {
         .fetch_all(&pool)
         .await
         .unwrap();
-        let charge_count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM credits_transactions \
+        let charges: Vec<Decimal> = sqlx::query_scalar(
+            "SELECT amount FROM credits_transactions \
              WHERE fusillade_request_id = $1 AND transaction_type = 'usage'",
         )
         .bind(request_id)
-        .fetch_one(&pool)
+        .fetch_all(&pool)
         .await
         .unwrap();
 
         assert_eq!(analytics_rows.len(), 1, "batchless flex must retain one canonical success");
         assert_eq!(analytics_rows[0].request_origin, "fusillade");
-        assert_eq!(charge_count, 1, "batchless flex must produce one debit");
+        assert_eq!(
+            charges,
+            vec![Decimal::from_str("0.10").unwrap()],
+            "batchless flex must produce exactly one correctly priced debit"
+        );
     }
 
     #[sqlx::test]
