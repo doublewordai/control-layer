@@ -388,15 +388,18 @@ mod tests {
         }
     }
 
-    /// Barrier: wait until the background `run` task has actually issued its
-    /// `LISTEN`, so a subsequent write cannot race the subscription and be
-    /// missed. Scoped to this test database so parallel tests cannot satisfy it.
+    /// Barrier: wait until the background `run` task's `LISTEN` has completed,
+    /// so a subsequent write cannot race the subscription and be missed.
+    /// `pg_stat_activity` shows a statement from the moment it starts, and a
+    /// NOTIFY committed before the LISTEN commits is never delivered, so the
+    /// connection must also be back to `idle`. Scoped to this test database so
+    /// parallel tests cannot satisfy it.
     async fn wait_for_listen_connection(pool: &PgPool) {
         let deadline = std::time::Instant::now() + POLL_TIMEOUT;
         loop {
             let listener: Option<i32> = sqlx::query_scalar(
                 "SELECT pid FROM pg_stat_activity \
-                 WHERE query LIKE '%LISTEN%auth_config_changed%' \
+                 WHERE query LIKE '%LISTEN%auth_config_changed%' AND state = 'idle' \
                  AND datname = current_database() AND pid != pg_backend_pid() LIMIT 1",
             )
             .fetch_optional(pool)
