@@ -2019,18 +2019,35 @@ mod integration_tests {
         output_price: Decimal,
         api_key_purpose: ApiKeyPurpose,
     ) {
+        let completion_window = if api_key_purpose == ApiKeyPurpose::Batch {
+            Some("24h")
+        } else {
+            None
+        };
+        setup_tariff_with_window(
+            pool,
+            deployed_model_id,
+            input_price,
+            output_price,
+            api_key_purpose,
+            completion_window,
+        )
+        .await;
+    }
+
+    async fn setup_tariff_with_window(
+        pool: &sqlx::PgPool,
+        deployed_model_id: crate::types::DeploymentId,
+        input_price: Decimal,
+        output_price: Decimal,
+        api_key_purpose: ApiKeyPurpose,
+        completion_window: Option<&str>,
+    ) {
         use crate::db::handlers::Tariffs;
         use crate::db::models::tariffs::TariffCreateDBRequest;
 
         let mut conn = pool.acquire().await.unwrap();
         let mut tariffs_repo = Tariffs::new(&mut conn);
-
-        // Batch tariffs require a completion_window
-        let completion_window = if api_key_purpose == ApiKeyPurpose::Batch {
-            Some("24h".to_string())
-        } else {
-            None
-        };
 
         tariffs_repo
             .create(&TariffCreateDBRequest {
@@ -2041,7 +2058,7 @@ mod integration_tests {
                 output_price_per_token: output_price,
                 // Capture timestamps use the host clock; PostgreSQL may run in a VM.
                 valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
-                completion_window,
+                completion_window: completion_window.map(str::to_string),
             })
             .await
             .unwrap();
@@ -2726,12 +2743,13 @@ mod integration_tests {
     #[test_log::test]
     async fn test_batchless_flex_success_index_gates_billing(pool: sqlx::PgPool) {
         let model_id = create_test_model(&pool, "flex-billing-idempotency").await;
-        setup_tariff(
+        setup_tariff_with_window(
             &pool,
             model_id,
             Decimal::from_str("0.00005").unwrap(),
             Decimal::from_str("0.00010").unwrap(),
             ApiKeyPurpose::Batch,
+            Some("1h"),
         )
         .await;
         let user_id = setup_user_with_balance(&pool, Decimal::from_str("100.00").unwrap()).await;
