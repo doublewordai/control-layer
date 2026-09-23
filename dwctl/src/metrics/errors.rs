@@ -32,6 +32,7 @@ pub mod component {
     pub const BATCH_POPULATE: &str = "batch_populate";
     pub const PAYMENTS: &str = "payments";
     pub const USAGE_REFRESH: &str = "usage_refresh";
+    pub const TASK_RETENTION: &str = "task_retention";
     pub const CONTINUATION: &str = "continuation";
 }
 
