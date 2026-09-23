@@ -201,7 +201,8 @@ export function useAuthorization() {
 
     return {
       isLoading,
-      userRoles,
+      // Consumers also use userRoles for feature gates inside protected pages.
+      userRoles: permissionRoles,
       hasPermission: (permission: PagePermission) =>
         hasPermission(permissionRoles, permission),
       canAccessRoute: (path: string) => canAccessRoute(permissionRoles, path, config),

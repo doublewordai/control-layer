@@ -244,13 +244,7 @@ mod tests {
         resp.assert_status_ok();
         let mut seen = tariffs(resp.json());
         seen.sort();
-        assert_eq!(
-            seen,
-            vec![
-                ("deal".to_string(), Some(deal_holder.id.to_string())),
-                ("general-24h".to_string(), None)
-            ]
-        );
+        assert_eq!(seen, vec![("deal".to_string(), None), ("general-24h".to_string(), None)]);
 
         // Anyone else pays the general prices and never sees the deal.
         let resp = get(&server, &path, &other).await;
@@ -273,24 +267,15 @@ mod tests {
             ]
         );
 
-        // Class prices are isolated to the owner, zero is a real price, and
-        // scheduled future prices are absent from today's quotes.
+        // Class prices remain operator-only, even for the deal holder.
+        // Scheduled future prices are also absent from today's quotes.
         sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,$2,'interactive','free-interactive','realtime',0,0,NOW()), ($1,$2,'throughput','future','realtime',9,9,NOW()+interval '1 day')")
             .bind(model_id).bind(deal_holder.id).execute(&pool).await.unwrap();
         let body: Value = get(&server, &path, &deal_holder).await.json();
         let rows = body["tariffs"].as_array().unwrap();
-        let interactive: Vec<_> = rows.iter().filter(|t| t["serving_class"] == "interactive").collect();
-        assert_eq!(interactive.len(), 1, "async prices must not select interactive");
-        assert_eq!(interactive[0]["name"], "free-interactive");
-        assert_eq!(
-            interactive[0]["input_price_per_token"]
-                .as_str()
-                .unwrap()
-                .parse::<rust_decimal::Decimal>()
-                .unwrap(),
-            rust_decimal::Decimal::ZERO
-        );
-        assert!(rows.iter().all(|t| t["name"] != "future"));
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|t| t.get("serving_class").is_none()));
+        assert!(rows.iter().all(|t| t["name"] != "free-interactive" && t["name"] != "future"));
         let body: Value = get(&server, &path, &other).await.json();
         assert!(body["tariffs"].as_array().unwrap().iter().all(|t| t["organization_id"].is_null()));
         // Organisation cache prices do not turn caching on. Once generally
@@ -299,7 +284,7 @@ mod tests {
             .bind(model_id).bind(deal_holder.id).execute(&pool).await.unwrap();
         let body: Value = get(&server, &path, &deal_holder).await.json();
         assert_ne!(body["cache_pricing"]["enabled"], true);
-        assert!(body["cache_pricing_by_class"].as_object().unwrap().is_empty());
+        assert!(body.get("cache_pricing_by_class").is_none());
         sqlx::query("INSERT INTO model_cache_tariffs(deployed_model_id,read_multiplier,min_prefix_tokens,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h) VALUES ($1,0.8,2048,1,1,1)")
             .bind(model_id)
             .execute(&pool)
@@ -307,15 +292,8 @@ mod tests {
             .unwrap();
         let body: Value = get(&server, &path, &deal_holder).await.json();
         assert_eq!(body["cache_pricing"]["min_prefix_tokens"], 2048);
-        assert_eq!(body["cache_pricing_by_class"]["interactive"]["min_prefix_tokens"], 2048);
-        assert_eq!(
-            body["cache_pricing_by_class"]["interactive"]["read_multiplier"]
-                .as_str()
-                .unwrap()
-                .parse::<rust_decimal::Decimal>()
-                .unwrap(),
-            rust_decimal::Decimal::ZERO
-        );
+        assert!(body.get("cache_pricing_by_class").is_none());
+        assert_eq!(body["cache_pricing"]["read_multiplier"], "0.5000");
     }
 
     #[sqlx::test]
@@ -410,7 +388,7 @@ mod tests {
         let path = format!("/admin/api/v1/models/{model}?include=pricing");
         get(&server, &path, &customer).await.assert_status_ok();
         // A database-side failure in only the token-pricing query must surface.
-        sqlx::query("CREATE OR REPLACE FUNCTION effective_model_tariff(model_id UUID, account_id UUID, purpose TEXT, completion_window TEXT, resolved_class TEXT, at_time TIMESTAMPTZ) RETURNS SETOF model_tariffs LANGUAGE plpgsql STABLE AS $$ BEGIN RAISE EXCEPTION 'simulated tariff lookup failure'; END $$").execute(&pool).await.unwrap();
+        sqlx::query("CREATE OR REPLACE FUNCTION effective_model_display_tariff(model_id UUID, account_id UUID, purpose TEXT, completion_window TEXT, at_time TIMESTAMPTZ) RETURNS SETOF model_tariffs LANGUAGE plpgsql STABLE AS $$ BEGIN RAISE EXCEPTION 'simulated tariff lookup failure'; END $$").execute(&pool).await.unwrap();
         get(&server, &path, &customer).await.assert_status_internal_server_error();
         get(&server, &format!("/admin/api/v1/models/{model}"), &customer)
             .await

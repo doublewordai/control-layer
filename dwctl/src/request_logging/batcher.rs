@@ -3002,9 +3002,19 @@ mod integration_tests {
                 quotes.iter().all(|q| q.user_id == Some(account)),
                 "general playground must not bypass an account deal"
             );
-            assert!(quotes.iter().any(|q| q.api_key_purpose == Some(ApiKeyPurpose::Realtime)
-                && q.input_price_per_token == input
-                && q.serving_class.as_deref() == class));
+            assert!(quotes.iter().all(|q| q.serving_class.is_none()));
+            if class.is_none() {
+                assert!(
+                    quotes
+                        .iter()
+                        .any(|q| q.api_key_purpose == Some(ApiKeyPurpose::Realtime) && q.input_price_per_token == input)
+                );
+            } else {
+                assert!(
+                    quotes.iter().all(|q| q.input_price_per_token != input),
+                    "class billing is intentionally absent from catalogue quotes"
+                );
+            }
             let paid: bool = sqlx::query_scalar("SELECT model_has_effective_paid_tariff($1,$2,'playground')")
                 .bind(model)
                 .bind(account)
@@ -3352,6 +3362,62 @@ mod integration_tests {
                 break;
             }
         }
+    }
+
+    #[sqlx::test]
+    async fn organization_class_charges_fold_into_the_owning_keys_cap(pool: sqlx::PgPool) {
+        use crate::db::handlers::api_keys::ApiKeys;
+        let model = create_test_model(&pool, "org-class-cap").await;
+        setup_tariff(&pool, model, Decimal::new(10, 6), Decimal::new(20, 6), ApiKeyPurpose::Realtime).await;
+        setup_tariff(&pool, model, Decimal::new(1, 6), Decimal::new(2, 6), ApiKeyPurpose::Batch).await;
+        let account = setup_user_with_balance(&pool, Decimal::from(100)).await;
+        sqlx::query("UPDATE users SET user_type='organization' WHERE id=$1")
+            .bind(account)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let creator = setup_user_with_balance(&pool, Decimal::from(100)).await;
+        let parent = create_api_key_for_user(&pool, account, ApiKeyPurpose::Realtime).await;
+        sqlx::query("UPDATE api_keys SET created_by=$2,spend_limit=0.02 WHERE id=$1")
+            .bind(parent)
+            .bind(creator)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (class, price) in [(None, Decimal::new(2, 6)), (Some("interactive"), Decimal::new(9, 6))] {
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,$2,$3,'org-price',$4,$4,'realtime')").bind(model).bind(account).bind(class).bind(price).execute(&pool).await.unwrap();
+        }
+        let child = {
+            let mut conn = pool.acquire().await.unwrap();
+            ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent).await.unwrap().1
+        };
+        let mut realtime = create_raw_record("org-class-cap", Some(parent), 1000, 500);
+        realtime.resolved_serving_class = Some("interactive".into());
+        let mut batch = create_raw_record("org-class-cap", Some(child), 1000, 500);
+        batch.batch_completion_window = Some("24h".into());
+        batch.resolved_serving_class = Some("standard".into());
+        run_batcher_with_records(&pool, vec![realtime, batch]).await;
+        // Class realtime: .0135; model batch: .002. Display's all-class .003
+        // realtime amount must never be substituted in billing or cap accounting.
+        let expected = Decimal::new(155, 4);
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            Credits::new(&mut conn).get_user_balance(account).await.unwrap(),
+            Decimal::from(100) - expected
+        );
+        assert_eq!(Credits::new(&mut conn).get_user_balance(creator).await.unwrap(), Decimal::from(100));
+        let rows: Vec<(Uuid, Decimal, Decimal)> =
+            sqlx::query_as("SELECT api_key_id,total_spend,window_spend FROM api_key_spend_checkpoints")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(parent, expected, expected)]);
+        let billed_accounts: Vec<Uuid> =
+            sqlx::query_scalar("SELECT DISTINCT user_id FROM credits_transactions WHERE transaction_type='usage'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(billed_accounts, vec![account]);
     }
 
     /// Mixed flush across a cap scope: the parent's realtime row and the

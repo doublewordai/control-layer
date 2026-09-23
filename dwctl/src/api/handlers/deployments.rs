@@ -1797,6 +1797,80 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn customer_model_prices_hide_class_details_but_managers_keep_them(pool: PgPool) {
+        let (app, _services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let customer = create_test_user(&pool, Role::StandardUser).await;
+        let model = create_test_deployment(&pool, admin.id, "customer-price", "customer-price").await;
+        sqlx::query(
+            "INSERT INTO deployment_groups (deployment_id,group_id,granted_by) VALUES ($1,'00000000-0000-0000-0000-000000000000',$2)",
+        )
+        .bind(model.id)
+        .bind(admin.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        for (account, class, rate) in [
+            (None, None, 3),
+            (Some(customer.id), None, 2),
+            (Some(customer.id), Some("standard"), 9),
+            (Some(customer.id), Some("interactive"), 0),
+        ] {
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,$2,$3,'price',$4,$4,'realtime')").bind(model.id).bind(account).bind(class).bind(rust_decimal::Decimal::from(rate)).execute(&pool).await.unwrap();
+        }
+        for (account, class, rate) in [
+            (None, None, "0.1"),
+            (Some(customer.id), None, "0.2"),
+            (Some(customer.id), Some("interactive"), "0.8"),
+        ] {
+            sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,user_id,serving_class,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,read_multiplier,min_prefix_tokens) VALUES ($1,$2,$3,1,1,1,$4,1)").bind(model.id).bind(account).bind(class).bind(rate.parse::<rust_decimal::Decimal>().unwrap()).execute(&pool).await.unwrap();
+        }
+        for user in [&customer, &admin] {
+            for path in [
+                "/admin/api/v1/models?include=pricing".to_string(),
+                format!("/admin/api/v1/models/{}?include=pricing", model.id),
+            ] {
+                let headers = add_auth_headers(user);
+                let response = app
+                    .get(&path)
+                    .add_header(&headers[0].0, &headers[0].1)
+                    .add_header(&headers[1].0, &headers[1].1)
+                    .await;
+                response.assert_status_ok();
+                let body: serde_json::Value = response.json();
+                let response_model = if let Some(data) = body["data"].as_array() {
+                    data.iter().find(|m| m["id"] == model.id.to_string()).unwrap()
+                } else {
+                    &body
+                };
+                let tariffs = response_model["tariffs"].as_array().unwrap();
+                if user.id == customer.id {
+                    assert_eq!(tariffs.len(), 1);
+                    assert_eq!(
+                        tariffs[0]["input_price_per_token"]
+                            .as_str()
+                            .unwrap()
+                            .parse::<rust_decimal::Decimal>()
+                            .unwrap(),
+                        rust_decimal::Decimal::from(2)
+                    );
+                    assert!(tariffs[0].get("organization_id").is_none());
+                    assert!(tariffs[0].get("serving_class").is_none());
+                    assert!(response_model.get("cache_pricing_by_class").is_none());
+                    assert_eq!(response_model["cache_pricing"]["read_multiplier"], "0.2000");
+                } else {
+                    assert_eq!(tariffs.len(), 4);
+                    assert!(
+                        tariffs
+                            .iter()
+                            .any(|t| t["serving_class"] == "interactive" && t["organization_id"] == customer.id.to_string())
+                    );
+                }
+            }
+        }
+    }
+
+    #[sqlx::test]
     #[test_log::test]
     async fn test_deployments_with_nonexistent_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;

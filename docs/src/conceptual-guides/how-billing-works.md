@@ -84,26 +84,50 @@ batch tiers can underbill: configure every supported completion window.
 Validity is `valid_from <= time < valid_until` (an absent end is unbounded).
 Batch pricing uses batch creation time; other pricing uses the captured request
 time. Within the same scope/purpose/window, the latest valid start wins, then
-ascending tariff ID breaks exact ties. SQL quotes and Rust billing use the same
-rules. Quotes retain the matched tariff's actual purpose and class.
+ascending tariff ID breaks exact ties. The SQL effective billing resolver and
+Rust billing use the same rules. Actual usage billing selects tariffs in Rust
+after bulk-loading relevant histories; parity tests protect this contract.
+Deploy matching API and worker images before activating customer deals.
 
-The same SQL resolver also feeds effective-price sorting and the paid-model
-admission check used when configuring API keys. Migration 155 therefore changes
-those results on existing deals as well as quotes: an account's zero realtime
-deal beats a paid general playground tariff. The quote reflects the zero deal;
-if no other applicable class is paid, playground no longer requires a paid-model
-balance check. Model access permissions still apply. Admission remains a
-conservative model-level check, so another paid class can still require credit.
-Actual usage billing selects tariffs in Rust after bulk-loading the relevant
-histories; SQL/Rust parity tests protect the shared contract. Deploy the matching
-API and worker image throughout the fleet before activating customer deals.
+#### Customer catalogue and usage comparison
 
-Batch tariff authoring normalizes surrounding completion-window whitespace.
-Unchanged legacy NULL-purpose rows may be preserved during model metadata edits,
-but cannot be created or repriced through the customer tariff API and are not
-billable fallback rows. Organisation catalog prices must not overlap manually
-managed prices in the same scope and purpose/window, including future schedules.
-Such conflicts fail reconciliation without taking ownership of the manual deal.
+Customer model list/detail prices deliberately present **one all-class set**:
+account all-class deal → general model, separately for each existing
+purpose/completion-window tier. Class-specific prices (including `standard`)
+are omitted until there is a public UX for them. Playground can use realtime
+within each scope; batch stays exact-purpose/exact-window. Price sorting uses
+the same display resolver and the existing minimum input-plus-output metric.
+Zero is a valid display price; missing prices sort last. The response exposes
+effective amounts without organisation/class metadata. Platform managers retain
+all scoped token tariffs; organisation-serving controls expose class deals.
+Customer cache multipliers similarly use the all-class override, with no class
+price map. Existing private aliases retain their own prices.
+
+The `/usage` realtime-equivalent estimate is a counterfactual comparison, not a
+bill. It uses the billed account's current all-class realtime deal, then its
+standard-class realtime deal, then the general realtime rate. Other classes are
+ignored. Actual usage totals and cap accounting remain actual resolved-class
+charges. The comparison can be cached for 60 minutes.
+
+Migration 155 changed effective billing, paid admission and the then-current
+catalogue selection on existing deals: an account's zero realtime deal beats a
+paid general playground tariff. Migration 156 separates customer display prices
+from class-aware billing and admission. Admission remains a conservative
+model-level check: another paid class may require credit/cap headroom even for a
+free-class request, including a class the account is not granted. Free class
+products need a separate per-request admission design before offering them.
+Model access permissions still apply. Explicit free batch windows take priority
+over a legacy NULL-purpose admission guard.
+
+HTTP batch tariff authoring normalizes surrounding completion-window whitespace;
+YAML authoring rejects it. Unchanged legacy NULL-purpose rows may be preserved
+during model metadata edits, but cannot be created or repriced through the
+customer tariff API and are not billable fallback rows. Organisation catalog
+prices must not overlap manually managed prices in the same scope and
+purpose/window, including future schedules. Such conflicts roll back the whole
+reconciliation without taking ownership of the manual deal. Historical org
+token/cache prices prevent hard account deletion; normal soft deletion retains
+them. Already-applied migrations must not be edited.
 
 Cache multipliers are selected independently by account + resolved class →
 account all-class → general model, at the same timestamp. They have no

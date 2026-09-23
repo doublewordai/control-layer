@@ -157,47 +157,38 @@ impl<'c> Tariffs<'c> {
         Ok(tariffs)
     }
 
-    /// The tariffs a caller billed to `account` effectively pays on these models: the
-    /// organisation's active rows where it has them (per purpose and completion window),
-    /// the general active rows otherwise. Mirrors the billing assigner's preference.
+    /// Customer catalogue prices: all-class account deal, then model price,
+    /// per purpose/window. Class-specific deals remain internal until the public
+    /// UX supports them. Actual billing still uses the resolved class.
     #[instrument(skip(self), err)]
     pub async fn list_effective_for_account(
         &mut self,
         deployed_model_ids: &[DeploymentId],
         account: Uuid,
     ) -> Result<Vec<TariffDBResponse>> {
-        let tariffs = sqlx::query_as!(
+        Ok(sqlx::query_as!(
             ModelTariff,
-            r#"
-            WITH relevant AS (
-                SELECT deployed_model_id, api_key_purpose, completion_window, serving_class
+            r#"WITH selectors AS (
+                SELECT DISTINCT deployed_model_id, api_key_purpose, completion_window
                 FROM model_tariffs
                 WHERE deployed_model_id = ANY($1) AND (user_id IS NULL OR user_id = $2)
+                  AND serving_class IS NULL
                   AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW())
                   AND api_key_purpose IN ('realtime','batch','playground')
-            ), selectors AS (
-                SELECT DISTINCT deployed_model_id, api_key_purpose, completion_window FROM relevant
-            ), classes AS (
-                SELECT DISTINCT deployed_model_id, serving_class FROM relevant
-                UNION SELECT DISTINCT deployed_model_id, NULL::text FROM relevant
             )
             SELECT DISTINCT t.id as "id!", t.deployed_model_id as "deployed_model_id!", t.name as "name!",
                    t.input_price_per_token as "input_price_per_token!", t.output_price_per_token as "output_price_per_token!",
                    t.valid_from as "valid_from!", t.valid_until, t.api_key_purpose as "api_key_purpose: _",
                    t.completion_window, t.user_id, t.serving_class
-            FROM selectors s JOIN classes c USING (deployed_model_id)
-            CROSS JOIN LATERAL effective_model_tariff(s.deployed_model_id, $2, s.api_key_purpose,
-                s.completion_window, CASE WHEN s.api_key_purpose = 'batch' THEN 'standard' ELSE c.serving_class END, NOW()) t
-            WHERE s.api_key_purpose <> 'batch' OR c.serving_class IS NULL
-            ORDER BY "deployed_model_id!", t.serving_class NULLS FIRST, "api_key_purpose: _", t.completion_window
-            "#,
+            FROM selectors s
+            CROSS JOIN LATERAL effective_model_display_tariff(s.deployed_model_id, $2,
+                s.api_key_purpose, s.completion_window, NOW()) t
+            ORDER BY "deployed_model_id!", "api_key_purpose: _", t.completion_window"#,
             deployed_model_ids,
             account
         )
         .fetch_all(&mut *self.db)
-        .await?;
-
-        Ok(tariffs)
+        .await?)
     }
 
     pub async fn get_effective_pricing_at_timestamp(

@@ -2389,3 +2389,22 @@ async fn organisation_prices_gate_balance_and_capped_root_and_child(pool: sqlx::
         assert_eq!(keys.iter().any(|key| key.secret == KEY_A_SECRET), phase != 0);
     }
 }
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn deleted_accounts_lose_free_and_unpriced_targets(pool: sqlx::PgPool) {
+    let tiers = RateLimitTiersConfig::default();
+    let before = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    for alias in ["regular-public", "composite-priority"] {
+        assert!(pool_has_key(before.targets.get(alias).unwrap().value(), KEY_A_SECRET), "{alias}");
+    }
+    // Deliberately leave the key active: sync must defend independently of the
+    // normal soft-delete handler, including free models' balance bypass.
+    sqlx::query("UPDATE users SET is_deleted=true WHERE username='cache_user_a'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let after = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    for alias in ["regular-public", "composite-priority"] {
+        assert!(!pool_has_key(after.targets.get(alias).unwrap().value(), KEY_A_SECRET), "{alias}");
+    }
+}

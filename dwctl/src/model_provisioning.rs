@@ -574,8 +574,11 @@ pub(crate) fn validate_tariffs(tariffs: &[Tariff], source: &str) -> Result<()> {
         ensure_nonempty(&tariff.name, source, "tariff.name")?;
         match tariff.purpose {
             TariffPurpose::Batch => ensure!(
-                tariff.completion_window.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                "{source}: batch tariff {:?} requires completion_window",
+                tariff
+                    .completion_window
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty() && value == value.trim()),
+                "{source}: batch tariff {:?} requires a non-empty completion_window without surrounding whitespace",
                 tariff.name
             ),
             _ => ensure!(
@@ -755,6 +758,18 @@ mod tests {
                 matches!(purpose, "realtime" | "batch" | "playground"),
                 "{purpose}"
             );
+        }
+    }
+
+    #[test]
+    fn catalog_batch_windows_reject_noncanonical_whitespace() {
+        for window in ["24h", " 24h ", "", " "] {
+            let tariff: Tariff = serde_json::from_value(serde_json::json!({
+                "name":"batch", "purpose":"batch", "completion_window":window,
+                "input_per_million_tokens":"1", "output_per_million_tokens":"2"
+            }))
+            .unwrap();
+            assert_eq!(validate_tariffs(&[tariff], "test").is_ok(), window == "24h", "{window:?}");
         }
     }
 

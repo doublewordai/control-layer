@@ -38,8 +38,8 @@ pub struct TariffResponse {
     #[serde(default)]
     pub is_active: bool,
     /// Set when this is an organisation's own price rather than the model's general
-    /// price. A customer sees it only on their own organisation's rows; platform
-    /// managers see every organisation's rows.
+    /// price. Only operator views expose ownership; customer catalogue responses
+    /// return effective all-class amounts without organisation/class metadata.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(value_type = Option<String>, format = "uuid")]
     pub organization_id: Option<Uuid>,

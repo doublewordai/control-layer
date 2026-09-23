@@ -847,7 +847,32 @@ models:
                         .bind(model).bind(org).bind(class).bind(finite).execute(&pool).await.unwrap();
                     sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,user_id,serving_class,read_multiplier,min_prefix_tokens,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,valid_from,valid_until) VALUES ($1,$2,$3,0.5,1,1,1,1,NOW()+INTERVAL '1 day',CASE WHEN $4 THEN NOW()+INTERVAL '2 days' ELSE NULL END)")
                         .bind(model).bind(org).bind(class).bind(finite).execute(&pool).await.unwrap();
-                    let base = format!("org: future-org\nmodels:\n  - alias: {alias}\n    self_hosted_only: false\n");
+                    let earlier: Uuid = sqlx::query_scalar(
+                        "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ($1,$1,true,$2) RETURNING id",
+                    )
+                    .bind(format!("early-{alias}"))
+                    .bind(org)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    let base = format!(
+                        "org: future-org\nmodels:\n  - alias: early-{alias}\n    self_hosted_only: false\n    tariffs:\n      - {{name: early, purpose: realtime, input_per_million_tokens: '1', output_per_million_tokens: '1'}}\n  - alias: {alias}\n    self_hosted_only: false\n"
+                    );
+                    // Positive control: this earlier entry really changes a price
+                    // and overlay before the later entry is processed.
+                    let changed = base
+                        .replace("input_per_million_tokens: '1'", "input_per_million_tokens: '2'")
+                        .replace("self_hosted_only: false", "self_hosted_only: true");
+                    write(directory.path(), "org.yaml", &changed);
+                    apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+                    let rate: rust_decimal::Decimal = sqlx::query_scalar(
+                        "SELECT input_price_per_token FROM model_tariffs WHERE deployed_model_id=$1 AND valid_until IS NULL",
+                    )
+                    .bind(earlier)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                    assert_eq!(rate, rust_decimal::Decimal::new(2, 6));
                     write(directory.path(), "org.yaml", &base);
                     apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
                     let mut before = Vec::new();
@@ -871,10 +896,7 @@ models:
                     };
                     let indent = if class.is_some() { "        " } else { "    " };
                     let price = price.lines().map(|line| format!("{indent}{line}\n")).collect::<String>();
-                    let yaml = format!(
-                        "{}{scope}{price}",
-                        base.replace("self_hosted_only: false", "self_hosted_only: true")
-                    );
+                    let yaml = format!("{}{scope}{price}", changed);
                     write(directory.path(), "org.yaml", &yaml);
                     let err = apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap_err();
                     let expected = if cache {

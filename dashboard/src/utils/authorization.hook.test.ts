@@ -23,7 +23,7 @@ describe("useAuthorization legacy admin capabilities", () => {
     expect(result.current.hasPermission("users-groups")).toBe(allowed);
     expect(result.current.canAccessRoute("/users-groups")).toBe(allowed);
     expect(result.current.canAccessRoute("/batches")).toBe(false);
-    expect(result.current.userRoles).toEqual(roles);
+    expect(result.current.userRoles).toEqual(is_admin ? [...roles, "PlatformManager"] : roles);
     expect(fixture.user.roles).toEqual(roles);
   });
 

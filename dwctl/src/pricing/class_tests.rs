@@ -173,7 +173,7 @@ fn cache_class_deals_require_a_general_enablement_row_and_respect_history() {
 }
 
 #[sqlx::test]
-async fn quotes_keep_matched_classes_and_ownerless_estimates_use_general_prices(pool: PgPool) {
+async fn customer_quotes_hide_classes_and_ownerless_estimates_use_general_prices(pool: PgPool) {
     use crate::db::handlers::{Tariffs, analytics::get_realtime_tariffs};
     let account: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('review-org','review@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
     let model: Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('review-model','review-model',true,$1) RETURNING id").bind(account).fetch_one(&pool).await.unwrap();
@@ -182,7 +182,7 @@ async fn quotes_keep_matched_classes_and_ownerless_estimates_use_general_prices(
     let mut conn = pool.acquire().await.unwrap();
     let mut tariffs = Tariffs::new(&mut conn);
     let quotes = tariffs.list_effective_for_account(&[model], account).await.unwrap();
-    assert_eq!(quotes.len(), 2, "a batch class must not duplicate the general realtime quote");
+    assert_eq!(quotes.len(), 1, "class-specific batch deals remain internal");
     let general = quotes.iter().find(|q| q.name == "general").unwrap();
     assert_eq!(general.serving_class, None, "fallback must retain the matched price's class");
     let own = tariffs
@@ -209,7 +209,7 @@ async fn quotes_keep_matched_classes_and_ownerless_estimates_use_general_prices(
 }
 
 #[sqlx::test]
-async fn customer_price_sort_keeps_legacy_and_class_only_prices(pool: PgPool) {
+async fn customer_price_sort_ignores_class_only_and_legacy_prices(pool: PgPool) {
     use crate::api::models::deployments::ModelSortField;
     use crate::db::handlers::deployments::DeploymentFilter;
     use crate::db::handlers::{Deployments, Repository};
@@ -242,9 +242,11 @@ async fn customer_price_sort_keeps_legacy_and_class_only_prices(pool: PgPool) {
     filter.sort_field = Some(ModelSortField::PriceFrom);
     filter.pricing_account = Some(account);
     let listed = Deployments::new(&mut conn).list(&filter).await.unwrap();
+    models.sort();
     assert_eq!(
-        listed.iter().map(|m| m.alias.as_str()).collect::<Vec<_>>(),
-        vec!["legacy", "class-only", "unpriced"]
+        listed.iter().map(|m| m.id).collect::<Vec<_>>(),
+        models,
+        "none has a supported all-class price: all sort as unpriced, by id"
     );
 }
 
@@ -506,5 +508,176 @@ async fn equal_timestamp_tariffs_use_the_same_stable_id_in_sql_and_billing(pool:
             (Some(Decimal::ONE), Some(Decimal::ONE))
         );
         rows.reverse();
+    }
+}
+
+#[sqlx::test]
+async fn customer_display_sort_and_usage_have_explicitly_different_class_rules(pool: PgPool) {
+    use crate::api::models::deployments::ModelSortField;
+    use crate::db::handlers::{Deployments, Repository, Tariffs, analytics::get_realtime_tariffs, deployments::DeploymentFilter};
+    let account: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('display-org','display@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
+    let mut models = Vec::new();
+    for alias in ["display-deal", "display-comparator"] {
+        let model: Uuid = sqlx::query_scalar(
+            "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ($1,$1,true,$2) RETURNING id",
+        )
+        .bind(alias)
+        .bind(account)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,'general',3,3,'realtime')").bind(model).execute(&pool).await.unwrap();
+        models.push(model);
+    }
+    let model = models[0];
+    for (class, price) in [(None, 2), (Some("standard"), 9), (Some("interactive"), 0)] {
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,$2,$3,'deal', $4,$4,'realtime')").bind(model).bind(account).bind(class).bind(Decimal::from(price)).execute(&pool).await.unwrap();
+    }
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window) VALUES ($1,'batch',1,1,'batch','24h')").bind(model).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window) VALUES ($1,$2,'standard','free-batch',0,0,'batch','24h')").bind(model).bind(account).execute(&pool).await.unwrap();
+    // Future and expired rows must not replace the currently applicable deal.
+    sqlx::query("UPDATE model_tariffs SET valid_until=NOW()+INTERVAL '1 hour' WHERE user_id=$1 AND serving_class IS NULL")
+        .bind(account)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose,valid_from) VALUES ($1,$2,'future',99,99,'realtime',NOW()+INTERVAL '1 hour')").bind(model).bind(account).execute(&pool).await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let quotes = Tariffs::new(&mut conn).list_effective_for_account(&[model], account).await.unwrap();
+    assert_eq!(quotes.len(), 2);
+    assert!(quotes.iter().all(|t| t.serving_class.is_none()));
+    assert_eq!(
+        quotes
+            .iter()
+            .find(|t| t.api_key_purpose == Some(ApiKeyPurpose::Realtime))
+            .unwrap()
+            .input_price_per_token,
+        Decimal::from(2)
+    );
+    assert_eq!(
+        quotes
+            .iter()
+            .find(|t| t.api_key_purpose == Some(ApiKeyPurpose::Batch))
+            .unwrap()
+            .input_price_per_token,
+        Decimal::ONE
+    );
+    let stranger = Tariffs::new(&mut conn)
+        .list_effective_for_account(&[model], Uuid::new_v4())
+        .await
+        .unwrap();
+    assert!(stranger.iter().all(|t| t.user_id.is_none()));
+    for (class, expected) in [("standard", 9), ("interactive", 0)] {
+        let price = Tariffs::new(&mut conn)
+            .get_effective_pricing_at_timestamp(model, Some(account), "realtime", None, Some(class), Utc::now())
+            .await
+            .unwrap();
+        assert_eq!(price.unwrap().0, Decimal::from(expected), "billing still uses class {class}");
+    }
+    let mut filter = DeploymentFilter::new(0, 100);
+    filter.sort_field = Some(ModelSortField::PriceFrom);
+    filter.pricing_account = Some(account);
+    assert_eq!(Deployments::new(&mut conn).list(&filter).await.unwrap()[0].id, model);
+    drop(conn);
+    for (expired_class, expected) in [(None, 2), (Some("all"), 9), (Some("standard"), 3)] {
+        if let Some(class) = expired_class {
+            sqlx::query("UPDATE model_tariffs SET valid_until=NOW() WHERE user_id=$1 AND api_key_purpose='realtime' AND valid_from<=NOW() AND serving_class IS NOT DISTINCT FROM $2").bind(account).bind(if class=="all" {None} else {Some(class)}).execute(&pool).await.unwrap();
+        }
+        assert_eq!(
+            get_realtime_tariffs(&pool, account, &["display-deal".to_string()]).await.unwrap()["display-deal"].0,
+            Decimal::from(expected)
+        );
+    }
+    // A zero interactive deal cannot make an otherwise expensive model sort first.
+    sqlx::query("UPDATE model_tariffs SET input_price_per_token=5,output_price_per_token=5 WHERE deployed_model_id=$1 AND user_id IS NULL")
+        .bind(model)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    assert_eq!(Deployments::new(&mut conn).list(&filter).await.unwrap()[0].id, models[1]);
+}
+
+#[sqlx::test]
+async fn legacy_paid_admission_respects_explicit_zero_batch_windows(pool: PgPool) {
+    let account: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (username,email,auth_source) VALUES ('free-batch','free-batch@example.com','test') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let model: Uuid = sqlx::query_scalar(
+        "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('free-batch','free-batch',true,$1) RETURNING id",
+    )
+    .bind(account)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token) VALUES ($1,'legacy',1,1)")
+        .bind(model)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for window in ["1h", "24h"] {
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window) VALUES ($1,'batch',1,1,'batch',$2)").bind(model).bind(window).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window) VALUES ($1,$2,'free-batch',0,0,'batch',$3)").bind(model).bind(account).bind(window).execute(&pool).await.unwrap();
+    }
+    let paid: bool = sqlx::query_scalar("SELECT model_has_effective_paid_tariff($1,$2,'batch')")
+        .bind(model)
+        .bind(account)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!paid, "legacy NULL-purpose rows must not override explicit free batch windows");
+    sqlx::query("UPDATE model_tariffs SET input_price_per_token=1 WHERE user_id=$1 AND completion_window='1h'")
+        .bind(account)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let paid: bool = sqlx::query_scalar("SELECT model_has_effective_paid_tariff($1,$2,'batch')")
+        .bind(model)
+        .bind(account)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(paid, "one paid batch window still requires credit");
+}
+
+#[sqlx::test]
+async fn historical_deals_prevent_hard_account_deletion(pool: PgPool) {
+    let model: Uuid=sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('retention','retention',true,'00000000-0000-0000-0000-000000000000') RETURNING id").fetch_one(&pool).await.unwrap();
+    for table in ["model_tariffs", "model_cache_tariffs"] {
+        let account: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (username,email,auth_source,user_type) VALUES ($1,$1,'test','organization') RETURNING id",
+        )
+        .bind(table)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if table == "model_tariffs" {
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose,valid_from,valid_until) VALUES ($1,$2,'historical',1,1,'realtime',NOW()-INTERVAL '2 days',NOW()-INTERVAL '1 day')").bind(model).bind(account).execute(&pool).await.unwrap();
+        } else {
+            sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,user_id,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,read_multiplier,min_prefix_tokens,valid_from,valid_until) VALUES ($1,$2,1,1,1,1,1,NOW()-INTERVAL '2 days',NOW()-INTERVAL '1 day')").bind(model).bind(account).execute(&pool).await.unwrap();
+        }
+        let error = sqlx::query("DELETE FROM users WHERE id=$1")
+            .bind(account)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.as_database_error().unwrap().constraint(),
+            Some(format!("{table}_user_id_fkey").as_str())
+        );
+        sqlx::query("UPDATE users SET is_deleted=true WHERE id=$1")
+            .bind(account)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table} WHERE user_id=$1"))
+            .bind(account)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "soft deletion retains historical prices");
     }
 }

@@ -821,6 +821,9 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                                  (SELECT paid FROM general_paid WHERE id = cm.id AND purpose = ak.purpose), FALSE)
                 )
             )
+            -- Deletion revokes free/unpriced models too, independently of the
+            -- normal delete path also revoking API keys.
+            AND (ak.user_id = '00000000-0000-0000-0000-000000000000' OR u.is_deleted = false)
             AND ak.is_deleted = false
             -- Spending-cap gate: exclude every key of a cap scope (the capped
             -- root and its hidden batch child alike) once the scope's
@@ -1665,6 +1668,9 @@ pub async fn load_targets_from_db(
                                  (SELECT paid FROM general_paid WHERE id = dm.id AND purpose = ak.purpose), FALSE)
                 )
             )
+            -- Deletion revokes free/unpriced models too, independently of the
+            -- normal delete path also revoking API keys.
+            AND (ak.user_id = '00000000-0000-0000-0000-000000000000' OR u.is_deleted = false)
             AND ak.is_deleted = false
             -- Spending-cap gate: exclude every key of a cap scope (the capped
             -- root and its hidden batch child alike) once the scope's

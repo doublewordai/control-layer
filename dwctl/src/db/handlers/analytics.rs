@@ -1196,6 +1196,9 @@ pub async fn refresh_user_model_usage_daily(pool: &PgPool) -> Result<()> {
     Ok(())
 }
 
+/// Usage comparison only: prefer the account's all-class realtime deal, then
+/// its standard-class deal, then general realtime. Never borrow an interactive
+/// price or reprice actual usage totals. This differs intentionally from billing.
 /// Load current realtime tariff rates keyed by model alias.
 /// Returns a map of model alias → (input_price_per_token, output_price_per_token).
 /// Only resolve models present in this usage response, including retired models.
@@ -1205,7 +1208,17 @@ pub async fn get_realtime_tariffs(pool: &PgPool, account: Uuid, models: &[String
         r#"
         SELECT dm.alias, t.input_price_per_token as "input_price_per_token!", t.output_price_per_token as "output_price_per_token!"
         FROM deployed_models dm
-        CROSS JOIN LATERAL effective_model_tariff(dm.id, $1, 'realtime', NULL, 'standard', NOW()) t
+        CROSS JOIN LATERAL (
+            SELECT choices.input_price_per_token, choices.output_price_per_token FROM (
+                SELECT user_id, serving_class, input_price_per_token, output_price_per_token
+                FROM effective_model_display_tariff(dm.id, $1, 'realtime', NULL, NOW())
+                UNION SELECT user_id, serving_class, input_price_per_token, output_price_per_token
+                FROM effective_model_tariff(dm.id, $1, 'realtime', NULL, 'standard', NOW())
+            ) choices
+            ORDER BY CASE WHEN choices.user_id = $1 AND choices.serving_class IS NULL THEN 0
+                          WHEN choices.user_id = $1 THEN 1 ELSE 2 END
+            LIMIT 1
+        ) t
         WHERE dm.alias = ANY($2)
         "#,
         account,

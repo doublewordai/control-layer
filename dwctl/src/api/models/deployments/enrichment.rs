@@ -82,16 +82,7 @@ impl<'a> DeployedModelEnricher<'a> {
         let model_aliases: Vec<String> = models.iter().map(|m| m.alias.clone()).collect();
 
         // Fetch all includes in parallel for maximum performance
-        let (
-            groups_result,
-            status_map,
-            metrics_map,
-            endpoints_map,
-            pricing_tariffs_map,
-            cache_tariffs_map,
-            class_cache_prices,
-            components_map,
-        ) = tokio::join!(
+        let (groups_result, status_map, metrics_map, endpoints_map, pricing_tariffs_map, cache_tariffs_map, components_map) = tokio::join!(
             // Groups query
             async {
                 if self.include_groups {
@@ -182,15 +173,17 @@ impl<'a> DeployedModelEnricher<'a> {
                                 .push(TariffResponse::from(tariff));
                         }
                     } else if let Some(account) = self.pricing_account {
-                        // Customers: what they actually pay, in one query.
+                        // Customer catalogue prices exclude class-specific deals.
                         let mut tariffs_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
                         let mut tariffs_repo = Tariffs::new(&mut tariffs_conn);
                         let tariffs = tariffs_repo.list_effective_for_account(&model_ids, account).await?;
                         for tariff in tariffs {
-                            tariffs_map
-                                .entry(tariff.deployed_model_id)
-                                .or_default()
-                                .push(TariffResponse::from(tariff));
+                            let mut response = TariffResponse::from(tariff);
+                            // Effective amounts are public; deal ownership and
+                            // serving-class configuration remain operator-only.
+                            response.organization_id = None;
+                            response.serving_class = None;
+                            tariffs_map.entry(response.deployed_model_id).or_default().push(response);
                         }
                     } else {
                         for model_id in &model_ids {
@@ -227,20 +220,6 @@ impl<'a> DeployedModelEnricher<'a> {
                     Ok(None)
                 }
             },
-            // Class cache prices are independent of the other enrichment reads.
-            async {
-                if self.include_pricing
-                    && !self.can_read_pricing
-                    && let Some(account) = self.pricing_account
-                {
-                    let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-                    return CacheTariffs::new(&mut conn)
-                        .get_class_prices_bulk(&model_ids, account)
-                        .await
-                        .map_err(Error::from);
-                }
-                Ok(HashMap::new())
-            },
             // Components query (for composite models)
             async {
                 if self.include_components && self.can_read_composite_info {
@@ -269,7 +248,6 @@ impl<'a> DeployedModelEnricher<'a> {
             None => (None, None),
         };
         let cache_tariffs_map = cache_tariffs_map?;
-        let class_cache_prices = class_cache_prices?;
 
         // Build enriched responses
         let mut enriched_models = Vec::with_capacity(models.len());
@@ -299,17 +277,8 @@ impl<'a> DeployedModelEnricher<'a> {
             if self.include_pricing {
                 model_response = Self::apply_tariffs(model_response, &pricing_tariffs_map);
                 model_response = Self::apply_cache_pricing(model_response, &cache_tariffs_map);
-                model_response.cache_pricing_by_class = Some(
-                    class_cache_prices
-                        .get(&model_response.id)
-                        .map(|prices| {
-                            prices
-                                .iter()
-                                .map(|(class, price)| (class.clone(), CachePricingResponse::from(price.clone())))
-                                .collect()
-                        })
-                        .unwrap_or_default(),
-                );
+                // Class cache prices are available only through operator org views.
+                model_response.cache_pricing_by_class = None;
 
                 // Hide pricing for purposes that the model denies via a
                 // traffic-routing rule. Run after `apply_tariffs` so it
