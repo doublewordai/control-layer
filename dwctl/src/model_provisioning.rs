@@ -1052,6 +1052,44 @@ clay:
     }
 
     #[sqlx::test]
+    async fn catalog_seeds_component_enabled_but_never_overwrites_it(pool: PgPool) {
+        sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
+            .execute(&pool).await.unwrap();
+        let component_state = || async {
+            sqlx::query_as::<_, (bool, i32)>(
+                "SELECT c.enabled, c.weight FROM deployed_model_components c
+                 JOIN deployed_models m ON m.id = c.composite_model_id
+                 WHERE m.alias = 'org/model'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let directory = tempdir().unwrap();
+        let disabled = catalog_yaml("0.50", false, "0.1").replace(
+            "        - deployment: provider-org-model\n",
+            "        - deployment: provider-org-model\n          enabled: false\n",
+        );
+        write(directory.path(), "model.yaml", &disabled);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(component_state().await, (false, 1), "first insert takes the catalog value");
+
+        // A runtime controller (scouter) or an operator flips the component on.
+        sqlx::query("UPDATE deployed_model_components SET enabled = TRUE")
+            .execute(&pool)
+            .await
+            .unwrap();
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(component_state().await, (true, 1), "a restart must not revert the live toggle");
+
+        // Other component fields stay authoritative.
+        let reweighted = disabled.replace("          enabled: false\n", "          enabled: false\n          weight: 7\n");
+        write(directory.path(), "model.yaml", &reweighted);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(component_state().await, (true, 7));
+    }
+
+    #[sqlx::test]
     async fn startup_apply_is_idempotent_and_versions_tariffs(pool: PgPool) {
         sqlx::query(
             "INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')",

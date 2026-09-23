@@ -453,6 +453,11 @@ impl<'c> ModelProvisioning<'c> {
     }
 
     async fn upsert_component(&mut self, composite_id: Uuid, deployed_id: Uuid, pool: &str, component: &Component) -> Result<()> {
+        // `enabled` is runtime state: scouter flips it as serving-stack workers
+        // come and go and operators flip it to drain a provider. The catalog
+        // only seeds it on first insert; re-applying at every pod start must
+        // not revert a live toggle (a snapshotted `false` took a Dynamo-backed
+        // composite to 0 providers and 503s until scouter's next loop).
         sqlx::query(
             r#"INSERT INTO deployed_model_components (
                    composite_model_id, deployed_model_id, pool, weight, enabled, sort_order,
@@ -460,7 +465,6 @@ impl<'c> ModelProvisioning<'c> {
                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                ON CONFLICT (composite_model_id, deployed_model_id, pool) DO UPDATE SET
                    weight = EXCLUDED.weight,
-                   enabled = EXCLUDED.enabled,
                    sort_order = EXCLUDED.sort_order,
                    continuation_validated_at = CASE
                        WHEN deployed_model_components.strip_leading_bos IS DISTINCT FROM EXCLUDED.strip_leading_bos
