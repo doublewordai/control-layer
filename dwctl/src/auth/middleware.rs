@@ -37,15 +37,11 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
     // Reconstruct request for further processing
     request = Request::from_parts(parts, body);
 
-    // Extract the request body to parse the model
-    let body_bytes = match axum::body::to_bytes(std::mem::take(request.body_mut()), usize::MAX).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return Err(Error::BadRequest {
-                message: "Failed to read request body".to_string(),
-            });
-        }
-    };
+    // This parser runs before URI rewriting reaches the inference router, so
+    // it must enforce the same limit before buffering or extracting the model.
+    let max_bytes = usize::try_from(state.current_config().limits.requests.max_body_size).unwrap_or(usize::MAX);
+    let body = std::mem::take(request.body_mut());
+    let body_bytes = crate::inference::body_limit::read_inference_body(request.headers(), body, max_bytes).await?;
 
     // Extract the model name from the request using the shared function
     let model_name = onwards::extract_model_from_request(request.headers(), &body_bytes).ok_or(Error::BadRequest {
@@ -133,6 +129,26 @@ mod tests {
         },
         test::utils::{create_test_config, create_test_user},
     };
+
+    #[sqlx::test]
+    async fn test_playground_body_limit_precedes_model_parsing(pool: PgPool) {
+        let mut config = create_test_config();
+        config.limits.requests.max_body_size = 4;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+        for length in [None, Some("5")] {
+            let mut request = axum::http::Request::post("/admin/api/v1/ai/v1/chat/completions")
+                .header("x-doubleword-user", user.external_user_id.as_ref().unwrap_or(&user.username))
+                .header("x-doubleword-email", &user.email);
+            if let Some(length) = length {
+                request = request.header("content-length", length);
+            }
+            let error = admin_ai_proxy(state.clone(), request.body("xxxxx".into()).unwrap())
+                .await
+                .unwrap_err();
+            assert!(matches!(error, crate::errors::Error::PayloadTooLarge { .. }));
+        }
+    }
 
     #[sqlx::test]
     async fn test_user_no_access_auth_error(pool: PgPool) {

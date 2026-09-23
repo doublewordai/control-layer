@@ -10,6 +10,40 @@ use crate::api::models::users::Role;
 use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_config, create_test_user};
 use sqlx::PgPool;
 
+/// Reject before inference parsing, logging, or daemon-header bypasses, with
+/// cache pricing disabled so enforcement cannot depend on its inner reader.
+#[sqlx::test]
+async fn test_inference_body_limit_precedes_processing_in_all_modes(pool: PgPool) {
+    for strict_mode in [true, false] {
+        let mut config = create_test_config();
+        config.onwards.strict_mode = strict_mode;
+        config.cache.enabled = false;
+        config.limits.requests.max_body_size = 64;
+        let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+            .await
+            .expect("Failed to create application");
+        let (server, _services) = app.into_test_server();
+
+        for path in ["chat/completions", "completions", "responses", "messages", "embeddings"] {
+            // Invalid JSON would produce a 400 if the inference parser ran first.
+            let response = server.post(&format!("/ai/v1/{path}")).bytes(vec![b'x'; 65].into()).await;
+            response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+
+            let response = server
+                .post(&format!("/ai/v1/{path}"))
+                .add_header("x-fusillade-request-id", uuid::Uuid::new_v4().to_string())
+                .bytes(vec![b'x'; 65].into())
+                .await;
+            response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        // File uploads have their own larger cap and must not inherit the
+        // inference limit. This unauthenticated upload is rejected by auth.
+        let response = server.post("/ai/v1/files").bytes(vec![b'x'; 65].into()).await;
+        response.assert_status(axum::http::StatusCode::UNAUTHORIZED);
+    }
+}
+
 /// Test that strict mode rejects unknown endpoints with 404
 #[sqlx::test]
 #[test_log::test]

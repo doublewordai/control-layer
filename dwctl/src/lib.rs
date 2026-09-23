@@ -2544,7 +2544,7 @@ pub async fn build_router(
         onwards_router
     };
 
-    // Apply the inference middleware as the OUTERMOST layer. It sees the raw
+    // Apply inference routing outside the other processing layers. It sees the raw
     // foreign request (before translation), so it can read Responses-only fields
     // (`background`, `service_tier`), mint the response/tracking id, run
     // previous_response_id hydration, and set the correlation headers before
@@ -2557,6 +2557,14 @@ pub async fn build_router(
     } else {
         onwards_router
     };
+
+    // Bound the raw body before inference routing parses it or outlet captures
+    // it. Inner limits are too late to prevent allocation amplification. Keep
+    // this on the onwards router so files/batches retain their separate limits.
+    let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
+        usize::try_from(config.limits.requests.max_body_size).unwrap_or(usize::MAX),
+        crate::inference::body_limit::limit_inference_body,
+    ));
 
     // Build the app with admin API and onwards proxy nested. serve the (restricted) openai spec.
     // Strict mode requires different nesting:
