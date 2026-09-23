@@ -1,5 +1,13 @@
 # Changelog
 
+## [12.3.1](https://github.com/doublewordai/control-layer/compare/v12.3.0...v12.3.1) (2026-09-23)
+
+
+### Bug Fixes
+
+* **analytics:** enforce queued request success uniqueness ([#1835](https://github.com/doublewordai/control-layer/issues/1835)) ([61d48a8](https://github.com/doublewordai/control-layer/commit/61d48a809ced2d306ee20b30994265555e165bbf))
+* **inference:** enforce body limits before buffering and parsing ([#1836](https://github.com/doublewordai/control-layer/issues/1836)) ([e0b9899](https://github.com/doublewordai/control-layer/commit/e0b9899a831fa5a19232d4822e868b0593a76439))
+
 ## [12.3.0](https://github.com/doublewordai/control-layer/compare/v12.2.2...v12.3.0) (2026-09-23)
 
 
