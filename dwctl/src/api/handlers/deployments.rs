@@ -967,6 +967,20 @@ pub async fn update_deployed_model<P: PoolProvider>(
                 tariff.completion_window = tariff.completion_window.take().map(|window| window.trim().to_owned());
             }
         }
+        let scheduled: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM model_tariffs WHERE deployed_model_id=$1 AND user_id IS NULL
+             AND valid_from>NOW() AND (valid_until IS NULL OR valid_until>valid_from))",
+        )
+        .bind(deployment_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| Error::Database(e.into()))?;
+        if scheduled {
+            return Err(Error::BadRequest {
+                message: "This model has scheduled future prices; explicitly cancel or resolve the schedule before replacing tariffs"
+                    .to_string(),
+            });
+        }
         let tariff_conn = tx.acquire().await.map_err(|e| Error::Database(e.into()))?;
         let mut tariffs_repo = Tariffs::new(tariff_conn);
 
@@ -4280,5 +4294,38 @@ mod tests {
             fetched.traffic_routing_rules.is_none(),
             "traffic rules should be cleared after cascade delete of redirect target"
         );
+    }
+    #[sqlx::test]
+    async fn tariff_replacement_rejects_future_schedule_without_partial_updates(pool: PgPool) {
+        let (app, _services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let model = create_test_deployment(&pool, admin.id, "scheduled", "scheduled").await;
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose,valid_from,valid_until) VALUES ($1,'current',1,1,'realtime',NOW()-INTERVAL '1 day',NOW()+INTERVAL '1 day'),($1,'future',2,2,'realtime',NOW()+INTERVAL '1 day',NULL)").bind(model.id).execute(&pool).await.unwrap();
+        let before: serde_json::Value = sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM model_tariffs t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let headers = add_auth_headers(&admin);
+        let path = format!("/admin/api/v1/models/{}", model.id);
+        let response=app.patch(&path).add_header(&headers[0].0,&headers[0].1).add_header(&headers[1].0,&headers[1].1).json(&json!({"description":"rejected-change","tariffs":[{"name":"new","api_key_purpose":"realtime","input_price_per_token":"3","output_price_per_token":"3"}]})).await;
+        response.assert_status_bad_request();
+        assert!(response.text().contains("scheduled future prices"));
+        let after: serde_json::Value = sqlx::query_scalar("SELECT jsonb_agg(to_jsonb(t) ORDER BY id) FROM model_tariffs t")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        let description: Option<String> = sqlx::query_scalar("SELECT description FROM deployed_models WHERE id=$1")
+            .bind(model.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_ne!(description.as_deref(), Some("rejected-change"));
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"description":"metadata-only"}))
+            .await
+            .assert_status_ok();
     }
 }

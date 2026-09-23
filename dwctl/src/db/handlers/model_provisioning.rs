@@ -50,7 +50,9 @@ impl<'c> ModelProvisioning<'c> {
             .await
             .context("acquire model provisioning advisory lock")?;
 
-        let effective_at: DateTime<Utc> = sqlx::query_scalar("SELECT transaction_timestamp()")
+        // Transaction start order can differ from lock acquisition order.
+        // Price versions must start after the preceding lock holder committed.
+        let effective_at: DateTime<Utc> = sqlx::query_scalar("SELECT clock_timestamp()")
             .fetch_one(&mut *self.db)
             .await
             .context("read model provisioning effective timestamp")?;

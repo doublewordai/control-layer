@@ -608,6 +608,10 @@ pub(crate) fn validate_cache_tariff(cache: &CacheTariff, source: &str) -> Result
     ] {
         let parsed = parse_decimal(value).with_context(|| format!("{source}: cache tariff {field}"))?;
         ensure!(parsed >= Decimal::ZERO, "{source}: cache tariff {field} cannot be negative");
+        ensure!(
+            parsed.round_dp(4) == parsed && parsed < Decimal::from(100),
+            "{source}: cache tariff {field} must fit DECIMAL(6,4) exactly (0 to 99.9999, at most four decimal places)"
+        );
     }
     ensure!(
         cache.min_prefix_tokens > 0,
@@ -1226,5 +1230,55 @@ clay:
         assert_eq!(orphan.try_get::<Uuid, _>("id").unwrap(), orphan_id);
         assert!(orphan.try_get::<Option<String>, _>("provisioning_source").unwrap().is_none());
         assert!(!orphan.try_get::<bool, _>("deleted").unwrap());
+    }
+    #[test]
+    fn cache_multipliers_must_fit_storage_exactly() {
+        for (value, valid) in [
+            ("0", true),
+            ("0.10000", true),
+            ("99.9999", true),
+            ("100", false),
+            ("0.12345", false),
+            ("-0.1", false),
+        ] {
+            let directory = tempdir().unwrap();
+            write(directory.path(), "model.yaml", &catalog_yaml("1", false, value));
+            assert_eq!(Catalog::load(directory.path()).is_ok(), valid, "{value}");
+        }
+    }
+
+    #[sqlx::test]
+    async fn waiting_replica_uses_time_after_catalog_lock(pool: PgPool) {
+        sqlx::query("INSERT INTO inference_endpoints (name,url,created_by) VALUES ('onwards','http://onwards.test','00000000-0000-0000-0000-000000000000')").execute(&pool).await.unwrap();
+        let directory = tempdir().unwrap();
+        write(directory.path(), "model.yaml", &catalog_yaml("1", false, "0.10000"));
+        let catalog = Catalog::load(directory.path()).unwrap();
+        // This transaction starts first but reaches the lock second.
+        let mut older = pool.begin().await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *older).await.unwrap();
+        let mut winner = pool.begin().await.unwrap();
+        ModelProvisioning::new(&mut winner).apply(&catalog).await.unwrap();
+        let (waiting, ()) = tokio::join!(
+            async {
+                ModelProvisioning::new(&mut older).apply(&catalog).await?;
+                older.commit().await?;
+                Ok::<_, anyhow::Error>(())
+            },
+            async {
+                crate::test::utils::wait_for_advisory_waiter(&pool, pid).await;
+                winner.commit().await.unwrap();
+            }
+        );
+        waiting.unwrap();
+        for table in ["model_tariffs", "model_cache_tariffs"] {
+            let versions: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                versions, 1,
+                "{table}: restart must not spuriously version a rounded or newly committed price"
+            );
+        }
     }
 }

@@ -2564,7 +2564,7 @@ const ModelInfo: React.FC = () => {
                                 ' Click "Manage Tariffs" to set up pricing.'}
                             </p>
                           )}
-                          {organisationTariffs.length > 0 && (
+                          {canManageModels && organisationTariffs.length > 0 && (
                             <div className="mt-4">
                               <p className="text-sm text-gray-600 mb-2">
                                 Organisation prices

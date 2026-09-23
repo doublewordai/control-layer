@@ -171,4 +171,21 @@ describe("ModelInfo", () => {
       "This model is provisioned from model-catalog:zai-org--GLM-5.2-FP8.yaml. Changes made here will be overwritten when the server restarts.",
     );
   });
+  it.each([false, true])("guards organisation price details independently of fetched data: %s", (manager) => {
+    vi.mocked(useAuthorization).mockReturnValue({ hasPermission: vi.fn(() => manager) } as unknown as ReturnType<typeof useAuthorization>);
+    vi.mocked(useModel).mockReturnValue({ data: {...virtualModel, tariffs: [{
+      id:"deal", deployed_model_id:virtualModel.id, name:"deal", api_key_purpose:"realtime",
+      input_price_per_token:"0.000001", output_price_per_token:"0.000002",
+      valid_from:"2026-01-01T00:00:00Z", valid_until:null, is_active:true,
+      organization_id:"org-test", serving_class:"interactive",
+    }]}, isLoading:false, error:null } as ReturnType<typeof useModel>);
+    const queryClient = new QueryClient({defaultOptions:{queries:{retry:false}}});
+    const {container} = render(<QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={["/models/manage/virtual-model-id"]}><Routes>
+        <Route path="/models/manage/:modelId" element={<ModelInfo />} />
+      </Routes></MemoryRouter>
+    </QueryClientProvider>);
+    expect(within(container).queryByText("Organisation prices") !== null).toBe(manager);
+  });
+
 });

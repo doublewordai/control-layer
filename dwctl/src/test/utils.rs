@@ -783,3 +783,23 @@ pub async fn create_test_model(pool: &PgPool, model_name: &str, alias: &str, end
     .expect("Failed to create test model");
     deployment_id
 }
+
+/// Wait until a test reconciliation actually blocks behind another replica's lock.
+pub async fn wait_for_advisory_waiter(pool: &PgPool, pid: i32) {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let waiting: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND NOT granted)")
+                    .bind(pid)
+                    .fetch_one(pool)
+                    .await
+                    .unwrap();
+            if waiting {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("replica did not wait for the catalog lock");
+}

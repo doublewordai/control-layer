@@ -205,3 +205,50 @@ The Helm chart exposes a separate, opt-in ConfigMap through
 overrides, and includes the catalog checksum in the pod template so catalog
 changes trigger a rollout. An enabled, empty ConfigMap mounts an empty
 directory and is a startup no-op.
+
+
+## Organisation catalog validation and ownership
+
+Run the same offline validation used by deployment CI:
+
+```sh
+dwctl-model-provisioning validate-org-overlays ./org-overlays.d --models ./model-provisioning.d
+dwctl-model-provisioning org-schema
+```
+
+Both directories must exist. Validation checks the complete org directory and
+references against public `clay.alias` values in the model catalog. It reuses
+startup parsing and pricing validation: duplicate org/model entries, unknown
+fields/classes, incompatible purpose/windows, and invalid decimals are rejected.
+Cache multipliers must be exactly representable in `DECIMAL(6,4)`: nonnegative,
+less than 100, with no more than four significant fractional places. Redundant
+trailing zeros are accepted. This avoids silent rounding and repeated versioning.
+The API's cache-pricing writer already validates storage precision.
+
+Offline validation cannot inspect database organisations, manual ownership or
+future scheduled prices. Check those against the target database before
+activating an overlay catalog. Class price collision errors identify the file,
+organisation, public alias and class; a model UUID alone is insufficient for an
+operator to locate the conflicting declaration.
+
+A row in `model_overlays` with no catalog `provisioning_source` is manually
+managed. Declaring its org/model in YAML now fails instead of silently changing
+its routing and ownership. Even a price-only declaration can reset omitted
+routing fields, so it cannot implicitly adopt that row. To transfer ownership,
+first review a complete YAML entry carrying the intended existing routing
+policy, then deliberately mark that specific row as owned by
+`org-overlays:<filename>`. Catalog reconciliation may subsequently change or
+remove it. No automatic transfer is performed, and rejected applies roll back.
+Manual token/cache prices retain their separate ownership checks.
+
+Reconciliation captures one wall-clock timestamp **after** obtaining the
+transaction-scoped advisory lock. A waiting replica may have begun its
+transaction before the winner; its transaction-start timestamp is therefore
+not a valid price-version boundary. Tests force a real lock wait and verify
+that the second replica observes the winner's rows without creating versions.
+
+Ordinary price edits close current tariffs and insert open-ended replacements.
+A pre-existing future-dated general tariff is different: it already reserves a
+future interval. Model tariff replacement returns an explicit bad-request error
+until an operator resolves that schedule; it neither cancels the schedule nor
+leaves partial model edits. Metadata-only edits are still permitted.
