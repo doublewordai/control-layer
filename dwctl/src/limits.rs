@@ -27,6 +27,9 @@ pub const MULTIPART_OVERHEAD: u64 = 10 * 1024; // 10KB
 /// Add new limiters here as fields when implementing additional rate limiting.
 #[derive(Debug, Default, Clone)]
 pub struct Limiters {
+    /// Startup inference cap, shared by entry guards and downstream routing.
+    /// Raising this limit requires rebuilding the router (a process restart).
+    pub inference_body_size: usize,
     /// Limiter for concurrent file uploads. None means unlimited.
     pub file_uploads: Option<Arc<UploadLimiter>>,
 }
@@ -35,6 +38,7 @@ impl Limiters {
     /// Creates all limiters from configuration.
     pub fn new(config: &LimitsConfig) -> Self {
         Self {
+            inference_body_size: usize::try_from(config.requests.max_body_size).unwrap_or(usize::MAX),
             file_uploads: UploadLimiter::new(&config.files).map(Arc::new),
         }
     }

@@ -477,8 +477,11 @@ batches:
 #   requests:
 #     # Maximum body size per individual request (bytes). Applies to requests
 #     # in batch JSONL files and to realtime request bodies on /ai/v1/*.
+#     # Inference bodies are bounded before parsing or request logging;
+#     # oversized bodies return HTTP 413. Multipart uploads use max_file_size.
 #     # Set to 0 for unlimited (not recommended for production)
 #     # Default: 10MB (10485760)
+#     # Changing this limit requires a restart to rebuild all routing layers.
 #     max_body_size: 10485760
 
 # External data source connections (S3, etc.)
