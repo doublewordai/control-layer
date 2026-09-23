@@ -19,15 +19,24 @@ async fn test_inference_body_limit_precedes_processing_in_all_modes(pool: PgPool
         config.onwards.strict_mode = strict_mode;
         config.cache.enabled = false;
         config.limits.requests.max_body_size = 64;
-        let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
+        let app = crate::Application::new_with_pool(config.clone(), Some(pool.clone()), None)
             .await
             .expect("Failed to create application");
+        // The downstream router limits are fixed at startup. Reloading a larger
+        // cap must not permit oversized bodies to reach the outer parsers.
+        config.limits.requests.max_body_size = 1000;
+        app.app_state.config.store(config);
         let (server, _services) = app.into_test_server();
 
         for path in ["chat/completions", "completions", "responses", "messages", "embeddings"] {
             // Invalid JSON would produce a 400 if the inference parser ran first.
             let response = server.post(&format!("/ai/v1/{path}")).bytes(vec![b'x'; 65].into()).await;
             response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["type"], "request_too_large");
+            if path == "messages" {
+                assert_eq!(body["type"], "error");
+            }
 
             let response = server
                 .post(&format!("/ai/v1/{path}"))

@@ -39,7 +39,7 @@ pub(crate) async fn admin_ai_proxy<P: sqlx_pool_router::PoolProvider + Clone>(
 
     // This parser runs before URI rewriting reaches the inference router, so
     // it must enforce the same limit before buffering or extracting the model.
-    let max_bytes = usize::try_from(state.current_config().limits.requests.max_body_size).unwrap_or(usize::MAX);
+    let max_bytes = state.limiters.inference_body_size;
     let body = std::mem::take(request.body_mut());
     let body_bytes = crate::inference::body_limit::read_inference_body(request.headers(), body, max_bytes).await?;
 
@@ -105,7 +105,12 @@ pub async fn admin_ai_proxy_middleware<P: sqlx_pool_router::PoolProvider + Clone
     request: Request,
     next: Next,
 ) -> Result<Response, Error> {
-    let request = admin_ai_proxy(state, request).await?;
+    let path = request.uri().path().to_owned();
+    let request = match admin_ai_proxy(state, request).await {
+        Ok(request) => request,
+        Err(Error::PayloadTooLarge { message }) => return Ok(crate::inference::body_limit::oversized_body(message, &path)),
+        Err(error) => return Err(error),
+    };
     Ok(next.run(request).await)
 }
 
@@ -135,7 +140,10 @@ mod tests {
         let mut config = create_test_config();
         config.limits.requests.max_body_size = 4;
         let user = create_test_user(&pool, Role::StandardUser).await;
-        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
+        let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config.clone()).await;
+        // Reloads must not raise this guard above the downstream startup caps.
+        config.limits.requests.max_body_size = 100;
+        state.config.store(config);
         for length in [None, Some("5")] {
             let mut request = axum::http::Request::post("/admin/api/v1/ai/v1/chat/completions")
                 .header("x-doubleword-user", user.external_user_id.as_ref().unwrap_or(&user.username))
@@ -147,6 +155,27 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(error, crate::errors::Error::PayloadTooLarge { .. }));
+        }
+
+        let router = axum::Router::new()
+            .fallback(|| async { "unexpected success" })
+            .layer(axum::middleware::from_fn_with_state(state, super::admin_ai_proxy_middleware));
+        let server = axum_test::TestServer::new(router).unwrap();
+        for endpoint in ["chat/completions", "messages"] {
+            let response = server
+                .post(&format!("/admin/api/v1/ai/v1/{endpoint}"))
+                .add_header("x-doubleword-user", user.external_user_id.as_ref().unwrap_or(&user.username))
+                .add_header("x-doubleword-email", &user.email)
+                .bytes("xxxxx".into())
+                .await;
+            response.assert_status(axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+            let body: serde_json::Value = response.json();
+            assert_eq!(body["error"]["type"], "request_too_large");
+            if endpoint == "messages" {
+                assert_eq!(body["type"], "error");
+            } else {
+                assert_eq!(body["error"]["code"], "request_too_large");
+            }
         }
     }
 

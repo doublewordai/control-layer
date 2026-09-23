@@ -2562,7 +2562,7 @@ pub async fn build_router(
     // it. Inner limits are too late to prevent allocation amplification. Keep
     // this on the onwards router so files/batches retain their separate limits.
     let onwards_router = onwards_router.layer(middleware::from_fn_with_state(
-        usize::try_from(config.limits.requests.max_body_size).unwrap_or(usize::MAX),
+        state.limiters.inference_body_size,
         crate::inference::body_limit::limit_inference_body,
     ));
 

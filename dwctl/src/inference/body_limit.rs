@@ -20,7 +20,7 @@ pub async fn limit_inference_body(State(max_bytes): State<usize>, request: Reque
     let (parts, body) = request.into_parts();
     match read_inference_body(&parts.headers, body, max_bytes).await {
         Ok(bytes) => next.run(Request::from_parts(parts, Body::from(bytes))).await,
-        Err(crate::errors::Error::PayloadTooLarge { .. }) => oversized_body(max_bytes),
+        Err(crate::errors::Error::PayloadTooLarge { message }) => oversized_body(message, parts.uri.path()),
         Err(_) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": {
@@ -66,16 +66,17 @@ pub(crate) async fn read_inference_body(headers: &HeaderMap, body: Body, max_byt
         })
 }
 
-fn oversized_body(max_bytes: usize) -> Response {
-    (
-        StatusCode::PAYLOAD_TOO_LARGE,
-        Json(serde_json::json!({"error": {
-            "message": format!("Request body exceeds the maximum size of {max_bytes} bytes"),
-            "type": "request_too_large",
-            "code": "request_too_large"
-        }})),
-    )
-        .into_response()
+pub(crate) fn oversized_body(message: String, path: &str) -> Response {
+    let body = if path.ends_with("/messages") {
+        serde_json::json!({"type": "error", "error": {
+            "message": message, "type": "request_too_large"
+        }})
+    } else {
+        serde_json::json!({"error": {
+            "message": message, "type": "request_too_large", "code": "request_too_large"
+        }})
+    };
+    (StatusCode::PAYLOAD_TOO_LARGE, Json(body)).into_response()
 }
 
 #[cfg(test)]
