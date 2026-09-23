@@ -150,6 +150,14 @@ rules, because it cannot run inside a transaction:
    is an operator decision (rename or drop by hand), never something a
    migration guesses at.
 
+   For a UNIQUE index, this recovery covers cancellation or interruption, not
+   duplicate source data. A uniqueness violation leaves an INVALID index and a
+   following REINDEX will report the same conflict. Reconcile the reported rows
+   to one canonical row per key, then rerun the migration. If `indisready` is
+   true, the invalid index remains maintained and prevents new conflicting
+   writes while the repair is performed; check the catalog because a failure in
+   an earlier build phase can leave it false.
+
    If `REINDEX INDEX CONCURRENTLY` itself is interrupted it can leave an
    invalid `<index>_ccnew` behind; the next `REINDEX` run tolerates it, and
    `DROP INDEX CONCURRENTLY IF EXISTS <index>_ccnew` in its own
