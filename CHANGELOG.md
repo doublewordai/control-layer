@@ -1,5 +1,17 @@
 # Changelog
 
+## [12.3.0](https://github.com/doublewordai/control-layer/compare/v12.2.2...v12.3.0) (2026-09-23)
+
+
+### Features
+
+* **dashboard:** let admins remove funds from the gift funds dialog ([#1832](https://github.com/doublewordai/control-layer/issues/1832)) ([3ef94e5](https://github.com/doublewordai/control-layer/commit/3ef94e504860ba69cb08a2a0021f8c6f0c87a272))
+
+
+### Bug Fixes
+
+* **underway:** ordered claim index, bounded task retention, purge script ([#1828](https://github.com/doublewordai/control-layer/issues/1828)) ([a888adb](https://github.com/doublewordai/control-layer/commit/a888adb5cdcc17db120db15fcfb6d67fb3016d97))
+
 ## [12.2.2](https://github.com/doublewordai/control-layer/compare/v12.2.1...v12.2.2) (2026-09-22)
 
 
