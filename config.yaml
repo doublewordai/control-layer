@@ -956,6 +956,12 @@ image_normalizer:
     # endpoint_url: https://<account_id>.r2.cloudflarestorage.com
     # region: auto            # R2 uses "auto"; AWS S3 uses e.g. us-east-1
     # force_path_style: true  # required by most S3-compatible endpoints
+    # reuse_max_age_secs: 1036800  # 12 days. Objects are deduplicated by
+    #                               # content hash, and the R2 lifecycle deletes
+    #                               # them 14 days after upload regardless of use,
+    #                               # so a dedup hit older than this is re-uploaded
+    #                               # rather than referenced by a 24h batch that
+    #                               # would outlive it. 0 disables.
   fetcher:
     max_bytes: 20971520        # 20 MiB
     timeout_secs: 30

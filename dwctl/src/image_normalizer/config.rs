@@ -79,7 +79,28 @@ pub enum BackendConfig {
         /// S3-compatible endpoints (R2, MinIO); defaults to true.
         #[serde(default = "default_true")]
         force_path_style: bool,
+        /// Re-upload an object on a dedup hit once it is this old, in
+        /// seconds. `0` disables the check.
+        ///
+        /// Objects are content-addressed and deduplicated, so a customer who
+        /// reuses an image has it uploaded once and referenced from then on.
+        /// A bucket lifecycle rule (production R2: delete after 14 days,
+        /// counted from upload, not last use) then removes it while batch
+        /// requests still point at it. On 2026-09-24 three Qwen3-VL-235B
+        /// batch requests retried an image fetch 404 more than 600 times
+        /// each: the object had been uploaded 14 days earlier, the dedup
+        /// check found it an hour before expiry, and it vanished mid-batch.
+        ///
+        /// Set this to the lifecycle age minus the longest time a signed
+        /// reference can stay in use (a 24h batch plus its 24h retry
+        /// buffer). The default, 12 days, matches the 14-day production rule.
+        #[serde(default = "default_s3_reuse_max_age_secs")]
+        reuse_max_age_secs: u64,
     },
+}
+
+fn default_s3_reuse_max_age_secs() -> u64 {
+    12 * 24 * 60 * 60
 }
 
 fn default_gcs_region() -> String {
@@ -227,6 +248,22 @@ impl SigningConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn s3_reuse_max_age_defaults_to_twelve_days_and_can_be_disabled() {
+        let cfg: BackendConfig = serde_yaml::from_str("type: s3_compatible\nbucket: b\nendpoint_url: https://example.invalid\n").unwrap();
+        let BackendConfig::S3Compatible { reuse_max_age_secs, .. } = cfg else {
+            panic!("expected s3_compatible");
+        };
+        assert_eq!(reuse_max_age_secs, 12 * 24 * 60 * 60);
+
+        let cfg: BackendConfig =
+            serde_yaml::from_str("type: s3_compatible\nbucket: b\nendpoint_url: https://example.invalid\nreuse_max_age_secs: 0\n").unwrap();
+        let BackendConfig::S3Compatible { reuse_max_age_secs, .. } = cfg else {
+            panic!("expected s3_compatible");
+        };
+        assert_eq!(reuse_max_age_secs, 0);
+    }
 
     #[test]
     fn defaults_disabled_with_no_backend() {
