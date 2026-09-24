@@ -57,29 +57,32 @@ For the requested model, billing uses the API key's owning account and the
 access to a class. An existing private alias keeps its own prices; there is no
 implicit pricing fallback between model aliases.
 
-First discard tariffs outside their validity interval or for another account,
-class, purpose or batch window. Then choose the first eligible entry below:
+First discard tariffs outside their validity interval or for another account
+or class. Then choose the first eligible purpose/window entry below:
 
 | Priority | Realtime | Playground | Batch/flex, completion window W |
 |---|---|---|---|
 | 1 | Account + class, realtime | Account + class, playground | Account + standard, batch W |
 | 2 | Account all-class, realtime | Account + class, realtime | Account all-class, batch W |
 | 3 | General model, realtime | Account all-class, playground | General model, batch W |
-| 4 | — | Account all-class, realtime | — |
-| 5 | — | General model, playground | — |
-| 6 | — | General model, realtime | — |
+| 4 | — | Account all-class, realtime | Account + standard, realtime |
+| 5 | — | General model, playground | Account all-class, realtime |
+| 6 | — | General model, realtime | General model, realtime |
 
 Playground's realtime fallback is evaluated **within each scope** before moving
 to the next scope. An organisation's realtime deal therefore beats a general
-playground price. Realtime never substitutes for batch, and a 1h batch price
-never substitutes for 24h. Realtime/playground use no completion window.
+playground price. Batch/flex exhausts all three exact-window batch scopes before
+trying realtime prices in the same scope order, using only the standard class.
+A 1h batch price never substitutes for 24h. Realtime/playground use no completion
+window.
 Continuation and platform purposes do not select customer prices.
 
 A selected row supplies both input and output prices. Zero is an explicit price
 and stops fallback; the resolver never chooses the cheapest row or combines
 fields from different rows. If no eligible price exists, analytics cost remains
-NULL and no usage debit is created. This avoids an invented charge, but missing
-batch tiers can underbill: configure every supported completion window.
+NULL and no usage debit is created. A missing batch tier uses the realtime safety
+net first; it remains unpriced only if no eligible realtime price exists either.
+Configure every supported completion window to avoid unintended realtime charges.
 
 Validity is `valid_from <= time < valid_until` (an absent end is unbounded).
 Batch pricing uses batch creation time; other pricing uses the captured request
@@ -95,7 +98,8 @@ Customer model list/detail prices deliberately present **one all-class set**:
 account all-class deal → general model, separately for each existing
 purpose/completion-window tier. Class-specific prices (including `standard`)
 are omitted until there is a public UX for them. Playground can use realtime
-within each scope; batch stays exact-purpose/exact-window. Price sorting uses
+within each scope. Batch tries the all-class account and general exact-window
+prices before their realtime fallbacks; class prices stay hidden. Price sorting uses
 the same display resolver and the existing minimum input-plus-output metric.
 Zero is a valid display price; missing prices sort last. The response exposes
 effective amounts without organisation/class metadata. Platform managers retain

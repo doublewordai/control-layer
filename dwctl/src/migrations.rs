@@ -697,6 +697,26 @@ mod tests {
         assert!(second.applied.is_empty());
     }
 
+    #[test]
+    fn main_migration_versions_use_unique_timestamps_after_legacy_history() {
+        let legacy: BTreeSet<i64> = (1..=156).filter(|v| ![140, 141, 150, 151].contains(v)).collect();
+        let mut seen = BTreeSet::new();
+        for migration in Target::main().migrator.iter() {
+            let version = migration.version;
+            assert!(seen.insert(version), "duplicate main migration version {version}");
+            if legacy.contains(&version) {
+                continue;
+            }
+            let stamp = version.to_string();
+            assert!(
+                stamp.len() == 14 && chrono::NaiveDateTime::parse_from_str(&stamp, "%Y%m%d%H%M%S").is_ok(),
+                "new main migration {version} must use a UTC YYYYMMDDhhmmss version; integer history is frozen"
+            );
+            assert!(version >= 20260924115900, "do not backfill main migration history: {version}");
+        }
+        assert!(legacy.is_subset(&seen), "released integer migrations must remain present");
+    }
+
     #[sqlx::test(migrations = false)]
     async fn check_rejects_an_unmigrated_database(pool: PgPool) {
         let err = check(&Target::main(), &pool).await.unwrap_err().to_string();

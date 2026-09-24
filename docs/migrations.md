@@ -107,9 +107,18 @@ happened, or nothing did. Prefer this whenever Postgres allows it:
   fails fast and the Job's next attempt retries, instead of queueing every
   request behind it.
 
-Naming: `dwctl/migrations/NNN_description.sql` (sequential), or
+Naming: new main migrations use `dwctl/migrations/YYYYMMDDhhmmss_description.sql`
+(UTC timestamps); Fusillade uses
 `fusillade-arsenal/migrations/YYYYMMDDhhmmss_description.up.sql` plus a
-`.down.sql`. **Never edit a migration after it has been released.** SQLx
+`.down.sql`. The existing main integer versions through 156 are frozen; never
+add another integer version or fill a historical gap. The migration tests enforce
+unique versions and timestamp naming after that legacy history. Choose a timestamp
+newer than every migration on the target branch; rebase and renumber unreleased
+files when necessary. An unknown version below a running binary's latest version
+is treated as divergent history, so backfilling older numbers can prevent older
+pods from restarting during a rollout or rollback.
+
+**Never edit a migration after it has been released.** SQLx
 checksums each file; a changed checksum stops both the Job and every
 `check`-mode pod (`released migration file(s) changed after they were
 applied`). Ship a new migration instead.

@@ -98,6 +98,10 @@ async fn tariff_indexes_accept_prebuilt_and_recover_interrupted_builds(pool: PgP
         .execute(&pool)
         .await
         .unwrap();
+    sqlx::query("UPDATE pg_index SET indisvalid=false, indisready=false WHERE indexrelid='idx_model_tariffs_general_history'::regclass")
+        .execute(&pool)
+        .await
+        .unwrap();
     apply(&target, &pool).await.unwrap();
     assert_valid(&pool).await;
 }
@@ -217,4 +221,64 @@ async fn legacy_general_price_queries_survive_each_upgrade_boundary(pool: PgPool
         .await
         .unwrap();
     assert_eq!(scoped, 0);
+}
+
+/// IF NOT EXISTS and REINDEX must not bless an incorrectly prebuilt history index.
+#[sqlx::test(migrations = false)]
+async fn general_tariff_history_index_rejects_wrong_definitions(pool: PgPool) {
+    let target = Target::main();
+    target.run_to(20260924203009, &pool).await.unwrap();
+    for definition in [
+        "ON model_tariffs (user_id) WHERE user_id IS NULL",
+        "ON model_tariffs (deployed_model_id DESC) WHERE user_id IS NULL",
+        "ON model_tariffs (deployed_model_id) WHERE user_id IS NULL AND valid_until IS NULL",
+        "ON model_tariffs (deployed_model_id) INCLUDE (id) WHERE user_id IS NULL",
+        "ON model_cache_tariffs (deployed_model_id) WHERE user_id IS NULL",
+    ] {
+        sqlx::raw_sql(&format!("CREATE INDEX idx_model_tariffs_general_history {definition}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let error = apply(&target, &pool).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("idx_model_tariffs_general_history is missing, invalid, not ready, or has the wrong definition"),
+            "{error:#}"
+        );
+        sqlx::query("DROP INDEX idx_model_tariffs_general_history")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM _sqlx_migrations WHERE version >= 20260924203010")
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+}
+
+#[sqlx::test(migrations = false)]
+async fn general_tariff_history_validation_rejects_missing_invalid_and_not_ready(pool: PgPool) {
+    let target = Target::main();
+    target.run_to(20260924203020, &pool).await.unwrap();
+    for flag in ["indisvalid", "indisready"] {
+        sqlx::query(&format!(
+            "UPDATE pg_index SET {flag}=false WHERE indexrelid='idx_model_tariffs_general_history'::regclass"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        let error = apply(&target, &pool).await.unwrap_err();
+        assert!(format!("{error:#}").contains("missing, invalid, not ready"), "{error:#}");
+        sqlx::query(&format!(
+            "UPDATE pg_index SET {flag}=true WHERE indexrelid='idx_model_tariffs_general_history'::regclass"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    sqlx::query("DROP INDEX idx_model_tariffs_general_history")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let error = apply(&target, &pool).await.unwrap_err();
+    assert!(format!("{error:#}").contains("missing, invalid, not ready"), "{error:#}");
 }
