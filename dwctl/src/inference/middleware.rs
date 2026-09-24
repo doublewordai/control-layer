@@ -1003,6 +1003,7 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     model: &str,
     background: bool,
 ) -> Response {
+    let request_id = flex_input.request_id;
     // Flex needs the row created synchronously (daemon must find it).
     if let Err(e) = fusillade::Storage::create_flex(&*state.request_manager, flex_input).await {
         tracing::error!(error = %e, "Failed to create flex row in fusillade");
@@ -1040,8 +1041,13 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
         let poll_interval = std::time::Duration::from_millis(500);
         let timeout = std::time::Duration::from_secs(3600);
 
+        // Dropped on client disconnect (hyper drops the handler future) or on
+        // poll failure: either way nobody will collect the result, so cancel
+        // the row rather than let the daemon keep working it.
+        let abandon_guard = response_store::AbandonGuard::arm(state.request_manager.clone(), request_id);
         match response_store::poll_until_complete(&state.request_manager, resp_id, poll_interval, timeout, state.keystore.as_ref()).await {
             Ok(response_obj) => {
+                abandon_guard.disarm();
                 let status_code = if response_obj["status"].as_str() == Some("completed") {
                     StatusCode::OK
                 } else {
@@ -1115,6 +1121,7 @@ async fn handle_background<P: PoolProvider + Clone + Send + Sync + 'static>(
 ///
 /// Always blocks: chat completions has no `background` field in the OpenAI surface,
 /// so we hold the connection until the daemon finishes (or we hit the 1h timeout).
+/// If the caller disconnects first, the queued request is cancelled.
 /// On success the upstream `chat.completion` body is returned verbatim. On failure
 /// the OpenAI chat-completions error envelope is returned with the upstream HTTP
 /// status surfaced.
@@ -1144,8 +1151,12 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
     let poll_interval = std::time::Duration::from_millis(500);
     let timeout = std::time::Duration::from_secs(3600);
 
+    // See `handle_flex`: cancel the row if the caller disconnects or the poll
+    // gives up before a terminal state was delivered.
+    let abandon_guard = response_store::AbandonGuard::arm(state.request_manager.clone(), request_id);
     match response_store::poll_until_terminal(&state.request_manager, request_id, poll_interval, timeout, state.keystore.as_ref()).await {
         Ok(detail) => {
+            abandon_guard.disarm();
             let (status, body) = response_store::detail_to_chat_completion_object(&detail);
             let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             tracing::debug!(request_id = %request_id, %status_code, "Flex chat-completions terminal");

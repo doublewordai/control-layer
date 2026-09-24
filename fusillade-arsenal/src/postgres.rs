@@ -5156,6 +5156,56 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(rows.into_iter().map(BatchId::from).collect())
     }
 
+    async fn get_cancelled_request_ids(&self, request_ids: &[RequestId]) -> Result<Vec<RequestId>> {
+        if request_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let uuids: Vec<Uuid> = request_ids.iter().map(|id| **id).collect();
+
+        let rows: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id
+            FROM requests
+            WHERE id = ANY($1)
+              AND state = 'canceled'
+            "#,
+        )
+        .bind(&uuids)
+        .fetch_all(self.read_executor())
+        .await
+        .map_err(|e| {
+            FusilladeError::Other(anyhow!("Failed to fetch cancelled request IDs: {}", e))
+        })?;
+
+        Ok(rows.into_iter().map(RequestId).collect())
+    }
+
+    async fn cancel_batchless_request(&self, request_id: RequestId) -> Result<bool> {
+        // Same guard as the `AnyRequest::Canceled` arm of `persist` for a
+        // request with no claim context: only the hard terminals resist.
+        // Ownership columns are left as they are so a daemon holding the
+        // claim still recognises the row as its own when it observes the
+        // cancel (or when a late completion supersedes it).
+        let cancelled: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            UPDATE requests SET
+                state = 'canceled',
+                canceled_at = NOW()
+            WHERE id = $1
+              AND batch_id IS NULL
+              AND state NOT IN ('completed', 'failed', 'canceled')
+            RETURNING id
+            "#,
+        )
+        .bind(*request_id)
+        .fetch_optional(self.write_executor())
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to cancel batchless request: {}", e)))?;
+
+        Ok(cancelled.is_some())
+    }
+
     #[tracing::instrument(skip(self), fields(batch_id = %batch_id))]
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()> {
         let now = Utc::now();
@@ -24628,6 +24678,84 @@ mod tests {
             .unwrap()
             .expect("completed request must return its payload");
         assert_eq!(detail.response_body.as_deref(), Some("done"));
+    }
+
+    #[sqlx::test]
+    async fn get_cancelled_request_ids_reports_only_canceled_rows(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let request_id = uuid::Uuid::new_v4();
+            manager
+                .create_flex(crate::request::CreateFlexInput {
+                    request_id,
+                    body: r#"{"model":"m","messages":[]}"#.to_string(),
+                    model: "m".to_string(),
+                    endpoint: "http://localhost/ai".to_string(),
+                    method: "POST".to_string(),
+                    path: "/v1/chat/completions".to_string(),
+                    api_key: "k".to_string(),
+                    created_by: "owner".to_string(),
+                    metadata: None,
+                })
+                .await
+                .unwrap();
+            ids.push(crate::request::RequestId(request_id));
+        }
+        let unknown = crate::request::RequestId(uuid::Uuid::new_v4());
+
+        assert!(
+            manager
+                .get_cancelled_request_ids(&[ids[0], ids[1], unknown])
+                .await
+                .unwrap()
+                .is_empty(),
+            "pending rows are not cancelled"
+        );
+        assert!(
+            manager
+                .get_cancelled_request_ids(&[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        assert!(manager.cancel_batchless_request(ids[0]).await.unwrap());
+        assert!(
+            !manager.cancel_batchless_request(ids[0]).await.unwrap(),
+            "second cancel is a no-op"
+        );
+        assert!(
+            !manager.cancel_batchless_request(unknown).await.unwrap(),
+            "unknown row is a no-op"
+        );
+
+        let cancelled = manager
+            .get_cancelled_request_ids(&[ids[0], ids[1], unknown])
+            .await
+            .unwrap();
+        assert_eq!(cancelled, vec![ids[0]]);
+
+        // Hard terminals resist: a completed row is left alone.
+        sqlx::query(
+            "UPDATE requests SET state = 'completed', response_body = '{}', response_status = 200, completed_at = now() WHERE id = $1",
+        )
+        .bind(*ids[1])
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(!manager.cancel_batchless_request(ids[1]).await.unwrap());
+        let state: String = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(*ids[1])
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(state, "completed");
     }
 
     #[sqlx::test]

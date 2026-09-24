@@ -28,7 +28,9 @@ use crate::manager::{
     RetainedResponseRetirementOutcome, RetentionPolicy, Storage,
 };
 use crate::processor::{DefaultRequestProcessor, RequestProcessor};
-use crate::request::{Claimed, DaemonId, FailureReason, Request, RequestCompletionResult};
+use crate::request::{
+    Claimed, DaemonId, FailureReason, Request, RequestCompletionResult, RequestId,
+};
 
 pub use config::{
     DaemonConfig, DaemonMode, LeakConfig, ModelEscalationConfig, RetentionMaintenanceConfig,
@@ -1728,6 +1730,11 @@ where
     /// Map of batch_id -> cancellation token for batch-level cancellation
     /// All requests in a batch share the same cancellation token
     cancellation_tokens: Arc<dashmap::DashMap<BatchId, tokio_util::sync::CancellationToken>>,
+    /// Map of request_id -> cancellation token for in-flight batchless
+    /// (flex/background) requests, which have no batch to be cancelled through.
+    /// Entries live only while the request's processing task runs.
+    batchless_cancellation_tokens:
+        Arc<dashmap::DashMap<RequestId, tokio_util::sync::CancellationToken>>,
 }
 
 impl<S, H> Daemon<S, H>
@@ -1803,6 +1810,7 @@ where
             requests_failed: Arc::new(AtomicU64::new(0)),
             shutdown_token,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
+            batchless_cancellation_tokens: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -2588,10 +2596,19 @@ where
                 let should_retry = self.config.should_retry.clone();
                 let shutdown_token = self.shutdown_token.clone();
                 let cancellation_tokens = self.cancellation_tokens.clone();
+                let batchless_cancellation_tokens = self.batchless_cancellation_tokens.clone();
 
+                // Batched requests share their batch's token, fired when the
+                // batch is cancelled. Batchless requests get their own, keyed
+                // by request id and fired when the cancellation poll sees the
+                // row move to `canceled` (e.g. the API layer cancelling a flex
+                // request whose caller disconnected).
                 let batch_cancellation_token = match batch_id {
                     Some(bid) => cancellation_tokens.entry(bid).or_default().clone(),
-                    None => tokio_util::sync::CancellationToken::new(),
+                    None => batchless_cancellation_tokens
+                        .entry(request_id)
+                        .or_default()
+                        .clone(),
                 };
 
                 // Record which version of the limit this request is being sent
@@ -2651,6 +2668,16 @@ where
                     }
 
                     let processing_start = std::time::Instant::now();
+                    // The batchless token is only meaningful while this task
+                    // runs; drop it on every exit path so the cancellation poll
+                    // does not keep checking finished requests.
+                    let batchless_token_id = batch_id.is_none().then_some(request_id);
+                    let batchless_tokens_for_guard = batchless_cancellation_tokens.clone();
+                    let _batchless_token_guard = scopeguard::guard((), move |_| {
+                        if let Some(id) = batchless_token_id {
+                            batchless_tokens_for_guard.remove(&id);
+                        }
+                    });
                     let model_for_guard = capacity_model_clone.clone();
                     let user_for_guard = user_id.clone();
                     let cw_for_guard = completion_window.clone();
@@ -3257,6 +3284,7 @@ where
         // 1. Triggers lazy finalization by fetching batches (computes completion timestamps)
         // 2. Detects cancelled batches and aborts their in-flight requests
         let cancellation_tokens = self.cancellation_tokens.clone();
+        let batchless_cancellation_tokens = self.batchless_cancellation_tokens.clone();
         let storage = self.storage.clone();
         let shutdown_token = self.shutdown_token.clone();
         let cancellation_poll_interval_ms = self.config.cancellation_poll_interval_ms;
@@ -3282,43 +3310,85 @@ where
                             .map(|entry| *entry.key())
                             .collect();
 
-                        if active_batch_ids.is_empty() {
+                        // In-flight batchless requests, watched by row rather than by batch.
+                        let active_request_ids: Vec<RequestId> = batchless_cancellation_tokens
+                            .iter()
+                            .map(|entry| *entry.key())
+                            .collect();
+
+                        if active_batch_ids.is_empty() && active_request_ids.is_empty() {
                             continue;
                         }
 
                         let poll_start = std::time::Instant::now();
                         gauge!("fusillade_cancellation_poll_batches_checked")
                             .set(active_batch_ids.len() as f64);
+                        gauge!("fusillade_cancellation_poll_requests_checked")
+                            .set(active_request_ids.len() as f64);
 
                         // Single bulk query to find which active batches have been cancelled.
                         // If a silently severed connection wedges this poll, cancelled batches
                         // keep spending and finalization stalls, so bound it like claims.
-                        match with_query_timeout(
-                            "cancellation poll query",
-                            poll_query_timeout,
-                            storage.get_cancelled_batch_ids(&active_batch_ids),
-                        )
-                        .await
-                        {
-                            Ok(cancelled_ids) => {
-                                for batch_id in cancelled_ids {
-                                    if let Some(entry) = cancellation_tokens.get(&batch_id) {
-                                        entry.value().cancel();
-                                        counter!("fusillade_batches_cancelled_total").increment(1);
-                                        tracing::info!(batch_id = %batch_id, "Cancelled all requests in batch");
-                                        drop(entry);
-                                        cancellation_tokens.remove(&batch_id);
+                        if !active_batch_ids.is_empty() {
+                            match with_query_timeout(
+                                "cancellation poll query",
+                                poll_query_timeout,
+                                storage.get_cancelled_batch_ids(&active_batch_ids),
+                            )
+                            .await
+                            {
+                                Ok(cancelled_ids) => {
+                                    for batch_id in cancelled_ids {
+                                        if let Some(entry) = cancellation_tokens.get(&batch_id) {
+                                            entry.value().cancel();
+                                            counter!("fusillade_batches_cancelled_total").increment(1);
+                                            tracing::info!(batch_id = %batch_id, "Cancelled all requests in batch");
+                                            drop(entry);
+                                            cancellation_tokens.remove(&batch_id);
+                                        }
                                     }
                                 }
+                                Err(e) => {
+                                    // Sustained failure means cancelled batches keep spending and
+                                    // completed batches never get finalized - error, not warn.
+                                    crate::background_error!(
+                                        "cancellation_poll_failed", Error,
+                                        error = %e,
+                                        "Failed to check batch cancellation status"
+                                    );
+                                }
                             }
-                            Err(e) => {
-                                // Sustained failure means cancelled batches keep spending and
-                                // completed batches never get finalized - error, not warn.
-                                crate::background_error!(
-                                    "cancellation_poll_failed", Error,
-                                    error = %e,
-                                    "Failed to check batch cancellation status"
-                                );
+                        }
+
+                        // Same shape for batchless rows: a row that has moved to
+                        // `canceled` under a running task means the caller gave up
+                        // (flex client disconnected); abort the upstream call so
+                        // the engine stops spending on it.
+                        if !active_request_ids.is_empty() {
+                            match with_query_timeout(
+                                "batchless cancellation poll query",
+                                poll_query_timeout,
+                                storage.get_cancelled_request_ids(&active_request_ids),
+                            )
+                            .await
+                            {
+                                Ok(cancelled_ids) => {
+                                    for request_id in cancelled_ids {
+                                        if let Some(entry) = batchless_cancellation_tokens.get(&request_id) {
+                                            entry.value().cancel();
+                                            drop(entry);
+                                            batchless_cancellation_tokens.remove(&request_id);
+                                            tracing::info!(request_id = %request_id, "Cancelled in-flight batchless request");
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    crate::background_error!(
+                                        "cancellation_poll_failed", Error,
+                                        error = %e,
+                                        "Failed to check batchless request cancellation status"
+                                    );
+                                }
                             }
                         }
 

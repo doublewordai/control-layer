@@ -9,6 +9,8 @@
 use std::sync::Arc;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
+
+use crate::inference::store::cancel_abandoned_request;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -54,6 +56,12 @@ impl ReplayFrame {
 /// Enqueue failure is the one exception: it happens before any byte is sent,
 /// so it still returns a clean JSON `500`.
 ///
+/// If the client disconnects while we are still polling, the request is
+/// cancelled (see [`cancel_abandoned_request`]): nobody will collect the
+/// result, and leaving it queued or in flight only spends engine time. The
+/// same happens when the poll itself gives up, since the client has by then
+/// been answered with an error frame.
+///
 /// `done_sentinel` appends a trailing `data: [DONE]` (the chat-completions
 /// terminator); the Responses surface ends on `response.completed`/`.failed`
 /// and passes `false`.
@@ -95,13 +103,22 @@ where
     tokio::spawn(async move {
         let poll_interval = std::time::Duration::from_millis(500);
         let timeout = std::time::Duration::from_secs(3600);
-        let result =
-            crate::inference::store::poll_until_terminal(&request_manager, request_id, poll_interval, timeout, keystore.as_ref()).await;
+        let result = tokio::select! {
+            result = crate::inference::store::poll_until_terminal(&request_manager, request_id, poll_interval, timeout, keystore.as_ref()) => result,
+            // The receiver lives in the response body; it is dropped when the
+            // client goes away.
+            _ = tx.closed() => {
+                tracing::info!(request_id = %request_id, "Client disconnected before flex request finished");
+                cancel_abandoned_request(&request_manager, request_id).await;
+                return;
+            }
+        };
 
         let frames = match &result {
             Ok(detail) => render(Ok(detail)),
             Err(e) => {
                 tracing::error!(error = %e, request_id = %request_id, "Streaming flex poll failed");
+                cancel_abandoned_request(&request_manager, request_id).await;
                 render(Err(&e.to_string()))
             }
         };
@@ -121,4 +138,64 @@ where
     });
 
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fusillade_arsenal::PostgresRequestManager;
+    use sqlx_pool_router::TestDbPools;
+
+    fn flex_input(request_id: uuid::Uuid) -> fusillade::CreateFlexInput {
+        fusillade::CreateFlexInput {
+            request_id,
+            body: r#"{"model":"m","messages":[]}"#.to_string(),
+            model: "m".to_string(),
+            endpoint: "http://localhost/ai".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            api_key: "k".to_string(),
+            created_by: "owner".to_string(),
+            metadata: None,
+        }
+    }
+
+    async fn request_state(pool: &sqlx::PgPool, request_id: uuid::Uuid) -> String {
+        sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn dropping_the_stream_cancels_the_flex_request(pool: sqlx::PgPool) {
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
+        let request_manager = Arc::new(PostgresRequestManager::new(
+            TestDbPools::new(fusillade_pool.clone()).await.unwrap(),
+            Default::default(),
+        ));
+        let request_id = uuid::Uuid::new_v4();
+
+        let response = flex_stream_response(request_manager, flex_input(request_id), request_id, true, None, |_| Vec::new()).await;
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(request_state(&fusillade_pool, request_id).await, "pending");
+
+        // Client disconnect: the SSE body (and its receiver) is dropped.
+        drop(response);
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = request_state(&fusillade_pool, request_id).await;
+            if state == "canceled" {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "request stayed {state} after the stream was dropped"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
 }

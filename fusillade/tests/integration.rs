@@ -6,7 +6,8 @@ use fusillade::daemon::{
 use fusillade::http::{HttpResponse, MockHttpClient};
 use fusillade::manager::{ModelFilter, ModelFilterState, Storage};
 use fusillade::request::{
-    CreateBackgroundInput, CreateFlexInput, Failed, ListRequestsFilter, Request, ServiceTierFilter,
+    CreateBackgroundInput, CreateFlexInput, Failed, ListRequestsFilter, Request, RequestId,
+    ServiceTierFilter,
 };
 use fusillade_arsenal::{PostgresRequestManager as PostgresStore, TestDbPools};
 use std::sync::Arc;
@@ -376,6 +377,102 @@ async fn default_claims_start_while_weekly_partition_ddl_is_blocked(pool: sqlx::
         .expect("claim loop must not await the blocked weekly DDL");
 
     blocker.rollback().await.expect("blocker must release");
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("daemon must stop")
+        .expect("daemon task must not panic")
+        .expect("daemon must stop cleanly");
+}
+
+/// A flex row cancelled while its upstream call is in flight (what the API
+/// layer does when a blocking flex caller disconnects) must abort that call
+/// rather than let the daemon run it to completion and retry it.
+#[sqlx::test(migrator = "fusillade_arsenal::MIGRATOR")]
+async fn cancelling_in_flight_batchless_request_aborts_http(pool: sqlx::PgPool) {
+    let http_client = Arc::new(MockHttpClient::new());
+    // Held for the whole test: the upstream call hangs until the daemon aborts it.
+    let _trigger = http_client.add_response_with_trigger(
+        "POST /v1/chat/completions",
+        Ok(HttpResponse {
+            status: 200,
+            body: "{}".to_string(),
+        }),
+    );
+
+    let limits = Arc::new(dashmap::DashMap::new());
+    limits.insert("flex-cancel-model".to_string(), 1);
+    let config = DaemonConfig {
+        claim_interval_ms: 10,
+        claim_batch_size: 1,
+        model_concurrency_limits: limits,
+        status_log_interval_ms: None,
+        throughput_log_interval_ms: None,
+        heartbeat_interval_ms: 10_000,
+        cancellation_poll_interval_ms: 50,
+        claim_query_timeout_ms: 5_000,
+        ..Default::default()
+    };
+    let manager = postgres_store(pool.clone(), &config).await;
+    let request_id = uuid::Uuid::new_v4();
+    manager
+        .create_flex(CreateFlexInput {
+            request_id,
+            body: r#"{"model":"flex-cancel-model","messages":[]}"#.to_string(),
+            model: "flex-cancel-model".to_string(),
+            endpoint: "https://api.example.com".to_string(),
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            api_key: "test-key".to_string(),
+            created_by: "flex-cancel-owner".to_string(),
+            metadata: None,
+        })
+        .await
+        .expect("flex request must seed");
+    mark_models_live_for_test(manager.as_ref(), &["flex-cancel-model"]).await;
+
+    let shutdown = CancellationToken::new();
+    let handle = postgres_daemon(manager.clone(), http_client.clone(), config)
+        .run(shutdown.clone())
+        .expect("daemon must start");
+    tokio::time::timeout(Duration::from_secs(2), wait_for_mock_calls(&http_client, 1))
+        .await
+        .expect("daemon must dispatch the flex request");
+    assert_eq!(http_client.in_flight_count(), 1);
+
+    // Row-level cancel, as the API layer issues on client disconnect.
+    assert!(
+        manager
+            .cancel_batchless_request(RequestId(request_id))
+            .await
+            .expect("cancel must reach storage"),
+        "processing row must be cancellable"
+    );
+
+    // The cancellation poll fires the request's token and aborts the HTTP task.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while http_client.in_flight_count() != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "daemon did not abort the in-flight batchless request after cancel"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Nothing is re-dispatched and the row stays canceled.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        http_client.call_count(),
+        1,
+        "cancelled request must not be retried"
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+        .bind(request_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "canceled");
+
     shutdown.cancel();
     tokio::time::timeout(Duration::from_secs(5), handle)
         .await
