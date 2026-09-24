@@ -18,7 +18,7 @@
 //! `metadata.max_output_tokens` gate the length rules. A model with no metadata
 //! must never be rejected (fail open).
 
-use axum::http::{StatusCode, header};
+use axum::http::StatusCode;
 use axum_test::{TestResponse, TestServer};
 use serde_json::{Value, json};
 use sqlx::PgPool;
