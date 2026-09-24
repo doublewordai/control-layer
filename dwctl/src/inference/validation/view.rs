@@ -82,28 +82,26 @@ fn add_json(view: &mut RequestView, value: &Value) {
     }
 }
 
-/// Count a `prompt` / `input` value: strings are tokenized text (byte length),
-/// token-id arrays contribute one byte per id, and nesting is flattened.
-fn count_prompt_ids(view: &mut RequestView, value: &Value) {
+/// Bytes of the largest independent sequence in a Completions `prompt` or an
+/// Embeddings `input`. The engine processes each element of a list of strings
+/// (or of token-id lists) as its own sequence against the context window, so
+/// the bound is the largest one, not the sum. A flat list of token ids is a
+/// single sequence; each id counts as one byte (it is exactly one token).
+fn largest_sequence_bytes(value: &Value) -> usize {
     match value {
-        Value::String(text) => add_text(view, text),
-        Value::Array(items) => {
-            for item in items {
-                count_prompt_ids(view, item);
-            }
-        }
-        // A token id (or any number) is at least one token; count one byte so
-        // the bound stays >= the true token count.
-        Value::Number(_) => view.prompt_text_bytes = view.prompt_text_bytes.saturating_add(1),
+        Value::String(text) => text.len(),
+        Value::Array(items) if items.iter().all(Value::is_number) => items.len(),
+        Value::Array(items) => items.iter().map(largest_sequence_bytes).max().unwrap_or(0),
         // null / bool / object are not prompt text in any surface we know.
-        _ => {}
+        _ => 0,
     }
 }
 
-/// Record `max_output_tokens` and the field it came from. `preferred` wins over
-/// `fallback` (chat: `max_completion_tokens` over `max_tokens`).
+/// Record `max_output_tokens` and the field it came from. A non-null
+/// `preferred` wins over `fallback` (chat: `max_completion_tokens` over
+/// `max_tokens`); a null `preferred` is treated as absent.
 fn set_max_output_tokens(view: &mut RequestView, body: &Value, preferred: &'static str, fallback: Option<&'static str>) {
-    if let Some(value) = body.get(preferred) {
+    if let Some(value) = body.get(preferred).filter(|value| !value.is_null()) {
         view.max_output_tokens = Some(value.clone());
         view.max_output_tokens_param = Some(preferred);
     } else if let Some(fallback) = fallback
@@ -197,7 +195,7 @@ fn walk_chat_content(view: &mut RequestView, content: &Value) {
 fn extract_completions(view: &mut RequestView, body: &Value) {
     set_max_output_tokens(view, body, "max_tokens", None);
     if let Some(prompt) = body.get("prompt") {
-        count_prompt_ids(view, prompt);
+        view.prompt_text_bytes = largest_sequence_bytes(prompt);
     }
 }
 
@@ -222,7 +220,16 @@ fn extract_responses(view: &mut RequestView, body: &Value) {
         _ => {}
     }
 
-    count_tools(view, body.get("tools"));
+    // Only function tools reach the engine; the translator drops hosted tools
+    // (`code_interpreter`, `web_search`, ...), so they are not prompt text.
+    if let Some(Value::Array(tools)) = body.get("tools") {
+        for tool in tools
+            .iter()
+            .filter(|tool| tool.get("type").and_then(Value::as_str) == Some("function"))
+        {
+            add_json(view, tool);
+        }
+    }
 }
 
 /// Responses input items. A missing `type` defaults to `message`, matching the
@@ -281,7 +288,8 @@ fn walk_response_content(view: &mut RequestView, content: &Value) {
                             add_text(view, text);
                         }
                     }
-                    Some("input_image") => view.has_image_input = true,
+                    // The Responses translator only forwards images given by URL.
+                    Some("input_image") if part.get("image_url").is_some_and(|url| !url.is_null()) => view.has_image_input = true,
                     Some("input_file") => view.has_file_input = true,
                     Some("input_audio") => view.has_audio_input = true,
                     _ => {}
@@ -382,7 +390,7 @@ fn walk_tool_result_content(view: &mut RequestView, content: &Value) {
 
 fn extract_embeddings(view: &mut RequestView, body: &Value) {
     if let Some(input) = body.get("input") {
-        count_prompt_ids(view, input);
+        view.prompt_text_bytes = largest_sequence_bytes(input);
     }
 }
 
@@ -512,8 +520,9 @@ mod tests {
         assert_eq!(single.prompt_text_bytes, "hello".len());
         assert_eq!(single.max_output_tokens_param, None);
 
+        // Each string is its own sequence: the bound is the largest, not the sum.
         let strings = extract(Surface::Completions, &json!({ "prompt": ["ab", "cde"] }));
-        assert_eq!(strings.prompt_text_bytes, "ab".len() + "cde".len());
+        assert_eq!(strings.prompt_text_bytes, "cde".len());
 
         let tokens = extract(Surface::Completions, &json!({ "prompt": [1, 2, 3], "max_tokens": 5 }));
         assert_eq!(tokens.prompt_text_bytes, 3);
@@ -523,8 +532,10 @@ mod tests {
 
     #[test]
     fn completions_mixed_and_nested_token_arrays() {
-        let view = extract(Surface::Completions, &json!({ "prompt": ["ab", [1, 2], [3]] }));
-        assert_eq!(view.prompt_text_bytes, "ab".len() + 3);
+        let view = extract(Surface::Completions, &json!({ "prompt": ["abc", [1, 2], [3]] }));
+        assert_eq!(view.prompt_text_bytes, "abc".len());
+        let view = extract(Surface::Completions, &json!({ "prompt": ["a", [1, 2, 3, 4]] }));
+        assert_eq!(view.prompt_text_bytes, 4);
     }
 
     #[test]
@@ -671,12 +682,12 @@ mod tests {
         );
         assert_eq!(
             extract(Surface::Embeddings, &json!({ "input": ["a", "bc"] })).prompt_text_bytes,
-            "a".len() + "bc".len()
+            "bc".len()
         );
         assert_eq!(extract(Surface::Embeddings, &json!({ "input": [1, 2, 3] })).prompt_text_bytes, 3);
         assert_eq!(
             extract(Surface::Embeddings, &json!({ "input": [[1, 2], [3]] })).prompt_text_bytes,
-            3
+            2
         );
     }
 
@@ -705,5 +716,37 @@ mod tests {
                 assert_eq!(view.surface, Some(surface));
             }
         }
+    }
+
+    #[test]
+    fn null_max_completion_tokens_falls_back_to_max_tokens() {
+        let view = extract(
+            Surface::ChatCompletions,
+            &json!({ "max_completion_tokens": null, "max_tokens": 100_000 }),
+        );
+        assert_eq!(view.max_output_tokens, Some(json!(100_000)));
+        assert_eq!(view.max_output_tokens_param, Some("max_tokens"));
+    }
+
+    #[test]
+    fn responses_input_image_without_url_is_not_image_input() {
+        let body = |part: Value| json!({ "input": [{ "role": "user", "content": [part] }] });
+        let by_file = extract(Surface::Responses, &body(json!({ "type": "input_image", "file_id": "file-1" })));
+        assert!(!by_file.has_image_input);
+        let by_url = extract(
+            Surface::Responses,
+            &body(json!({ "type": "input_image", "image_url": "https://x/y.png" })),
+        );
+        assert!(by_url.has_image_input);
+    }
+
+    #[test]
+    fn responses_hosted_tools_are_not_counted() {
+        let function = json!({ "type": "function", "name": "f", "parameters": {} });
+        let view = extract(
+            Surface::Responses,
+            &json!({ "tools": [function.clone(), { "type": "code_interpreter", "container": { "type": "auto" } }] }),
+        );
+        assert_eq!(view.prompt_text_bytes, serde_json::to_string(&function).unwrap().len());
     }
 }

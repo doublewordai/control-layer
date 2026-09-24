@@ -945,7 +945,8 @@ request_validation:
   # Set via environment: DWCTL_REQUEST_VALIDATION__ENABLED=true
   enabled: false
   # off | shadow | enforce. Shadow records
-  # dwctl_request_validation_violations_total{rule,surface,model,mode} and
+  # dwctl_request_validation_violations_total{rule,surface,source,model,mode}
+  # (source: request | batch_file) and
   # forwards the request; enforce rejects it.
   default_mode: shadow
   # Per-rule overrides, e.g. DWCTL_REQUEST_VALIDATION__RULES__MODEL_NOT_FOUND=enforce
@@ -954,13 +955,11 @@ request_validation:
   # context_length_exceeded.
   rules: {}
   # Exact prompt token counts via tokenizer-svc (cache.tokenizer_url), only for
-  # prompts larger in bytes than the context window. When enabled, context
-  # rejections are always backed by an exact count; on timeout the request passes.
+  # prompts larger in bytes than the context window. Context rejections are
+  # always backed by an exact count, so with this off the context rule never
+  # rejects. On timeout or tokenizer outage the request passes.
   exact_count_enabled: false
   exact_count_deadline_ms: 2000
-  # Without exact counting: reject on size alone when bytes / this ratio
-  # already exceeds the window (heuristic).
-  reject_min_bytes_per_token: 12.0
 
 image_normalizer:
   enabled: false # Default: false; set to true after configuring a backend

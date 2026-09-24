@@ -13,6 +13,29 @@ use serde_json::Value;
 use super::exact::{ExactCounter, ExactOutcome};
 use super::{ModelInfoSource, ModelLookup, RuleId, RuleMode, Surface, ValidationConfig, Violation, envelope, rules, view};
 
+/// Whether a caller may use a model alias. Validation runs only for callers
+/// that may: everyone else gets the normal authentication or access error
+/// downstream, so rejection messages never reveal anything about a model the
+/// caller cannot use, and unauthenticated traffic never reaches the tokenizer.
+pub trait ModelAccess: Send + Sync {
+    fn allows(&self, bearer_token: Option<&str>, alias: &str) -> bool;
+}
+
+/// The routing table onwards authorises requests against: an alias is usable
+/// when its default pool has no keys or lists the caller's key. This mirrors
+/// onwards' own `/models` visibility check.
+impl ModelAccess for onwards::target::Targets {
+    fn allows(&self, bearer_token: Option<&str>, alias: &str) -> bool {
+        let Some(pools) = self.targets.get(alias) else {
+            return false;
+        };
+        match pools.default_pool().keys() {
+            None => true,
+            Some(keys) => bearer_token.is_some_and(|token| onwards::auth::validate_bearer_token(keys, token)),
+        }
+    }
+}
+
 /// Where a validated request came from, recorded as the `source` metric label.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
@@ -38,28 +61,45 @@ pub struct ValidationStage {
     models: Arc<dyn ModelInfoSource>,
     /// `None` disables stage 2: near-limit requests pass.
     exact: Option<ExactCounter>,
+    /// Gate for [`Self::check`]. `None` validates every caller (tests only).
+    access: Option<Arc<dyn ModelAccess>>,
 }
 
 impl ValidationStage {
-    pub fn new(config: ValidationConfig, models: Arc<dyn ModelInfoSource>, exact: Option<ExactCounter>) -> Self {
+    pub fn new(
+        config: ValidationConfig,
+        models: Arc<dyn ModelInfoSource>,
+        exact: Option<ExactCounter>,
+        access: Option<Arc<dyn ModelAccess>>,
+    ) -> Self {
         rules::describe_metrics();
         let exact = exact.filter(|_| config.exact_count_enabled);
         Self {
             config: Arc::new(config),
             models,
             exact,
+            access,
         }
     }
 
-    /// Validate a parsed inference request body. `Some` is the rejection to
-    /// return to the client; `None` means forward the request unchanged.
-    pub async fn check(&self, surface: Surface, body: &Value) -> Option<Response> {
+    /// Validate a parsed inference request body from a caller presenting
+    /// `bearer_token`. `Some` is the rejection to return to the client; `None`
+    /// means forward the request unchanged. Callers without access to the
+    /// model are not validated (see [`ModelAccess`]).
+    pub async fn check(&self, surface: Surface, body: &Value, bearer_token: Option<&str>) -> Option<Response> {
+        if let Some(access) = &self.access {
+            let alias = body.get("model").and_then(Value::as_str)?;
+            if !access.allows(bearer_token, alias) {
+                return None;
+            }
+        }
         let violation = self.enforced_violation(surface, body, Source::Request).await?;
         Some(envelope::rejection_response(surface, &violation))
     }
 
     /// Run every rule on a parsed body, record all violations, and return the
-    /// first enforced one. Callers render it in their own error shape.
+    /// first enforced one. Callers render it in their own error shape, and must
+    /// already have established that the caller may use the model.
     pub async fn enforced_violation(&self, surface: Surface, body: &Value, source: Source) -> Option<Violation> {
         let view = view::extract(surface, body);
         let lookup = match view.model.as_deref() {
@@ -134,7 +174,7 @@ mod tests {
             default_mode,
             ..ValidationConfig::default()
         };
-        ValidationStage::new(config, Arc::new(models), None)
+        ValidationStage::new(config, Arc::new(models), None, None)
     }
 
     fn chat(model: &str, text: &str) -> Value {
@@ -145,7 +185,7 @@ mod tests {
     async fn valid_request_passes() {
         assert!(
             stage(RuleMode::Enforce)
-                .check(Surface::ChatCompletions, &chat("chat-model", "hi"))
+                .check(Surface::ChatCompletions, &chat("chat-model", "hi"), None)
                 .await
                 .is_none()
         );
@@ -154,7 +194,7 @@ mod tests {
     #[tokio::test]
     async fn enforced_violation_is_rejected_in_surface_shape() {
         let response = stage(RuleMode::Enforce)
-            .check(Surface::ChatCompletions, &chat("missing-model", "hi"))
+            .check(Surface::ChatCompletions, &chat("missing-model", "hi"), None)
             .await
             .expect("unknown model is rejected");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -165,7 +205,7 @@ mod tests {
     async fn shadow_violation_forwards_the_request() {
         assert!(
             stage(RuleMode::Shadow)
-                .check(Surface::ChatCompletions, &chat("missing-model", "hi"))
+                .check(Surface::ChatCompletions, &chat("missing-model", "hi"), None)
                 .await
                 .is_none()
         );
@@ -178,19 +218,52 @@ mod tests {
         let text = "a".repeat(500);
         assert!(
             stage(RuleMode::Enforce)
-                .check(Surface::ChatCompletions, &chat("chat-model", &text))
+                .check(Surface::ChatCompletions, &chat("chat-model", &text), None)
                 .await
                 .is_none()
         );
     }
 
     #[tokio::test]
-    async fn far_over_limit_is_rejected_without_exact_counter() {
+    async fn far_over_limit_without_exact_counter_passes() {
+        // Size alone never proves a prompt is over the window: without an
+        // exact count the context rule cannot reject.
         let text = "a".repeat(5_000);
-        let response = stage(RuleMode::Enforce)
-            .check(Surface::ChatCompletions, &chat("chat-model", &text))
-            .await
-            .expect("far over the window is rejected at stage 1");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            stage(RuleMode::Enforce)
+                .check(Surface::ChatCompletions, &chat("chat-model", &text), None)
+                .await
+                .is_none()
+        );
+    }
+
+    struct AllowOnly(&'static str);
+
+    impl ModelAccess for AllowOnly {
+        fn allows(&self, bearer_token: Option<&str>, _alias: &str) -> bool {
+            bearer_token == Some(self.0)
+        }
+    }
+
+    fn gated_stage() -> ValidationStage {
+        let config = ValidationConfig {
+            enabled: true,
+            default_mode: RuleMode::Enforce,
+            ..ValidationConfig::default()
+        };
+        let models = FixedModels(HashMap::new());
+        ValidationStage::new(config, Arc::new(models), None, Some(Arc::new(AllowOnly("good-key"))))
+    }
+
+    #[tokio::test]
+    async fn callers_without_model_access_are_not_validated() {
+        let stage = gated_stage();
+        let body = chat("missing-model", "hi");
+        // Without access: no validation, so the normal auth/access error
+        // downstream answers instead of a rule revealing model details.
+        assert!(stage.check(Surface::ChatCompletions, &body, None).await.is_none());
+        assert!(stage.check(Surface::ChatCompletions, &body, Some("other-key")).await.is_none());
+        // With access: the rule applies.
+        assert!(stage.check(Surface::ChatCompletions, &body, Some("good-key")).await.is_some());
     }
 }

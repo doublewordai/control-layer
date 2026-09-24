@@ -216,18 +216,14 @@ pub struct ValidationConfig {
     pub default_mode: RuleMode,
     /// Per-rule override, keyed by [`RuleId::as_str`].
     pub rules: HashMap<RuleId, RuleMode>,
-    /// Stage-2 exact counting (tokenizer-svc). Off = near-limit requests pass.
+    /// Stage-2 exact counting (tokenizer-svc). Prompts larger in bytes than the
+    /// context window are only ever rejected on an exact count, so with this
+    /// off the context rule never rejects.
     pub exact_count_enabled: bool,
     /// Hard deadline for the stage-2 tokenizer call; on expiry the request
     /// passes. Only prompts larger in bytes than the context window are ever
     /// counted, so this bounds the cost of already-huge requests.
     pub exact_count_deadline_ms: u64,
-    /// Byte-level BPE never yields more tokens than bytes, so prompts with
-    /// `bytes <= prompt_token_limit` pass without a count. Above that, with
-    /// exact counting enabled the count decides; with it disabled, stage 1
-    /// rejects on size alone when `bytes / reject_min_bytes_per_token` already
-    /// exceeds the limit (a heuristic: it assumes no token spans more bytes).
-    pub reject_min_bytes_per_token: f64,
 }
 
 impl Default for ValidationConfig {
@@ -238,7 +234,6 @@ impl Default for ValidationConfig {
             rules: HashMap::new(),
             exact_count_enabled: false,
             exact_count_deadline_ms: 2_000,
-            reject_min_bytes_per_token: 12.0,
         }
     }
 }

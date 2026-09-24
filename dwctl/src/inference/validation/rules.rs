@@ -22,6 +22,9 @@ use crate::db::models::deployments::ModelType;
 /// `scale`). Anything else is rejected rather than silently treated as realtime.
 const ACCEPTED_SERVICE_TIERS: [&str; 6] = ["auto", "default", "flex", "priority", "scale", "background"];
 const ACCEPTED_SERVICE_TIERS_LIST: &str = "auto, default, flex, priority, scale, background";
+/// Anthropic Messages additionally defines `standard_only`.
+const ACCEPTED_MESSAGES_SERVICE_TIERS: [&str; 7] = ["auto", "standard_only", "default", "flex", "priority", "scale", "background"];
+const ACCEPTED_MESSAGES_SERVICE_TIERS_LIST: &str = "auto, standard_only, default, flex, priority, scale, background";
 
 /// Register the rule metric with the recorder. Idempotent; callers may invoke it
 /// at startup so rate-based alerts see a zero sample before the first rejection.
@@ -63,7 +66,10 @@ pub fn evaluate(view: &RequestView, model: &ModelLookup, config: &ValidationConf
 
     // Parsed once: `MaxTokensExceedsLimit` only considers a well-formed value,
     // and `InvalidMaxTokens` reports the malformed ones.
-    let max_tokens = view.max_output_tokens.as_ref().and_then(parse_positive_int);
+    let max_tokens = view
+        .max_output_tokens
+        .as_ref()
+        .and_then(|value| parse_max_tokens(value, view.surface));
 
     if enabled(config, RuleId::InvalidMaxTokens)
         && let Some(violation) = invalid_max_tokens(view)
@@ -88,7 +94,7 @@ pub fn evaluate(view: &RequestView, model: &ModelLookup, config: &ValidationConf
         && let Some(info) = info
         && let Some(window) = info.context_window
     {
-        apply_context_length(view, window, config, &mut evaluation);
+        apply_context_length(view, window, &mut evaluation);
     }
 
     evaluation
@@ -185,10 +191,14 @@ fn invalid_service_tier(view: &RequestView) -> Option<Violation> {
     if value.is_null() {
         return None;
     }
+    let (accepted, list): (&[&str], &str) = match view.surface {
+        Some(Surface::Messages) => (&ACCEPTED_MESSAGES_SERVICE_TIERS, ACCEPTED_MESSAGES_SERVICE_TIERS_LIST),
+        _ => (&ACCEPTED_SERVICE_TIERS, ACCEPTED_SERVICE_TIERS_LIST),
+    };
     let message = match value.as_str() {
-        Some(tier) if ACCEPTED_SERVICE_TIERS.contains(&tier) => return None,
-        Some(tier) => format!("Invalid value '{tier}' for 'service_tier'. Expected one of: {ACCEPTED_SERVICE_TIERS_LIST}."),
-        None => format!("Invalid value for 'service_tier'. Expected one of: {ACCEPTED_SERVICE_TIERS_LIST}."),
+        Some(tier) if accepted.contains(&tier) => return None,
+        Some(tier) => format!("Invalid value '{tier}' for 'service_tier'. Expected one of: {list}."),
+        None => format!("Invalid value for 'service_tier'. Expected one of: {list}."),
     };
     Some(Violation {
         rule: RuleId::InvalidServiceTier,
@@ -203,7 +213,7 @@ fn invalid_service_tier(view: &RequestView) -> Option<Violation> {
 /// Integral floats (`256.0`) are accepted as `256`.
 fn invalid_max_tokens(view: &RequestView) -> Option<Violation> {
     let value = view.max_output_tokens.as_ref()?;
-    if value.is_null() || parse_positive_int(value).is_some() {
+    if value.is_null() || parse_max_tokens(value, view.surface).is_some() {
         return None;
     }
     let param = view.max_output_tokens_param;
@@ -265,58 +275,33 @@ fn modality_violation(view: &RequestView, modality: &str) -> Violation {
 /// itself: engines disagree on whether `prompt + max_tokens` must fit, so
 /// subtracting the requested output here would reject requests some engines
 /// accept. Byte-level BPE never produces more tokens than bytes, so a prompt
-/// that fits in `context_window` bytes is provably under the limit. Below that
-/// we reject only when the bytes/rate estimate is already over the limit;
-/// otherwise we defer to stage 2.
-fn apply_context_length(view: &RequestView, context_window: u64, config: &ValidationConfig, evaluation: &mut Evaluation) {
-    let bytes = view.prompt_text_bytes as f64;
-    let limit = context_window as f64;
-
-    // Provably fits: tokens <= bytes <= limit.
-    if bytes <= limit {
+/// that fits in `context_window` bytes is provably under the limit. Anything
+/// larger needs an exact count: no byte ratio proves a prompt is over.
+fn apply_context_length(view: &RequestView, context_window: u64, evaluation: &mut Evaluation) {
+    if view.prompt_text_bytes as u64 <= context_window {
         return;
     }
-
-    // With exact counting on, every rejection is backed by a real count: the
-    // size heuristic below assumes no token spans more than
-    // `reject_min_bytes_per_token` bytes, which is likely but not provable.
-    let estimated = bytes / config.reject_min_bytes_per_token;
-    if !config.exact_count_enabled && estimated > limit {
-        evaluation
-            .violations
-            .push(context_length_violation(view.surface, context_window, estimated.floor() as u64));
-    } else {
-        evaluation.exact_count = Some(ExactCountNeeded {
-            prompt_token_limit: context_window,
-            context_window,
-        });
-    }
+    evaluation.exact_count = Some(ExactCountNeeded {
+        prompt_token_limit: context_window,
+        context_window,
+    });
 }
 
-fn context_length_violation(surface: Option<Surface>, context_window: u64, estimated_tokens: u64) -> Violation {
-    Violation {
-        rule: RuleId::ContextLengthExceeded,
-        status: StatusCode::BAD_REQUEST,
-        code: "context_length_exceeded",
-        param: Some(prompt_param(surface)),
-        message: format!(
-            "This model's maximum context length is {context_window} tokens; your request is estimated at over {estimated_tokens} tokens. Reduce the length of the input."
-        ),
-    }
-}
-
-/// Positive integers, plus integral floats (`256.0`). Zero, negatives,
-/// fractions, strings, bools and `null` are all `None`.
-fn parse_positive_int(value: &Value) -> Option<u64> {
+/// A valid max-tokens value for `surface`, or `None`. Zero, negatives,
+/// fractions, strings, bools and `null` are never valid. The Messages and
+/// Responses request types are strict `u32` integers, so only integers up to
+/// `u32::MAX` pass there. Other surfaces also accept integral floats
+/// (`256.0`), bounded by `u32::MAX` so the float-to-int conversion is exact.
+fn parse_max_tokens(value: &Value, surface: Option<Surface>) -> Option<u64> {
+    let strict = matches!(surface, Some(Surface::Messages | Surface::Responses));
     if let Some(n) = value.as_u64() {
-        return (n > 0).then_some(n);
+        return (n > 0 && (!strict || n <= u64::from(u32::MAX))).then_some(n);
+    }
+    if strict || value.is_i64() {
+        return None;
     }
     let f = value.as_f64()?;
-    if f > 0.0 && f.fract() == 0.0 && f <= u64::MAX as f64 {
-        Some(f as u64)
-    } else {
-        None
-    }
+    (f > 0.0 && f.fract() == 0.0 && f <= f64::from(u32::MAX)).then_some(f as u64)
 }
 
 /// `param` for prompt-shape violations; `messages` when the surface is unknown.
@@ -766,17 +751,17 @@ mod tests {
 
     #[test]
     fn context_stage1_passes_when_bytes_fit() {
-        // 12 bytes/token, 100-token window: 100 bytes <= 100 is provably fine.
+        // 100-token window: 100 bytes <= 100 is provably fine.
         let evaluation = evaluate(&context_view(Surface::ChatCompletions, 100), &known(context_window(100)), &config());
         assert!(evaluation.violations.is_empty());
         assert!(evaluation.exact_count.is_none());
     }
 
     #[test]
-    fn context_stage1_requests_exact_count_between_limits() {
-        // 101..=1200 bytes is ambiguous: over the byte budget, under the
-        // rejected-estimate budget.
-        for bytes in [101, 600, 1200] {
+    fn context_stage1_requests_exact_count_over_byte_budget() {
+        // Over the byte budget is never a rejection on its own, however large:
+        // only an exact count can prove the prompt is over the window.
+        for bytes in [101, 1_201, 10_000_000] {
             let evaluation = evaluate(
                 &context_view(Surface::ChatCompletions, bytes),
                 &known(context_window(100)),
@@ -792,48 +777,6 @@ mod tests {
                 "bytes {bytes}"
             );
         }
-    }
-
-    #[test]
-    fn context_stage1_rejects_when_estimate_exceeds_limit() {
-        // 1201 / 12 = 100.08 > 100.
-        let evaluation = evaluate(
-            &context_view(Surface::ChatCompletions, 1201),
-            &known(context_window(100)),
-            &config(),
-        );
-        assert_eq!(violations(&evaluation), vec![RuleId::ContextLengthExceeded]);
-        let violation = &evaluation.violations[0];
-        assert_eq!(violation.status, StatusCode::BAD_REQUEST);
-        assert_eq!(violation.code, "context_length_exceeded");
-        assert_eq!(violation.param, Some("messages"));
-        assert!(violation.message.contains("100 tokens"));
-        assert!(evaluation.exact_count.is_none());
-    }
-
-    #[test]
-    fn context_stage1_defers_to_exact_count_when_enabled() {
-        // Same size as above, but with exact counting on the heuristic never
-        // rejects: the exact count decides.
-        let config = ValidationConfig {
-            exact_count_enabled: true,
-            ..config()
-        };
-        let evaluation = evaluate(&context_view(Surface::ChatCompletions, 1201), &known(context_window(100)), &config);
-        assert!(evaluation.violations.is_empty());
-        assert_eq!(
-            evaluation.exact_count,
-            Some(ExactCountNeeded {
-                prompt_token_limit: 100,
-                context_window: 100,
-            })
-        );
-    }
-
-    #[test]
-    fn context_stage1_uses_input_param_for_responses() {
-        let evaluation = evaluate(&context_view(Surface::Responses, 99_999), &known(context_window(100)), &config());
-        assert_eq!(evaluation.violations[0].param, Some("input"));
     }
 
     #[test]
@@ -974,15 +917,44 @@ mod tests {
     }
 
     #[test]
-    fn parse_positive_int_boundaries() {
-        assert_eq!(parse_positive_int(&json!(1)), Some(1));
-        assert_eq!(parse_positive_int(&json!(u64::MAX)), Some(u64::MAX));
-        assert_eq!(parse_positive_int(&json!(1.0)), Some(1));
-        assert_eq!(parse_positive_int(&json!(0)), None);
-        assert_eq!(parse_positive_int(&json!(0.0)), None);
-        assert_eq!(parse_positive_int(&json!(-1)), None);
-        assert_eq!(parse_positive_int(&json!(1.25)), None);
-        assert_eq!(parse_positive_int(&json!(null)), None);
-        assert_eq!(parse_positive_int(&json!("1")), None);
+    fn parse_max_tokens_boundaries() {
+        let chat = Some(Surface::ChatCompletions);
+        assert_eq!(parse_max_tokens(&json!(1), chat), Some(1));
+        assert_eq!(parse_max_tokens(&json!(u64::MAX), chat), Some(u64::MAX));
+        assert_eq!(parse_max_tokens(&json!(1.0), chat), Some(1));
+        assert_eq!(parse_max_tokens(&json!(f64::from(u32::MAX)), chat), Some(u64::from(u32::MAX)));
+        // Out-of-range floats are rejected rather than saturated.
+        assert_eq!(parse_max_tokens(&json!(1.8446744073709552e19), chat), None);
+        for invalid in [json!(0), json!(0.0), json!(-1), json!(1.25), json!(null), json!("1")] {
+            assert_eq!(parse_max_tokens(&invalid, chat), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn parse_max_tokens_is_strict_u32_on_messages_and_responses() {
+        for surface in [Surface::Messages, Surface::Responses] {
+            assert_eq!(parse_max_tokens(&json!(256), Some(surface)), Some(256));
+            assert_eq!(parse_max_tokens(&json!(u32::MAX), Some(surface)), Some(u64::from(u32::MAX)));
+            assert_eq!(parse_max_tokens(&json!(u64::from(u32::MAX) + 1), Some(surface)), None);
+            assert_eq!(parse_max_tokens(&json!(256.0), Some(surface)), None);
+        }
+    }
+
+    #[test]
+    fn messages_accepts_standard_only_service_tier() {
+        let view = |surface| RequestView {
+            surface: Some(surface),
+            service_tier: Some(json!("standard_only")),
+            ..Default::default()
+        };
+        assert!(
+            evaluate(&view(Surface::Messages), &ModelLookup::NotLoaded, &config())
+                .violations
+                .is_empty()
+        );
+        assert_eq!(
+            violations(&evaluate(&view(Surface::ChatCompletions), &ModelLookup::NotLoaded, &config())),
+            vec![RuleId::InvalidServiceTier]
+        );
     }
 }

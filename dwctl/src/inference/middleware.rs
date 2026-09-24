@@ -189,14 +189,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         body_bytes
     };
 
-    // Validate on the bare alias (serving-class suffix already stripped) and
-    // before anything is persisted, forwarded or enqueued.
-    if let (Some(validation), Some(surface)) = (&state.validation, surface)
-        && let Some(rejection) = validation.check(surface, &request_value).await
-    {
-        return rejection;
-    }
-
     let model = request_value["model"].as_str().unwrap_or("unknown").to_string();
     let model = model.as_str();
     // The router is nested at /ai/v1, so the path here is e.g. "/responses".
@@ -306,6 +298,15 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 ))
                 .unwrap();
         }
+    }
+
+    // Validate on the bare alias (serving-class suffix already stripped), after
+    // `previous_response_id` hydration so the prior turn counts toward the
+    // context window, and before anything is persisted, forwarded or enqueued.
+    if let (Some(validation), Some(surface)) = (&state.validation, surface)
+        && let Some(rejection) = validation.check(surface, &request_value, api_key.as_deref()).await
+    {
+        return rejection;
     }
 
     // Parse `service_tier` and `background` from the body.

@@ -36,6 +36,8 @@ use crate::test::utils::{add_auth_headers, create_test_admin_user, create_test_c
 
 const REJECTED_BY_HEADER: &str = "x-dw-rejected-by";
 const REJECTED_BY_VALUE: &str = "ingress-validation";
+/// What the mocked tokenizer reports for every exact count.
+const EXACT_TOKEN_COUNT: u32 = 5_000;
 
 /// The base config: validation on, onwards sync on, image normalisation off.
 fn validation_config(enabled: bool, default_mode: RuleMode) -> Config {
@@ -134,7 +136,7 @@ impl Fixture {
                 }
             }
             assert!(attempt < 499, "model `{alias}` never became routable");
-            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
     }
 }
@@ -157,6 +159,24 @@ async fn setup(pool: &PgPool, config: Config) -> Fixture {
         })))
         .mount(&mock)
         .await;
+
+    // The same mock doubles as tokenizer-svc for exact context counts. Only
+    // prompts larger in bytes than a model's context window are ever counted,
+    // so a fixed count well over the small test windows is enough.
+    Mock::given(method("POST"))
+        .and(path("/v1/render"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "virtual_model": "any",
+            "tokenizer_version": "test",
+            "template_version": "test",
+            "total": EXACT_TOKEN_COUNT,
+            "prefix_counts": []
+        })))
+        .mount(&mock)
+        .await;
+    let mut config = config;
+    config.cache.tokenizer_url = mock.uri();
+    config.request_validation.exact_count_enabled = true;
 
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
         .await
@@ -276,31 +296,61 @@ async fn fusillade_request_count(pool: &PgPool) -> i64 {
         .expect("count fusillade requests")
 }
 
-/// Unknown model under `Enforce`: 404 in the OpenAI envelope, marked as an
-/// ingress rejection, with the model name in the message.
+/// An alias the caller cannot use is never validated: the normal not-found
+/// answer comes from routing, so a rejection can never reveal model details.
 #[sqlx::test]
 #[test_log::test]
-async fn enforce_rejects_unknown_model_with_openai_envelope(pool: PgPool) {
+async fn unknown_model_is_left_to_the_normal_not_found_error(pool: PgPool) {
     let fixture = setup(&pool, validation_config(true, RuleMode::Enforce)).await;
 
     let response = fixture.chat(chat_request("ghost-model", "hi")).await;
 
     assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
-    assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
-    assert_eq!(rejected_by(&response).as_deref(), Some(REJECTED_BY_VALUE));
-    let body: Value = response.json();
-    assert_eq!(body["error"]["type"], "invalid_request_error");
-    assert_eq!(body["error"]["code"], "model_not_found");
-    assert_eq!(body["error"]["param"], "model");
-    assert!(
-        body["error"]["message"].as_str().unwrap().contains("ghost-model"),
-        "message should name the model: {}",
-        body["error"]["message"]
-    );
+    assert_eq!(rejected_by(&response), None);
 }
 
-/// A rejected flex request must not enqueue a fusillade row: validation runs
-/// before the flex path. A valid flex/background request is sent afterwards as a
+/// A caller whose key cannot use a model gets the normal authentication or
+/// access error, not a validation rule that would describe the model.
+#[sqlx::test]
+#[test_log::test]
+async fn callers_without_access_are_not_validated(pool: PgPool) {
+    let fixture = setup(&pool, validation_config(true, RuleMode::Enforce)).await;
+
+    let alias = format!("embedder-private-{}", Uuid::new_v4());
+    fixture
+        .create_model(model_body(&alias, fixture.endpoint_id, json!({"model_type": "EMBEDDINGS"})))
+        .await;
+    fixture.sync(&pool).await;
+
+    // The fixture's key can use the model, so the rule applies to it...
+    let authorised = fixture.chat(chat_request(&alias, "hi")).await;
+    assert_eq!(authorised.status_code(), StatusCode::BAD_REQUEST);
+    assert_eq!(rejected_by(&authorised).as_deref(), Some(REJECTED_BY_VALUE));
+
+    // ...but the same request without a key is left to authentication.
+    let anonymous = fixture
+        .server
+        .post("/ai/v1/chat/completions")
+        .json(&chat_request(&alias, "hi"))
+        .await;
+    assert_eq!(anonymous.status_code(), StatusCode::UNAUTHORIZED, "{}", anonymous.text());
+    assert_eq!(rejected_by(&anonymous), None);
+
+    // ...and so is a key that does not exist.
+    let wrong_key = fixture
+        .server
+        .post("/ai/v1/chat/completions")
+        .add_header("authorization", "Bearer not-a-real-key")
+        .json(&chat_request(&alias, "hi"))
+        .await;
+    assert!(wrong_key.status_code().is_client_error(), "{}", wrong_key.text());
+    assert_eq!(rejected_by(&wrong_key), None);
+}
+
+/// A doomed flex request must not enqueue a fusillade row. An unknown model is
+/// refused by the queued path's access check (validation leaves unknown aliases
+/// to it); a known model breaking a rule is rejected by validation before the
+/// flex path. A valid flex/background request is sent afterwards as a
 /// positive control, proving the count is not simply frozen at zero.
 #[sqlx::test]
 #[test_log::test]
@@ -317,10 +367,27 @@ async fn flex_rejection_does_not_enqueue_fusillade_request(pool: PgPool) {
         }))
         .await;
 
-    assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
-    assert_eq!(rejected_by(&response).as_deref(), Some(REJECTED_BY_VALUE));
-    let body: Value = response.json();
-    assert_eq!(body["error"]["code"], "model_not_found");
+    assert!(response.status_code().is_client_error(), "{}", response.text());
+    assert_eq!(
+        fusillade_request_count(&pool).await,
+        before,
+        "a flex request for an unknown model must not enqueue a fusillade row"
+    );
+
+    let embedder = format!("flex-embedder-{}", Uuid::new_v4());
+    fixture
+        .create_model(model_body(&embedder, fixture.endpoint_id, json!({"model_type": "EMBEDDINGS"})))
+        .await;
+    fixture.sync(&pool).await;
+    let mismatch = fixture
+        .chat(json!({
+            "model": embedder,
+            "messages": [{"role": "user", "content": "hi"}],
+            "service_tier": "flex"
+        }))
+        .await;
+    assert_eq!(mismatch.status_code(), StatusCode::BAD_REQUEST, "{}", mismatch.text());
+    assert_eq!(rejected_by(&mismatch).as_deref(), Some(REJECTED_BY_VALUE));
     assert_eq!(
         fusillade_request_count(&pool).await,
         before,
@@ -361,27 +428,33 @@ async fn flex_rejection_does_not_enqueue_fusillade_request(pool: PgPool) {
 /// The Anthropic Messages surface gets an Anthropic-shaped rejection body.
 #[sqlx::test]
 #[test_log::test]
-async fn messages_surface_unknown_model_uses_anthropic_envelope(pool: PgPool) {
+async fn messages_surface_rejection_uses_anthropic_envelope(pool: PgPool) {
     let fixture = setup(&pool, validation_config(true, RuleMode::Enforce)).await;
+
+    let alias = format!("embedder-messages-{}", Uuid::new_v4());
+    fixture
+        .create_model(model_body(&alias, fixture.endpoint_id, json!({"model_type": "EMBEDDINGS"})))
+        .await;
+    fixture.sync(&pool).await;
 
     let response = fixture
         .server
         .post("/ai/v1/messages")
         .add_header("authorization", format!("Bearer {}", fixture.api_key))
         .json(&json!({
-            "model": "ghost-model",
+            "model": alias,
             "max_tokens": 16,
             "messages": [{"role": "user", "content": "hi"}]
         }))
         .await;
 
-    assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST, "{}", response.text());
     assert_eq!(rejected_by(&response).as_deref(), Some(REJECTED_BY_VALUE));
     let body: Value = response.json();
     assert_eq!(body["type"], "error");
-    assert_eq!(body["error"]["type"], "not_found_error");
+    assert_eq!(body["error"]["type"], "invalid_request_error");
     assert!(
-        body["error"]["message"].as_str().unwrap().contains("ghost-model"),
+        body["error"]["message"].as_str().unwrap().contains(&alias),
         "message should name the model: {}",
         body["error"]["message"]
     );
@@ -421,21 +494,21 @@ async fn malformed_json_is_rejected_even_with_validation_disabled(pool: PgPool) 
 /// response must not carry the ingress-rejection marker.
 #[sqlx::test]
 #[test_log::test]
-async fn shadow_mode_forwards_unknown_model(pool: PgPool) {
+async fn shadow_mode_forwards_a_violating_request(pool: PgPool) {
     let fixture = setup(&pool, validation_config(true, RuleMode::Shadow)).await;
 
-    // A routable model keeps onwards active so the unknown alias gets its own
-    // (unmarked) 404 rather than an auth error.
-    let base = format!("shadow-base-{}", Uuid::new_v4());
+    // An embeddings model on chat completions breaks `model_type_mismatch`;
+    // in shadow mode it is only recorded and the upstream answers.
+    let alias = format!("shadow-embedder-{}", Uuid::new_v4());
     fixture
-        .create_model(model_body(&base, fixture.endpoint_id, json!({"model_type": "CHAT"})))
+        .create_model(model_body(&alias, fixture.endpoint_id, json!({"model_type": "EMBEDDINGS"})))
         .await;
     fixture.sync(&pool).await;
-    fixture.wait_until_routable(&base).await;
+    fixture.wait_until_routable(&alias).await;
 
-    let response = fixture.chat(chat_request("ghost-model", "hi")).await;
+    let response = fixture.chat(chat_request(&alias, "hi")).await;
 
-    assert_eq!(response.status_code(), StatusCode::NOT_FOUND);
+    assert_eq!(response.status_code(), StatusCode::OK, "{}", response.text());
     assert_eq!(
         rejected_by(&response),
         None,
@@ -510,8 +583,8 @@ async fn context_window_exceeded_is_rejected(pool: PgPool) {
         .await;
     fixture.sync(&pool).await;
 
-    // 5000 bytes / 12 bytes-per-token = 416 > 100, so stage 1 rejects without a
-    // tokenizer round trip.
+    // 5000 bytes is over the 100-token window in bytes, so the tokenizer is
+    // asked for an exact count (mocked at EXACT_TOKEN_COUNT) and that rejects.
     let prompt = "a".repeat(5000);
     let response = fixture.chat(chat_request(&alias, &prompt)).await;
 

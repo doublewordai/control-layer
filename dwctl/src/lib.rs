@@ -4335,6 +4335,9 @@ impl Application {
                 config.request_validation.clone(),
                 Arc::new(bg_services.model_metadata_cache.clone()),
                 exact,
+                // The live routing table onwards authorises against: validate
+                // only callers whose key may use the requested model.
+                Some(Arc::new(bg_services.onwards_targets.clone())),
             )
         });
 
