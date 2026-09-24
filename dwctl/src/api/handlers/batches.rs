@@ -1905,7 +1905,7 @@ pub async fn retry_specific_requests<P: PoolProvider>(
     // Retry the specified requests
     let results = state
         .request_manager
-        .retry_failed_requests(request_ids.clone())
+        .retry_failed_requests(fusillade::BatchId(batch_id), request_ids.clone())
         .await
         .map_err(|e| Error::Internal {
             operation: format!("retry failed requests: {}", e),
@@ -6013,6 +6013,67 @@ mod tests {
             .add_header(&auth[1].0, &auth[1].1)
             .await;
         resp.assert_status(StatusCode::BAD_REQUEST);
+    }
+
+    /// `retry-requests` only acts on requests in the path batch: ids from a
+    /// different batch are ignored, leaving that request and its batch as
+    /// they were.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_retry_requests_only_retries_requests_in_path_batch(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let owner = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let other = create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::BatchAPIUser]).await;
+        let auth = add_auth_headers(&owner);
+
+        let (owner_batch, owner_requests) = insert_batch_with_pending_requests(&pool, owner.id, 1).await;
+        let (other_batch, other_requests) = insert_batch_with_pending_requests(&pool, other.id, 1).await;
+        sqlx::query("UPDATE fusillade.requests SET state = 'failed', failed_at = NOW(), error = 'test-error' WHERE batch_id = ANY($1)")
+            .bind(vec![owner_batch, other_batch])
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE fusillade.batches SET cancelled_at = NOW() WHERE id = $1")
+            .bind(other_batch)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let state = |id: Uuid| {
+            sqlx::query_scalar::<_, String>("SELECT state FROM fusillade.requests WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+        };
+        assert_eq!(state(other_requests[0]).await.unwrap(), "failed");
+        assert_eq!(state(owner_requests[0]).await.unwrap(), "failed");
+
+        let resp = app
+            .post(&format!("/ai/v1/batches/{owner_batch}/retry-requests"))
+            .add_header(&auth[0].0, &auth[0].1)
+            .add_header(&auth[1].0, &auth[1].1)
+            .json(&serde_json::json!({
+                "request_ids": [other_requests[0].to_string(), owner_requests[0].to_string()]
+            }))
+            .await;
+        resp.assert_status_ok();
+
+        assert_eq!(
+            state(other_requests[0]).await.unwrap(),
+            "failed",
+            "requests outside the path batch must not be retried"
+        );
+        let other_cancelled_at: Option<chrono::DateTime<chrono::Utc>> =
+            sqlx::query_scalar("SELECT cancelled_at FROM fusillade.batches WHERE id = $1")
+                .bind(other_batch)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(other_cancelled_at.is_some(), "batches other than the path batch must be unchanged");
+        assert_eq!(
+            state(owner_requests[0]).await.unwrap(),
+            "pending",
+            "requests in the path batch must still retry"
+        );
     }
 
     // ── Explicit API key selection for dashboard batch creation ───────────
