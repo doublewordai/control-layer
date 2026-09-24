@@ -57,8 +57,8 @@ pub mod store;
 pub mod token;
 pub mod walker;
 
-pub use config::{BackendConfig, FetcherConfig, ImageNormalizerConfig, SigningConfig};
-pub use store::{ImageStore, MemoryStore, SignedImageUrl, StoreError};
+pub use config::{BackendConfig, DEFAULT_REFRESH_AFTER_SECS, FetcherConfig, ImageNormalizerConfig, SigningConfig};
+pub use store::{ImageStore, MemoryStore, ObjectMeta, SignedImageUrl, StoreError};
 pub use token::{ImageToken, TokenParseError};
 pub use walker::Mode;
 
@@ -185,6 +185,10 @@ impl ImageNormalizer for DisabledNormalizer {
 pub struct DefaultImageNormalizer<S: ImageStore> {
     fetcher: fetcher::ImageFetcher,
     store: Arc<S>,
+    /// Re-upload on a dedup hit when the stored object is at least this old
+    /// (or its age is unknown). `None` disables the refresh. See
+    /// [`ImageNormalizerConfig::refresh_after_secs`].
+    refresh_after: Option<Duration>,
 }
 
 impl<S: ImageStore> DefaultImageNormalizer<S> {
@@ -192,6 +196,30 @@ impl<S: ImageStore> DefaultImageNormalizer<S> {
         Self {
             fetcher: fetcher::ImageFetcher::new(fetcher_cfg),
             store,
+            refresh_after: Some(Duration::from_secs(DEFAULT_REFRESH_AFTER_SECS)),
+        }
+    }
+
+    /// Override the dedup refresh threshold (`None` disables it).
+    pub fn with_refresh_after(mut self, refresh_after: Option<Duration>) -> Self {
+        self.refresh_after = refresh_after;
+        self
+    }
+
+    /// Whether a dedup hit on an object with this metadata must be
+    /// re-uploaded so a bucket lifecycle rule cannot delete it while a
+    /// queued request still references it.
+    fn needs_refresh(&self, meta: &ObjectMeta, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let Some(refresh_after) = self.refresh_after else {
+            return false;
+        };
+        match meta.last_modified {
+            // Age unknown: the backend gave no timestamp, so assume the worst.
+            None => true,
+            Some(last_modified) => {
+                let age = (now - last_modified).to_std().unwrap_or_default();
+                age >= refresh_after
+            }
         }
     }
 }
@@ -232,9 +260,24 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
         sha.copy_from_slice(&digest);
         let token = ImageToken(sha);
 
-        // exists() short-circuit avoids re-uploading dedup hits.
-        if !self.store.exists(token).await? {
-            self.store.put(token, &mime, bytes).await?;
+        // Dedup: a stored object with this hash is reused rather than
+        // re-uploaded — unless it is old enough that the bucket lifecycle
+        // rule could delete it before a request referencing the token has
+        // finished dispatching, in which case it is overwritten to reset
+        // its age. Nothing else ever touches an object's age (a HEAD does
+        // not), so without this a re-submission near expiry hands out a
+        // token whose object vanishes mid-batch.
+        match self.store.stat(token).await? {
+            None => {
+                self.store.write(token, &mime, bytes).await?;
+            }
+            Some(meta) if self.needs_refresh(&meta, chrono::Utc::now()) => {
+                let age_secs = meta.last_modified.map(|t| (chrono::Utc::now() - t).num_seconds());
+                tracing::info!(token = %token.to_hex(), age_secs, "refreshing near-expiry image on dedup hit");
+                metrics::counter!("dwctl_image_normalizer_refresh_total").increment(1);
+                self.store.write(token, &mime, bytes).await?;
+            }
+            Some(_) => {}
         }
         Ok(IngestResult { token, mime, bytes_len })
     }
@@ -279,11 +322,11 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalize
                  restart and are not shared across replicas — use gcs or s3_compatible in production"
             );
             let store = Arc::new(MemoryStore::new());
-            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
+            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store).with_refresh_after(cfg.refresh_after()))
         }
         BackendConfig::Gcs { bucket, region } => {
             let store = Arc::new(store::GcsStore::new(bucket.clone(), region.clone()));
-            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
+            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store).with_refresh_after(cfg.refresh_after()))
         }
         BackendConfig::S3Compatible {
             bucket,
@@ -319,7 +362,7 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalize
                 access_key_id,
                 secret_access_key,
             ));
-            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
+            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store).with_refresh_after(cfg.refresh_after()))
         }
     })
 }
@@ -356,6 +399,87 @@ mod tests {
         let (mime, bytes) = n.read(token).await.unwrap();
         assert_eq!(mime, "image/png");
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[tokio::test]
+    async fn ingest_refreshes_dedup_hit_older_than_threshold() {
+        // An object re-submitted after it has aged past the refresh
+        // threshold is overwritten, resetting the age a bucket lifecycle
+        // rule measures — so it cannot be swept while a queued request
+        // still holds the token.
+        let store = Arc::new(MemoryStore::new());
+        let n = DefaultImageNormalizer::new(FetcherConfig::default(), store.clone())
+            .with_refresh_after(Some(Duration::from_secs(10 * 24 * 60 * 60)));
+        let token = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap().token;
+        assert!(store.backdate(token, Duration::from_secs(11 * 24 * 60 * 60)));
+        let before = store.stored_at(token).unwrap();
+
+        let again = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap();
+        assert_eq!(again.token, token);
+        let after = store.stored_at(token).unwrap();
+        assert!(after > before, "dedup hit past the threshold must rewrite the object");
+        assert!(
+            chrono::Utc::now() - after < chrono::Duration::seconds(60),
+            "rewrite must reset the age to now"
+        );
+    }
+
+    #[tokio::test]
+    async fn ingest_leaves_fresh_dedup_hit_untouched() {
+        let store = Arc::new(MemoryStore::new());
+        let n = DefaultImageNormalizer::new(FetcherConfig::default(), store.clone())
+            .with_refresh_after(Some(Duration::from_secs(10 * 24 * 60 * 60)));
+        let token = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap().token;
+        // Old, but still inside the threshold.
+        assert!(store.backdate(token, Duration::from_secs(9 * 24 * 60 * 60)));
+        let before = store.stored_at(token).unwrap();
+
+        n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap();
+        assert_eq!(store.stored_at(token).unwrap(), before, "a fresh dedup hit must not be re-uploaded");
+    }
+
+    #[tokio::test]
+    async fn ingest_refresh_disabled_never_rewrites() {
+        let store = Arc::new(MemoryStore::new());
+        let n = DefaultImageNormalizer::new(FetcherConfig::default(), store.clone()).with_refresh_after(None);
+        let token = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap().token;
+        assert!(store.backdate(token, Duration::from_secs(365 * 24 * 60 * 60)));
+        let before = store.stored_at(token).unwrap();
+
+        n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap();
+        assert_eq!(store.stored_at(token).unwrap(), before);
+    }
+
+    #[test]
+    fn needs_refresh_treats_unknown_age_as_stale() {
+        // A backend that reports no timestamp cannot prove the object is
+        // fresh, so the safe answer is to rewrite it.
+        let n = DefaultImageNormalizer::new(FetcherConfig::default(), Arc::new(MemoryStore::new()))
+            .with_refresh_after(Some(Duration::from_secs(60)));
+        let now = chrono::Utc::now();
+        assert!(n.needs_refresh(&ObjectMeta { last_modified: None }, now));
+        assert!(!n.needs_refresh(
+            &ObjectMeta {
+                last_modified: Some(now - chrono::Duration::seconds(30))
+            },
+            now
+        ));
+        assert!(n.needs_refresh(
+            &ObjectMeta {
+                last_modified: Some(now - chrono::Duration::seconds(60))
+            },
+            now
+        ));
+        // A last-modified in the future (clock skew) is age zero, not stale.
+        assert!(!n.needs_refresh(
+            &ObjectMeta {
+                last_modified: Some(now + chrono::Duration::seconds(30))
+            },
+            now
+        ));
+        // Disabled → never.
+        let off = DefaultImageNormalizer::new(FetcherConfig::default(), Arc::new(MemoryStore::new())).with_refresh_after(None);
+        assert!(!off.needs_refresh(&ObjectMeta { last_modified: None }, now));
     }
 
     #[tokio::test]
@@ -414,8 +538,7 @@ mod tests {
         let cfg = ImageNormalizerConfig {
             enabled: true,
             backend: Some(BackendConfig::Memory),
-            fetcher: FetcherConfig::default(),
-            signing: SigningConfig::default(),
+            ..ImageNormalizerConfig::default()
         };
         let _: Arc<dyn ImageNormalizer> = from_config(&cfg).expect("memory backend must build");
     }
@@ -425,8 +548,7 @@ mod tests {
         let cfg = ImageNormalizerConfig {
             enabled: true,
             backend: None,
-            fetcher: FetcherConfig::default(),
-            signing: SigningConfig::default(),
+            ..ImageNormalizerConfig::default()
         };
         // Manual match because the Ok arm holds `Arc<dyn ImageNormalizer>`
         // which doesn't implement Debug (required by `expect_err`).

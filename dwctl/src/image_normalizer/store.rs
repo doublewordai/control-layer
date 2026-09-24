@@ -35,6 +35,16 @@ pub struct SignedImageUrl {
     pub expires_at: DateTime<Utc>,
 }
 
+/// Metadata about a stored object, as reported by the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectMeta {
+    /// When the object was last written (upload or overwrite). Bucket
+    /// lifecycle rules measure an object's age from this instant. `None`
+    /// when the backend does not report it; callers must treat that as
+    /// "age unknown", not "fresh".
+    pub last_modified: Option<DateTime<Utc>>,
+}
+
 /// Errors that can come out of an object-store backend.
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -50,10 +60,26 @@ pub enum StoreError {
 /// SHA-256.
 #[async_trait]
 pub trait ImageStore: Send + Sync {
+    /// Metadata for the object stored under `token`, or `None` if there is
+    /// no such object. Cheap (a HEAD where the backend supports one).
+    async fn stat(&self, token: ImageToken) -> Result<Option<ObjectMeta>, StoreError>;
+
+    /// Unconditionally write `bytes` under `token`, overwriting any object
+    /// already there. An overwrite resets the object's age for bucket
+    /// lifecycle rules, which is how the normaliser keeps a dedup hit on a
+    /// near-expiry object alive (see `DefaultImageNormalizer::ingest`).
+    async fn write(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<(), StoreError>;
+
     /// Idempotently store `bytes` under `token`. If the object already
     /// exists, this is a no-op and returns `Ok(false)`. Otherwise stores
     /// and returns `Ok(true)`.
-    async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError>;
+    async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError> {
+        if self.exists(token).await? {
+            return Ok(false);
+        }
+        self.write(token, mime, bytes).await?;
+        Ok(true)
+    }
 
     /// Generate a short-lived signed URL pointing at the bytes for `token`.
     async fn sign(&self, token: ImageToken, ttl: Duration) -> Result<SignedImageUrl, StoreError>;
@@ -62,9 +88,10 @@ pub trait ImageStore: Send + Sync {
     /// image-view path. Caller is responsible for authorisation.
     async fn read(&self, token: ImageToken) -> Result<(String, Bytes), StoreError>;
 
-    /// True if an object with this token already exists. Cheap check used
-    /// by the ingest path to skip uploads on dedup hits.
-    async fn exists(&self, token: ImageToken) -> Result<bool, StoreError>;
+    /// True if an object with this token already exists.
+    async fn exists(&self, token: ImageToken) -> Result<bool, StoreError> {
+        Ok(self.stat(token).await?.is_some())
+    }
 
     /// True if `url` already points at an object in THIS store — i.e. a URL
     /// we previously signed. Used to avoid re-ingesting and re-signing our
@@ -81,13 +108,23 @@ pub trait ImageStore: Send + Sync {
 
 // ============================ MemoryStore =================================
 
+/// One object held by [`MemoryStore`].
+#[derive(Clone)]
+struct StoredObject {
+    mime: String,
+    bytes: Bytes,
+    /// Set on every write, mirroring a real backend's last-modified time so
+    /// the normaliser's refresh-on-dedup-hit logic is testable in-process.
+    stored_at: DateTime<Utc>,
+}
+
 /// In-process store. Bytes held in a `Mutex<HashMap>` keyed by SHA-256.
 ///
 /// Signed URLs returned here are `http://{base}/dw-img/{hex}?expires={ts}`
 /// where `base` is configured via [`MemoryStore::with_base_url`]. The
 /// dashboard image endpoint (or test fixtures) resolve these.
 pub struct MemoryStore {
-    inner: Mutex<HashMap<ImageToken, (String, Bytes)>>,
+    inner: Mutex<HashMap<ImageToken, StoredObject>>,
     base_url: String,
 }
 
@@ -109,17 +146,48 @@ impl MemoryStore {
         self.base_url = base_url.into();
         self
     }
+
+    /// When `token` was last written, if it is stored. Test helper.
+    pub fn stored_at(&self, token: ImageToken) -> Option<DateTime<Utc>> {
+        let map = self.inner.lock().expect("MemoryStore mutex poisoned");
+        map.get(&token).map(|o| o.stored_at)
+    }
+
+    /// Move `token`'s last-written time `by` into the past, simulating an
+    /// object that has been sitting in a bucket. Returns `false` if the token
+    /// is not stored. Test helper for the refresh-on-dedup-hit path.
+    pub fn backdate(&self, token: ImageToken, by: Duration) -> bool {
+        let mut map = self.inner.lock().expect("MemoryStore mutex poisoned");
+        match map.get_mut(&token) {
+            Some(o) => {
+                o.stored_at -= ChronoDuration::from_std(by).unwrap_or(ChronoDuration::zero());
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 #[async_trait]
 impl ImageStore for MemoryStore {
-    async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError> {
+    async fn stat(&self, token: ImageToken) -> Result<Option<ObjectMeta>, StoreError> {
+        let map = self.inner.lock().expect("MemoryStore mutex poisoned");
+        Ok(map.get(&token).map(|o| ObjectMeta {
+            last_modified: Some(o.stored_at),
+        }))
+    }
+
+    async fn write(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<(), StoreError> {
         let mut map = self.inner.lock().expect("MemoryStore mutex poisoned");
-        if map.contains_key(&token) {
-            return Ok(false);
-        }
-        map.insert(token, (mime.to_string(), bytes));
-        Ok(true)
+        map.insert(
+            token,
+            StoredObject {
+                mime: mime.to_string(),
+                bytes,
+                stored_at: Utc::now(),
+            },
+        );
+        Ok(())
     }
 
     async fn sign(&self, token: ImageToken, ttl: Duration) -> Result<SignedImageUrl, StoreError> {
@@ -139,12 +207,9 @@ impl ImageStore for MemoryStore {
 
     async fn read(&self, token: ImageToken) -> Result<(String, Bytes), StoreError> {
         let map = self.inner.lock().expect("MemoryStore mutex poisoned");
-        map.get(&token).cloned().ok_or(StoreError::NotFound)
-    }
-
-    async fn exists(&self, token: ImageToken) -> Result<bool, StoreError> {
-        let map = self.inner.lock().expect("MemoryStore mutex poisoned");
-        Ok(map.contains_key(&token))
+        map.get(&token)
+            .map(|o| (o.mime.clone(), o.bytes.clone()))
+            .ok_or(StoreError::NotFound)
     }
 
     fn owns_url(&self, url: &str) -> bool {
@@ -235,11 +300,7 @@ impl GcsStore {
 
 #[async_trait]
 impl ImageStore for GcsStore {
-    async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError> {
-        // Idempotency: short-circuit if the object already exists.
-        if self.exists(token).await? {
-            return Ok(false);
-        }
+    async fn write(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<(), StoreError> {
         let client = self.client().await?;
         let key = Self::key(token);
         client
@@ -248,7 +309,7 @@ impl ImageStore for GcsStore {
             .send_buffered()
             .await
             .map_err(|e| StoreError::Backend(format!("GCS put {key}: {e}")))?;
-        Ok(true)
+        Ok(())
     }
 
     async fn sign(&self, token: ImageToken, ttl: Duration) -> Result<SignedImageUrl, StoreError> {
@@ -281,19 +342,23 @@ impl ImageStore for GcsStore {
         Ok((mime, Bytes::from(bytes_vec)))
     }
 
-    async fn exists(&self, token: ImageToken) -> Result<bool, StoreError> {
+    async fn stat(&self, token: ImageToken) -> Result<Option<ObjectMeta>, StoreError> {
         let client = self.client().await?;
         let key = Self::key(token);
         // The smallest GET we can do — start a read; if it succeeds, the
         // object exists. We immediately drop the response without reading
-        // the body. Typed 404 → false; any other error (auth failure,
+        // the body. Typed 404 → None; any other error (auth failure,
         // network, server error) → bubble up so misconfiguration can't be
         // misread as a missing object (which would trigger a re-upload).
+        //
+        // The read-object highlights carry no timestamp, so the age is
+        // reported as unknown and the normaliser refreshes every dedup hit.
+        // Correct, if wasteful; this backend is not the production one.
         match client.read_object(self.bucket_resource(), &key).send().await {
-            Ok(_) => Ok(true),
+            Ok(_) => Ok(Some(ObjectMeta { last_modified: None })),
             Err(e) => match e.http_status_code() {
-                Some(404) => Ok(false),
-                _ => Err(StoreError::Backend(format!("GCS exists {key}: {e}"))),
+                Some(404) => Ok(None),
+                _ => Err(StoreError::Backend(format!("GCS stat {key}: {e}"))),
             },
         }
     }
@@ -378,11 +443,7 @@ impl S3CompatStore {
 
 #[async_trait]
 impl ImageStore for S3CompatStore {
-    async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError> {
-        // Idempotency: short-circuit if the object already exists.
-        if self.exists(token).await? {
-            return Ok(false);
-        }
+    async fn write(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<(), StoreError> {
         let key = Self::key(token);
         self.client
             .put_object()
@@ -393,7 +454,7 @@ impl ImageStore for S3CompatStore {
             .send()
             .await
             .map_err(|e| StoreError::Backend(format!("S3 put {key}: {}", e.into_service_error())))?;
-        Ok(true)
+        Ok(())
     }
 
     async fn sign(&self, token: ImageToken, ttl: Duration) -> Result<SignedImageUrl, StoreError> {
@@ -436,19 +497,25 @@ impl ImageStore for S3CompatStore {
         Ok((mime, bytes))
     }
 
-    async fn exists(&self, token: ImageToken) -> Result<bool, StoreError> {
+    async fn stat(&self, token: ImageToken) -> Result<Option<ObjectMeta>, StoreError> {
         let key = Self::key(token);
-        // Typed 404 → false; any other error (auth, network, server) bubbles
+        // Typed 404 → None; any other error (auth, network, server) bubbles
         // up so a misconfiguration can't be misread as a missing object
         // (which would otherwise trigger a needless re-upload).
         match self.client.head_object().bucket(&self.bucket).key(&key).send().await {
-            Ok(_) => Ok(true),
+            Ok(head) => Ok(Some(ObjectMeta {
+                // `Last-Modified` is the upload/overwrite instant that bucket
+                // lifecycle rules (R2, S3) measure object age from.
+                last_modified: head
+                    .last_modified()
+                    .and_then(|t| DateTime::<Utc>::from_timestamp(t.secs(), t.subsec_nanos())),
+            })),
             Err(e) => {
                 let svc = e.into_service_error();
                 if svc.is_not_found() {
-                    Ok(false)
+                    Ok(None)
                 } else {
-                    Err(StoreError::Backend(format!("S3 exists {key}: {svc}")))
+                    Err(StoreError::Backend(format!("S3 stat {key}: {svc}")))
                 }
             }
         }
@@ -635,6 +702,32 @@ mod tests {
         );
         assert_eq!(s.endpoint, "https://acct.r2.cloudflarestorage.com");
         assert!(s.owns_url("https://acct.r2.cloudflarestorage.com/imgs/images/ab/cd/abcd"));
+    }
+
+    #[tokio::test]
+    async fn memory_store_stat_reports_write_time_and_backdate_moves_it() {
+        let s = MemoryStore::new();
+        assert!(s.stat(tok(1)).await.unwrap().is_none());
+        assert!(!s.backdate(tok(1), Duration::from_secs(1)), "backdating a missing token is a no-op");
+
+        assert!(s.put(tok(1), "image/png", Bytes::from_static(b"x")).await.unwrap());
+        let meta = s.stat(tok(1)).await.unwrap().expect("stored");
+        let written = meta.last_modified.expect("memory store always knows the write time");
+        assert!(Utc::now() - written < ChronoDuration::seconds(60));
+
+        assert!(s.backdate(tok(1), Duration::from_secs(3600)));
+        let moved = s.stat(tok(1)).await.unwrap().unwrap().last_modified.unwrap();
+        assert_eq!(written - moved, ChronoDuration::seconds(3600));
+
+        // The provided `put` stays idempotent: a second put is a no-op and
+        // does not touch the write time...
+        assert!(!s.put(tok(1), "image/png", Bytes::from_static(b"y")).await.unwrap());
+        assert_eq!(s.stat(tok(1)).await.unwrap().unwrap().last_modified, Some(moved));
+        assert_eq!(s.read(tok(1)).await.unwrap().1, Bytes::from_static(b"x"));
+        // ...whereas `write` overwrites and resets it.
+        s.write(tok(1), "image/png", Bytes::from_static(b"y")).await.unwrap();
+        assert!(s.stat(tok(1)).await.unwrap().unwrap().last_modified.unwrap() > moved);
+        assert_eq!(s.read(tok(1)).await.unwrap().1, Bytes::from_static(b"y"));
     }
 
     #[test]

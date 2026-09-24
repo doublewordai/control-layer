@@ -10,7 +10,7 @@ use std::time::Duration;
 /// Default = disabled with no backend; safe for builds and tests where
 /// the feature is off. When `enabled` is set to true, `backend` MUST be
 /// configured — see `from_config` for the explicit error.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageNormalizerConfig {
     /// Master switch. When false, the normaliser is replaced by a no-op
     /// at startup and the middleware passes all traffic through unchanged.
@@ -31,6 +31,54 @@ pub struct ImageNormalizerConfig {
     /// Signed-URL TTL policy.
     #[serde(default)]
     pub signing: SigningConfig,
+
+    /// Re-upload an image on a dedup hit when the stored object is older
+    /// than this many seconds. `0` disables the refresh.
+    ///
+    /// Objects are content-addressed and the bucket has a lifecycle rule
+    /// that deletes them by age (14 days on the production buckets, see
+    /// `infra/terraform/cloudflare/r2-retention`). Without a refresh, an
+    /// image re-submitted near the end of that window passes the exists
+    /// check, is not re-uploaded, and is then deleted by the lifecycle
+    /// sweep while a queued request still references it — every dispatch
+    /// of that request 404s on the image until the request is failed.
+    /// Overwriting the object resets its age, so re-submission keeps it
+    /// alive for another full window.
+    ///
+    /// Must be less than the bucket's retention minus the longest time a
+    /// stored token can still be dispatched: the batch completion window
+    /// (24 h), the daemon retrying for 24 h past the deadline, and the
+    /// lifecycle sweep's own lag. The default of 10 days leaves 4 days of
+    /// margin against a 14-day rule. Only re-submissions of old images pay
+    /// for this (one extra upload each); fresh dedup hits are unaffected.
+    #[serde(default = "default_refresh_after_secs")]
+    pub refresh_after_secs: u64,
+}
+
+/// Default for [`ImageNormalizerConfig::refresh_after_secs`]: 10 days.
+pub const DEFAULT_REFRESH_AFTER_SECS: u64 = 10 * 24 * 60 * 60;
+
+fn default_refresh_after_secs() -> u64 {
+    DEFAULT_REFRESH_AFTER_SECS
+}
+
+impl Default for ImageNormalizerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: None,
+            fetcher: FetcherConfig::default(),
+            signing: SigningConfig::default(),
+            refresh_after_secs: DEFAULT_REFRESH_AFTER_SECS,
+        }
+    }
+}
+
+impl ImageNormalizerConfig {
+    /// The dedup refresh threshold, or `None` when disabled (`0`).
+    pub fn refresh_after(&self) -> Option<Duration> {
+        (self.refresh_after_secs > 0).then(|| Duration::from_secs(self.refresh_after_secs))
+    }
 }
 
 /// Object-store backend selection.
@@ -269,6 +317,7 @@ mod tests {
                 dispatch_ttl_headroom_secs: 300,
                 dashboard_ttl_secs: 30,
             },
+            refresh_after_secs: 3600,
         };
         let json = serde_json::to_string(&cfg).expect("serialize");
         let back: ImageNormalizerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -281,6 +330,21 @@ mod tests {
         assert!(back.fetcher.mime_allowed("image/png"));
         assert!(!back.fetcher.mime_allowed("image/jpeg"));
         assert_eq!(back.signing.realtime_ttl().as_secs(), 60);
+        assert_eq!(back.refresh_after(), Some(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn refresh_after_defaults_to_ten_days_and_zero_disables() {
+        let c = ImageNormalizerConfig::default();
+        assert_eq!(c.refresh_after(), Some(Duration::from_secs(10 * 24 * 60 * 60)));
+        // Omitted in config → the default, not zero.
+        let parsed: ImageNormalizerConfig = serde_json::from_str(r#"{"enabled": false}"#).expect("deserialize");
+        assert_eq!(parsed.refresh_after_secs, DEFAULT_REFRESH_AFTER_SECS);
+        let off = ImageNormalizerConfig {
+            refresh_after_secs: 0,
+            ..ImageNormalizerConfig::default()
+        };
+        assert_eq!(off.refresh_after(), None);
     }
 
     #[test]
