@@ -1050,7 +1050,11 @@ pub trait Storage: Send + Sync {
     /// This resets the specified failed requests to pending state with retry_attempt = 0,
     /// allowing them to be picked up by the daemon for reprocessing.
     ///
+    /// Only requests belonging to `batch_id` are retried. Ids from any other
+    /// batch (or batchless requests) are left untouched and reported as [`RequestNotFound`](crate::error::FusilladeError::RequestNotFound).
+    ///
     /// # Arguments
+    /// * `batch_id` - The batch the requests must belong to
     /// * `ids` - Request IDs to retry
     ///
     /// # Returns
@@ -1059,9 +1063,13 @@ pub trait Storage: Send + Sync {
     ///
     /// # Errors
     /// Individual retry results may fail if:
-    /// - Request ID doesn't exist
+    /// - Request ID doesn't exist or belongs to a different batch
     /// - Request is not in failed state
-    async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>>;
+    async fn retry_failed_requests(
+        &self,
+        batch_id: BatchId,
+        ids: Vec<RequestId>,
+    ) -> Result<Vec<Result<()>>>;
 
     /// Retry a batch: re-pend its FAILED and CANCELED requests in a single
     /// database operation (completed requests are never redone).
