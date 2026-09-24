@@ -65,7 +65,7 @@ pub fn from_chat_completions(body: Bytes) -> Result<Bytes, TranslationError> {
     }
 
     let (input_tokens, output_tokens, cache_read_input_tokens, cache_creation_input_tokens, cache_creation) =
-        resp.get("usage").map(anthropic_usage).unwrap_or((0, 0, None, None, None));
+        resp.get("usage").map(anthropic_usage).unwrap_or((0, 0, 0, 0, None));
 
     // vLLM/sglang expose the matched stop sequence (a string) at
     // `choices[].stop_reason`. When present, Anthropic reports
@@ -136,10 +136,10 @@ pub fn anthropic_error(status: StatusCode, message: String) -> (StatusCode, Byte
 /// `input + cache_read + cache_creation` reconstructs the full prompt. The analytics
 /// serializer relies on exactly that sum to recover `prompt_tokens` (total input);
 /// subtracting only one bucket here would make it double-bill the other. Returns
-/// `(input, output, cache_read, cache_creation)`; the cache values are `None`
-/// when zero/absent so they serialise out. Shared by the blocking and streaming
-/// paths.
-pub(super) fn anthropic_usage(usage: &Value) -> (u64, u64, Option<u64>, Option<u64>, Option<super::model::CacheCreation>) {
+/// `(input, output, cache_read, cache_creation)`; the cache scalars are plain
+/// counts (0 when unused) and always serialize, matching the live Anthropic API.
+/// Shared by the blocking and streaming paths.
+pub(super) fn anthropic_usage(usage: &Value) -> (u64, u64, u64, u64, Option<super::model::CacheCreation>) {
     let prompt = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
     let output = usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
     let cached = usage
@@ -157,8 +157,8 @@ pub(super) fn anthropic_usage(usage: &Value) -> (u64, u64, Option<u64>, Option<u
     (
         prompt.saturating_sub(cached).saturating_sub(creation),
         output,
-        (cached > 0).then_some(cached),
-        (creation > 0).then_some(creation),
+        cached,
+        creation,
         breakdown,
     )
 }
