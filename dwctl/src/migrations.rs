@@ -940,9 +940,11 @@ mod tests {
              CREATE INDEX idx_task_claim ON underway.task(task_queue_name, priority DESC, created_at, id)
                  WHERE state IN ('pending', 'in_progress');
              CREATE INDEX idx_task_created_at ON underway.task(created_at);
+             CREATE INDEX idx_task_terminal_created_at ON underway.task(created_at) WHERE state IN ('succeeded', 'failed');
              UPDATE pg_index SET indisvalid = false
              WHERE indexrelid IN ('underway.idx_task_queue_state'::regclass, 'underway.idx_task_id'::regclass,
-                                  'underway.idx_task_claim'::regclass, 'underway.idx_task_created_at'::regclass);",
+                                  'underway.idx_task_claim'::regclass, 'underway.idx_task_created_at'::regclass,
+                                  'underway.idx_task_terminal_created_at'::regclass);",
         )
         .execute(&pool)
         .await
@@ -951,7 +953,8 @@ mod tests {
         let valid: bool = sqlx::query_scalar(
             "SELECT bool_and(indisvalid AND indisready) FROM pg_index
              WHERE indexrelid IN ('underway.idx_task_queue_state'::regclass, 'underway.idx_task_id'::regclass,
-                                  'underway.idx_task_claim'::regclass, 'underway.idx_task_created_at'::regclass)",
+                                  'underway.idx_task_claim'::regclass, 'underway.idx_task_created_at'::regclass,
+                                  'underway.idx_task_terminal_created_at'::regclass)",
         )
         .fetch_one(&pool)
         .await
@@ -979,6 +982,24 @@ mod tests {
             sqlx::query(wrong).execute(&pool).await.unwrap();
             let error = apply_underway(&pool).await.unwrap_err();
             assert!(format!("{error:#}").contains("idx_task_claim"), "{wrong}: {error:#}");
+            assert!(format!("{error:#}").contains("wrong definition"), "{wrong}: {error:#}");
+            assert!(check_underway(&pool).await.is_err(), "{wrong}");
+        }
+    }
+
+    #[sqlx::test]
+    async fn underway_extensions_reject_wrong_terminal_retention_index_definitions(pool: PgPool) {
+        for wrong in [
+            "CREATE INDEX idx_task_terminal_created_at ON underway.task(created_at)",
+            "CREATE INDEX idx_task_terminal_created_at ON underway.task(created_at) WHERE state = 'succeeded'",
+            "CREATE INDEX idx_task_terminal_created_at ON underway.task(created_at DESC) WHERE state IN ('succeeded', 'failed')",
+        ] {
+            sqlx::raw_sql("DROP SCHEMA IF EXISTS underway CASCADE; DROP SCHEMA IF EXISTS underway_extensions CASCADE; CREATE SCHEMA underway_extensions;")
+                .execute(&pool).await.unwrap();
+            underway::run_migrations(&pool).await.unwrap();
+            sqlx::query(wrong).execute(&pool).await.unwrap();
+            let error = apply_underway(&pool).await.unwrap_err();
+            assert!(format!("{error:#}").contains("idx_task_terminal_created_at"), "{wrong}: {error:#}");
             assert!(format!("{error:#}").contains("wrong definition"), "{wrong}: {error:#}");
             assert!(check_underway(&pool).await.is_err(), "{wrong}");
         }
