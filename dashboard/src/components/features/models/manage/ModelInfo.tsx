@@ -19,8 +19,6 @@ import {
   useModel,
   useEndpoint,
   useUpdateModel,
-  useModelCachePricing,
-  useModelOverlays,
   useProbes,
   useModelComponents,
   useDaemons,
@@ -36,7 +34,6 @@ import type {
 import {
   useAuthorization,
   isPlaygroundDenied,
-  getTariffDisplayName,
   copyToClipboard,
 } from "../../../../utils";
 import {
@@ -48,6 +45,7 @@ import {
 } from "../../../modals";
 import UserUsageTable from "./UserUsageTable";
 import ModelProbes from "./ModelProbes";
+import { ModelPricing } from "./ModelPricing";
 import ProvidersTab from "./ProvidersTab";
 import {
   Card,
@@ -239,24 +237,6 @@ const ModelInfo: React.FC = () => {
     isLoading: modelLoading,
     error: modelError,
   } = useModel(modelId!, { include: includeParam });
-
-  // Cache pricing is fetched separately (admin-only endpoint), not via the model include.
-  // Gated on `manage-models` to mirror the backend's `Models:UpdateAll` gate (the same one
-  // that guards base-price edits) rather than the incidental `manage-groups` proxy.
-  const { data: cachePricing, isLoading: cachePricingLoading } =
-    useModelCachePricing(modelId!, {
-      enabled: !!modelId && canManageModels,
-    });
-  // Organisations with a serving overlay on this model (platform managers only).
-  const { data: modelOverlays } = useModelOverlays(modelId!, {
-    enabled: !!modelId && canManageModels,
-  });
-  // The model's own prices vs organisation deals (platform managers see both).
-  const generalTariffs = (model?.tariffs ?? []).filter((t) => !t.organization_id);
-  const organisationTariffs = (model?.tariffs ?? []).filter(
-    (t) => !!t.organization_id,
-  );
-  const servingPresets = Object.entries(model?.serving_classes ?? {});
 
   const {
     data: endpoint,
@@ -2475,315 +2455,14 @@ const ModelInfo: React.FC = () => {
                         </div>
                       )}
 
-                      {/* Pricing Display - visible to all users when billing is enabled */}
-                      {
-                        <div className="border-t pt-6">
-                          <div className="flex items-center justify-between mb-3">
-                            <div className="flex items-center gap-1">
-                              <p className="text-sm text-gray-600">
-                                Pricing Tariffs
-                              </p>
-                              {canManageGroups && (
-                                <InfoTip>
-                                  <p className="text-sm text-muted-foreground">
-                                    Pricing tiers for different API key
-                                    purposes. Set different rates for realtime,
-                                    batch, and playground usage. Click "Manage
-                                    Tariffs" to configure pricing.
-                                  </p>
-                                </InfoTip>
-                              )}
-                            </div>
-                            {canManageGroups && (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => setShowPricingModal(true)}
-                                className="h-8"
-                              >
-                                <Edit className="h-3 w-3 mr-1" />
-                                Manage Tariffs
-                              </Button>
-                            )}
-                          </div>
-                          {generalTariffs.length > 0 ? (
-                            <div className="space-y-3">
-                              {generalTariffs.map((tariff) => (
-                                <div
-                                  key={`${tariff.id}:${tariff.api_key_purpose}:${tariff.completion_window}:${tariff.serving_class ?? "all"}`}
-                                  className="bg-gray-50 rounded-lg p-3"
-                                >
-                                  <div className="flex items-center gap-2 mb-2">
-                                    <p className="font-medium text-sm">
-                                      {getTariffDisplayName(
-                                        tariff.api_key_purpose,
-                                        tariff.completion_window,
-                                      )}
-                                    </p>
-                                    <span className="text-xs text-gray-500 ml-auto">
-                                      Valid from{" "}
-                                      {new Date(
-                                        tariff.valid_from,
-                                      ).toLocaleString()}
-                                    </span>
-                                  </div>
-                                  <div className="grid grid-cols-2 gap-4 text-sm">
-                                    <div>
-                                      <p className="text-xs text-gray-500">
-                                        Input (per 1M tokens)
-                                      </p>
-                                      <p className="font-medium">
-                                        $
-                                        {(
-                                          parseFloat(
-                                            tariff.input_price_per_token,
-                                          ) * 1000000
-                                        ).toFixed(2)}
-                                      </p>
-                                    </div>
-                                    <div>
-                                      <p className="text-xs text-gray-500">
-                                        Output (per 1M tokens)
-                                      </p>
-                                      <p className="font-medium">
-                                        $
-                                        {(
-                                          parseFloat(
-                                            tariff.output_price_per_token,
-                                          ) * 1000000
-                                        ).toFixed(2)}
-                                      </p>
-                                    </div>
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          ) : (
-                            <p className="text-sm text-gray-500 mt-2">
-                              No tariffs configured.
-                              {canManageGroups &&
-                                ' Click "Manage Tariffs" to set up pricing.'}
-                            </p>
-                          )}
-                          {canManageModels && organisationTariffs.length > 0 && (
-                            <div className="mt-4">
-                              <p className="text-sm text-gray-600 mb-2">
-                                Organisation prices
-                              </p>
-                              <p className="text-xs text-gray-500 mb-2">
-                                Deals declared in the organisation catalog; they
-                                replace the general price for that organisation.
-                              </p>
-                              <div className="space-y-2">
-                                {organisationTariffs.map((tariff) => (
-                                  <div
-                                    key={`${tariff.id}:${tariff.api_key_purpose}:${tariff.completion_window}:${tariff.serving_class ?? "all"}`}
-                                    className="bg-gray-50 rounded-lg p-3 text-sm flex flex-wrap items-center gap-x-4 gap-y-1"
-                                  >
-                                    <span className="font-mono text-xs">
-                                      {tariff.organization_id}
-                                    </span>
-                                    <span>{tariff.serving_class ?? "All classes"}</span>
-                                    <span className="font-medium">
-                                      {getTariffDisplayName(
-                                        tariff.api_key_purpose,
-                                        tariff.completion_window,
-                                      )}
-                                    </span>
-                                    <span className="tabular-nums">
-                                      $
-                                      {(
-                                        parseFloat(tariff.input_price_per_token) *
-                                        1000000
-                                      ).toFixed(2)}{" "}
-                                      in / $
-                                      {(
-                                        parseFloat(tariff.output_price_per_token) *
-                                        1000000
-                                      ).toFixed(2)}{" "}
-                                      out
-                                    </span>
-                                  </div>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                        </div>
-                      }
-                      {/* Serving classes and organisation overlays (platform managers only; catalog-declared) */}
-                      {canManageModels && (
-                        <div className="border-t pt-6">
-                          <div className="flex items-center gap-1 mb-3">
-                            <p className="text-sm text-gray-600">
-                              Serving classes
-                            </p>
-                            <InfoTip>
-                              <p className="text-sm text-muted-foreground">
-                                Classes this model offers, each a preset of
-                                router targets sent to the serving stack.
-                                Declared in the model catalog; no class means
-                                every request is served as standard.
-                              </p>
-                            </InfoTip>
-                          </div>
-                          {servingPresets.length === 0 ? (
-                            <p className="text-sm text-gray-500">
-                              None offered (standard only).
-                            </p>
-                          ) : (
-                            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                              {servingPresets.map(([name, preset]) => (
-                                <div
-                                  key={name}
-                                  className="bg-gray-50 rounded-lg p-3 text-sm"
-                                >
-                                  <p className="font-medium">{name}</p>
-                                  <p className="text-xs text-gray-500 mt-1 tabular-nums">
-                                    TTFT {preset.ttft_ms} ms · ITL {preset.itl_ms}{" "}
-                                    ms
-                                    {preset.priority !== undefined
-                                      ? ` · priority ${preset.priority}`
-                                      : ""}
-                                  </p>
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                          <div className="flex items-center gap-1 mt-5 mb-2">
-                            <p className="text-sm text-gray-600">
-                              Organisation overlays
-                            </p>
-                            <InfoTip>
-                              <p className="text-sm text-muted-foreground">
-                                Per-organisation overrides on this model from
-                                the organisation catalog: a default class or
-                                explicit targets, and the routing preference.
-                              </p>
-                            </InfoTip>
-                          </div>
-                          {!modelOverlays || modelOverlays.length === 0 ? (
-                            <p className="text-sm text-gray-500">
-                              No organisation overlays.
-                            </p>
-                          ) : (
-                            <div className="space-y-2">
-                              {modelOverlays.map((o) => (
-                                <div
-                                  key={o.organization_id}
-                                  className="bg-gray-50 rounded-lg p-3 text-sm flex flex-wrap items-center gap-x-4 gap-y-1"
-                                >
-                                  <span className="font-medium">
-                                    {o.organization_name}
-                                  </span>
-                                  {o.default_serving_class && (
-                                    <span>default {o.default_serving_class}</span>
-                                  )}
-                                  {o.targets && (
-                                    <span className="tabular-nums">
-                                      TTFT {o.targets.ttft_ms} ms · ITL{" "}
-                                      {o.targets.itl_ms} ms
-                                      {o.targets.priority !== undefined
-                                        ? ` · priority ${o.targets.priority}`
-                                        : ""}
-                                    </span>
-                                  )}
-                                  {o.self_hosted_only !== undefined && (
-                                    <span>
-                                      self-hosted only:{" "}
-                                      {o.self_hosted_only ? "yes" : "no"}
-                                    </span>
-                                  )}
-                                  <span className="text-xs text-gray-500 ml-auto">
-                                    {o.provisioning_source ?? "hand-written"}
-                                  </span>
-                                </div>
-                              ))}
-                            </div>
-                          )}
-                        </div>
-                      )}
-                      {/* Cache Pricing Display (admin-only; data via the dedicated endpoint) */}
-                      {canManageModels && (
-                        <div className="border-t pt-6">
-                          <div className="flex items-center justify-between mb-3">
-                            <div className="flex items-center gap-1">
-                              <p className="text-sm text-gray-600">
-                                Cache Pricing
-                              </p>
-                              <InfoTip>
-                                <p className="text-sm text-muted-foreground">
-                                  Anthropic-style prompt-cache pricing: per-TTL
-                                  write multipliers (5m / 1h / 24h), the read
-                                  multiplier, and the minimum cacheable prefix.
-                                </p>
-                              </InfoTip>
-                            </div>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => setShowCachePricingModal(true)}
-                              className="h-8"
-                            >
-                              <Edit className="h-3 w-3 mr-1" />
-                              {cachePricing?.enabled ? "Edit" : "Configure"}
-                            </Button>
-                          </div>
-                          {cachePricingLoading ? (
-                            <p className="text-sm text-gray-500 mt-2">
-                              Loading cache pricing...
-                            </p>
-                          ) : cachePricing?.enabled ? (
-                            <div className="bg-gray-50 rounded-lg p-3">
-                              <div className="grid grid-cols-2 gap-4 text-sm">
-                                <div>
-                                  <p className="text-xs text-gray-500">
-                                    Write 5m
-                                  </p>
-                                  <p className="font-medium">
-                                    {cachePricing.write_multiplier_5m ?? "—"}×
-                                  </p>
-                                </div>
-                                <div>
-                                  <p className="text-xs text-gray-500">
-                                    Write 1h
-                                  </p>
-                                  <p className="font-medium">
-                                    {cachePricing.write_multiplier_1h ?? "—"}×
-                                  </p>
-                                </div>
-                                <div>
-                                  <p className="text-xs text-gray-500">
-                                    Write 24h
-                                  </p>
-                                  <p className="font-medium">
-                                    {cachePricing.write_multiplier_24h ?? "—"}×
-                                  </p>
-                                </div>
-                                <div>
-                                  <p className="text-xs text-gray-500">Read</p>
-                                  <p className="font-medium">
-                                    {cachePricing.read_multiplier ?? "—"}×
-                                  </p>
-                                </div>
-                                <div>
-                                  <p className="text-xs text-gray-500">
-                                    Min prefix tokens
-                                  </p>
-                                  <p className="font-medium">
-                                    {cachePricing.min_prefix_tokens?.toLocaleString() ??
-                                      "—"}
-                                  </p>
-                                </div>
-                              </div>
-                            </div>
-                          ) : (
-                            <p className="text-sm text-gray-500 mt-2">
-                              Cache pricing not configured. Click "Configure" to
-                              enable.
-                            </p>
-                          )}
-                        </div>
-                      )}
+                      <ModelPricing
+                        key={`${model.id}:${searchParams.get("pricing_org") ?? "general"}`}
+                        model={model}
+                        manager={canManageModels}
+                        initialOrganization={searchParams.get("pricing_org") ?? undefined}
+                        onEditPrices={() => setShowPricingModal(true)}
+                        onEditCache={() => setShowCachePricingModal(true)}
+                      />
 
                       {/* Rate Limiting & Capacity Display - only show for Platform Managers */}
                       {canManageGroups &&

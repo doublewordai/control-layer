@@ -1,16 +1,62 @@
 # Organization model overlays
 
-Define customer deals in the mounted `org-overlays.d` YAML catalog. Reference the
-organization's account username and the public or private virtual model alias.
-Account defaults and class grants are managed separately; declaring a price does
-not grant model access or enable a serving class.
+Organization overlays configure per-model serving behavior and pricing for an
+organization in a Control Layer installation. Account defaults, class grants and
+model access are configured separately; declaring a price does not grant model
+access or enable a serving class.
+
+## Enable the built-in catalog
+
+Control Layer includes an optional YAML catalog reader and startup reconciler.
+The catalog files can live on a local filesystem or be mounted into a container;
+no particular deployment repository, CI service or orchestration system is
+required. Startup provisioning is disabled by default.
+
+Configure the paths in your Control Layer configuration:
+
+```yaml
+model_provisioning:
+  enabled: true
+  directory: ./model-provisioning.d
+  org_overlays_directory: ./org-overlays.d
+```
+
+Paths are resolved from the server's working directory. Use absolute paths when
+mounting configuration files into containers. Enabling provisioning applies both
+the [model catalog](../reference/model-provisioning.md) and the organization
+catalog at startup; maintain both as the desired configuration for your
+installation.
+
+Create organization accounts first. Each organization file references the
+account's `username` and model catalog aliases. Overlay and organization-price
+views in the admin console are read-only; this release provides no management
+API for authoring those overlays. Account-level settings remain editable through
+the authorized management API and console.
+
+## Inspect effective configuration
+
+Platform managers can select **General pricing** or an organization above the
+pricing section on a model's management page. The selection applies to both token
+prices and cache multipliers. Source labels distinguish organization overrides
+from inherited general prices. Realtime prices are shown by serving class; batch
+and flex use standard-class pricing for the specified completion window. A missing
+matching tariff is shown as unpriced rather than substituted with a different tier.
+
+Below cache pricing, **Serving classes** lists the model's presets and
+**Organisation overlays** expands each organization's explicit settings and price
+overrides. The organization's own page groups these same details by model under
+**Model overlays**, with a link to its effective model prices.
+
+These inspection controls are restricted to platform managers. Customer price
+listings continue to show a single all-class organization price set, falling back
+to general model prices, without exposing class-specific overrides.
 
 ## Ownership and inheritance
 
 A declared org/model entry is the complete desired overlay and price set. It
 adopts existing current rows for that pair, including rows inserted directly in
-the database. Manage production deals in YAML; direct database edits are suitable
-only for isolated testing or an emergency repair that is also reflected in YAML.
+the database. For catalog-managed entries, update the YAML source; a
+database-only change may be replaced on the next reconciliation.
 
 Omitted serving fields inherit account/model defaults. For example, omitting
 `self_hosted_only` restores the account's preference; `false` explicitly permits
@@ -27,12 +73,13 @@ startup reconciliation applies immediately and does not author schedules.
 
 ## Example: batch/flex and class-specific realtime prices
 
-These are illustrative prices per million tokens, not customer terms:
+The organization, model alias and prices below are fictional. Token prices are
+expressed per million tokens:
 
 ```yaml
-org: example-customer
+org: example-organization
 models:
-  - alias: z-ai/glm-5.2
+  - alias: example-model
     default_class: throughput
     tariffs:
       - name: realtime-default
@@ -88,7 +135,7 @@ interactive/throughput batch prices are rejected by validation.
 
 ## Billing, display and admission
 
-Billing selects the key owner's class-specific deal, then its all-class deal,
+Billing selects the key owner's class-specific price, then its all-class price,
 then the general model price. Each scope must match the purpose and, for batch,
 the exact completion window. Playground may fall back to realtime within the
 same scope; batch never falls back to realtime. If no scope supplies the batch
@@ -97,32 +144,35 @@ catalog. Continuation and platform keys have no customer tariffs.
 
 Cache multipliers follow class, all-class, then model scope, with the general
 model cache tariff controlling whether cache billing is enabled. Customer model
-listings and price sorting show the all-class deal or general model price;
-class-specific prices remain internal. Actual billing still uses the resolved
-class. Usage's realtime-equivalent comparison is an estimate, separate from the
+listings and price sorting show the all-class price or general model price;
+class-specific prices are visible only in platform-manager views. Actual billing
+still uses the resolved class. Usage's realtime-equivalent comparison is an estimate, separate from the
 recorded actual charge.
 
 Zero is an explicit price and stops price fallback. Generally free or unpriced
 models retain their existing access without balance or key-cap headroom. A zero
-customer deal on a generally paid model does not grant that exemption: positive
-account balance or `ALLOW_NEGATIVE_BALANCE` is still required, and key caps apply.
-A positive customer deal on an otherwise free model requires credit for that
-account only; it does not restrict other accounts. Admission checks tariff
+organization price on a generally paid model does not grant that exemption:
+positive account balance or `ALLOW_NEGATIVE_BALANCE` is still required, and key caps apply.
+A positive organization price on an otherwise free model requires credit for
+that account only; it does not restrict other accounts. Admission checks tariff
 existence without resolving effective purpose/window/class prices per key/model.
 
 ## Validation and rollout
 
-Run the matching release's validator before merging catalog edits:
+Run the validator from the same Control Layer release that will apply the files:
 
 ```sh
 dwctl-model-provisioning validate-org-overlays /path/to/org-overlays.d \
   --models /path/to/model-deployments
 ```
 
-Internal CI runs this against the staging release image when organization YAML
-files exist. It checks syntax, pricing precision, class/purpose compatibility and
-model references. It cannot verify organization existence or future ledger rows
-in the target database. Check those prerequisites before rollout, then verify
-catalog reconciliation, Onwards synchronization, effective prices, a small billed
-request and key-cap attribution. Do not remove an existing private alias until
-its callers have moved to the shared model.
+The validator checks syntax, pricing precision, class/purpose compatibility and
+model references. You can run it locally or add it to your own CI pipeline. It
+cannot verify organization existence or future ledger rows in the target
+database. Check those prerequisites before restarting the server with an updated
+catalog.
+
+After applying a catalog, verify reconciliation, gateway configuration
+synchronization, effective prices, a small billed request and key-cap
+attribution. If consolidating existing model aliases, retain each alias until
+its callers have moved to the replacement.

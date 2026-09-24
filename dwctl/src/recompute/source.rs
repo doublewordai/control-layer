@@ -400,9 +400,8 @@ mod tests {
     }
 
     /// A dwctl-cached request re-prices with the tariff version valid at its time — not the
-    /// config defaults, and not a version that superseded it. Measured failure this pins:
-    /// healthy GLM-5.2 traffic (tariff read ×0.8, writes ×1.0) re-priced with the defaults
-    /// (read ×0.1, write ×1.25) and reported a −$0.06 "overcharge" on 25 healthy rows.
+    /// config defaults, and not a version that superseded it. Using either can
+    /// incorrectly report a billing discrepancy on correctly charged requests.
     #[sqlx::test]
     async fn cached_row_reprices_with_the_tariff_valid_at_its_time(pool: PgPool) {
         setup_fusillade_pool(&pool).await;

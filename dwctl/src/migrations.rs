@@ -1110,3 +1110,6 @@ mod tests {
         assert_eq!(text, "db.example:5433/clay");
     }
 }
+
+#[cfg(test)]
+mod tariff_indexes_tests;

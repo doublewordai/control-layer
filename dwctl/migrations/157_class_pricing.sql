@@ -11,22 +11,7 @@ ALTER TABLE model_tariffs ADD CONSTRAINT model_tariffs_class_scope
 ALTER TABLE model_cache_tariffs ADD CONSTRAINT model_cache_tariffs_class_scope
     CHECK (serving_class IS NULL OR (user_id IS NOT NULL AND serving_class IN ('standard','interactive','throughput','custom')));
 
--- These are configuration ledgers, not inference/analytics tables. New class
--- rows are empty on upgrade; general-price indexes remain unchanged.
-DROP INDEX idx_model_tariffs_unique_active_org_batch_per_sla;
-DROP INDEX idx_model_tariffs_unique_active_org_per_purpose;
-CREATE UNIQUE INDEX idx_model_tariffs_unique_active_org_batch_per_sla
-    ON model_tariffs (user_id, deployed_model_id, api_key_purpose, completion_window, COALESCE(serving_class, ''))
-    WHERE valid_until IS NULL AND user_id IS NOT NULL AND api_key_purpose = 'batch' AND completion_window IS NOT NULL;
-CREATE UNIQUE INDEX idx_model_tariffs_unique_active_org_per_purpose
-    ON model_tariffs (user_id, deployed_model_id, api_key_purpose, COALESCE(serving_class, ''))
-    WHERE valid_until IS NULL AND user_id IS NOT NULL AND api_key_purpose IN ('realtime','playground','platform','continuation');
-DROP INDEX idx_model_cache_tariffs_version_org;
-DROP INDEX idx_model_cache_tariffs_unique_active_org;
-CREATE UNIQUE INDEX idx_model_cache_tariffs_version_org
-    ON model_cache_tariffs (user_id, deployed_model_id, valid_from, COALESCE(serving_class, '')) WHERE user_id IS NOT NULL;
-CREATE UNIQUE INDEX idx_model_cache_tariffs_unique_active_org
-    ON model_cache_tariffs (user_id, deployed_model_id, COALESCE(serving_class, '')) WHERE valid_until IS NULL AND user_id IS NOT NULL;
+-- Final class-aware indexes are built concurrently after the schema additions.
 
 -- Shared by admission, price display, sorting and estimates. Billing's in-memory
 -- resolver uses this same order: the whole purpose/window fallback within each

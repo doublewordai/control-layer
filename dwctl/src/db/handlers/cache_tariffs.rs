@@ -121,7 +121,7 @@ impl<'c> CacheTariffs<'c> {
         // Atomic: expire the active version and insert the new one in one transaction, so a
         // failed insert can't leave the model unintentionally disabled (ledger: never edit a
         // version in place). Two concurrent enables can't both land an active row — the
-        // `idx_model_cache_tariffs_unique_active` partial unique index (migration 104) fails
+        // `idx_model_cache_tariffs_unique_active_general` partial unique index fails
         // the loser's INSERT; the transaction just keeps each enable all-or-nothing.
         let mut tx = self.db.begin().await?;
 

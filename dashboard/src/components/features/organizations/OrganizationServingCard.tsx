@@ -1,10 +1,7 @@
-import { formatTariffPrice } from "@/utils/formatters";
-import { useOrganizationServing } from "@/api/control-layer/hooks";
-import type {
-  ModelTariff,
-  OrganizationCacheTariff,
-  ServingOverlay,
-} from "@/api/control-layer/types";
+import { useState } from "react";
+import { useModel, useOrganizationServing } from "@/api/control-layer/hooks";
+import type { OrganizationServing } from "@/api/control-layer/types";
+import { OverlayDetails } from "../serving/OverlayDetails";
 import { Badge } from "@/components/ui/badge";
 import {
   Card,
@@ -13,7 +10,6 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { getTariffDisplayName } from "@/utils/formatters";
 
 interface OrganizationServingCardProps {
   organizationId: string;
@@ -43,7 +39,9 @@ export function OrganizationServingCard({
     );
   }
   if (isError || !data) {
-    return null;
+    return (
+      <p role="alert">Could not load organisation serving configuration.</p>
+    );
   }
 
   const classes = data.granted_serving_classes;
@@ -88,163 +86,92 @@ export function OrganizationServingCard({
           </div>
         </dl>
 
-        <OverlaysTable overlays={data.overlays} />
-        <TariffsTable tariffs={data.tariffs} />
-        <CacheTariffsTable rows={data.cache_tariffs} />
+        <section className="space-y-3">
+          <h3 className="font-medium text-sm">Model overlays</h3>
+          <p className="text-sm text-muted-foreground">
+            Serving settings and price overrides are grouped by model. Expand a
+            model to inspect its configuration.
+          </p>
+          {[
+            ...new Set([
+              ...data.overlays.map((row) => row.deployed_model_id),
+              ...data.tariffs.map((row) => row.deployed_model_id),
+              ...data.cache_tariffs.map((row) => row.deployed_model_id),
+            ]),
+          ].map((modelId) => (
+            <OrganizationModelOverlay
+              key={modelId}
+              modelId={modelId}
+              serving={data}
+            />
+          ))}
+          {!data.overlays.length &&
+            !data.tariffs.length &&
+            !data.cache_tariffs.length && (
+              <p className="text-sm text-muted-foreground">
+                No model overrides; account settings and general model prices
+                apply.
+              </p>
+            )}
+        </section>
       </CardContent>
     </Card>
   );
 }
 
-function OverlaysTable({ overlays }: { overlays: ServingOverlay[] }) {
+function OrganizationModelOverlay({
+  modelId,
+  serving,
+}: {
+  modelId: string;
+  serving: OrganizationServing;
+}) {
+  const [open, setOpen] = useState(false);
+  const overlay = serving.overlays.find(
+    (row) => row.deployed_model_id === modelId,
+  );
+  const alias =
+    overlay?.alias ??
+    serving.cache_tariffs.find((row) => row.deployed_model_id === modelId)
+      ?.alias;
+  const tokenCount = serving.tariffs.filter(
+    (row) => row.deployed_model_id === modelId,
+  ).length;
+  const cacheCount = serving.cache_tariffs.filter(
+    (row) => row.deployed_model_id === modelId,
+  ).length;
   return (
-    <section>
-      <h3 className="mb-2 text-sm font-medium text-gray-700">
-        Per-model overlays
-      </h3>
-      {overlays.length === 0 ? (
-        <p className="text-sm text-gray-500">No overlays.</p>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead className="text-left text-xs uppercase tracking-wide text-gray-500">
-              <tr>
-                <th className="py-1 pr-4">Model</th>
-                <th className="py-1 pr-4">Default class</th>
-                <th className="py-1 pr-4">Targets</th>
-                <th className="py-1 pr-4">Self-hosted only</th>
-                <th className="py-1">Source</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {overlays.map((o) => (
-                <tr key={`${o.organization_id}-${o.deployed_model_id}`}>
-                  <td className="py-1.5 pr-4 font-mono text-xs">{o.alias}</td>
-                  <td className="py-1.5 pr-4">
-                    {o.default_serving_class ?? "—"}
-                  </td>
-                  <td className="py-1.5 pr-4 tabular-nums">
-                    {o.targets ? formatTargets(o.targets) : "—"}
-                  </td>
-                  <td className="py-1.5 pr-4">
-                    {o.self_hosted_only === undefined
-                      ? "—"
-                      : o.self_hosted_only
-                        ? "Yes"
-                        : "No"}
-                  </td>
-                  <td className="py-1.5 text-xs text-gray-500">
-                    {o.provisioning_source ?? "hand-written"}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+    <details
+      className="rounded-lg border"
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary className="cursor-pointer p-3 text-sm">
+        <span className="font-medium">
+          {alias ?? <ModelAlias modelId={modelId} />}
+        </span>
+        <span className="text-muted-foreground ml-2">
+          {tokenCount} token price overrides · {cacheCount} cache overrides
+        </span>
+      </summary>
+      {open && (
+        <div className="border-t p-3">
+          <OverlayDetails
+            modelId={modelId}
+            overlay={overlay}
+            serving={serving}
+          />
         </div>
       )}
-    </section>
+    </details>
   );
 }
 
-function TariffsTable({ tariffs }: { tariffs: ModelTariff[] }) {
+function ModelAlias({ modelId }: { modelId: string }) {
+  const model = useModel(modelId);
   return (
-    <section>
-      <h3 className="mb-2 text-sm font-medium text-gray-700">
-        Organisation prices
-      </h3>
-      {tariffs.length === 0 ? (
-        <p className="text-sm text-gray-500">
-          No organisation prices; general model prices apply.
-        </p>
-      ) : (
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead className="text-left text-xs uppercase tracking-wide text-gray-500">
-              <tr>
-                <th className="py-1 pr-4">Model</th>
-                <th className="py-1 pr-4">Class</th>
-                <th className="py-1 pr-4">Tier</th>
-                <th className="py-1 pr-4">Input / 1M</th>
-                <th className="py-1 pr-4">Output / 1M</th>
-                <th className="py-1">Since</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {tariffs.map((t) => (
-                <tr key={t.id}>
-                  <td className="py-1.5 pr-4 font-mono text-xs">
-                    {t.deployed_model_id}
-                  </td>
-                  <td className="py-1.5 pr-4">{t.serving_class ?? "All classes"}</td>
-                  <td className="py-1.5 pr-4">
-                    {getTariffDisplayName(
-                      t.api_key_purpose,
-                      t.completion_window,
-                    )}
-                  </td>
-                  <td className="py-1.5 pr-4 tabular-nums">
-                    {formatTariffPrice(t.input_price_per_token)}
-                  </td>
-                  <td className="py-1.5 pr-4 tabular-nums">
-                    {formatTariffPrice(t.output_price_per_token)}
-                  </td>
-                  <td className="py-1.5 text-xs text-gray-500">
-                    {new Date(t.valid_from).toLocaleDateString()}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </section>
+    <>
+      {model.data?.alias ??
+        (model.isError ? "Model unavailable" : "Loading model…")}
+    </>
   );
-}
-
-function CacheTariffsTable({ rows }: { rows: OrganizationCacheTariff[] }) {
-  if (rows.length === 0) {
-    return null;
-  }
-  return (
-    <section>
-      <h3 className="mb-2 text-sm font-medium text-gray-700">
-        Organisation cache multipliers
-      </h3>
-      <div className="overflow-x-auto">
-        <table className="w-full text-sm">
-          <thead className="text-left text-xs uppercase tracking-wide text-gray-500">
-            <tr>
-              <th className="py-1 pr-4">Model</th>
-              <th className="py-1 pr-4">Read</th>
-              <th className="py-1 pr-4">Write 5m</th>
-              <th className="py-1 pr-4">Write 1h</th>
-              <th className="py-1 pr-4">Write 24h</th>
-              <th className="py-1">Class</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y">
-            {rows.map((r) => (
-              <tr key={`${r.deployed_model_id}:${r.serving_class ?? "all"}`}>
-                <td className="py-1.5 pr-4 font-mono text-xs">{r.alias}</td>
-                <td className="py-1.5 pr-4 tabular-nums">{r.read_multiplier}×</td>
-                <td className="py-1.5 pr-4 tabular-nums">{r.write_multiplier_5m}×</td>
-                <td className="py-1.5 pr-4 tabular-nums">{r.write_multiplier_1h}×</td>
-                <td className="py-1.5 pr-4 tabular-nums">{r.write_multiplier_24h}×</td>
-                <td className="py-1.5 tabular-nums">{r.serving_class ?? "All classes"}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </section>
-  );
-}
-
-function formatTargets(t: {
-  ttft_ms: number;
-  itl_ms: number;
-  priority: number;
-}): string {
-  const priority = t.priority !== undefined ? `, priority ${t.priority}` : "";
-  return `TTFT ${t.ttft_ms} ms, ITL ${t.itl_ms} ms${priority}`;
 }

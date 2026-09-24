@@ -7,6 +7,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Maintain shared skills in `.claude/skills/`. Codex discovers the same skills via
 `.agents/skills -> ../.claude/skills`; no per-skill links or inventory are needed.
 
+## Public repository confidentiality
+
+This is a public, open-source repository. Use fictional organizations, model
+aliases and illustrative prices in examples and test fixtures. Never include
+real customer identities, private aliases, negotiated terms, account identifiers
+or customer-specific operational details in code, docs, fixtures, commit
+messages, pull-request text or review comments. Keep private deployment paths,
+internal runbooks and customer investigations outside this repository. Describe
+built-in features generically, with configuration that any installation can use.
+Check the diff and publication text for these details before committing or posting.
+
 ## Project Overview
 
 The Doubleword Control Layer (dwctl) is a high-performance AI model gateway
