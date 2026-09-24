@@ -156,6 +156,7 @@ pub async fn get_transaction<P: PoolProvider>(
     ),
     responses(
         (status = 200, description = "Paginated list of transactions with balance context", body = TransactionListResponse),
+        (status = 400, description = "Bad request - unrecognized `transaction_types` token"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden - cannot access other users' transactions or all transactions without proper permissions"),
         (status = 500, description = "Internal server error"),
@@ -218,8 +219,11 @@ pub async fn list_transactions<P: PoolProvider>(
     let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     let mut repo = Credits::new(&mut pool_conn);
 
-    // Parse filters from query
-    let filters = query.to_filters();
+    // Parse filters from query. An unrecognized `transaction_types` token is a
+    // client error (the create endpoint rejects unknown `transaction_type`
+    // values the same way), so surface it as 400 instead of silently dropping
+    // it and matching zero rows.
+    let filters = query.to_filters().map_err(|message| Error::BadRequest { message })?;
 
     // Batch grouping only works with a user filter (requires per-user batch_aggregates table)
     let grouping_enabled = query.group_batches.unwrap_or(false) && filter_user_id.is_some();
@@ -624,6 +628,60 @@ mod tests {
 
         // Should only see user1's transactions
         assert!(transactions.iter().all(|t| t.user_id == user1.id));
+    }
+
+    // Test: an all-invalid `transaction_types` filter is rejected with 400
+    // (consistent with the create endpoint's closed-enum validation), not
+    // silently turned into a "match no rows" predicate that returns 200.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_transactions_all_invalid_type_token_returns_400(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        create_initial_credit_transaction(&pool, user.id, "100.0").await;
+
+        // Control: a valid token returns the seeded transaction (200, non-empty).
+        let response = app
+            .get("/admin/api/v1/transactions?transaction_types=admin_grant")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status_ok();
+        let control_body: TransactionListResponse = response.json();
+        assert!(
+            !control_body.data.is_empty(),
+            "control: valid filter must return seeded transaction"
+        );
+
+        // Repro: every token unrecognized -> 400 BadRequest (was: 200 with empty data).
+        let response = app
+            .get("/admin/api/v1/transactions?transaction_types=admin_grnt_typo")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status_bad_request();
+    }
+
+    // Test: a *valid* `transaction_types` filter that matches no rows still
+    // returns 200 with empty data — distinguishes "valid filter, no matching
+    // rows" (correct, 200) from "unrecognized token, no rows" (400). This must
+    // not regress now that unknown tokens are rejected.
+    #[sqlx::test]
+    #[test_log::test]
+    async fn test_list_transactions_valid_filter_matching_no_rows_returns_200_empty(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        // Seed only an admin_grant; `purchase` is valid but matches nothing.
+        create_initial_credit_transaction(&pool, user.id, "100.0").await;
+
+        let response = app
+            .get("/admin/api/v1/transactions?transaction_types=purchase")
+            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
+            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
+            .await;
+        response.assert_status_ok();
+        let body: TransactionListResponse = response.json();
+        assert!(body.data.is_empty(), "valid filter matching no rows => empty 200, not 400");
     }
 
     // Test: Create transaction validates amount > 0 (zero amount)
