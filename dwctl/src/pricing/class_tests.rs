@@ -194,7 +194,11 @@ async fn customer_quotes_hide_classes_and_ownerless_estimates_use_general_prices
         .await
         .unwrap();
     assert_eq!(own, Some((Decimal::ONE, Decimal::ONE)));
-    assert_eq!(unknown_owner, None, "missing batch price must not borrow realtime");
+    assert_eq!(
+        unknown_owner,
+        Some((Decimal::from(3), Decimal::from(3))),
+        "missing batch price uses the final general realtime fallback"
+    );
     drop(conn);
     sqlx::query("UPDATE deployed_models SET deleted = TRUE WHERE id = $1")
         .bind(model)
@@ -680,4 +684,100 @@ async fn historical_deals_prevent_hard_account_deletion(pool: PgPool) {
             .unwrap();
         assert_eq!(count, 1, "soft deletion retains historical prices");
     }
+}
+
+#[sqlx::test]
+async fn batch_exhausts_exact_scopes_before_realtime_safety_net(pool: PgPool) {
+    let account: Uuid = sqlx::query_scalar(
+        "INSERT INTO users (username,email,user_type) VALUES ('fallback-org','fallback@example.invalid','organization') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let model: Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('fallback-model','fallback-model',true,$1) RETURNING id").bind(account).fetch_one(&pool).await.unwrap();
+    let now = Utc::now();
+    let mut tariffs = Vec::new();
+    // Removal order is the expected selection order, deliberately unrelated to price.
+    for (scope, class, purpose, window, price) in [
+        (Some(account), Some("standard"), ApiKeyPurpose::Batch, Some("24h"), 0),
+        (Some(account), None, ApiKeyPurpose::Batch, Some("24h"), 6),
+        (None, None, ApiKeyPurpose::Batch, Some("24h"), 8),
+        (Some(account), Some("standard"), ApiKeyPurpose::Realtime, None, 1),
+        (Some(account), None, ApiKeyPurpose::Realtime, None, 2),
+        (None, None, ApiKeyPurpose::Realtime, None, 3),
+    ] {
+        let price = Decimal::from(price);
+        let name = if purpose == ApiKeyPurpose::Batch { "batch" } else { "realtime" };
+        let from = now - chrono::Duration::hours(1);
+        let id: Uuid = sqlx::query_scalar("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,completion_window,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,$2,$3,'fallback',$4,$5,$6,$6,$7) RETURNING id")
+            .bind(model).bind(scope).bind(class).bind(name).bind(window).bind(price).bind(from).fetch_one(&pool).await.unwrap();
+        tariffs.push(TariffInfo {
+            id,
+            account: scope,
+            serving_class: class.map(str::to_owned),
+            purpose,
+            completion_window: window.map(str::to_owned),
+            input_price_per_token: price,
+            output_price_per_token: price,
+            effective_from: from,
+            valid_until: None,
+        });
+    }
+    // An unrelated batch tier and an interactive realtime price are never fallback candidates.
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,completion_window,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,$2,'interactive','excluded','realtime',NULL,99,99,$3), ($1,$2,NULL,'other-window','batch','1h',99,99,$3)")
+        .bind(model).bind(account).bind(now-chrono::Duration::hours(1)).execute(&pool).await.unwrap();
+    for expected in [0, 6, 8, 1, 2, 3] {
+        let rust = find_best_tariff(
+            &tariffs,
+            Some(&ApiKeyPurpose::Batch),
+            Some("24h"),
+            now,
+            Some(account),
+            Some("interactive"),
+        );
+        let sql: (Decimal, Decimal) = sqlx::query_as(
+            "SELECT input_price_per_token,output_price_per_token FROM effective_model_tariff($1,$2,'batch','24h','interactive',$3)",
+        )
+        .bind(model)
+        .bind(account)
+        .bind(now)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(sql, (Decimal::from(expected), Decimal::from(expected)));
+        assert_eq!(rust, (Some(sql.0), Some(sql.1)));
+        // Public display intentionally ignores standard-class deals.
+        let display: Decimal =
+            sqlx::query_scalar("SELECT input_price_per_token FROM effective_model_display_tariff($1,$2,'batch','24h',$3)")
+                .bind(model)
+                .bind(account)
+                .bind(now)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let expected_display = match expected {
+            0 => 6,
+            1 => 2,
+            x => x,
+        };
+        assert_eq!(display, Decimal::from(expected_display));
+        let removed = tariffs.remove(0);
+        sqlx::query("UPDATE model_tariffs SET valid_until=$2 WHERE id=$1")
+            .bind(removed.id)
+            .bind(now)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    let absent: Option<Uuid> = sqlx::query_scalar("SELECT id FROM effective_model_tariff($1,$2,'batch','24h','interactive',$3)")
+        .bind(model)
+        .bind(account)
+        .bind(now)
+        .fetch_optional(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        absent, None,
+        "no other batch window or elevated realtime class may leak into fallback"
+    );
 }

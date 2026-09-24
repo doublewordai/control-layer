@@ -73,6 +73,9 @@ pub struct OrganizationServingResponse {
     /// The organisation's own active token prices, across models
     /// (`organization_id` is set on every row).
     pub tariffs: Vec<TariffResponse>,
+    /// Names for token-price models, including those with no routing overlay.
+    #[schema(value_type = std::collections::BTreeMap<String, String>)]
+    pub model_aliases: std::collections::BTreeMap<DeploymentId, String>,
     /// The organisation's own active cache multipliers, across models.
     pub cache_tariffs: Vec<OrganizationCacheTariffResponse>,
 }

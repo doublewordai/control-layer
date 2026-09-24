@@ -11,7 +11,7 @@ use crate::api::models::serving::{OrganizationCacheTariffResponse, OrganizationS
 use crate::api::models::tariffs::TariffResponse;
 use crate::auth::permissions::{RequiresPermission, operation, resource};
 use crate::db::handlers::repository::Repository;
-use crate::db::handlers::{Tariffs, Users};
+use crate::db::handlers::{Deployments, Tariffs, Users};
 use crate::errors::{Error, Result};
 use crate::types::{DeploymentId, UserId};
 
@@ -77,12 +77,14 @@ pub async fn get_organization_serving<P: PoolProvider>(
         .await
         .map_err(|e| Error::Database(e.into()))?;
 
-    let tariffs = Tariffs::new(&mut conn)
+    let tariffs: Vec<TariffResponse> = Tariffs::new(&mut conn)
         .list_current_by_account(id)
         .await?
         .into_iter()
         .map(TariffResponse::from)
         .collect();
+    let model_ids: Vec<_> = tariffs.iter().map(|tariff| tariff.deployed_model_id).collect();
+    let model_aliases = Deployments::new(&mut conn).get_aliases_by_ids(&model_ids).await?;
 
     #[derive(sqlx::FromRow)]
     struct CacheRow {
@@ -115,6 +117,7 @@ pub async fn get_organization_serving<P: PoolProvider>(
         self_hosted_only: org.self_hosted_only,
         overlays: overlays.into_iter().map(OverlayResponse::from).collect(),
         tariffs,
+        model_aliases,
         cache_tariffs: cache_rows
             .into_iter()
             .map(|r| OrganizationCacheTariffResponse {
@@ -153,8 +156,7 @@ pub async fn list_model_overlays<P: PoolProvider>(
 ) -> Result<Json<Vec<OverlayResponse>>> {
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     require_current_platform_manager(&mut conn, user.id).await?;
-    drop(conn);
-    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // The model-details view requests overlays immediately after creating a model.
     let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM deployed_models WHERE id = $1 AND deleted = FALSE)")
         .bind(id)
         .fetch_one(&mut *conn)
@@ -368,6 +370,42 @@ mod tests {
             .await
             .assert_status_not_found();
     }
+    #[sqlx::test]
+    async fn new_models_and_token_only_deals_are_readable_together(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let member = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, member.id).await;
+        let headers = add_auth_headers(&admin);
+        let response = server
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"type":"composite","model_name":"token-only-model","alias":"token-only-model"}))
+            .await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        let model_id: uuid::Uuid = body["id"].as_str().unwrap().parse().unwrap();
+        let response = get(&server, &format!("/admin/api/v1/models/{model_id}/overlays"), &admin).await;
+        response.assert_status_ok();
+        assert_eq!(response.json::<Value>(), json!([]));
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,$2,'token-only','realtime',1,2)")
+            .bind(model_id).bind(org.id).execute(&pool).await.unwrap();
+        let response = get(&server, &format!("/admin/api/v1/organizations/{}/serving", org.id), &admin).await;
+        response.assert_status_ok();
+        let body: Value = response.json();
+        assert_eq!(body["model_aliases"], json!({model_id.to_string(): "token-only-model"}));
+        assert_eq!(body["overlays"], json!([]));
+        assert_eq!(body["cache_tariffs"], json!([]));
+        sqlx::query("UPDATE deployed_models SET deleted=TRUE WHERE id=$1")
+            .bind(model_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let response = get(&server, &format!("/admin/api/v1/organizations/{}/serving", org.id), &admin).await;
+        assert_eq!(response.json::<Value>()["model_aliases"], json!({}));
+    }
+
     #[sqlx::test]
     async fn organization_edits_are_visible_in_the_next_serving_read(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;

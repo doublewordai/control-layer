@@ -3109,7 +3109,7 @@ mod integration_tests {
 
     #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_does_not_charge_realtime_when_batch_tariff_missing(pool: sqlx::PgPool) {
+    async fn test_batcher_charges_realtime_when_all_batch_scopes_are_missing(pool: sqlx::PgPool) {
         // Setup: Create model with ONLY realtime tariff
         let model_id = create_test_model(&pool, "gpt-4-fallback-test").await;
         let realtime_input = Decimal::from_str("0.00015").unwrap();
@@ -3130,14 +3130,14 @@ mod integration_tests {
         let mut credits = Credits::new(&mut conn);
         assert_eq!(
             credits.get_user_balance(user_id).await.unwrap(),
-            Decimal::from(100),
-            "Missing batch pricing must not invent a realtime charge"
+            Decimal::from(100) - Decimal::new(3, 1),
+            "Missing batch pricing uses the final realtime safety net"
         );
         let cost: Option<Decimal> = sqlx::query_scalar("SELECT total_cost FROM http_analytics WHERE model='gpt-4-fallback-test'")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(cost, None, "the request remains recorded with unresolved pricing");
+        assert_eq!(cost, Some(Decimal::new(3, 1)), "analytics and balance use the same fallback charge");
     }
 
     #[sqlx::test]

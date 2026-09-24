@@ -247,8 +247,9 @@ pub(crate) fn resolve_cache_multipliers(
 }
 
 /// Resolve eligible prices by account/class scope first. Within each scope,
-/// playground prefers its own purpose then realtime. Batch only matches its exact
-/// window and never borrows realtime. Zero stops fallback. Newer valid rows win,
+/// playground prefers its own purpose then realtime. Batch exhausts exact-window
+/// prices across all scopes before trying standard-class realtime prices in the
+/// same scope order. Zero stops fallback. Newer valid rows win,
 /// then the lowest tariff ID, matching SQL. Iterate references without cloning.
 pub(crate) fn find_best_tariff(
     tariffs: &[TariffInfo],
@@ -280,13 +281,13 @@ pub(crate) fn find_best_tariff(
             }
             let purpose_rank = if t.purpose == *purpose {
                 0
-            } else if *purpose == ApiKeyPurpose::Playground && t.purpose == ApiKeyPurpose::Realtime {
+            } else if matches!(purpose, ApiKeyPurpose::Playground | ApiKeyPurpose::Batch) && t.purpose == ApiKeyPurpose::Realtime {
                 1
             } else {
                 return None;
             };
             // Batch prices are per SLA, not an override for every batch tier.
-            if t.completion_window.as_deref() != window {
+            if t.completion_window.as_deref() != if t.purpose == ApiKeyPurpose::Batch { window } else { None } {
                 return None;
             }
             let scope_rank = match (t.account, t.serving_class.as_deref()) {
@@ -295,7 +296,12 @@ pub(crate) fn find_best_tariff(
                 (None, None) => 2,
                 _ => return None,
             };
-            Some(((scope_rank, purpose_rank, std::cmp::Reverse(t.effective_from), t.id), t))
+            // A general batch price wins over every realtime deal, including zero.
+            let fallback_phase = if *purpose == ApiKeyPurpose::Batch { purpose_rank } else { 0 };
+            Some((
+                (fallback_phase, scope_rank, purpose_rank, std::cmp::Reverse(t.effective_from), t.id),
+                t,
+            ))
         })
         .min_by_key(|(rank, _)| *rank)
         .map(|(_, t)| (Some(t.input_price_per_token), Some(t.output_price_per_token)))
@@ -747,8 +753,8 @@ mod tests {
     }
 
     #[test]
-    fn only_playground_falls_back_to_realtime() {
-        // Playground keeps realtime billing; a missing batch tier stays unresolved.
+    fn missing_batch_and_playground_prices_fall_back_to_realtime() {
+        // Realtime is the final safety net when no batch window matches.
         let now = chrono::Utc::now();
         let tariffs = vec![make_tariff(
             ApiKeyPurpose::Realtime,
@@ -761,7 +767,10 @@ mod tests {
 
         assert_eq!(
             find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), now, None, None),
-            (None, None)
+            (
+                Some(Decimal::from_str("0.00015").unwrap()),
+                Some(Decimal::from_str("0.00030").unwrap())
+            )
         );
         let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Playground), None, now, None, None);
         assert_eq!(input, Some(Decimal::from_str("0.00015").unwrap()));
@@ -865,7 +874,7 @@ mod tests {
 
     #[test]
     fn missing_batch_window_does_not_borrow_another_tariff() {
-        // Test that unknown completion_window falls back to generic tariff, not another priority
+        // Without a realtime safety net, another batch window is not a match.
         let now = chrono::Utc::now();
         let tariffs = vec![
             // Generic batch tariff

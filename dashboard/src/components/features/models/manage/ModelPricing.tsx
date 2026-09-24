@@ -120,7 +120,7 @@ export function ModelPricing({
               ? cls
               : "All classes"
         }
-        source={`${priceSource(row, !!organization)}${purpose === "playground" && row?.api_key_purpose === "realtime" ? " · realtime fallback" : ""}`}
+        source={`${priceSource(row, !!organization)}${purpose !== "realtime" && row?.api_key_purpose === "realtime" ? " · realtime fallback" : ""}`}
         note={
           purpose !== "batch" &&
           cls !== "standard" &&
@@ -223,7 +223,9 @@ export function ModelPricing({
                 </div>
               </section>
             )}
-            {rows.some((row) => row.api_key_purpose === "playground") && (
+            {classes.some((cls) =>
+              resolveTokenPrice(rows, organization, cls, "playground"),
+            ) && (
               <section aria-label="Playground prices">
                 <h4 className="text-sm font-medium mb-2">Playground</h4>
                 <div className="space-y-2">

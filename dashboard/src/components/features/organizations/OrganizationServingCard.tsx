@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useModel, useOrganizationServing } from "@/api/control-layer/hooks";
+import { useOrganizationServing } from "@/api/control-layer/hooks";
 import type { OrganizationServing } from "@/api/control-layer/types";
 import { OverlayDetails } from "../serving/OverlayDetails";
 import { Badge } from "@/components/ui/badge";
@@ -133,7 +133,8 @@ function OrganizationModelOverlay({
   const alias =
     overlay?.alias ??
     serving.cache_tariffs.find((row) => row.deployed_model_id === modelId)
-      ?.alias;
+      ?.alias ??
+    serving.model_aliases?.[modelId];
   const tokenCount = serving.tariffs.filter(
     (row) => row.deployed_model_id === modelId,
   ).length;
@@ -147,7 +148,7 @@ function OrganizationModelOverlay({
     >
       <summary className="cursor-pointer p-3 text-sm">
         <span className="font-medium">
-          {alias ?? <ModelAlias modelId={modelId} />}
+          {alias ?? modelId}
         </span>
         <span className="text-muted-foreground ml-2">
           {tokenCount} token price overrides · {cacheCount} cache overrides
@@ -163,15 +164,5 @@ function OrganizationModelOverlay({
         </div>
       )}
     </details>
-  );
-}
-
-function ModelAlias({ modelId }: { modelId: string }) {
-  const model = useModel(modelId);
-  return (
-    <>
-      {model.data?.alias ??
-        (model.isError ? "Model unavailable" : "Loading model…")}
-    </>
   );
 }

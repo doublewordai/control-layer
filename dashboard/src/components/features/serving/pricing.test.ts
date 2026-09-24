@@ -47,9 +47,13 @@ describe("operator effective pricing", () => {
       resolveTokenPrice(rows, undefined, "standard", "realtime", null, now)?.id,
     ).toBe("general");
   });
-  it("uses exact batch windows and standard-class pricing, never realtime", () => {
+  it("exhausts exact batch windows before standard-class realtime fallback", () => {
     const rows = [
-      tariff("realtime", { organization_id: "a" }),
+      tariff("realtime", {
+        organization_id: "a",
+        input_price_per_token: "0",
+        output_price_per_token: "0",
+      }),
       tariff("batch", { api_key_purpose: "batch", completion_window: "24h" }),
       tariff("standard", {
         organization_id: "a",
@@ -65,8 +69,8 @@ describe("operator effective pricing", () => {
       resolveTokenPrice(rows, "a", "interactive", "batch", "1h", now)?.id,
     ).toBe("standard");
     expect(
-      resolveTokenPrice(rows, "a", "standard", "batch", "12h", now),
-    ).toBeUndefined();
+      resolveTokenPrice(rows, "a", "standard", "batch", "12h", now)?.id,
+    ).toBe("realtime");
   });
   it("exhausts playground fallback within the class scope before general playground", () => {
     const rows = [

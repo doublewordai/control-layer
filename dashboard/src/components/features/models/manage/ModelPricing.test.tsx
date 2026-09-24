@@ -131,6 +131,14 @@ beforeEach(() => {
   } as unknown as ReturnType<typeof useOrganizationServing>);
 });
 describe("model pricing selector", () => {
+  it("shows effective playground prices when only realtime is configured", () => {
+    const { container } = mount(true, "org-a");
+    const playground = within(within(container).getByRole("region", { name: "Playground prices" }));
+    expect(playground.getByText("Bespoke · interactive · realtime fallback")).toBeInTheDocument();
+    expect(playground.getAllByText("$0")).toHaveLength(2);
+    expect(playground.getAllByText("$2.00")).toHaveLength(2);
+  });
+
   it("starts general then shows effective class prices and inherited batch/cache values", async () => {
     const user = userEvent.setup();
     const { container } = mount();
@@ -157,7 +165,7 @@ describe("model pricing selector", () => {
       page.getByRole("region", { name: "Batch and flex prices" }),
     );
     expect(batch.getByText("Inherited · general model")).toBeInTheDocument();
-    expect(batch.getByText(/Unpriced/)).toBeInTheDocument();
+    expect(batch.getByText("Bespoke · all classes · realtime fallback")).toBeInTheDocument();
     expect(
       page.queryByRole("button", { name: "Manage Tariffs" }),
     ).not.toBeInTheDocument();

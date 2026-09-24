@@ -40,7 +40,9 @@ pricing section on a model's management page. The selection applies to both toke
 prices and cache multipliers. Source labels distinguish organization overrides
 from inherited general prices. Realtime prices are shown by serving class; batch
 and flex use standard-class pricing for the specified completion window. A missing
-matching tariff is shown as unpriced rather than substituted with a different tier.
+batch window uses the realtime safety net only after every exact batch scope has
+been exhausted; the source label identifies that fallback. With no eligible
+realtime price either, the view shows unpriced.
 
 Below cache pricing, **Serving classes** lists the model's presets and
 **Organisation overlays** expands each organization's explicit settings and price
@@ -138,9 +140,15 @@ interactive/throughput batch prices are rejected by validation.
 Billing selects the key owner's class-specific price, then its all-class price,
 then the general model price. Each scope must match the purpose and, for batch,
 the exact completion window. Playground may fall back to realtime within the
-same scope; batch never falls back to realtime. If no scope supplies the batch
-window, it is unpriced: define every supported window in the general model
-catalog. Continuation and platform keys have no customer tariffs.
+same scope. Batch first exhausts exact-window prices across standard-class,
+all-class organization and general model scopes. Only if none matches does it
+try realtime prices in that same scope order, using standard class. It never
+borrows another batch window or an elevated class's realtime price. This final
+fallback supports a single realtime definition as a flat price across tiers.
+Prefer explicit prices for every supported window so the intended rates are
+clear. A matching zero batch price stops fallback. With neither a batch nor a
+realtime match, the request remains unpriced. Continuation and platform keys
+have no customer tariffs.
 
 Cache multipliers follow class, all-class, then model scope, with the general
 model cache tariff controlling whether cache billing is enabled. Customer model

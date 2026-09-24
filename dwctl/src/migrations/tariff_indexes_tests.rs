@@ -161,3 +161,59 @@ async fn tariff_indexes_validation_rejects_missing_invalid_and_not_ready(pool: P
     let error = apply(&target, &pool).await.unwrap_err();
     assert!(format!("{error:#}").contains("missing, invalid, not ready"));
 }
+
+/// Old replicas keep serving while a pre-rollout Job advances the schema.
+#[sqlx::test(migrations = false)]
+async fn legacy_general_price_queries_survive_each_upgrade_boundary(pool: PgPool) {
+    let target = Target::main();
+    target.run_to(155, &pool).await.unwrap();
+    let user: uuid::Uuid =
+        sqlx::query_scalar("INSERT INTO users (username,email) VALUES ('rolling-schema','rolling@example.invalid') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let model: uuid::Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('rolling-model','rolling-model',true,$1) RETURNING id")
+        .bind(user).fetch_one(&pool).await.unwrap();
+    let mut old = pool.acquire().await.unwrap();
+    // Explicit result columns match the pre-organisation reader/writer shapes.
+    const INSERT: &str = "INSERT INTO model_tariffs (deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window,valid_from) VALUES ($1,'rolling',1,2,'realtime',NULL,NOW()) RETURNING id,deployed_model_id,name,input_price_per_token,output_price_per_token,valid_from,valid_until,api_key_purpose,completion_window";
+    const READ: &str = "SELECT id,deployed_model_id,name,input_price_per_token,output_price_per_token,valid_from,valid_until,api_key_purpose,completion_window FROM model_tariffs WHERE deployed_model_id=$1 AND valid_until IS NULL";
+    const CACHE: &str = "SELECT write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,read_multiplier,min_prefix_tokens,valid_from,valid_until FROM model_cache_tariffs WHERE deployed_model_id=$1 AND valid_from<=NOW() AND (valid_until IS NULL OR valid_until>NOW())";
+    sqlx::query(INSERT).bind(model).fetch_one(&mut *old).await.unwrap();
+    sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,read_multiplier,min_prefix_tokens) VALUES ($1,1,2,3,0.1,1024)").bind(model).execute(&mut *old).await.unwrap();
+    sqlx::query(READ).bind(model).fetch_one(&mut *old).await.unwrap();
+    sqlx::query(CACHE).bind(model).fetch_one(&mut *old).await.unwrap();
+    for migration in target
+        .migrator
+        .iter()
+        .filter(|m| m.version > 155 && !m.migration_type.is_down_migration())
+    {
+        target.run_to(migration.version, &pool).await.unwrap();
+        assert_eq!(
+            sqlx::query(READ).bind(model).fetch_all(&mut *old).await.unwrap().len(),
+            1,
+            "after {}",
+            migration.version
+        );
+        assert_eq!(
+            sqlx::query(CACHE).bind(model).fetch_all(&mut *old).await.unwrap().len(),
+            1,
+            "after {}",
+            migration.version
+        );
+        let mut tx = sqlx::Connection::begin(&mut *old).await.unwrap();
+        sqlx::query("UPDATE model_tariffs SET valid_until=NOW() WHERE deployed_model_id=$1 AND valid_until IS NULL")
+            .bind(model)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query(INSERT).bind(model).fetch_one(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    // No scoped data is activated during the mixed-version deployment.
+    let scoped: i64 = sqlx::query_scalar("SELECT count(*) FROM model_tariffs WHERE user_id IS NOT NULL")
+        .fetch_one(&mut *old)
+        .await
+        .unwrap();
+    assert_eq!(scoped, 0);
+}

@@ -389,6 +389,8 @@ export interface OrganizationServing {
   self_hosted_only: boolean;
   overlays: ServingOverlay[];
   tariffs: ModelTariff[];
+  /** Token-price model aliases, returned together to avoid per-model requests. */
+  model_aliases?: Record<string, string>;
   cache_tariffs: OrganizationCacheTariff[];
 }
 

@@ -1714,6 +1714,16 @@ impl<'c> Deployments<'c> {
         Ok(map)
     }
 
+    /// Resolve names for an already-authorized model set in one query.
+    pub async fn get_aliases_by_ids(&mut self, ids: &[DeploymentId]) -> Result<std::collections::BTreeMap<DeploymentId, String>> {
+        let rows: Vec<(DeploymentId, String)> =
+            sqlx::query_as("SELECT id, alias FROM deployed_models WHERE id = ANY($1) AND deleted = FALSE")
+                .bind(ids)
+                .fetch_all(&mut *self.db)
+                .await?;
+        Ok(rows.into_iter().collect())
+    }
+
     /// Get model UUIDs keyed by alias for the given aliases.
     /// Aliases are enforced to be unique, so this should be a one to one mapping
     /// Only returns rows where `deleted = false`.

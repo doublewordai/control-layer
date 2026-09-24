@@ -32,13 +32,19 @@ export function resolveTokenPrice(
       (row.serving_class == null ||
         (organization !== undefined && row.serving_class === resolvedClass)) &&
       (row.api_key_purpose === purpose ||
-        (purpose === "playground" && row.api_key_purpose === "realtime")) &&
-      (row.completion_window ?? null) === (purpose === "batch" ? window : null),
+        ((purpose === "playground" || purpose === "batch") &&
+          row.api_key_purpose === "realtime")) &&
+      (row.completion_window ?? null) ===
+        (row.api_key_purpose === "batch" ? window : null),
   );
   const scope = (row: ModelTariff) =>
     row.organization_id ? (row.serving_class ? 0 : 1) : 2;
+  // Exhaust exact batch prices in every scope before the realtime safety net.
+  const phase = (row: ModelTariff) =>
+    Number(purpose === "batch" && row.api_key_purpose === "realtime");
   return candidates.sort(
     (a, b) =>
+      phase(a) - phase(b) ||
       scope(a) - scope(b) ||
       Number(a.api_key_purpose !== purpose) -
         Number(b.api_key_purpose !== purpose) ||
