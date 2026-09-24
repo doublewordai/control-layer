@@ -5466,8 +5466,43 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(total)
     }
 
-    async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
-        tracing::debug!(count = ids.len(), "Retrying failed requests");
+    async fn retry_failed_requests(
+        &self,
+        batch_id: BatchId,
+        requested_ids: Vec<RequestId>,
+    ) -> Result<Vec<Result<()>>> {
+        tracing::debug!(%batch_id, count = requested_ids.len(), "Retrying failed requests");
+
+        // Scope to `batch_id` before anything else, matching
+        // retry_failed_requests_for_batch: ids from any other batch (or
+        // batchless requests) are not classified, re-pended, or used to reset
+        // a parent batch. They are reported as not found, like unknown ids.
+        let requested_uuids = requested_ids.iter().map(|id| **id).collect::<Vec<_>>();
+        let in_batch: std::collections::HashSet<Uuid> = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            SELECT id FROM requests WHERE id = ANY($1) AND batch_id = $2
+            UNION
+            SELECT id FROM batch_requests_archive WHERE id = ANY($1) AND batch_id = $2
+            "#,
+        )
+        .bind(&requested_uuids)
+        .bind(*batch_id)
+        .fetch_all(self.write_executor())
+        .await
+        .map_err(|_| FusilladeError::Other(anyhow!("Failed to scope retry to batch")))?
+        .into_iter()
+        .collect();
+        let ids: Vec<RequestId> = requested_ids
+            .iter()
+            .copied()
+            .filter(|id| in_batch.contains(&**id))
+            .collect();
+        if ids.is_empty() {
+            return Ok(requested_ids
+                .iter()
+                .map(|id| Err(FusilladeError::RequestNotFound(*id)))
+                .collect());
+        }
 
         let lifecycle_ids = ids.iter().map(|id| id.0).collect::<Vec<_>>();
         let mut lifecycle_tx = self.begin_response_write(&lifecycle_ids).await?;
@@ -5761,7 +5796,21 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             ))));
         }
 
-        Ok(results)
+        // Map back onto the caller's ids, in order, with out-of-batch ids
+        // reported as not found.
+        let mut results = results.into_iter();
+        Ok(requested_ids
+            .iter()
+            .map(|id| {
+                if in_batch.contains(&**id) {
+                    results
+                        .next()
+                        .unwrap_or(Err(FusilladeError::RequestNotFound(*id)))
+                } else {
+                    Err(FusilladeError::RequestNotFound(*id))
+                }
+            })
+            .collect())
     }
 
     /// Retries failed AND canceled requests for a batch and un-cancels it
@@ -13991,7 +14040,7 @@ mod tests {
         .await
         .unwrap();
         let results = manager
-            .retry_failed_requests(vec![RequestId(failed_id)])
+            .retry_failed_requests(batch_id, vec![RequestId(failed_id)])
             .await
             .unwrap();
         assert!(results.iter().all(|r| r.is_ok()));
@@ -14019,6 +14068,71 @@ mod tests {
             ),
             (1, 0, 1),
             "reads must count live again and show the retried row"
+        );
+    }
+
+    /// Per-id retry is scoped to the given batch: ids from another batch are
+    /// reported as not found and neither re-pended nor allowed to reset
+    /// their parent batch, while in-batch ids still retry.
+    #[sqlx::test]
+    async fn test_retry_failed_requests_ignores_ids_from_other_batches(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let own_batch = setup_freeze_test_batch(&manager, "retry-scope-own", 1).await;
+        let other_batch = setup_freeze_test_batch(&manager, "retry-scope-other", 1).await;
+        for batch_id in [own_batch, other_batch] {
+            sqlx::query(
+                "UPDATE requests SET state = 'failed', failed_at = NOW(), error = 'test-error' WHERE batch_id = $1",
+            )
+            .bind(*batch_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let failed_id = |batch_id: BatchId| {
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM requests WHERE batch_id = $1")
+                .bind(*batch_id)
+                .fetch_one(&pool)
+        };
+        let own_id = failed_id(own_batch).await.unwrap();
+        let other_id = failed_id(other_batch).await.unwrap();
+        let other_version_before: i64 =
+            sqlx::query_scalar("SELECT retry_version FROM batches WHERE id = $1")
+                .bind(*other_batch)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let results = manager
+            .retry_failed_requests(own_batch, vec![RequestId(other_id), RequestId(own_id)])
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                results.as_slice(),
+                [Err(FusilladeError::RequestNotFound(id)), Ok(())] if **id == other_id
+            ),
+            "out-of-batch id must be reported as not found, in-batch id retried: {results:?}"
+        );
+
+        let state = |id: Uuid| {
+            sqlx::query_scalar::<_, String>("SELECT state FROM requests WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+        };
+        assert_eq!(state(other_id).await.unwrap(), "failed");
+        assert_eq!(state(own_id).await.unwrap(), "pending");
+        let other_version_after: i64 =
+            sqlx::query_scalar("SELECT retry_version FROM batches WHERE id = $1")
+                .bind(*other_batch)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            other_version_after, other_version_before,
+            "another batch must not be reset by a retry scoped elsewhere"
         );
     }
 
@@ -14160,7 +14274,7 @@ mod tests {
         .await
         .unwrap();
         let results = manager
-            .retry_failed_requests(vec![RequestId(failed_id)])
+            .retry_failed_requests(batch_id, vec![RequestId(failed_id)])
             .await
             .unwrap();
         assert!(results.iter().all(|r| r.is_ok()));
@@ -15044,7 +15158,7 @@ mod tests {
 
         // Per-id retry moves the archived failed row back; parent splits.
         let results = manager
-            .retry_failed_requests(vec![failed_id])
+            .retry_failed_requests(batch_id, vec![failed_id])
             .await
             .unwrap();
         assert!(
@@ -21313,7 +21427,7 @@ mod tests {
         assert_eq!(state.1, 1, "failed work must not be re-pended");
 
         let individual = manager
-            .retry_failed_requests(vec![RequestId(request_id)])
+            .retry_failed_requests(batch.id, vec![RequestId(request_id)])
             .await
             .unwrap();
         assert!(individual[0].is_err());
