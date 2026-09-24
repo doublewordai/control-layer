@@ -320,9 +320,15 @@ pub async fn poll_until_terminal<P: PoolProvider + Clone>(
 pub async fn cancel_abandoned_request<P: PoolProvider + Clone>(request_manager: &PostgresRequestManager<P>, request_id: Uuid) {
     match request_manager.cancel_batchless_request(RequestId(request_id)).await {
         Ok(true) => tracing::info!(request_id = %request_id, "Cancelled abandoned flex request"),
-        // Already completed/failed: the daemon beat us to it; nothing to free.
-        Ok(false) => tracing::debug!(request_id = %request_id, "Abandoned flex request already terminal"),
-        Err(e) => tracing::warn!(error = %e, request_id = %request_id, "Failed to cancel abandoned flex request"),
+        // Nothing to free: either the daemon already reached completed/failed,
+        // or the guard was armed before an enqueue that never committed.
+        Ok(false) => tracing::debug!(request_id = %request_id, "Abandoned flex request not cancellable (missing or already terminal)"),
+        // Off the request path (the caller is gone, and from the guard this
+        // runs in a detached task), so a plain log would be invisible: count
+        // it, since a failed cancel is engine time spent on abandoned work.
+        Err(e) => {
+            crate::background_error!(crate::metrics::errors::component::FLEX_CANCEL, "cancel_abandoned", Error, request_id = %request_id, error = %e, "Failed to cancel abandoned flex request")
+        }
     }
 }
 

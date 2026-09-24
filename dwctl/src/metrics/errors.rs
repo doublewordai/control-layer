@@ -34,6 +34,7 @@ pub mod component {
     pub const USAGE_REFRESH: &str = "usage_refresh";
     pub const TASK_RETENTION: &str = "task_retention";
     pub const CONTINUATION: &str = "continuation";
+    pub const FLEX_CANCEL: &str = "flex_cancel";
 }
 
 /// Increment `dwctl_background_errors_total`. `component`/`reason`/`severity` are `&'static str`
