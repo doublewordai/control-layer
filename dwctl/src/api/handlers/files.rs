@@ -1169,6 +1169,15 @@ pub async fn upload_file<P: PoolProvider>(
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
     let uploaded_by = Some(target_user_id.to_string());
 
+    // Files exist to feed batches: if an owner has switched the batch API
+    // off for the workspace, refuse the upload before streaming the body.
+    {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get db connection for modality check: {}", e),
+        })?;
+        crate::api::handlers::modalities::ensure_batch_enabled(&mut conn, target_user_id).await?;
+    }
+
     // Re-use the AppState-bound normaliser singleton (built once at
     // startup). The dispatcher will JIT-resign any `dw-img://` tokens
     // produced here with a fresh short-lived signed URL before sending

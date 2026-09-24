@@ -162,6 +162,11 @@ pub enum Error {
         message: String,
     },
 
+    /// An organization owner has switched this product surface off for the
+    /// organization (`users.disabled_modalities`); see [`crate::modalities`].
+    #[error("{modality} is disabled for this organization")]
+    ModalityDisabled { modality: crate::modalities::Modality },
+
     /// Too many concurrent requests - rate limiting
     #[error("Too many requests: {message}")]
     TooManyRequests { message: String },
@@ -208,6 +213,7 @@ impl Error {
             Error::SpendCapExceeded { .. } => StatusCode::PAYMENT_REQUIRED,
             Error::ModelAccessDenied { .. } => StatusCode::FORBIDDEN,
             Error::ModalityAccessDenied { .. } => StatusCode::FORBIDDEN,
+            Error::ModalityDisabled { .. } => StatusCode::FORBIDDEN,
             Error::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
             Error::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -271,6 +277,7 @@ impl Error {
             Error::SpendCapExceeded { message } => message.clone(),
             Error::ModelAccessDenied { message, .. } => message.clone(),
             Error::ModalityAccessDenied { message, .. } => message.clone(),
+            Error::ModalityDisabled { modality } => modality.disabled_message(),
             Error::TooManyRequests { message } => message.clone(),
             Error::ServiceUnavailable { message } => message.clone(),
         }
@@ -314,6 +321,9 @@ impl IntoResponse for Error {
             }
             Error::ModalityAccessDenied { .. } => {
                 tracing::info!("Modality access denied error: {}", self);
+            }
+            Error::ModalityDisabled { .. } => {
+                tracing::info!("Modality disabled for organization: {}", self);
             }
             Error::TooManyRequests { .. } => {
                 tracing::info!("Rate limit exceeded: {}", self);

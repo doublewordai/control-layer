@@ -66,6 +66,13 @@ pub struct OrganizationUpdate {
     /// who gets into the workspace without anyone reviewing them, which is not
     /// a call an admin should make unilaterally. Omit to leave unchanged.
     pub auto_join_enabled: Option<bool>,
+    /// Product surfaces switched off for every key this organization owns:
+    /// `realtime` (the inference endpoints, all service tiers) and/or `batch`
+    /// (the Files and Batches API). Replaces the whole set; an empty list
+    /// re-enables everything. Same owner-only gate as `zero_data_retention`.
+    /// Omit to leave unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disabled_modalities: Option<Vec<crate::modalities::Modality>>,
 }
 
 /// Full organization details returned by the API.
@@ -90,6 +97,11 @@ pub struct OrganizationResponse {
     /// admins can read it here but cannot change it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_join_enabled: Option<bool>,
+    /// Product surfaces an owner has switched off for this organization
+    /// (`realtime`, `batch`). Empty when everything is allowed. Readable by
+    /// any member with access to the organization; only owners change it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_modalities: Option<Vec<crate::modalities::Modality>>,
 }
 
 impl OrganizationResponse {
@@ -99,6 +111,7 @@ impl OrganizationResponse {
             member_count: None,
             pending_email_change: None,
             auto_join_enabled: None,
+            disabled_modalities: None,
         }
     }
 
@@ -114,6 +127,11 @@ impl OrganizationResponse {
 
     pub fn with_auto_join_enabled(mut self, enabled: bool) -> Self {
         self.auto_join_enabled = Some(enabled);
+        self
+    }
+
+    pub fn with_disabled_modalities(mut self, disabled: crate::modalities::ModalitySet) -> Self {
+        self.disabled_modalities = Some(disabled.to_vec());
         self
     }
 }
