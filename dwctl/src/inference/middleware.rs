@@ -1333,7 +1333,8 @@ fn scrub_request_id_fields(value: &mut serde_json::Value) -> bool {
 /// legitimate senders never reach this middleware: fusillade daemon requests
 /// (deadline-derived batch priority) take the `x-fusillade-request-id` early
 /// return, and continuation resume legs enter the stack below it. Everything
-/// parsed here is external traffic, for which absent ≡ priority 0 downstream.
+/// parsed here is external traffic, which onwards sends to a dynamo member at
+/// realtime's priority 0.
 ///
 /// NOTE: the `x-fusillade-request-id` early return is only safe because the
 /// sso-stack ingress strips all `x-fusillade-*` headers from external requests

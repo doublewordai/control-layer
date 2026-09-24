@@ -169,7 +169,11 @@ async fn serving_classes_survive_strict_and_translated_ingress(pool: PgPool) {
         assert_eq!(body["nvext"]["router"]["ttft_target"], 5000, "{path}");
         assert_eq!(body["nvext"]["agent_hints"]["priority"], 100, "{path}");
         f.post(path, "policy:standard", false).await.assert_status_ok();
-        assert!(f.last_body().await.get("nvext").is_none(), "{path}: explicit standard opts down");
+        assert_eq!(
+            f.last_body().await["nvext"],
+            json!({"agent_hints": {"priority": 0}}),
+            "{path}: explicit standard opts down to realtime's priority alone"
+        );
         f.post(path, "no-offer:interactive", false)
             .await
             .assert_status(StatusCode::FORBIDDEN);
