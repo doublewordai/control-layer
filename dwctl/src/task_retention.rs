@@ -282,19 +282,23 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn purge_uses_the_retention_index(pool: PgPool) {
+    async fn purge_skips_old_live_tasks_with_terminal_retention_index(pool: PgPool) {
         setup(&pool).await;
         sqlx::raw_sql(
             "INSERT INTO underway.task(id, task_queue_name, input, state, created_at)
+             SELECT gen_random_uuid(), 'q', '{}', CASE WHEN n % 2 = 0 THEN 'pending' ELSE 'in_progress' END::underway.task_state,
+                    now() - interval '90 days' + (n * interval '1 second')
+             FROM generate_series(1, 10000) n;
+             INSERT INTO underway.task(id, task_queue_name, input, state, created_at)
              SELECT gen_random_uuid(), 'q', '{}', 'succeeded', now() - interval '30 days' + (n * interval '1 second')
-             FROM generate_series(1, 5000) n;
+             FROM generate_series(1, 10) n;
              ANALYZE underway.task;",
         )
         .execute(&pool)
         .await
         .unwrap();
         let plan: serde_json::Value = sqlx::query_scalar(
-            "EXPLAIN (FORMAT JSON)
+            "EXPLAIN (ANALYZE, FORMAT JSON)
              WITH victims AS (
                  SELECT task_queue_name, id FROM underway.task
                  WHERE state IN ('succeeded', 'failed') AND created_at < now() - interval '14 days' AND created_at + ttl < now()
@@ -306,10 +310,8 @@ mod tests {
         .await
         .unwrap();
         let rendered = plan.to_string();
-        // The victim selection is what the index exists for: it must walk
-        // idx_task_created_at and never read the whole task history. The join
-        // that applies the delete is left to the planner; on a table this small
-        // it legitimately prefers a hash join over a thousand primary-key probes.
+        // Old live tasks must not be scanned just to find a handful of terminal rows.
+        // EXPLAIN ANALYZE executes the delete only in this isolated test database.
         fn find_cte<'a>(node: &'a serde_json::Value, name: &str) -> Option<&'a serde_json::Value> {
             if node["Subplan Name"] == format!("CTE {name}") {
                 return Some(node);
@@ -321,7 +323,13 @@ mod tests {
                 || node["Plans"].as_array().is_some_and(|plans| plans.iter().any(seq_scans_task))
         }
         let victims = find_cte(&plan[0]["Plan"], "victims").unwrap_or_else(|| panic!("{rendered}"));
-        assert!(victims.to_string().contains("idx_task_created_at"), "{rendered}");
+        assert!(victims.to_string().contains("idx_task_terminal_created_at"), "{rendered}");
+        assert_eq!(victims["Actual Rows"].as_f64(), Some(10.0), "{rendered}");
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM underway.task")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(remaining, 10000);
         assert!(!seq_scans_task(victims), "{rendered}");
     }
 
