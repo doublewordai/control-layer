@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.3.2](https://github.com/doublewordai/control-layer/compare/v12.3.1...v12.3.2) (2026-09-24)
+
+
+### Bug Fixes
+
+* **provisioning:** keep existing components' enabled state on startup ([#1840](https://github.com/doublewordai/control-layer/issues/1840)) ([8e0d127](https://github.com/doublewordai/control-layer/commit/8e0d1279359115c046790f310a3c47380f909c4c))
+
 ## [12.3.1](https://github.com/doublewordai/control-layer/compare/v12.3.0...v12.3.1) (2026-09-23)
 
 

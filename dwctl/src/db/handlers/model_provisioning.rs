@@ -460,7 +460,6 @@ impl<'c> ModelProvisioning<'c> {
                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                ON CONFLICT (composite_model_id, deployed_model_id, pool) DO UPDATE SET
                    weight = EXCLUDED.weight,
-                   enabled = EXCLUDED.enabled,
                    sort_order = EXCLUDED.sort_order,
                    continuation_validated_at = CASE
                        WHEN deployed_model_components.strip_leading_bos IS DISTINCT FROM EXCLUDED.strip_leading_bos
