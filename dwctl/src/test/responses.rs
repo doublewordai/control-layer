@@ -1401,7 +1401,9 @@ async fn background_flex_response_survives_the_client_moving_on(pool: PgPool) {
         .and_then(|s| s.trim_start_matches("resp_").parse().ok())
         .expect("202 body carries a resp_<uuid> id");
 
-    // The client has its id and moves on: the HTTP exchange is over.
+    // The client has its id and moves on: the HTTP exchange is over. The test
+    // harness never runs the daemon, so the row can only leave `pending` if
+    // something cancels it — which is exactly what must not happen here.
     drop(response);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
@@ -1413,8 +1415,8 @@ async fn background_flex_response_survives_the_client_moving_on(pool: PgPool) {
     let state: String = sqlx::Row::get(&row, "state");
     let service_tier: Option<String> = sqlx::Row::get(&row, "service_tier");
     assert_eq!(service_tier.as_deref(), Some("flex"));
-    assert_ne!(
-        state, "canceled",
+    assert_eq!(
+        state, "pending",
         "a background submission must never be cancelled on client disconnect"
     );
 }
