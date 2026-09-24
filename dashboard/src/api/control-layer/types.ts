@@ -1149,16 +1149,11 @@ export interface TransactionsQuery {
   end_date?: string; // Filter transactions created on or before this date/time (ISO 8601 format)
 }
 
-/** Admin-initiated balance adjustments: gift funds or claw them back. */
-export type AdminTransactionType = "admin_grant" | "admin_removal";
-
 export interface AddFundsRequest {
   user_id: string; // UUID of the user to add funds to
   source_id: string; // UUID of the user providing the funds
-  amount: number; // Amount in dollars (always positive; the type decides the sign)
+  amount: number; // Amount in dollars
   description?: string;
-  /** Defaults to "admin_grant". Use "admin_removal" to remove funds. */
-  transaction_type?: AdminTransactionType;
 }
 
 export type AddFundsResponse = Transaction;

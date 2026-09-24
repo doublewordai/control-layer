@@ -31,18 +31,6 @@
   },
   {
     "path": "fusillade-arsenal/src/postgres/batch_list.rs",
-    "source": "query_builder.push(\"active_batches AS MATERIALIZED (SELECT b.* FROM batches b WHERE b.deleted_at IS NULL AND (\");",
-    "count": 1,
-    "reason": "Intermediate materialized/ordered batch rows only; push_query ends in an explicit final SELECT, so added batch columns do not change its client result."
-  },
-  {
-    "path": "fusillade-arsenal/src/postgres/batch_list.rs",
-    "source": "query_builder.push(\"SELECT * FROM (\");",
-    "count": 1,
-    "reason": "Intermediate materialized/ordered batch rows only; push_query ends in an explicit final SELECT, so added batch columns do not change its client result."
-  },
-  {
-    "path": "fusillade-arsenal/src/postgres/batch_list.rs",
     "source": "query_builder.push(\"(SELECT b.*, \");",
     "count": 1,
     "reason": "Intermediate materialized/ordered batch rows only; push_query ends in an explicit final SELECT, so added batch columns do not change its client result."
@@ -184,5 +172,17 @@
     "source": "let repeated = sqlx::query(\"SELECT * FROM cached_shape\")",
     "count": 1,
     "reason": "Intentional negative regression in cfg(test): reproduces stale-plan failure and verifies that persistent(false) does not invalidate an already cached statement. Not a production query."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres/batch_list.rs",
+    "source": "query_builder.push(\"SELECT * FROM active_page UNION ALL \");",
+    "count": 1,
+    "reason": "Intermediate materialized/ordered batch rows only; push_query ends in an explicit final SELECT, so added batch columns do not change its client result."
+  },
+  {
+    "path": "fusillade-arsenal/src/postgres/batch_list.rs",
+    "source": ".push(\"SELECT * FROM terminal_page ORDER BY priority, created_at DESC, id DESC LIMIT \");",
+    "count": 1,
+    "reason": "Intermediate materialized/ordered batch rows only; push_query ends in an explicit final SELECT, so added batch columns do not change its client result."
   }
 ]

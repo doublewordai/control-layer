@@ -32,40 +32,39 @@ pub(super) fn push_query<'a>(
     let include_active = active_first && cursor.is_none_or(|c| c.priority == 0);
     let limit = filter.limit.unwrap_or(100);
     query_builder.push("WITH ");
-    if include_active {
-        // Fence the active set before applying ordering and page limits.
-        // Otherwise the planner can walk an owner's terminal history looking
-        // for active rows. The existing active partial index supplies this set directly.
-        query_builder.push("active_batches AS MATERIALIZED (SELECT b.* FROM batches b WHERE b.deleted_at IS NULL AND (");
-        query_builder.push(ACTIVE);
-        query_builder.push(")");
-        // Filter before materializing so another owner's backlog does not fill
-        // this page's intermediate result. The id-leading active index can still
-        // scan other owners' active rows; this bounds materialization, not I/O.
-        if let Some(owner) = &filter.created_by {
-            query_builder.push(" AND b.created_by = ").push_bind(owner);
-        }
-        query_builder.push("), ");
-    }
-    // Plan the bounded page independently of the expensive count LATERAL.
-    // Inlining lets its row estimates bias the page toward a full owner bitmap
-    // scan + sort (especially with a generic, unknown LIMIT).
-    query_builder.push("filtered AS MATERIALIZED (");
     if active_first {
-        query_builder.push("SELECT * FROM (");
+        // Materialize each sort group's own page: every predicate, the group
+        // ordering and the page limit all live inside the arm. Splitting the
+        // active and terminal groups into separately bounded CTEs keeps the
+        // page's cost proportional to the page, not to the live backlog.
+        //
+        // The previous shape fenced the whole active set first
+        // (`active_batches`) and applied the arm's ordering, filters and
+        // limit afterwards. That cost O(active batches) per request for
+        // platform-wide (unscoped) views — materializing and sorting every
+        // live batch's full row — and O(active batches) of index I/O even for
+        // owner-scoped views, since the owner predicate filtered the fenced
+        // set only after it was read. When the live backlog grows faster than
+        // batches complete (a customer fan-out creating thousands of batches
+        // in an afternoon), every list page degraded with it and tripped the
+        // 15s page budget, surfacing as 5xx on /ai/v1/batches.
+        //
+        // Ordering inside the arm lets the active-first expression index
+        // (unscoped) and the owner active partial index (scoped) walk
+        // straight to the page and stop at the limit.
         if include_active {
+            query_builder.push("active_page AS MATERIALIZED ");
             push_arm(
                 query_builder,
                 filter,
-                "active_batches",
+                "batches",
                 false,
-                cursor,
+                cursor.filter(|c| c.priority == 0),
                 limit,
             )?;
-            query_builder.push(" UNION ALL ");
+            query_builder.push(", ");
         }
-        // A cursor in the active group must not constrain terminal timestamps:
-        // even newer terminal batches follow every active batch.
+        query_builder.push("terminal_page AS MATERIALIZED ");
         push_arm(
             query_builder,
             filter,
@@ -74,9 +73,17 @@ pub(super) fn push_query<'a>(
             cursor.filter(|c| c.priority == 1),
             limit,
         )?;
-        query_builder.push(") candidates ORDER BY priority, created_at DESC, id DESC LIMIT ");
+        query_builder.push(", filtered AS MATERIALIZED (");
+        if include_active {
+            query_builder.push("SELECT * FROM active_page UNION ALL ");
+        }
+        query_builder
+            .push("SELECT * FROM terminal_page ORDER BY priority, created_at DESC, id DESC LIMIT ");
         query_builder.push_bind(limit);
     } else {
+        // Chronological listings walk one index-ordered, cursor-bounded arm;
+        // they never fence a group.
+        query_builder.push("filtered AS MATERIALIZED (");
         push_arm(query_builder, filter, "batches", false, cursor, limit)?;
     }
     query_builder.push(") ");
@@ -456,7 +463,9 @@ mod tests {
     #[sqlx::test]
     async fn owner_page_materializes_only_its_own_backlog(pool: PgPool) {
         // Both owners have more active rows than fit on a page. Filtering only
-        // after the CTE would materialize 2,020 rows instead of this owner's 20.
+        // after the CTE would materialize 2,020 rows instead of this owner's
+        // page; the arm carries its predicates and limit inside, so the CTE
+        // holds exactly the page.
         sqlx::query(
             r#"
             INSERT INTO batches (id, endpoint, completion_window, created_by,
@@ -485,11 +494,92 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find(|node| node["Subplan Name"] == "CTE active_batches")
-            .expect("materialized active set");
+            .find(|node| node["Subplan Name"] == "CTE active_page")
+            .expect("materialized active page");
         // EXPLAIN can encode row counts as integers or decimal numbers.
-        assert_eq!(active["Actual Rows"].as_f64(), Some(20.0), "{plan}");
+        assert_eq!(active["Actual Rows"].as_f64(), Some(10.0), "{plan}");
         assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
+        // And the page is the owner's newest active batches, not another
+        // owner's — the owner predicate must stay inside the arm.
+        let expected: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM batches
+            WHERE created_by = 'owner' AND deleted_at IS NULL
+              AND completed_at IS NULL AND failed_at IS NULL
+              AND cancelled_at IS NULL AND cancelling_at IS NULL
+            ORDER BY created_at DESC, id DESC LIMIT 10
+        "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut query = QueryBuilder::new("");
+        push_query(&mut query, &filter, None).unwrap();
+        let actual: Vec<Uuid> = query.build_query_scalar().fetch_all(&pool).await.unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[sqlx::test]
+    async fn unscoped_active_pages_bound_the_live_backlog(pool: PgPool) {
+        // Platform managers list every owner's batches. A growing live backlog
+        // (customer fan-out) must not grow the page's cost with it: the page
+        // materializes its own top rows and returns the globally newest
+        // active batches. Counts are frozen to isolate page selection. Newest
+        // rows are terminal so both sort groups are reachable from the front
+        // of the chronological index.
+        sqlx::query(
+            r#"
+            INSERT INTO batches (id, endpoint, completion_window, created_by,
+                                 created_at, counts_frozen_at, completed_at, expires_at)
+            SELECT md5(i::text)::uuid, '/v1/chat/completions', '24h',
+                   'owner-' || (i % 50)::text,
+                   '2026-01-01'::timestamptz + i * interval '1 second',
+                   CASE WHEN i <= 3000 THEN NULL ELSE NOW() END,
+                   CASE WHEN i <= 3000 THEN NULL ELSE NOW() END,
+                   NOW() + interval '1 day'
+            FROM generate_series(1, 3020) i
+        "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE batches").execute(&pool).await.unwrap();
+        let filter = ListBatchesFilter {
+            active_first: true,
+            limit: Some(10),
+            ..Default::default()
+        };
+        let mut query = QueryBuilder::new("EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) ");
+        push_query(&mut query, &filter, None).unwrap();
+        let plan: Value = query.build_query_scalar().fetch_one(&pool).await.unwrap();
+        // The active page holds only the page's worth of live rows, not the
+        // 3,000-row backlog the old fence materialized.
+        let active = plan[0]["Plan"]["Plans"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["Subplan Name"] == "CTE active_page")
+            .expect("materialized active page");
+        assert_eq!(active["Actual Rows"].as_f64(), Some(10.0), "{plan}");
+        assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
+        let visited = batch_rows_visited(&plan);
+        assert!(visited < 100.0, "visited {visited} batch rows: {plan}");
+        // The page is the globally newest active batches, unscoped.
+        let expected: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT id FROM batches
+            WHERE deleted_at IS NULL AND completed_at IS NULL AND failed_at IS NULL
+              AND cancelled_at IS NULL AND cancelling_at IS NULL
+            ORDER BY created_at DESC, id DESC LIMIT 10
+        "#,
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut query = QueryBuilder::new("");
+        push_query(&mut query, &filter, None).unwrap();
+        let actual: Vec<Uuid> = query.build_query_scalar().fetch_all(&pool).await.unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[sqlx::test]
