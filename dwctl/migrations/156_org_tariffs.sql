@@ -17,6 +17,9 @@
 -- ---------------------------------------------------------------------------------------
 -- model_tariffs
 -- ---------------------------------------------------------------------------------------
+-- Bound lock waits so queued DDL does not block live billing and admission reads.
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE model_tariffs
     ADD COLUMN user_id UUID REFERENCES users(id) ON DELETE CASCADE;
 

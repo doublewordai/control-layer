@@ -1,6 +1,9 @@
 -- Organisation prices may specialize a resolved serving class. NULL remains an
 -- all-class deal, distinct from an explicit standard-class price.
 -- The pre-rollout migration Job bounds execution time.
+-- Bound lock waits so queued DDL does not block live billing and admission reads.
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE model_tariffs ADD COLUMN serving_class TEXT;
 ALTER TABLE model_cache_tariffs ADD COLUMN serving_class TEXT;
 ALTER TABLE model_tariffs ADD CONSTRAINT model_tariffs_class_scope

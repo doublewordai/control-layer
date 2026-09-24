@@ -3,6 +3,9 @@
 
 -- Historical deals must survive account removal. Normal account deletion is
 -- soft; a hard delete requires an explicit ledger-retention procedure.
+-- Bound lock waits so queued DDL does not block live billing and admission reads.
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE model_tariffs DROP CONSTRAINT model_tariffs_user_id_fkey;
 ALTER TABLE model_tariffs ADD CONSTRAINT model_tariffs_user_id_fkey
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE RESTRICT;

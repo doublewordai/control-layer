@@ -907,6 +907,8 @@ impl<'c> ApiKeys<'c> {
     /// Get all API keys that can access the specified deployment with full response data
     /// Excludes API keys from users with insufficient credits (balance <= 0),
     /// unless their billing account allows negative balances.
+    /// General free-model exemptions retain the legacy rule: positive open-ended
+    /// general tariffs count as paid, including future and internal-purpose rows.
     #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id)), err)]
     pub async fn get_api_keys_for_deployment_with_sufficient_credit(
         &mut self,

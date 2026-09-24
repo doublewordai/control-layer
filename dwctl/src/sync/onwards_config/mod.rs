@@ -668,6 +668,8 @@ struct OnwardsCompositeModel {
 }
 
 /// Loads composite models with their components and API keys from the database
+/// General paid admission deliberately includes future/internal-purpose open-ended
+/// tariffs, preserving existing free-model access rules independently of billing.
 #[tracing::instrument(skip(db, escalation_models))]
 async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
     debug!(
@@ -1535,6 +1537,7 @@ fn convert_to_config_file(
 }
 
 /// Loads the current targets configuration from the database (including composite models)
+/// General paid admission retains the same legacy tariff rule as composite loading.
 ///
 /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
 /// This enables batch processing to route requests to escalation models without needing

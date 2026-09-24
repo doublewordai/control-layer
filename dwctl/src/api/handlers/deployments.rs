@@ -2,7 +2,7 @@
 
 use sqlx_pool_router::PoolProvider;
 
-use crate::api::models::deployments::{ModelFacets, ModelListResponse, TrafficRoutingAction, TrafficRoutingRule};
+use crate::api::models::deployments::{ModelFacets, ModelListResponse, TariffDefinition, TrafficRoutingAction, TrafficRoutingRule};
 use crate::db::models::deployments::{
     AimdConfig, LoadBalancingStrategy, MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS, ModelCatalogMetadata,
     TrafficRuleAction,
@@ -35,6 +35,18 @@ use axum::{
 };
 use onwards::aimd::AimdConfig as OnwardsAimdConfig;
 use sqlx::Acquire;
+
+fn validate_tariff_prices(tariffs: Option<&[TariffDefinition]>) -> Result<()> {
+    for tariff in tariffs.unwrap_or_default() {
+        // Zero is a valid price; negative rates are never customer discounts.
+        if tariff.input_price_per_token < rust_decimal::Decimal::ZERO || tariff.output_price_per_token < rust_decimal::Decimal::ZERO {
+            return Err(Error::BadRequest {
+                message: "Tariff input and output prices must be non-negative".to_string(),
+            });
+        }
+    }
+    Ok(())
+}
 
 fn validate_reasoning_translation_overrides(overrides: Option<&ReasoningTranslationOverrides>) -> Result<()> {
     if let Some(overrides) = overrides {
@@ -601,6 +613,8 @@ pub async fn create_deployed_model<P: PoolProvider>(
         });
     }
 
+    validate_tariff_prices(tariffs.as_deref())?;
+
     // Validate throughput is positive if provided
     if let Some(t) = throughput
         && t <= 0.0
@@ -794,6 +808,8 @@ pub async fn update_deployed_model<P: PoolProvider>(
     Json(mut update): Json<DeployedModelUpdate>,
 ) -> Result<Json<DeployedModelResponse>> {
     let has_system_access = has_permission(&current_user, resource::Models.into(), operation::SystemAccess.into());
+
+    validate_tariff_prices(update.tariffs.as_deref())?;
 
     if let Some(Some(t)) = update.throughput
         && t <= 0.0
@@ -2448,6 +2464,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[sqlx::test]
+    async fn negative_tariff_prices_are_rejected_before_model_or_ledger_changes(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+        let endpoint = get_test_endpoint_id(&pool).await;
+        let existing = create_test_deployment(&pool, admin.id, "original", "original").await;
+        let original_tariff: uuid::Uuid = sqlx::query_scalar(
+            "INSERT INTO model_tariffs(deployed_model_id,name,api_key_purpose,input_price_per_token,output_price_per_token)
+             VALUES ($1,'original','realtime',1,2) RETURNING id",
+        )
+        .bind(existing.id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        for (input, output) in [("-1", "2"), ("1", "-0.00000001"), ("-1", "-2")] {
+            // A valid earlier row must not be written before rejecting a later bad rate.
+            let tariffs = json!([
+                {"name":"valid", "api_key_purpose":"playground", "input_price_per_token":"1", "output_price_per_token":"2"},
+                {"name":"invalid", "api_key_purpose":"realtime", "input_price_per_token":input, "output_price_per_token":output}
+            ]);
+            for kind in ["standard", "composite"] {
+                let mut create = json!({"type":kind,"model_name":"invalid-price","alias":"invalid-price","tariffs":tariffs});
+                if kind == "standard" {
+                    create["hosted_on"] = json!(endpoint);
+                }
+                let response = app
+                    .post("/admin/api/v1/models")
+                    .add_header(&headers[0].0, &headers[0].1)
+                    .add_header(&headers[1].0, &headers[1].1)
+                    .json(&create)
+                    .await;
+                response.assert_status_bad_request();
+                assert!(response.text().contains("non-negative"));
+            }
+            let response = app
+                .patch(&format!("/admin/api/v1/models/{}", existing.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"alias":"must-not-change","tariffs":tariffs}))
+                .await;
+            response.assert_status_bad_request();
+            assert!(response.text().contains("non-negative"));
+
+            let rows: Vec<(uuid::Uuid, Decimal, Decimal, bool)> = sqlx::query_as(
+                "SELECT id,input_price_per_token,output_price_per_token,valid_until IS NULL FROM model_tariffs WHERE deployed_model_id=$1",
+            )
+            .bind(existing.id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(rows, vec![(original_tariff, Decimal::ONE, Decimal::from(2), true)]);
+            let alias: String = sqlx::query_scalar("SELECT alias FROM deployed_models WHERE id=$1")
+                .bind(existing.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(alias, "original");
+        }
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM deployed_models WHERE alias='invalid-price'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[sqlx::test]
+    async fn zero_tariff_prices_remain_valid_on_create_and_update(pool: PgPool) {
+        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&admin);
+        let endpoint = get_test_endpoint_id(&pool).await;
+        for (input, output) in [("0", "2"), ("1", "0"), ("0", "0")] {
+            let alias = format!("zero-{input}-{output}");
+            let tariff =
+                json!({"name":"zero", "api_key_purpose":"realtime", "input_price_per_token":input,"output_price_per_token":output});
+            let response = app
+                .post("/admin/api/v1/models")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"type":"standard","model_name":alias,"alias":alias,"hosted_on":endpoint,"tariffs":[tariff]}))
+                .await;
+            response.assert_status_ok();
+            let model: DeployedModelResponse = response.json();
+            let original: uuid::Uuid = sqlx::query_scalar("SELECT id FROM model_tariffs WHERE deployed_model_id=$1")
+                .bind(model.id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            app.patch(&format!("/admin/api/v1/models/{}", model.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({"description":"zero remains valid","tariffs":[tariff]}))
+                .await
+                .assert_status_ok();
+            let rows: Vec<(uuid::Uuid, Decimal, Decimal)> =
+                sqlx::query_as("SELECT id,input_price_per_token,output_price_per_token FROM model_tariffs WHERE deployed_model_id=$1")
+                    .bind(model.id)
+                    .fetch_all(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(rows, vec![(original, input.parse().unwrap(), output.parse().unwrap())]);
+        }
     }
 
     #[sqlx::test]

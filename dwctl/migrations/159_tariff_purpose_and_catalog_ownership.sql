@@ -1,5 +1,8 @@
 -- Purpose/window isolation and explicit organization-catalog price ownership.
 
+-- Bound lock waits so queued DDL does not block live billing and admission reads.
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE model_tariffs ADD COLUMN provisioning_source TEXT;
 ALTER TABLE model_cache_tariffs ADD COLUMN provisioning_source TEXT;
 COMMENT ON COLUMN model_tariffs.provisioning_source IS 'NULL = manually managed; org-overlays = owned by the organization catalog';
