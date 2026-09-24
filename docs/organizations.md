@@ -801,3 +801,36 @@ Each PR is non-breaking — existing functionality is preserved at every step.
    - Verify batches page shows member filter when in org context
    - Verify org management page: create org, add/remove members, change roles
    - Verify API keys page shows org keys when in org context
+
+## Disabled modalities (owner-controlled product surfaces)
+
+An organization owner can switch a whole product surface off for the
+workspace. The set is stored as `users.disabled_modalities TEXT[]` (migration
+156, CHECK-constrained to known values) and exposed as `disabled_modalities`
+on `GET`/`PATCH /admin/api/v1/organizations/{id}`. Writing it is owner-only
+(or a platform manager with `UpdateAll`), the same gate as
+`zero_data_retention` and `auto_join_enabled`.
+
+| Modality | What it blocks | Where it is enforced |
+|---|---|---|
+| `realtime` | `POST` to the inference endpoints under `/ai/v1` (chat completions, completions, responses, messages, embeddings), whatever `service_tier` the request asks for | `inference::middleware`, from the per-key policy cache (`sync::key_policy`), before onwards sees the request |
+| `batch` | `POST /ai/v1/files` and `POST /ai/v1/batches` | the handlers, against the account the work bills to (`active_organization`, else the user) |
+
+The block is keyed on the *owning account* of the API key (`api_keys.user_id`),
+so every key the organization owns is covered regardless of which member
+created it or what purpose it has. A member's personal keys are governed by
+the member's own row, which the API never writes. Requests the fusillade
+daemon replays for an existing batch carry `x-fusillade-request-id` and are not
+affected; reading, listing and cancelling existing batches stays available so
+results can still be collected.
+
+Refused requests get `403` with `code: "modality_disabled"` and a message that
+names the surface and tells the caller an owner can re-enable it. The realtime
+switch propagates through the `users_disabled_modalities_notify` trigger on
+the `auth_config_changed` channel, so it takes effect within the policy cache's
+debounce (about 100 ms) plus the periodic fallback reload. That refresh loop runs under `background_services.key_policy_sync`,
+independently of `onwards_sync`, so turning routing sync off does not freeze
+the policy map.
+
+Source: `dwctl/src/modalities.rs` (the enum and set), `api/handlers/modalities.rs`
+(the batch check), `dwctl/src/test/modalities.rs` (end-to-end coverage).

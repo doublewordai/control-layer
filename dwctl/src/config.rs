@@ -2657,6 +2657,11 @@ impl Default for NotificationsConfig {
 pub struct BackgroundServicesConfig {
     /// Configuration for onwards config sync service
     pub onwards_sync: OnwardsSyncConfig,
+    /// Configuration for the per-key account policy sync (ZDR flag and
+    /// disabled modalities). Independent of `onwards_sync`: the realtime
+    /// modality gate and ZDR handling both read this map, so it must keep
+    /// refreshing even where routing sync is turned off.
+    pub key_policy_sync: KeyPolicySyncConfig,
     /// Configuration for the usage-aggregate refresh daemon
     pub usage_refresh: UsageRefreshConfig,
     /// Configuration for probe scheduler service
@@ -2777,6 +2782,33 @@ pub struct OnwardsSyncConfig {
     /// removes protection against missed notifications and is generally not recommended
     /// in production environments.
     pub fallback_interval_milliseconds: u64,
+}
+
+/// Per-key account policy sync configuration ([`crate::sync::key_policy`]).
+///
+/// The map is always loaded once at startup; this controls the background
+/// task that keeps it fresh afterwards (LISTEN on `auth_config_changed` plus
+/// a periodic fallback reload).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KeyPolicySyncConfig {
+    /// Keep the map fresh after startup (default: true). With this off, a
+    /// change to an account's ZDR flag or disabled modalities only reaches
+    /// this instance on restart.
+    pub enabled: bool,
+    /// Fallback full-reload interval in milliseconds (default: 300000). The
+    /// reload is one small two-table join, and NOTIFY carries real changes,
+    /// so this only guards against a missed notification. `0` disables it.
+    pub fallback_interval_milliseconds: u64,
+}
+
+impl Default for KeyPolicySyncConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            fallback_interval_milliseconds: 300_000,
+        }
+    }
 }
 
 impl Default for OnwardsSyncConfig {

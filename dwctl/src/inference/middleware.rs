@@ -76,10 +76,10 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Encrypted key custody for ZDR flex bodies. `None` disables ZDR.
     pub keystore: Option<crate::keystore::Keystore>,
     /// Per-key ZDR policy map (api key secret to the owning account's
-    /// `zero_data_retention` flag), kept fresh by [`crate::sync::zdr_keys`].
+    /// `zero_data_retention` flag), kept fresh by [`crate::sync::key_policy`].
     /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
     /// empty (every key reads as non-ZDR) when the sync is not wired.
-    pub zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
+    pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -200,7 +200,22 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // so reject the contract before touching the response store. Besides being
     // clearer for callers, this avoids turning an unavailable/minimal stored
     // object into a hydration 5xx.
-    let zdr = crate::inference::zdr::is_zdr_request(&state.zdr_key_cache, api_key.as_deref());
+    let zdr = crate::inference::zdr::is_zdr_request(&state.key_policy_cache, api_key.as_deref());
+
+    // An organization owner may have switched realtime inference off for
+    // every key the organization owns. Every service tier arrives on these
+    // endpoints, so one switch covers realtime, flex and background alike;
+    // batch execution re-enters with `x-fusillade-request-id` and was skipped
+    // above. Answered from the per-key policy map: no DB round-trip, and a
+    // key auth will reject anyway reads as nothing disabled.
+    if let Some(key) = api_key.as_deref()
+        && state
+            .key_policy_cache
+            .disabled_modalities(key)
+            .contains(crate::modalities::Modality::Realtime)
+    {
+        return modality_disabled_response(crate::modalities::Modality::Realtime);
+    }
     if is_responses_api {
         if let Some(include) = request_value.get("include")
             && !include.is_null()
@@ -1286,6 +1301,27 @@ pub(crate) fn should_intercept(method: &axum::http::Method, path: &str) -> bool 
     // external key steer the dynamo scheduler queue.
     method == axum::http::Method::POST
         && (path.ends_with("/responses") || path.ends_with("/completions") || path.ends_with("/messages") || path.ends_with("/embeddings"))
+}
+
+/// 403 for a product surface an organization owner has switched off. Same
+/// shape as the daemon-tier refusals above; `code` lets clients tell it apart
+/// from a permission problem on the key itself.
+fn modality_disabled_response(modality: crate::modalities::Modality) -> Response {
+    Response::builder()
+        .status(StatusCode::FORBIDDEN)
+        .header("content-type", "application/json")
+        .body(Body::from(
+            serde_json::json!({
+                "error": {
+                    "message": modality.disabled_message(),
+                    "type": "invalid_request_error",
+                    "code": "modality_disabled",
+                    "param": null
+                }
+            })
+            .to_string(),
+        ))
+        .unwrap()
 }
 
 fn invalid_request_response(message: &str, code: &str, param: &str) -> Response {
