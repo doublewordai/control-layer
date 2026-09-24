@@ -58,10 +58,6 @@ pub trait ImageStore: Send + Sync {
     /// Generate a short-lived signed URL pointing at the bytes for `token`.
     async fn sign(&self, token: ImageToken, ttl: Duration) -> Result<SignedImageUrl, StoreError>;
 
-    /// Read the bytes for `token` directly. Used by the dashboard
-    /// image-view path. Caller is responsible for authorisation.
-    async fn read(&self, token: ImageToken) -> Result<(String, Bytes), StoreError>;
-
     /// True if an object with this token already exists. Cheap check used
     /// by the ingest path to skip uploads on dedup hits.
     async fn exists(&self, token: ImageToken) -> Result<bool, StoreError>;
@@ -135,11 +131,6 @@ impl ImageStore for MemoryStore {
             expires_at.timestamp()
         );
         Ok(SignedImageUrl { url, expires_at })
-    }
-
-    async fn read(&self, token: ImageToken) -> Result<(String, Bytes), StoreError> {
-        let map = self.inner.lock().expect("MemoryStore mutex poisoned");
-        map.get(&token).cloned().ok_or(StoreError::NotFound)
     }
 
     async fn exists(&self, token: ImageToken) -> Result<bool, StoreError> {
@@ -262,23 +253,6 @@ impl ImageStore for GcsStore {
             .map_err(|e| StoreError::Backend(format!("GCS sign {key}: {e}")))?;
         let expires_at = Utc::now() + ChronoDuration::from_std(ttl).unwrap_or(ChronoDuration::seconds(900));
         Ok(SignedImageUrl { url, expires_at })
-    }
-
-    async fn read(&self, token: ImageToken) -> Result<(String, Bytes), StoreError> {
-        let client = self.client().await?;
-        let key = Self::key(token);
-        let mut resp = client
-            .read_object(self.bucket_resource(), &key)
-            .send()
-            .await
-            .map_err(|e| StoreError::Backend(format!("GCS read {key}: {e}")))?;
-        let mime = resp.object().content_type.clone();
-        let mut bytes_vec: Vec<u8> = Vec::new();
-        while let Some(chunk) = resp.next().await {
-            let chunk = chunk.map_err(|e| StoreError::Backend(format!("GCS read body: {e}")))?;
-            bytes_vec.extend_from_slice(&chunk);
-        }
-        Ok((mime, Bytes::from(bytes_vec)))
     }
 
     async fn exists(&self, token: ImageToken) -> Result<bool, StoreError> {
@@ -416,26 +390,6 @@ impl ImageStore for S3CompatStore {
         })
     }
 
-    async fn read(&self, token: ImageToken) -> Result<(String, Bytes), StoreError> {
-        let key = Self::key(token);
-        let resp = self.client.get_object().bucket(&self.bucket).key(&key).send().await.map_err(|e| {
-            let svc = e.into_service_error();
-            if svc.is_no_such_key() {
-                StoreError::NotFound
-            } else {
-                StoreError::Backend(format!("S3 read {key}: {svc}"))
-            }
-        })?;
-        let mime = resp.content_type().unwrap_or("application/octet-stream").to_string();
-        let bytes = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| StoreError::Backend(format!("S3 read body {key}: {e}")))?
-            .into_bytes();
-        Ok((mime, bytes))
-    }
-
     async fn exists(&self, token: ImageToken) -> Result<bool, StoreError> {
         let key = Self::key(token);
         // Typed 404 → false; any other error (auth, network, server) bubbles
@@ -524,15 +478,6 @@ mod tests {
         assert!(!s.exists(tok(2)).await.unwrap());
         s.put(tok(2), "image/png", Bytes::from_static(b"x")).await.unwrap();
         assert!(s.exists(tok(2)).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn memory_store_read_returns_bytes_and_mime() {
-        let s = MemoryStore::new();
-        s.put(tok(3), "image/jpeg", Bytes::from_static(b"jpegbytes")).await.unwrap();
-        let (mime, bytes) = s.read(tok(3)).await.unwrap();
-        assert_eq!(mime, "image/jpeg");
-        assert_eq!(bytes.as_ref(), b"jpegbytes");
     }
 
     #[test]
