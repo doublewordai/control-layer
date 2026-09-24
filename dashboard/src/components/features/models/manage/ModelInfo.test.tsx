@@ -168,7 +168,7 @@ describe("ModelInfo", () => {
     );
 
     expect(getByRole("status")).toHaveTextContent(
-      "This model is provisioned from model-catalog:zai-org--GLM-5.2-FP8.yaml. Changes made here will be overwritten when the server restarts.",
+      "This model is provisioned from model-catalog:zai-org--GLM-5.2-FP8.yaml. Changes made here, other than enabling or disabling a hosted model, will be overwritten when the server restarts.",
     );
   });
   it.each([false, true])("guards organisation price details independently of fetched data: %s", (manager) => {

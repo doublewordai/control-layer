@@ -156,8 +156,13 @@ For models present in YAML, model fields, physical deployments, components,
 routing, access groups, traffic rules and active tariffs are authoritative.
 Manual dashboard changes to those fields remain visible until the next server
 restart, when YAML restores them. The dashboard displays a warning on such
-models. The exception is `routing.fallback.realtime_on_status` (statuses that
-fail over realtime requests only): when omitted, the stored value is kept.
+models. Two values are exceptions:
+
+- `routing.fallback.realtime_on_status` (statuses that fail over realtime
+  requests only): when omitted, the stored value is kept.
+- A component's `enabled` is applied when provisioning creates the component.
+  An existing component keeps its stored value across restarts; enable or
+  disable it through the admin API or dashboard.
 
 Models omitted from YAML are not deleted or otherwise rewritten. Their
 `provisioning_source` becomes `NULL`, which makes them manually managed again.
