@@ -326,6 +326,12 @@ pub fn create_test_config() -> crate::config::Config {
                 enabled: false,
                 fallback_interval_milliseconds: 10000,
             },
+            // Tests refresh the map explicitly (`sync_key_policy`) rather than
+            // holding a LISTEN connection open per test app.
+            key_policy_sync: crate::config::KeyPolicySyncConfig {
+                enabled: false,
+                fallback_interval_milliseconds: 0,
+            },
             probe_scheduler: ProbeSchedulerConfig { enabled: false },
             batch_daemon: DaemonConfig {
                 enabled: DaemonEnabled::Never,

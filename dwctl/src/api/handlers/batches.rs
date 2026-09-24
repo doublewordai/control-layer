@@ -594,6 +594,9 @@ pub async fn create_batch<P: PoolProvider>(
         let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
             operation: format!("get db connection for credit check: {}", e),
         })?;
+        // An owner may have switched the batch API off for the workspace.
+        // Checked on the same account the batch bills to, before any work.
+        crate::api::handlers::modalities::ensure_batch_enabled(&mut conn, balance_check_id).await?;
         let balance = Credits::new(&mut conn)
             .get_balance_for_admission(balance_check_id)
             .await

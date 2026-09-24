@@ -2,6 +2,7 @@
 use super::*;
 
 const FIRST_INDEX: i64 = 20260924120010;
+const BEFORE_INDEXES: i64 = 20260924115950;
 const LAST_VALIDATION: i64 = 20260924120630;
 const ORG_BATCH: &str = "idx_model_tariffs_unique_active_org_batch_per_sla";
 
@@ -84,7 +85,7 @@ async fn tariff_indexes_fresh_upgrade_preserves_rows_and_uniqueness(pool: PgPool
 #[sqlx::test(migrations = false)]
 async fn tariff_indexes_accept_prebuilt_and_recover_interrupted_builds(pool: PgPool) {
     let target = Target::main();
-    target.run_to(161, &pool).await.unwrap();
+    target.run_to(BEFORE_INDEXES, &pool).await.unwrap();
     for build in index_builds() {
         sqlx::raw_sql(&build.sql).execute(&pool).await.unwrap();
     }
@@ -104,7 +105,7 @@ async fn tariff_indexes_accept_prebuilt_and_recover_interrupted_builds(pool: PgP
 #[sqlx::test(migrations = false)]
 async fn tariff_indexes_reject_wrong_definitions_before_dropping_old_guards(pool: PgPool) {
     let target = Target::main();
-    target.run_to(161, &pool).await.unwrap();
+    target.run_to(BEFORE_INDEXES, &pool).await.unwrap();
     let build = index_builds().into_iter().find(|m| m.sql.contains(ORG_BATCH)).unwrap();
     target.run_to(build.version - 1, &pool).await.unwrap();
     for wrong in [

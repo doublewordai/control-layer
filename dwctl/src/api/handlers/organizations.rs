@@ -504,7 +504,12 @@ pub async fn get_organization<P: PoolProvider>(
 ) -> Result<Json<OrganizationResponse>> {
     let can_all = can_read_all_resources(&current_user, Resource::Organizations);
 
-    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // Primary, not the replica: the dashboard PATCHes an owner setting
+    // (`disabled_modalities`, `auto_join_enabled`) and immediately refetches
+    // this endpoint. Off the replica that read can land before the write has
+    // propagated, and the toggle the owner just flipped appears to revert.
+    // Same inter-endpoint consistency rule as `list_user_organizations`.
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
     if !can_all {
         let mut repo = Organizations::new(&mut pool_conn);
@@ -540,10 +545,12 @@ pub async fn get_organization<P: PoolProvider>(
     // source of truth either way.
     let pending_email_change = org_repo.find_pending_email_change_for_org(id).await?;
     let auto_join_enabled = org_repo.auto_join_enabled(id).await?;
+    let disabled_modalities = org_repo.disabled_modalities(id).await?;
 
     let mut response = OrganizationResponse::from_user(UserResponse::from(org))
         .with_member_count(members.len() as i64)
-        .with_auto_join_enabled(auto_join_enabled);
+        .with_auto_join_enabled(auto_join_enabled)
+        .with_disabled_modalities(disabled_modalities);
     if let Some(pending) = pending_email_change {
         response = response.with_pending_email_change(PendingEmailChangeResponse::from(pending));
     }
@@ -650,6 +657,17 @@ pub async fn update_organization<P: PoolProvider>(
             required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
             action: Operation::UpdateOwn,
             resource: format!("domain auto-join for organization {id}"),
+        });
+    }
+
+    // SECURITY: owner-only as well. Disabling a modality switches a product
+    // surface off for every key the workspace owns; which products a
+    // workspace uses is the owner's call, not an admin's.
+    if !can_all && data.disabled_modalities.is_some() && caller_org_role.as_deref() != Some("owner") {
+        return Err(Error::InsufficientPermissions {
+            required: Permission::Allow(Resource::Organizations, Operation::UpdateOwn),
+            action: Operation::UpdateOwn,
+            resource: format!("disabled modalities for organization {id}"),
         });
     }
 
@@ -836,6 +854,12 @@ pub async fn update_organization<P: PoolProvider>(
         repo.set_auto_join_enabled(id, enabled).await?;
     }
     let auto_join_enabled = repo.auto_join_enabled(id).await?;
+    // Same side-channel: the set is read by the endpoints that enforce it and
+    // by the organization's own settings page, nowhere else.
+    if let Some(disabled) = data.disabled_modalities.as_deref() {
+        repo.set_disabled_modalities(id, disabled).await?;
+    }
+    let disabled_modalities = repo.disabled_modalities(id).await?;
 
     // Surface any pending email-change on EVERY PATCH response — not just
     // the one that created it — so a dashboard mid-verification doesn't lose
@@ -850,7 +874,9 @@ pub async fn update_organization<P: PoolProvider>(
             .map(PendingEmailChangeResponse::from),
     };
 
-    let mut response = OrganizationResponse::from_user(UserResponse::from(org)).with_auto_join_enabled(auto_join_enabled);
+    let mut response = OrganizationResponse::from_user(UserResponse::from(org))
+        .with_auto_join_enabled(auto_join_enabled)
+        .with_disabled_modalities(disabled_modalities);
     if let Some(info) = pending_email_change {
         response = response.with_pending_email_change(info);
     }

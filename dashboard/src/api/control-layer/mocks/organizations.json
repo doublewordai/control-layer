@@ -16,7 +16,8 @@
     "batch_notifications_enabled": false,
     "low_balance_threshold": null,
     "user_type": "organization",
-    "member_count": 5
+    "member_count": 5,
+    "disabled_modalities": []
   },
   {
     "id": "org-550e8400-0002",
@@ -35,6 +36,7 @@
     "batch_notifications_enabled": false,
     "low_balance_threshold": null,
     "user_type": "organization",
-    "member_count": 3
+    "member_count": 3,
+    "disabled_modalities": []
   }
 ]

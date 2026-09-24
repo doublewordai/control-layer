@@ -1,5 +1,25 @@
 # Changelog
 
+## [12.5.0](https://github.com/doublewordai/control-layer/compare/v12.4.0...v12.5.0) (2026-09-24)
+
+
+### Features
+
+* **organizations:** let owners disable modalities for their organization ([#1842](https://github.com/doublewordai/control-layer/issues/1842)) ([ed76744](https://github.com/doublewordai/control-layer/commit/ed76744541e475a6c07e18eb63ba2d24d6e4f6fd))
+
+## [12.4.0](https://github.com/doublewordai/control-layer/compare/v12.3.2...v12.4.0) (2026-09-24)
+
+
+### Features
+
+* **onwards:** send a scheduling priority on every dynamo request ([#1848](https://github.com/doublewordai/control-layer/issues/1848)) ([094fe22](https://github.com/doublewordai/control-layer/commit/094fe227e2bcd3c86f2b090a6b7a4fa44eb2d17d))
+
+
+### Bug Fixes
+
+* **batches:** scope per-request retry to its batch ([#1847](https://github.com/doublewordai/control-layer/issues/1847)) ([695112e](https://github.com/doublewordai/control-layer/commit/695112e9c932aec65a46a43681f360b717114b82))
+* **underway:** index terminal tasks for retention sweeps ([#1845](https://github.com/doublewordai/control-layer/issues/1845)) ([1b6b4a0](https://github.com/doublewordai/control-layer/commit/1b6b4a034b83c1b34e028245a80b0a8377b99fda))
+
 ## [12.3.2](https://github.com/doublewordai/control-layer/compare/v12.3.1...v12.3.2) (2026-09-24)
 
 

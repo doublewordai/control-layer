@@ -1786,6 +1786,13 @@ export interface SyncedKey {
 
 export type OrgMemberRole = "owner" | "admin" | "member";
 
+/**
+ * A product surface an organization owner can switch off for the whole
+ * organization. `realtime` is the synchronous inference endpoints (all
+ * service tiers); `batch` is the Files and Batches API.
+ */
+export type Modality = "realtime" | "batch";
+
 export interface OrganizationSummary {
   id: string;
   name: string;
@@ -1818,6 +1825,11 @@ export interface Organization extends User {
   member_count?: number;
   /** Present while an email change is waiting on confirmation. */
   pending_email_change?: PendingEmailChange;
+  /**
+   * Product surfaces an owner has switched off for every key this
+   * organization owns. Empty (or absent) means everything is allowed.
+   */
+  disabled_modalities?: Modality[];
 }
 
 export interface OrganizationMember {
@@ -1848,6 +1860,8 @@ export interface OrganizationUpdateRequest {
   granted_serving_classes?: ServingClassName[];
   default_serving_class?: ServingClassName | null;
   self_hosted_only?: boolean;
+  /** Replaces the whole set; owner-only. An empty list re-enables everything. */
+  disabled_modalities?: Modality[];
 }
 
 export interface InviteMemberRequest {
