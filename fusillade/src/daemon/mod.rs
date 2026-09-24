@@ -3316,15 +3316,18 @@ where
                             .map(|entry| *entry.key())
                             .collect();
 
+                        // Publish before the early exit so an idle daemon reads
+                        // 0 rather than the last non-empty poll.
+                        gauge!("fusillade_cancellation_poll_batches_checked")
+                            .set(active_batch_ids.len() as f64);
+                        gauge!("fusillade_cancellation_poll_requests_checked")
+                            .set(active_request_ids.len() as f64);
+
                         if active_batch_ids.is_empty() && active_request_ids.is_empty() {
                             continue;
                         }
 
                         let poll_start = std::time::Instant::now();
-                        gauge!("fusillade_cancellation_poll_batches_checked")
-                            .set(active_batch_ids.len() as f64);
-                        gauge!("fusillade_cancellation_poll_requests_checked")
-                            .set(active_request_ids.len() as f64);
 
                         // Single bulk query to find which active batches have been cancelled.
                         // If a silently severed connection wedges this poll, cancelled batches

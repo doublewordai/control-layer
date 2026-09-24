@@ -1004,6 +1004,13 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     background: bool,
 ) -> Response {
     let request_id = flex_input.request_id;
+    // Foreground callers are the only ones who will ever collect the result,
+    // so only they arm the guard. Armed *before* the enqueue: a disconnect
+    // while the INSERT is in flight drops this future, but the row can still
+    // commit. Disarmed once a terminal state has been delivered; on any other
+    // exit (disconnect, enqueue or poll failure) it cancels the row, which is
+    // a no-op if the row never made it in.
+    let abandon_guard = (!background).then(|| response_store::AbandonGuard::arm(state.request_manager.clone(), request_id));
     // Flex needs the row created synchronously (daemon must find it).
     if let Err(e) = fusillade::Storage::create_flex(&*state.request_manager, flex_input).await {
         tracing::error!(error = %e, "Failed to create flex row in fusillade");
@@ -1041,13 +1048,11 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
         let poll_interval = std::time::Duration::from_millis(500);
         let timeout = std::time::Duration::from_secs(3600);
 
-        // Dropped on client disconnect (hyper drops the handler future) or on
-        // poll failure: either way nobody will collect the result, so cancel
-        // the row rather than let the daemon keep working it.
-        let abandon_guard = response_store::AbandonGuard::arm(state.request_manager.clone(), request_id);
         match response_store::poll_until_complete(&state.request_manager, resp_id, poll_interval, timeout, state.keystore.as_ref()).await {
             Ok(response_obj) => {
-                abandon_guard.disarm();
+                if let Some(guard) = abandon_guard {
+                    guard.disarm();
+                }
                 let status_code = if response_obj["status"].as_str() == Some("completed") {
                     StatusCode::OK
                 } else {
@@ -1130,6 +1135,10 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
     flex_input: fusillade::CreateFlexInput,
     request_id: uuid::Uuid,
 ) -> Response {
+    // See `handle_flex`: armed before the enqueue so a disconnect during the
+    // INSERT still cancels a row that committed; disarmed once the terminal
+    // state has been delivered.
+    let abandon_guard = response_store::AbandonGuard::arm(state.request_manager.clone(), request_id);
     if let Err(e) = fusillade::Storage::create_flex(&*state.request_manager, flex_input).await {
         tracing::error!(error = %e, "Failed to create flex chat-completions batch in fusillade");
         return Response::builder()
@@ -1151,9 +1160,6 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
     let poll_interval = std::time::Duration::from_millis(500);
     let timeout = std::time::Duration::from_secs(3600);
 
-    // See `handle_flex`: cancel the row if the caller disconnects or the poll
-    // gives up before a terminal state was delivered.
-    let abandon_guard = response_store::AbandonGuard::arm(state.request_manager.clone(), request_id);
     match response_store::poll_until_terminal(&state.request_manager, request_id, poll_interval, timeout, state.keystore.as_ref()).await {
         Ok(detail) => {
             abandon_guard.disarm();

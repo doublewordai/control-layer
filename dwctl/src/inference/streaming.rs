@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
 
-use crate::inference::store::cancel_abandoned_request;
+use crate::inference::store::AbandonGuard;
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -57,10 +57,11 @@ impl ReplayFrame {
 /// so it still returns a clean JSON `500`.
 ///
 /// If the client disconnects while we are still polling, the request is
-/// cancelled (see [`cancel_abandoned_request`]): nobody will collect the
-/// result, and leaving it queued or in flight only spends engine time. The
-/// same happens when the poll itself gives up, since the client has by then
-/// been answered with an error frame.
+/// cancelled (see [`AbandonGuard`]): nobody will collect the result, and
+/// leaving it queued or in flight only spends engine time. The same happens
+/// when the poll itself gives up, since the client has by then been answered
+/// with an error frame. The guard is armed before the enqueue so a disconnect
+/// during the INSERT still cancels a row that committed.
 ///
 /// `done_sentinel` appends a trailing `data: [DONE]` (the chat-completions
 /// terminator); the Responses surface ends on `response.completed`/`.failed`
@@ -79,8 +80,12 @@ where
 {
     use axum::response::IntoResponse;
 
+    let abandon_guard = AbandonGuard::arm(request_manager.clone(), request_id);
+
     // Enqueue synchronously so an enqueue failure is a clean JSON 500 — it
     // happens before the stream opens, so we're not yet committed to a 200.
+    // The guard is left armed on this path too: the cancel is a no-op if the
+    // row never made it in, and covers a commit that raced the error.
     if let Err(e) = fusillade::Storage::create_flex(&*request_manager, flex_input).await {
         tracing::error!(error = %e, "Failed to create streaming flex batch in fusillade");
         return axum::response::Response::builder()
@@ -109,7 +114,7 @@ where
             // client goes away.
             _ = tx.closed() => {
                 tracing::info!(request_id = %request_id, "Client disconnected before flex request finished");
-                cancel_abandoned_request(&request_manager, request_id).await;
+                drop(abandon_guard); // cancels the row
                 return;
             }
         };
@@ -118,10 +123,13 @@ where
             Ok(detail) => render(Ok(detail)),
             Err(e) => {
                 tracing::error!(error = %e, request_id = %request_id, "Streaming flex poll failed");
-                cancel_abandoned_request(&request_manager, request_id).await;
                 render(Err(&e.to_string()))
             }
         };
+        match result {
+            Ok(_) => abandon_guard.disarm(),
+            Err(_) => drop(abandon_guard), // cancels the row
+        }
 
         for frame in frames {
             let mut event = Event::default().data(frame.data.to_string());

@@ -329,10 +329,13 @@ pub async fn cancel_abandoned_request<P: PoolProvider + Clone>(request_manager: 
 /// Cancels a flex request if the handler awaiting it is dropped first.
 ///
 /// hyper drops the handler future when the client disconnects, so a guard
-/// held across `poll_until_terminal` turns a dropped blocking flex request into
-/// a [`cancel_abandoned_request`]. Call [`AbandonGuard::disarm`] once a
-/// terminal state has been observed and rendered; let it drop otherwise
-/// (disconnect, poll timeout, storage error) and the cancel is issued.
+/// held from before the enqueue through `poll_until_terminal` turns a dropped
+/// flex request into a [`cancel_abandoned_request`]. Arm it before
+/// `create_flex`: a disconnect during the INSERT drops the future, but the
+/// row can still commit. Call [`AbandonGuard::disarm`] once a terminal state
+/// has been observed and rendered; let it drop otherwise (disconnect, enqueue
+/// or poll failure) and the cancel is issued — a no-op for a row that never
+/// made it in.
 pub struct AbandonGuard<P: PoolProvider + Clone + Send + Sync + 'static> {
     request_manager: Option<Arc<PostgresRequestManager<P>>>,
     request_id: Uuid,

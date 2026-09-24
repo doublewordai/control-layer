@@ -5172,7 +5172,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             "#,
         )
         .bind(&uuids)
-        .fetch_all(self.read_executor())
+        // Primary, not replica: this is the daemon's detector for a marker the
+        // API layer has just written, and every poll interval of replica lag
+        // is more engine time spent on an abandoned request. The query is a
+        // PK probe over the in-flight set, so the cost is negligible.
+        .fetch_all(self.write_executor())
         .await
         .map_err(|e| {
             FusilladeError::Other(anyhow!("Failed to fetch cancelled request IDs: {}", e))
