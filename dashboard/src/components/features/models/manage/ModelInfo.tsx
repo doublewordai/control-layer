@@ -785,7 +785,8 @@ const ModelInfo: React.FC = () => {
               <Info className="mt-0.5 h-4 w-4 shrink-0" />
               <p>
                 This model is provisioned from {model.provisioning_source}.
-                Changes made here will be overwritten when the server restarts.
+                Changes made here, other than enabling or disabling a hosted
+                model, will be overwritten when the server restarts.
               </p>
             </div>
           )}

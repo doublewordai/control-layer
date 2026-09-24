@@ -333,6 +333,8 @@ impl Jitter {
 #[serde(deny_unknown_fields)]
 pub struct Component {
     pub deployment: String,
+    /// Applied when the component is created. An existing component keeps its
+    /// stored value.
     #[serde(default = "default_true")]
     pub enabled: bool,
     #[serde(default = "default_weight")]
@@ -1089,6 +1091,39 @@ clay:
         write(directory.path(), "model.yaml", &declared);
         apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
         assert_eq!(realtime_statuses().await, Vec::<i32>::new());
+    }
+
+    #[sqlx::test]
+    async fn catalog_sets_component_enabled_only_on_create(pool: PgPool) {
+        sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
+            .execute(&pool).await.unwrap();
+        let component = || async {
+            sqlx::query_as::<_, (bool, i32)>(
+                "SELECT c.enabled, c.weight FROM deployed_model_components c
+                 JOIN deployed_models m ON m.id = c.composite_model_id
+                 WHERE m.alias = 'org/model'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        let directory = tempdir().unwrap();
+        let disabled = catalog_yaml("0.50", false, "0.1").replace(
+            "        - deployment: provider-org-model\n",
+            "        - deployment: provider-org-model\n          enabled: false\n",
+        );
+        write(directory.path(), "model.yaml", &disabled);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(component().await, (false, 1));
+
+        sqlx::query("UPDATE deployed_model_components SET enabled = true")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let reweighted = disabled.replace("          enabled: false\n", "          enabled: false\n          weight: 5\n");
+        write(directory.path(), "model.yaml", &reweighted);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(component().await, (true, 5));
     }
 
     #[sqlx::test]
