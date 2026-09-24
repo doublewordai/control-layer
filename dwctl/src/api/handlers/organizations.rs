@@ -504,7 +504,12 @@ pub async fn get_organization<P: PoolProvider>(
 ) -> Result<Json<OrganizationResponse>> {
     let can_all = can_read_all_resources(&current_user, Resource::Organizations);
 
-    let mut pool_conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // Primary, not the replica: the dashboard PATCHes an owner setting
+    // (`disabled_modalities`, `auto_join_enabled`) and immediately refetches
+    // this endpoint. Off the replica that read can land before the write has
+    // propagated, and the toggle the owner just flipped appears to revert.
+    // Same inter-endpoint consistency rule as `list_user_organizations`.
+    let mut pool_conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
 
     if !can_all {
         let mut repo = Organizations::new(&mut pool_conn);

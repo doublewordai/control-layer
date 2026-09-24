@@ -217,6 +217,38 @@ describe("MyOrganization", () => {
     });
   });
 
+  it("keeps a modality switch where the owner left it after the refetch", async () => {
+    // Uses the demo-mode handlers for both GET and PATCH: the update hook
+    // invalidates and refetches, so the switch only stays put if the mock
+    // persists the change.
+    server.use(userWithOrg("owner"));
+    const { container } = render(<MyOrganization />, {
+      wrapper: createWrapper(),
+    });
+
+    const batchSwitch = await waitFor(() =>
+      within(container).getByRole("switch", { name: "Batch API" }),
+    );
+    expect(batchSwitch).toBeChecked();
+
+    await userEvent.click(batchSwitch);
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("switch", { name: "Batch API" }),
+      ).not.toBeChecked();
+    });
+
+    // Turn it back on, which also restores the shared fixture for other tests.
+    await userEvent.click(
+      within(container).getByRole("switch", { name: "Batch API" }),
+    );
+    await waitFor(() => {
+      expect(
+        within(container).getByRole("switch", { name: "Batch API" }),
+      ).toBeChecked();
+    });
+  });
+
   it("shows modalities read-only to non-owners", async () => {
     server.use(userWithOrg("admin"));
     server.use(

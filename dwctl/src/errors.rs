@@ -416,6 +416,21 @@ impl IntoResponse for Error {
                 });
                 (status, [(RETRY_AFTER, "30")], axum::response::Json(body)).into_response()
             }
+            // Same OpenAI-style body the inference middleware returns for the
+            // realtime gate, so a client sees one shape and one `code` for
+            // "an owner switched this off" on every endpoint.
+            Error::ModalityDisabled { .. } => {
+                use serde_json::json;
+                let body = json!({
+                    "error": {
+                        "message": self.user_message(),
+                        "type": "invalid_request_error",
+                        "code": "modality_disabled",
+                        "param": null
+                    }
+                });
+                (status, axum::response::Json(body)).into_response()
+            }
             _ => {
                 // For all other errors, return simple text message (unchanged)
                 let user_message = self.user_message();

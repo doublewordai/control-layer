@@ -828,7 +828,9 @@ Refused requests get `403` with `code: "modality_disabled"` and a message that
 names the surface and tells the caller an owner can re-enable it. The realtime
 switch propagates through the `users_disabled_modalities_notify` trigger on
 the `auth_config_changed` channel, so it takes effect within the policy cache's
-debounce (about 100 ms) plus the periodic fallback reload.
+debounce (about 100 ms) plus the periodic fallback reload. That refresh loop runs under `background_services.key_policy_sync`,
+independently of `onwards_sync`, so turning routing sync off does not freeze
+the policy map.
 
 Source: `dwctl/src/modalities.rs` (the enum and set), `api/handlers/modalities.rs`
 (the batch check), `dwctl/src/test/modalities.rs` (end-to-end coverage).

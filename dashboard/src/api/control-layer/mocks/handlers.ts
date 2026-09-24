@@ -2936,6 +2936,11 @@ export const handlers = [
     }
     const emailChanged =
       newEmail !== undefined && newEmail !== org.email.toLowerCase();
+    // Persist the owner's modality switches so the follow-up GET (the update
+    // hook invalidates and refetches) shows the new state instead of the fixture.
+    if (rest.disabled_modalities !== undefined) {
+      org.disabled_modalities = rest.disabled_modalities;
+    }
     return HttpResponse.json({
       ...org,
       ...rest,

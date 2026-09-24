@@ -49,6 +49,16 @@ async fn set_disabled(pool: &PgPool, org_id: UserId, disabled: &[Modality]) {
     );
 }
 
+/// Both gates answer with the same OpenAI-style body, so clients can tell an
+/// owner's switch apart from a problem with the key itself.
+fn assert_modality_disabled(resp: &axum_test::TestResponse, message: &str) {
+    resp.assert_status(axum::http::StatusCode::FORBIDDEN);
+    let body = resp.json::<serde_json::Value>();
+    assert_eq!(body["error"]["code"], "modality_disabled", "{body}");
+    assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+    assert!(body["error"]["message"].as_str().unwrap().contains(message), "{body}");
+}
+
 fn jsonl_upload() -> axum_test::multipart::MultipartForm {
     let jsonl = r#"{"custom_id":"r1","method":"POST","url":"/v1/chat/completions","body":{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}}
 "#;
@@ -205,12 +215,7 @@ async fn batch_entry_points_refuse_an_org_with_batch_disabled(pool: PgPool) {
         .add_header("cookie", &org_cookie)
         .multipart(jsonl_upload())
         .await;
-    resp.assert_status(axum::http::StatusCode::FORBIDDEN);
-    assert!(
-        resp.text().contains("batch API is disabled for this organization"),
-        "{}",
-        resp.text()
-    );
+    assert_modality_disabled(&resp, "batch API is disabled for this organization");
 
     let resp = server
         .post("/ai/v1/batches")
@@ -223,12 +228,7 @@ async fn batch_entry_points_refuse_an_org_with_batch_disabled(pool: PgPool) {
             "completion_window": "24h"
         }))
         .await;
-    resp.assert_status(axum::http::StatusCode::FORBIDDEN);
-    assert!(
-        resp.text().contains("batch API is disabled for this organization"),
-        "{}",
-        resp.text()
-    );
+    assert_modality_disabled(&resp, "batch API is disabled for this organization");
 
     // Listing what exists stays open: the switch is on creating new work.
     let resp = server

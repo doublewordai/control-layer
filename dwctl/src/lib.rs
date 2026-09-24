@@ -3462,23 +3462,23 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         (onwards::target::Targets::from_config(empty_config)?, None)
     };
 
-    // Per-key ZDR policy map: an initial synchronous load ALWAYS runs, so the
-    // map is never empty under live traffic (an empty map reads every key as
-    // non-ZDR and would silently leak a ZDR account's body). Only the
-    // LISTEN/NOTIFY refresh loop is gated on onwards config sync, with which it
-    // shares the `auth_config_changed` channel; with sync disabled the map is
-    // still correct at startup, it just does not pick up later policy changes.
+    // Per-key account policy map (ZDR flag, disabled modalities): an initial
+    // synchronous load ALWAYS runs, so the map is never empty under live
+    // traffic (an empty map reads every key as non-ZDR and would silently leak
+    // a ZDR account's body). The LISTEN/NOTIFY refresh loop has its own switch,
+    // independent of onwards routing sync: the realtime modality gate enforces
+    // from this map, so it must keep refreshing even where routing sync is off.
     let key_policy_cache = crate::sync::key_policy::initial_cache(&db_pools.write()).await?;
-    if config.background_services.onwards_sync.enabled {
-        let zdr_pool = dyn_pools.clone();
-        let zdr_listener_pool = direct_pools.clone();
-        let zdr_cache = key_policy_cache.clone();
-        let zdr_shutdown = shutdown_token.clone();
-        let zdr_fallback = config.background_services.onwards_sync.fallback_interval_milliseconds;
-        background_tasks.spawn("zdr-key-sync", async move {
-            crate::sync::key_policy::run(zdr_pool, zdr_listener_pool, zdr_cache, zdr_fallback, zdr_shutdown)
+    if config.background_services.key_policy_sync.enabled {
+        let policy_pool = dyn_pools.clone();
+        let policy_listener_pool = direct_pools.clone();
+        let policy_cache = key_policy_cache.clone();
+        let policy_shutdown = shutdown_token.clone();
+        let policy_fallback = config.background_services.key_policy_sync.fallback_interval_milliseconds;
+        background_tasks.spawn("key-policy-sync", async move {
+            crate::sync::key_policy::run(policy_pool, policy_listener_pool, policy_cache, policy_fallback, policy_shutdown)
                 .await
-                .context("ZDR key sync failed")
+                .context("key policy sync failed")
         });
     }
 
