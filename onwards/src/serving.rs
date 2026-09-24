@@ -42,9 +42,11 @@
 //!
 //! The targets travel in the request body as `nvext.router.{ttft_target,
 //! itl_target}` and, when the preset carries one, the priority as
-//! `nvext.agent_hints.priority`, on members of kind `dynamo` only. Everything
-//! a client could send to steer this itself is scrubbed at dwctl's ingress;
-//! only the resolver sets them.
+//! `nvext.agent_hints.priority`, on members of kind `dynamo` only. A request
+//! to a `dynamo` member that carries no priority is sent
+//! [`DEFAULT_PRIORITY`], so every priority is relative to realtime's 0.
+//! Everything a client could send to steer this itself is scrubbed at dwctl's
+//! ingress; only the resolver sets them.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -65,6 +67,9 @@ pub const NVEXT_AGENT_HINTS_FIELD: &str = "agent_hints";
 /// The scheduling priority carrier the serving stack honours
 /// (`nvext.agent_hints.priority`).
 pub const PRIORITY_FIELD: &str = "priority";
+/// The priority a request to a `dynamo` member carries when nothing set one:
+/// realtime's. Batch deadlines sit below it, continuation resumes above.
+pub const DEFAULT_PRIORITY: i32 = 0;
 /// Separator between a model alias and its class suffix (`alias:class`).
 pub const SUFFIX_SEPARATOR: char = ':';
 /// Key label naming the account (organisation) that owns the key. The account
@@ -205,7 +210,7 @@ pub struct ServingTargets {
     /// Inter-token-latency target, milliseconds.
     pub itl_ms: u32,
     /// Scheduling priority on the serving stack (higher wins; 0 is the
-    /// implicit realtime value and is not sent).
+    /// realtime value, sent by [`stamp_default_priority`] instead).
     #[serde(default)]
     pub priority: i32,
 }
@@ -248,6 +253,34 @@ impl ServingTargets {
                 .insert(PRIORITY_FIELD.to_string(), self.priority.into());
         }
     }
+}
+
+/// Write [`DEFAULT_PRIORITY`] as `nvext.agent_hints.priority` unless the body
+/// already carries a priority. One already present was set by someone
+/// entitled to: the daemon (batch deadline, continuation resume), a resolved
+/// preset, or the first hop when this crate runs again inside the serving
+/// namespace; callers' own are scrubbed at dwctl's ingress. The rest of
+/// `nvext` is kept.
+pub fn stamp_default_priority(body: &mut serde_json::Map<String, serde_json::Value>) {
+    let nvext = body
+        .entry(NVEXT_FIELD)
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if !nvext.is_object() {
+        *nvext = serde_json::Value::Object(Default::default());
+    }
+    let hints = nvext
+        .as_object_mut()
+        .expect("nvext was just made an object")
+        .entry(NVEXT_AGENT_HINTS_FIELD)
+        .or_insert_with(|| serde_json::Value::Object(Default::default()));
+    if !hints.is_object() {
+        *hints = serde_json::Value::Object(Default::default());
+    }
+    hints
+        .as_object_mut()
+        .expect("agent_hints was just made an object")
+        .entry(PRIORITY_FIELD)
+        .or_insert_with(|| DEFAULT_PRIORITY.into());
 }
 
 /// Remove any router targets a caller put in `nvext`, returning whether
@@ -833,6 +866,41 @@ mod tests {
     }
 
     #[test]
+    fn default_priority_is_stamped_only_where_none_is_present() {
+        let mut body = serde_json::json!({"model": "m"});
+        stamp_default_priority(body.as_object_mut().unwrap());
+        assert_eq!(
+            body["nvext"],
+            serde_json::json!({"agent_hints": {"priority": 0}})
+        );
+
+        // a priority already present (batch deadline, resume, first hop) is kept
+        let mut body = serde_json::json!({
+            "nvext": {"cache_control": {"enabled": true}, "agent_hints": {"priority": -1234, "max_batch_size": 8}}
+        });
+        stamp_default_priority(body.as_object_mut().unwrap());
+        assert_eq!(body["nvext"]["agent_hints"]["priority"], -1234);
+        assert_eq!(body["nvext"]["agent_hints"]["max_batch_size"], 8);
+        assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+
+        // siblings survive when the priority is added
+        let mut body = serde_json::json!({"nvext": {"agent_hints": {"max_batch_size": 8}}});
+        stamp_default_priority(body.as_object_mut().unwrap());
+        assert_eq!(
+            body["nvext"]["agent_hints"],
+            serde_json::json!({"max_batch_size": 8, "priority": 0})
+        );
+
+        // malformed carriers are replaced rather than panicking
+        let mut body = serde_json::json!({"nvext": "x"});
+        stamp_default_priority(body.as_object_mut().unwrap());
+        assert_eq!(body["nvext"]["agent_hints"]["priority"], 0);
+        let mut body = serde_json::json!({"nvext": {"agent_hints": 7}});
+        stamp_default_priority(body.as_object_mut().unwrap());
+        assert_eq!(body["nvext"]["agent_hints"]["priority"], 0);
+    }
+
+    #[test]
     fn kinds_and_classes() {
         assert!(ServingClass::Interactive.is_elevated());
         assert!(!ServingClass::Standard.is_elevated());
@@ -1175,8 +1243,8 @@ mod handler_tests {
         let req = &mock.get_requests()[0];
         assert_eq!(
             sent(req),
-            Some((5_000, 100, None)),
-            "a zero priority is not sent"
+            Some((5_000, 100, Some(0))),
+            "a zero preset priority is sent as realtime's 0"
         );
     }
 
@@ -1214,14 +1282,18 @@ mod handler_tests {
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let srv = server(&s, &mock);
         assert_eq!(post(&srv, "gpt-4", json!({})).await.status_code(), 200);
-        assert_eq!(sent(&mock.get_requests()[0]), Some((5_000, 100, None)));
+        assert_eq!(sent(&mock.get_requests()[0]), Some((5_000, 100, Some(0))));
 
-        // same account, a model that offers nothing: served, nothing sent
+        // same account, a model that offers nothing: served with no targets,
+        // only realtime's priority
         s.presets = ServingPresets::new();
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let srv = server(&s, &mock);
         assert_eq!(post(&srv, "gpt-4", json!({})).await.status_code(), 200);
-        assert_eq!(sent(&mock.get_requests()[0]), None);
+        assert_eq!(
+            body(&mock.get_requests()[0])["nvext"],
+            json!({"agent_hints": {"priority": 0}})
+        );
 
         // an overlay default overrides the account default on this alias
         s.presets = both();
@@ -1253,14 +1325,34 @@ mod handler_tests {
     }
 
     #[tokio::test]
-    async fn no_policy_at_all_is_byte_identical_to_today() {
+    async fn no_policy_at_all_sends_only_realtimes_priority() {
         let mut s = setup(&[DYNAMO]);
         s.presets = both();
         let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
         let srv = server(&s, &mock);
         assert_eq!(post(&srv, "gpt-4", json!({})).await.status_code(), 200);
         let req = &mock.get_requests()[0];
-        assert!(body(req).get("nvext").is_none());
+        assert_eq!(body(req)["nvext"], json!({"agent_hints": {"priority": 0}}));
+        assert_eq!(body(req)["messages"][0]["content"], "hi");
+    }
+
+    #[tokio::test]
+    async fn a_non_json_body_reaches_a_dynamo_member_untouched() {
+        // Multipart uploads carry no hints; without targets to deliver they
+        // are forwarded as they came, never refused.
+        let s = setup(&[DYNAMO]);
+        let mock = MockHttpClient::new(StatusCode::OK, OK_BODY);
+        let srv = server(&s, &mock);
+        let raw = "--b\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngpt-4\r\n--b--\r\n";
+        let response = srv
+            .post("/v1/audio/transcriptions")
+            .add_header("authorization", format!("Bearer {KEY}"))
+            .add_header("model-override", ALIAS)
+            .add_header("content-type", "multipart/form-data; boundary=b")
+            .bytes(raw.as_bytes().to_vec().into())
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        assert_eq!(mock.get_requests()[0].body, raw.as_bytes());
     }
 
     #[tokio::test]
@@ -1536,6 +1628,50 @@ mod handler_tests {
             req.uri
         );
         assert_eq!(sent(req), Some((500, 20, Some(200))));
+    }
+
+    #[tokio::test]
+    async fn a_named_pool_member_that_refuses_scheduling_fields_gets_no_default_priority() {
+        let s = setup(&[DYNAMO]);
+        let mock = MockHttpClient::new(
+            StatusCode::OK,
+            r#"{"id":"cmpl-1","object":"text_completion","model":"gpt-4","choices":[]}"#,
+        );
+        let targets = targets(&s);
+        let completions = ProviderPool::with_config(
+            vec![Provider::new(
+                Target::builder()
+                    .url("https://dynamo-completions.example.com/".parse().unwrap())
+                    .kind(ProviderKind::Dynamo)
+                    .accepts_scheduling_priority(false)
+                    .build(),
+                1,
+            )],
+            None,
+            None,
+            None,
+            None,
+            LoadBalanceStrategy::Priority,
+            false,
+            Vec::new(),
+        );
+        let default_pool = targets.targets.get(ALIAS).unwrap().default_pool().clone();
+        targets.targets.insert(
+            ALIAS.to_string(),
+            TargetPools::with_pools(
+                default_pool,
+                HashMap::from([("completions".to_string(), completions)]),
+            ),
+        );
+        let srv =
+            TestServer::new(build_router(AppState::with_client(targets, mock.clone()))).unwrap();
+        let response = srv
+            .post("/v1/completions")
+            .add_header("authorization", format!("Bearer {KEY}"))
+            .json(&json!({"model": "gpt-4", "prompt": "hi"}))
+            .await;
+        assert_eq!(response.status_code(), 200, "{}", response.text());
+        assert!(body(&mock.get_requests()[0]).get("nvext").is_none());
     }
 
     #[test]
