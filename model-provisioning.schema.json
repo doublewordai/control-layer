@@ -241,6 +241,7 @@
           "type": "string"
         },
         "enabled": {
+          "description": "Applied when the component is created. An existing component keeps its\nstored value.",
           "type": "boolean",
           "default": true
         },
