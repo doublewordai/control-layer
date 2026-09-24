@@ -21,6 +21,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use metrics::counter;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -330,9 +331,20 @@ impl ImageStore for GcsStore {
 /// treated as fresh: the alternative is re-uploading on every dedup hit.
 fn stale_for_reuse(last_modified_secs: Option<i64>, now_secs: i64, max_age: Option<Duration>) -> bool {
     match (last_modified_secs, max_age) {
-        (Some(modified), Some(max_age)) => now_secs.saturating_sub(modified) >= max_age.as_secs() as i64,
+        (Some(modified), Some(max_age)) => {
+            // Saturate rather than cast: a configured age beyond i64::MAX would
+            // otherwise wrap negative and mark every object stale.
+            let max_age_secs = i64::try_from(max_age.as_secs()).unwrap_or(i64::MAX);
+            now_secs.saturating_sub(modified) >= max_age_secs
+        }
         _ => false,
     }
+}
+
+/// `Last-Modified` from a HeadObject response as epoch seconds, or `None`
+/// when the backend did not report one.
+fn head_last_modified_secs(head: &aws_sdk_s3::operation::head_object::HeadObjectOutput) -> Option<i64> {
+    head.last_modified().map(|t| t.secs())
 }
 
 /// SigV4 presigning has a hard 7-day ceiling. Clamp any requested TTL to
@@ -479,8 +491,11 @@ impl ImageStore for S3CompatStore {
                 // as absent: report it so, and the caller re-uploads, which
                 // resets the object's age. HeadObject already carries
                 // Last-Modified, so this costs no extra request.
-                let last_modified_secs = head.last_modified().map(|t| t.secs());
+                let last_modified_secs = head_last_modified_secs(&head);
                 if stale_for_reuse(last_modified_secs, Utc::now().timestamp(), self.reuse_max_age) {
+                    // Counted so the refresh rate is visible in Grafana; a
+                    // debug line is easy to lose at production log volume.
+                    counter!("dwctl_image_normalizer_refresh_total").increment(1);
                     debug!(key, ?last_modified_secs, "image object older than reuse_max_age; re-uploading");
                     return Ok(false);
                 }
@@ -594,30 +609,36 @@ mod tests {
     fn stale_for_reuse_only_when_older_than_max_age() {
         let day = 24 * 60 * 60;
         let now = 1_790_000_000;
+        let five_days = Some(Duration::from_secs(5 * day as u64));
         // Disabled: never stale.
         assert!(!stale_for_reuse(Some(now - 100 * day), now, None));
         // No Last-Modified reported: treat as fresh rather than re-upload every hit.
-        assert!(!stale_for_reuse(None, now, Some(Duration::from_secs(12 * day as u64))));
+        assert!(!stale_for_reuse(None, now, five_days));
         // Younger than the threshold: reuse.
-        assert!(!stale_for_reuse(
-            Some(now - 11 * day),
-            now,
-            Some(Duration::from_secs(12 * day as u64))
-        ));
+        assert!(!stale_for_reuse(Some(now - 4 * day), now, five_days));
         // At or past it: re-upload. The 2026-09-24 case was an object uploaded
         // 14 days before a 24h batch referenced it.
-        assert!(stale_for_reuse(
-            Some(now - 12 * day),
-            now,
-            Some(Duration::from_secs(12 * day as u64))
-        ));
-        assert!(stale_for_reuse(
-            Some(now - 14 * day),
-            now,
-            Some(Duration::from_secs(12 * day as u64))
-        ));
+        assert!(stale_for_reuse(Some(now - 5 * day), now, five_days));
+        assert!(stale_for_reuse(Some(now - 14 * day), now, five_days));
         // A clock skewed into the future never counts as stale.
-        assert!(!stale_for_reuse(Some(now + day), now, Some(Duration::from_secs(12 * day as u64))));
+        assert!(!stale_for_reuse(Some(now + day), now, five_days));
+        // An absurd max_age saturates instead of wrapping negative, which
+        // would have marked every object stale.
+        assert!(!stale_for_reuse(Some(now - 100 * day), now, Some(Duration::from_secs(u64::MAX))));
+    }
+
+    #[test]
+    fn head_last_modified_maps_to_epoch_seconds() {
+        use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+        use aws_sdk_s3::primitives::DateTime;
+
+        let with = HeadObjectOutput::builder()
+            .last_modified(DateTime::from_secs(1_790_000_000))
+            .build();
+        assert_eq!(head_last_modified_secs(&with), Some(1_790_000_000));
+
+        let without = HeadObjectOutput::builder().build();
+        assert_eq!(head_last_modified_secs(&without), None);
     }
 
     #[test]

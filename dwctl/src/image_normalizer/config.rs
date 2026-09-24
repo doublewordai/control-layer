@@ -92,15 +92,18 @@ pub enum BackendConfig {
         /// check found it an hour before expiry, and it vanished mid-batch.
         ///
         /// Set this to the lifecycle age minus the longest time a signed
-        /// reference can stay in use (a 24h batch plus its 24h retry
-        /// buffer). The default, 12 days, matches the 14-day production rule.
+        /// reference can stay in use. In production a batch request can be
+        /// dispatched up to 24h after ingest plus the 7-day retry buffer
+        /// (`stop_before_deadline_ms` is -7 days), so 14 - 8 = 6 days is the
+        /// bound and the default of 5 days leaves the lifecycle sweep some
+        /// slack.
         #[serde(default = "default_s3_reuse_max_age_secs")]
         reuse_max_age_secs: u64,
     },
 }
 
 fn default_s3_reuse_max_age_secs() -> u64 {
-    12 * 24 * 60 * 60
+    5 * 24 * 60 * 60
 }
 
 fn default_gcs_region() -> String {
@@ -250,12 +253,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn s3_reuse_max_age_defaults_to_twelve_days_and_can_be_disabled() {
+    fn s3_reuse_max_age_defaults_to_five_days_and_can_be_disabled() {
         let cfg: BackendConfig = serde_yaml::from_str("type: s3_compatible\nbucket: b\nendpoint_url: https://example.invalid\n").unwrap();
         let BackendConfig::S3Compatible { reuse_max_age_secs, .. } = cfg else {
             panic!("expected s3_compatible");
         };
-        assert_eq!(reuse_max_age_secs, 12 * 24 * 60 * 60);
+        assert_eq!(reuse_max_age_secs, 5 * 24 * 60 * 60);
 
         let cfg: BackendConfig =
             serde_yaml::from_str("type: s3_compatible\nbucket: b\nendpoint_url: https://example.invalid\nreuse_max_age_secs: 0\n").unwrap();
