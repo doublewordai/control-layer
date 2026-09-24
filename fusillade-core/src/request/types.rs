@@ -277,6 +277,17 @@ impl FailureReason {
         }
     }
 
+    /// Bytes of upstream response body this failure carried, for the daemon's
+    /// in-flight byte accounting. Failures that never received an HTTP
+    /// response (transport errors, timeouts, terminations) contribute nothing.
+    pub fn response_body_len(&self) -> usize {
+        match self {
+            FailureReason::RetriableHttpStatus { body, .. }
+            | FailureReason::NonRetriableHttpStatus { body, .. } => body.len(),
+            _ => 0,
+        }
+    }
+
     /// Returns the HTTP status code as a string for metrics, or empty for non-HTTP failures.
     pub fn status_code_label(&self) -> String {
         match self {
