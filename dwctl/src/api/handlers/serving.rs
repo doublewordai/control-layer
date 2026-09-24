@@ -59,8 +59,7 @@ pub async fn get_organization_serving<P: PoolProvider>(
 ) -> Result<Json<OrganizationServingResponse>> {
     let mut conn = state.db.write().acquire().await.map_err(|e| Error::Database(e.into()))?;
     require_current_platform_manager(&mut conn, user.id).await?;
-    drop(conn);
-    let mut conn = state.db.read().acquire().await.map_err(|e| Error::Database(e.into()))?;
+    // The console reads these settings immediately after updating the organisation.
     let org = Users::new(&mut conn).get_by_id(id).await?.ok_or_else(|| Error::NotFound {
         resource: "Organization".to_string(),
         id: id.to_string(),
@@ -369,6 +368,36 @@ mod tests {
             .await
             .assert_status_not_found();
     }
+    #[sqlx::test]
+    async fn organization_edits_are_visible_in_the_next_serving_read(pool: PgPool) {
+        let (server, _bg) = create_test_app(pool.clone(), false).await;
+        let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let member = create_test_user(&pool, Role::StandardUser).await;
+        let org = create_test_org(&pool, member.id).await;
+        let headers = add_auth_headers(&admin);
+        for settings in [
+            json!({"granted_serving_classes": ["interactive"], "default_serving_class": "interactive", "self_hosted_only": true}),
+            json!({"granted_serving_classes": [], "default_serving_class": null, "self_hosted_only": false}),
+        ] {
+            server
+                .patch(&format!("/admin/api/v1/organizations/{}", org.id))
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&settings)
+                .await
+                .assert_status_ok();
+            let response = get(&server, &format!("/admin/api/v1/organizations/{}/serving", org.id), &admin).await;
+            response.assert_status_ok();
+            let body: Value = response.json();
+            for field in ["granted_serving_classes", "default_serving_class", "self_hosted_only"] {
+                assert_eq!(
+                    body[field], settings[field],
+                    "{field} must reflect the completed edit without polling"
+                );
+            }
+        }
+    }
+
     #[sqlx::test]
     async fn pricing_lookup_errors_are_not_successful_empty_quotes(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
