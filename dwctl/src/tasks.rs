@@ -46,10 +46,6 @@ pub struct TaskState<P: PoolProvider + Clone = sqlx_pool_router::DbPools> {
     pub ingest_file_job: WeakJobRef<IngestFileInput, P>,
     /// Weak reference to the ActivateBatchJob so IngestFileJob can enqueue it.
     pub activate_batch_job: WeakJobRef<ActivateBatchInput, P>,
-    /// Weak reference to the CreateBatchInput job so ActivateBatchJob can enqueue populate.
-    pub create_batch_job: WeakJobRef<CreateBatchInput, P>,
-    /// Weak reference to the CascadeBatchState job so cancel/delete handlers can enqueue cleanup.
-    pub cascade_batch_state_job: WeakJobRef<CascadeBatchStateInput, P>,
 }
 
 impl<P: PoolProvider + Clone> TaskState<P> {
@@ -69,24 +65,6 @@ impl<P: PoolProvider + Clone> TaskState<P> {
             .ok_or_else(|| anyhow::anyhow!("activate_batch_job not initialized"))?
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("activate_batch_job dropped (TaskRunner gone)"))
-    }
-
-    /// Get the create batch job.
-    pub fn get_create_batch_job(&self) -> anyhow::Result<Arc<Job<CreateBatchInput, TaskState<P>>>> {
-        self.create_batch_job
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("create_batch_job not initialized"))?
-            .upgrade()
-            .ok_or_else(|| anyhow::anyhow!("create_batch_job dropped (TaskRunner gone)"))
-    }
-
-    /// Get the cascade batch state job.
-    pub fn get_cascade_batch_state_job(&self) -> anyhow::Result<Arc<Job<CascadeBatchStateInput, TaskState<P>>>> {
-        self.cascade_batch_state_job
-            .get()
-            .ok_or_else(|| anyhow::anyhow!("cascade_batch_state_job not initialized"))?
-            .upgrade()
-            .ok_or_else(|| anyhow::anyhow!("cascade_batch_state_job dropped (TaskRunner gone)"))
     }
 }
 
@@ -116,10 +94,6 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
         let create_batch_job = Arc::new(build_create_batch_job(pool.clone(), state.clone()).await?);
         let cascade_batch_state_job = if task_config.cascade_batch_state_workers > 0 {
             let job = Arc::new(build_cascade_batch_state_job(pool.clone(), state.clone()).await?);
-            state
-                .cascade_batch_state_job
-                .set(Arc::downgrade(&job))
-                .map_err(|_| anyhow::anyhow!("cascade_batch_state_job OnceLock already set"))?;
             Some(job)
         } else {
             None
@@ -139,10 +113,6 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> TaskRunner<P> {
             .activate_batch_job
             .set(Arc::downgrade(&activate_batch_job))
             .map_err(|_| anyhow::anyhow!("activate_batch_job OnceLock already set — double initialization"))?;
-        state
-            .create_batch_job
-            .set(Arc::downgrade(&create_batch_job))
-            .map_err(|_| anyhow::anyhow!("create_batch_job OnceLock already set — double initialization"))?;
 
         Ok(Self {
             create_batch_job,
