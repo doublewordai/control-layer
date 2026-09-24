@@ -148,13 +148,36 @@ pub async fn initial_cache(pool: &PgPool) -> Result<ModelMetadataCache, sqlx::Er
     Ok(cache)
 }
 
+/// Initial delay before retrying listener setup after a failure.
+const INITIAL_LISTENER_BACKOFF: Duration = Duration::from_secs(1);
+/// Upper bound for the listener reconnect backoff.
+const MAX_LISTENER_BACKOFF: Duration = Duration::from_secs(30);
+
+/// Double `current`, capped at `max`. Split out so the retry schedule is
+/// testable without a flaky database.
+fn next_backoff(current: Duration, max: Duration) -> Duration {
+    current.saturating_mul(2).min(max)
+}
+
+/// Open the LISTEN session and subscribe to the change channel.
+async fn connect_listener(listener_pools: &sqlx_pool_router::DynPools) -> Result<PgListener, sqlx::Error> {
+    // LISTEN needs a session: direct connections, never the pooled endpoint.
+    let mut listener = PgListener::connect_with(&listener_pools.write()).await?;
+    listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await?;
+    Ok(listener)
+}
+
 /// Background task: keep `cache` fresh. Listens on `auth_config_changed` and
 /// reloads (debounced), with a periodic fallback reload to recover from any
-/// missed notification. Returns when `shutdown` fires.
+/// missed notification. Returns `Ok` only when `shutdown` fires.
 ///
 /// Notifications that arrive inside the debounce window are coalesced into a
 /// single trailing reload (rather than dropped), so the final state after a
 /// burst of changes still lands in the cache.
+///
+/// Model metadata is fail-open, so a database error must never end this task:
+/// listener setup failures are retried forever with capped exponential backoff,
+/// and reload failures are logged and retried on the next notification/tick.
 pub async fn run(
     pools: impl sqlx_pool_router::PoolProvider,
     listener_pools: impl sqlx_pool_router::PoolProvider,
@@ -162,17 +185,67 @@ pub async fn run(
     fallback_interval_ms: u64,
     shutdown: CancellationToken,
 ) -> Result<(), anyhow::Error> {
+    run_with_backoff(
+        pools,
+        listener_pools,
+        cache,
+        fallback_interval_ms,
+        INITIAL_LISTENER_BACKOFF,
+        MAX_LISTENER_BACKOFF,
+        shutdown,
+    )
+    .await
+}
+
+/// [`run`] with an explicit backoff schedule so tests can use millisecond
+/// delays instead of waiting out the production 1s -> 30s ramp.
+#[allow(clippy::too_many_arguments)]
+async fn run_with_backoff(
+    pools: impl sqlx_pool_router::PoolProvider,
+    listener_pools: impl sqlx_pool_router::PoolProvider,
+    cache: ModelMetadataCache,
+    fallback_interval_ms: u64,
+    initial_backoff: Duration,
+    max_backoff: Duration,
+    shutdown: CancellationToken,
+) -> Result<(), anyhow::Error> {
     let pools = sqlx_pool_router::DynPools::new(pools);
-    // LISTEN needs a session: direct connections, never the pooled endpoint.
     let listener_pools = sqlx_pool_router::DynPools::new(listener_pools);
     const MIN_RELOAD_INTERVAL: Duration = Duration::from_millis(100);
     let fallback = (fallback_interval_ms > 0).then(|| Duration::from_millis(fallback_interval_ms));
 
     'outer: loop {
-        let mut listener = PgListener::connect_with(&listener_pools.write()).await?;
-        listener.listen(ONWARDS_CONFIG_CHANGED_CHANNEL).await?;
+        // Fail-open: never return on a DB error. Retry the listener setup with
+        // capped exponential backoff, resetting the delay after each success,
+        // and keep honouring shutdown while we wait.
+        let mut backoff = initial_backoff;
+        let mut listener = loop {
+            match connect_listener(&listener_pools).await {
+                Ok(listener) => break listener,
+                Err(e) => {
+                    crate::background_error!(
+                        component::MODEL_METADATA_SYNC,
+                        "listener_connect",
+                        Error,
+                        error = %e,
+                        backoff_ms = backoff.as_millis(),
+                        "Model metadata sync: listener setup failed, retrying"
+                    );
+                }
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(backoff) => {}
+            }
+            backoff = next_backoff(backoff, max_backoff);
+        };
         info!("Started model metadata sync listener");
 
+        // A change committed before this subscription (or while the connection
+        // was down) is never delivered over LISTEN, so reload once immediately
+        // after every successful (re)connect. This keeps the cache correct even
+        // when the periodic fallback reload is disabled.
+        reload(&pools.write(), &cache).await;
         let mut last_reload = std::time::Instant::now();
         let mut pending_reload: Option<tokio::time::Instant> = None;
         let mut fallback_timer = fallback.map(|interval| {
@@ -199,9 +272,8 @@ pub async fn run(
                 notif = listener.try_recv() => match notif {
                     Ok(Some(_)) => {
                         if last_reload.elapsed() < MIN_RELOAD_INTERVAL {
-                            pending_reload.get_or_insert_with(|| {
-                                tokio::time::Instant::now() + (MIN_RELOAD_INTERVAL - last_reload.elapsed())
-                            });
+                            let delay = MIN_RELOAD_INTERVAL.saturating_sub(last_reload.elapsed());
+                            pending_reload.get_or_insert_with(|| tokio::time::Instant::now() + delay);
                             continue;
                         }
                         last_reload = std::time::Instant::now();
@@ -322,6 +394,15 @@ mod tests {
         assert_eq!(model_type_from_str(None), None);
     }
 
+    #[test]
+    fn listener_backoff_doubles_then_caps() {
+        let max = Duration::from_secs(30);
+        assert_eq!(next_backoff(Duration::from_secs(1), max), Duration::from_secs(2));
+        assert_eq!(next_backoff(Duration::from_secs(16), max), Duration::from_secs(30));
+        // Already at the cap: it must not keep growing (no overflow, no panic).
+        assert_eq!(next_backoff(max, max), max);
+    }
+
     // --- Integration tests: real DB, real trigger, real LISTEN/NOTIFY ---
 
     const SYSTEM_USER: &str = "00000000-0000-0000-0000-000000000000";
@@ -399,7 +480,7 @@ mod tests {
         loop {
             let listener: Option<i32> = sqlx::query_scalar(
                 "SELECT pid FROM pg_stat_activity \
-                 WHERE query LIKE '%LISTEN%auth_config_changed%' AND state = 'idle' \
+                 WHERE query LIKE 'LISTEN%auth_config_changed%' AND state = 'idle' \
                  AND datname = current_database() AND pid != pg_backend_pid() LIMIT 1",
             )
             .fetch_optional(pool)
@@ -520,6 +601,140 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), handle)
             .await
             .expect("run task should stop on shutdown")
+            .expect("run task should not panic")
+            .expect("run should return Ok after shutdown");
+    }
+
+    /// A [`sqlx_pool_router::PoolProvider`] whose first `write()` returns a pool
+    /// that cannot connect, then serves the real pool. Proves `run` retries
+    /// listener setup instead of returning an error and dying.
+    #[derive(Clone)]
+    struct FailFirstListenerPools {
+        good: PgPool,
+        bad: PgPool,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl sqlx_pool_router::PoolProvider for FailFirstListenerPools {
+        fn read(&self) -> sqlx_pool_router::PoolHandle {
+            self.good.read()
+        }
+
+        fn write(&self) -> sqlx_pool_router::PoolHandle {
+            if self.writes.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                self.bad.write()
+            } else {
+                self.good.write()
+            }
+        }
+    }
+
+    #[sqlx::test]
+    async fn run_survives_a_failed_listener_connect_and_eventually_serves(pool: PgPool) {
+        insert_endpoint(&pool).await;
+        insert_model(
+            &pool,
+            "40000000-0000-0000-0000-00000000e201",
+            "resilient-model",
+            Some("CHAT"),
+            None,
+            serde_json::json!({}),
+            false,
+            false,
+        )
+        .await;
+
+        // Cold cache: every alias reads NotLoaded until the listener task loads.
+        let cache = ModelMetadataCache::empty();
+        assert!(matches!(cache.lookup("resilient-model"), ModelLookup::NotLoaded));
+
+        // A lazily-connected pool to a non-routable address fails only when
+        // acquired, so the first listener-setup attempt fails and every later
+        // one succeeds. The acquire timeout bounds the failure.
+        let bad = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://postgres:password@192.0.2.1:1/nonexistent")
+            .expect("lazy pool URL should parse");
+        let listener_pools = FailFirstListenerPools {
+            good: pool.clone(),
+            bad,
+            writes: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+
+        let shutdown = CancellationToken::new();
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            let cache = cache.clone();
+            let pools = pool.clone();
+            let listener_pools = listener_pools.clone();
+            async move {
+                run_with_backoff(
+                    pools,
+                    listener_pools,
+                    cache,
+                    0,
+                    Duration::from_millis(20),
+                    Duration::from_millis(100),
+                    shutdown,
+                )
+                .await
+            }
+        });
+
+        // The task must not give up: despite the failed connect, the cache
+        // eventually serves because the retry succeeded and reloaded.
+        wait_until(|| matches!(cache.lookup("resilient-model"), ModelLookup::Known(_))).await;
+        assert!(!handle.is_finished(), "run must keep running, not return after a DB error");
+        assert!(
+            listener_pools.writes.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the failed connect must have been retried"
+        );
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run should stop on shutdown")
+            .expect("run task should not panic")
+            .expect("run should return Ok despite the earlier failure");
+    }
+
+    #[sqlx::test]
+    async fn reload_after_listen_picks_up_changes_committed_before_subscribe(pool: PgPool) {
+        insert_endpoint(&pool).await;
+        // Commit the row BEFORE the listener subscribes. A NOTIFY committed with
+        // no listener attached is never delivered, so without the reload that
+        // runs immediately after LISTEN this row would stay missing forever.
+        insert_model(
+            &pool,
+            "40000000-0000-0000-0000-00000000e202",
+            "pre-subscribe-model",
+            Some("CHAT"),
+            None,
+            serde_json::json!({}),
+            false,
+            false,
+        )
+        .await;
+
+        let cache = ModelMetadataCache::empty();
+        assert!(matches!(cache.lookup("pre-subscribe-model"), ModelLookup::NotLoaded));
+
+        let shutdown = CancellationToken::new();
+        // Fallback disabled (0): the reload-after-listen is the only path that
+        // can ever load this pre-existing row.
+        let handle = tokio::spawn({
+            let shutdown = shutdown.clone();
+            let cache = cache.clone();
+            let pools = pool.clone();
+            async move { run(pools.clone(), pools, cache, 0, shutdown).await }
+        });
+
+        wait_until(|| matches!(cache.lookup("pre-subscribe-model"), ModelLookup::Known(_))).await;
+
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run should stop on shutdown")
             .expect("run task should not panic")
             .expect("run should return Ok after shutdown");
     }
