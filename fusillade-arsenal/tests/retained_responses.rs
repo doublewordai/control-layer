@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
-use fusillade_arsenal::batch::TemplateId;
+use fusillade_arsenal::batch::{BatchId, TemplateId};
+use fusillade_arsenal::error::FusilladeError;
 use fusillade_arsenal::manager::{
     RetainedResponseArchiveCutoffs, RetainedResponseArchiveOutcome,
     RetainedResponseMaintenanceError, RetainedResponseWriteError, RetentionPolicy,
@@ -1342,11 +1343,19 @@ async fn generic_persist_and_retry_paths_share_retained_and_fenced_outcomes(pool
             .await
             .unwrap()
     );
+    // Manual retry is batch-scoped, so it can never reach a batchless
+    // retained response: the id is reported as not found and left untouched.
     let retained_retry = manager
-        .retry_failed_requests(vec![RequestId(graph.request_ids[0])])
+        .retry_failed_requests(
+            BatchId(Uuid::new_v4()),
+            vec![RequestId(graph.request_ids[0])],
+        )
         .await
-        .expect_err("manual retry must not thaw immutable retained content");
-    assert_write_error(&retained_retry, RetainedResponseWriteError::AlreadyRetained);
+        .unwrap();
+    assert!(matches!(
+        retained_retry.as_slice(),
+        [Err(FusilladeError::RequestNotFound(_))]
+    ));
     assert_wholly_retained(&pool, &graph).await;
 
     manager.delete_response_group(graph.group_id).await.unwrap();
@@ -1365,10 +1374,6 @@ async fn generic_persist_and_retry_paths_share_retained_and_fenced_outcomes(pool
             )
             .await
             .expect_err("daemon retry must honor the erasure fence"),
-        manager
-            .retry_failed_requests(vec![RequestId(graph.request_ids[0])])
-            .await
-            .expect_err("manual retry must honor the erasure fence"),
     ] {
         assert_write_error(&error, RetainedResponseWriteError::NotFound);
     }

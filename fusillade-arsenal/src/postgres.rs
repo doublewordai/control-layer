@@ -5466,39 +5466,63 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         Ok(total)
     }
 
-    async fn retry_failed_requests(&self, ids: Vec<RequestId>) -> Result<Vec<Result<()>>> {
-        tracing::debug!(count = ids.len(), "Retrying failed requests");
+    async fn retry_failed_requests(
+        &self,
+        batch_id: BatchId,
+        requested_ids: Vec<RequestId>,
+    ) -> Result<Vec<Result<()>>> {
+        tracing::debug!(%batch_id, count = requested_ids.len(), "Retrying failed requests");
 
-        let lifecycle_ids = ids.iter().map(|id| id.0).collect::<Vec<_>>();
-        let mut lifecycle_tx = self.begin_response_write(&lifecycle_ids).await?;
-        if let Some(disposition) =
-            retained_response::classify_response_write(&mut lifecycle_tx, &lifecycle_ids).await?
-        {
-            return Err(disposition.into_fusillade_error());
-        }
-        lifecycle_tx.commit().await.map_err(|_| {
-            FusilladeError::Other(anyhow!("Failed to finish failed-request retry check"))
-        })?;
+        // One batch-driven lookup, matching retry_failed_requests_for_batch:
+        // resolve the batch first, then read only its own rows (live, plus
+        // archived rows in its bucket) filtered by the requested ids. Ids from
+        // any other batch, or batchless requests, never match, so they are
+        // not classified, re-pended, or used to reset a parent batch. Primary
+        // pool: this feeds the mutation below.
+        let requested_uuids = requested_ids.iter().map(|id| **id).collect::<Vec<_>>();
+        let found: std::collections::HashMap<Uuid, (String, bool)> = sqlx::query!(
+            r#"
+            SELECT r.id AS "id!", r.state AS "state!", (t.id IS NOT NULL) AS "has_template!"
+            FROM batches b
+            CROSS JOIN LATERAL (
+                SELECT id, state, template_id FROM requests
+                WHERE batch_id = b.id AND id = ANY($2)
+                UNION ALL
+                SELECT id, state, template_id FROM batch_requests_archive a
+                -- Scalar subquery (not b.archive_bucket) so the bucket is a
+                -- run-time param and the archive is pruned to one partition.
+                WHERE a.archive_bucket = (SELECT archive_bucket FROM batches WHERE id = $1)
+                  AND a.batch_id = b.id AND a.id = ANY($2)
+            ) r
+            LEFT JOIN LATERAL (
+                SELECT t.id FROM request_templates_all t
+                WHERE t.id = r.template_id AND t.file_id IS NOT DISTINCT FROM b.file_id
+                LIMIT 1
+            ) t ON TRUE
+            WHERE b.id = $1
+            "#,
+            *batch_id as Uuid,
+            &requested_uuids,
+        )
+        .fetch_all(self.write_executor())
+        .await
+        .map_err(|_| FusilladeError::Other(anyhow!("Failed to read requests to retry")))?
+        .into_iter()
+        .map(|row| (row.id, (row.state, row.has_template)))
+        .collect();
 
-        // Get all requests in a single bulk query to avoid N+1 problem
-        let get_results = self.get_requests(ids.clone()).await?;
-        let found_count = get_results.len();
-
-        // Check if any requests were not found (e.g., template was deleted)
-        if found_count != ids.len() {
-            // Some requests were not returned - likely because their template was deleted
-            // Find which ones are missing
-            let returned_ids: std::collections::HashSet<_> = get_results
-                .iter()
-                .filter_map(|r| r.as_ref().ok().map(|req| req.id()))
-                .collect();
-
-            let missing_ids: Vec<_> = ids.iter().filter(|id| !returned_ids.contains(id)).collect();
-
-            tracing::warn!(
-                missing_count = missing_ids.len(),
-                "Some requests not found, likely due to deleted templates"
-            );
+        let lifecycle_ids = found.keys().copied().collect::<Vec<_>>();
+        if !lifecycle_ids.is_empty() {
+            let mut lifecycle_tx = self.begin_response_write(&lifecycle_ids).await?;
+            if let Some(disposition) =
+                retained_response::classify_response_write(&mut lifecycle_tx, &lifecycle_ids)
+                    .await?
+            {
+                return Err(disposition.into_fusillade_error());
+            }
+            lifecycle_tx.commit().await.map_err(|_| {
+                FusilladeError::Other(anyhow!("Failed to finish failed-request retry check"))
+            })?;
         }
 
         // Row re-pend and parent-batch reset happen in ONE transaction (same
@@ -5510,12 +5534,11 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         // cancellation — and bumps retry_version per the CAS rule: any
         // writer that un-terminalizes a batch bumps it, so a stamp/freeze
         // computed against the pre-retry state cannot land afterwards.
-        let retryable: Vec<(Uuid, Option<Uuid>)> = get_results
+        // Rows whose template was deleted cannot be rebuilt, so never re-pend.
+        let retryable: Vec<(Uuid, Option<Uuid>)> = found
             .iter()
-            .filter_map(|r| match r {
-                Ok(AnyRequest::Failed(req)) => Some((*req.data.id, req.data.batch_id.map(|b| *b))),
-                _ => None,
-            })
+            .filter(|(_, (state, has_template))| state == "failed" && *has_template)
+            .map(|(id, _)| (*id, Some(*batch_id)))
             .collect();
 
         let repended: std::collections::HashSet<Uuid> = if retryable.is_empty() {
@@ -5734,34 +5757,31 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             repended
         };
 
-        let mut results = Vec::new();
-        for (id, request_result) in ids.iter().zip(get_results) {
-            let result = match request_result {
-                Ok(AnyRequest::Failed(_)) if repended.contains(&(**id)) => Ok(()),
-                Ok(AnyRequest::Failed(_)) => Err(crate::error::FusilladeError::InvalidState(
-                    *id,
-                    "state changed concurrently".to_string(),
-                    "failed state".to_string(),
-                )),
-                Ok(_) => Err(crate::error::FusilladeError::InvalidState(
+        Ok(requested_ids
+            .iter()
+            .map(|id| match found.get(&**id) {
+                None => Err(FusilladeError::RequestNotFound(*id)),
+                Some((_, false)) => Err(FusilladeError::Other(anyhow!(
+                    "Request template has been deleted"
+                ))),
+                Some((state, true)) if state == "failed" => {
+                    if repended.contains(&**id) {
+                        Ok(())
+                    } else {
+                        Err(FusilladeError::InvalidState(
+                            *id,
+                            "state changed concurrently".to_string(),
+                            "failed state".to_string(),
+                        ))
+                    }
+                }
+                Some(_) => Err(FusilladeError::InvalidState(
                     *id,
                     "non-failed state".to_string(),
                     "failed state".to_string(),
                 )),
-                Err(e) => Err(e),
-            };
-
-            results.push(result);
-        }
-
-        // For any missing requests, add an error result
-        for _ in 0..(ids.len() - found_count) {
-            results.push(Err(FusilladeError::Other(anyhow!(
-                "Request not found - template may have been deleted"
-            ))));
-        }
-
-        Ok(results)
+            })
+            .collect())
     }
 
     /// Retries failed AND canceled requests for a batch and un-cancels it
@@ -13991,7 +14011,7 @@ mod tests {
         .await
         .unwrap();
         let results = manager
-            .retry_failed_requests(vec![RequestId(failed_id)])
+            .retry_failed_requests(batch_id, vec![RequestId(failed_id)])
             .await
             .unwrap();
         assert!(results.iter().all(|r| r.is_ok()));
@@ -14019,6 +14039,71 @@ mod tests {
             ),
             (1, 0, 1),
             "reads must count live again and show the retried row"
+        );
+    }
+
+    /// Per-id retry is scoped to the given batch: ids from another batch are
+    /// reported as not found and neither re-pended nor allowed to reset
+    /// their parent batch, while in-batch ids still retry.
+    #[sqlx::test]
+    async fn test_retry_failed_requests_ignores_ids_from_other_batches(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let own_batch = setup_freeze_test_batch(&manager, "retry-scope-own", 1).await;
+        let other_batch = setup_freeze_test_batch(&manager, "retry-scope-other", 1).await;
+        for batch_id in [own_batch, other_batch] {
+            sqlx::query(
+                "UPDATE requests SET state = 'failed', failed_at = NOW(), error = 'test-error' WHERE batch_id = $1",
+            )
+            .bind(*batch_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let failed_id = |batch_id: BatchId| {
+            sqlx::query_scalar::<_, Uuid>("SELECT id FROM requests WHERE batch_id = $1")
+                .bind(*batch_id)
+                .fetch_one(&pool)
+        };
+        let own_id = failed_id(own_batch).await.unwrap();
+        let other_id = failed_id(other_batch).await.unwrap();
+        let other_version_before: i64 =
+            sqlx::query_scalar("SELECT retry_version FROM batches WHERE id = $1")
+                .bind(*other_batch)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+
+        let results = manager
+            .retry_failed_requests(own_batch, vec![RequestId(other_id), RequestId(own_id)])
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                results.as_slice(),
+                [Err(FusilladeError::RequestNotFound(id)), Ok(())] if **id == other_id
+            ),
+            "out-of-batch id must be reported as not found, in-batch id retried: {results:?}"
+        );
+
+        let state = |id: Uuid| {
+            sqlx::query_scalar::<_, String>("SELECT state FROM requests WHERE id = $1")
+                .bind(id)
+                .fetch_one(&pool)
+        };
+        assert_eq!(state(other_id).await.unwrap(), "failed");
+        assert_eq!(state(own_id).await.unwrap(), "pending");
+        let other_version_after: i64 =
+            sqlx::query_scalar("SELECT retry_version FROM batches WHERE id = $1")
+                .bind(*other_batch)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            other_version_after, other_version_before,
+            "another batch must not be reset by a retry scoped elsewhere"
         );
     }
 
@@ -14160,7 +14245,7 @@ mod tests {
         .await
         .unwrap();
         let results = manager
-            .retry_failed_requests(vec![RequestId(failed_id)])
+            .retry_failed_requests(batch_id, vec![RequestId(failed_id)])
             .await
             .unwrap();
         assert!(results.iter().all(|r| r.is_ok()));
@@ -15044,7 +15129,7 @@ mod tests {
 
         // Per-id retry moves the archived failed row back; parent splits.
         let results = manager
-            .retry_failed_requests(vec![failed_id])
+            .retry_failed_requests(batch_id, vec![failed_id])
             .await
             .unwrap();
         assert!(
@@ -21313,7 +21398,7 @@ mod tests {
         assert_eq!(state.1, 1, "failed work must not be re-pended");
 
         let individual = manager
-            .retry_failed_requests(vec![RequestId(request_id)])
+            .retry_failed_requests(batch.id, vec![RequestId(request_id)])
             .await
             .unwrap();
         assert!(individual[0].is_err());

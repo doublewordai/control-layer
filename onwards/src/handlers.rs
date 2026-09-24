@@ -1111,8 +1111,9 @@ pub async fn target_message_handler<T: HttpClient>(
         // on its presence) and a legacy top-level `priority`. Default-pool
         // traffic is untouched: batch/flex deadline priorities must keep
         // reaching dynamo exactly as today.
-        if resolved_pool_name.is_some()
-            && !target.accepts_scheduling_priority
+        let scheduling_fields_refused =
+            resolved_pool_name.is_some() && !target.accepts_scheduling_priority;
+        if scheduling_fields_refused
             && (attempt_body.windows(10).any(|w| w == b"\"priority\"")
                 || attempt_body.windows(7).any(|w| w == b"\"nvext\""))
             && let Ok(mut parsed) = serde_json::from_slice::<serde_json::Value>(&attempt_body)
@@ -1189,34 +1190,43 @@ pub async fn target_message_handler<T: HttpClient>(
 
         // Send the resolved serving targets to a member of kind `dynamo`, the
         // only serving stack that reads them, as `nvext.router` targets plus
-        // (when the preset carries one) `nvext.agent_hints.priority`. A
-        // resolution without targets — no policy, `standard` on a model with
-        // no standard preset, the daemon legs — sends nothing, so the body is
-        // byte-identical to today and a partial rollout is safe. Values
-        // already present are overwritten, never removed: this same crate runs
-        // again as the hop inside the serving namespace, with no key policy of
-        // its own, and must forward what the first hop set. Client-supplied
-        // targets are scrubbed at dwctl's ingress, alongside the body priority
-        // (the same perimeter the priority strip relies on).
-        if target.kind == ProviderKind::Dynamo
-            && let Some(targets) = serving_resolution.targets
-            && !attempt_body.is_empty()
-        {
-            let mut body: serde_json::Value = match serde_json::from_slice(&attempt_body) {
-                Ok(body) => body,
-                Err(_) => {
+        // (when the preset carries one) `nvext.agent_hints.priority`. Every
+        // JSON request to a `dynamo` member also carries a priority (unless
+        // the capability strip above refused scheduling fields for it): when
+        // neither the body nor the preset sets one, realtime's 0, so the
+        // dynamo frontend is never left to pick a value for a missing one.
+        // A priority already present is kept, and targets overwrite rather
+        // than remove: this same crate runs again as the hop inside the
+        // serving namespace, with no key policy of its own, and must forward
+        // what the first hop set. Client-supplied targets are scrubbed at
+        // dwctl's ingress, alongside the body priority (the same perimeter
+        // the priority strip relies on).
+        if target.kind == ProviderKind::Dynamo && !attempt_body.is_empty() {
+            match serde_json::from_slice::<serde_json::Value>(&attempt_body) {
+                Ok(mut body) => {
+                    if let Some(object) = body.as_object_mut() {
+                        if let Some(targets) = serving_resolution.targets {
+                            targets.stamp(object);
+                        }
+                        if !scheduling_fields_refused {
+                            serving::stamp_default_priority(object);
+                        }
+                        attempt_body = match serde_json::to_vec(&body) {
+                            Ok(bytes) => axum::body::Bytes::from(bytes),
+                            Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
+                        };
+                    }
+                }
+                // Targets must reach the member; a body that cannot carry
+                // them is refused. Without targets a non-JSON body (a
+                // multipart upload) is forwarded as it came.
+                Err(_) if serving_resolution.targets.is_some() => {
                     return LoopAction::Done(Err(OnwardsErrorResponse::bad_request(
                         "Request body must be valid JSON.",
                         None,
                     )))
                 }
-            };
-            if let Some(object) = body.as_object_mut() {
-                targets.stamp(object);
-                attempt_body = match serde_json::to_vec(&body) {
-                    Ok(bytes) => axum::body::Bytes::from(bytes),
-                    Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
-                };
+                Err(_) => {}
             }
         }
 
