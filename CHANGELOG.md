@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.5.0](https://github.com/doublewordai/control-layer/compare/v12.4.0...v12.5.0) (2026-09-24)
+
+
+### Features
+
+* **organizations:** let owners disable modalities for their organization ([#1842](https://github.com/doublewordai/control-layer/issues/1842)) ([ed76744](https://github.com/doublewordai/control-layer/commit/ed76744541e475a6c07e18eb63ba2d24d6e4f6fd))
+
 ## [12.4.0](https://github.com/doublewordai/control-layer/compare/v12.3.2...v12.4.0) (2026-09-24)
 
 
