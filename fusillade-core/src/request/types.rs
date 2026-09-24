@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::AbortHandle;
 use uuid::Uuid;
@@ -21,26 +21,6 @@ pub struct HttpResponse {
     pub status: u16,
     /// Response body as a string.
     pub body: String,
-}
-
-/// Database state for filtering and querying requests.
-///
-/// This enum represents the string values stored in the database's `state` column.
-/// It's used for filtering operations like SLA monitoring and escalation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-#[cfg_attr(feature = "sqlx-postgres", derive(sqlx::Type))]
-#[cfg_attr(
-    feature = "sqlx-postgres",
-    sqlx(type_name = "text", rename_all = "lowercase")
-)]
-pub enum RequestStateFilter {
-    Pending,
-    Claimed,
-    Processing,
-    Completed,
-    Failed,
-    Canceled,
 }
 
 /// Marker trait for valid request states.
