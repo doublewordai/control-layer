@@ -12,9 +12,7 @@
 -- organisation's rows. NULL is not equal to NULL in a unique index, which is why the
 -- general and organisation scopes need their own indexes rather than one wider key.
 
-SET LOCAL lock_timeout = '5s';
--- Small configuration ledgers; bound index/constraint execution as well as lock acquisition.
-SET LOCAL statement_timeout = '10s';
+-- The pre-rollout migration Job bounds execution time.
 
 -- ---------------------------------------------------------------------------------------
 -- model_tariffs

@@ -230,21 +230,18 @@ less than 100, with no more than four significant fractional places. Redundant
 trailing zeros are accepted. This avoids silent rounding and repeated versioning.
 The API's cache-pricing writer already validates storage precision.
 
-Offline validation cannot inspect database organisations, manual ownership or
-future scheduled prices. Check those against the target database before
-activating an overlay catalog. Class price collision errors identify the file,
-organisation, public alias and class; a model UUID alone is insufficient for an
-operator to locate the conflicting declaration.
+Offline validation cannot inspect database organisations or future scheduled
+prices. Check those against the target database before activating a catalog.
+Future-price errors identify the file, organisation, alias and class.
 
-A row in `model_overlays` with no catalog `provisioning_source` is manually
-managed. Declaring its org/model in YAML now fails instead of silently changing
-its routing and ownership. Even a price-only declaration can reset omitted
-routing fields, so it cannot implicitly adopt that row. To transfer ownership,
-first review a complete YAML entry carrying the intended existing routing
-policy, then deliberately mark that specific row as owned by
-`org-overlays:<filename>`. Catalog reconciliation may subsequently change or
-remove it. No automatic transfer is performed, and rejected applies roll back.
-Manual token/cache prices retain their separate ownership checks.
+Declaring an org/model makes YAML authoritative for its overlay and current
+prices, including existing rows inserted directly in the database. Omitted
+routing settings inherit defaults; omitted prices retire. Changed prices are
+versioned without altering historical amounts. Undeclared, unowned pairs are
+untouched. Future schedules must be resolved before adoption because the catalog
+has immediate-only semantics. A failed apply rolls back the whole transaction.
+See [Customize Organization Models](../how-to/organization-model-overlays.md)
+for examples and the complete ownership contract.
 
 Reconciliation captures one wall-clock timestamp **after** obtaining the
 transaction-scoped advisory lock. A waiting replica may have begun its

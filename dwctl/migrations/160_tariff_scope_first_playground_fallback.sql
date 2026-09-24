@@ -1,8 +1,7 @@
 -- Exhaust each account/class scope before falling back to general model prices.
 -- Only playground may fall back to realtime, within that same scope. Batch stays
--- isolated by purpose and exact completion window. Keep migration 154 immutable.
-SET LOCAL lock_timeout = '5s';
-SET LOCAL statement_timeout = '10s';
+-- isolated by purpose and exact completion window. Quotes and sorting that
+-- use this resolver follow the same account-first precedence, including zero.
 
 CREATE OR REPLACE FUNCTION effective_model_tariff(
     model_id UUID, account_id UUID, purpose TEXT, completion_window TEXT,

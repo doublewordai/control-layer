@@ -3013,7 +3013,7 @@ mod integration_tests {
     }
 
     #[sqlx::test]
-    async fn playground_customer_fallback_matches_quotes_admission_and_actual_charges(pool: sqlx::PgPool) {
+    async fn playground_customer_fallback_matches_quotes_and_actual_charges(pool: sqlx::PgPool) {
         use crate::db::handlers::Tariffs;
         for (alias, class, rate, org_playground) in [
             ("playground-org", None, 5, false),
@@ -3079,7 +3079,11 @@ mod integration_tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-            assert_eq!(paid, rate > 0, "admission must respect a zero all-class customer fallback: {alias}");
+            assert_eq!(
+                paid,
+                rate > 0,
+                "price helper must respect a zero all-class customer fallback: {alias}"
+            );
         }
     }
 

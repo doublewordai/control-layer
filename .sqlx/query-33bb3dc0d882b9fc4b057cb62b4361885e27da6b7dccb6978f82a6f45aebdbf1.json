@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT request_origin FROM http_analytics WHERE fusillade_request_id = $1 AND status_code BETWEEN 200 AND 299",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "request_origin",
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "33bb3dc0d882b9fc4b057cb62b4361885e27da6b7dccb6978f82a6f45aebdbf1"
+}

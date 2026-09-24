@@ -1,7 +1,5 @@
 -- Customer catalogue prices intentionally omit class-specific deals. Billing
 -- continues to use effective_model_tariff with the resolved class.
-SET LOCAL lock_timeout = '5s';
-SET LOCAL statement_timeout = '10s';
 
 -- Historical deals must survive account removal. Normal account deletion is
 -- soft; a hard delete requires an explicit ledger-retention procedure.
@@ -32,11 +30,8 @@ CREATE FUNCTION effective_model_display_tariff(
     LIMIT 1
 $$;
 
--- Admission remains model-level and conservative: any paid class requires
--- credit/cap headroom, even for a request choosing a free class (or a class the
--- account is not granted). Free class-level offers are not an intended product
--- yet. Per-request admission would require a separate design; do not silently
--- weaken this gate to a catalogue/display price, which deliberately hides classes.
+-- Retained for compatibility with earlier pricing schemas. Admission does not
+-- call this helper: zero customer deals do not exempt generally paid models.
 CREATE OR REPLACE FUNCTION model_has_effective_paid_tariff(model_id UUID, account_id UUID, purpose TEXT)
 RETURNS BOOLEAN LANGUAGE SQL STABLE AS $$
     SELECT COALESCE(purpose, 'realtime') IN ('realtime','batch','playground') AND (EXISTS (

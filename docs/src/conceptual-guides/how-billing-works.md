@@ -109,25 +109,23 @@ standard-class realtime deal, then the general realtime rate. Other classes are
 ignored. Actual usage totals and cap accounting remain actual resolved-class
 charges. The comparison can be cached for 60 minutes.
 
-Migration 160 changed effective billing, paid admission and the then-current
-catalogue selection on existing deals: an account's zero realtime deal beats a
-paid general playground tariff. Migration 161 separates customer display prices
-from class-aware billing and admission. Admission remains a conservative
-model-level check: another paid class may require credit/cap headroom even for a
-free-class request, including a class the account is not granted. Free class
-products need a separate per-request admission design before offering them.
-Model access permissions still apply. Explicit free batch windows take priority
-over a legacy NULL-purpose admission guard.
+Zero prices stop pricing fallback and bill zero. Generally free or unpriced
+models retain their existing balance and key-cap exemptions. A zero customer
+price on a generally paid model does not create a new exemption: the account
+still needs positive balance or `ALLOW_NEGATIVE_BALANCE`, and key caps apply.
+The exemption permits negative account balances, not exceeding key caps.
+A positive customer deal on a generally free model requires credit for that
+account only. Other accounts keep the general free-model behavior. Admission
+uses existence checks rather than effective purpose/window/class resolution.
 
 HTTP batch tariff authoring normalizes surrounding completion-window whitespace;
 YAML authoring rejects it. Unchanged legacy NULL-purpose rows may be preserved
 during model metadata edits, but cannot be created or repriced through the
-customer tariff API and are not billable fallback rows. Organisation catalog
-prices must not overlap manually managed prices in the same scope and
-purpose/window, including future schedules. Such conflicts roll back the whole
-reconciliation without taking ownership of the manual deal. Historical org
-token/cache prices prevent hard account deletion; normal soft deletion retains
-them. Already-applied migrations must not be edited.
+customer tariff API and are not billable fallback rows. Declaring an org/model
+in YAML adopts its current overlay and prices. Omitted prices retire; changed
+prices create new ledger versions. Future schedules block reconciliation, which
+rolls back atomically. Historical org token/cache prices prevent hard account
+deletion; normal soft deletion retains them. Released migrations are immutable.
 
 Cache multipliers are selected independently by account + resolved class →
 account all-class → general model, at the same timestamp. They have no
@@ -212,7 +210,9 @@ API requests are free (no credits deducted) when:
 - The request fails (non-2xx response)
 - The user is the system user (internal requests)
 
-This means you can offer some models for free while charging for others, or run a deployment without any billing at all.
+Generally free or unpriced models remain accessible without balance or cap
+headroom. A customer-specific zero price on a generally paid model changes its
+bill, but does not create a new admission exemption.
 
 ## Related Topics
 

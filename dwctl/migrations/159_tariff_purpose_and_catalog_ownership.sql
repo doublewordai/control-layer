@@ -1,6 +1,4 @@
 -- Purpose/window isolation and explicit organization-catalog price ownership.
-SET LOCAL lock_timeout = '5s';
-SET LOCAL statement_timeout = '10s';
 
 ALTER TABLE model_tariffs ADD COLUMN provisioning_source TEXT;
 ALTER TABLE model_cache_tariffs ADD COLUMN provisioning_source TEXT;

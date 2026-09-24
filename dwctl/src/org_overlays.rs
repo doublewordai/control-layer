@@ -11,7 +11,8 @@
 //!
 //! Rows written here are owned by the file (`provisioning_source`) and are
 //! rewritten on every start, exactly like the model catalog. Removed catalog
-//! entries retire their deals; independently managed rows are left alone.
+//! entries retire their deals. Rows on undeclared, unowned org/model pairs are
+//! left alone; declaring a pair adopts its current overlay and prices.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -314,23 +315,12 @@ async fn apply_in(db: &mut PgConnection, catalog: &OrgCatalog) -> Result<()> {
         let source = format!("{SOURCE_PREFIX}{}", entry.source);
         for model in &entry.document.models {
             let model_id = aliases[&model.alias];
-            // A price-only declaration must not reset a manual routing policy or
-            // silently turn it into a row that catalog pruning may delete later.
-            let owner: Option<Option<String>> =
-                sqlx::query_scalar("SELECT provisioning_source FROM model_overlays WHERE user_id=$1 AND deployed_model_id=$2 FOR UPDATE")
-                    .bind(org_id)
-                    .bind(model_id)
-                    .fetch_optional(&mut *db)
-                    .await?;
-            ensure!(
-                owner
-                    .as_ref()
-                    .is_none_or(|source| source.as_deref().is_some_and(|s| s.starts_with(SOURCE_PREFIX))),
-                "{}: organisation {:?}, model {:?}: manually managed serving overlay; explicitly transfer its ownership before declaring it in the catalog",
-                entry.source,
-                entry.document.org,
-                model.alias
-            );
+            // A declared org/model is wholly catalog-owned. Omitted settings
+            // inherit defaults; omitted prices retire without deleting history.
+            ModelProvisioning::for_org_catalog(db)
+                .adopt_account_model_tariffs(org_id, model_id, effective_at)
+                .await
+                .with_context(|| format!("{}: organisation {:?}, model {:?}", entry.source, entry.document.org, model.alias))?;
             desired.push((org_id, model_id));
             // The organisation's prices on this model: a temporal ledger scoped to the
             // organisation, versioned exactly like the model catalog's general prices.
@@ -902,12 +892,14 @@ models:
                     .fetch_one(&pool)
                     .await
                     .unwrap();
-                    // Both ledgers have a legitimate manual schedule, either
-                    // open-ended or finite, in the exact scope being tested.
-                    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from,valid_until) VALUES ($1,$2,$3,'future','realtime',1,2,NOW()+INTERVAL '1 day',CASE WHEN $4 THEN NOW()+INTERVAL '2 days' ELSE NULL END)")
-                        .bind(model).bind(org).bind(class).bind(finite).execute(&pool).await.unwrap();
-                    sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,user_id,serving_class,read_multiplier,min_prefix_tokens,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,valid_from,valid_until) VALUES ($1,$2,$3,0.5,1,1,1,1,NOW()+INTERVAL '1 day',CASE WHEN $4 THEN NOW()+INTERVAL '2 days' ELSE NULL END)")
-                        .bind(model).bind(org).bind(class).bind(finite).execute(&pool).await.unwrap();
+                    // Future schedules cannot be adopted by an immediate-only catalog.
+                    if cache {
+                        sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,user_id,serving_class,read_multiplier,min_prefix_tokens,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,valid_from,valid_until) VALUES ($1,$2,$3,0.5,1,1,1,1,NOW()+INTERVAL '1 day',CASE WHEN $4 THEN NOW()+INTERVAL '2 days' ELSE NULL END)")
+                            .bind(model).bind(org).bind(class).bind(finite).execute(&pool).await.unwrap();
+                    } else {
+                        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from,valid_until) VALUES ($1,$2,$3,'future','realtime',1,2,NOW()+INTERVAL '1 day',CASE WHEN $4 THEN NOW()+INTERVAL '2 days' ELSE NULL END)")
+                            .bind(model).bind(org).bind(class).bind(finite).execute(&pool).await.unwrap();
+                    }
                     let earlier: Uuid = sqlx::query_scalar(
                         "INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ($1,$1,true,$2) RETURNING id",
                     )
@@ -924,7 +916,11 @@ models:
                     let changed = base
                         .replace("input_per_million_tokens: '1'", "input_per_million_tokens: '2'")
                         .replace("self_hosted_only: false", "self_hosted_only: true");
-                    write(directory.path(), "org.yaml", &changed);
+                    write(
+                        directory.path(),
+                        "org.yaml",
+                        changed.split(&format!("  - alias: {alias}\n")).next().unwrap(),
+                    );
                     apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
                     let rate: rust_decimal::Decimal = sqlx::query_scalar(
                         "SELECT input_price_per_token FROM model_tariffs WHERE deployed_model_id=$1 AND valid_until IS NULL",
@@ -934,11 +930,15 @@ models:
                     .await
                     .unwrap();
                     assert_eq!(rate, rust_decimal::Decimal::new(2, 6));
-                    write(directory.path(), "org.yaml", &base);
+                    write(
+                        directory.path(),
+                        "org.yaml",
+                        base.split(&format!("  - alias: {alias}\n")).next().unwrap(),
+                    );
                     apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
                     let mut before = Vec::new();
                     for table in ["model_tariffs", "model_cache_tariffs", "model_overlays"] {
-                        let snapshot: serde_json::Value =
+                        let snapshot: Option<serde_json::Value> =
                             sqlx::query_scalar(&format!("SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text) FROM {table} t"))
                                 .fetch_one(&pool)
                                 .await
@@ -960,27 +960,23 @@ models:
                     let yaml = format!("{}{scope}{price}", changed);
                     write(directory.path(), "org.yaml", &yaml);
                     let err = apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap_err();
-                    let expected = if cache {
-                        "manually managed cache tariff"
-                    } else {
-                        "manually managed tariff"
-                    };
+                    let expected = if cache { "model_cache_tariffs" } else { "model_tariffs" };
                     let message = format!("{err:#}");
-                    assert!(message.contains(expected), "{alias}: {err:#}");
+                    assert!(message.contains(expected) && message.contains("future tariff"), "{alias}: {err:#}");
                     assert!(message.contains("future-org") && message.contains(&alias));
                     if let Some(class) = class {
                         assert!(message.contains(class));
                     }
                     for (table, before) in ["model_tariffs", "model_cache_tariffs", "model_overlays"].into_iter().zip(before) {
-                        let after: serde_json::Value =
+                        let after: Option<serde_json::Value> =
                             sqlx::query_scalar(&format!("SELECT jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text) FROM {table} t"))
                                 .fetch_one(&pool)
                                 .await
                                 .unwrap();
                         assert_eq!(after, before, "{alias}: failed reconciliation must preserve {table}");
                     }
-                    // Unrelated batch pricing can coexist with manual realtime
-                    // and cache schedules; preflight must not reject the org.
+                    // Even a different tier adopts the entire declared org/model,
+                    // so its existing future schedule must be resolved first.
                     write(
                         directory.path(),
                         "org.yaml",
@@ -988,14 +984,15 @@ models:
                             "{base}    tariffs:\n      - {{name: batch, purpose: batch, completion_window: 24h, input_per_million_tokens: '1', output_per_million_tokens: '2'}}\n"
                         ),
                     );
-                    apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+                    let error = apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap_err();
+                    assert!(format!("{error:#}").contains("future tariff"));
                 }
             }
         }
     }
 
     #[sqlx::test]
-    async fn catalog_preserves_manual_prices_on_the_same_org_and_rejects_takeover(pool: PgPool) {
+    async fn catalog_adopts_declared_prices_and_preserves_undeclared_models(pool: PgPool) {
         let org: Uuid = sqlx::query_scalar("INSERT INTO users (username,email,auth_source,user_type) VALUES ('manual-org','manual@example.com','test','organization') RETURNING id").fetch_one(&pool).await.unwrap();
         let mut models = Vec::new();
         for alias in ["manual-model", "omitted-model"] {
@@ -1012,34 +1009,45 @@ models:
             sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,user_id,read_multiplier,min_prefix_tokens,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h) VALUES ($1,$2,0.5,1,1,1,1)").bind(model).bind(org).execute(&pool).await.unwrap();
         }
         let directory = tempdir().unwrap();
-        // A routing-only declaration neither takes over same-model prices nor
-        // closes deals on omitted models of the same organization.
+        // A routing-only declaration retires omitted same-model prices,
+        // without changing undeclared models of the same organization.
         write(
             directory.path(),
             "org.yaml",
             "org: manual-org\nmodels:\n  - alias: manual-model\n    self_hosted_only: true\n",
         );
         apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
-        // A distinct batch tier can coexist with manual realtime/cache prices.
+        for table in ["model_tariffs", "model_cache_tariffs"] {
+            let rows: Vec<(Uuid, Option<DateTime<Utc>>, Option<String>)> = sqlx::query_as(&format!(
+                "SELECT deployed_model_id,valid_until,provisioning_source FROM {table} WHERE user_id=$1 ORDER BY deployed_model_id"
+            ))
+            .bind(org)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            for (model, until, source) in rows {
+                assert_eq!(until.is_some(), model == models[0]);
+                assert_eq!(source.as_deref(), (model == models[0]).then_some("org-overlays"));
+            }
+        }
+        // Adding a tier versions the declared model's ledger.
         let batch = "org: manual-org\nmodels:\n  - alias: manual-model\n    tariffs:\n      - {name: batch, purpose: batch, completion_window: 24h, input_per_million_tokens: '1', output_per_million_tokens: '2'}\n";
         write(directory.path(), "org.yaml", batch);
         apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
-        // A conflicting price refuses the transaction, preserving the deal.
+        // A changed price replaces the current catalog version.
         write(
             directory.path(),
             "org.yaml",
             "org: manual-org\nmodels:\n  - alias: manual-model\n    tariffs:\n      - {name: replacement, purpose: realtime, input_per_million_tokens: '3', output_per_million_tokens: '4'}\n",
         );
-        let err = apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap_err();
-        assert!(format!("{err:#}").contains("manually managed tariff"));
+        apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
         write(
             directory.path(),
             "org.yaml",
             "org: manual-org\nmodels:\n  - alias: manual-model\n    cache_tariff: {write_multiplier_5m: '1', write_multiplier_1h: '1', write_multiplier_24h: '1', read_multiplier: '0'}\n",
         );
-        let err = apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap_err();
-        assert!(format!("{err:#}").contains("manually managed cache tariff"));
-        // Removing the file closes only catalog-owned batch prices.
+        apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+        // Removing the file retires owned prices and preserves the unrelated model.
         std::fs::remove_file(directory.path().join("org.yaml")).unwrap();
         apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
         for table in ["model_tariffs", "model_cache_tariffs"] {
@@ -1050,7 +1058,7 @@ models:
             .fetch_one(&pool)
             .await
             .unwrap();
-            assert_eq!(n, 2, "manual {table} prices must survive routing, omission, conflict and removal");
+            assert_eq!(n, 1, "the undeclared model retains its manual {table} price");
         }
         let active_owned: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM model_tariffs WHERE user_id=$1 AND provisioning_source='org-overlays' AND valid_until IS NULL",
@@ -1103,7 +1111,7 @@ models:
     }
 
     #[sqlx::test]
-    async fn manual_overlay_requires_explicit_transfer_even_for_price_only_catalog(pool: PgPool) {
+    async fn price_only_catalog_adopts_overlay_and_inherits_omitted_routing(pool: PgPool) {
         let (org, model) = review_org_model(&pool).await;
         sqlx::query("INSERT INTO model_overlays(user_id,deployed_model_id,self_hosted_only) VALUES ($1,$2,true)")
             .bind(org)
@@ -1118,32 +1126,24 @@ models:
             "org: review-org\nmodels:\n  - alias: review-model\n    tariffs:\n      - {name: price, purpose: realtime, input_per_million_tokens: '1', output_per_million_tokens: '2'}\n",
         );
         let catalog = OrgCatalog::load(directory.path()).unwrap();
-        let error = apply(&pool, &catalog).await.unwrap_err();
-        assert!(format!("{error:#}").contains("manually managed serving overlay"));
+        apply(&pool, &catalog).await.unwrap();
         let row: (Option<bool>, Option<String>) =
             sqlx::query_as("SELECT self_hosted_only,provisioning_source FROM model_overlays WHERE user_id=$1")
                 .bind(org)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(row, (Some(true), None));
+        assert_eq!(row, (None, Some("org-overlays:org.yaml".to_owned())));
         let prices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_tariffs")
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(prices, 0, "rejection must not leave partial prices");
-        // Ownership transfer is an explicit operator action after checking the
-        // complete desired YAML (omitted routing settings will inherit defaults).
-        sqlx::query("UPDATE model_overlays SET provisioning_source='org-overlays:org.yaml' WHERE user_id=$1")
-            .bind(org)
-            .execute(&pool)
-            .await
-            .unwrap();
+        assert_eq!(prices, 1);
         apply(&pool, &catalog).await.unwrap();
     }
 
     #[sqlx::test]
-    async fn class_prices_version_and_manual_collisions_name_the_scope(pool: PgPool) {
+    async fn class_prices_version_and_adopt_unchanged_manual_rows(pool: PgPool) {
         let (org, model) = review_org_model(&pool).await;
         let directory = tempdir().unwrap();
         for input in ["1", "2"] {
@@ -1172,11 +1172,14 @@ models:
             .execute(&pool)
             .await
             .unwrap();
-        let error = apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap_err();
-        let message = format!("{error:#}");
-        for context in ["org.yaml", "review-org", "review-model", "interactive", "manually managed tariff"] {
-            assert!(message.contains(context), "{message}");
-        }
+        apply(&pool, &OrgCatalog::load(directory.path()).unwrap()).await.unwrap();
+        let source: String =
+            sqlx::query_scalar("SELECT provisioning_source FROM model_tariffs WHERE deployed_model_id=$1 AND valid_until IS NULL")
+                .bind(model)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(source, "org-overlays");
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM model_tariffs WHERE user_id=$1")
             .bind(org)
             .fetch_one(&pool)

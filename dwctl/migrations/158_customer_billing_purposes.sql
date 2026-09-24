@@ -1,7 +1,5 @@
 -- Internal resume and management keys never select customer prices. Preserve
 -- historical rows; only replace the pricing functions from migration 151.
-SET LOCAL lock_timeout = '5s';
-SET LOCAL statement_timeout = '10s';
 
 CREATE OR REPLACE FUNCTION effective_model_tariff(
     model_id UUID, account_id UUID, purpose TEXT, completion_window TEXT,

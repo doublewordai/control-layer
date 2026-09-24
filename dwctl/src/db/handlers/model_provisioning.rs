@@ -35,7 +35,7 @@ impl<'c> ModelProvisioning<'c> {
         Self { db, tariff_source: None }
     }
 
-    /// Organization catalogs may only replace prices they created themselves.
+    /// Organization catalog prices carry ownership markers for retirement on omission.
     pub(crate) fn for_org_catalog(db: &'c mut PgConnection) -> Self {
         Self {
             db,
@@ -154,22 +154,63 @@ impl<'c> ModelProvisioning<'c> {
         Ok(())
     }
 
+    /// YAML is authoritative for the complete declared org/model, including
+    /// prices originally inserted manually. Historical amounts remain immutable.
+    pub(crate) async fn adopt_account_model_tariffs(&mut self, account: Uuid, model: Uuid, effective_at: DateTime<Utc>) -> Result<()> {
+        for table in ["model_tariffs", "model_cache_tariffs"] {
+            let future: Option<(DateTime<Utc>, Option<String>)> = sqlx::query_as(&format!(
+                "SELECT valid_from, serving_class FROM {table}
+                 WHERE user_id=$1 AND deployed_model_id=$2 AND valid_from>$3
+                   AND (valid_until IS NULL OR valid_until>valid_from)
+                 ORDER BY valid_from, id LIMIT 1"
+            ))
+            .bind(account)
+            .bind(model)
+            .bind(effective_at)
+            .fetch_optional(&mut *self.db)
+            .await?;
+            if let Some((valid_from, class)) = future {
+                bail!(
+                    "{table}, class {:?}: future tariff scheduled for {valid_from}; startup provisioning has no scheduling semantics",
+                    class.as_deref().unwrap_or("all")
+                );
+            }
+            sqlx::query(&format!(
+                "UPDATE {table} SET provisioning_source='org-overlays'
+                 WHERE user_id=$1 AND deployed_model_id=$2 AND valid_from<=$3
+                   AND (valid_until IS NULL OR valid_until>$3)
+                   AND provisioning_source IS DISTINCT FROM 'org-overlays'"
+            ))
+            .bind(account)
+            .bind(model)
+            .bind(effective_at)
+            .execute(&mut *self.db)
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Refuse to reconcile an organisation whose rows carry a future `valid_from`:
     /// startup provisioning has no scheduling semantics (same rule as the model catalog).
     pub(crate) async fn preflight_future_account_tariffs(&mut self, account: Uuid, effective_at: DateTime<Utc>) -> Result<()> {
         for table in ["model_tariffs", "model_cache_tariffs"] {
-            let future: Option<DateTime<Utc>> = sqlx::query_scalar(&format!(
-                "SELECT valid_from FROM {table}
-                 WHERE user_id = $1 AND provisioning_source = 'org-overlays' AND valid_from > $2 AND (valid_until IS NULL OR valid_until > valid_from)
-                 ORDER BY valid_from LIMIT 1"
+            let future: Option<(DateTime<Utc>, String, Option<String>)> = sqlx::query_as(&format!(
+                "SELECT t.valid_from, dm.alias, t.serving_class FROM {table} t
+                 JOIN deployed_models dm ON dm.id=t.deployed_model_id
+                 WHERE t.user_id=$1 AND t.provisioning_source='org-overlays' AND t.valid_from>$2
+                   AND (t.valid_until IS NULL OR t.valid_until>t.valid_from)
+                 ORDER BY t.valid_from, t.id LIMIT 1"
             ))
             .bind(account)
             .bind(effective_at)
             .fetch_optional(&mut *self.db)
             .await
             .with_context(|| format!("check future {table} rows of an organisation"))?;
-            if let Some(valid_from) = future {
-                bail!("organisation has a future tariff scheduled for {valid_from}; startup provisioning has no scheduling semantics");
+            if let Some((valid_from, alias, class)) = future {
+                bail!(
+                    "{table}, model {alias:?}, class {:?}: future tariff scheduled for {valid_from}; startup provisioning has no scheduling semantics",
+                    class.as_deref().unwrap_or("all")
+                );
             }
         }
         Ok(())

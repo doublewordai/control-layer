@@ -112,7 +112,7 @@ async fn sql_and_billing_agree_on_class_scope_window_and_history(pool: PgPool) {
         .0,
         Some(Decimal::ZERO)
     );
-    // The model-level gate sees the actual all-class deal, including explicit zero.
+    // The compatibility price helper sees the actual all-class deal, including zero.
     sqlx::query("UPDATE model_tariffs SET input_price_per_token=0,output_price_per_token=0 WHERE user_id=$1")
         .bind(account)
         .execute(&pool)
@@ -367,7 +367,7 @@ async fn general_price_sort_uses_current_windows_and_includes_free_prices(pool: 
 }
 
 #[sqlx::test]
-async fn realtime_admission_ignores_windowed_rows(pool: PgPool) {
+async fn compatibility_paid_helper_ignores_realtime_windowed_rows(pool: PgPool) {
     let model: Uuid = sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by) VALUES ('window-test','window-test',true,'00000000-0000-0000-0000-000000000000') RETURNING id").fetch_one(&pool).await.unwrap();
     sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,api_key_purpose,completion_window,input_price_per_token,output_price_per_token) VALUES ($1,'misconfigured','realtime','24h',1,2)").bind(model).execute(&pool).await.unwrap();
     let paid: bool = sqlx::query_scalar("SELECT model_has_effective_paid_tariff($1,NULL,'realtime')")
@@ -375,7 +375,7 @@ async fn realtime_admission_ignores_windowed_rows(pool: PgPool) {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert!(!paid, "admission must not invent a realtime completion window");
+    assert!(!paid, "price helper must not invent a realtime completion window");
 }
 
 /// Exhaust every combination of the six eligible playground candidates. The
@@ -599,7 +599,7 @@ async fn customer_display_sort_and_usage_have_explicitly_different_class_rules(p
 }
 
 #[sqlx::test]
-async fn legacy_paid_admission_respects_explicit_zero_batch_windows(pool: PgPool) {
+async fn compatibility_paid_helper_respects_explicit_zero_batch_windows(pool: PgPool) {
     let account: Uuid = sqlx::query_scalar(
         "INSERT INTO users (username,email,auth_source) VALUES ('free-batch','free-batch@example.com','test') RETURNING id",
     )

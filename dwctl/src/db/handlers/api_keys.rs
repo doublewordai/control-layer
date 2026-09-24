@@ -962,6 +962,7 @@ impl<'c> ApiKeys<'c> {
             INNER JOIN deployed_models dm ON dg.deployment_id = dm.id
             WHERE dg.deployment_id = $1
             AND ak.is_deleted = false
+            -- General free-model access is preserved; zero customer deals do not exempt paid models.
             AND (
                 ak.user_id = $2  -- System user always has access
                 OR user_has_feature(ak.user_id, 'ALLOW_NEGATIVE_BALANCE')
@@ -972,11 +973,17 @@ impl<'c> ApiKeys<'c> {
                     SELECT 1 FROM user_balance_checkpoints c
                     WHERE c.user_id = ak.user_id AND c.balance > 0
                 )
-                OR (
-                    -- Free models are accessible to all users (zero balance OK)
-                    -- A model is free if it has no active tariffs or all active tariffs are zero-priced
-                    NOT model_has_effective_paid_tariff(dm.id, ak.user_id, ak.purpose)
-                )
+                OR (NOT EXISTS (
+                    SELECT 1 FROM model_tariffs mt
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                      AND mt.valid_until IS NULL
+                      AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM model_tariffs mt
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                      AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
+                      AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                ))
             )
 
             UNION
@@ -1005,6 +1012,7 @@ impl<'c> ApiKeys<'c> {
             WHERE dg.deployment_id = $1
             AND ak.is_deleted = false
             AND ak.user_id != '00000000-0000-0000-0000-000000000000'  -- Exclude system user (already covered above)
+            -- General free-model access is preserved; zero customer deals do not exempt paid models.
             AND (
                 ak.user_id = $2  -- System user always has access
                 OR user_has_feature(ak.user_id, 'ALLOW_NEGATIVE_BALANCE')
@@ -1015,11 +1023,17 @@ impl<'c> ApiKeys<'c> {
                     SELECT 1 FROM user_balance_checkpoints c
                     WHERE c.user_id = ak.user_id AND c.balance > 0
                 )
-                OR (
-                    -- Free models are accessible to all users (zero balance OK)
-                    -- A model is free if it has no active tariffs or all active tariffs are zero-priced
-                    NOT model_has_effective_paid_tariff(dm.id, ak.user_id, ak.purpose)
-                )
+                OR (NOT EXISTS (
+                    SELECT 1 FROM model_tariffs mt
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                      AND mt.valid_until IS NULL
+                      AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM model_tariffs mt
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                      AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
+                      AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                ))
             )
             "#,
             deployment_id,

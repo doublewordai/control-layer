@@ -1,8 +1,6 @@
 -- Organisation prices may specialize a resolved serving class. NULL remains an
 -- all-class deal, distinct from an explicit standard-class price.
-SET LOCAL lock_timeout = '5s';
--- Small configuration ledgers; bound index/constraint execution as well as lock acquisition.
-SET LOCAL statement_timeout = '10s';
+-- The pre-rollout migration Job bounds execution time.
 ALTER TABLE model_tariffs ADD COLUMN serving_class TEXT;
 ALTER TABLE model_cache_tariffs ADD COLUMN serving_class TEXT;
 ALTER TABLE model_tariffs ADD CONSTRAINT model_tariffs_class_scope
