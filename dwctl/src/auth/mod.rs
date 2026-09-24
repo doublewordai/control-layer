@@ -61,18 +61,6 @@
 //! }
 //! ```
 //!
-//! ## API Key Authentication
-//!
-//! ```ignore
-//! use dwctl::auth::current_user::ApiKeyUser;
-//!
-//! async fn api_handler(
-//!     ApiKeyUser(user): ApiKeyUser,
-//! ) -> Result<String, AppError> {
-//!     Ok(format!("API access for user {}", user.id))
-//! }
-//! ```
-//!
 //! ## Permission Checking
 //!
 //! ```ignore
