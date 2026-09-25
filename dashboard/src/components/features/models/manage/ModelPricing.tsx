@@ -54,7 +54,10 @@ export function ModelPricing({
   const options = new Map<string, string>();
   if (manager) {
     for (const row of overlays.data ?? [])
-      options.set(row.organization_id, row.organization_name);
+      options.set(
+        row.organization_id,
+        row.organization_display_name?.trim() || row.organization_name,
+      );
     for (const row of model.tariffs ?? [])
       if (row.organization_id && !options.has(row.organization_id))
         options.set(row.organization_id, row.organization_id);

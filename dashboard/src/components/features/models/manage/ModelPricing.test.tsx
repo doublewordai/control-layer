@@ -33,7 +33,8 @@ const tariff = (id: string, extra: Partial<ModelTariff> = {}): ModelTariff => ({
 });
 const overlay: ServingOverlay = {
   organization_id: "org-a",
-  organization_name: "Example Organisation",
+  organization_name: "example-org~1234",
+  organization_display_name: "Example Organisation",
   deployed_model_id: "model",
   alias: "example-model",
   default_serving_class: "throughput",
@@ -131,6 +132,21 @@ beforeEach(() => {
   } as unknown as ReturnType<typeof useOrganizationServing>);
 });
 describe("model pricing selector", () => {
+  it.each([undefined, null, "", "   "])(
+    "falls back to the account username when the display name is %j",
+    (displayName) => {
+      vi.mocked(useModelOverlays).mockReturnValue({
+        data: [{ ...overlay, organization_display_name: displayName }],
+        isLoading: false,
+        isError: false,
+      } as unknown as ReturnType<typeof useModelOverlays>);
+      const { container } = mount(true, "org-a");
+      expect(
+        within(container).getByRole("combobox", { name: "Pricing for" }),
+      ).toHaveTextContent("example-org~1234");
+    },
+  );
+
   it("shows effective playground prices when only realtime is configured", () => {
     const { container } = mount(true, "org-a");
     const playground = within(within(container).getByRole("region", { name: "Playground prices" }));
