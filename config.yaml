@@ -688,6 +688,18 @@ background_services:
     # Default: 300000 (5 min). Set to 0 to disable (not recommended).
     fallback_interval_milliseconds: 300000
 
+  # Per-key account policy sync - keeps the in-memory map of each API key's owning
+  # account policy (zero data retention, disabled modalities) fresh after startup.
+  # Independent of onwards_sync: the realtime modality gate enforces from this map.
+  # The map is always loaded once at startup; with this off, policy changes only
+  # reach an instance when it restarts.
+  key_policy_sync:
+    enabled: true # Default: true
+    # Periodic full reload (milliseconds). One small join; NOTIFY carries real
+    # changes, so this only guards against a missed notification.
+    # Default: 300000 (5 min). Set to 0 to disable.
+    fallback_interval_milliseconds: 300000
+
   # Usage-refresh daemon - incrementally folds new http_analytics rows into the
   # user_model_usage_daily rollup. Woken in-process by the analytics batcher after each
   # flush (no LISTEN/NOTIFY - emitter and consumer share the pod); the fallback tick only

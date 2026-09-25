@@ -11,6 +11,7 @@
 - [Set Up Health Monitoring](how-to/health-monitoring.md)
 - [Deploy to Production](how-to/deploy-to-production.md)
 - [Set Up Model Pricing](how-to/tariffs.md)
+- [Customize Organization Models](how-to/organization-model-overlays.md)
 - [Set Up Payments](how-to/payments.md)
 
 # Reference

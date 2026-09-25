@@ -58,6 +58,9 @@ pub(crate) struct CacheTariffRow {
     pub read_multiplier: Decimal,
     pub valid_from: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
+    /// Organisation the version belongs to; `None` = the model's general pricing.
+    pub account: Option<uuid::Uuid>,
+    pub serving_class: Option<String>,
 }
 
 /// An engine-sourced (implicit) cache read must never bill above list price: the customer
@@ -116,18 +119,24 @@ pub(crate) struct ModelInfo {
 }
 
 /// Tariff info for pricing lookup.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct TariffInfo {
+    /// Stable final tie-breaker shared with the SQL resolver.
+    pub id: uuid::Uuid,
     pub purpose: ApiKeyPurpose,
     pub effective_from: DateTime<Utc>,
     pub valid_until: Option<DateTime<Utc>>,
     pub input_price_per_token: Decimal,
     pub output_price_per_token: Decimal,
     pub completion_window: Option<String>,
+    /// Organisation the tariff belongs to; `None` = the model's general price.
+    pub account: Option<uuid::Uuid>,
+    pub serving_class: Option<String>,
 }
 
-/// Load the full cache-tariff history (including expired versions) for a set of model
-/// aliases: alias → versions, ready for [`resolve_cache_multipliers`] at any timestamp.
+/// Load cache-tariff history (including expired versions) for the requested models
+/// and billed accounts, plus general prices. Unrelated accounts are never loaded.
+/// Returns alias → versions for [`resolve_cache_multipliers`] at any timestamp.
 ///
 /// Shared by the live batcher and the recompute for the same reason the arithmetic is:
 /// the ledger is temporal (`valid_from` / `valid_until`, closed rather than updated), so
@@ -137,6 +146,7 @@ pub(crate) struct TariffInfo {
 pub(crate) async fn lookup_cache_tariffs<'e, E>(
     executor: E,
     aliases: &[String],
+    accounts: &[uuid::Uuid],
 ) -> Result<std::collections::HashMap<String, Vec<CacheTariffRow>>, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
@@ -149,6 +159,8 @@ where
         read_multiplier: Decimal,
         valid_from: DateTime<Utc>,
         valid_until: Option<DateTime<Utc>>,
+        account: Option<uuid::Uuid>,
+        serving_class: Option<String>,
     }
 
     let rows: Vec<Row> = sqlx::query_as!(
@@ -161,13 +173,17 @@ where
             mct.write_multiplier_24h,
             mct.read_multiplier,
             mct.valid_from,
-            mct.valid_until
+            mct.valid_until,
+            mct.user_id as "account?",
+            mct.serving_class
         FROM deployed_models dm
         JOIN model_cache_tariffs mct ON mct.deployed_model_id = dm.id
         WHERE dm.alias = ANY($1)
+          AND (mct.user_id IS NULL OR mct.user_id = ANY($2))
         ORDER BY dm.alias, mct.valid_from DESC
         "#,
-        aliases
+        aliases,
+        accounts
     )
     .fetch_all(executor)
     .await?;
@@ -181,6 +197,8 @@ where
             read_multiplier: row.read_multiplier,
             valid_from: row.valid_from,
             valid_until: row.valid_until,
+            account: row.account,
+            serving_class: row.serving_class,
         });
     }
     Ok(map)
@@ -190,67 +208,104 @@ where
 /// most-recently-effective version still in its window. One row carries all tiers, so
 /// there is no per-tier resolution or gap. `None` when no version was valid at `timestamp`
 /// (so the caller can distinguish "no tariff" from a real row and fall back deliberately).
-pub(crate) fn resolve_cache_multipliers(rows: &[CacheTariffRow], timestamp: DateTime<Utc>) -> Option<CacheMultipliers> {
-    rows.iter()
-        .filter(|r| r.valid_from <= timestamp && r.valid_until.is_none_or(|u| u > timestamp))
-        .max_by_key(|r| r.valid_from)
-        .map(|r| CacheMultipliers {
-            read: r.read_multiplier,
-            write_5m: r.write_multiplier_5m,
-            write_1h: r.write_multiplier_1h,
-            write_24h: r.write_multiplier_24h,
-        })
+///
+/// `account` is the billed organisation: its own version valid at `timestamp` wins over
+/// the general one. An organisation row alone does not enable caching (the classifier
+/// gates on the general row), so a resolved organisation row always sits over a general one.
+pub(crate) fn resolve_cache_multipliers(
+    rows: &[CacheTariffRow],
+    timestamp: DateTime<Utc>,
+    account: Option<uuid::Uuid>,
+    serving_class: Option<&str>,
+) -> Option<CacheMultipliers> {
+    let valid = |scope: Option<uuid::Uuid>, class: Option<&str>| {
+        rows.iter()
+            .filter(|r| {
+                r.account == scope
+                    && r.serving_class.as_deref() == class
+                    && r.valid_from <= timestamp
+                    && r.valid_until.is_none_or(|u| u > timestamp)
+            })
+            .max_by_key(|r| r.valid_from)
+    };
+    let general = valid(None, None)?;
+    Some(
+        account
+            .and_then(|a| {
+                serving_class
+                    .and_then(|class| valid(Some(a), Some(class)))
+                    .or_else(|| valid(Some(a), None))
+            })
+            .unwrap_or(general),
+    )
+    .map(|r| CacheMultipliers {
+        read: r.read_multiplier,
+        write_5m: r.write_multiplier_5m,
+        write_1h: r.write_multiplier_1h,
+        write_24h: r.write_multiplier_24h,
+    })
 }
 
-/// Find the best matching tariff for a request.
-///
-/// Implements fallback logic:
-/// 1. Try exact match (purpose + completion_window + timestamp)
-/// 2. Fall back to generic tariff for that purpose (completion_window = None)
-/// 3. Fall back to realtime purpose (generic)
+/// Resolve eligible prices by account/class scope first. Within each scope,
+/// playground prefers its own purpose then realtime. Batch exhausts exact-window
+/// prices across all scopes before trying standard-class realtime prices in the
+/// same scope order. Zero stops fallback. Newer valid rows win,
+/// then the lowest tariff ID, matching SQL. Iterate references without cloning.
 pub(crate) fn find_best_tariff(
     tariffs: &[TariffInfo],
     api_key_purpose: Option<&ApiKeyPurpose>,
     completion_window: Option<&str>,
     timestamp: DateTime<Utc>,
+    account: Option<uuid::Uuid>,
+    serving_class: Option<&str>,
 ) -> (Option<Decimal>, Option<Decimal>) {
     let purpose = api_key_purpose.unwrap_or(&ApiKeyPurpose::Realtime);
-
-    // Filter tariffs valid at timestamp:
-    // effective_from <= timestamp AND (valid_until IS NULL OR valid_until > timestamp)
-    let valid_tariffs: Vec<_> = tariffs
+    if !purpose.is_customer_billing() {
+        return (None, None);
+    }
+    let class = if *purpose == ApiKeyPurpose::Batch {
+        Some("standard")
+    } else {
+        serving_class
+    };
+    let window = if *purpose == ApiKeyPurpose::Batch {
+        completion_window
+    } else {
+        None
+    };
+    tariffs
         .iter()
-        .filter(|t| t.effective_from <= timestamp && t.valid_until.is_none_or(|valid_until| valid_until > timestamp))
-        .collect();
-
-    // Try exact match with completion_window (for batch tariffs with specific priority)
-    if let Some(cw) = completion_window
-        && let Some(tariff) = valid_tariffs
-            .iter()
-            .find(|t| &t.purpose == purpose && t.completion_window.as_deref() == Some(cw))
-    {
-        return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-    }
-
-    // Try generic tariff for this purpose (completion_window = None)
-    // This ensures we don't accidentally match a different priority tier
-    if let Some(tariff) = valid_tariffs
-        .iter()
-        .find(|t| &t.purpose == purpose && t.completion_window.is_none())
-    {
-        return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-    }
-
-    // Fall back to generic realtime tariff
-    if purpose != &ApiKeyPurpose::Realtime
-        && let Some(tariff) = valid_tariffs
-            .iter()
-            .find(|t| t.purpose == ApiKeyPurpose::Realtime && t.completion_window.is_none())
-    {
-        return (Some(tariff.input_price_per_token), Some(tariff.output_price_per_token));
-    }
-
-    (None, None)
+        .filter_map(|t| {
+            if t.effective_from > timestamp || t.valid_until.is_some_and(|until| until <= timestamp) {
+                return None;
+            }
+            let purpose_rank = if t.purpose == *purpose {
+                0
+            } else if matches!(purpose, ApiKeyPurpose::Playground | ApiKeyPurpose::Batch) && t.purpose == ApiKeyPurpose::Realtime {
+                1
+            } else {
+                return None;
+            };
+            // Batch prices are per SLA, not an override for every batch tier.
+            if t.completion_window.as_deref() != if t.purpose == ApiKeyPurpose::Batch { window } else { None } {
+                return None;
+            }
+            let scope_rank = match (t.account, t.serving_class.as_deref()) {
+                (Some(owner), Some(c)) if Some(owner) == account && Some(c) == class => 0,
+                (Some(owner), None) if Some(owner) == account => 1,
+                (None, None) => 2,
+                _ => return None,
+            };
+            // A general batch price wins over every realtime deal, including zero.
+            let fallback_phase = if *purpose == ApiKeyPurpose::Batch { purpose_rank } else { 0 };
+            Some((
+                (fallback_phase, scope_rank, purpose_rank, std::cmp::Reverse(t.effective_from), t.id),
+                t,
+            ))
+        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, t)| (Some(t.input_price_per_token), Some(t.output_price_per_token)))
+        .unwrap_or((None, None))
 }
 
 /// The charged cost for a request, gating the cache discount on dwctl enablement: when a
@@ -511,13 +566,50 @@ mod tests {
 
     fn tariff_row(write_1h: Decimal, from_hrs: i64, valid_until: Option<DateTime<Utc>>) -> CacheTariffRow {
         CacheTariffRow {
+            serving_class: None,
             write_multiplier_5m: Decimal::new(125, 2), // 1.25
             write_multiplier_1h: write_1h,
             write_multiplier_24h: Decimal::new(25, 1), // 2.5
             read_multiplier: Decimal::new(1, 1),       // 0.1
             valid_from: chrono::Utc::now() - chrono::Duration::hours(from_hrs),
             valid_until,
+            account: None,
         }
+    }
+
+    #[test]
+    fn resolve_multipliers_prefers_the_billed_organisations_version() {
+        let now = chrono::Utc::now();
+        let org = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let mut org_row = tariff_row(Decimal::from(7), 1, None);
+        org_row.account = Some(org);
+        let mut other_row = tariff_row(Decimal::from(9), 1, None);
+        other_row.account = Some(other);
+        let rows = vec![tariff_row(Decimal::from(2), 3, None), org_row, other_row];
+        assert_eq!(
+            resolve_cache_multipliers(&rows, now, Some(org), None).unwrap().write_1h,
+            Decimal::from(7)
+        );
+        assert_eq!(
+            resolve_cache_multipliers(&rows, now, None, None).unwrap().write_1h,
+            Decimal::from(2)
+        );
+        // an organisation without its own version falls back to the general one
+        assert_eq!(
+            resolve_cache_multipliers(&rows, now, Some(uuid::Uuid::new_v4()), None)
+                .unwrap()
+                .write_1h,
+            Decimal::from(2)
+        );
+        // an expired organisation version does not shadow the general one
+        let mut expired = tariff_row(Decimal::from(7), 3, Some(now - chrono::Duration::hours(1)));
+        expired.account = Some(org);
+        let rows = vec![tariff_row(Decimal::from(2), 3, None), expired];
+        assert_eq!(
+            resolve_cache_multipliers(&rows, now, Some(org), None).unwrap().write_1h,
+            Decimal::from(2)
+        );
     }
 
     #[test]
@@ -525,7 +617,7 @@ mod tests {
         let now = chrono::Utc::now();
         // Two versions; the newer (valid_from 1h ago) wins over the older (5h ago).
         let rows = vec![tariff_row(Decimal::from(2), 1, None), tariff_row(Decimal::from(3), 5, None)];
-        let m = resolve_cache_multipliers(&rows, now).expect("a valid version exists");
+        let m = resolve_cache_multipliers(&rows, now, None, None).expect("a valid version exists");
         assert_eq!(m.write_1h, Decimal::from(2), "latest valid version wins");
         assert_eq!(m.write_5m, Decimal::new(125, 2), "all tiers come from that one row");
         assert_eq!(m.write_24h, Decimal::new(25, 1));
@@ -536,10 +628,13 @@ mod tests {
     fn resolve_multipliers_none_when_empty_or_expired() {
         let now = chrono::Utc::now();
         // empty → no version valid → None (the caller falls back to defaults deliberately).
-        assert!(resolve_cache_multipliers(&[], now).is_none(), "no rows → None");
+        assert!(resolve_cache_multipliers(&[], now, None, None).is_none(), "no rows → None");
         // expired version ignored → None.
         let expired = vec![tariff_row(Decimal::from(5), 2, Some(now - chrono::Duration::hours(1)))];
-        assert!(resolve_cache_multipliers(&expired, now).is_none(), "expired version ignored → None");
+        assert!(
+            resolve_cache_multipliers(&expired, now, None, None).is_none(),
+            "expired version ignored → None"
+        );
     }
 
     #[test]
@@ -563,13 +658,48 @@ mod tests {
         completion_window: Option<&str>,
     ) -> TariffInfo {
         TariffInfo {
+            id: uuid::Uuid::new_v4(),
+            serving_class: None,
             purpose,
             effective_from,
             valid_until,
             input_price_per_token: Decimal::from_str(input_price).unwrap(),
             output_price_per_token: Decimal::from_str(output_price).unwrap(),
             completion_window: completion_window.map(|s| s.to_string()),
+            account: None,
         }
+    }
+
+    #[test]
+    fn find_best_tariff_overrides_only_the_requested_purpose() {
+        let now = chrono::Utc::now();
+        let org = uuid::Uuid::new_v4();
+        let from = now - chrono::Duration::days(1);
+        let mut org_realtime = make_tariff(ApiKeyPurpose::Realtime, from, None, "0.00001", "0.00002", None);
+        org_realtime.account = Some(org);
+        let tariffs = vec![
+            make_tariff(ApiKeyPurpose::Realtime, from, None, "0.00010", "0.00020", None),
+            make_tariff(ApiKeyPurpose::Batch, from, None, "0.00005", "0.00010", Some("24h")),
+            org_realtime,
+        ];
+        // the organisation's realtime price wins over the general realtime price
+        let (input, _) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now, Some(org), None);
+        assert_eq!(input, Some(Decimal::from_str("0.00001").unwrap()));
+        // A realtime deal does not change this organization's batch price.
+        let (input, _) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), now, Some(org), None);
+        assert_eq!(input, Some(Decimal::from_str("0.00005").unwrap()));
+        // everyone else pays the general prices
+        let (input, _) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now, None, None);
+        assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()));
+        let (input, _) = find_best_tariff(
+            &tariffs,
+            Some(&ApiKeyPurpose::Batch),
+            Some("24h"),
+            now,
+            Some(uuid::Uuid::new_v4()),
+            None,
+        );
+        assert_eq!(input, Some(Decimal::from_str("0.00005").unwrap()));
     }
 
     #[test]
@@ -584,7 +714,7 @@ mod tests {
             None,
         )];
 
-        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now, None, None);
         assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()));
         assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
     }
@@ -612,19 +742,19 @@ mod tests {
         ];
 
         // Batch purpose should get batch pricing
-        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
+        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now, None, None);
         assert_eq!(input, Some(Decimal::from_str("0.00005").unwrap()));
         assert_eq!(output, Some(Decimal::from_str("0.00010").unwrap()));
 
         // Realtime purpose should get realtime pricing
-        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now, None, None);
         assert_eq!(input, Some(Decimal::from_str("0.00010").unwrap()));
         assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
     }
 
     #[test]
-    fn test_find_best_tariff_fallback_to_realtime() {
-        // When batch tariff is missing, should fall back to realtime
+    fn missing_batch_and_playground_prices_fall_back_to_realtime() {
+        // Realtime is the final safety net when no batch window matches.
         let now = chrono::Utc::now();
         let tariffs = vec![make_tariff(
             ApiKeyPurpose::Realtime,
@@ -635,8 +765,14 @@ mod tests {
             None,
         )];
 
-        // Batch purpose with no batch tariff should fall back to realtime
-        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
+        assert_eq!(
+            find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), now, None, None),
+            (
+                Some(Decimal::from_str("0.00015").unwrap()),
+                Some(Decimal::from_str("0.00030").unwrap())
+            )
+        );
+        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Playground), None, now, None, None);
         assert_eq!(input, Some(Decimal::from_str("0.00015").unwrap()));
         assert_eq!(output, Some(Decimal::from_str("0.00030").unwrap()));
     }
@@ -672,7 +808,7 @@ mod tests {
         ];
 
         // Current request should use new pricing
-        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now, None, None);
         assert_eq!(
             input,
             Some(Decimal::from_str("0.00010").unwrap()),
@@ -683,7 +819,7 @@ mod tests {
         // Historical request (20 days ago) should use old pricing — this is the property the
         // recompute path depends on: a correction re-prices as of the original request.
         let historical_time = now - chrono::Duration::days(20);
-        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, historical_time);
+        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, historical_time, None, None);
         assert_eq!(
             input,
             Some(Decimal::from_str("0.00020").unwrap()),
@@ -718,7 +854,7 @@ mod tests {
         ];
 
         // Request with 24h completion window should get the priority-specific pricing
-        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), now);
+        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("24h"), now, None, None);
         assert_eq!(
             input,
             Some(Decimal::from_str("0.00005").unwrap()),
@@ -727,7 +863,7 @@ mod tests {
         assert_eq!(output, Some(Decimal::from_str("0.00010").unwrap()));
 
         // Request without completion window should get generic batch pricing
-        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now);
+        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), None, now, None, None);
         assert_eq!(
             input,
             Some(Decimal::from_str("0.00010").unwrap()),
@@ -737,8 +873,8 @@ mod tests {
     }
 
     #[test]
-    fn test_find_best_tariff_completion_window_fallback_to_generic() {
-        // Test that unknown completion_window falls back to generic tariff, not another priority
+    fn missing_batch_window_does_not_borrow_another_tariff() {
+        // Without a realtime safety net, another batch window is not a match.
         let now = chrono::Utc::now();
         let tariffs = vec![
             // Generic batch tariff
@@ -770,14 +906,8 @@ mod tests {
             ),
         ];
 
-        // Request with unknown "1h" priority should fall back to generic, NOT to 24h or 7d
-        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), now);
-        assert_eq!(
-            input,
-            Some(Decimal::from_str("0.00010").unwrap()),
-            "Unknown priority should fall back to generic, not another priority"
-        );
-        assert_eq!(output, Some(Decimal::from_str("0.00020").unwrap()));
+        let actual = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Batch), Some("1h"), now, None, None);
+        assert_eq!(actual, (None, None), "An absent SLA is not another tier or a generic batch price");
     }
 
     #[test]
@@ -785,7 +915,7 @@ mod tests {
         let now = chrono::Utc::now();
         let tariffs = vec![];
 
-        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now, None, None);
         assert_eq!(input, None);
         assert_eq!(output, None);
     }
@@ -803,8 +933,11 @@ mod tests {
             None,
         )];
 
-        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now);
+        let (input, output) = find_best_tariff(&tariffs, Some(&ApiKeyPurpose::Realtime), None, now, None, None);
         assert_eq!(input, None, "Future tariff should not be selected");
         assert_eq!(output, None);
     }
 }
+
+#[cfg(test)]
+mod class_tests;

@@ -168,13 +168,14 @@ export function formatContextLength(tokens: number): string {
 
 /**
  * Derive a user-facing display name for a tariff from its api_key_purpose and completion_window.
- * Playground tariffs should be filtered out before calling this.
+ * Customer-facing lists filter playground tariffs; operator views display them.
  */
 export function getTariffDisplayName(
   apiKeyPurpose: string | null | undefined,
   completionWindow: string | null | undefined,
 ): string {
   if (apiKeyPurpose === "realtime") return "Realtime";
+  if (apiKeyPurpose === "playground") return "Playground";
   if (apiKeyPurpose === "batch") {
     if (completionWindow === "1h") return "Async";
     return "Batch"; // 24h or any other batch window

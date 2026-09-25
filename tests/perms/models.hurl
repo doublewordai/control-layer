@@ -158,6 +158,7 @@ dwctl_session: {{admin_jwt}}
   "requests_per_second": 100.0,
   "burst_size": 200,
   "tariffs": [{
+    "api_key_purpose": "realtime",
     "name": "Standard Pricing",
     "input_price_per_token": "0.001",
     "output_price_per_token": "0.002"
@@ -194,6 +195,7 @@ dwctl_session: {{admin_jwt}}
   "requests_per_second": 100.0,
   "burst_size": 200,
   "tariffs": [{
+    "api_key_purpose": "realtime",
     "name": "Standard Pricing",
     "input_price_per_token": "0.001",
     "output_price_per_token": "0.002"
@@ -228,6 +230,7 @@ dwctl_session: {{admin_jwt}}
   "requests_per_second": 100.0,
   "burst_size": 200,
   "tariffs": [{
+    "api_key_purpose": "realtime",
     "name": "Standard Pricing",
     "input_price_per_token": "0.001",
     "output_price_per_token": "0.002"
@@ -377,6 +380,7 @@ PATCH http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
 dwctl_session: {{user_jwt}}
 {
   "tariffs": [{
+    "api_key_purpose": "realtime",
     "name": "Unauthorized Pricing",
     "input_price_per_token": "0.999",
     "output_price_per_token": "0.999"
@@ -407,6 +411,7 @@ PATCH http://localhost:3001/admin/api/v1/models/{{user1_model_id}}
 dwctl_session: {{admin_jwt}}
 {
   "tariffs": [{
+    "api_key_purpose": "realtime",
     "name": "Updated Pricing",
     "input_price_per_token": "0.005",
     "output_price_per_token": "0.010"

@@ -218,6 +218,9 @@ pub async fn get_usage<P: PoolProvider>(
     // Resolve the target user *before* building the cache key — different
     // targets must never share a cache entry.
     let target_user_id = resolve_usage_target(&state, &current_user, query.user_id).await?;
+    // Usage is attributed to the billed account (API key user_id), not the key's
+    // human creator. A member drill-down reads that member's personal usage;
+    // substituting the viewer's active organisation would quote another account.
 
     // Build cache key: truncate dates to midnight UTC so preset windows always hit cache.
     // Skip cache for ranges under 30 days — the data moves too fast to cache usefully.
@@ -242,7 +245,7 @@ pub async fn get_usage<P: PoolProvider>(
 
     // Two paths: all-time uses fast pre-aggregated tables, date-filtered
     // queries http_analytics directly (bounded by covering index).
-    let (batch_count, by_model, tariffs) = if has_dates {
+    let (batch_count, by_model) = if has_dates {
         let end_date = query.end_date.unwrap_or_else(Utc::now);
         let start = query.start_date.unwrap_or_else(|| end_date - Duration::days(180));
         let max_start = end_date - Duration::days(180);
@@ -252,7 +255,6 @@ pub async fn get_usage<P: PoolProvider>(
         tokio::try_join!(
             get_user_batch_count_for_range(&db, target_user_id, start_date, end_date),
             get_user_model_breakdown_for_range(&db, target_user_id, start_date, end_date),
-            get_realtime_tariffs(&db),
         )?
     } else {
         // All-time usage combines two pre-aggregated tables:
@@ -283,13 +285,15 @@ pub async fn get_usage<P: PoolProvider>(
             refresh_user_model_usage_daily(&state.db.write()).await?;
         }
         let db = state.db.read();
-        let (batch_stats, by_model, tariffs) = tokio::try_join!(
+        let (batch_stats, by_model) = tokio::try_join!(
             get_user_batch_counts(&db, target_user_id),
             get_user_model_breakdown(&db, target_user_id),
-            get_realtime_tariffs(&db),
         )?;
-        (batch_stats.0, by_model, tariffs)
+        (batch_stats.0, by_model)
     };
+
+    let aliases: Vec<String> = by_model.iter().map(|entry| entry.model.clone()).collect();
+    let tariffs = get_realtime_tariffs(&state.db.read(), target_user_id, &aliases).await?;
 
     let total_cost = by_model
         .iter()

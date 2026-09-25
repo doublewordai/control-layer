@@ -2887,6 +2887,25 @@ export const handlers = [
     });
   }),
 
+  http.get("/admin/api/v1/models/:id/overlays", ({ params }) => {
+    const model = modelsData.find((m) => m.id === params.id);
+    if (!model) return HttpResponse.json({ error: "Not found" }, { status: 404 });
+    return HttpResponse.json([]);
+  }),
+
+  http.get("/admin/api/v1/organizations/:id/serving", ({ params }) => {
+    const org = organizationsData.find((o) => o.id === params.id);
+    if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });
+    return HttpResponse.json({
+      organization_id: org.id,
+      granted_serving_classes: [],
+      self_hosted_only: false,
+      overlays: [],
+      tariffs: [],
+      cache_tariffs: [],
+    });
+  }),
+
   http.get("/admin/api/v1/organizations/:id", ({ params }) => {
     const org = organizationsData.find((o) => o.id === params.id);
     if (!org) return HttpResponse.json({ error: "Not found" }, { status: 404 });
@@ -2936,6 +2955,11 @@ export const handlers = [
     }
     const emailChanged =
       newEmail !== undefined && newEmail !== org.email.toLowerCase();
+    // Persist the owner's modality switches so the follow-up GET (the update
+    // hook invalidates and refetches) shows the new state instead of the fixture.
+    if (rest.disabled_modalities !== undefined) {
+      org.disabled_modalities = rest.disabled_modalities;
+    }
     return HttpResponse.json({
       ...org,
       ...rest,

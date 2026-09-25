@@ -1,6 +1,7 @@
 import { useOrganization } from "@/api/control-layer/hooks";
 import { useOrganizationContext } from "@/contexts";
 import { MemberManagement } from "./MemberManagement";
+import { ModalitySettings } from "./ModalitySettings";
 import { PendingEmailChangeBadge } from "./PendingEmailChangeBadge";
 import { NotificationSettings } from "../notifications/NotificationSettings";
 import { Badge } from "@/components/ui/badge";
@@ -34,6 +35,7 @@ export function MyOrganization() {
 
   const canManage =
     activeOrganization.role === "owner" || activeOrganization.role === "admin";
+  const isOwner = activeOrganization.role === "owner";
 
   return (
     <div className="p-6 space-y-6">
@@ -77,6 +79,8 @@ export function MyOrganization() {
         organizationId={activeOrganizationId}
         readOnly={!canManage}
       />
+
+      {org && <ModalitySettings organization={org} canEdit={isOwner} />}
 
       <NotificationSettings
         userId={activeOrganizationId}

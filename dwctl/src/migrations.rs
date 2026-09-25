@@ -697,6 +697,26 @@ mod tests {
         assert!(second.applied.is_empty());
     }
 
+    #[test]
+    fn main_migration_versions_use_unique_timestamps_after_legacy_history() {
+        let legacy: BTreeSet<i64> = (1..=156).filter(|v| ![140, 141, 150, 151].contains(v)).collect();
+        let mut seen = BTreeSet::new();
+        for migration in Target::main().migrator.iter() {
+            let version = migration.version;
+            assert!(seen.insert(version), "duplicate main migration version {version}");
+            if legacy.contains(&version) {
+                continue;
+            }
+            let stamp = version.to_string();
+            assert!(
+                stamp.len() == 14 && chrono::NaiveDateTime::parse_from_str(&stamp, "%Y%m%d%H%M%S").is_ok(),
+                "new main migration {version} must use a UTC YYYYMMDDhhmmss version; integer history is frozen"
+            );
+            assert!(version >= 20260924115900, "do not backfill main migration history: {version}");
+        }
+        assert!(legacy.is_subset(&seen), "released integer migrations must remain present");
+    }
+
     #[sqlx::test(migrations = false)]
     async fn check_rejects_an_unmigrated_database(pool: PgPool) {
         let err = check(&Target::main(), &pool).await.unwrap_err().to_string();
@@ -940,9 +960,11 @@ mod tests {
              CREATE INDEX idx_task_claim ON underway.task(task_queue_name, priority DESC, created_at, id)
                  WHERE state IN ('pending', 'in_progress');
              CREATE INDEX idx_task_created_at ON underway.task(created_at);
+             CREATE INDEX idx_task_terminal_created_at ON underway.task(created_at) WHERE state IN ('succeeded', 'failed');
              UPDATE pg_index SET indisvalid = false
              WHERE indexrelid IN ('underway.idx_task_queue_state'::regclass, 'underway.idx_task_id'::regclass,
-                                  'underway.idx_task_claim'::regclass, 'underway.idx_task_created_at'::regclass);",
+                                  'underway.idx_task_claim'::regclass, 'underway.idx_task_created_at'::regclass,
+                                  'underway.idx_task_terminal_created_at'::regclass);",
         )
         .execute(&pool)
         .await
@@ -951,7 +973,8 @@ mod tests {
         let valid: bool = sqlx::query_scalar(
             "SELECT bool_and(indisvalid AND indisready) FROM pg_index
              WHERE indexrelid IN ('underway.idx_task_queue_state'::regclass, 'underway.idx_task_id'::regclass,
-                                  'underway.idx_task_claim'::regclass, 'underway.idx_task_created_at'::regclass)",
+                                  'underway.idx_task_claim'::regclass, 'underway.idx_task_created_at'::regclass,
+                                  'underway.idx_task_terminal_created_at'::regclass)",
         )
         .fetch_one(&pool)
         .await
@@ -979,6 +1002,24 @@ mod tests {
             sqlx::query(wrong).execute(&pool).await.unwrap();
             let error = apply_underway(&pool).await.unwrap_err();
             assert!(format!("{error:#}").contains("idx_task_claim"), "{wrong}: {error:#}");
+            assert!(format!("{error:#}").contains("wrong definition"), "{wrong}: {error:#}");
+            assert!(check_underway(&pool).await.is_err(), "{wrong}");
+        }
+    }
+
+    #[sqlx::test]
+    async fn underway_extensions_reject_wrong_terminal_retention_index_definitions(pool: PgPool) {
+        for wrong in [
+            "CREATE INDEX idx_task_terminal_created_at ON underway.task(created_at)",
+            "CREATE INDEX idx_task_terminal_created_at ON underway.task(created_at) WHERE state = 'succeeded'",
+            "CREATE INDEX idx_task_terminal_created_at ON underway.task(created_at DESC) WHERE state IN ('succeeded', 'failed')",
+        ] {
+            sqlx::raw_sql("DROP SCHEMA IF EXISTS underway CASCADE; DROP SCHEMA IF EXISTS underway_extensions CASCADE; CREATE SCHEMA underway_extensions;")
+                .execute(&pool).await.unwrap();
+            underway::run_migrations(&pool).await.unwrap();
+            sqlx::query(wrong).execute(&pool).await.unwrap();
+            let error = apply_underway(&pool).await.unwrap_err();
+            assert!(format!("{error:#}").contains("idx_task_terminal_created_at"), "{wrong}: {error:#}");
             assert!(format!("{error:#}").contains("wrong definition"), "{wrong}: {error:#}");
             assert!(check_underway(&pool).await.is_err(), "{wrong}");
         }
@@ -1089,3 +1130,6 @@ mod tests {
         assert_eq!(text, "db.example:5433/clay");
     }
 }
+
+#[cfg(test)]
+mod tariff_indexes_tests;

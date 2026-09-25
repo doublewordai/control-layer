@@ -333,9 +333,8 @@ mod tests {
 
     /// A Dynamo upstream leaves `role` off the message object, so the typed parse cannot
     /// represent the body and the untagged enum falls through to `Other` — which read every
-    /// count as zero for requests the live path recorded correctly (measured on healthy
-    /// GLM-5.2 traffic: analytics_id 186138686 recomputed to all-zero against a body whose
-    /// usage was perfect). The raw-usage fallback must recover the counts.
+    /// count as zero even when the raw body contains valid usage. The raw-usage
+    /// fallback must recover the counts.
     #[test]
     fn dynamo_body_without_role_recovers_counts_from_raw_usage() {
         let e = exchange(

@@ -2,6 +2,7 @@ import { render, within, waitFor, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { setupServer } from "msw/node";
+import { http, HttpResponse } from "msw";
 import { ReactNode } from "react";
 import { describe, it, expect, vi, beforeAll, afterEach, afterAll } from "vitest";
 import userEvent from "@testing-library/user-event";
@@ -270,5 +271,43 @@ describe("EditOrganizationModal", () => {
 
     const dialog = screen.getByRole("dialog");
     expect(within(dialog).getByText(/acme-corp/)).toBeInTheDocument();
+  });
+});
+
+
+describe("serving setting authorization and cancellation", () => {
+  it.each([false, true])("only includes protected fields when authorized: %s", async (canEditServing) => {
+    let submitted: Record<string, unknown> | undefined;
+    server.use(http.patch("/admin/api/v1/organizations/:id", async ({ request }) => {
+      submitted = await request.json() as Record<string, unknown>;
+      return HttpResponse.json({ ...mockOrg, ...submitted });
+    }));
+    const user = userEvent.setup();
+    render(<EditOrganizationModal isOpen onClose={vi.fn()} organization={mockOrg} canEditServing={canEditServing} />, { wrapper: createWrapper() });
+    const dialog = within(screen.getByRole("dialog"));
+    if (canEditServing) {
+      await user.click(dialog.getByRole("checkbox", { name: "Grant interactive" }));
+      await user.click(dialog.getByRole("switch", { name: "Toggle self-hosted only" }));
+    }
+    await user.click(dialog.getByRole("button", { name: /save/i }));
+    await waitFor(() => expect(submitted).toBeDefined());
+    if (canEditServing) {
+      expect(submitted).toMatchObject({ granted_serving_classes: ["interactive"], default_serving_class: null, self_hosted_only: true });
+    } else {
+      for (const field of ["granted_serving_classes", "default_serving_class", "self_hosted_only"]) expect(submitted).not.toHaveProperty(field);
+    }
+  });
+
+  it("discards cancelled serving edits when reopening the same organization", async () => {
+    const user = userEvent.setup();
+    const props = { onClose: vi.fn(), organization: mockOrg, canEditServing: true };
+    const { rerender } = render(<EditOrganizationModal {...props} isOpen />, { wrapper: createWrapper() });
+    const checkbox = within(screen.getByRole("dialog")).getByRole("checkbox", { name: "Grant interactive" });
+    await user.click(checkbox);
+    expect(checkbox).toBeChecked();
+    await user.click(within(screen.getByRole("dialog")).getByRole("button", { name: /cancel/i }));
+    rerender(<EditOrganizationModal {...props} isOpen={false} />);
+    rerender(<EditOrganizationModal {...props} isOpen />);
+    expect(within(screen.getByRole("dialog")).getByRole("checkbox", { name: "Grant interactive" })).not.toBeChecked();
   });
 });
