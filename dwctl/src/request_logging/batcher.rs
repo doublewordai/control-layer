@@ -526,16 +526,25 @@ where
             HashMap::new()
         };
 
+        // Only these key owners can be billed by this batch. Keep general prices
+        // but avoid loading every other customer's historical deals.
+        let accounts: Vec<Uuid> = key_map
+            .values()
+            .map(|key| key.user_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+
         // Batch lookup: model alias → (model_id, provider_name, tariffs)
         let model_map = if !models.is_empty() {
-            self.batch_lookup_models_with_tariffs(tx, &models).await?
+            self.batch_lookup_models_with_tariffs(tx, &models, &accounts).await?
         } else {
             HashMap::new()
         };
 
         // Batch lookup: model alias → cache tariffs (per tier), for the cache multipliers.
         let cache_tariff_map = if !models.is_empty() {
-            self.batch_lookup_cache_tariffs(tx, &models).await?
+            self.batch_lookup_cache_tariffs(tx, &models, &accounts).await?
         } else {
             HashMap::new()
         };
@@ -575,11 +584,14 @@ where
             let (provider_name, input_price, output_price) = if let Some(ref model_alias) = raw.request_model {
                 if let Some(model_info) = model_map.get(model_alias) {
                     // Find best matching tariff
+                    // The billed account's own tariffs (an organisation's deal) come first.
                     let (input, output) = find_best_tariff(
                         &model_info.tariffs,
                         api_key_purpose.as_ref(),
                         raw.batch_completion_window.as_deref(),
                         pricing_timestamp,
+                        user_id,
+                        raw.resolved_serving_class.as_deref(),
                     );
 
                     (Some(model_info.provider_name.clone()), input, output)
@@ -599,7 +611,7 @@ where
                 .request_model
                 .as_deref()
                 .and_then(|alias| cache_tariff_map.get(alias))
-                .and_then(|rows| resolve_cache_multipliers(rows, pricing_timestamp));
+                .and_then(|rows| resolve_cache_multipliers(rows, pricing_timestamp, user_id, raw.resolved_serving_class.as_deref()));
 
             // dwctl only injects cache tokens when a tariff is active, so if no tariff was valid
             // at inference yet the response still carries cache_* tokens, those are the upstream
@@ -699,28 +711,32 @@ where
 
     /// Batch lookup model info with tariffs.
     ///
-    /// Fetches ALL tariffs (including expired ones) to support historical pricing
-    /// for batch requests that may have been created in the past.
+    /// Fetches general tariffs and the billed accounts' tariffs, including expired
+    /// versions for batch requests that may have been created in the past.
     #[tracing::instrument(skip_all)]
     async fn batch_lookup_models_with_tariffs(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         aliases: &[&str],
+        accounts: &[Uuid],
     ) -> Result<HashMap<String, ModelInfo>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
 
         struct ModelRow {
             alias: String,
             provider_name: Option<String>,
+            tariff_id: Option<Uuid>,
             tariff_purpose: Option<String>,
             tariff_valid_from: Option<DateTime<Utc>>,
             tariff_valid_until: Option<DateTime<Utc>>,
             tariff_input_price: Option<Decimal>,
             tariff_output_price: Option<Decimal>,
             tariff_completion_window: Option<String>,
+            tariff_account: Option<Uuid>,
+            tariff_class: Option<String>,
         }
 
-        // Query models with ALL their tariffs (including expired) for historical pricing
+        // Keep all historical versions within the requested account scopes.
         // Note: Column aliases use "?" suffix to force nullable for LEFT JOIN columns
         let rows: Vec<ModelRow> = sqlx::query_as!(
             ModelRow,
@@ -728,19 +744,24 @@ where
             SELECT
                 dm.alias,
                 ie.name as "provider_name?",
+                mt.id as "tariff_id?",
                 mt.api_key_purpose as "tariff_purpose?",
                 mt.valid_from as "tariff_valid_from?",
                 mt.valid_until as "tariff_valid_until?",
                 mt.input_price_per_token as "tariff_input_price?",
                 mt.output_price_per_token as "tariff_output_price?",
-                mt.completion_window as "tariff_completion_window?"
+                mt.completion_window as "tariff_completion_window?",
+                mt.user_id as "tariff_account?",
+                mt.serving_class as "tariff_class?"
             FROM deployed_models dm
             LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
             LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id
+                AND (mt.user_id IS NULL OR mt.user_id = ANY($2))
             WHERE dm.alias = ANY($1)
             ORDER BY dm.alias, mt.valid_from DESC
             "#,
-            &aliases_vec
+            &aliases_vec,
+            accounts
         )
         .fetch_all(&mut **tx)
         .await?;
@@ -754,19 +775,23 @@ where
             });
 
             // Add tariff if present
-            if let (Some(purpose), Some(valid_from), Some(input_price), Some(output_price)) = (
+            if let (Some(id), Some(purpose), Some(valid_from), Some(input_price), Some(output_price)) = (
+                row.tariff_id,
                 row.tariff_purpose,
                 row.tariff_valid_from,
                 row.tariff_input_price,
                 row.tariff_output_price,
             ) {
                 entry.tariffs.push(TariffInfo {
+                    id,
+                    serving_class: row.tariff_class,
                     purpose: parse_api_key_purpose(&purpose),
                     effective_from: valid_from,
                     valid_until: row.tariff_valid_until,
                     input_price_per_token: input_price,
                     output_price_per_token: output_price,
                     completion_window: row.tariff_completion_window,
+                    account: row.tariff_account,
                 });
             }
         }
@@ -777,17 +802,18 @@ where
 
     /// Batch lookup cache tariffs (per model, per tier) for the given aliases.
     ///
-    /// Fetches ALL rows (including expired) so batch requests price as of their creation
-    /// time, exactly like `batch_lookup_models_with_tariffs`. Models without cache tariffs
+    /// Fetches general and billed-account rows (including expired) so requests price as
+    /// of their creation time, like `batch_lookup_models_with_tariffs`. Models without cache tariffs
     /// simply don't appear (the resolver then falls back to safe defaults).
     #[tracing::instrument(skip_all)]
     async fn batch_lookup_cache_tariffs(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         aliases: &[&str],
+        accounts: &[Uuid],
     ) -> Result<HashMap<String, Vec<CacheTariffRow>>, sqlx::Error> {
         let aliases_vec: Vec<String> = aliases.iter().map(|s| s.to_string()).collect();
-        let map = crate::pricing::lookup_cache_tariffs(&mut **tx, &aliases_vec).await?;
+        let map = crate::pricing::lookup_cache_tariffs(&mut **tx, &aliases_vec, accounts).await?;
         trace!(count = map.len(), "Batch lookup cache tariffs completed");
         Ok(map)
     }
@@ -2059,6 +2085,7 @@ mod integration_tests {
                 // Capture timestamps use the host clock; PostgreSQL may run in a VM.
                 valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
                 completion_window: completion_window.map(str::to_string),
+                user_id: None,
             })
             .await
             .unwrap();
@@ -2170,6 +2197,112 @@ mod integration_tests {
         }
 
         while batcher.project_outbox_batch().await.unwrap() > 0 {}
+    }
+
+    #[sqlx::test]
+    async fn tariff_lookups_scope_accounts_without_losing_history_or_unpriced_models(pool: sqlx::PgPool) {
+        let model = create_test_model(&pool, "scoped-history").await;
+        let private_only = create_test_model(&pool, "other-account-only").await;
+        let a = create_test_user(&pool, Role::StandardUser).await.id;
+        let b = create_test_user(&pool, Role::StandardUser).await.id;
+        let other = create_test_user(&pool, Role::StandardUser).await.id;
+        let now = Utc::now();
+        let boundary = now - chrono::Duration::days(1);
+        let historical = now - chrono::Duration::days(2);
+
+        // Both expired and current versions, including bespoke class prices and
+        // an unrelated customer's deals on the same models.
+        for (account, class, cents, read) in [
+            (None, None, 1, 5),
+            (Some(a), None, 2, 4),
+            (Some(a), Some("interactive"), 3, 2),
+            (Some(b), Some("throughput"), 4, 3),
+            (Some(other), Some("interactive"), 9, 9),
+        ] {
+            for (start, end, factor) in [(now - chrono::Duration::days(3), Some(boundary), 1), (boundary, None, 10)] {
+                sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from,valid_until) VALUES ($1,$2,$3,'history','realtime',$4,$4,$5,$6)")
+                    .bind(model).bind(account).bind(class).bind(Decimal::new(cents * factor, 2)).bind(start).bind(end)
+                    .execute(&pool).await.unwrap();
+                sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,user_id,serving_class,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,read_multiplier,min_prefix_tokens,valid_from,valid_until) VALUES ($1,$2,$3,1.25,2,2.5,$4,1,$5,$6)")
+                    .bind(model).bind(account).bind(class).bind(Decimal::new(read, 1)).bind(start).bind(end)
+                    .execute(&pool).await.unwrap();
+            }
+        }
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,$2,'private','realtime',1,1)")
+            .bind(private_only).bind(other).execute(&pool).await.unwrap();
+
+        let config = crate::test::utils::create_test_config();
+        let (batcher, _writer) = AnalyticsBatcher::<crate::metrics::GenAiMetrics>::new(pool.clone(), config, None);
+        let mut tx = pool.begin().await.unwrap();
+        for (accounts, count) in [(vec![], 2), (vec![a], 6), (vec![a, b], 8)] {
+            let models = batcher
+                .batch_lookup_models_with_tariffs(&mut tx, &["scoped-history", "other-account-only"], &accounts)
+                .await
+                .unwrap();
+            assert_eq!(models["scoped-history"].tariffs.len(), count);
+            assert!(
+                models["scoped-history"]
+                    .tariffs
+                    .iter()
+                    .all(|t| t.account.is_none_or(|id| accounts.contains(&id)))
+            );
+            assert!(
+                models["other-account-only"].tariffs.is_empty(),
+                "LEFT JOIN must retain models with no applicable price"
+            );
+            let cache = batcher
+                .batch_lookup_cache_tariffs(&mut tx, &["scoped-history"], &accounts)
+                .await
+                .unwrap();
+            assert_eq!(cache["scoped-history"].len(), count);
+            assert!(
+                cache["scoped-history"]
+                    .iter()
+                    .all(|t| t.account.is_none_or(|id| accounts.contains(&id)))
+            );
+        }
+
+        // Exercise the real key-owner extraction, including a batch-purpose key,
+        // multiple accounts and an unknown key that must use general prices.
+        // The batch-purpose key needs an explicit price for its SLA, with the
+        // same historical versions so owner extraction is exercised for both.
+        for (start, end, rate) in [
+            (now - chrono::Duration::days(3), Some(boundary), Decimal::new(2, 2)),
+            (boundary, None, Decimal::new(2, 1)),
+        ] {
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,completion_window,input_price_per_token,output_price_per_token,valid_from,valid_until) VALUES ($1,$2,'batch-history','batch','24h',$3,$3,$4,$5)")
+                .bind(model).bind(a).bind(rate).bind(start).bind(end).execute(&mut *tx).await.unwrap();
+        }
+        let a_key = create_api_key_for_user(&pool, a, ApiKeyPurpose::Realtime).await;
+        let a_batch_key = create_api_key_for_user(&pool, a, ApiKeyPurpose::Batch).await;
+        let b_key = create_api_key_for_user(&pool, b, ApiKeyPurpose::Realtime).await;
+        let cases = [
+            (Some(a_key), "interactive", Some(a), Decimal::new(18, 1)),
+            (Some(a_batch_key), "standard", Some(a), Decimal::new(14, 1)),
+            (Some(b_key), "throughput", Some(b), Decimal::new(26, 1)),
+            (Some(Uuid::new_v4()), "standard", None, Decimal::new(75, 2)),
+            (None, "standard", None, Decimal::new(75, 2)),
+        ];
+        for (timestamp, factor) in [(historical, Decimal::ONE), (now, Decimal::TEN)] {
+            let records: Vec<_> = cases
+                .iter()
+                .map(|(key, class, _, _)| {
+                    let mut record = create_raw_record("scoped-history", *key, 100, 0);
+                    if *key == Some(a_batch_key) {
+                        record.batch_completion_window = Some("24h".to_string());
+                    }
+                    record.batch_created_at = Some(timestamp);
+                    record.resolved_serving_class = Some((*class).to_string());
+                    record.cache_read_input_tokens = 50;
+                    record
+                })
+                .collect();
+            let priced = batcher.enrich_batch(&mut tx, &records).await.unwrap();
+            for (record, (_, _, account, expected)) in priced.iter().zip(cases) {
+                assert_eq!(record.user_id, account);
+                assert_eq!(record.total_cost, Some(expected * factor));
+            }
+        }
     }
 
     #[sqlx::test]
@@ -2880,8 +3013,103 @@ mod integration_tests {
     }
 
     #[sqlx::test]
+    async fn playground_customer_fallback_matches_quotes_and_actual_charges(pool: sqlx::PgPool) {
+        use crate::db::handlers::Tariffs;
+        for (alias, class, rate, org_playground) in [
+            ("playground-org", None, 5, false),
+            ("playground-class", Some("interactive"), 2, true),
+            ("playground-free", None, 0, false),
+        ] {
+            let model = create_test_model(&pool, alias).await;
+            setup_tariff(&pool, model, Decimal::new(20, 6), Decimal::new(40, 6), ApiKeyPurpose::Playground).await;
+            let account = setup_user_with_balance(&pool, Decimal::from(100)).await;
+            let input = Decimal::new(rate, 6);
+            let output = input * Decimal::from(2);
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,$2,$3,'customer','realtime',$4,$5,NOW()-INTERVAL '1 hour')")
+                .bind(model).bind(account).bind(class).bind(input).bind(output).execute(&pool).await.unwrap();
+            if org_playground {
+                sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,$2,'org-playground','playground',0.000009,0.000018,NOW()-INTERVAL '1 hour')")
+                    .bind(model).bind(account).execute(&pool).await.unwrap();
+            }
+            let key = create_api_key_for_user(&pool, account, ApiKeyPurpose::Playground).await;
+            let mut record = create_raw_record(alias, Some(key), 1000, 500);
+            record.resolved_serving_class = Some("interactive".to_string());
+            run_batcher_with_records(&pool, vec![record]).await;
+            let expected = input * Decimal::from(1000) + output * Decimal::from(500);
+            let mut conn = pool.acquire().await.unwrap();
+            assert_eq!(
+                Credits::new(&mut conn).get_user_balance(account).await.unwrap(),
+                Decimal::from(100) - expected,
+                "{alias}"
+            );
+            let cost: Option<Decimal> = sqlx::query_scalar("SELECT total_cost FROM http_analytics WHERE api_key_id=$1")
+                .bind(key)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(cost, Some(expected), "zero is a price, not unresolved: {alias}");
+            let mut repo = Tariffs::new(&mut conn);
+            assert_eq!(
+                repo.get_effective_pricing_at_timestamp(model, Some(account), "playground", None, Some("interactive"), Utc::now())
+                    .await
+                    .unwrap(),
+                Some((input, output))
+            );
+            let quotes = repo.list_effective_for_account(&[model], account).await.unwrap();
+            assert!(
+                quotes.iter().all(|q| q.user_id == Some(account)),
+                "general playground must not bypass an account deal"
+            );
+            assert!(quotes.iter().all(|q| q.serving_class.is_none()));
+            if class.is_none() {
+                assert!(
+                    quotes
+                        .iter()
+                        .any(|q| q.api_key_purpose == Some(ApiKeyPurpose::Realtime) && q.input_price_per_token == input)
+                );
+            } else {
+                assert!(
+                    quotes.iter().all(|q| q.input_price_per_token != input),
+                    "class billing is intentionally absent from catalogue quotes"
+                );
+            }
+            let paid: bool = sqlx::query_scalar("SELECT model_has_effective_paid_tariff($1,$2,'playground')")
+                .bind(model)
+                .bind(account)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                paid,
+                rate > 0,
+                "price helper must respect a zero all-class customer fallback: {alias}"
+            );
+        }
+    }
+
+    #[sqlx::test]
+    async fn realtime_org_deal_leaves_batch_charges_at_the_model_batch_price(pool: sqlx::PgPool) {
+        let model = create_test_model(&pool, "purpose-isolation").await;
+        setup_tariff(&pool, model, Decimal::new(10, 6), Decimal::new(20, 6), ApiKeyPurpose::Realtime).await;
+        setup_tariff(&pool, model, Decimal::new(1, 6), Decimal::new(2, 6), ApiKeyPurpose::Batch).await;
+        let account = setup_user_with_balance(&pool, Decimal::from(100)).await;
+        sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,$2,'deal','realtime',0.000005,0.000010)").bind(model).bind(account).execute(&pool).await.unwrap();
+        let key = create_api_key_for_user(&pool, account, ApiKeyPurpose::Batch).await;
+        let mut record = create_raw_record("purpose-isolation", Some(key), 1000, 500);
+        record.batch_completion_window = Some("24h".to_string());
+        run_batcher_with_records(&pool, vec![record]).await;
+        let mut conn = pool.acquire().await.unwrap();
+        let balance = Credits::new(&mut conn).get_user_balance(account).await.unwrap();
+        assert_eq!(
+            balance,
+            Decimal::from(100) - Decimal::new(2, 3),
+            "charge the model's 24h batch rate, not the customer's realtime rate"
+        );
+    }
+
+    #[sqlx::test]
     #[test_log::test]
-    async fn test_batcher_fallback_to_realtime_when_batch_tariff_missing(pool: sqlx::PgPool) {
+    async fn test_batcher_charges_realtime_when_all_batch_scopes_are_missing(pool: sqlx::PgPool) {
         // Setup: Create model with ONLY realtime tariff
         let model_id = create_test_model(&pool, "gpt-4-fallback-test").await;
         let realtime_input = Decimal::from_str("0.00015").unwrap();
@@ -2898,19 +3126,18 @@ mod integration_tests {
         // Run batcher
         run_batcher_with_records(&pool, vec![record]).await;
 
-        // Expected: Should fall back to realtime pricing
-        // Cost: (1000 * 0.00015) + (500 * 0.00030) = 0.15 + 0.15 = 0.30
-        let expected_cost = Decimal::from_str("0.30").unwrap();
-
-        // Verify
         let mut conn = pool.acquire().await.unwrap();
         let mut credits = Credits::new(&mut conn);
-        let final_balance = credits.get_user_balance(user_id).await.unwrap();
-        let expected_balance = Decimal::from_str("100.00").unwrap() - expected_cost;
         assert_eq!(
-            final_balance, expected_balance,
-            "Batch request should fall back to realtime pricing"
+            credits.get_user_balance(user_id).await.unwrap(),
+            Decimal::from(100) - Decimal::new(3, 1),
+            "Missing batch pricing uses the final realtime safety net"
         );
+        let cost: Option<Decimal> = sqlx::query_scalar("SELECT total_cost FROM http_analytics WHERE model='gpt-4-fallback-test'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(cost, Some(Decimal::new(3, 1)), "analytics and balance use the same fallback charge");
     }
 
     #[sqlx::test]
@@ -3197,6 +3424,62 @@ mod integration_tests {
                 break;
             }
         }
+    }
+
+    #[sqlx::test]
+    async fn organization_class_charges_fold_into_the_owning_keys_cap(pool: sqlx::PgPool) {
+        use crate::db::handlers::api_keys::ApiKeys;
+        let model = create_test_model(&pool, "org-class-cap").await;
+        setup_tariff(&pool, model, Decimal::new(10, 6), Decimal::new(20, 6), ApiKeyPurpose::Realtime).await;
+        setup_tariff(&pool, model, Decimal::new(1, 6), Decimal::new(2, 6), ApiKeyPurpose::Batch).await;
+        let account = setup_user_with_balance(&pool, Decimal::from(100)).await;
+        sqlx::query("UPDATE users SET user_type='organization' WHERE id=$1")
+            .bind(account)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let creator = setup_user_with_balance(&pool, Decimal::from(100)).await;
+        let parent = create_api_key_for_user(&pool, account, ApiKeyPurpose::Realtime).await;
+        sqlx::query("UPDATE api_keys SET created_by=$2,spend_limit=0.02 WHERE id=$1")
+            .bind(parent)
+            .bind(creator)
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (class, price) in [(None, Decimal::new(2, 6)), (Some("interactive"), Decimal::new(9, 6))] {
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose) VALUES ($1,$2,$3,'org-price',$4,$4,'realtime')").bind(model).bind(account).bind(class).bind(price).execute(&pool).await.unwrap();
+        }
+        let child = {
+            let mut conn = pool.acquire().await.unwrap();
+            ApiKeys::new(&mut conn).get_or_create_child_hidden_key(parent).await.unwrap().1
+        };
+        let mut realtime = create_raw_record("org-class-cap", Some(parent), 1000, 500);
+        realtime.resolved_serving_class = Some("interactive".into());
+        let mut batch = create_raw_record("org-class-cap", Some(child), 1000, 500);
+        batch.batch_completion_window = Some("24h".into());
+        batch.resolved_serving_class = Some("standard".into());
+        run_batcher_with_records(&pool, vec![realtime, batch]).await;
+        // Class realtime: .0135; model batch: .002. Display's all-class .003
+        // realtime amount must never be substituted in billing or cap accounting.
+        let expected = Decimal::new(155, 4);
+        let mut conn = pool.acquire().await.unwrap();
+        assert_eq!(
+            Credits::new(&mut conn).get_user_balance(account).await.unwrap(),
+            Decimal::from(100) - expected
+        );
+        assert_eq!(Credits::new(&mut conn).get_user_balance(creator).await.unwrap(), Decimal::from(100));
+        let rows: Vec<(Uuid, Decimal, Decimal)> =
+            sqlx::query_as("SELECT api_key_id,total_spend,window_spend FROM api_key_spend_checkpoints")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, vec![(parent, expected, expected)]);
+        let billed_accounts: Vec<Uuid> =
+            sqlx::query_scalar("SELECT DISTINCT user_id FROM credits_transactions WHERE transaction_type='usage'")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(billed_accounts, vec![account]);
     }
 
     /// Mixed flush across a cap scope: the parent's realtime row and the

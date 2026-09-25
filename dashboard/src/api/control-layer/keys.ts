@@ -31,6 +31,8 @@ export const queryKeys = {
       ["models", "byId", modelId, "components"] as const,
     cachePricing: (modelId: string) =>
       ["models", "byId", modelId, "cachePricing"] as const,
+    overlays: (modelId: string) =>
+      ["models", "byId", modelId, "overlays"] as const,
     // Separate metrics query for lazy loading
     metrics: (options?: {
       skip?: number;
@@ -165,6 +167,7 @@ export const queryKeys = {
     query: (options?: { skip?: number; limit?: number; search?: string; include?: string }) =>
       ["organizations", "query", options] as const,
     byId: (id: string) => ["organizations", "byId", id] as const,
+    serving: (id: string) => ["organizations", "serving", id] as const,
     members: (orgId: string) =>
       ["organizations", "members", orgId] as const,
   },

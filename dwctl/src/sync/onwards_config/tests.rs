@@ -1504,6 +1504,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             api_key_purpose: None,
             completion_window: None,
             valid_from: None,
+            user_id: None,
         })
         .await
         .unwrap();
@@ -2295,6 +2296,311 @@ async fn test_deleted_keys_excluded_from_deployment_lookup(pool: sqlx::PgPool) {
                 .await
                 .unwrap();
             assert_eq!(keys.is_empty(), deleted, "deployment {id}: deleted={deleted}");
+        }
+    }
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_balance_user_a_positive")))]
+async fn organisation_prices_gate_balance_and_capped_root_and_child(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+    let owner: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
+    let key_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret=$1")
+        .bind(KEY_A_SECRET)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let child = {
+        let mut db = pool.acquire().await.unwrap();
+        ApiKeys::new(&mut db).get_or_create_child_hidden_key(key_id).await.unwrap().0
+    };
+    // These aliases are generally free: only this customer's deal is paid.
+    sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose) SELECT id,$1,'org-paid',1,1,'realtime' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
+        .bind(owner).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window) SELECT id,$1,'org-paid-batch',1,1,'batch','24h' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
+        .bind(owner).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE user_balance_checkpoints SET balance=0 WHERE user_id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let tiers = RateLimitTiersConfig::default();
+    for phase in 0..5 {
+        match phase {
+            1 => {
+                sqlx::query("UPDATE user_balance_checkpoints SET balance=10 WHERE user_id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            2 => {
+                sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE id=$1")
+                    .bind(key_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO api_key_spend_checkpoints(api_key_id,total_spend,window_spend) VALUES ($1,1,1)")
+                    .bind(key_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            3 => {
+                sqlx::query("UPDATE model_tariffs SET input_price_per_token=0,output_price_per_token=0 WHERE user_id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            4 => {
+                // Deleting the owner does not itself delete its keys. Do not
+                // drop its paid deal and accidentally use a free model fallback.
+                sqlx::query("UPDATE model_tariffs SET input_price_per_token=1,output_price_per_token=1 WHERE user_id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE users SET is_deleted=true WHERE id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let allowed = phase == 1 || phase == 3;
+        let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+        for alias in ["regular-public", "composite-priority"] {
+            let target = targets.targets.get(alias).unwrap();
+            assert_eq!(pool_has_key(target.value(), KEY_A_SECRET), allowed, "root {alias} phase {phase}");
+            assert_eq!(pool_has_key(target.value(), &child), allowed, "child {alias} phase {phase}");
+        }
+        let model: uuid::Uuid = sqlx::query_scalar("SELECT id FROM deployed_models WHERE alias='regular-public'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mut db = pool.acquire().await.unwrap();
+        let keys = ApiKeys::new(&mut db)
+            .get_api_keys_for_deployment_with_sufficient_credit(model)
+            .await
+            .unwrap();
+        // This repository method covers balance only; Onwards also applies the
+        // spend cap and deleted-owner guard checked above.
+        assert_eq!(keys.iter().any(|key| key.secret == KEY_A_SECRET), phase != 0);
+    }
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn deleted_accounts_lose_free_and_unpriced_targets(pool: sqlx::PgPool) {
+    let tiers = RateLimitTiersConfig::default();
+    let before = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    for alias in ["regular-public", "composite-priority"] {
+        assert!(pool_has_key(before.targets.get(alias).unwrap().value(), KEY_A_SECRET), "{alias}");
+    }
+    // Deliberately leave the key active: sync must defend independently of the
+    // normal soft-delete handler, including free models' balance bypass.
+    sqlx::query("UPDATE users SET is_deleted=true WHERE username='cache_user_a'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let after = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+    for alias in ["regular-public", "composite-priority"] {
+        assert!(!pool_has_key(after.targets.get(alias).unwrap().value(), KEY_A_SECRET), "{alias}");
+    }
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_balance_user_a_positive")))]
+async fn zero_customer_deals_on_paid_models_do_not_bypass_credit_or_caps(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+    let owner: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
+    let key_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM api_keys WHERE secret=$1")
+        .bind(KEY_A_SECRET)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let child = {
+        let mut db = pool.acquire().await.unwrap();
+        ApiKeys::new(&mut db).get_or_create_child_hidden_key(key_id).await.unwrap().0
+    };
+    // A generally paid model stays credit-gated even when this customer's
+    // all-class or class-specific deal is zero.
+    sqlx::query("INSERT INTO model_tariffs(deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose) SELECT id,'general-paid',2,2,'realtime' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,serving_class,name,input_price_per_token,output_price_per_token,api_key_purpose) SELECT id,$1,'interactive','free-interactive',0,0,'realtime' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
+        .bind(owner).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose) SELECT id,$1,'org-paid',1,1,'realtime' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
+        .bind(owner).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose,completion_window) SELECT id,$1,'org-paid-batch',1,1,'batch','24h' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
+        .bind(owner).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE user_balance_checkpoints SET balance=0 WHERE user_id=$1")
+        .bind(owner)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let tiers = RateLimitTiersConfig::default();
+    for phase in 0..8 {
+        match phase {
+            1 => {
+                sqlx::query("UPDATE user_balance_checkpoints SET balance=10 WHERE user_id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            2 => {
+                sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE id=$1")
+                    .bind(key_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO api_key_spend_checkpoints(api_key_id,total_spend,window_spend) VALUES ($1,1,1)")
+                    .bind(key_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            3 => {
+                sqlx::query("UPDATE model_tariffs SET input_price_per_token=0,output_price_per_token=0 WHERE user_id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            4 => {
+                // Account deletion must revoke still-active keys too.
+                sqlx::query("UPDATE users SET is_deleted=true WHERE id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            5 => {
+                // A free deal still needs credit even after removing the key cap.
+                sqlx::query("UPDATE users SET is_deleted=false WHERE id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE api_keys SET spend_limit=NULL WHERE id=$1")
+                    .bind(key_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE user_balance_checkpoints SET balance=-10 WHERE user_id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            6 => {
+                sqlx::query("INSERT INTO user_feature_flags(user_id,feature_flag,enabled) VALUES ($1,'ALLOW_NEGATIVE_BALANCE',true)")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            7 => {
+                // Invoice billing bypasses account credit, never a key's own cap.
+                sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE id=$1")
+                    .bind(key_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let allowed = phase == 1 || phase == 6;
+        let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+        for alias in ["regular-public", "composite-priority"] {
+            let target = targets.targets.get(alias).unwrap();
+            assert_eq!(pool_has_key(target.value(), KEY_A_SECRET), allowed, "root {alias} phase {phase}");
+            assert_eq!(pool_has_key(target.value(), &child), allowed, "child {alias} phase {phase}");
+            if phase >= 3 {
+                let price: rust_decimal::Decimal = sqlx::query_scalar(
+                    "SELECT t.input_price_per_token FROM deployed_models m CROSS JOIN LATERAL effective_model_tariff(m.id,$1,'realtime',NULL,'standard',NOW()) t WHERE m.alias=$2"
+                ).bind(owner).bind(alias).fetch_one(&pool).await.unwrap();
+                assert_eq!(price, rust_decimal::Decimal::ZERO, "admission must not change the agreed price");
+            }
+        }
+        let model: uuid::Uuid = sqlx::query_scalar("SELECT id FROM deployed_models WHERE alias='regular-public'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let mut db = pool.acquire().await.unwrap();
+        let keys = ApiKeys::new(&mut db)
+            .get_api_keys_for_deployment_with_sufficient_credit(model)
+            .await
+            .unwrap();
+        // This repository method covers balance only; Onwards also applies the
+        // spend cap and deleted-owner guard checked above.
+        assert_eq!(keys.iter().any(|key| key.secret == KEY_A_SECRET), !matches!(phase, 0 | 5));
+    }
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_user_b_in_private_group")))]
+async fn generally_free_models_ignore_other_accounts_paid_deals(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+    let owner: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
+    let tiers = RateLimitTiersConfig::default();
+    // Exhausted keys and zero balances retain access to generally free models.
+    sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE secret IN ($1,$2)")
+        .bind(KEY_A_SECRET)
+        .bind(KEY_B_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO api_key_spend_checkpoints(api_key_id,total_spend,window_spend) SELECT id,1,1 FROM api_keys WHERE secret IN ($1,$2)",
+    )
+    .bind(KEY_A_SECRET)
+    .bind(KEY_B_SECRET)
+    .execute(&pool)
+    .await
+    .unwrap();
+    for phase in 0..4 {
+        match phase {
+            1 => {
+                sqlx::query("INSERT INTO model_tariffs(deployed_model_id,name,input_price_per_token,output_price_per_token,api_key_purpose) SELECT id,'general-free',0,0,'realtime' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
+                    .execute(&pool).await.unwrap();
+            }
+            2 => {
+                // A finite, currently valid paid deal must only restrict its owner.
+                sqlx::query("INSERT INTO model_tariffs(deployed_model_id,user_id,name,input_price_per_token,output_price_per_token,api_key_purpose,valid_from,valid_until) SELECT id,$1,'own-paid',1,1,'realtime',NOW()-INTERVAL '1 hour',NOW()+INTERVAL '1 hour' FROM deployed_models WHERE alias IN ('regular-public','composite-priority')")
+                    .bind(owner).execute(&pool).await.unwrap();
+            }
+            3 => {
+                sqlx::query("UPDATE model_tariffs SET valid_until=NOW() WHERE user_id=$1")
+                    .bind(owner)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            _ => {}
+        }
+        let targets = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
+        for alias in ["regular-public", "composite-priority"] {
+            let target = targets.targets.get(alias).unwrap();
+            assert_eq!(
+                pool_has_key(target.value(), KEY_A_SECRET),
+                phase != 2,
+                "deal owner {alias}: phase {phase}"
+            );
+            assert!(
+                pool_has_key(target.value(), KEY_B_SECRET),
+                "another account's deal must not restrict {alias}"
+            );
+            let model: uuid::Uuid = sqlx::query_scalar("SELECT id FROM deployed_models WHERE alias=$1")
+                .bind(alias)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let mut conn = pool.acquire().await.unwrap();
+            let keys = ApiKeys::new(&mut conn)
+                .get_api_keys_for_deployment_with_sufficient_credit(model)
+                .await
+                .unwrap();
+            assert_eq!(keys.iter().any(|k| k.secret == KEY_A_SECRET), phase != 2);
+            assert!(keys.iter().any(|k| k.secret == KEY_B_SECRET));
         }
     }
 }

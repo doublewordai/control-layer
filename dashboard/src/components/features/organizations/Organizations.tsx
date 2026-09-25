@@ -113,6 +113,8 @@ export function Organizations() {
         isOpen={!!editingOrg}
         onClose={() => setEditingOrg(null)}
         organization={editingOrg}
+        canEditServing={isPlatformManager}
+        canEditZdr={isPlatformManager}
       />
 
       <Dialog

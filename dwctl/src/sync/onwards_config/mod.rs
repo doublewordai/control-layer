@@ -668,6 +668,8 @@ struct OnwardsCompositeModel {
 }
 
 /// Loads composite models with their components and API keys from the database
+/// General paid admission deliberately includes future/internal-purpose open-ended
+/// tariffs, preserving existing free-model access rules independently of billing.
 #[tracing::instrument(skip(db, escalation_models))]
 async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]) -> Result<Vec<OnwardsCompositeModel>, anyhow::Error> {
     debug!(
@@ -780,7 +782,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     AND cm.alias = ANY($1::text[])
                 )
             )
-            -- Require positive balance, a contracted account, or a free model.
+            -- General free-model access is preserved; a zero customer deal does not make a paid model free.
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
                 -- Positive balance read directly from the total
@@ -802,22 +804,31 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
                 )))
                 OR (
+                    -- Keep the legacy general-tariff rule; only this account's
+                    -- positive deal can require credit on an otherwise free model.
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = cm.id
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL
                           AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id = ak.user_id
+                          AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     )
                 )
             )
+            -- Account deletion revokes access independently of key deletion.
+            AND (ak.user_id = '00000000-0000-0000-0000-000000000000' OR u.is_deleted = false)
             AND ak.is_deleted = false
             -- Spending-cap gate: exclude every key of a cap scope (the capped
             -- root and its hidden batch child alike) once the scope's
             -- CALENDAR-ALIGNED (UTC, non-rolling) window spend has reached the
             -- root's limit. Guarded so the uncapped majority short-circuits on
-            -- the first branch; the subquery is two PK probes. Free models
-            -- stay usable on an exhausted scope, mirroring the balance gate's
-            -- free-model arm. Un-capping needs no job or traffic: the
+            -- the first branch; the subquery is two PK probes. Generally free
+            -- models remain usable, but zero customer deals do not bypass caps
+            -- on paid models. Un-capping needs no job or traffic: the
             -- window-membership check (shared function, migration 123) turns
             -- false at the calendar boundary and the periodic fallback sync
             -- readmits the keys.
@@ -831,12 +842,17 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                       AND root.spend_limit IS NOT NULL
                       AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
                       AND ck.window_spend >= root.spend_limit
-                      AND EXISTS (
-                          SELECT 1 FROM model_tariffs mt
-                          WHERE mt.deployed_model_id = cm.id
-                            AND mt.valid_until IS NULL
-                            AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
-                      )
+                      AND (EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL
+                          AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      ) OR EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id = ak.user_id
+                          AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      ))
                 )
             )
             -- Inference data plane only: platform (management) keys must never
@@ -1521,6 +1537,7 @@ fn convert_to_config_file(
 }
 
 /// Loads the current targets configuration from the database (including composite models)
+/// General paid admission retains the same legacy tariff rule as composite loading.
 ///
 /// `escalation_models` - Model aliases that batch API keys should have automatic access to.
 /// This enables batch processing to route requests to escalation models without needing
@@ -1618,6 +1635,7 @@ pub async fn load_targets_from_db(
                     AND dm.alias = ANY($1::text[])
                 )
             )
+            -- General free-model access is preserved; a zero customer deal does not make a paid model free.
             AND (
                 ak.user_id = '00000000-0000-0000-0000-000000000000'
                 -- Positive balance read directly from the total
@@ -1639,22 +1657,31 @@ pub async fn load_targets_from_db(
                     WHERE ub.user_id = ak.user_id AND ub.balance > 0
                 )))
                 OR (
+                    -- Keep the legacy general-tariff rule; only this account's
+                    -- positive deal can require credit on an otherwise free model.
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
                           AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                    ) AND NOT EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                          AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     )
                 )
             )
+            -- Account deletion revokes access independently of key deletion.
+            AND (ak.user_id = '00000000-0000-0000-0000-000000000000' OR u.is_deleted = false)
             AND ak.is_deleted = false
             -- Spending-cap gate: exclude every key of a cap scope (the capped
             -- root and its hidden batch child alike) once the scope's
             -- CALENDAR-ALIGNED (UTC, non-rolling) window spend has reached the
             -- root's limit. Guarded so the uncapped majority short-circuits on
-            -- the first branch; the subquery is two PK probes. Free models
-            -- stay usable on an exhausted scope, mirroring the balance gate's
-            -- free-model arm. Un-capping needs no job or traffic: the
+            -- the first branch; the subquery is two PK probes. Generally free
+            -- models remain usable, but zero customer deals do not bypass caps
+            -- on paid models. Un-capping needs no job or traffic: the
             -- window-membership check (shared function, migration 123) turns
             -- false at the calendar boundary and the periodic fallback sync
             -- readmits the keys.
@@ -1668,12 +1695,17 @@ pub async fn load_targets_from_db(
                       AND root.spend_limit IS NOT NULL
                       AND api_key_cap_window_current(ck.window_started_at, root.spend_limit_interval)
                       AND ck.window_spend >= root.spend_limit
-                      AND EXISTS (
-                          SELECT 1 FROM model_tariffs mt
-                          WHERE mt.deployed_model_id = dm.id
-                            AND mt.valid_until IS NULL
-                            AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
-                      )
+                      AND (EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                          AND mt.valid_until IS NULL
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      ) OR EXISTS (
+                        SELECT 1 FROM model_tariffs mt
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                          AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
+                          AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                      ))
                 )
             )
             -- Inference data plane only: platform (management) keys must never

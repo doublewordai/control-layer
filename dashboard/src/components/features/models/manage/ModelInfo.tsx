@@ -19,7 +19,6 @@ import {
   useModel,
   useEndpoint,
   useUpdateModel,
-  useModelCachePricing,
   useProbes,
   useModelComponents,
   useDaemons,
@@ -35,7 +34,6 @@ import type {
 import {
   useAuthorization,
   isPlaygroundDenied,
-  getTariffDisplayName,
   copyToClipboard,
 } from "../../../../utils";
 import {
@@ -47,6 +45,7 @@ import {
 } from "../../../modals";
 import UserUsageTable from "./UserUsageTable";
 import ModelProbes from "./ModelProbes";
+import { ModelPricing } from "./ModelPricing";
 import ProvidersTab from "./ProvidersTab";
 import {
   Card,
@@ -238,14 +237,6 @@ const ModelInfo: React.FC = () => {
     isLoading: modelLoading,
     error: modelError,
   } = useModel(modelId!, { include: includeParam });
-
-  // Cache pricing is fetched separately (admin-only endpoint), not via the model include.
-  // Gated on `manage-models` to mirror the backend's `Models:UpdateAll` gate (the same one
-  // that guards base-price edits) rather than the incidental `manage-groups` proxy.
-  const { data: cachePricing, isLoading: cachePricingLoading } =
-    useModelCachePricing(modelId!, {
-      enabled: !!modelId && canManageModels,
-    });
 
   const {
     data: endpoint,
@@ -2464,180 +2455,14 @@ const ModelInfo: React.FC = () => {
                         </div>
                       )}
 
-                      {/* Pricing Display - visible to all users when billing is enabled */}
-                      {
-                        <div className="border-t pt-6">
-                          <div className="flex items-center justify-between mb-3">
-                            <div className="flex items-center gap-1">
-                              <p className="text-sm text-gray-600">
-                                Pricing Tariffs
-                              </p>
-                              {canManageGroups && (
-                                <InfoTip>
-                                  <p className="text-sm text-muted-foreground">
-                                    Pricing tiers for different API key
-                                    purposes. Set different rates for realtime,
-                                    batch, and playground usage. Click "Manage
-                                    Tariffs" to configure pricing.
-                                  </p>
-                                </InfoTip>
-                              )}
-                            </div>
-                            {canManageGroups && (
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                onClick={() => setShowPricingModal(true)}
-                                className="h-8"
-                              >
-                                <Edit className="h-3 w-3 mr-1" />
-                                Manage Tariffs
-                              </Button>
-                            )}
-                          </div>
-                          {model.tariffs && model.tariffs.length > 0 ? (
-                            <div className="space-y-3">
-                              {model.tariffs.map((tariff) => (
-                                <div
-                                  key={tariff.id}
-                                  className="bg-gray-50 rounded-lg p-3"
-                                >
-                                  <div className="flex items-center gap-2 mb-2">
-                                    <p className="font-medium text-sm">
-                                      {getTariffDisplayName(
-                                        tariff.api_key_purpose,
-                                        tariff.completion_window,
-                                      )}
-                                    </p>
-                                    <span className="text-xs text-gray-500 ml-auto">
-                                      Valid from{" "}
-                                      {new Date(
-                                        tariff.valid_from,
-                                      ).toLocaleString()}
-                                    </span>
-                                  </div>
-                                  <div className="grid grid-cols-2 gap-4 text-sm">
-                                    <div>
-                                      <p className="text-xs text-gray-500">
-                                        Input (per 1M tokens)
-                                      </p>
-                                      <p className="font-medium">
-                                        $
-                                        {(
-                                          parseFloat(
-                                            tariff.input_price_per_token,
-                                          ) * 1000000
-                                        ).toFixed(2)}
-                                      </p>
-                                    </div>
-                                    <div>
-                                      <p className="text-xs text-gray-500">
-                                        Output (per 1M tokens)
-                                      </p>
-                                      <p className="font-medium">
-                                        $
-                                        {(
-                                          parseFloat(
-                                            tariff.output_price_per_token,
-                                          ) * 1000000
-                                        ).toFixed(2)}
-                                      </p>
-                                    </div>
-                                  </div>
-                                </div>
-                              ))}
-                            </div>
-                          ) : (
-                            <p className="text-sm text-gray-500 mt-2">
-                              No tariffs configured.
-                              {canManageGroups &&
-                                ' Click "Manage Tariffs" to set up pricing.'}
-                            </p>
-                          )}
-                        </div>
-                      }
-                      {/* Cache Pricing Display (admin-only; data via the dedicated endpoint) */}
-                      {canManageModels && (
-                        <div className="border-t pt-6">
-                          <div className="flex items-center justify-between mb-3">
-                            <div className="flex items-center gap-1">
-                              <p className="text-sm text-gray-600">
-                                Cache Pricing
-                              </p>
-                              <InfoTip>
-                                <p className="text-sm text-muted-foreground">
-                                  Anthropic-style prompt-cache pricing: per-TTL
-                                  write multipliers (5m / 1h / 24h), the read
-                                  multiplier, and the minimum cacheable prefix.
-                                </p>
-                              </InfoTip>
-                            </div>
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              onClick={() => setShowCachePricingModal(true)}
-                              className="h-8"
-                            >
-                              <Edit className="h-3 w-3 mr-1" />
-                              {cachePricing?.enabled ? "Edit" : "Configure"}
-                            </Button>
-                          </div>
-                          {cachePricingLoading ? (
-                            <p className="text-sm text-gray-500 mt-2">
-                              Loading cache pricing...
-                            </p>
-                          ) : cachePricing?.enabled ? (
-                            <div className="bg-gray-50 rounded-lg p-3">
-                              <div className="grid grid-cols-2 gap-4 text-sm">
-                                <div>
-                                  <p className="text-xs text-gray-500">
-                                    Write 5m
-                                  </p>
-                                  <p className="font-medium">
-                                    {cachePricing.write_multiplier_5m ?? "—"}×
-                                  </p>
-                                </div>
-                                <div>
-                                  <p className="text-xs text-gray-500">
-                                    Write 1h
-                                  </p>
-                                  <p className="font-medium">
-                                    {cachePricing.write_multiplier_1h ?? "—"}×
-                                  </p>
-                                </div>
-                                <div>
-                                  <p className="text-xs text-gray-500">
-                                    Write 24h
-                                  </p>
-                                  <p className="font-medium">
-                                    {cachePricing.write_multiplier_24h ?? "—"}×
-                                  </p>
-                                </div>
-                                <div>
-                                  <p className="text-xs text-gray-500">Read</p>
-                                  <p className="font-medium">
-                                    {cachePricing.read_multiplier ?? "—"}×
-                                  </p>
-                                </div>
-                                <div>
-                                  <p className="text-xs text-gray-500">
-                                    Min prefix tokens
-                                  </p>
-                                  <p className="font-medium">
-                                    {cachePricing.min_prefix_tokens?.toLocaleString() ??
-                                      "—"}
-                                  </p>
-                                </div>
-                              </div>
-                            </div>
-                          ) : (
-                            <p className="text-sm text-gray-500 mt-2">
-                              Cache pricing not configured. Click "Configure" to
-                              enable.
-                            </p>
-                          )}
-                        </div>
-                      )}
+                      <ModelPricing
+                        key={`${model.id}:${searchParams.get("pricing_org") ?? "general"}`}
+                        model={model}
+                        manager={canManageModels}
+                        initialOrganization={searchParams.get("pricing_org") ?? undefined}
+                        onEditPrices={() => setShowPricingModal(true)}
+                        onEditCache={() => setShowCachePricingModal(true)}
+                      />
 
                       {/* Rate Limiting & Capacity Display - only show for Platform Managers */}
                       {canManageGroups &&

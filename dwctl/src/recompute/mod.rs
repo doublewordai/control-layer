@@ -147,7 +147,10 @@ pub async fn recompute_corpus(
     let mut aliases: Vec<String> = corpus.iter().filter_map(|r| r.model.clone()).collect();
     aliases.sort();
     aliases.dedup();
-    let cache_tariffs = crate::pricing::lookup_cache_tariffs(pool, &aliases).await?;
+    let mut accounts: Vec<_> = corpus.iter().filter_map(|r| r.user_id).collect();
+    accounts.sort();
+    accounts.dedup();
+    let cache_tariffs = crate::pricing::lookup_cache_tariffs(pool, &aliases, &accounts).await?;
     // Rows that recorded cache tokens but whose tariff history no longer resolves (e.g. the
     // deployed model was deleted, cascading its tariffs away). Those re-price at list rate,
     // which is NOT what the live path charged — the report must say so rather than present
@@ -225,7 +228,14 @@ pub async fn recompute_corpus(
                     .model
                     .as_deref()
                     .and_then(|alias| cache_tariffs.get(alias))
-                    .and_then(|versions| crate::pricing::resolve_cache_multipliers(versions, row.pricing_timestamp()));
+                    .and_then(|versions| {
+                        crate::pricing::resolve_cache_multipliers(
+                            versions,
+                            row.pricing_timestamp(),
+                            row.user_id,
+                            row.resolved_serving_class.as_deref(),
+                        )
+                    });
                 rows_tariff_unresolvable_count(row, &cache_mults);
                 let cost = price(row, &usage, cache_mults);
                 let mut report_row = report::ReportRow::replayed(row, &usage, cost);
@@ -268,7 +278,14 @@ pub async fn recompute_corpus(
                             .model
                             .as_deref()
                             .and_then(|alias| cache_tariffs.get(alias))
-                            .and_then(|versions| crate::pricing::resolve_cache_multipliers(versions, row.pricing_timestamp()));
+                            .and_then(|versions| {
+                                crate::pricing::resolve_cache_multipliers(
+                                    versions,
+                                    row.pricing_timestamp(),
+                                    row.user_id,
+                                    row.resolved_serving_class.as_deref(),
+                                )
+                            });
                         rows_tariff_unresolvable_count(row, &cache_mults);
                         let cost = price(row, &usage, cache_mults);
                         let mut report_row = report::ReportRow::replayed(row, &usage, cost);

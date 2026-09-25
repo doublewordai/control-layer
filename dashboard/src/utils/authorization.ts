@@ -193,15 +193,21 @@ export function useAuthorization() {
     }
 
     const userRoles = currentUser.roles;
+    // Legacy admins are authorized by the backend even without an explicit
+    // PlatformManager role. Keep stored roles unchanged; derive UI capabilities.
+    const permissionRoles: Role[] = currentUser.is_admin
+      ? [...userRoles, "PlatformManager"]
+      : userRoles;
 
     return {
       isLoading,
-      userRoles,
+      // Consumers also use userRoles for feature gates inside protected pages.
+      userRoles: permissionRoles,
       hasPermission: (permission: PagePermission) =>
-        hasPermission(userRoles, permission),
-      canAccessRoute: (path: string) => canAccessRoute(userRoles, path, config),
+        hasPermission(permissionRoles, permission),
+      canAccessRoute: (path: string) => canAccessRoute(permissionRoles, path, config),
       getFirstAccessibleRoute: (): string =>
-        getFirstAccessibleRoute(userRoles, config),
+        getFirstAccessibleRoute(permissionRoles, config),
     };
   }, [config, currentUser, isLoading]);
 

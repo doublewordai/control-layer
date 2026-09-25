@@ -47,6 +47,11 @@ pub struct DeployedModelEnricher<'a> {
     pub can_read_rate_limits: bool,
     /// Whether the user can read who created models
     pub can_read_users: bool,
+    /// The account the caller is billed to (their active organisation, else themselves).
+    /// A customer's pricing view is the EFFECTIVE one: their organisation's own rows
+    /// where they exist, the general rows otherwise. Platform managers (`can_read_pricing`)
+    /// see every scope instead, each organisation row marked with its `organization_id`.
+    pub pricing_account: Option<crate::types::UserId>,
     /// Whether the user can read composite model information (is_composite, lb_strategy, fallback, components)
     pub can_read_composite_info: bool,
 }
@@ -155,27 +160,62 @@ impl<'a> DeployedModelEnricher<'a> {
                 if self.include_pricing {
                     use crate::{api::models::tariffs::TariffResponse, db::handlers::Tariffs};
 
-                    let mut tariffs_map: HashMap<DeploymentId, Vec<TariffResponse>> = HashMap::new();
+                    let mut tariffs_map: HashMap<DeploymentId, Vec<TariffResponse>> =
+                        model_ids.iter().map(|id| (*id, Vec::new())).collect();
 
-                    for model_id in &model_ids {
-                        let mut tariffs_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into())).ok()?;
+                    if self.can_read_pricing {
+                        let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+                        let tariffs = Tariffs::new(&mut conn).list_current_all_scopes_bulk(&model_ids).await?;
+                        for tariff in tariffs {
+                            tariffs_map
+                                .entry(tariff.deployed_model_id)
+                                .or_default()
+                                .push(TariffResponse::from(tariff));
+                        }
+                    } else if let Some(account) = self.pricing_account {
+                        // Customer catalogue prices exclude class-specific deals.
+                        let mut tariffs_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
                         let mut tariffs_repo = Tariffs::new(&mut tariffs_conn);
-
-                        if let Ok(tariffs) = tariffs_repo.list_current_by_model(*model_id).await {
+                        let tariffs = tariffs_repo.list_effective_for_account(&model_ids, account).await?;
+                        for tariff in tariffs {
+                            let mut response = TariffResponse::from(tariff);
+                            // Effective amounts are public; deal ownership and
+                            // serving-class configuration remain operator-only.
+                            response.organization_id = None;
+                            response.serving_class = None;
+                            tariffs_map.entry(response.deployed_model_id).or_default().push(response);
+                        }
+                    } else {
+                        for model_id in &model_ids {
+                            let mut tariffs_conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
+                            let mut tariffs_repo = Tariffs::new(&mut tariffs_conn);
+                            let tariffs = tariffs_repo.list_current_by_model(*model_id).await?;
                             tariffs_map.insert(*model_id, tariffs.into_iter().map(TariffResponse::from).collect());
                         }
                     }
 
-                    Some(tariffs_map)
+                    Ok::<_, Error>(Some(tariffs_map))
                 } else {
-                    None
+                    Ok(None)
                 }
             },
             // Active prompt-cache tariffs query
             async {
                 if self.include_pricing {
                     let mut conn = self.db.acquire().await.map_err(|e| Error::Database(e.into()))?;
-                    Ok::<_, Error>(Some(CacheTariffs::new(&mut conn).get_active_bulk(&model_ids).await?))
+                    let mut repo = CacheTariffs::new(&mut conn);
+                    let mut active = repo.get_active_bulk(&model_ids).await?;
+                    // A customer's organisation multipliers sit over the general ones; caching
+                    // itself stays gated on the general row, so only override where one exists.
+                    if let Some(account) = self.pricing_account.filter(|_| !self.can_read_pricing) {
+                        for (model_id, mut own) in repo.get_active_for_account_bulk(&model_ids, account).await? {
+                            if let Some(general) = active.get(&model_id) {
+                                own.min_prefix_tokens = general.min_prefix_tokens;
+                                active.insert(model_id, own);
+                            }
+                        }
+                    }
+                    Ok::<_, Error>(Some(active))
                 } else {
                     Ok(None)
                 }
@@ -200,6 +240,8 @@ impl<'a> DeployedModelEnricher<'a> {
                 }
             }
         );
+
+        let pricing_tariffs_map = pricing_tariffs_map?;
 
         let (model_groups_map, groups_map) = match groups_result {
             Some((model_groups_map, groups_map)) => (Some(model_groups_map), Some(groups_map)),
@@ -235,6 +277,9 @@ impl<'a> DeployedModelEnricher<'a> {
             if self.include_pricing {
                 model_response = Self::apply_tariffs(model_response, &pricing_tariffs_map);
                 model_response = Self::apply_cache_pricing(model_response, &cache_tariffs_map);
+                // Class cache prices are available only through operator org views.
+                model_response.cache_pricing_by_class = None;
+
                 // Hide pricing for purposes that the model denies via a
                 // traffic-routing rule. Run after `apply_tariffs` so it
                 // operates on the freshly-attached set; no-op if no tariffs.
@@ -482,6 +527,7 @@ mod tests {
             metrics: None,
             status: None,
             provider_pricing: None,
+            cache_pricing_by_class: None,
             cache_pricing: None,
             endpoint: None,
             tariffs: None,
@@ -727,6 +773,7 @@ mod tests {
         tariffs_map.insert(
             model_id,
             vec![TariffResponse {
+                serving_class: None,
                 id: Uuid::new_v4(),
                 deployed_model_id: model_id,
                 name: "Standard Tariff".to_string(),
@@ -737,6 +784,7 @@ mod tests {
                 valid_from: Utc::now(),
                 valid_until: None,
                 is_active: true,
+                organization_id: None,
             }],
         );
 
@@ -777,6 +825,7 @@ mod tests {
         use std::str::FromStr;
 
         crate::api::models::tariffs::TariffResponse {
+            serving_class: None,
             id: Uuid::new_v4(),
             deployed_model_id: Uuid::new_v4(),
             name: format!("Tariff {:?} {:?}", purpose, window.unwrap_or("none")),
@@ -787,6 +836,7 @@ mod tests {
             valid_from: Utc::now(),
             valid_until: None,
             is_active: true,
+            organization_id: None,
         }
     }
 

@@ -41,12 +41,13 @@ pub struct DeploymentFilter {
     pub accessible_to: Option<UserId>, // None = show all deployments, Some(user_id) = show only deployments accessible to that user
     pub group_ids: Option<Vec<crate::types::GroupId>>, // None = show all, Some(group_ids) = show only models in any of these groups
     pub aliases: Option<Vec<String>>,
-    pub search: Option<String>,                // Case-insensitive substring search
-    pub is_composite: Option<bool>,            // None = show all, Some(true) = composite only, Some(false) = non-composite only
-    pub provider: Option<String>,              // Filter by metadata provider (case-insensitive exact match)
-    pub model_type: Option<ModelType>,         // Filter by model type column
-    pub capability: Option<String>,            // Filter to models that have this capability
-    pub available_for_realtime: Option<bool>,  // Filter by whether realtime traffic is denied
+    pub search: Option<String>,               // Case-insensitive substring search
+    pub is_composite: Option<bool>,           // None = show all, Some(true) = composite only, Some(false) = non-composite only
+    pub provider: Option<String>,             // Filter by metadata provider (case-insensitive exact match)
+    pub model_type: Option<ModelType>,        // Filter by model type column
+    pub capability: Option<String>,           // Filter to models that have this capability
+    pub available_for_realtime: Option<bool>, // Filter by whether realtime traffic is denied
+    pub pricing_account: Option<UserId>,
     pub sort_field: Option<ModelSortField>,    // Sort field (default: created_at)
     pub sort_direction: Option<SortDirection>, // Sort direction (default depends on field)
 }
@@ -68,8 +69,9 @@ impl DeploymentFilter {
             model_type: None,             // Default: no type filter
             capability: None,             // Default: no capability filter
             available_for_realtime: None, // Default: no realtime availability filter
-            sort_field: None,             // Default: created_at
-            sort_direction: None,         // Default: depends on field
+            pricing_account: None,
+            sort_field: None,     // Default: created_at
+            sort_direction: None, // Default: depends on field
         }
     }
 
@@ -758,7 +760,7 @@ impl<'c> Repository for Deployments<'c> {
             Some(ModelSortField::ContextWindow) => ("(dm.metadata->>'context_window')::bigint", "DESC"),
             Some(ModelSortField::Provider) => ("dm.metadata->>'provider'", "ASC"),
             Some(ModelSortField::PriceFrom) => (
-                "(SELECT MIN(mt.input_price_per_token + mt.output_price_per_token) FROM model_tariffs mt WHERE mt.deployed_model_id = dm.id AND mt.valid_until IS NULL AND (mt.input_price_per_token + mt.output_price_per_token) > 0)",
+                "(SELECT MIN(mt.input_price_per_token + mt.output_price_per_token) FROM model_tariffs mt WHERE mt.deployed_model_id = dm.id AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW()) AND mt.user_id IS NULL AND (mt.api_key_purpose IS NULL OR mt.api_key_purpose IN ('realtime','batch','playground')))",
                 "ASC",
             ),
             Some(ModelSortField::CreatedAt) | None => ("dm.created_at", "DESC"),
@@ -775,7 +777,16 @@ impl<'c> Repository for Deployments<'c> {
             } else {
                 ""
             };
-        query.push(format!(" ORDER BY {sort_expr} {direction}{nulls_clause} LIMIT "));
+        if matches!(filter.sort_field, Some(ModelSortField::PriceFrom)) && filter.pricing_account.is_some() {
+            query.push(" ORDER BY (WITH selectors AS (SELECT DISTINCT api_key_purpose, completion_window FROM model_tariffs WHERE deployed_model_id = dm.id AND (user_id IS NULL OR user_id = ");
+            query.push_bind(filter.pricing_account);
+            query.push(") AND serving_class IS NULL AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW()) AND api_key_purpose IN ('realtime','batch','playground')) SELECT MIN(t.input_price_per_token + t.output_price_per_token) FROM selectors s CROSS JOIN LATERAL effective_model_display_tariff(dm.id, ");
+            query.push_bind(filter.pricing_account);
+            query.push(", s.api_key_purpose, s.completion_window, NOW()) t)");
+            query.push(format!(" {direction} NULLS LAST, dm.id LIMIT "));
+        } else {
+            query.push(format!(" ORDER BY {sort_expr} {direction}{nulls_clause} LIMIT "));
+        }
         query.push_bind(filter.limit);
         query.push(" OFFSET ");
         query.push_bind(filter.skip);
@@ -1701,6 +1712,16 @@ impl<'c> Deployments<'c> {
         }
 
         Ok(map)
+    }
+
+    /// Resolve names for an already-authorized model set in one query.
+    pub async fn get_aliases_by_ids(&mut self, ids: &[DeploymentId]) -> Result<std::collections::BTreeMap<DeploymentId, String>> {
+        let rows: Vec<(DeploymentId, String)> =
+            sqlx::query_as("SELECT id, alias FROM deployed_models WHERE id = ANY($1) AND deleted = FALSE")
+                .bind(ids)
+                .fetch_all(&mut *self.db)
+                .await?;
+        Ok(rows.into_iter().collect())
     }
 
     /// Get model UUIDs keyed by alias for the given aliases.

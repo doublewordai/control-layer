@@ -123,6 +123,16 @@ export type Role =
 export type ApiKeyPurpose = "platform" | "realtime" | "batch" | "playground";
 export type TariffApiKeyPurpose = "realtime" | "batch" | "playground";
 
+// Serving classes (operator-only; customers only ever see the model suffix)
+export type ServingClassName = "interactive" | "throughput";
+/** A model's preset for one class: the router targets its requests ask for. */
+export interface ServingPreset {
+  ttft_ms: number;
+  itl_ms: number;
+  priority: number;
+}
+export type EndpointKind = "dynamo" | "hosted" | "external";
+
 export type TrafficRoutingAction =
   | { type: "deny" }
   | { type: "redirect"; target: string };
@@ -199,6 +209,9 @@ export interface ModelTariff {
   api_key_purpose?: TariffApiKeyPurpose | null;
   completion_window?: string | null; // Completion window like "24h", "1h"
   is_active: boolean;
+  /** Set on an organisation's own price (a deal); absent on the model's general price. */
+  organization_id?: string | null;
+  serving_class?: ServingClassName | "standard" | "custom" | null;
 }
 
 // Cache pricing (Anthropic-style prompt-cache multipliers). Multipliers are decimal
@@ -339,6 +352,46 @@ export interface Model {
   traffic_routing_rules?: TrafficRoutingRule[] | null;
   allowed_batch_completion_windows?: string[] | null;
   metadata?: ModelMetadata | null;
+  /** Serving classes the model offers, keyed by class, each a preset of router targets.
+   *  Only present for platform managers; declared in the model catalog. */
+  serving_classes?: Record<string, ServingPreset>;
+}
+
+/** One organisation's serving overrides on one model (platform managers only). */
+export interface ServingOverlay {
+  organization_id: string;
+  organization_name: string;
+  deployed_model_id: string;
+  alias: string;
+  default_serving_class?: ServingClassName;
+  targets?: ServingPreset;
+  self_hosted_only?: boolean;
+  provisioning_source?: string;
+  updated_at: string;
+}
+
+export interface OrganizationCacheTariff {
+  deployed_model_id: string;
+  alias: string;
+  write_multiplier_5m: string;
+  write_multiplier_1h: string;
+  write_multiplier_24h: string;
+  read_multiplier: string;
+  serving_class?: ServingClassName | "standard" | "custom";
+  valid_from: string;
+}
+
+/** Everything serving-related about one organisation (platform managers only). */
+export interface OrganizationServing {
+  organization_id: string;
+  granted_serving_classes: ServingClassName[];
+  default_serving_class?: ServingClassName;
+  self_hosted_only: boolean;
+  overlays: ServingOverlay[];
+  tariffs: ModelTariff[];
+  /** Token-price model aliases, returned together to avoid per-model requests. */
+  model_aliases?: Record<string, string>;
+  cache_tariffs: OrganizationCacheTariff[];
 }
 
 // Model creation types - discriminated union with "type" field
@@ -414,6 +467,8 @@ export interface Endpoint {
   auth_header_name: string;
   auth_header_prefix: string;
   reasoning_translation?: ReasoningTranslationConfig | null;
+  /** What kind of server this is; only `dynamo` receives serving targets. */
+  kind?: EndpointKind;
 }
 
 export interface EndpointSyncResponse {
@@ -462,6 +517,10 @@ export interface User {
   has_auto_topup_payment_method: boolean; // Whether user has a saved payment method for auto top-up
   auto_topup_monthly_limit: number | null; // Monthly spending limit for auto top-ups (null = no limit)
   zero_data_retention: boolean; // Account-wide zero-data-retention flag
+  // Serving account settings (platform managers only)
+  granted_serving_classes?: ServingClassName[];
+  default_serving_class?: ServingClassName | null;
+  self_hosted_only?: boolean;
   user_type?: "individual" | "organization"; // User type
   organizations?: OrganizationSummary[]; // only present when include=organizations or for current user
   active_organization_id?: string; // only present for /users/current
@@ -637,6 +696,10 @@ export interface UserUpdateRequest {
   auto_topup_threshold?: number | null; // Set a threshold to enable, null to disable
   auto_topup_monthly_limit?: number | null; // Set a limit to cap, null to remove limit
   zero_data_retention?: boolean; // Users may update this for their own account
+  // Serving account settings: platform managers only (dwctl rejects the whole request otherwise)
+  granted_serving_classes?: ServingClassName[];
+  default_serving_class?: ServingClassName | null;
+  self_hosted_only?: boolean;
 }
 
 export interface GroupUpdateRequest {
@@ -693,6 +756,7 @@ export interface EndpointCreateRequest {
   sync?: boolean; // Whether to sync models during creation (defaults to true)
   skip_fetch?: boolean; // Create deployments directly from model_filter without fetching (defaults to false)
   reasoning_translation?: ReasoningTranslationConfig;
+  kind?: EndpointKind;
 }
 
 export interface EndpointUpdateRequest {
@@ -705,6 +769,7 @@ export interface EndpointUpdateRequest {
   auth_header_name?: string;
   auth_header_prefix?: string;
   reasoning_translation?: ReasoningTranslationConfig | null;
+  kind?: EndpointKind;
 }
 
 export type EndpointValidateRequest =
@@ -1791,6 +1856,10 @@ export interface OrganizationUpdateRequest {
   batch_notifications_enabled?: boolean;
   low_balance_threshold?: number | null;
   zero_data_retention?: boolean; // Account-wide zero-data-retention flag (admin-only)
+  // Serving account settings: platform managers only
+  granted_serving_classes?: ServingClassName[];
+  default_serving_class?: ServingClassName | null;
+  self_hosted_only?: boolean;
   /** Replaces the whole set; owner-only. An empty list re-enables everything. */
   disabled_modalities?: Modality[];
 }
