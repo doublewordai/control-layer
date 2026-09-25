@@ -383,6 +383,8 @@ impl OnwardsConfigSync {
         // are COALESCED into one trailing reload (pending_reload) rather than
         // dropped - a dropped notification used to wait for the fallback
         // timer, which is minutes in production.
+        // Measure the quiet window after completion: a slow reload must not
+        // make every notification queued during it immediately reload again.
         let mut last_reload_time = std::time::Instant::now();
         const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
         let mut pending_reload: Option<tokio::time::Instant> = None;
@@ -463,11 +465,11 @@ impl OnwardsConfigSync {
                                     continue;
                                 }
 
-                                last_reload_time = std::time::Instant::now();
                                 pending_reload = None;
                                 if !self.full_reload("listen_notify").await? {
                                     break;
                                 }
+                                last_reload_time = std::time::Instant::now();
 
                                 // Record cache sync lag metric (time from DB change to cache update)
                                 if let Some((table_name, lag)) = notify_info {
@@ -509,10 +511,10 @@ impl OnwardsConfigSync {
                     } => {
                         debug!("Coalesced trailing reload triggered");
                         pending_reload = None;
-                        last_reload_time = std::time::Instant::now();
                         if !self.full_reload("coalesced").await? {
                             break;
                         }
+                        last_reload_time = std::time::Instant::now();
                     }
 
                     // Fallback periodic sync (if enabled)
@@ -531,10 +533,11 @@ impl OnwardsConfigSync {
                             continue;
                         }
 
-                        last_reload_time = std::time::Instant::now();
+                        pending_reload = None;
                         if !self.full_reload("fallback").await? {
                             break;
                         }
+                        last_reload_time = std::time::Instant::now();
                     }
                 }
             }

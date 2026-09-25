@@ -2604,3 +2604,85 @@ async fn generally_free_models_ignore_other_accounts_paid_deals(pool: sqlx::PgPo
         }
     }
 }
+
+/// A reload slower than the debounce interval must not replay a catalog burst
+/// one notification at a time. Changes made while it runs still need a trailing refresh.
+#[sqlx::test]
+async fn slow_reload_coalesces_queued_notifications_and_keeps_later_changes(pool: sqlx::PgPool) {
+    use crate::api::models::users::Role;
+    use crate::test::utils::{create_test_endpoint, create_test_model, create_test_user};
+
+    let user = create_test_user(&pool, Role::StandardUser).await;
+    let endpoint = create_test_endpoint(&pool, "sync-test", user.id).await;
+    let model = create_test_model(&pool, "sync-model", "before", endpoint, user.id).await;
+    let (sync, _, _stream) = super::OnwardsConfigSync::new(pool.clone()).await.unwrap();
+    let mut updates = sync.sender().subscribe();
+    let (status_tx, mut status_rx) = mpsc::channel(10);
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            sync.start(
+                SyncConfig {
+                    status_tx: Some(status_tx),
+                    fallback_interval_milliseconds: 0,
+                },
+                shutdown,
+            )
+            .await
+        }
+    });
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
+
+    // Hold the table while the real loader runs, rather than relying on its speed.
+    let mut lock = pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE deployed_models IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    sqlx::query("SELECT pg_notify('auth_config_changed', 'start')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock')"
+            ).fetch_one(&pool).await.unwrap();
+            if blocked { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.expect("reload should wait for the held table lock");
+    // Deliberately exceed the 100ms debounce window inside the active reload.
+    sqlx::query("SELECT pg_sleep(0.2)").execute(&mut *lock).await.unwrap();
+    sqlx::query("SELECT pg_notify('auth_config_changed', 'burst-' || n::text) FROM generate_series(1, 100) n")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE deployed_models SET alias = 'after-burst' WHERE id = $1")
+        .bind(model)
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    lock.commit().await.unwrap();
+
+    timeout(Duration::from_secs(5), updates.changed()).await.unwrap().unwrap();
+    assert!(updates.borrow_and_update().targets.contains_key("after-burst"));
+    timeout(Duration::from_secs(5), updates.changed()).await.unwrap().unwrap();
+    updates.borrow_and_update();
+    assert!(
+        timeout(Duration::from_millis(500), updates.changed()).await.is_err(),
+        "queued burst must collapse into one trailing reload"
+    );
+
+    sqlx::query("UPDATE deployed_models SET alias = 'after-later-change' WHERE id = $1")
+        .bind(model)
+        .execute(&pool)
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(5), updates.changed()).await.unwrap().unwrap();
+    assert!(updates.borrow_and_update().targets.contains_key("after-later-change"));
+    shutdown.cancel();
+    timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+}
