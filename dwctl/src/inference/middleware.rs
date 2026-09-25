@@ -175,7 +175,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // `request_value` only stays removed if the bytes are rebuilt from it.
     // Every scrubber reports whether it changed something; the common case
     // (nothing to scrub, no suffix) keeps the caller's bytes untouched.
-    let body_bytes = if scrubbed_class || scrubbed_ids || scrubbed_scheduling {
+    let mut body_bytes = if scrubbed_class || scrubbed_ids || scrubbed_scheduling {
         bytes::Bytes::from(request_value.to_string())
     } else {
         body_bytes
@@ -262,8 +262,10 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // BEFORE the edge translation (one layer inside this one) converts the request
     // to Chat Completions. Runs here rather than in the translator so the pure
     // translator stays stateless. Gated on the field's presence so the common path
-    // pays nothing. The hydrated body flows to every downstream path because it is
-    // re-serialised from `request_value` below.
+    // pays nothing. Hydration rewrites `request_value`, so `body_bytes` is rebuilt
+    // from it immediately after a successful load; that is what carries the prior
+    // turns to every downstream path, the realtime one included (it forwards
+    // `body_bytes` verbatim, COR-522).
     if is_responses_api && request_value.get("previous_response_id").is_some() {
         use crate::inference::translation::responses::hydrate::{HydrationError, hydrate_previous_response};
         // The prior turn is only ever the caller's own: resolve the key's
@@ -305,6 +307,10 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 ))
                 .unwrap();
         }
+        // Hydration succeeded; re-serialise so the inlined prior turns reach the
+        // provider. Skipped entirely when `previous_response_id` is absent, so the
+        // common path keeps the caller's original bytes without a copy.
+        body_bytes = bytes::Bytes::from(request_value.to_string());
     }
 
     // Parse `service_tier` and `background` from the body.

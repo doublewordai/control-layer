@@ -704,6 +704,70 @@ async fn a_chain_can_extend_a_response_after_its_graph_moved_to_the_retained_sto
     assert_ne!(extended_json["id"], format!("resp_{id}"));
 }
 
+/// A realtime `/v1/responses` continuation forwards `body_bytes` to the provider
+/// verbatim, so the hydrated prior turns must be rebuilt into those bytes, not
+/// just into `request_value`. This makes the prior turn visible in the second
+/// turn's upstream chat-completions request.
+///
+/// The response store retains a turn's assistant output (not the original user
+/// input), so the hydrated prior turn here is the first turn's assistant message
+/// (`Hello from the test!`), followed by the current `second turn`.
+#[sqlx::test]
+#[test_log::test]
+async fn realtime_previous_response_id_forwards_the_hydrated_history(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({"model": "gpt-4o", "input": "first turn", "service_tier": "priority"}))
+        .await
+        .assert_status_ok();
+    let id = poll_completed_row(&pool, uuid::Uuid::nil()).await;
+
+    server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {api_key}"))
+        .add_header("Content-Type", "application/json")
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "second turn",
+            "previous_response_id": format!("resp_{id}"),
+            "service_tier": "priority"
+        }))
+        .await
+        .assert_status_ok();
+
+    // The upstream is a chat-completions mock, so the translated second-turn
+    // request is the one carrying "second turn". Hydration must have prepended
+    // the first turn's hydrated history to it.
+    let second_turn_bodies: Vec<String> = mock_server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .map(|r| String::from_utf8_lossy(&r.body).to_string())
+        .filter(|body| body.contains("second turn"))
+        .collect();
+    assert_eq!(
+        second_turn_bodies.len(),
+        1,
+        "expected exactly one upstream request for the second turn"
+    );
+    let second_turn = &second_turn_bodies[0];
+    assert!(
+        second_turn.contains("Hello from the test!"),
+        "realtime continuation must forward the hydrated prior turn, got: {second_turn}"
+    );
+    assert!(
+        second_turn.contains("second turn"),
+        "the current turn must still be present, got: {second_turn}"
+    );
+}
+
 #[sqlx::test]
 #[test_log::test]
 async fn previous_response_id_of_another_users_response_is_rejected(pool: PgPool) {
