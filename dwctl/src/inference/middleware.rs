@@ -266,7 +266,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // from it immediately after a successful load; that is what carries the prior
     // turns to every downstream path, the realtime one included (it forwards
     // `body_bytes` verbatim, COR-522).
-    if is_responses_api && request_value.get("previous_response_id").is_some() {
+    if is_responses_api && request_value.get("previous_response_id").is_some_and(|id| !id.is_null()) {
         use crate::inference::translation::responses::hydrate::{HydrationError, hydrate_previous_response};
         // The prior turn is only ever the caller's own: resolve the key's
         // owner first, and treat an unresolvable key as "no such response".
@@ -308,7 +308,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 .unwrap();
         }
         // Hydration succeeded; re-serialise so the inlined prior turns reach the
-        // provider. Skipped entirely when `previous_response_id` is absent, so the
+        // provider. Skipped entirely when `previous_response_id` is absent or null, so the
         // common path keeps the caller's original bytes without a copy.
         body_bytes = bytes::Bytes::from(request_value.to_string());
     }

@@ -758,13 +758,18 @@ async fn realtime_previous_response_id_forwards_the_hydrated_history(pool: PgPoo
         "expected exactly one upstream request for the second turn"
     );
     let second_turn = &second_turn_bodies[0];
+    // The prior turn must precede the current input, as a conversation.
+    let body: serde_json::Value = serde_json::from_str(second_turn).expect("upstream body is JSON");
+    let messages = body["messages"].as_array().expect("upstream body has messages");
+    let position = |role: &str, text: &str| {
+        messages
+            .iter()
+            .position(|m| m["role"] == role && m["content"].to_string().contains(text))
+            .unwrap_or_else(|| panic!("no {role} message containing {text:?} in: {second_turn}"))
+    };
     assert!(
-        second_turn.contains("Hello from the test!"),
-        "realtime continuation must forward the hydrated prior turn, got: {second_turn}"
-    );
-    assert!(
-        second_turn.contains("second turn"),
-        "the current turn must still be present, got: {second_turn}"
+        position("assistant", "Hello from the test!") < position("user", "second turn"),
+        "the hydrated prior turn must come before the current input, got: {second_turn}"
     );
 }
 
