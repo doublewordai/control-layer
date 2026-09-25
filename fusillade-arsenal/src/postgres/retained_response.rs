@@ -931,23 +931,8 @@ fn to_payload<T: Serialize>(
     serde_json::to_value(value).map_err(|_| RetainedResponseSerializationError::EncodeFailure)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetainedResponseReadError {
-    DatabaseFailure,
-}
-
-impl fmt::Display for RetainedResponseReadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Retained response read failed")
-    }
-}
-
-impl std::error::Error for RetainedResponseReadError {}
-
-fn read_database_failure<T>(_: T) -> FusilladeError {
-    FusilladeError::Other(anyhow::Error::new(
-        RetainedResponseReadError::DatabaseFailure,
-    ))
+fn read_database_failure<T: fmt::Display>(error: T) -> FusilladeError {
+    FusilladeError::Other(anyhow::anyhow!("Retained response read failed: {error}"))
 }
 
 async fn begin_primary_read<P: PoolProvider>(
@@ -4107,6 +4092,21 @@ mod tests {
     use serde_json::json;
     use sqlx::PgPool;
     use uuid::Uuid;
+
+    #[test]
+    fn read_database_failure_keeps_underlying_error() {
+        let error =
+            read_database_failure("canceling statement due to statement timeout".to_string());
+        let message = error.to_string();
+        assert!(
+            message.contains("Retained response read failed"),
+            "{message}"
+        );
+        assert!(
+            message.contains("canceling statement due to statement timeout"),
+            "{message}"
+        );
+    }
 
     #[sqlx::test]
     async fn detail_lookup_avoids_sparse_user_index_after_mass_deletion(pool: PgPool) {
