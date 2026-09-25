@@ -18,6 +18,9 @@ pub struct OverlayResponse {
     pub organization_id: UserId,
     /// The organisation's account username (what the catalog file names).
     pub organization_name: String,
+    /// Human-readable label; the account username remains the catalog identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization_display_name: Option<String>,
     #[schema(value_type = String, format = "uuid")]
     pub deployed_model_id: DeploymentId,
     pub alias: String,
@@ -85,6 +88,7 @@ pub struct OrganizationServingResponse {
 pub(crate) struct OverlayRow {
     pub organization_id: Uuid,
     pub organization_name: String,
+    pub organization_display_name: Option<String>,
     pub deployed_model_id: Uuid,
     pub alias: String,
     pub default_serving_class: Option<String>,
@@ -99,6 +103,7 @@ impl From<OverlayRow> for OverlayResponse {
         Self {
             organization_id: row.organization_id,
             organization_name: row.organization_name,
+            organization_display_name: row.organization_display_name,
             deployed_model_id: row.deployed_model_id,
             alias: row.alias,
             default_serving_class: row.default_serving_class,
