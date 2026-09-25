@@ -38,6 +38,11 @@ interface Props {
   onEditCache: () => void;
 }
 
+function organizationLabel(displayName: string | null | undefined, username: string) {
+  const display = displayName?.trim();
+  return display && display !== username ? `${display} (${username})` : username;
+}
+
 export function ModelPricing({
   model,
   manager,
@@ -57,7 +62,7 @@ export function ModelPricing({
     for (const row of overlays.data ?? [])
       options.set(
         row.organization_id,
-        row.organization_display_name?.trim() || row.organization_name,
+        organizationLabel(row.organization_display_name, row.organization_name),
       );
     for (const row of model.tariffs ?? [])
       if (row.organization_id && !options.has(row.organization_id))
@@ -70,7 +75,7 @@ export function ModelPricing({
   );
   const organizations = useOrganizationsByIds(missingNames);
   for (const { data } of organizations) {
-    if (data) options.set(data.id, data.display_name?.trim() || data.username);
+    if (data) options.set(data.id, organizationLabel(data.display_name, data.username));
   }
   const general = (model.tariffs ?? []).filter((row) => !row.organization_id);
   const rows = organization
