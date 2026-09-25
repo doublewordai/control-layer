@@ -2606,6 +2606,23 @@ async fn generally_free_models_ignore_other_accounts_paid_deals(pool: sqlx::PgPo
 }
 
 #[test]
+fn notification_lag_includes_debounce_reload_and_retry_time() {
+    use super::{MIN_RELOAD_INTERVAL, NotificationLag, RELOAD_RETRY_INTERVAL};
+    let received_at = tokio::time::Instant::now();
+    let age_at_receipt = Duration::from_millis(25);
+    let lag = NotificationLag {
+        table: "api_keys".to_string(),
+        age_at_receipt,
+        received_at,
+    };
+    assert_eq!(lag.at_publication(received_at), age_at_receipt);
+
+    let database_work = Duration::from_secs(2);
+    let elapsed = MIN_RELOAD_INTERVAL + database_work + RELOAD_RETRY_INTERVAL + database_work;
+    assert_eq!(lag.at_publication(received_at + elapsed), age_at_receipt + elapsed);
+}
+
+#[test]
 fn slow_reload_starts_one_quiet_window_at_completion() {
     use super::{MIN_RELOAD_INTERVAL, ReloadOutcome, ReloadSchedule};
     let started = tokio::time::Instant::now();

@@ -266,6 +266,19 @@ fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
 const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 const RELOAD_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+struct NotificationLag {
+    table: String,
+    age_at_receipt: std::time::Duration,
+    received_at: tokio::time::Instant,
+}
+
+impl NotificationLag {
+    fn at_publication(&self, now: tokio::time::Instant) -> std::time::Duration {
+        // Include debounce, database work and retries in DB-change-to-publication lag.
+        self.age_at_receipt + now.duration_since(self.received_at)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReloadOutcome {
     Published,
@@ -502,7 +515,11 @@ impl OnwardsConfigSync {
 
                                 schedule.notify(tokio::time::Instant::now());
                                 if let Some((table_name, lag)) = parse_notify_payload(notification.payload()) {
-                                    notification_lag.get_or_insert((table_name.to_string(), lag));
+                                    notification_lag.get_or_insert(NotificationLag {
+                                        table: table_name.to_string(),
+                                        age_at_receipt: lag,
+                                        received_at: tokio::time::Instant::now(),
+                                    });
                                 }
                             }
                             Err(e) => {
@@ -536,9 +553,10 @@ impl OnwardsConfigSync {
                         let outcome = self.full_reload(source).await?;
                         schedule.completed(tokio::time::Instant::now(), outcome);
                         if outcome == ReloadOutcome::Published
-                            && let Some((table_name, lag)) = notification_lag.take()
+                            && let Some(lag) = notification_lag.take()
                         {
-                            histogram!("dwctl_cache_sync_lag_seconds", "table" => table_name).record(lag.as_secs_f64());
+                            let seconds = lag.at_publication(tokio::time::Instant::now()).as_secs_f64();
+                            histogram!("dwctl_cache_sync_lag_seconds", "table" => lag.table).record(seconds);
                         }
                         if outcome == ReloadOutcome::Closed {
                             break 'outer;

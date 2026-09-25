@@ -1160,6 +1160,8 @@ dwctl_session: {{user_jwt}}
   "max_tokens": 8
 }
 HTTP 403
+[Asserts]
+body contains "You do not have access to 'mock-gpt-markdown-permtest'. Please contact your administrator to request access."
 
 # -----------------------------------------------------------------------------
 # User1 CAN still create batch from the file (permissions checked at upload time)
