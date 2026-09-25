@@ -50,6 +50,93 @@ If a model has no tariff, requests to that model are free.
 
 Tariffs are time-versioned, so you can change pricing without affecting how historical transactions are displayed. The system records which tariff was active when each charge occurred.
 
+### Organisation and serving-class price precedence
+
+For the requested model, billing uses the API key's owning account and the
+**resolved** serving class. A routing overlay or a price does not itself grant
+access to a class. An existing private alias keeps its own prices; there is no
+implicit pricing fallback between model aliases.
+
+First discard tariffs outside their validity interval or for another account
+or class. Then choose the first eligible purpose/window entry below:
+
+| Priority | Realtime | Playground | Batch/flex, completion window W |
+|---|---|---|---|
+| 1 | Account + class, realtime | Account + class, playground | Account + standard, batch W |
+| 2 | Account all-class, realtime | Account + class, realtime | Account all-class, batch W |
+| 3 | General model, realtime | Account all-class, playground | General model, batch W |
+| 4 | — | Account all-class, realtime | Account + standard, realtime |
+| 5 | — | General model, playground | Account all-class, realtime |
+| 6 | — | General model, realtime | General model, realtime |
+
+Playground's realtime fallback is evaluated **within each scope** before moving
+to the next scope. An organisation's realtime deal therefore beats a general
+playground price. Batch/flex exhausts all three exact-window batch scopes before
+trying realtime prices in the same scope order, using only the standard class.
+A 1h batch price never substitutes for 24h. Realtime/playground use no completion
+window.
+Continuation and platform purposes do not select customer prices.
+
+A selected row supplies both input and output prices. Zero is an explicit price
+and stops fallback; the resolver never chooses the cheapest row or combines
+fields from different rows. If no eligible price exists, analytics cost remains
+NULL and no usage debit is created. A missing batch tier uses the realtime safety
+net first; it remains unpriced only if no eligible realtime price exists either.
+Configure every supported completion window to avoid unintended realtime charges.
+
+Validity is `valid_from <= time < valid_until` (an absent end is unbounded).
+Batch pricing uses batch creation time; other pricing uses the captured request
+time. Within the same scope/purpose/window, the latest valid start wins, then
+ascending tariff ID breaks exact ties. The SQL effective billing resolver and
+Rust billing use the same rules. Actual usage billing selects tariffs in Rust
+after bulk-loading relevant histories; parity tests protect this contract.
+Deploy matching API and worker images before activating customer deals.
+
+#### Customer catalogue and usage comparison
+
+Customer model list/detail prices deliberately present **one all-class set**:
+account all-class deal → general model, separately for each existing
+purpose/completion-window tier. Class-specific prices (including `standard`)
+are omitted until there is a public UX for them. Playground can use realtime
+within each scope. Batch tries the all-class account and general exact-window
+prices before their realtime fallbacks; class prices stay hidden. Price sorting uses
+the same display resolver and the existing minimum input-plus-output metric.
+Zero is a valid display price; missing prices sort last. The response exposes
+effective amounts without organisation/class metadata. Platform managers retain
+all scoped token tariffs; organisation-serving controls expose class deals.
+Customer cache multipliers similarly use the all-class override, with no class
+price map. Existing private aliases retain their own prices.
+
+The `/usage` realtime-equivalent estimate is a counterfactual comparison, not a
+bill. It uses the billed account's current all-class realtime deal, then its
+standard-class realtime deal, then the general realtime rate. Other classes are
+ignored. Actual usage totals and cap accounting remain actual resolved-class
+charges. The comparison can be cached for 60 minutes.
+
+Zero prices stop pricing fallback and bill zero. Generally free or unpriced
+models retain their existing balance and key-cap exemptions. A zero customer
+price on a generally paid model does not create a new exemption: the account
+still needs positive balance or `ALLOW_NEGATIVE_BALANCE`, and key caps apply.
+The exemption permits negative account balances, not exceeding key caps.
+A positive customer deal on a generally free model requires credit for that
+account only. Other accounts keep the general free-model behavior. Admission
+uses existence checks rather than effective purpose/window/class resolution.
+
+HTTP batch tariff authoring normalizes surrounding completion-window whitespace;
+YAML authoring rejects it. Unchanged legacy NULL-purpose rows may be preserved
+during model metadata edits, but cannot be created or repriced through the
+customer tariff API and are not billable fallback rows. Declaring an org/model
+in YAML adopts its current overlay and prices. Omitted prices retire; changed
+prices create new ledger versions. Future schedules block reconciliation, which
+rolls back atomically. Historical org token/cache prices prevent hard account
+deletion; normal soft deletion retains them. Released migrations are immutable.
+
+Cache multipliers are selected independently by account + resolved class →
+account all-class → general model, at the same timestamp. They have no
+purpose/window dimension. A general cache tariff is required for Control Layer
+cache pricing to apply; an organisation override alone cannot enable it.
+Applicable cache-read/write multipliers adjust the selected input token rate.
+
 ## The Transaction Ledger
 
 All credit movements are recorded in an append-only transaction ledger. Transactions are never modified or deleted — this creates a complete audit trail.
@@ -127,7 +214,9 @@ API requests are free (no credits deducted) when:
 - The request fails (non-2xx response)
 - The user is the system user (internal requests)
 
-This means you can offer some models for free while charging for others, or run a deployment without any billing at all.
+Generally free or unpriced models remain accessible without balance or cap
+headroom. A customer-specific zero price on a generally paid model changes its
+bill, but does not create a new admission exemption.
 
 ## Related Topics
 

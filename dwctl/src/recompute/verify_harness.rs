@@ -7,9 +7,9 @@
 //!
 //! ```sh
 //! kubectl -n control-layer port-forward svc/tokenizer-svc 18088:8088 &
-//! RECOMPUTE_DB_URL='postgresql://…/clay' \
+//! RECOMPUTE_DB_URL='postgresql://…/control_layer' \
 //! RECOMPUTE_TOKENIZER_URL='http://localhost:18088' \
-//! RECOMPUTE_USER_ID='…' RECOMPUTE_MODEL='detail-zai/glm-5.2' RECOMPUTE_LIMIT=200 \
+//! RECOMPUTE_USER_ID='…' RECOMPUTE_MODEL='example-model' RECOMPUTE_LIMIT=200 \
 //!   cargo test -p dwctl --lib recompute::verify_harness -- --ignored --nocapture
 //! ```
 //!

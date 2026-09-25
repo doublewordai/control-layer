@@ -77,6 +77,7 @@ pub struct CorpusRow {
     /// cache fields, so the replay overlays the engine-reported hit (and pricing clamps
     /// the read multiplier) to reproduce live semantics.
     pub cache_read_source: Option<String>,
+    pub resolved_serving_class: Option<String>,
 
     /// The payload, when fusillade still holds it. `None` means not replayable — a ZDR row,
     /// a row with no fusillade link, or one whose bodies have been purged.
@@ -127,6 +128,7 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
             ha.input_price_per_token,
             ha.output_price_per_token,
             ha.cache_read_source,
+            ha.resolved_serving_class,
             -- `?` overrides sqlx's nullability inference: rt.body is NOT NULL in its own
             -- table, but this is a LEFT JOIN, so it is absent for any row with no fusillade
             -- link. Without the override sqlx types it as String and the None case vanishes.
@@ -203,6 +205,7 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
                 input_price_per_token: r.input_price_per_token,
                 output_price_per_token: r.output_price_per_token,
                 cache_read_source: r.cache_read_source,
+                resolved_serving_class: r.resolved_serving_class,
                 exchange,
             }
         })
@@ -397,9 +400,8 @@ mod tests {
     }
 
     /// A dwctl-cached request re-prices with the tariff version valid at its time — not the
-    /// config defaults, and not a version that superseded it. Measured failure this pins:
-    /// healthy GLM-5.2 traffic (tariff read ×0.8, writes ×1.0) re-priced with the defaults
-    /// (read ×0.1, write ×1.25) and reported a −$0.06 "overcharge" on 25 healthy rows.
+    /// config defaults, and not a version that superseded it. Using either can
+    /// incorrectly report a billing discrepancy on correctly charged requests.
     #[sqlx::test]
     async fn cached_row_reprices_with_the_tariff_valid_at_its_time(pool: PgPool) {
         setup_fusillade_pool(&pool).await;

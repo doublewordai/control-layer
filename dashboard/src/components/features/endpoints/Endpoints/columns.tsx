@@ -213,6 +213,15 @@ export const createColumns = (
     },
   },
   {
+    accessorKey: "kind",
+    header: "Kind",
+    cell: ({ row }) => (
+      <span className="rounded border px-1.5 py-0.5 font-mono text-xs text-doubleword-neutral-600">
+        {row.original.kind ?? "external"}
+      </span>
+    ),
+  },
+  {
     accessorKey: "description",
     header: "Description",
     cell: ({ row }) => {

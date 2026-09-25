@@ -71,6 +71,7 @@ impl ModelConfigResolver {
             FROM deployed_models dm
             JOIN model_cache_tariffs mct
               ON mct.deployed_model_id = dm.id
+             AND mct.user_id IS NULL
              AND mct.valid_from <= now()
              AND (mct.valid_until IS NULL OR mct.valid_until > now())
             WHERE dm.alias = $1 AND dm.deleted = false

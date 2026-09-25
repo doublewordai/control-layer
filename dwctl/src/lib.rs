@@ -160,6 +160,7 @@ mod leader_election;
 pub mod limits;
 mod metrics;
 pub mod migrations;
+pub mod modalities;
 pub mod model_provisioning;
 mod notifications;
 mod openapi;
@@ -1992,6 +1993,7 @@ pub async fn build_router(
         .route("/models/{id}", get(api::handlers::deployments::get_deployed_model))
         .route("/models/{id}", patch(api::handlers::deployments::update_deployed_model))
         .route("/models/{id}", delete(api::handlers::deployments::delete_deployed_model))
+        .route("/models/{id}/overlays", get(api::handlers::serving::list_model_overlays))
         .route("/models/{id}/cache-pricing", get(api::handlers::cache_pricing::get_cache_pricing))
         .route(
             "/models/{id}/cache-pricing",
@@ -2073,6 +2075,7 @@ pub async fn build_router(
         .route("/organizations/{id}", get(api::handlers::organizations::get_organization))
         .route("/organizations/{id}", patch(api::handlers::organizations::update_organization))
         .route("/organizations/{id}", delete(api::handlers::organizations::delete_organization))
+        .route("/organizations/{id}/serving", get(api::handlers::serving::get_organization_serving))
         // Organization membership
         .route("/organizations/{id}/members", get(api::handlers::organizations::list_members))
         .route("/organizations/{id}/members", post(api::handlers::organizations::add_member))
@@ -2859,9 +2862,9 @@ pub struct BackgroundServices {
     is_leader: bool,
     onwards_targets: onwards::target::Targets,
     /// Per-key ZDR policy map, initial-loaded and then refreshed by
-    /// [`crate::sync::zdr_keys`]. Handed to `AppState` so `is_zdr_request`
+    /// [`crate::sync::key_policy`]. Handed to `AppState` so `is_zdr_request`
     /// reads it on the request hot path.
-    zdr_key_cache: crate::sync::zdr_keys::ZdrKeyCache,
+    key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
     /// Per-alias model metadata for ingress request validation, refreshed by
     /// [`crate::sync::model_metadata`]. Empty (every lookup `NotLoaded`, so
     /// every rule passes) when validation is disabled.
@@ -3172,8 +3175,8 @@ impl BackgroundServices {
     /// letting a test flip an account to ZDR mid-run without spawning the
     /// LISTEN/NOTIFY loop.
     #[cfg(test)]
-    pub async fn sync_zdr_keys(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
-        crate::sync::zdr_keys::refresh(pool, &self.zdr_key_cache).await?;
+    pub async fn sync_key_policy(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        crate::sync::key_policy::refresh(pool, &self.key_policy_cache).await?;
         Ok(())
     }
 
@@ -3479,23 +3482,23 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         (onwards::target::Targets::from_config(empty_config)?, None)
     };
 
-    // Per-key ZDR policy map: an initial synchronous load ALWAYS runs, so the
-    // map is never empty under live traffic (an empty map reads every key as
-    // non-ZDR and would silently leak a ZDR account's body). Only the
-    // LISTEN/NOTIFY refresh loop is gated on onwards config sync, with which it
-    // shares the `auth_config_changed` channel; with sync disabled the map is
-    // still correct at startup, it just does not pick up later policy changes.
-    let zdr_key_cache = crate::sync::zdr_keys::initial_cache(&db_pools.write()).await?;
-    if config.background_services.onwards_sync.enabled {
-        let zdr_pool = dyn_pools.clone();
-        let zdr_listener_pool = direct_pools.clone();
-        let zdr_cache = zdr_key_cache.clone();
-        let zdr_shutdown = shutdown_token.clone();
-        let zdr_fallback = config.background_services.onwards_sync.fallback_interval_milliseconds;
-        background_tasks.spawn("zdr-key-sync", async move {
-            crate::sync::zdr_keys::run(zdr_pool, zdr_listener_pool, zdr_cache, zdr_fallback, zdr_shutdown)
+    // Per-key account policy map (ZDR flag, disabled modalities): an initial
+    // synchronous load ALWAYS runs, so the map is never empty under live
+    // traffic (an empty map reads every key as non-ZDR and would silently leak
+    // a ZDR account's body). The LISTEN/NOTIFY refresh loop has its own switch,
+    // independent of onwards routing sync: the realtime modality gate enforces
+    // from this map, so it must keep refreshing even where routing sync is off.
+    let key_policy_cache = crate::sync::key_policy::initial_cache(&db_pools.write()).await?;
+    if config.background_services.key_policy_sync.enabled {
+        let policy_pool = dyn_pools.clone();
+        let policy_listener_pool = direct_pools.clone();
+        let policy_cache = key_policy_cache.clone();
+        let policy_shutdown = shutdown_token.clone();
+        let policy_fallback = config.background_services.key_policy_sync.fallback_interval_milliseconds;
+        background_tasks.spawn("key-policy-sync", async move {
+            crate::sync::key_policy::run(policy_pool, policy_listener_pool, policy_cache, policy_fallback, policy_shutdown)
                 .await
-                .context("ZDR key sync failed")
+                .context("key policy sync failed")
         });
     }
 
@@ -4005,7 +4008,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         task_runner,
         is_leader,
         onwards_targets: initial_targets,
-        zdr_key_cache,
+        key_policy_cache,
         model_metadata_cache,
         onwards_sender,
         strict_mode: config.onwards.strict_mode,
@@ -4360,7 +4363,7 @@ impl Application {
             unverified_requests_per_completion_hour: config.batches.unverified_requests_per_completion_hour,
             flex_completion_window: config.batches.async_requests.completion_window.clone(),
             keystore: bg_services.keystore.clone(),
-            zdr_key_cache: bg_services.zdr_key_cache.clone(),
+            key_policy_cache: bg_services.key_policy_cache.clone(),
             validation: request_validation.clone(),
         };
 

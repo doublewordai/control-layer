@@ -907,6 +907,8 @@ impl<'c> ApiKeys<'c> {
     /// Get all API keys that can access the specified deployment with full response data
     /// Excludes API keys from users with insufficient credits (balance <= 0),
     /// unless their billing account allows negative balances.
+    /// General free-model exemptions retain the legacy rule: positive open-ended
+    /// general tariffs count as paid, including future and internal-purpose rows.
     #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&deployment_id)), err)]
     pub async fn get_api_keys_for_deployment_with_sufficient_credit(
         &mut self,
@@ -962,6 +964,7 @@ impl<'c> ApiKeys<'c> {
             INNER JOIN deployed_models dm ON dg.deployment_id = dm.id
             WHERE dg.deployment_id = $1
             AND ak.is_deleted = false
+            -- General free-model access is preserved; zero customer deals do not exempt paid models.
             AND (
                 ak.user_id = $2  -- System user always has access
                 OR user_has_feature(ak.user_id, 'ALLOW_NEGATIVE_BALANCE')
@@ -972,16 +975,17 @@ impl<'c> ApiKeys<'c> {
                     SELECT 1 FROM user_balance_checkpoints c
                     WHERE c.user_id = ak.user_id AND c.balance > 0
                 )
-                OR (
-                    -- Free models are accessible to all users (zero balance OK)
-                    -- A model is free if it has no active tariffs or all active tariffs are zero-priced
-                    NOT EXISTS (
-                        SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id
-                        AND mt.valid_until IS NULL
-                        AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
-                    )
-                )
+                OR (NOT EXISTS (
+                    SELECT 1 FROM model_tariffs mt
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                      AND mt.valid_until IS NULL
+                      AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM model_tariffs mt
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                      AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
+                      AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                ))
             )
 
             UNION
@@ -1010,6 +1014,7 @@ impl<'c> ApiKeys<'c> {
             WHERE dg.deployment_id = $1
             AND ak.is_deleted = false
             AND ak.user_id != '00000000-0000-0000-0000-000000000000'  -- Exclude system user (already covered above)
+            -- General free-model access is preserved; zero customer deals do not exempt paid models.
             AND (
                 ak.user_id = $2  -- System user always has access
                 OR user_has_feature(ak.user_id, 'ALLOW_NEGATIVE_BALANCE')
@@ -1020,16 +1025,17 @@ impl<'c> ApiKeys<'c> {
                     SELECT 1 FROM user_balance_checkpoints c
                     WHERE c.user_id = ak.user_id AND c.balance > 0
                 )
-                OR (
-                    -- Free models are accessible to all users (zero balance OK)
-                    -- A model is free if it has no active tariffs or all active tariffs are zero-priced
-                    NOT EXISTS (
-                        SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id
-                        AND mt.valid_until IS NULL
-                        AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
-                    )
-                )
+                OR (NOT EXISTS (
+                    SELECT 1 FROM model_tariffs mt
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                      AND mt.valid_until IS NULL
+                      AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM model_tariffs mt
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                      AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
+                      AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
+                ))
             )
             "#,
             deployment_id,
@@ -3416,6 +3422,7 @@ mod tests {
                     api_key_purpose: None,
                     completion_window: None,
                     valid_from: None,
+                    user_id: None,
                 })
                 .await
                 .unwrap();
@@ -3528,6 +3535,7 @@ mod tests {
                     api_key_purpose: None,
                     completion_window: None,
                     valid_from: None,
+                    user_id: None,
                 })
                 .await
                 .unwrap();
@@ -4213,6 +4221,7 @@ mod tests {
                     api_key_purpose: None,
                     completion_window: None,
                     valid_from: None,
+                    user_id: None,
                 })
                 .await
                 .unwrap();
@@ -4352,6 +4361,7 @@ mod tests {
                     api_key_purpose: None,
                     completion_window: None,
                     valid_from: None,
+                    user_id: None,
                 })
                 .await
                 .unwrap();

@@ -257,6 +257,19 @@ describe("dwctlApi.users", () => {
   });
 });
 
+describe("dwctlApi.models.overlays", () => {
+  it("handles model overlays in demo mode", async () => {
+    const models = await dwctlApi.models.list();
+    await expect(dwctlApi.models.overlays.list(models.data[0].id)).resolves.toEqual([]);
+  });
+
+  it("rejects an unknown demo model", async () => {
+    await expect(dwctlApi.models.overlays.list("missing-model")).rejects.toThrow(
+      "Failed to fetch model overlays: 404",
+    );
+  });
+});
+
 describe("dwctlApi.models", () => {
   describe("list", () => {
     it("should fetch all models", async () => {

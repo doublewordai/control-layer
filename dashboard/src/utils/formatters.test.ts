@@ -310,6 +310,9 @@ describe("formatters", () => {
   });
 
   describe("getTariffDisplayName", () => {
+    it("labels playground tariffs explicitly in operator views", () => {
+      expect(getTariffDisplayName("playground", null)).toBe("Playground");
+    });
     it("should return Realtime for realtime purpose", () => {
       expect(getTariffDisplayName("realtime", null)).toBe("Realtime");
     });

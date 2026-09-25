@@ -20,12 +20,17 @@ pub enum ApiKeyPurpose {
     Batch,
     /// Playground inference access (/ai/*) - hidden keys for dashboard playground
     Playground,
-    /// Mid-stream continuation access (/ai/*) - hidden keys the resume middleware
-    /// uses to replay a failed stream's exact token-id prefix via a completions
-    /// route. The purpose is what `model_traffic_rules` keys on to steer resume
-    /// legs to a model's continuation deployment; one hidden key per user, like
-    /// batch/playground.
+    /// Internal mid-stream recovery using the single system-owned key. Resume
+    /// legs are free; their usage is accounted for on the original customer request.
     Continuation,
+}
+
+impl ApiKeyPurpose {
+    /// Only customer inference participates in tariff resolution. Internal resume
+    /// legs are accounted for on the original request, and management is not inference.
+    pub fn is_customer_billing(&self) -> bool {
+        matches!(self, Self::Realtime | Self::Batch | Self::Playground)
+    }
 }
 
 /// Whether an API key `purpose` (raw DB string) is permitted on the inference

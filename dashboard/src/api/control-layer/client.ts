@@ -94,6 +94,8 @@ import type {
   ProviderDisplayConfig,
   ProviderDisplayConfigCreateRequest,
   ProviderDisplayConfigUpdateRequest,
+  ServingOverlay,
+  OrganizationServing,
 } from "./types";
 import { ApiError } from "./errors";
 
@@ -576,6 +578,17 @@ const modelApi = {
       if (!response.ok) {
         throw new Error(`Failed to remove component: ${response.status}`);
       }
+    },
+  },
+
+  // Organisations with a serving overlay on the model (platform managers only)
+  overlays: {
+    async list(modelId: string): Promise<ServingOverlay[]> {
+      const response = await fetch(`/admin/api/v1/models/${modelId}/overlays`);
+      if (!response.ok) {
+        throw new Error(`Failed to fetch model overlays: ${response.status}`);
+      }
+      return response.json();
     },
   },
 
@@ -1894,6 +1907,15 @@ const usageApi = {
 
 
 const organizationsApi = {
+  // The organisation's serving settings, overlays and prices (platform managers only)
+  async serving(id: string): Promise<OrganizationServing> {
+    const response = await fetch(`/admin/api/v1/organizations/${id}/serving`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch organization serving: ${response.status}`);
+    }
+    return response.json();
+  },
+
   async list(
     options?: OrganizationsQuery,
   ): Promise<PaginatedResponse<Organization>> {

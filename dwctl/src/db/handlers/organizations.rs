@@ -250,6 +250,49 @@ impl<'c> Organizations<'c> {
         Ok(enabled.unwrap_or(false))
     }
 
+    /// The product surfaces an owner has switched off for this account
+    /// (`users.disabled_modalities`). Read for any account id, not only
+    /// organizations: the batch handlers pass the *billing* account (the org
+    /// in org context, the person otherwise), and a personal row simply has
+    /// the empty default. Unknown rows read as nothing disabled; the endpoint
+    /// has already authenticated the caller, so an unknown id is not an
+    /// authorization question here.
+    #[instrument(skip(self), fields(account_id = %abbrev_uuid(&account_id)), err)]
+    pub async fn disabled_modalities(&mut self, account_id: UserId) -> Result<crate::modalities::ModalitySet> {
+        let values = sqlx::query_scalar!(
+            r#"
+            SELECT disabled_modalities
+            FROM users
+            WHERE id = $1 AND is_deleted = false
+            "#,
+            account_id,
+        )
+        .fetch_optional(&mut *self.db)
+        .await?;
+
+        Ok(values.as_deref().map(crate::modalities::ModalitySet::from_db).unwrap_or_default())
+    }
+
+    /// Replace the organization's disabled modalities. Returns false if there
+    /// is no such organization to change. Fires the column's NOTIFY trigger so
+    /// the per-key policy cache picks the change up.
+    #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), ?disabled), err)]
+    pub async fn set_disabled_modalities(&mut self, org_id: UserId, disabled: &[crate::modalities::Modality]) -> Result<bool> {
+        let values: Vec<String> = disabled.iter().map(|m| m.as_str().to_string()).collect();
+        let result = sqlx::query!(
+            r#"
+            UPDATE users SET disabled_modalities = $2, updated_at = NOW()
+            WHERE id = $1 AND user_type = 'organization' AND is_deleted = false
+            "#,
+            org_id,
+            &values,
+        )
+        .execute(&mut *self.db)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Turn domain auto-join on or off. Returns false if there is no such
     /// organization to change.
     #[instrument(skip(self), fields(org_id = %abbrev_uuid(&org_id), enabled), err)]

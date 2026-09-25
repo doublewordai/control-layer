@@ -1205,6 +1205,15 @@ pub async fn upload_file<P: PoolProvider>(
     let target_user_id = current_user.active_organization.unwrap_or(current_user.id);
     let uploaded_by = Some(target_user_id.to_string());
 
+    // Files exist to feed batches: if an owner has switched the batch API
+    // off for the workspace, refuse the upload before streaming the body.
+    {
+        let mut conn = state.db.write().acquire().await.map_err(|e| Error::Internal {
+            operation: format!("get db connection for modality check: {}", e),
+        })?;
+        crate::api::handlers::modalities::ensure_batch_enabled(&mut conn, target_user_id).await?;
+    }
+
     // Re-use the AppState-bound normaliser singleton (built once at
     // startup). The dispatcher will JIT-resign any `dw-img://` tokens
     // produced here with a fresh short-lived signed URL before sending
@@ -2146,6 +2155,8 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
 
     // Use the completion_window from query params, defaulting to "24h"
     let completion_window = query.completion_window.as_deref().unwrap_or("24h");
+    // Operators may inspect another account's file; quote that account's deal.
+    let pricing_account = file.uploaded_by.as_deref().and_then(|owner| Uuid::parse_str(owner).ok());
 
     for (model_alias, (request_count, input_tokens)) in model_stats {
         // Look up the deployment and historical average
@@ -2167,14 +2178,15 @@ pub async fn get_file_cost_estimate<P: PoolProvider>(
         };
 
         let cost = if let Some(deployment) = deployment_opt {
-            // Look up tariff pricing for Batch API key purpose, with fallback to realtime
+            // Resolve the owner's batch price for this exact completion window.
             let pricing_result = tariffs_repo
-                .get_pricing_at_timestamp_with_fallback(
+                .get_effective_pricing_at_timestamp(
                     deployment.id,
-                    Some(&ApiKeyPurpose::Batch),
-                    &ApiKeyPurpose::Realtime,
-                    current_time,
+                    pricing_account,
+                    "batch",
                     Some(completion_window),
+                    Some("standard"),
+                    current_time,
                 )
                 .await
                 .map_err(Error::Database)?;
@@ -2753,6 +2765,7 @@ mod tests {
                 completion_window: Some("24h".to_string()),
                 // Estimates use the host clock; the database may run in a VM.
                 valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
+                user_id: None,
             })
             .await
             .unwrap();
@@ -2768,6 +2781,7 @@ mod tests {
                 completion_window: Some("24h".to_string()),
                 // Estimates use the host clock; the database may run in a VM.
                 valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
+                user_id: None,
             })
             .await
             .unwrap();
@@ -2885,6 +2899,7 @@ mod tests {
                 completion_window: Some("24h".to_string()),
                 // Estimates use the host clock; the database may run in a VM.
                 valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
+                user_id: None,
             })
             .await
             .unwrap();
@@ -2900,6 +2915,7 @@ mod tests {
                 completion_window: Some("1h".to_string()),
                 // Estimates use the host clock; the database may run in a VM.
                 valid_from: Some(Utc::now() - chrono::Duration::minutes(1)),
+                user_id: None,
             })
             .await
             .unwrap();

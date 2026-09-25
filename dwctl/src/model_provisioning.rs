@@ -355,11 +355,30 @@ fn default_weight() -> i32 {
 #[serde(deny_unknown_fields)]
 pub struct Tariff {
     pub name: String,
-    pub purpose: Purpose,
+    pub purpose: TariffPurpose,
     #[serde(default)]
     pub completion_window: Option<String>,
     pub input_per_million_tokens: String,
     pub output_per_million_tokens: String,
+}
+
+/// Customer inference pricing is independent of internal key purposes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TariffPurpose {
+    Realtime,
+    Batch,
+    Playground,
+}
+
+impl TariffPurpose {
+    pub(crate) fn as_db_str(self) -> &'static str {
+        match self {
+            Self::Realtime => "realtime",
+            Self::Batch => "batch",
+            Self::Playground => "playground",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
@@ -517,51 +536,9 @@ impl Catalog {
             );
             validate_fallback(&model.clay.routing.fallback, &model.source)?;
 
-            let mut tariff_keys = HashSet::new();
-            for tariff in &model.clay.tariffs {
-                ensure_nonempty(&tariff.name, &model.source, "tariff.name")?;
-                match tariff.purpose {
-                    Purpose::Batch => ensure!(
-                        tariff.completion_window.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                        "{}: batch tariff {:?} requires completion_window",
-                        model.source,
-                        tariff.name
-                    ),
-                    _ => ensure!(
-                        tariff.completion_window.is_none(),
-                        "{}: non-batch tariff {:?} must not set completion_window",
-                        model.source,
-                        tariff.name
-                    ),
-                }
-                ensure!(
-                    tariff_keys.insert((tariff.purpose, tariff.completion_window.clone())),
-                    "{}: duplicate tariff for purpose {:?} and completion window {:?}",
-                    model.source,
-                    tariff.purpose,
-                    tariff.completion_window
-                );
-                parse_per_million(&tariff.input_per_million_tokens)
-                    .with_context(|| format!("{}: tariff {:?} input price", model.source, tariff.name))?;
-                parse_per_million(&tariff.output_per_million_tokens)
-                    .with_context(|| format!("{}: tariff {:?} output price", model.source, tariff.name))?;
-            }
-
+            validate_tariffs(&model.clay.tariffs, &model.source)?;
             if let Some(cache) = &model.clay.cache_tariff {
-                for (field, value) in [
-                    ("write_multiplier_5m", &cache.write_multiplier_5m),
-                    ("write_multiplier_1h", &cache.write_multiplier_1h),
-                    ("write_multiplier_24h", &cache.write_multiplier_24h),
-                    ("read_multiplier", &cache.read_multiplier),
-                ] {
-                    let parsed = parse_decimal(value).with_context(|| format!("{}: cache tariff {field}", model.source))?;
-                    ensure!(parsed >= Decimal::ZERO, "{}: cache tariff {field} cannot be negative", model.source);
-                }
-                ensure!(
-                    cache.min_prefix_tokens > 0,
-                    "{}: cache tariff min_prefix_tokens must be positive",
-                    model.source
-                );
+                validate_cache_tariff(cache, &model.source)?;
             }
 
             ensure_unique_strings(&model.clay.access_groups, &model.source, "access group")?;
@@ -598,6 +575,61 @@ pub async fn apply(pool: &PgPool, catalog: &Catalog) -> Result<()> {
     let mut transaction = pool.begin().await.context("begin model provisioning transaction")?;
     ModelProvisioning::new(&mut transaction).apply(catalog).await?;
     transaction.commit().await.context("commit model provisioning transaction")?;
+    Ok(())
+}
+
+/// The tariff rules shared by the model catalog (a model's general price) and the
+/// organisation catalog (a deal on one model): batch rows carry a completion window,
+/// others do not, one row per (purpose, window), prices exact at 8 dp per token.
+pub(crate) fn validate_tariffs(tariffs: &[Tariff], source: &str) -> Result<()> {
+    let mut tariff_keys = HashSet::new();
+    for tariff in tariffs {
+        ensure_nonempty(&tariff.name, source, "tariff.name")?;
+        match tariff.purpose {
+            TariffPurpose::Batch => ensure!(
+                tariff
+                    .completion_window
+                    .as_deref()
+                    .is_some_and(|value| !value.is_empty() && value == value.trim()),
+                "{source}: batch tariff {:?} requires a non-empty completion_window without surrounding whitespace",
+                tariff.name
+            ),
+            _ => ensure!(
+                tariff.completion_window.is_none(),
+                "{source}: non-batch tariff {:?} must not set completion_window",
+                tariff.name
+            ),
+        }
+        ensure!(
+            tariff_keys.insert((tariff.purpose, tariff.completion_window.clone())),
+            "{source}: duplicate tariff for purpose {:?} and completion window {:?}",
+            tariff.purpose,
+            tariff.completion_window
+        );
+        parse_per_million(&tariff.input_per_million_tokens).with_context(|| format!("{source}: tariff {:?} input price", tariff.name))?;
+        parse_per_million(&tariff.output_per_million_tokens).with_context(|| format!("{source}: tariff {:?} output price", tariff.name))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_cache_tariff(cache: &CacheTariff, source: &str) -> Result<()> {
+    for (field, value) in [
+        ("write_multiplier_5m", &cache.write_multiplier_5m),
+        ("write_multiplier_1h", &cache.write_multiplier_1h),
+        ("write_multiplier_24h", &cache.write_multiplier_24h),
+        ("read_multiplier", &cache.read_multiplier),
+    ] {
+        let parsed = parse_decimal(value).with_context(|| format!("{source}: cache tariff {field}"))?;
+        ensure!(parsed >= Decimal::ZERO, "{source}: cache tariff {field} cannot be negative");
+        ensure!(
+            parsed.round_dp(4) == parsed && parsed < Decimal::from(100),
+            "{source}: cache tariff {field} must fit DECIMAL(6,4) exactly (0 to 99.9999, at most four decimal places)"
+        );
+    }
+    ensure!(
+        cache.min_prefix_tokens > 0,
+        "{source}: cache tariff min_prefix_tokens must be positive"
+    );
     Ok(())
 }
 
@@ -760,6 +792,31 @@ mod tests {
 
     fn write(directory: &Path, name: &str, contents: &str) {
         fs::write(directory.join(name), contents).unwrap();
+    }
+
+    #[test]
+    fn tariffs_accept_only_customer_inference_purposes() {
+        for purpose in ["realtime", "batch", "playground", "continuation", "platform"] {
+            let value = serde_json::json!({"name":"price", "purpose":purpose,
+                "input_per_million_tokens":"1", "output_per_million_tokens":"2"});
+            assert_eq!(
+                serde_json::from_value::<Tariff>(value).is_ok(),
+                matches!(purpose, "realtime" | "batch" | "playground"),
+                "{purpose}"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_batch_windows_reject_noncanonical_whitespace() {
+        for window in ["24h", " 24h ", "", " "] {
+            let tariff: Tariff = serde_json::from_value(serde_json::json!({
+                "name":"batch", "purpose":"batch", "completion_window":window,
+                "input_per_million_tokens":"1", "output_per_million_tokens":"2"
+            }))
+            .unwrap();
+            assert_eq!(validate_tariffs(&[tariff], "test").is_ok(), window == "24h", "{window:?}");
+        }
     }
 
     #[test]
@@ -1248,5 +1305,55 @@ clay:
         assert_eq!(orphan.try_get::<Uuid, _>("id").unwrap(), orphan_id);
         assert!(orphan.try_get::<Option<String>, _>("provisioning_source").unwrap().is_none());
         assert!(!orphan.try_get::<bool, _>("deleted").unwrap());
+    }
+    #[test]
+    fn cache_multipliers_must_fit_storage_exactly() {
+        for (value, valid) in [
+            ("0", true),
+            ("0.10000", true),
+            ("99.9999", true),
+            ("100", false),
+            ("0.12345", false),
+            ("-0.1", false),
+        ] {
+            let directory = tempdir().unwrap();
+            write(directory.path(), "model.yaml", &catalog_yaml("1", false, value));
+            assert_eq!(Catalog::load(directory.path()).is_ok(), valid, "{value}");
+        }
+    }
+
+    #[sqlx::test]
+    async fn waiting_replica_uses_time_after_catalog_lock(pool: PgPool) {
+        sqlx::query("INSERT INTO inference_endpoints (name,url,created_by) VALUES ('onwards','http://onwards.test','00000000-0000-0000-0000-000000000000')").execute(&pool).await.unwrap();
+        let directory = tempdir().unwrap();
+        write(directory.path(), "model.yaml", &catalog_yaml("1", false, "0.10000"));
+        let catalog = Catalog::load(directory.path()).unwrap();
+        // This transaction starts first but reaches the lock second.
+        let mut older = pool.begin().await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *older).await.unwrap();
+        let mut winner = pool.begin().await.unwrap();
+        ModelProvisioning::new(&mut winner).apply(&catalog).await.unwrap();
+        let (waiting, ()) = tokio::join!(
+            async {
+                ModelProvisioning::new(&mut older).apply(&catalog).await?;
+                older.commit().await?;
+                Ok::<_, anyhow::Error>(())
+            },
+            async {
+                crate::test::utils::wait_for_advisory_waiter(&pool, pid).await;
+                winner.commit().await.unwrap();
+            }
+        );
+        waiting.unwrap();
+        for table in ["model_tariffs", "model_cache_tariffs"] {
+            let versions: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(
+                versions, 1,
+                "{table}: restart must not spuriously version a rounded or newly committed price"
+            );
+        }
     }
 }

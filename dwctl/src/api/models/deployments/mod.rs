@@ -159,7 +159,7 @@ pub struct TariffDefinition {
     /// Output price per token (sent/returned as string to preserve precision)
     #[schema(value_type = String)]
     pub output_price_per_token: rust_decimal::Decimal,
-    /// Optional API key purpose this tariff applies to (realtime, batch, playground)
+    /// Required for new prices: realtime, batch or playground. Missing/null is rejected.
     pub api_key_purpose: Option<crate::db::models::api_keys::ApiKeyPurpose>,
     /// Optional completion window (priority) for batch tariffs (e.g., "24h", "1h")
     /// Required when api_key_purpose is Batch to support multiple pricing tiers per priority
@@ -573,6 +573,9 @@ pub struct DeployedModelResponse {
     /// Active customer prompt-cache pricing (only included when include=pricing)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_pricing: Option<CachePricingResponse>,
+    /// Class-specific cache prices; omitted classes inherit cache_pricing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_pricing_by_class: Option<std::collections::BTreeMap<String, CachePricingResponse>>,
     /// Inference endpoint information (only included if requested)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<super::inference_endpoints::InferenceEndpointResponse>,
@@ -674,9 +677,10 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             metrics: None,          // By default, metrics are not included
             status: None,           // By default, probe status is not included
             provider_pricing: None, // By default, provider pricing is not included
-            cache_pricing: None,    // By default, cache pricing is not included
-            endpoint: None,         // By default, endpoint is not included
-            tariffs: None,          // By default, tariffs are not included
+            cache_pricing_by_class: None,
+            cache_pricing: None, // By default, cache pricing is not included
+            endpoint: None,      // By default, endpoint is not included
+            tariffs: None,       // By default, tariffs are not included
             // Composite model fields
             is_composite: Some(db.is_composite),
             lb_strategy: if db.is_composite { Some(db.lb_strategy) } else { None },

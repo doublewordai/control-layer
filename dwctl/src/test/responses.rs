@@ -1085,7 +1085,7 @@ async fn enable_zdr_for_key(pool: &PgPool, bg: &crate::BackgroundServices, api_k
     .execute(pool)
     .await
     .unwrap();
-    bg.sync_zdr_keys(pool).await.unwrap();
+    bg.sync_key_policy(pool).await.unwrap();
 }
 
 /// Stateful continuation requires the prior response body, so a ZDR key must

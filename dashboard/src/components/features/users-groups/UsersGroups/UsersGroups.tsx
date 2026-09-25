@@ -749,8 +749,12 @@ const UsersGroups: React.FC = () => {
             avatar: activeUser.avatar,
             roles: activeUser.roles,
             zero_data_retention: activeUser.zero_data_retention,
+            granted_serving_classes: activeUser.granted_serving_classes,
+            default_serving_class: activeUser.default_serving_class,
+            self_hosted_only: activeUser.self_hosted_only,
           }}
           canEditZdr={isPlatformManager}
+          canEditServing={isPlatformManager}
         />
       )}
       {activeGroup && (
@@ -782,6 +786,7 @@ const UsersGroups: React.FC = () => {
         onClose={() => setEditingOrg(null)}
         organization={editingOrg}
         canEditZdr={isPlatformManager}
+        canEditServing={isPlatformManager}
       />
       <Dialog
         open={!!deletingOrg}
