@@ -6,6 +6,7 @@ import {
   useModelCachePricing,
   useModelOverlays,
   useOrganizationServing,
+  useOrganizationsByIds,
 } from "@/api/control-layer";
 import type {
   Model,
@@ -18,6 +19,7 @@ vi.mock("@/api/control-layer", () => ({
   useModelCachePricing: vi.fn(),
   useModelOverlays: vi.fn(),
   useOrganizationServing: vi.fn(),
+  useOrganizationsByIds: vi.fn(),
 }));
 const tariff = (id: string, extra: Partial<ModelTariff> = {}): ModelTariff => ({
   id,
@@ -105,6 +107,7 @@ function mount(manager = true, initialOrganization?: string) {
 }
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(useOrganizationsByIds).mockReturnValue([]);
   vi.mocked(useModelOverlays).mockReturnValue({
     data: [overlay],
     isLoading: false,
@@ -132,6 +135,35 @@ beforeEach(() => {
   } as unknown as ReturnType<typeof useOrganizationServing>);
 });
 describe("model pricing selector", () => {
+  it.each([
+    ["Price-only Organisation", "Price-only Organisation"],
+    [null, "price-only~1234"],
+    ["   ", "price-only~1234"],
+  ])("labels a tariff-only scope with display name %j", (displayName, expected) => {
+    vi.mocked(useModelOverlays).mockReturnValue({ data: [] } as unknown as ReturnType<typeof useModelOverlays>);
+    vi.mocked(useOrganizationsByIds).mockReturnValue([
+      { data: { id: "price-org", username: "price-only~1234", display_name: displayName } },
+    ] as unknown as ReturnType<typeof useOrganizationsByIds>);
+    const { container } = render(
+      <MemoryRouter>
+        <ModelPricing
+          model={{ ...model, tariffs: [...model.tariffs!, tariff("price-only", { organization_id: "price-org" })] }}
+          manager
+          initialOrganization="price-org"
+          onEditPrices={vi.fn()}
+          onEditCache={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(useOrganizationsByIds).toHaveBeenCalledWith(["price-org"]);
+    expect(within(container).getByRole("combobox", { name: "Pricing for" })).toHaveTextContent(expected!);
+  });
+
+  it("does not fetch organisation names for customer pricing views", () => {
+    mount(false);
+    expect(useOrganizationsByIds).toHaveBeenCalledWith([]);
+  });
+
   it.each([undefined, null, "", "   "])(
     "falls back to the account username when the display name is %j",
     (displayName) => {

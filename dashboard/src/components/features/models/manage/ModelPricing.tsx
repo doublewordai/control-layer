@@ -4,6 +4,7 @@ import {
   useModelCachePricing,
   useModelOverlays,
   useOrganizationServing,
+  useOrganizationsByIds,
 } from "@/api/control-layer";
 import type {
   Model,
@@ -63,6 +64,13 @@ export function ModelPricing({
         options.set(row.organization_id, row.organization_id);
     if (organization && !options.has(organization))
       options.set(organization, organization);
+  }
+  const missingNames = [...options.keys()].filter(
+    (id) => !(overlays.data ?? []).some((row) => row.organization_id === id),
+  );
+  const organizations = useOrganizationsByIds(missingNames);
+  for (const { data } of organizations) {
+    if (data) options.set(data.id, data.display_name?.trim() || data.username);
   }
   const general = (model.tariffs ?? []).filter((row) => !row.organization_id);
   const rows = organization
