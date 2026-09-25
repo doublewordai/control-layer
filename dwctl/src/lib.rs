@@ -321,6 +321,9 @@ where
     /// Encrypted key custody, built from `config.keystore`. `None` means it is
     /// not configured (ZDR flex disabled).
     pub keystore: Option<crate::keystore::Keystore>,
+    /// Request validation shared by the inference middleware and batch file
+    /// upload, so both enforce the same rules. `None` when disabled.
+    pub request_validation: Option<crate::inference::validation::ValidationStage>,
 }
 
 impl<P> AppState<P>
@@ -2862,6 +2865,10 @@ pub struct BackgroundServices {
     /// [`crate::sync::key_policy`]. Handed to `AppState` so `is_zdr_request`
     /// reads it on the request hot path.
     key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
+    /// Per-alias model metadata for ingress request validation, refreshed by
+    /// [`crate::sync::model_metadata`]. Empty (every lookup `NotLoaded`, so
+    /// every rule passes) when validation is disabled.
+    model_metadata_cache: crate::sync::model_metadata::ModelMetadataCache,
     #[cfg_attr(not(test), allow(dead_code))]
     onwards_sender: Option<tokio::sync::watch::Sender<onwards::target::Targets>>,
     #[allow(dead_code)] // Used in sync_onwards_config method
@@ -3170,6 +3177,17 @@ impl BackgroundServices {
     #[cfg(test)]
     pub async fn sync_key_policy(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
         crate::sync::key_policy::refresh(pool, &self.key_policy_cache).await?;
+        Ok(())
+    }
+
+    /// Manually refresh the per-alias model metadata cache from the database
+    /// (for testing). The cache handle is shared (same `ArcSwap`) with the
+    /// inference middleware, so this immediately changes what ingress validation
+    /// sees - letting a test add or edit a deployed model mid-run and validate a
+    /// request against it without waiting on the LISTEN/NOTIFY loop.
+    #[cfg(test)]
+    pub async fn sync_model_metadata(&self, pool: &sqlx::PgPool) -> anyhow::Result<()> {
+        crate::sync::model_metadata::refresh(pool, &self.model_metadata_cache).await?;
         Ok(())
     }
 }
@@ -3483,6 +3501,44 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
                 .context("key policy sync failed")
         });
     }
+
+    // Model metadata for ingress request validation. Unlike the ZDR map, an
+    // empty cache is safe (every rule fails open), so a failed initial load
+    // degrades validation rather than blocking startup.
+    let model_metadata_cache = if config.request_validation.enabled {
+        let cache = match crate::sync::model_metadata::initial_cache(&db_pools.write()).await {
+            Ok(cache) => cache,
+            Err(e) => {
+                crate::background_error!(
+                    crate::metrics::errors::component::MODEL_METADATA_SYNC,
+                    "initial_load",
+                    Error,
+                    error = %e,
+                    "Initial model metadata load failed; request validation passes everything until the next refresh"
+                );
+                crate::sync::model_metadata::ModelMetadataCache::empty()
+            }
+        };
+        let metadata_pool = dyn_pools.clone();
+        let metadata_listener_pool = direct_pools.clone();
+        let metadata_cache = cache.clone();
+        let metadata_shutdown = shutdown_token.clone();
+        let metadata_fallback = config.background_services.onwards_sync.fallback_interval_milliseconds;
+        background_tasks.spawn("model-metadata-sync", async move {
+            crate::sync::model_metadata::run(
+                metadata_pool,
+                metadata_listener_pool,
+                metadata_cache,
+                metadata_fallback,
+                metadata_shutdown,
+            )
+            .await
+            .context("Model metadata sync failed")
+        });
+        cache
+    } else {
+        crate::sync::model_metadata::ModelMetadataCache::empty()
+    };
 
     // Leader election lock ID: 0x44574354_50524F42 (DWCT_PROB in hex for "dwctl probes")
     const LEADER_LOCK_ID: i64 = 0x4457_4354_5052_4F42_i64;
@@ -3953,6 +4009,7 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         is_leader,
         onwards_targets: initial_targets,
         key_policy_cache,
+        model_metadata_cache,
         onwards_sender,
         strict_mode: config.onwards.strict_mode,
         analytics_writer,
@@ -4268,6 +4325,25 @@ impl Application {
         // Inference middleware state. Non-background realtime no longer
         // does any DB work up front; the completion path goes through
         // FusilladeOutletHandler -> RequestsWriter.
+        // One validation stage for both inference requests and batch file
+        // lines, so the two ingress paths cannot drift apart.
+        let request_validation = config.request_validation.enabled.then(|| {
+            let exact = (!config.cache.tokenizer_url.is_empty()).then(|| {
+                crate::inference::validation::exact::ExactCounter::new(
+                    Arc::new(crate::prompt_cache::TokenizerClient::new(config.cache.tokenizer_url.clone())),
+                    std::time::Duration::from_millis(config.request_validation.exact_count_deadline_ms),
+                )
+            });
+            crate::inference::validation::ValidationStage::new(
+                config.request_validation.clone(),
+                Arc::new(bg_services.model_metadata_cache.clone()),
+                exact,
+                // The live routing table onwards authorises against: validate
+                // only callers whose key may use the requested model.
+                Some(Arc::new(bg_services.onwards_targets.clone())),
+            )
+        });
+
         let inference_middleware_state = crate::inference::middleware::InferenceMiddlewareState {
             request_manager: bg_services.request_manager.clone(),
             daemon_id: crate::inference::store::OnwardsDaemonId(onwards_daemon_id),
@@ -4288,6 +4364,7 @@ impl Application {
             flex_completion_window: config.batches.async_requests.completion_window.clone(),
             keystore: bg_services.keystore.clone(),
             key_policy_cache: bg_services.key_policy_cache.clone(),
+            validation: request_validation.clone(),
         };
 
         // Build onwards router from targets with body transform + response sanitization.
@@ -4345,6 +4422,7 @@ impl Application {
             .maybe_keystore(bg_services.keystore.clone())
             .response_store(response_store)
             .image_normalizer(image_normalizer)
+            .maybe_request_validation(request_validation)
             .build();
 
         if let Some(config_path) = config_path {

@@ -933,6 +933,36 @@ background_services:
     activate_workers: 1 # Batch activation workers (low to avoid capacity contention)
     discovery_workers: 1 # Sync discovery workers
 
+# Ingress request validation: reject inference requests that are provably doomed
+# (wrong endpoint for the model type, image input to a model without vision,
+# invalid service_tier / max tokens, prompt over the context window) before they
+# are forwarded or enqueued, with the surface's own error envelope. The same
+# rules run on every line of an uploaded batch input file. Every rule fails open
+# when model metadata is missing, and only callers whose key may use the model
+# are validated (everyone else gets the normal auth/access error).
+request_validation:
+  # Set via environment: DWCTL_REQUEST_VALIDATION__ENABLED=true
+  enabled: false
+  # off | shadow | enforce. Shadow records
+  # dwctl_request_validation_violations_total{rule,surface,source,model,mode}
+  # (source: request | batch_file) and
+  # forwards the request; enforce rejects it.
+  default_mode: shadow
+  # Per-rule overrides, e.g. DWCTL_REQUEST_VALIDATION__RULES__MODEL_TYPE_MISMATCH=enforce
+  # Rules: model_type_mismatch, invalid_service_tier, invalid_max_tokens,
+  # max_tokens_exceeds_limit, unsupported_modality, context_length_exceeded.
+  rules: {}
+  # Exact prompt token counts via tokenizer-svc (cache.tokenizer_url), only for
+  # prompts larger in bytes than the context window. Context rejections are
+  # always backed by an exact count, so with this off the context rule never
+  # rejects. On timeout or tokenizer outage the request passes.
+  exact_count_enabled: false
+  exact_count_deadline_ms: 2000
+  # Batch uploads validate lines one after another; cap the exact counts one
+  # file may spend. Past it, remaining near-limit lines pass (in shadow mode too,
+  # so shadow metrics under-count context violations for such files).
+  exact_count_max_per_batch_file: 1000
+
 # Image input normalisation.
 #
 # When enabled, image references in `/v1/chat/completions` and

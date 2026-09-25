@@ -392,6 +392,21 @@
           "default": null
         },
         "metadata": {
+          "description": "Free-form catalog metadata. `context_window` and `max_output_tokens`\nare validated when present; unknown keys pass through untouched.",
+          "type": "object",
+          "properties": {
+            "context_window": {
+              "type": "integer",
+              "maximum": 100000000,
+              "minimum": 1
+            },
+            "max_output_tokens": {
+              "type": "integer",
+              "maximum": 100000000,
+              "minimum": 1
+            }
+          },
+          "additionalProperties": true,
           "default": {}
         },
         "reasoning_translation_overrides": {

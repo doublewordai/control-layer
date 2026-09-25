@@ -234,6 +234,11 @@ pub struct Config {
     /// and resume-behavior knobs. See [`ContinuationConfig`].
     #[serde(default)]
     pub continuation: ContinuationConfig,
+    /// Ingress request validation: reject provably-doomed inference requests
+    /// before they are forwarded or enqueued. Off by default; rules start in
+    /// shadow mode. See [`crate::inference::validation::ValidationConfig`].
+    #[serde(default)]
+    pub request_validation: crate::inference::validation::ValidationConfig,
 }
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
@@ -3162,6 +3167,7 @@ impl Default for Config {
             clickhouse: None,
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: ContinuationConfig::default(),
+            request_validation: Default::default(),
         }
     }
 }
