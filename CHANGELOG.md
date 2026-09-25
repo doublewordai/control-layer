@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.6.1](https://github.com/doublewordai/control-layer/compare/v12.6.0...v12.6.1) (2026-09-25)
+
+
+### Bug Fixes
+
+* **image-normalizer:** re-upload dedup hits before the bucket lifecycle expires them ([#1843](https://github.com/doublewordai/control-layer/issues/1843)) ([268b3a4](https://github.com/doublewordai/control-layer/commit/268b3a48d6c2e3cb7659b8d01c84006534903068))
+
 ## [12.6.0](https://github.com/doublewordai/control-layer/compare/v12.5.0...v12.6.0) (2026-09-25)
 
 
