@@ -75,6 +75,13 @@ pub trait ImageStore: Send + Sync {
     /// (see `reuse_max_age` on [`S3CompatStore`]).
     async fn exists(&self, token: ImageToken) -> Result<bool, StoreError>;
 
+    /// True if the object for `token` is physically in the store right now,
+    /// with no reuse policy applied. [`exists`](Self::exists) may report a
+    /// present-but-ageing object as absent so ingest refreshes it; a caller
+    /// deciding whether a dispatch failed because the object is GONE needs
+    /// the plain answer.
+    async fn is_present(&self, token: ImageToken) -> Result<bool, StoreError>;
+
     /// True if `url` already points at an object in THIS store — i.e. a URL
     /// we previously signed. Used to avoid re-ingesting and re-signing our
     /// own signed URLs: doing so would (a) waste a round-trip re-fetching an
@@ -118,6 +125,12 @@ impl MemoryStore {
         self.base_url = base_url.into();
         self
     }
+
+    /// Drop `token`'s bytes, as a bucket lifecycle rule would. Test helper;
+    /// returns `false` if nothing was stored.
+    pub fn remove(&self, token: ImageToken) -> bool {
+        self.inner.lock().expect("MemoryStore mutex poisoned").remove(&token).is_some()
+    }
 }
 
 #[async_trait]
@@ -152,6 +165,11 @@ impl ImageStore for MemoryStore {
     }
 
     async fn exists(&self, token: ImageToken) -> Result<bool, StoreError> {
+        let map = self.inner.lock().expect("MemoryStore mutex poisoned");
+        Ok(map.contains_key(&token))
+    }
+
+    async fn is_present(&self, token: ImageToken) -> Result<bool, StoreError> {
         let map = self.inner.lock().expect("MemoryStore mutex poisoned");
         Ok(map.contains_key(&token))
     }
@@ -305,6 +323,11 @@ impl ImageStore for GcsStore {
                 _ => Err(StoreError::Backend(format!("GCS exists {key}: {e}"))),
             },
         }
+    }
+
+    async fn is_present(&self, token: ImageToken) -> Result<bool, StoreError> {
+        // Same probe as `exists`; this backend applies no reuse policy.
+        self.exists(token).await
     }
 
     fn owns_url(&self, url: &str) -> bool {
@@ -507,6 +530,22 @@ impl ImageStore for S3CompatStore {
                     Ok(false)
                 } else {
                     Err(StoreError::Backend(format!("S3 exists {key}: {svc}")))
+                }
+            }
+        }
+    }
+
+    async fn is_present(&self, token: ImageToken) -> Result<bool, StoreError> {
+        // A plain HEAD: no `reuse_max_age` policy, unlike `exists`.
+        let key = Self::key(token);
+        match self.client.head_object().bucket(&self.bucket).key(&key).send().await {
+            Ok(_) => Ok(true),
+            Err(e) => {
+                let svc = e.into_service_error();
+                if svc.is_not_found() {
+                    Ok(false)
+                } else {
+                    Err(StoreError::Backend(format!("S3 head {key}: {svc}")))
                 }
             }
         }
