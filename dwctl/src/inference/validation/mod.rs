@@ -35,7 +35,7 @@ pub mod stage;
 pub mod view;
 
 pub use rules::evaluate;
-pub use stage::{Source, ValidationStage};
+pub use stage::{ExactCountBudget, Source, ValidationStage};
 pub use view::RequestView;
 
 /// The inference API surface a request arrived on. Paths are the nested
@@ -135,7 +135,6 @@ pub trait ModelInfoSource: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuleId {
-    ModelNotFound,
     ModelTypeMismatch,
     InvalidServiceTier,
     InvalidMaxTokens,
@@ -147,7 +146,6 @@ pub enum RuleId {
 impl RuleId {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::ModelNotFound => "model_not_found",
             Self::ModelTypeMismatch => "model_type_mismatch",
             Self::InvalidServiceTier => "invalid_service_tier",
             Self::InvalidMaxTokens => "invalid_max_tokens",
@@ -173,8 +171,9 @@ pub struct Violation {
 /// Stage-1 context check could not decide; an exact count is needed.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExactCountNeeded {
-    /// Token budget the prompt must fit in (context window minus any reserved
-    /// output tokens).
+    /// Token budget the prompt must fit in. Currently the whole context
+    /// window: engines disagree on whether `prompt + max_tokens` must fit, so
+    /// subtracting the requested output would reject requests some accept.
     pub prompt_token_limit: u64,
     pub context_window: u64,
 }
@@ -224,6 +223,9 @@ pub struct ValidationConfig {
     /// passes. Only prompts larger in bytes than the context window are ever
     /// counted, so this bounds the cost of already-huge requests.
     pub exact_count_deadline_ms: u64,
+    /// Most exact counts one batch file upload may spend (lines are validated
+    /// one after another). Past it, remaining near-limit lines pass.
+    pub exact_count_max_per_batch_file: usize,
 }
 
 impl Default for ValidationConfig {
@@ -234,6 +236,7 @@ impl Default for ValidationConfig {
             rules: HashMap::new(),
             exact_count_enabled: false,
             exact_count_deadline_ms: 2_000,
+            exact_count_max_per_batch_file: 1_000,
         }
     }
 }

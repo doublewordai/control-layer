@@ -723,3 +723,52 @@ async fn batch_upload_shadow_mode_accepts_the_file(pool: PgPool) {
 
     assert_eq!(response.status_code(), StatusCode::CREATED, "{}", response.text());
 }
+
+/// Anthropic clients authenticate with `x-api-key`, not a bearer token; they
+/// are validated like any other caller with access to the model.
+#[sqlx::test]
+#[test_log::test]
+async fn messages_callers_using_x_api_key_are_validated(pool: PgPool) {
+    let fixture = setup(&pool, validation_config(true, RuleMode::Enforce)).await;
+
+    let alias = format!("embedder-x-api-key-{}", Uuid::new_v4());
+    fixture
+        .create_model(model_body(&alias, fixture.endpoint_id, json!({"model_type": "EMBEDDINGS"})))
+        .await;
+    fixture.sync(&pool).await;
+
+    let response = fixture
+        .server
+        .post("/ai/v1/messages")
+        .add_header("x-api-key", &fixture.api_key)
+        .json(&json!({
+            "model": alias,
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .await;
+
+    assert_eq!(response.status_code(), StatusCode::BAD_REQUEST, "{}", response.text());
+    assert_eq!(rejected_by(&response).as_deref(), Some(REJECTED_BY_VALUE));
+    let body: Value = response.json();
+    assert_eq!(body["type"], "error");
+}
+
+/// With validation disabled a request that breaks a rule is forwarded as before.
+#[sqlx::test]
+#[test_log::test]
+async fn disabled_validation_forwards_a_violating_request(pool: PgPool) {
+    let fixture = setup(&pool, validation_config(false, RuleMode::Enforce)).await;
+
+    let alias = format!("disabled-embedder-{}", Uuid::new_v4());
+    fixture
+        .create_model(model_body(&alias, fixture.endpoint_id, json!({"model_type": "EMBEDDINGS"})))
+        .await;
+    fixture.sync(&pool).await;
+    fixture.wait_until_routable(&alias).await;
+
+    let response = fixture.chat(chat_request(&alias, "hi")).await;
+
+    assert_eq!(response.status_code(), StatusCode::OK, "{}", response.text());
+    assert_eq!(rejected_by(&response), None);
+}

@@ -241,7 +241,8 @@ pub const MODEL_CATALOG_METADATA_MAX_BYTES: usize = 16_384;
 /// Maximum number of keys allowed in the `extra` object.
 pub const MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS: usize = 50;
 /// Upper bound accepted for the `context_window` / `max_output_tokens`
-/// metadata token counts. Above this an engine cannot serve the request.
+/// metadata token counts: a sanity bound that catches typos and unit
+/// mistakes, far above any real model limit.
 pub const MODEL_TOKEN_LIMIT_MAX: i64 = 100_000_000;
 
 /// Catalog-style metadata for display purposes (stored as JSONB).

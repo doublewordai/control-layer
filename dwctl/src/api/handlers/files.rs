@@ -28,7 +28,7 @@ use crate::db::{
 };
 use crate::errors::{Error, Result};
 use crate::image_normalizer::{ImageInput, ImageNormalizer, Mode as ImageNormalizerMode, walker as image_walker};
-use crate::inference::validation::{Source, Surface, ValidationStage};
+use crate::inference::validation::{ExactCountBudget, Source, Surface, ValidationStage};
 use crate::reasoning::ModelReasoningPolicy;
 use crate::types::Resource;
 use axum::{
@@ -702,6 +702,7 @@ struct AccessibleBatchModel {
 /// cannot enqueue a request the inference endpoints would reject.
 async fn validate_batch_line(
     validation: Option<&ValidationStage>,
+    budget: Option<&ExactCountBudget>,
     template: &fusillade::RequestTemplateInput,
     line: u64,
 ) -> std::result::Result<(), FileUploadError> {
@@ -712,7 +713,7 @@ async fn validate_batch_line(
     let Ok(body) = serde_json::from_str::<serde_json::Value>(&template.body) else {
         return Ok(());
     };
-    match validation.enforced_violation(surface, &body, Source::BatchFile).await {
+    match validation.enforced_violation(surface, &body, Source::BatchFile, budget).await {
         Some(violation) => Err(FileUploadError::ValidationError {
             line,
             message: violation.message,
@@ -755,6 +756,9 @@ fn create_file_stream(
         allowed_url_paths,
         validation,
     } = req_ctx;
+    // Lines are validated one after another, so cap the tokenizer round trips
+    // a single upload can spend on exact counts.
+    let exact_budget = validation.as_ref().map(ValidationStage::batch_file_budget);
     let normalizer = config.normalizer.clone();
     let normalizer_mode = config.normalizer_mode;
     let access_pool = config.access_pool.clone();
@@ -956,8 +960,13 @@ fn create_file_stream(
                                             match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths)
                                             {
                                                 Ok(mut template) => {
-                                                    if let Err(e) =
-                                                        validate_batch_line(validation.as_ref(), &template, line_count + 1).await
+                                                    if let Err(e) = validate_batch_line(
+                                                        validation.as_ref(),
+                                                        exact_budget.as_ref(),
+                                                        &template,
+                                                        line_count + 1,
+                                                    )
+                                                    .await
                                                     {
                                                         abort!(e);
                                                     }
@@ -1053,7 +1062,10 @@ fn create_file_stream(
                                 Ok(openai_req) => {
                                     match openai_req.to_internal(&endpoint, api_key.clone(), &accessible_models, &allowed_url_paths) {
                                         Ok(mut template) => {
-                                            if let Err(e) = validate_batch_line(validation.as_ref(), &template, line_count + 1).await {
+                                            if let Err(e) =
+                                                validate_batch_line(validation.as_ref(), exact_budget.as_ref(), &template, line_count + 1)
+                                                    .await
+                                            {
                                                 abort!(e);
                                             }
 

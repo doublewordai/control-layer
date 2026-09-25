@@ -32,10 +32,13 @@ pub struct RequestView {
     pub max_output_tokens: Option<serde_json::Value>,
     /// Name of the field `max_output_tokens` came from (for `param`).
     pub max_output_tokens_param: Option<&'static str>,
+    /// Image input the engine will receive (gated on the `vision` capability).
     pub has_image_input: bool,
+    /// Audio input. Tracked but not gated: the catalog has no `audio`
+    /// capability vocabulary yet.
     pub has_audio_input: bool,
     /// Files and documents (chat `file`, Responses `input_file`, Anthropic
-    /// `document`). Tracked apart from images: no capability gates them yet.
+    /// `document`). Tracked apart from images; not gated yet, for the same reason.
     pub has_file_input: bool,
     /// UTF-8 bytes of all prompt text the engine will tokenize (messages,
     /// system, instructions, tool definitions, embeddings input strings).

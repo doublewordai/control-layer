@@ -60,6 +60,10 @@ const CONVERSION_FAILED: &str = "conversion_failed";
 const UNSUPPORTED_PROMPT: &str = "unsupported_prompt";
 /// `ExactOutcome::Unavailable` reason: transport / 5xx / malformed response.
 const TOKENIZER_UNAVAILABLE: &str = "tokenizer_unavailable";
+/// `ExactOutcome::Unsupported` reason: tokenizer-svc rejected this request (a 4xx
+/// other than 408/429). About the request, not the service, so it never opens the
+/// circuit breaker.
+const TOKENIZER_REJECTED: &str = "tokenizer_rejected";
 /// `ExactOutcome::Unavailable` reason: the exact-count circuit breaker is open, so we
 /// skip tokenizer-svc entirely until the cooldown elapses.
 const CIRCUIT_OPEN: &str = "tokenizer_circuit_open";
@@ -188,7 +192,7 @@ impl ExactCounter {
                 let segments = message_text_segments(&messages);
                 self.count_message_text(model, &segments).await
             }
-            Err(TokenizerError::Http(_) | TokenizerError::Status { .. }) => ExactOutcome::Unavailable(TOKENIZER_UNAVAILABLE),
+            Err(e @ (TokenizerError::Http(_) | TokenizerError::Status { .. })) => service_error_outcome(&e),
         }
     }
 
@@ -242,8 +246,8 @@ impl ExactCounter {
                 self.memoize_unmapped(model).await;
                 Err(ExactOutcome::Unsupported(UNMAPPED_MODEL))
             }
-            Err(TokenizerError::RenderUnsupported(..) | TokenizerError::Http(_) | TokenizerError::Status { .. }) => {
-                Err(ExactOutcome::Unavailable(TOKENIZER_UNAVAILABLE))
+            Err(e @ (TokenizerError::RenderUnsupported(..) | TokenizerError::Http(_) | TokenizerError::Status { .. })) => {
+                Err(service_error_outcome(&e))
             }
         }
     }
@@ -282,6 +286,19 @@ impl Breaker {
         let cooldown_ms = u64::try_from(BREAKER_COOLDOWN.as_millis()).unwrap_or(u64::MAX);
         self.open_until_ms
             .store(self.now_ms().saturating_add(cooldown_ms), Ordering::Relaxed);
+    }
+}
+
+/// Outcome for a tokenizer-svc error. Transport failures, 5xx, 408 and 429 mean
+/// the service is unavailable (and open the circuit breaker); any other 4xx is
+/// about this request, so it is `Unsupported` and leaves the breaker closed.
+fn service_error_outcome(error: &TokenizerError) -> ExactOutcome {
+    match error {
+        TokenizerError::Status { status, .. } if (400..500).contains(status) && !matches!(status, 408 | 429) => {
+            ExactOutcome::Unsupported(TOKENIZER_REJECTED)
+        }
+        TokenizerError::RenderUnsupported(..) => ExactOutcome::Unsupported(TOKENIZER_REJECTED),
+        _ => ExactOutcome::Unavailable(TOKENIZER_UNAVAILABLE),
     }
 }
 
@@ -710,5 +727,22 @@ mod tests {
             ExactOutcome::Unavailable(CIRCUIT_OPEN)
         );
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn client_errors_do_not_count_as_an_outage() {
+        let status = |status| TokenizerError::Status {
+            status,
+            body: String::new(),
+        };
+        assert_eq!(service_error_outcome(&status(400)), ExactOutcome::Unsupported(TOKENIZER_REJECTED));
+        assert_eq!(service_error_outcome(&status(413)), ExactOutcome::Unsupported(TOKENIZER_REJECTED));
+        for unavailable in [408, 429, 500, 503] {
+            assert_eq!(
+                service_error_outcome(&status(unavailable)),
+                ExactOutcome::Unavailable(TOKENIZER_UNAVAILABLE),
+                "status {unavailable}"
+            );
+        }
     }
 }

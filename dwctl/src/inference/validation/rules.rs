@@ -45,12 +45,6 @@ pub fn evaluate(view: &RequestView, model: &ModelLookup, config: &ValidationConf
         ModelLookup::Unknown | ModelLookup::NotLoaded => None,
     };
 
-    if enabled(config, RuleId::ModelNotFound)
-        && let Some(violation) = model_not_found(view, model)
-    {
-        evaluation.violations.push(violation);
-    }
-
     if enabled(config, RuleId::ModelTypeMismatch)
         && let Some(info) = info
         && let Some(violation) = model_type_mismatch(view, info)
@@ -145,22 +139,6 @@ fn enabled(config: &ValidationConfig, rule: RuleId) -> bool {
     config.mode(rule) != RuleMode::Off
 }
 
-/// (a) The alias is not deployed. `NotLoaded` (metadata unavailable) and a
-/// missing alias both fail open.
-fn model_not_found(view: &RequestView, model: &ModelLookup) -> Option<Violation> {
-    if !matches!(model, ModelLookup::Unknown) {
-        return None;
-    }
-    let alias = view.model.as_deref()?;
-    Some(Violation {
-        rule: RuleId::ModelNotFound,
-        status: StatusCode::NOT_FOUND,
-        code: "model_not_found",
-        param: Some("model"),
-        message: format!("The model `{alias}` does not exist or you do not have access to it."),
-    })
-}
-
 /// (b) The catalog model type does not match what the surface serves. `None`
 /// model type, `None` surface or a surface without a constraint all pass.
 fn model_type_mismatch(view: &RequestView, info: &ModelInfo) -> Option<Violation> {
@@ -247,17 +225,12 @@ fn max_tokens_exceeds_limit(view: &RequestView, info: &ModelInfo, max_tokens: u6
     })
 }
 
-/// (f) The request carries an input modality the catalog says the model lacks.
-/// A `None` capability list means "unknown" and passes.
-fn unsupported_modality(view: &RequestView, info: &ModelInfo) -> Vec<Violation> {
-    let mut violations = Vec::new();
-    if view.has_image_input && info.has_capability("vision") == Some(false) {
-        violations.push(modality_violation(view, "image"));
-    }
-    if view.has_audio_input && info.has_capability("audio") == Some(false) {
-        violations.push(modality_violation(view, "audio"));
-    }
-    violations
+/// (f) The request carries image input and the catalog says the model lacks
+/// `vision`. A `None` capability list means "unknown" and passes. Audio and
+/// file inputs are tracked in the view but not gated: the catalog has no
+/// capability vocabulary for them, so a missing entry proves nothing.
+fn unsupported_modality(view: &RequestView, info: &ModelInfo) -> Option<Violation> {
+    (view.has_image_input && info.has_capability("vision") == Some(false)).then(|| modality_violation(view, "image"))
 }
 
 fn modality_violation(view: &RequestView, modality: &str) -> Violation {
@@ -369,54 +342,6 @@ mod tests {
 
     fn violations(evaluation: &Evaluation) -> Vec<RuleId> {
         evaluation.violations.iter().map(|violation| violation.rule).collect()
-    }
-
-    // --- (a) ModelNotFound -------------------------------------------------
-
-    #[test]
-    fn model_not_found_fires_for_unknown_alias() {
-        let view = view(Surface::ChatCompletions, "ghost");
-        let evaluation = evaluate(&view, &ModelLookup::Unknown, &config());
-
-        assert_eq!(violations(&evaluation), vec![RuleId::ModelNotFound]);
-        let violation = &evaluation.violations[0];
-        assert_eq!(violation.status, StatusCode::NOT_FOUND);
-        assert_eq!(violation.code, "model_not_found");
-        assert_eq!(violation.param, Some("model"));
-        assert_eq!(
-            violation.message,
-            "The model `ghost` does not exist or you do not have access to it."
-        );
-    }
-
-    #[test]
-    fn model_not_found_passes_when_alias_missing() {
-        let view = RequestView {
-            surface: Some(Surface::ChatCompletions),
-            ..Default::default()
-        };
-        let evaluation = evaluate(&view, &ModelLookup::Unknown, &config());
-        assert!(evaluation.violations.is_empty());
-    }
-
-    #[test]
-    fn model_not_found_passes_when_not_loaded() {
-        let view = view(Surface::ChatCompletions, "ghost");
-        assert!(evaluate(&view, &ModelLookup::NotLoaded, &config()).violations.is_empty());
-    }
-
-    #[test]
-    fn model_not_found_passes_when_known() {
-        let view = view(Surface::ChatCompletions, "ghost");
-        let evaluation = evaluate(&view, &known(info(ModelType::Chat)), &config());
-        assert!(evaluation.violations.is_empty());
-    }
-
-    #[test]
-    fn model_not_found_skipped_when_off() {
-        let view = view(Surface::ChatCompletions, "ghost");
-        let evaluation = evaluate(&view, &ModelLookup::Unknown, &config_with(RuleId::ModelNotFound, RuleMode::Off));
-        assert!(evaluation.violations.is_empty());
     }
 
     // --- (b) ModelTypeMismatch --------------------------------------------
@@ -669,7 +594,7 @@ mod tests {
             ..Default::default()
         };
         let supported = ModelInfo {
-            capabilities: Some(vec!["vision".to_string(), "audio".to_string()]),
+            capabilities: Some(vec!["vision".to_string()]),
             ..Default::default()
         };
         assert!(evaluate(&view, &known(supported), &config()).violations.is_empty());
@@ -687,22 +612,16 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_modality_fires_for_both_image_and_audio_in_order() {
+    fn unsupported_modality_does_not_gate_audio() {
+        // No catalog vocabulary grants `audio`, so its absence proves nothing.
         let view = RequestView {
-            has_image_input: true,
             has_audio_input: true,
+            has_file_input: true,
             ..Default::default()
         };
         let mut info = info(ModelType::Chat);
-        info.capabilities = Some(vec![]);
-        let evaluation = evaluate(&view, &known(info), &config());
-
-        assert_eq!(
-            violations(&evaluation),
-            vec![RuleId::UnsupportedModality, RuleId::UnsupportedModality]
-        );
-        assert!(evaluation.violations[0].message.contains("image"));
-        assert!(evaluation.violations[1].message.contains("audio"));
+        info.capabilities = Some(vec!["vision".to_string()]);
+        assert!(evaluate(&view, &known(info), &config()).violations.is_empty());
     }
 
     #[test]
@@ -844,10 +763,7 @@ mod tests {
             ..Default::default()
         };
         let evaluation = evaluate(&view, &ModelLookup::Unknown, &config());
-        assert_eq!(
-            violations(&evaluation),
-            vec![RuleId::ModelNotFound, RuleId::InvalidServiceTier, RuleId::InvalidMaxTokens]
-        );
+        assert_eq!(violations(&evaluation), vec![RuleId::InvalidServiceTier, RuleId::InvalidMaxTokens]);
     }
 
     #[test]
@@ -856,18 +772,20 @@ mod tests {
             surface: Some(Surface::ChatCompletions),
             model: Some("ghost".to_string()),
             service_tier: Some(json!("turbo")),
+            max_output_tokens: Some(json!("lots")),
+            max_output_tokens_param: Some("max_tokens"),
             ..Default::default()
         };
         let mut config = config();
-        config.rules.insert(RuleId::ModelNotFound, RuleMode::Enforce);
         config.rules.insert(RuleId::InvalidServiceTier, RuleMode::Shadow);
+        config.rules.insert(RuleId::InvalidMaxTokens, RuleMode::Enforce);
         let evaluation = evaluate(&view, &ModelLookup::Unknown, &config);
         assert_eq!(
             first_enforced(&evaluation.violations, &config).map(|v| v.rule),
-            Some(RuleId::ModelNotFound)
+            Some(RuleId::InvalidMaxTokens)
         );
 
-        config.rules.insert(RuleId::ModelNotFound, RuleMode::Off);
+        config.rules.insert(RuleId::InvalidMaxTokens, RuleMode::Off);
         config.rules.insert(RuleId::InvalidServiceTier, RuleMode::Enforce);
         let evaluation = evaluate(&view, &ModelLookup::Unknown, &config);
         assert_eq!(

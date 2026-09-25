@@ -319,7 +319,9 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // `previous_response_id` hydration so the prior turn counts toward the
     // context window, and before anything is persisted, forwarded or enqueued.
     if let (Some(validation), Some(surface)) = (&state.validation, surface)
-        && let Some(rejection) = validation.check(surface, &request_value, api_key.as_deref()).await
+        && let Some(rejection) = validation
+            .check(surface, &request_value, validation_key(api_key.as_deref(), &parts.headers))
+            .await
     {
         return rejection;
     }
@@ -1339,6 +1341,13 @@ fn modality_disabled_response(modality: crate::modalities::Modality) -> Response
             .to_string(),
         ))
         .unwrap()
+}
+
+/// The key to authorise request validation with: the bearer token, or for
+/// Anthropic clients the `x-api-key` header (which the translation layer only
+/// promotes to a bearer token further in).
+fn validation_key<'a>(bearer: Option<&'a str>, headers: &'a axum::http::HeaderMap) -> Option<&'a str> {
+    bearer.or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
 }
 
 fn invalid_request_response(message: &str, code: &str, param: &str) -> Response {
