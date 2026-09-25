@@ -959,7 +959,8 @@ request_validation:
   exact_count_enabled: false
   exact_count_deadline_ms: 2000
   # Batch uploads validate lines one after another; cap the exact counts one
-  # file may spend. Past it, remaining near-limit lines pass.
+  # file may spend. Past it, remaining near-limit lines pass (in shadow mode too,
+  # so shadow metrics under-count context violations for such files).
   exact_count_max_per_batch_file: 1000
 
 # Image input normalisation.

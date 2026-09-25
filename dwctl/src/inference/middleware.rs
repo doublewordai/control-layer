@@ -320,7 +320,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // context window, and before anything is persisted, forwarded or enqueued.
     if let (Some(validation), Some(surface)) = (&state.validation, surface)
         && let Some(rejection) = validation
-            .check(surface, &request_value, validation_key(api_key.as_deref(), &parts.headers))
+            .check(surface, &request_value, validation_key(surface, api_key.as_deref(), &parts.headers))
             .await
     {
         return rejection;
@@ -1343,11 +1343,15 @@ fn modality_disabled_response(modality: crate::modalities::Modality) -> Response
         .unwrap()
 }
 
-/// The key to authorise request validation with: the bearer token, or for
-/// Anthropic clients the `x-api-key` header (which the translation layer only
-/// promotes to a bearer token further in).
-fn validation_key<'a>(bearer: Option<&'a str>, headers: &'a axum::http::HeaderMap) -> Option<&'a str> {
-    bearer.or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
+/// The key to authorise request validation with: the bearer token, or on the
+/// Anthropic Messages surface (the only one that accepts it) the `x-api-key`
+/// header, which the translation layer only promotes to a bearer token further
+/// in. A bearer token always takes precedence.
+fn validation_key<'a>(surface: Surface, bearer: Option<&'a str>, headers: &'a axum::http::HeaderMap) -> Option<&'a str> {
+    bearer.or_else(|| match surface {
+        Surface::Messages => headers.get("x-api-key").and_then(|v| v.to_str().ok()),
+        _ => None,
+    })
 }
 
 fn invalid_request_response(message: &str, code: &str, param: &str) -> Response {
@@ -1583,6 +1587,22 @@ mod tests {
     #[test]
     fn test_should_not_intercept_files() {
         assert!(!should_intercept(&axum::http::Method::POST, "/v1/files"));
+    }
+
+    #[test]
+    fn validation_key_uses_x_api_key_only_on_messages() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("x-api-key", "anthropic-key".parse().unwrap());
+        assert_eq!(validation_key(Surface::Messages, None, &headers), Some("anthropic-key"));
+        assert_eq!(validation_key(Surface::Messages, Some("bearer"), &headers), Some("bearer"));
+        for surface in [
+            Surface::ChatCompletions,
+            Surface::Responses,
+            Surface::Embeddings,
+            Surface::Completions,
+        ] {
+            assert_eq!(validation_key(surface, None, &headers), None, "{surface:?}");
+        }
     }
 
     #[test]

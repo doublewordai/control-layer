@@ -224,7 +224,9 @@ pub struct ValidationConfig {
     /// counted, so this bounds the cost of already-huge requests.
     pub exact_count_deadline_ms: u64,
     /// Most exact counts one batch file upload may spend (lines are validated
-    /// one after another). Past it, remaining near-limit lines pass.
+    /// one after another). Past it, remaining near-limit lines pass. This
+    /// applies in shadow mode too, so for a file with more near-limit lines
+    /// than the budget the shadow metrics under-count context violations.
     pub exact_count_max_per_batch_file: usize,
 }
 
