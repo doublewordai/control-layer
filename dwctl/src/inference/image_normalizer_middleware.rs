@@ -208,8 +208,9 @@ pub async fn image_normalizer_middleware(
     // callers get an empty set (refused, not trusted: a token names bytes, and
     // signing it hands out a URL to them); a lookup failure is kept as such so
     // the token path refuses with a retryable 503.
+    let tokens = walker::tokens(&body_value);
+    let normalizer_for_check = state.normalizer.clone();
     let grants: Result<Arc<std::collections::HashSet<ImageToken>>, ()> = {
-        let tokens = walker::tokens(&body_value);
         match (&caller_lookup, state.pool.as_ref()) {
             (Err(()), _) => Err(()),
             (Ok(Some(caller)), Some(pool)) if !tokens.is_empty() => {
@@ -317,7 +318,77 @@ pub async fn image_normalizer_middleware(
         *request.body_mut() = Body::from(new_bytes);
     }
 
-    next.run(request).await
+    let response = next.run(request).await;
+
+    // A dispatch that failed upstream while referencing stored images: was it
+    // because the images are gone? Engines report a media fetch failure in
+    // their own words, and some gateways (Dynamo) hand the client only an
+    // opaque "internal server error", so the message cannot be relied on. The
+    // store can: if one of THIS request's objects is no longer there, no retry
+    // and no other provider can ever succeed. Fail it as a terminal 422 so the
+    // batch daemon writes it to the error file instead of retrying it to its
+    // attempt cap and reading every 503 as overload. Only a definitive "not
+    // found" counts; a store error leaves the upstream failure as it was.
+    let upstream_status = response.status();
+    if tokens.is_empty() || !is_upstream_failure(upstream_status) {
+        return response;
+    }
+    let missing = missing_image_tokens(&normalizer_for_check, &tokens).await;
+    if missing.is_empty() {
+        return response;
+    }
+    warn!(
+        missing = missing.len(),
+        referenced = tokens.len(),
+        upstream_status = %upstream_status,
+        "upstream failed and stored image(s) this request references are gone; failing it as image_unavailable"
+    );
+    metrics::counter!("dwctl_image_unavailable_total").increment(1);
+    image_unavailable_response()
+}
+
+/// Upstream statuses under which a missing stored image is the likely cause
+/// of the failure. Capacity signals (429, 529) are answered before the engine
+/// touches the media, so they are excluded.
+fn is_upstream_failure(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::INTERNAL_SERVER_ERROR | StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    )
+}
+
+/// Bound on store probes per failed dispatch; a request carries a handful of
+/// images, never hundreds.
+const MAX_PRESENCE_CHECKS: usize = 32;
+
+/// The distinct tokens among `tokens` whose object the store definitively
+/// reports missing. Probe errors are logged and treated as "unknown", never
+/// as missing.
+async fn missing_image_tokens(normalizer: &Arc<dyn ImageNormalizer>, tokens: &[ImageToken]) -> Vec<ImageToken> {
+    let mut seen = std::collections::HashSet::new();
+    let mut missing = Vec::new();
+    for &token in tokens.iter().filter(|t| seen.insert(**t)).take(MAX_PRESENCE_CHECKS) {
+        match normalizer.is_present(token).await {
+            Ok(true) => {}
+            Ok(false) => missing.push(token),
+            Err(e) => warn!(error = %e, "could not probe stored image presence after an upstream failure"),
+        }
+    }
+    missing
+}
+
+/// Terminal 422 for a request whose stored image(s) no longer exist. Fusillade
+/// treats 4xx as non-retriable, so this lands in the batch error file.
+pub(crate) fn image_unavailable_response() -> Response {
+    let body = serde_json::json!({
+        "error": {
+            "message": "One or more image inputs of this request are no longer available in the image store: their stored copies have expired. Resubmit the request; the images will be re-uploaded automatically.",
+            "type": "invalid_request_error",
+            "param": "image_url",
+            "code": "image_unavailable",
+        }
+    });
+    (StatusCode::UNPROCESSABLE_ENTITY, axum::Json(body)).into_response()
 }
 
 /// Normalise every image input in `body` to a `dw-img://` token (the
@@ -808,6 +879,117 @@ mod tests {
         assert!(url.contains(&token.to_hex()), "{url}");
         assert!((1800 - 60..=1800).contains(&ttl), "dispatch TTL expected, got {ttl}s");
         assert_eq!(echoed["messages"][0]["content"][0]["text"], "what is this?");
+    }
+
+    /// A router whose inner handler runs `on_request` then answers `status`
+    /// with an opaque upstream-style error body, standing in for onwards.
+    fn build_router_failing_upstream(
+        state: ImageNormalizerMiddlewareState,
+        status: StatusCode,
+        on_request: impl Fn() + Clone + Send + Sync + 'static,
+    ) -> Router {
+        let inner = post(move |_body: axum::body::Bytes| {
+            let on_request = on_request.clone();
+            async move {
+                on_request();
+                (
+                    status,
+                    axum::Json(json!({"error": {"message": "Service unavailable", "type": "server_error", "code": "service_unavailable"}})),
+                )
+            }
+        });
+        Router::new()
+            .route("/chat/completions", inner)
+            .layer(middleware::from_fn_with_state(state, image_normalizer_middleware))
+    }
+
+    fn state_with_pool_and_store(pool: &sqlx::PgPool) -> (ImageNormalizerMiddlewareState, Arc<MemoryStore>) {
+        let store = Arc::new(MemoryStore::new().with_base_url("http://test.local/dw-img"));
+        let normalizer = Arc::new(DefaultImageNormalizer::new(FetcherConfig::default(), store.clone()));
+        let state = ImageNormalizerMiddlewareState {
+            enabled: true,
+            normalizer,
+            realtime_ttl: Duration::from_secs(900),
+            token_ttl: Duration::from_secs(1800),
+            pool: Some(sqlx_pool_router::DynPools::new(pool.clone())),
+        };
+        (state, store)
+    }
+
+    /// The engine-independent detector: a dispatch fails upstream (opaque
+    /// 503, as a gateway that hides the engine diagnostic answers) and one of
+    /// the images the body references is no longer in the store — the bucket
+    /// lifecycle removed it after signing. The request is failed as a
+    /// terminal 422 `image_unavailable`, so the daemon stops retrying it.
+    #[sqlx::test]
+    async fn an_upstream_failure_with_a_missing_stored_image_becomes_image_unavailable(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::create_test_user;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let batch_key = hidden_batch_key_for(&pool, user.id).await;
+        let (state, store) = state_with_pool_and_store(&pool);
+        let token = ingest_for_key(&pool, &state, &batch_key).await;
+
+        // The object disappears between signing and the engine's fetch.
+        let vanish = {
+            let store = store.clone();
+            move || {
+                store.remove(token);
+            }
+        };
+        let router = build_router_failing_upstream(state, StatusCode::SERVICE_UNAVAILABLE, vanish);
+        let (status, body) = post_json_as(router, Some(&batch_key), body_with_token(token)).await;
+
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["error"]["code"], "image_unavailable");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["error"]["param"], "image_url");
+    }
+
+    /// The same upstream failure with the image still stored is NOT ours to
+    /// reinterpret: a real capacity or engine error passes through untouched
+    /// so the daemon's retry and overload logic see it as before.
+    #[sqlx::test]
+    async fn an_upstream_failure_with_images_still_stored_passes_through(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::create_test_user;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let batch_key = hidden_batch_key_for(&pool, user.id).await;
+        let (state, _store) = state_with_pool_and_store(&pool);
+        let token = ingest_for_key(&pool, &state, &batch_key).await;
+
+        for upstream in [
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let router = build_router_failing_upstream(state.clone(), upstream, || {});
+            let (status, body) = post_json_as(router, Some(&batch_key), body_with_token(token)).await;
+            assert_eq!(status, upstream, "{body}");
+            assert_eq!(body["error"]["code"], "service_unavailable");
+        }
+    }
+
+    /// A missing object only matters under an upstream failure: a capacity
+    /// signal (529) is answered before the engine touches any media, so it is
+    /// never reinterpreted even if the object happens to be gone.
+    #[sqlx::test]
+    async fn a_capacity_signal_is_never_reinterpreted_as_image_unavailable(pool: sqlx::PgPool) {
+        use crate::api::models::users::Role;
+        use crate::test::utils::create_test_user;
+
+        let user = create_test_user(&pool, Role::StandardUser).await;
+        let batch_key = hidden_batch_key_for(&pool, user.id).await;
+        let (state, store) = state_with_pool_and_store(&pool);
+        let token = ingest_for_key(&pool, &state, &batch_key).await;
+        let vanish = move || {
+            store.remove(token);
+        };
+        let router = build_router_failing_upstream(state, StatusCode::from_u16(529).unwrap(), vanish);
+        let (status, _body) = post_json_as(router, Some(&batch_key), body_with_token(token)).await;
+        assert_eq!(status.as_u16(), 529);
     }
 
     /// No trusted path: a dispatch whose stored body carries a token its

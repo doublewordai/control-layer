@@ -54,6 +54,7 @@ pub mod config;
 pub mod errors;
 pub mod handlers;
 pub mod load_balancer;
+pub mod media_failure;
 pub mod models;
 pub mod reasoning;
 pub mod response_id;
@@ -1748,6 +1749,76 @@ mod tests {
                 assert!(!response.text().contains("private upstream failure"));
             }
         }
+    }
+
+    /// An embedded 500 whose text says the engine could not fetch one of the
+    /// request's media inputs is terminal: one attempt, 422, no failover —
+    /// whatever the engine's phrasing. A bare "internal server error" with the
+    /// same code keeps the existing failover-then-503 behaviour.
+    #[tokio::test]
+    async fn test_embedded_media_fetch_failure_is_terminal_422_across_engine_phrasings() {
+        let phrasings = [
+            // Python requests, as forwarded by vLLM and SGLang.
+            "HTTPError: 404 Client Error: Not Found for url: https://acct.r2.cloudflarestorage.com/b/images/ab/cd/abcd?X-Amz-Signature=x",
+            // Current vLLM media connector (no URL in the text).
+            "Failed to fetch media from URL: HTTP 404 error",
+            // aiohttp.
+            "ClientResponseError: 404, message='Not Found', url='https://cdn.example.com/a.png' (image_url)",
+            // SGLang decode failure.
+            "Could not decode image: cannot identify image file",
+        ];
+        for (message, streaming) in phrasings.iter().flat_map(|m| [(m, false), (m, true)]) {
+            let body = serde_json::json!({"error": {"code": 500, "message": message, "type": "internal_error"}}).to_string();
+            let mock = if streaming {
+                MockHttpClient::new_streaming(StatusCode::OK, vec![format!("data:{body}\n\n")])
+            } else {
+                MockHttpClient::new(StatusCode::OK, &body)
+            };
+            // Two providers that DO fail over on 500: a terminal media failure
+            // must still stop at the first.
+            let targets = fallback_targets("gpt-4", 2, vec![500]);
+            let server =
+                TestServer::new(build_router(AppState::with_client(targets, mock.clone())))
+                    .unwrap();
+            let response = server
+                .post("/v1/chat/completions")
+                .json(&json!({"model": "gpt-4", "stream": streaming, "messages": [{"role": "user", "content": "hello"}]}))
+                .await;
+            assert_eq!(
+                response.status_code(),
+                422,
+                "{message} streaming={streaming}"
+            );
+            let error = response.json::<serde_json::Value>();
+            assert_eq!(
+                error["error"]["code"], "upstream_media_fetch_failed",
+                "{message}"
+            );
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+            assert_eq!(error["error"]["param"], "image_url");
+            assert_eq!(
+                mock.requests.lock().unwrap().len(),
+                1,
+                "no failover for {message}"
+            );
+        }
+
+        // Control: the same embedded 500 with an opaque message is not a media
+        // failure and keeps failing over (both providers tried) to a 503.
+        let body = r#"{"error":{"code":500,"message":"internal server error during processing","type":"internal_error"}}"#;
+        let mock = MockHttpClient::new(StatusCode::OK, body);
+        let targets = fallback_targets("gpt-4", 2, vec![500]);
+        let server =
+            TestServer::new(build_router(AppState::with_client(targets, mock.clone()))).unwrap();
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({"model": "gpt-4", "stream": false, "messages": [{"role": "user", "content": "hello"}]}))
+            .await;
+        assert_eq!(response.status_code(), 503);
+        assert!(
+            mock.requests.lock().unwrap().len() >= 2,
+            "opaque 500 still fails over"
+        );
     }
 
     #[tokio::test]

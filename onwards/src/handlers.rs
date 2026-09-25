@@ -1741,6 +1741,37 @@ pub async fn target_message_handler<T: HttpClient>(
                 // purposes, so it overrides the 200 recorded above.
                 last_upstream_status = Some(embedded);
 
+                // An embedded server error whose text says the engine could not
+                // fetch or decode one of THIS request's media inputs is a
+                // property of the request: no provider will do better, and a
+                // retry re-fetches the same dead URL. Fail it as a terminal 422
+                // rather than failing over or collapsing it to a 503 that a
+                // batch daemon retries and every AIMD limiter reads as overload.
+                // Engines that keep the diagnostic private (a bare "internal
+                // server error") do not reach here; the caller's own check on
+                // its stored media objects covers those.
+                if embedded >= 500
+                    && let Some(failure) = provider_error["message"]
+                        .as_str()
+                        .and_then(crate::media_failure::classify_media_failure)
+                    && failure.is_terminal()
+                {
+                    metrics::counter!(
+                        "onwards_upstream_media_failures_total",
+                        "kind" => failure.kind.as_str(),
+                        "upstream_status" => failure.upstream_status.map(|s| s.to_string()).unwrap_or_default(),
+                    )
+                    .increment(1);
+                    warn!(
+                        kind = failure.kind.as_str(),
+                        media_status = ?failure.upstream_status,
+                        upstream = %target.url,
+                        "Upstream could not fetch or decode a media input of this request; failing it as 422 instead of retrying"
+                    );
+                    record_response_status(422);
+                    return LoopAction::Done(Err(OnwardsErrorResponse::upstream_media_failure(failure.kind)));
+                }
+
                 let retryable = fails_over_on(embedded, attempt_number)
                     || (embedded == 429 && pool.should_fallback_on_rate_limit());
                 if retryable {

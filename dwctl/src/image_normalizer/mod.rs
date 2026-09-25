@@ -152,6 +152,14 @@ pub trait ImageNormalizer: Send + Sync {
     /// endpoint (after authorisation).
     async fn read(&self, token: ImageToken) -> Result<(String, Bytes), NormalizeError>;
 
+    /// True if the bytes for `token` are physically in the store right now,
+    /// ignoring any reuse policy. Used after a dispatch fails to tell "the
+    /// stored image is gone" from every other upstream failure. The default
+    /// is the conservative answer — never claim an object is missing.
+    async fn is_present(&self, _token: ImageToken) -> Result<bool, NormalizeError> {
+        Ok(true)
+    }
+
     /// True if `url` already points at an object in our own store (a URL we
     /// previously signed). Callers use this to avoid re-ingesting/re-signing
     /// an already-normalised URL — which would waste a re-fetch and clobber a
@@ -248,6 +256,10 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
 
     async fn read(&self, token: ImageToken) -> Result<(String, Bytes), NormalizeError> {
         Ok(self.store.read(token).await?)
+    }
+
+    async fn is_present(&self, token: ImageToken) -> Result<bool, NormalizeError> {
+        Ok(self.store.is_present(token).await?)
     }
 
     fn owns_url(&self, url: &str) -> bool {
