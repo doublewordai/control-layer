@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.6.0](https://github.com/doublewordai/control-layer/compare/v12.5.0...v12.6.0) (2026-09-25)
+
+
+### Features
+
+* **preview:** validate serving classes and class pricing ([#1825](https://github.com/doublewordai/control-layer/issues/1825)) ([99b92b0](https://github.com/doublewordai/control-layer/commit/99b92b031a755a81e8a3969a330d28070fd5225b))
+
 ## [12.5.0](https://github.com/doublewordai/control-layer/compare/v12.4.0...v12.5.0) (2026-09-24)
 
 
