@@ -1293,11 +1293,24 @@ async fn count_requests_with_budget<P: PoolProvider>(
 /// letting the planner use it as a scan bound. Owner already worked this way;
 /// this extends it to the two `created_at` bounds, which is what made date
 /// filtering slow.
+///
+/// `status_bound` extends the same treatment to the state filter. State was
+/// left as a disjunction the longest because a status-only page almost always
+/// matches recent rows and exits early either way — but combined with a model
+/// filter it is exactly the zero-match pathology: production repeatedly
+/// served 500s on `status=failed AND model=<deleted alias>` because the only
+/// plan that could answer it walked the whole terminal history in
+/// `created_at` order with both predicates as residual filters, and the walk
+/// exceeded the 30s page budget. The bound equality is also what proves the
+/// `state`-leading partial predicates, so `idx_requests_state` and
+/// `idx_requests_batchless_terminal_model_page` become eligible in generic
+/// prepared plans, not just custom ones.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct PageShape {
     pub(crate) active_first: bool,
     pub(crate) owner_scoped: bool,
     pub(crate) single_model: bool,
+    pub(crate) status_bound: bool,
     pub(crate) created_after: bool,
     pub(crate) created_before: bool,
 }
@@ -1311,6 +1324,7 @@ impl PageShape {
                 .models
                 .as_ref()
                 .is_some_and(|models| models.len() == 1),
+            status_bound: filter.status.is_some(),
             created_after: filter.created_after.is_some(),
             created_before: filter.created_before.is_some(),
         }
@@ -1322,6 +1336,7 @@ fn list_requests_page_sql(shape: PageShape) -> String {
         active_first,
         owner_scoped,
         single_model,
+        status_bound,
         created_after,
         created_before,
     } = shape;
@@ -1343,11 +1358,6 @@ fn list_requests_page_sql(shape: PageShape) -> String {
     } else {
         "$1::text IS NULL"
     };
-    let retained_owner = if owner_scoped {
-        "object.created_by = $1::text"
-    } else {
-        "$1::text IS NULL"
-    };
     // A singleton equality fixes the model-leading index prefix so its remaining
     // created_at ordering can satisfy LIMIT, even with a generic prepared plan.
     // Keep the array parameter bound and preserve ANY semantics for other sizes.
@@ -1357,6 +1367,31 @@ fn list_requests_page_sql(shape: PageShape) -> String {
         } else {
             format!("($3::text[] IS NULL OR {column} = ANY($3))")
         }
+    };
+    // Same treatment for the state filter. When no status is filtered the
+    // predicate disappears entirely rather than degrading into a disjunction;
+    // $2 stays bound positionally, exactly like the omitted date bounds. When
+    // one is, the plain equality lets the planner prove `state`-keyed indexes
+    // (including the terminal-listing partial and `idx_requests_state`) in
+    // both custom and generic prepared plans, which is what keeps a
+    // zero-match status+model page from walking the whole terminal history.
+    let status_pred = |column: &str| {
+        if status_bound {
+            format!("\n              AND {column} = $2::text")
+        } else {
+            String::new()
+        }
+    };
+    // With a bound status the CTE itself is empty for terminal statuses, so
+    // apply the equality here too instead of only outside the materialization.
+    let active_status_inner = status_pred("requests.state");
+    let active_status = status_pred("active.state");
+    let live_status = status_pred("request.state");
+    let retained_status = status_pred("object.state");
+    let retained_owner = if owner_scoped {
+        "object.created_by = $1::text"
+    } else {
+        "$1::text IS NULL"
     };
     let active_model = model_predicate("active.model");
     let live_model = model_predicate("request.model");
@@ -1489,7 +1524,7 @@ fn list_requests_page_sql(shape: PageShape) -> String {
             FROM requests
             WHERE created_by IS NOT NULL
               AND state IN ('processing', 'claimed', 'pending')
-              AND {active_owner_inner}
+              AND {active_owner_inner}{active_status_inner}
         ),
         candidates AS (
             (SELECT
@@ -1527,8 +1562,7 @@ fn list_requests_page_sql(shape: PageShape) -> String {
                 NULL::smallint AS schema_version,
                 NULL::jsonb AS payload
             FROM active
-            WHERE {active_owner}
-              AND ($2::text IS NULL OR active.state = $2)
+            WHERE {active_owner}{active_status}
               AND {active_model}{active_dates}
               AND ($6::text[] IS NULL OR active.service_tier = ANY($6))
             ORDER BY {active_order}
@@ -1575,8 +1609,7 @@ fn list_requests_page_sql(shape: PageShape) -> String {
               AND {live_owner}
               -- Complement of the `active` CTE: together the two live arms
               -- cover every batchless row exactly once.
-              AND request.state NOT IN ('processing', 'claimed', 'pending')
-              AND ($2::text IS NULL OR request.state = $2)
+              AND request.state NOT IN ('processing', 'claimed', 'pending'){live_status}
               AND {live_model}{live_dates}
               AND ($6::text[] IS NULL OR request.service_tier = ANY($6))
             ORDER BY {terminal_order}
@@ -1623,8 +1656,7 @@ fn list_requests_page_sql(shape: PageShape) -> String {
                   OFFSET 0
               )
               AND object.created_by IS NOT NULL
-              AND {retained_owner}
-              AND ($2::text IS NULL OR object.state = $2)
+              AND {retained_owner}{retained_status}
               AND {retained_model}{retained_dates}
               AND ($6::text[] IS NULL OR object.service_tier = ANY($6))
               AND NOT EXISTS (
@@ -4339,6 +4371,7 @@ mod tests {
                     active_first,
                     owner_scoped: true,
                     single_model: false,
+                    status_bound: false,
                     created_after: false,
                     created_before: false
                 })
@@ -4426,6 +4459,124 @@ mod tests {
         }
     }
 
+    /// Count rows visited on the live `requests` heap, including rejected
+    /// rows — the live-arm analogue of `retained_rows_visited`.
+    fn live_rows_visited(plan: &serde_json::Value) -> f64 {
+        match plan {
+            serde_json::Value::Array(values) => values.iter().map(live_rows_visited).sum(),
+            serde_json::Value::Object(fields) => {
+                let visited =
+                    if fields.get("Relation Name").and_then(|v| v.as_str()) == Some("requests") {
+                        [
+                            "Actual Rows",
+                            "Rows Removed by Filter",
+                            "Rows Removed by Index Recheck",
+                        ]
+                        .iter()
+                        .map(|key| fields.get(*key).and_then(|v| v.as_f64()).unwrap_or(0.0))
+                        .sum::<f64>()
+                            * fields
+                                .get("Actual Loops")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                visited + fields.values().map(live_rows_visited).sum::<f64>()
+            }
+            _ => 0.0,
+        }
+    }
+
+    /// A zero-match status+model page must be answerable from an index prefix
+    /// instead of walking the terminal history in `created_at` order.
+    ///
+    /// This is the live-table twin of the production incident behind the
+    /// `ControlLayerSystemErrors` 5xxs: the console Responses view filtered
+    /// `status=failed AND model=detail-zai/glm-5.2`, a combination matching
+    /// zero rows, and the only plan the generic prepared shape could produce
+    /// was an ordered walk with both predicates as residual filters — no early
+    /// exit, full history cost, 500 at the 30s page budget. The bound
+    /// `state = $2::text` plus `idx_requests_batchless_terminal_model_page`
+    /// give the planner a prefix-bounded ordered path for this shape.
+    ///
+    /// Toy-scale row estimates cannot always force the misplan (at this size a
+    /// model-equality probe is also cheap), so this test asserts the bound the
+    /// fix guarantees — a page over an absent model must not visit more than
+    /// page-size-scale rows — rather than reproducing the production plan
+    /// verbatim. `page_sql_emits_status_bound_directly_or_omits_it` is the
+    /// deterministic shape-level regression guard.
+    #[sqlx::test]
+    async fn live_terminal_page_bounds_history_scan_with_generic_plan(pool: PgPool) {
+        // Two models with deep terminal history each; the filter targets a
+        // model that exists nowhere in the table, in a state that exists.
+        sqlx::query(
+            r#"
+            INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by, created_at)
+            SELECT gen_random_uuid(), NULL, NULL,
+                   CASE WHEN i % 2 = 0 THEN 'model-a' ELSE 'model-b' END,
+                   NULL, 'completed', 0, 'priority', 'seed-owner',
+                   '2026-08-11'::timestamptz + (i % 100000) * interval '1 second'
+            FROM generate_series(1, 40000) i
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // A few genuinely failed rows so `failed` is present in the planner's
+        // statistics the way a live table's state histogram is.
+        sqlx::query(
+            r#"
+            INSERT INTO requests (id, batch_id, template_id, model, custom_id, state, retry_attempt, service_tier, created_by, created_at)
+            SELECT gen_random_uuid(), NULL, NULL,
+                   CASE WHEN i % 2 = 0 THEN 'model-a' ELSE 'model-b' END,
+                   NULL, 'failed', 0, 'priority', 'seed-owner',
+                   '2026-08-11'::timestamptz + i * interval '1 second'
+            FROM generate_series(1, 40) i
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::raw_sql("ANALYZE requests;")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let filter = ListRequestsFilter {
+            status: Some("failed".to_owned()),
+            models: Some(vec!["missing-model".to_owned()]),
+            ..Default::default()
+        };
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let sql = format!(
+            "PREPARE zero_match_page(text, text, text[], timestamptz, timestamptz, text[], bigint, bigint) AS {}",
+            list_requests_page_sql(PageShape::of(&filter))
+        );
+        sqlx::raw_sql(&sql).execute(&mut *tx).await.unwrap();
+        let plan: serde_json::Value = sqlx::query_scalar(
+            "EXPLAIN (ANALYZE, FORMAT JSON) EXECUTE zero_match_page(NULL, 'failed', ARRAY['missing-model'], NULL, NULL, NULL, 10, 0)",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("DEALLOCATE zero_match_page")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(plan[0]["Plan"]["Actual Rows"].as_f64(), Some(0.0));
+        let visited = live_rows_visited(&plan);
+        assert!(
+            visited < 1000.0,
+            "a zero-match status+model page must not walk the terminal history (visited {visited}): {plan}"
+        );
+        tx.commit().await.unwrap();
+    }
+
     #[sqlx::test]
     async fn retained_list_and_count_plans_prune_children_before_created_after(pool: PgPool) {
         let relevant_delete_on = NaiveDate::from_ymd_opt(2026, 8, 20).unwrap();
@@ -4491,6 +4642,7 @@ mod tests {
             active_first: false,
             owner_scoped: false,
             single_model: false,
+            status_bound: false,
             created_after: true,
             created_before: false,
         }))
@@ -4517,6 +4669,7 @@ mod tests {
                     active_first: false,
                     owner_scoped: false,
                     single_model: false,
+                    status_bound: false,
                     created_after: true,
                     created_before: false,
                 }),
@@ -4951,6 +5104,7 @@ mod tests {
             active_first: true,
             owner_scoped: true,
             single_model: false,
+            status_bound: false,
             created_after: true,
             created_before: true,
         });
@@ -4967,6 +5121,7 @@ mod tests {
             active_first: true,
             owner_scoped: true,
             single_model: false,
+            status_bound: false,
             created_after: false,
             created_before: false,
         });
@@ -4980,11 +5135,47 @@ mod tests {
             active_first: false,
             owner_scoped: false,
             single_model: false,
+            status_bound: false,
             created_after: true,
             created_before: false,
         });
         assert!(after_only.contains("AND object.delete_on > ($4 AT TIME ZONE 'UTC')::date"));
         assert!(!after_only.contains("created_at <= $5"));
+    }
+
+    #[test]
+    fn page_sql_emits_status_bound_directly_or_omits_it() {
+        // A `($n IS NULL OR col = $n)` state predicate can never become an
+        // index boundary condition in a generic prepared plan, and it cannot
+        // prove any partial index whose predicate names `state`. With a status
+        // filtered, emit the bound equality so state-keyed indexes —
+        // `idx_requests_state` and the terminal-listing partial — stay
+        // eligible; with none, drop the predicate entirely, exactly like the
+        // omitted date bounds. The value stays bound either way.
+        let bound = list_requests_page_sql(PageShape {
+            active_first: true,
+            owner_scoped: false,
+            single_model: true,
+            status_bound: true,
+            created_after: false,
+            created_before: false,
+        });
+        assert!(bound.contains("AND requests.state = $2::text"));
+        assert!(bound.contains("AND active.state = $2::text"));
+        assert!(bound.contains("AND request.state = $2::text"));
+        assert!(bound.contains("AND object.state = $2::text"));
+        assert!(!bound.contains("$2::text IS NULL"));
+
+        let unbound = list_requests_page_sql(PageShape {
+            active_first: true,
+            owner_scoped: false,
+            single_model: false,
+            status_bound: false,
+            created_after: false,
+            created_before: false,
+        });
+        assert!(!unbound.contains("state = $2"));
+        assert!(!unbound.contains("$2::text IS NULL"));
     }
 
     #[test]
@@ -4996,6 +5187,7 @@ mod tests {
             active_first: true,
             owner_scoped: true,
             single_model: false,
+            status_bound: false,
             created_after: false,
             created_before: false,
         });
