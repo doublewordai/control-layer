@@ -1128,7 +1128,7 @@ jsonpath "$.filename" == "mixed.jsonl"
 # -----------------------------------------------------------------------------
 
 # Establish that the user's existing inference key is admitted before revocation.
-POST http://localhost:3001/ai/v1/chat/completions
+POST http://localhost:3001/admin/api/v1/ai/v1/chat/completions
 [Options]
 retry: 30
 retry-interval: 1000
@@ -1148,7 +1148,7 @@ HTTP 204
 
 # Permission changes reach onwards asynchronously. Observe the revoked access
 # before dispatching the batch; a delay before DELETE does not wait for this sync.
-POST http://localhost:3001/ai/v1/chat/completions
+POST http://localhost:3001/admin/api/v1/ai/v1/chat/completions
 [Options]
 retry: 30
 retry-interval: 1000
