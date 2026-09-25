@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.6.2](https://github.com/doublewordai/control-layer/compare/v12.6.1...v12.6.2) (2026-09-25)
+
+
+### Bug Fixes
+
+* show organization display names in pricing selector ([#1855](https://github.com/doublewordai/control-layer/issues/1855)) ([5ed9e3b](https://github.com/doublewordai/control-layer/commit/5ed9e3b575951d1822b6de86cebff345d6d0bc02))
+
 ## [12.6.1](https://github.com/doublewordai/control-layer/compare/v12.6.0...v12.6.1) (2026-09-25)
 
 
