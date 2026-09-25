@@ -232,7 +232,10 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
         sha.copy_from_slice(&digest);
         let token = ImageToken(sha);
 
-        // exists() short-circuit avoids re-uploading dedup hits.
+        // exists() short-circuit avoids re-uploading dedup hits. It also
+        // reports an object the bucket lifecycle is about to expire as
+        // absent, so the re-upload here resets its age before a batch
+        // signs a reference to it.
         if !self.store.exists(token).await? {
             self.store.put(token, &mime, bytes).await?;
         }
@@ -290,6 +293,7 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalize
             endpoint_url,
             region,
             force_path_style,
+            reuse_max_age_secs,
         } => {
             // Credentials are sourced from the environment (not the
             // serializable config) so they can't leak via a config dump.
@@ -311,14 +315,17 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalize
                      IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY environment variable"
                 )
             })?;
-            let store = Arc::new(store::S3CompatStore::new(
-                bucket.clone(),
-                endpoint_url.clone(),
-                region.clone(),
-                *force_path_style,
-                access_key_id,
-                secret_access_key,
-            ));
+            let store = Arc::new(
+                store::S3CompatStore::new(
+                    bucket.clone(),
+                    endpoint_url.clone(),
+                    region.clone(),
+                    *force_path_style,
+                    access_key_id,
+                    secret_access_key,
+                )
+                .with_reuse_max_age((*reuse_max_age_secs > 0).then(|| Duration::from_secs(*reuse_max_age_secs))),
+            );
             Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
         }
     })
