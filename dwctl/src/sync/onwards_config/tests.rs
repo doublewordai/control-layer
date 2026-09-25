@@ -2605,18 +2605,70 @@ async fn generally_free_models_ignore_other_accounts_paid_deals(pool: sqlx::PgPo
     }
 }
 
-/// A reload slower than the debounce interval must not replay a catalog burst
-/// one notification at a time. Changes made while it runs still need a trailing refresh.
+#[test]
+fn slow_reload_starts_one_quiet_window_at_completion() {
+    use super::{MIN_RELOAD_INTERVAL, ReloadOutcome, ReloadSchedule};
+    let started = tokio::time::Instant::now();
+    let mut schedule = ReloadSchedule::new(started);
+    let completed = started + MIN_RELOAD_INTERVAL * 20;
+    schedule.completed(completed, ReloadOutcome::Published);
+    for _ in 0..100 {
+        schedule.notify(completed);
+    }
+    assert_eq!(schedule.pending.take(), Some((completed + MIN_RELOAD_INTERVAL, "coalesced")));
+    assert!(schedule.pending.is_none());
+    schedule.completed(completed + MIN_RELOAD_INTERVAL, ReloadOutcome::Published);
+    assert!(schedule.pending.is_none(), "a successful trailing reload must not repeat itself");
+}
+
+#[test]
+fn failed_reload_retains_a_paced_retry_despite_notifications_or_fallback_ticks() {
+    use super::{MIN_RELOAD_INTERVAL, RELOAD_RETRY_INTERVAL, ReloadOutcome, ReloadSchedule};
+    let now = tokio::time::Instant::now();
+    let mut schedule = ReloadSchedule::new(now);
+    schedule.completed(now, ReloadOutcome::Retry);
+    let retry = Some((now + RELOAD_RETRY_INTERVAL, "retry"));
+    assert_eq!(schedule.pending, retry);
+    for _ in 0..100 {
+        schedule.notify(now + MIN_RELOAD_INTERVAL);
+        schedule.fallback(now + MIN_RELOAD_INTERVAL);
+    }
+    assert_eq!(schedule.pending, retry, "notifications must not bypass failure backoff");
+    schedule.pending.take();
+    schedule.completed(now + RELOAD_RETRY_INTERVAL, ReloadOutcome::Retry);
+    assert_eq!(schedule.pending, Some((now + RELOAD_RETRY_INTERVAL * 2, "retry")));
+    schedule.completed(now + RELOAD_RETRY_INTERVAL * 2, ReloadOutcome::Published);
+    assert!(schedule.pending.is_none());
+}
+
+#[test]
+fn later_notifications_and_fallbacks_schedule_new_reloads() {
+    use super::{MIN_RELOAD_INTERVAL, ReloadOutcome, ReloadSchedule};
+    let now = tokio::time::Instant::now();
+    let mut schedule = ReloadSchedule::new(now);
+    schedule.completed(now, ReloadOutcome::Published);
+    schedule.notify(now + MIN_RELOAD_INTERVAL);
+    assert_eq!(schedule.pending.take(), Some((now + MIN_RELOAD_INTERVAL, "listen_notify")));
+    schedule.completed(now + MIN_RELOAD_INTERVAL, ReloadOutcome::Published);
+    schedule.fallback(now + MIN_RELOAD_INTERVAL);
+    assert!(schedule.pending.is_none());
+    schedule.fallback(now + MIN_RELOAD_INTERVAL * 2);
+    assert_eq!(schedule.pending.take(), Some((now + MIN_RELOAD_INTERVAL * 2, "fallback")));
+}
+
+/// Commit a new alias after the loader's snapshot, while publication is paused.
 #[sqlx::test]
-async fn slow_reload_coalesces_queued_notifications_and_keeps_later_changes(pool: sqlx::PgPool) {
+async fn change_after_reload_snapshot_is_published_by_trailing_refresh(pool: sqlx::PgPool) {
     use crate::api::models::users::Role;
     use crate::test::utils::{create_test_endpoint, create_test_model, create_test_user};
 
     let user = create_test_user(&pool, Role::StandardUser).await;
     let endpoint = create_test_endpoint(&pool, "sync-test", user.id).await;
     let model = create_test_model(&pool, "sync-model", "before", endpoint, user.id).await;
-    let (sync, _, _stream) = super::OnwardsConfigSync::new(pool.clone()).await.unwrap();
+    let (mut sync, _, _stream) = super::OnwardsConfigSync::new(pool.clone()).await.unwrap();
     let mut updates = sync.sender().subscribe();
+    let (checkpoint_tx, mut checkpoints) = mpsc::channel(1);
+    sync.reload_checkpoint = Some(checkpoint_tx);
     let (status_tx, mut status_rx) = mpsc::channel(10);
     let shutdown = CancellationToken::new();
     let task = tokio::spawn({
@@ -2634,8 +2686,75 @@ async fn slow_reload_coalesces_queued_notifications_and_keeps_later_changes(pool
     });
     assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
     assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
+    sqlx::query("SELECT pg_notify('auth_config_changed', 'start')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let first = timeout(Duration::from_secs(10), checkpoints.recv()).await.unwrap().unwrap();
+    assert_eq!(first.outcome, super::ReloadOutcome::Published);
+    sqlx::query("UPDATE deployed_models SET alias = 'after-snapshot' WHERE id = $1")
+        .bind(model)
+        .execute(&pool)
+        .await
+        .unwrap();
+    first.resume.send(()).unwrap();
+    timeout(Duration::from_secs(10), updates.changed()).await.unwrap().unwrap();
+    {
+        let initial = updates.borrow_and_update();
+        assert!(initial.targets.contains_key("before"));
+        assert!(!initial.targets.contains_key("after-snapshot"));
+    }
+    let trailing = timeout(Duration::from_secs(10), checkpoints.recv()).await.unwrap().unwrap();
+    assert_eq!(trailing.outcome, super::ReloadOutcome::Published);
+    trailing.resume.send(()).unwrap();
+    timeout(Duration::from_secs(10), updates.changed()).await.unwrap().unwrap();
+    assert!(updates.borrow_and_update().targets.contains_key("after-snapshot"));
+    shutdown.cancel();
+    timeout(Duration::from_secs(10), task).await.unwrap().unwrap().unwrap();
+}
 
-    // Hold the table while the real loader runs, rather than relying on its speed.
+#[sqlx::test]
+async fn failed_reload_retries_without_another_notification_or_fallback(pool: sqlx::PgPool) {
+    use crate::api::models::users::Role;
+    use crate::test::utils::{create_test_endpoint, create_test_model, create_test_user};
+
+    let user = create_test_user(&pool, Role::StandardUser).await;
+    let endpoint = create_test_endpoint(&pool, "retry-test", user.id).await;
+    create_test_model(&pool, "retry-model", "retry-model", endpoint, user.id).await;
+    let (mut sync, _, _stream) = super::OnwardsConfigSync::new(pool.clone()).await.unwrap();
+    let mut updates = sync.sender().subscribe();
+    // A held table lock deterministically fails the loader; LISTEN uses its normal pool.
+    let query_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .after_connect(|conn, _| {
+            Box::pin(async move {
+                sqlx::query("SET lock_timeout = '50ms'").execute(conn).await?;
+                Ok(())
+            })
+        })
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    sync.db = sqlx_pool_router::DynPools::new(query_pool.clone());
+    let (checkpoint_tx, mut checkpoints) = mpsc::channel(1);
+    sync.reload_checkpoint = Some(checkpoint_tx);
+    let (status_tx, mut status_rx) = mpsc::channel(10);
+    let shutdown = CancellationToken::new();
+    let task = tokio::spawn({
+        let shutdown = shutdown.clone();
+        async move {
+            sync.start(
+                SyncConfig {
+                    status_tx: Some(status_tx),
+                    fallback_interval_milliseconds: 0,
+                },
+                shutdown,
+            )
+            .await
+        }
+    });
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connecting));
+    assert_eq!(status_rx.recv().await, Some(super::SyncStatus::Connected));
     let mut lock = pool.begin().await.unwrap();
     sqlx::query("LOCK TABLE deployed_models IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *lock)
@@ -2645,44 +2764,17 @@ async fn slow_reload_coalesces_queued_notifications_and_keeps_later_changes(pool
         .execute(&pool)
         .await
         .unwrap();
-    timeout(Duration::from_secs(5), async {
-        loop {
-            let blocked: bool = sqlx::query_scalar(
-                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock')"
-            ).fetch_one(&pool).await.unwrap();
-            if blocked { break; }
-            tokio::task::yield_now().await;
-        }
-    }).await.expect("reload should wait for the held table lock");
-    // Deliberately exceed the 100ms debounce window inside the active reload.
-    sqlx::query("SELECT pg_sleep(0.2)").execute(&mut *lock).await.unwrap();
-    sqlx::query("SELECT pg_notify('auth_config_changed', 'burst-' || n::text) FROM generate_series(1, 100) n")
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("UPDATE deployed_models SET alias = 'after-burst' WHERE id = $1")
-        .bind(model)
-        .execute(&mut *lock)
-        .await
-        .unwrap();
-    lock.commit().await.unwrap();
-
-    timeout(Duration::from_secs(5), updates.changed()).await.unwrap().unwrap();
-    assert!(updates.borrow_and_update().targets.contains_key("after-burst"));
-    timeout(Duration::from_secs(5), updates.changed()).await.unwrap().unwrap();
-    updates.borrow_and_update();
-    assert!(
-        timeout(Duration::from_millis(500), updates.changed()).await.is_err(),
-        "queued burst must collapse into one trailing reload"
-    );
-
-    sqlx::query("UPDATE deployed_models SET alias = 'after-later-change' WHERE id = $1")
-        .bind(model)
-        .execute(&pool)
-        .await
-        .unwrap();
-    timeout(Duration::from_secs(5), updates.changed()).await.unwrap().unwrap();
-    assert!(updates.borrow_and_update().targets.contains_key("after-later-change"));
+    let failed = timeout(Duration::from_secs(10), checkpoints.recv()).await.unwrap().unwrap();
+    assert_eq!(failed.outcome, super::ReloadOutcome::Retry);
+    assert!(!updates.has_changed().unwrap(), "failed loads must preserve the last good targets");
+    lock.rollback().await.unwrap();
+    failed.resume.send(()).unwrap();
+    let retried = timeout(Duration::from_secs(10), checkpoints.recv()).await.unwrap().unwrap();
+    assert_eq!(retried.outcome, super::ReloadOutcome::Published);
+    retried.resume.send(()).unwrap();
+    timeout(Duration::from_secs(10), updates.changed()).await.unwrap().unwrap();
+    assert!(updates.borrow_and_update().targets.contains_key("retry-model"));
     shutdown.cancel();
-    timeout(Duration::from_secs(5), task).await.unwrap().unwrap().unwrap();
+    timeout(Duration::from_secs(10), task).await.unwrap().unwrap().unwrap();
+    query_pool.close().await;
 }

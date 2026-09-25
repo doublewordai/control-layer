@@ -263,6 +263,61 @@ fn key_labels(api_key: &OnwardsApiKey) -> HashMap<String, String> {
     ])
 }
 
+const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+const RELOAD_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReloadOutcome {
+    Published,
+    Retry,
+    Closed,
+}
+
+/// Coalesce notifications from slow reloads and retain failed refreshes for retry.
+struct ReloadSchedule {
+    next_allowed: tokio::time::Instant,
+    pending: Option<(tokio::time::Instant, &'static str)>,
+}
+
+impl ReloadSchedule {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            next_allowed: now + MIN_RELOAD_INTERVAL,
+            pending: None,
+        }
+    }
+
+    fn notify(&mut self, now: tokio::time::Instant) {
+        self.pending.get_or_insert((
+            now.max(self.next_allowed),
+            if now < self.next_allowed { "coalesced" } else { "listen_notify" },
+        ));
+    }
+
+    fn fallback(&mut self, now: tokio::time::Instant) {
+        if now >= self.next_allowed {
+            self.pending.get_or_insert((now, "fallback"));
+        }
+    }
+
+    fn completed(&mut self, now: tokio::time::Instant, outcome: ReloadOutcome) {
+        // The quiet/retry window starts after the attempt, not before the DB work.
+        self.next_allowed = now
+            + if outcome == ReloadOutcome::Retry {
+                RELOAD_RETRY_INTERVAL
+            } else {
+                MIN_RELOAD_INTERVAL
+            };
+        self.pending = (outcome == ReloadOutcome::Retry).then_some((self.next_allowed, "retry"));
+    }
+}
+
+#[cfg(test)]
+struct ReloadCheckpoint {
+    outcome: ReloadOutcome,
+    resume: tokio::sync::oneshot::Sender<()>,
+}
+
 /// Manages the integration between onwards-pilot and the onwards proxy
 pub struct OnwardsConfigSync {
     /// Query traffic (pooled endpoint when configured).
@@ -271,6 +326,8 @@ pub struct OnwardsConfigSync {
     /// cannot carry a subscription.
     listener_db: sqlx_pool_router::DynPools,
     sender: watch::Sender<Targets>,
+    #[cfg(test)]
+    reload_checkpoint: Option<mpsc::Sender<ReloadCheckpoint>>,
     /// Shared map of model batch capacity limits for the daemon
     daemon_capacity_limits: Option<Arc<dashmap::DashMap<String, usize>>>,
     /// Default batch concurrency for models without explicit batch_capacity
@@ -359,6 +416,8 @@ impl OnwardsConfigSync {
             db,
             listener_db: sqlx_pool_router::DynPools::new(listener_db),
             sender,
+            #[cfg(test)]
+            reload_checkpoint: None,
             daemon_capacity_limits,
             default_batch_capacity,
             escalation_models,
@@ -379,15 +438,8 @@ impl OnwardsConfigSync {
     /// Starts the background task that listens for database changes and updates the configuration
     #[instrument(skip(self, config, shutdown_token), err)]
     pub async fn start(mut self, config: SyncConfig, shutdown_token: CancellationToken) -> Result<(), anyhow::Error> {
-        // Debouncing for reloads. Notifications arriving inside the window
-        // are COALESCED into one trailing reload (pending_reload) rather than
-        // dropped - a dropped notification used to wait for the fallback
-        // timer, which is minutes in production.
-        // Measure the quiet window after completion: a slow reload must not
-        // make every notification queued during it immediately reload again.
-        let mut last_reload_time = std::time::Instant::now();
-        const MIN_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
-        let mut pending_reload: Option<tokio::time::Instant> = None;
+        let mut schedule = ReloadSchedule::new(tokio::time::Instant::now());
+        let mut notification_lag = None;
 
         // Fallback sync interval (0 = disabled)
         let fallback_interval = if config.fallback_interval_milliseconds > 0 {
@@ -448,38 +500,9 @@ impl OnwardsConfigSync {
                                 debug!("Received notification on channel: {} with payload: {:?}",
                                       notification.channel(), notification.payload());
 
-                                // Parse the notification timestamp for lag measurement
-                                let notify_info = parse_notify_payload(notification.payload());
-
-                                // Inside the debounce window: coalesce into
-                                // one trailing reload instead of dropping the
-                                // notification.
-                                if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
-                                    if pending_reload.is_none() {
-                                        let deadline = tokio::time::Instant::now()
-                                            + MIN_RELOAD_INTERVAL.saturating_sub(last_reload_time.elapsed());
-                                        pending_reload = Some(deadline);
-                                        debug!("Coalescing reload: trailing reload scheduled (last reload was {:?} ago)",
-                                               last_reload_time.elapsed());
-                                    }
-                                    continue;
-                                }
-
-                                pending_reload = None;
-                                if !self.full_reload("listen_notify").await? {
-                                    break;
-                                }
-                                last_reload_time = std::time::Instant::now();
-
-                                // Record cache sync lag metric (time from DB change to cache update)
-                                if let Some((table_name, lag)) = notify_info {
-                                    let lag_seconds = lag.as_secs_f64();
-                                    histogram!("dwctl_cache_sync_lag_seconds", "table" => table_name.to_string())
-                                        .record(lag_seconds);
-                                    info!("Updated onwards configuration successfully (sync lag: {:.3}ms from {})",
-                                          lag_seconds * 1000.0, table_name);
-                                } else {
-                                    info!("Updated onwards configuration successfully");
+                                schedule.notify(tokio::time::Instant::now());
+                                if let Some((table_name, lag)) = parse_notify_payload(notification.payload()) {
+                                    notification_lag.get_or_insert((table_name.to_string(), lag));
                                 }
                             }
                             Err(e) => {
@@ -502,42 +525,34 @@ impl OnwardsConfigSync {
                         }
                     }
 
-                    // Coalesced trailing reload from a debounced notification
+                    // A single deadline handles direct, trailing and retry refreshes.
                     _ = async {
-                        match pending_reload {
-                            Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        match schedule.pending {
+                            Some((deadline, _)) => tokio::time::sleep_until(deadline).await,
                             None => std::future::pending().await,
                         }
                     } => {
-                        debug!("Coalesced trailing reload triggered");
-                        pending_reload = None;
-                        if !self.full_reload("coalesced").await? {
-                            break;
+                        let (_, source) = schedule.pending.take().expect("reload deadline was scheduled");
+                        let outcome = self.full_reload(source).await?;
+                        schedule.completed(tokio::time::Instant::now(), outcome);
+                        if outcome == ReloadOutcome::Published
+                            && let Some((table_name, lag)) = notification_lag.take()
+                        {
+                            histogram!("dwctl_cache_sync_lag_seconds", "table" => table_name).record(lag.as_secs_f64());
                         }
-                        last_reload_time = std::time::Instant::now();
+                        if outcome == ReloadOutcome::Closed {
+                            break 'outer;
+                        }
                     }
 
                     // Fallback periodic sync (if enabled)
                     _ = async {
                         match &mut fallback_timer {
                             Some(timer) => timer.tick().await,
-                            None => std::future::pending().await, // Never resolve if disabled
+                            None => std::future::pending().await,
                         }
                     } => {
-                        debug!("Fallback periodic sync triggered");
-
-                        // Skip if we just reloaded via notification (debounce);
-                        // the fallback timer fires again on its own.
-                        if last_reload_time.elapsed() < MIN_RELOAD_INTERVAL {
-                            debug!("Skipping fallback sync due to recent notification-triggered reload");
-                            continue;
-                        }
-
-                        pending_reload = None;
-                        if !self.full_reload("fallback").await? {
-                            break;
-                        }
-                        last_reload_time = std::time::Instant::now();
+                        schedule.fallback(tokio::time::Instant::now());
                     }
                 }
             }
@@ -548,10 +563,9 @@ impl OnwardsConfigSync {
     }
 
     /// Full config rebuild from the database: updates capacity limits and
-    /// cache metrics, and sends the new Targets. Returns Ok(false) if the
-    /// watch channel is closed (all receivers dropped); Err only for fatal
-    /// DB errors (closed pool / connection).
-    async fn full_reload(&mut self, source: &'static str) -> Result<bool, anyhow::Error> {
+    /// cache metrics, and sends the new Targets. Recoverable failures retain a
+    /// pending retry; closed receivers stop the task, and fatal DB errors propagate.
+    async fn full_reload(&mut self, source: &'static str) -> Result<ReloadOutcome, anyhow::Error> {
         let new_targets =
             match load_targets_from_db(&self.db.write(), &self.escalation_models, self.strict_mode, &self.rate_limit_tiers).await {
                 Ok(targets) => targets,
@@ -561,10 +575,14 @@ impl OnwardsConfigSync {
                         error!("Database pool closed, exiting sync task");
                         return Err(e);
                     }
-                    // Continue listening for other types of errors
-                    return Ok(true);
+                    #[cfg(test)]
+                    self.checkpoint(ReloadOutcome::Retry).await;
+                    return Ok(ReloadOutcome::Retry);
                 }
             };
+        // Tests can commit a later change after this snapshot, before publication.
+        #[cfg(test)]
+        self.checkpoint(ReloadOutcome::Published).await;
         debug!("Loaded {} targets from database", new_targets.targets.len());
 
         // Update daemon capacity limits if configured
@@ -595,11 +613,22 @@ impl OnwardsConfigSync {
         if let Err(e) = self.sender.send(new_targets) {
             error!("Failed to send targets update: {}", e);
             // If all receivers are dropped, we can exit
-            return Ok(false);
+            return Ok(ReloadOutcome::Closed);
         }
 
         metrics::counter!("dwctl_cache_sync_total", "source" => source).increment(1);
-        Ok(true)
+        info!("Updated onwards configuration successfully ({source})");
+        Ok(ReloadOutcome::Published)
+    }
+
+    #[cfg(test)]
+    async fn checkpoint(&self, outcome: ReloadOutcome) {
+        if let Some(tx) = &self.reload_checkpoint {
+            let (resume, wait) = tokio::sync::oneshot::channel();
+            if tx.send(ReloadCheckpoint { outcome, resume }).await.is_ok() {
+                let _ = wait.await;
+            }
+        }
     }
 }
 
