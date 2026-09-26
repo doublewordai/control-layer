@@ -1003,6 +1003,14 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
     model: &str,
     background: bool,
 ) -> Response {
+    let request_id = flex_input.request_id;
+    // Foreground callers are the only ones who will ever collect the result,
+    // so only they arm the guard. Armed *before* the enqueue: a disconnect
+    // while the INSERT is in flight drops this future, but the row can still
+    // commit. Disarmed once a terminal state has been delivered; on any other
+    // exit (disconnect, enqueue or poll failure) it cancels the row, which is
+    // a no-op if the row never made it in.
+    let abandon_guard = (!background).then(|| response_store::AbandonGuard::arm(state.request_manager.clone(), request_id));
     // Flex needs the row created synchronously (daemon must find it).
     if let Err(e) = fusillade::Storage::create_flex(&*state.request_manager, flex_input).await {
         tracing::error!(error = %e, "Failed to create flex row in fusillade");
@@ -1042,6 +1050,9 @@ async fn handle_flex<P: PoolProvider + Clone + Send + Sync + 'static>(
 
         match response_store::poll_until_complete(&state.request_manager, resp_id, poll_interval, timeout, state.keystore.as_ref()).await {
             Ok(response_obj) => {
+                if let Some(guard) = abandon_guard {
+                    guard.disarm();
+                }
                 let status_code = if response_obj["status"].as_str() == Some("completed") {
                     StatusCode::OK
                 } else {
@@ -1115,6 +1126,7 @@ async fn handle_background<P: PoolProvider + Clone + Send + Sync + 'static>(
 ///
 /// Always blocks: chat completions has no `background` field in the OpenAI surface,
 /// so we hold the connection until the daemon finishes (or we hit the 1h timeout).
+/// If the caller disconnects first, the queued request is cancelled.
 /// On success the upstream `chat.completion` body is returned verbatim. On failure
 /// the OpenAI chat-completions error envelope is returned with the upstream HTTP
 /// status surfaced.
@@ -1123,6 +1135,10 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
     flex_input: fusillade::CreateFlexInput,
     request_id: uuid::Uuid,
 ) -> Response {
+    // See `handle_flex`: armed before the enqueue so a disconnect during the
+    // INSERT still cancels a row that committed; disarmed once the terminal
+    // state has been delivered.
+    let abandon_guard = response_store::AbandonGuard::arm(state.request_manager.clone(), request_id);
     if let Err(e) = fusillade::Storage::create_flex(&*state.request_manager, flex_input).await {
         tracing::error!(error = %e, "Failed to create flex chat-completions batch in fusillade");
         return Response::builder()
@@ -1146,6 +1162,7 @@ async fn handle_chat_completion_flex<P: PoolProvider + Clone + Send + Sync + 'st
 
     match response_store::poll_until_terminal(&state.request_manager, request_id, poll_interval, timeout, state.keystore.as_ref()).await {
         Ok(detail) => {
+            abandon_guard.disarm();
             let (status, body) = response_store::detail_to_chat_completion_object(&detail);
             let status_code = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             tracing::debug!(request_id = %request_id, %status_code, "Flex chat-completions terminal");

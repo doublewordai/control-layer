@@ -1373,3 +1373,50 @@ async fn test_realtime_zdr_suppresses_stored_bodies(pool: PgPool) {
 }
 
 mod trace_binding;
+
+/// `background: true` on a flex Responses request returns 202 and is collected
+/// later via `GET /v1/responses/{id}`, so the caller going away must NOT
+/// cancel it. Only the foreground (blocking / streaming) flex paths arm the
+/// disconnect cancel; this pins that a background submission never does.
+#[sqlx::test]
+async fn background_flex_response_survives_the_client_moving_on(pool: PgPool) {
+    let mock_server = wiremock::MockServer::start().await;
+    mount_chat_completions_mock(&mock_server).await;
+    let (server, api_key, _bg) = setup_ai_test(pool.clone(), &mock_server, true).await;
+
+    let response = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", &format!("Bearer {}", api_key))
+        .json(&serde_json::json!({
+            "model": "gpt-4o",
+            "input": "hello",
+            "background": true,
+            "service_tier": "flex"
+        }))
+        .await;
+    assert_eq!(response.status_code(), 202, "background flex must be accepted: {}", response.text());
+    let body: serde_json::Value = response.json();
+    let id: uuid::Uuid = body["id"]
+        .as_str()
+        .and_then(|s| s.trim_start_matches("resp_").parse().ok())
+        .expect("202 body carries a resp_<uuid> id");
+
+    // The client has its id and moves on: the HTTP exchange is over. The test
+    // harness never runs the daemon, so the row can only leave `pending` if
+    // something cancels it — which is exactly what must not happen here.
+    drop(response);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let row = sqlx::query("SELECT state, service_tier FROM fusillade.requests WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("background flex row must still exist");
+    let state: String = sqlx::Row::get(&row, "state");
+    let service_tier: Option<String> = sqlx::Row::get(&row, "service_tier");
+    assert_eq!(service_tier.as_deref(), Some("flex"));
+    assert_eq!(
+        state, "pending",
+        "a background submission must never be cancelled on client disconnect"
+    );
+}
