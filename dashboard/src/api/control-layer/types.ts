@@ -251,6 +251,7 @@ export interface ModelMetadata {
   display_category?: ModelDisplayCategory;
   intelligence_index?: number;
   context_window?: number;
+  max_output_tokens?: number;
   released_at?: string; // ISO date string (YYYY-MM-DD)
   attribution?: string;
   quantization?: string; // e.g. "FP8", "FP16", "INT4"

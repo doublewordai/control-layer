@@ -4,8 +4,8 @@ use sqlx_pool_router::PoolProvider;
 
 use crate::api::models::deployments::{ModelFacets, ModelListResponse, TariffDefinition, TrafficRoutingAction, TrafficRoutingRule};
 use crate::db::models::deployments::{
-    AimdConfig, LoadBalancingStrategy, MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS, ModelCatalogMetadata,
-    TrafficRuleAction,
+    AimdConfig, LoadBalancingStrategy, MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS, MODEL_TOKEN_LIMIT_MAX,
+    ModelCatalogMetadata, TrafficRuleAction,
 };
 use crate::db::models::tariffs::TariffCreateDBRequest;
 use crate::{
@@ -141,6 +141,17 @@ fn validate_backoff(initial_ms: Option<i32>, max_ms: Option<i32>, factor: Option
     Ok(())
 }
 
+/// A token-count metadata field must be a positive integer at or below
+/// [`MODEL_TOKEN_LIMIT_MAX`]; anything else is a client error.
+fn validate_token_limit(field: &str, value: i64) -> Result<()> {
+    if value <= 0 || value > MODEL_TOKEN_LIMIT_MAX {
+        return Err(Error::BadRequest {
+            message: format!("{field} must be between 1 and {MODEL_TOKEN_LIMIT_MAX} (got {value})"),
+        });
+    }
+    Ok(())
+}
+
 /// Validate that model catalog metadata is within size and key count limits.
 fn validate_metadata(metadata: &ModelCatalogMetadata) -> Result<()> {
     let size = serde_json::to_vec(metadata).map(|v| v.len()).unwrap_or(0);
@@ -161,6 +172,19 @@ fn validate_metadata(metadata: &ModelCatalogMetadata) -> Result<()> {
                 map.len(),
                 MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS
             ),
+        });
+    }
+    if let Some(context_window) = metadata.context_window {
+        validate_token_limit("metadata.context_window", context_window)?;
+    }
+    if let Some(max_output_tokens) = metadata.max_output_tokens {
+        validate_token_limit("metadata.max_output_tokens", max_output_tokens)?;
+    }
+    if let (Some(max_output_tokens), Some(context_window)) = (metadata.max_output_tokens, metadata.context_window)
+        && max_output_tokens > context_window
+    {
+        return Err(Error::BadRequest {
+            message: format!("metadata.max_output_tokens ({max_output_tokens}) must not exceed metadata.context_window ({context_window})"),
         });
     }
     Ok(())

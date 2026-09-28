@@ -2,6 +2,7 @@ pub mod anthropic;
 pub mod cache_classifier;
 pub mod databases;
 pub mod modalities;
+pub mod request_validation;
 pub mod responses;
 pub mod serving_classes;
 pub mod sigterm_drain;
