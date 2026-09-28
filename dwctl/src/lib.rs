@@ -159,6 +159,8 @@ pub mod keystore;
 mod leader_election;
 pub mod limits;
 mod metrics;
+/// jemalloc statistics (re-exported for the memory validation harness).
+pub use metrics::allocator as allocator_metrics;
 pub mod migrations;
 pub mod modalities;
 pub mod model_provisioning;
@@ -169,6 +171,7 @@ mod payment_providers;
 pub mod prefix_chain;
 pub mod pricing;
 mod probes;
+pub mod profiling;
 pub mod prompt_cache;
 pub mod reasoning;
 mod recompute;
@@ -375,7 +378,15 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             // compliance ratios are only exact at a bucket edge.
             const SUBMISSION_LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0, 1800.0, 3600.0];
 
+            // Heap profile dump duration (1ms to 30s, the default dump timeout).
+            const HEAP_PROFILE_DUMP_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
+
             let handle = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_heap_profile_dump_duration_seconds".to_string()),
+                    HEAP_PROFILE_DUMP_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_heap_profile_dump_duration_seconds")
                 .set_buckets_for_metric(Matcher::Full("dwctl_analytics_lag_seconds".to_string()), ANALYTICS_LAG_BUCKETS)
                 .expect("Failed to set custom buckets for dwctl_analytics_lag_seconds")
                 .set_buckets_for_metric(Matcher::Full("dwctl_cache_sync_lag_seconds".to_string()), CACHE_SYNC_LAG_BUCKETS)
@@ -3814,6 +3825,26 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         };
         background_tasks.spawn("pool-metrics-sampler", async move {
             db::run_pool_metrics_sampler(pools, metrics_config, metrics_shutdown).await
+        });
+    }
+
+    // jemalloc statistics gauges (Linux only; the sampler idles elsewhere).
+    if config.enable_metrics && config.background_services.allocator_metrics.enabled {
+        let allocator_config = config.background_services.allocator_metrics.clone();
+        let allocator_shutdown = shutdown_token.clone();
+        background_tasks.spawn("allocator-metrics-sampler", async move {
+            metrics::allocator::run_allocator_metrics_sampler(allocator_config, allocator_shutdown).await
+        });
+    }
+
+    // Opt-in heap profile listener. Serving is separate from sampling, which
+    // only happens when the process started with jemalloc `prof:true`.
+    profiling::log_heap_profiling_status();
+    if config.heap_profiling.enabled {
+        let profiling_config = config.heap_profiling.clone();
+        let profiling_shutdown = shutdown_token.clone();
+        background_tasks.spawn("heap-profiling-server", async move {
+            profiling::run_heap_profiling_server(profiling_config, profiling_shutdown).await
         });
     }
 

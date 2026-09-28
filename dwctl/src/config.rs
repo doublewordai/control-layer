@@ -234,6 +234,11 @@ pub struct Config {
     /// and resume-behavior knobs. See [`ContinuationConfig`].
     #[serde(default)]
     pub continuation: ContinuationConfig,
+    /// Opt-in sampled jemalloc heap profiling, served on a separate
+    /// cluster-internal listener. Off by default. See
+    /// [`crate::profiling::HeapProfilingConfig`].
+    #[serde(default)]
+    pub heap_profiling: crate::profiling::HeapProfilingConfig,
 }
 
 /// Controls exposure of the OpenAPI specs and Scalar doc UIs.
@@ -2672,6 +2677,9 @@ pub struct BackgroundServicesConfig {
     pub leader_election: LeaderElectionConfig,
     /// Configuration for database pool metrics sampling
     pub pool_metrics: PoolMetricsSamplerConfig,
+    /// jemalloc statistics sampling for the allocator Prometheus gauges.
+    /// See [`crate::metrics::allocator::AllocatorMetricsConfig`].
+    pub allocator_metrics: crate::metrics::allocator::AllocatorMetricsConfig,
     /// Configuration for batch completion notifications (email + webhooks)
     pub notifications: NotificationsConfig,
     /// Configuration for connection sync workers (file ingestion, batch activation)
@@ -3162,6 +3170,7 @@ impl Default for Config {
             clickhouse: None,
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: ContinuationConfig::default(),
+            heap_profiling: crate::profiling::HeapProfilingConfig::default(),
         }
     }
 }
