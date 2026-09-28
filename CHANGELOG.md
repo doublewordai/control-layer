@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.6.3](https://github.com/doublewordai/control-layer/compare/v12.6.2...v12.6.3) (2026-09-28)
+
+
+### Bug Fixes
+
+* debounce config notifications after reload completion ([#1856](https://github.com/doublewordai/control-layer/issues/1856)) ([5cf22c5](https://github.com/doublewordai/control-layer/commit/5cf22c5cf115cd8d3dcb8881bf55a223ab2b6845))
+
 ## [12.6.2](https://github.com/doublewordai/control-layer/compare/v12.6.1...v12.6.2) (2026-09-25)
 
 
