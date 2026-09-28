@@ -6,6 +6,7 @@ import {
   useModelCachePricing,
   useModelOverlays,
   useOrganizationServing,
+  useOrganizationsByIds,
 } from "@/api/control-layer";
 import type {
   Model,
@@ -18,6 +19,7 @@ vi.mock("@/api/control-layer", () => ({
   useModelCachePricing: vi.fn(),
   useModelOverlays: vi.fn(),
   useOrganizationServing: vi.fn(),
+  useOrganizationsByIds: vi.fn(),
 }));
 const tariff = (id: string, extra: Partial<ModelTariff> = {}): ModelTariff => ({
   id,
@@ -33,7 +35,8 @@ const tariff = (id: string, extra: Partial<ModelTariff> = {}): ModelTariff => ({
 });
 const overlay: ServingOverlay = {
   organization_id: "org-a",
-  organization_name: "Example Organisation",
+  organization_name: "example-org~1234",
+  organization_display_name: "Example Organisation",
   deployed_model_id: "model",
   alias: "example-model",
   default_serving_class: "throughput",
@@ -104,6 +107,7 @@ function mount(manager = true, initialOrganization?: string) {
 }
 beforeEach(() => {
   vi.clearAllMocks();
+  vi.mocked(useOrganizationsByIds).mockReturnValue([]);
   vi.mocked(useModelOverlays).mockReturnValue({
     data: [overlay],
     isLoading: false,
@@ -131,6 +135,62 @@ beforeEach(() => {
   } as unknown as ReturnType<typeof useOrganizationServing>);
 });
 describe("model pricing selector", () => {
+  it.each([
+    ["Price-only Organisation", "Price-only Organisation (price-only~1234)"],
+    [null, "price-only~1234"],
+    ["   ", "price-only~1234"],
+  ])("labels a tariff-only scope with display name %j", (displayName, expected) => {
+    vi.mocked(useModelOverlays).mockReturnValue({ data: [] } as unknown as ReturnType<typeof useModelOverlays>);
+    vi.mocked(useOrganizationsByIds).mockReturnValue([
+      { data: { id: "price-org", username: "price-only~1234", display_name: displayName } },
+    ] as unknown as ReturnType<typeof useOrganizationsByIds>);
+    const { container } = render(
+      <MemoryRouter>
+        <ModelPricing
+          model={{ ...model, tariffs: [...model.tariffs!, tariff("price-only", { organization_id: "price-org" })] }}
+          manager
+          initialOrganization="price-org"
+          onEditPrices={vi.fn()}
+          onEditCache={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+    expect(useOrganizationsByIds).toHaveBeenCalledWith(["price-org"]);
+    expect(within(container).getByRole("combobox", { name: "Pricing for" })).toHaveTextContent(expected!);
+  });
+
+  it("does not fetch organisation names for customer pricing views", () => {
+    mount(false);
+    expect(useOrganizationsByIds).toHaveBeenCalledWith([]);
+  });
+
+  it.each([undefined, null, "", "   "])(
+    "falls back to the account username when the display name is %j",
+    (displayName) => {
+      vi.mocked(useModelOverlays).mockReturnValue({
+        data: [{ ...overlay, organization_display_name: displayName }],
+        isLoading: false,
+        isError: false,
+      } as unknown as ReturnType<typeof useModelOverlays>);
+      const { container } = mount(true, "org-a");
+      expect(
+        within(container).getByRole("combobox", { name: "Pricing for" }),
+      ).toHaveTextContent("example-org~1234");
+    },
+  );
+
+  it("distinguishes organisations that share a display name", async () => {
+    vi.mocked(useModelOverlays).mockReturnValue({
+      data: [overlay, { ...overlay, organization_id: "org-b", organization_name: "other-org~5678" }],
+    } as unknown as ReturnType<typeof useModelOverlays>);
+    const user = userEvent.setup();
+    const { container } = mount();
+    await user.click(within(container).getByRole("combobox", { name: "Pricing for" }));
+    const options = within(document.body);
+    expect(options.getByRole("option", { name: "Example Organisation (example-org~1234)" })).toBeInTheDocument();
+    expect(options.getByRole("option", { name: "Example Organisation (other-org~5678)" })).toBeInTheDocument();
+  });
+
   it("shows effective playground prices when only realtime is configured", () => {
     const { container } = mount(true, "org-a");
     const playground = within(within(container).getByRole("region", { name: "Playground prices" }));
@@ -154,7 +214,7 @@ describe("model pricing selector", () => {
     await user.click(page.getByRole("combobox", { name: "Pricing for" }));
     await user.click(
       within(document.body).getByRole("option", {
-        name: "Example Organisation",
+        name: "Example Organisation (example-org~1234)",
       }),
     );
     const rt = within(page.getByRole("region", { name: "Realtime prices" }));
@@ -239,7 +299,7 @@ describe("model pricing selector", () => {
     const { container } = mount();
     const page = within(container);
     await user.click(
-      page.getByText("Example Organisation", { selector: "summary" }),
+      page.getByText("Example Organisation (example-org~1234)", { selector: "summary" }),
     );
     expect(await page.findByText("Token price overrides")).toBeInTheDocument();
     expect(page.getByText("No · model override")).toBeInTheDocument();

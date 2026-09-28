@@ -361,6 +361,7 @@ export interface Model {
 export interface ServingOverlay {
   organization_id: string;
   organization_name: string;
+  organization_display_name?: string | null;
   deployed_model_id: string;
   alias: string;
   default_serving_class?: ServingClassName;

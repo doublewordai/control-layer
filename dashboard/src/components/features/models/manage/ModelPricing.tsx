@@ -4,6 +4,7 @@ import {
   useModelCachePricing,
   useModelOverlays,
   useOrganizationServing,
+  useOrganizationsByIds,
 } from "@/api/control-layer";
 import type {
   Model,
@@ -37,6 +38,11 @@ interface Props {
   onEditCache: () => void;
 }
 
+function organizationLabel(displayName: string | null | undefined, username: string) {
+  const display = displayName?.trim();
+  return display && display !== username ? `${display} (${username})` : username;
+}
+
 export function ModelPricing({
   model,
   manager,
@@ -54,12 +60,22 @@ export function ModelPricing({
   const options = new Map<string, string>();
   if (manager) {
     for (const row of overlays.data ?? [])
-      options.set(row.organization_id, row.organization_name);
+      options.set(
+        row.organization_id,
+        organizationLabel(row.organization_display_name, row.organization_name),
+      );
     for (const row of model.tariffs ?? [])
       if (row.organization_id && !options.has(row.organization_id))
         options.set(row.organization_id, row.organization_id);
     if (organization && !options.has(organization))
       options.set(organization, organization);
+  }
+  const missingNames = [...options.keys()].filter(
+    (id) => !(overlays.data ?? []).some((row) => row.organization_id === id),
+  );
+  const organizations = useOrganizationsByIds(missingNames);
+  for (const { data } of organizations) {
+    if (data) options.set(data.id, organizationLabel(data.display_name, data.username));
   }
   const general = (model.tariffs ?? []).filter((row) => !row.organization_id);
   const rows = organization

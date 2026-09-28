@@ -30,6 +30,7 @@ async fn require_current_platform_manager(conn: &mut sqlx::PgConnection, user_id
 
 const OVERLAY_COLUMNS: &str = r#"
     SELECT mo.user_id AS organization_id, u.username AS organization_name,
+           u.display_name AS organization_display_name,
            mo.deployed_model_id, dm.alias, mo.default_serving_class, mo.targets,
            mo.self_hosted_only, mo.provisioning_source, mo.updated_at
     FROM model_overlays mo
@@ -364,6 +365,25 @@ mod tests {
         assert_eq!(body.as_array().unwrap().len(), 1);
         assert_eq!(body[0]["organization_id"], org.id.to_string());
         assert_eq!(body[0]["organization_name"], org.username);
+
+        // Labels may change without changing the catalog's stable account identifier.
+        for display_name in [Some("Example Workspace"), None] {
+            sqlx::query("UPDATE users SET display_name = $2 WHERE id = $1")
+                .bind(org.id)
+                .bind(display_name)
+                .execute(&pool)
+                .await
+                .unwrap();
+            let body: Value = get(&server, &format!("/admin/api/v1/models/{model_id}/overlays"), &admin)
+                .await
+                .json();
+            assert_eq!(body[0]["organization_name"], org.username);
+            assert_eq!(body[0]["organization_display_name"], json!(display_name));
+            let body: Value = get(&server, &format!("/admin/api/v1/organizations/{}/serving", org.id), &admin)
+                .await
+                .json();
+            assert_eq!(body["overlays"][0]["organization_display_name"], json!(display_name));
+        }
 
         // A personal account is not an organisation.
         get(&server, &format!("/admin/api/v1/organizations/{}/serving", member.id), &admin)

@@ -1,6 +1,7 @@
 import { useEffect, useMemo } from "react";
 import {
   useQuery,
+  useQueries,
   useMutation,
   useQueryClient,
   keepPreviousData,
@@ -1657,6 +1658,17 @@ export function useOrganization(id: string) {
     queryKey: queryKeys.organizations.byId(id),
     queryFn: () => dwctlApi.organizations.get(id),
     staleTime: 30 * 1000,
+  });
+}
+
+// Reuse the organisation-detail cache for price scopes without a serving overlay.
+export function useOrganizationsByIds(ids: string[]) {
+  return useQueries({
+    queries: [...new Set(ids)].map((id) => ({
+      queryKey: queryKeys.organizations.byId(id),
+      queryFn: () => dwctlApi.organizations.get(id),
+      staleTime: 30 * 1000,
+    })),
   });
 }
 
