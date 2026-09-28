@@ -217,7 +217,7 @@ export function CostManagement() {
         onPurchaseFunds: hasPaymentProvider
           ? handlePurchaseFundsExternal
           : handlePurchaseFunds,
-        // Only show "Gift/Remove Funds" option if user is actually an admin
+        // Only show "Gift Funds" option if user is actually an admin
         onGiftFunds: canManageFunds ? handleGiftFunds : undefined,
         // Only show "Billing Portal" if user has a customer ID
         onBillingPortal: hasCustomerId ? handleBillingPortal : undefined,
@@ -260,7 +260,7 @@ export function CostManagement() {
             filterUserId={filterUserId || undefined}
             headerExtra={autoTopupElement}
           />
-          {/* Admin modal for gifting funds to / removing funds from users */}
+          {/* Admin modal for gifting funds to users */}
           {canManageFunds && (
             <AddFundsModal
               isOpen={showAddFundsModal}

@@ -1,0 +1,3 @@
+-- No-op reversal: REINDEX is maintenance on the index 20260922000000 created;
+-- there is nothing to undo. The index itself is dropped by that migration's
+-- down file, which reverts before this one in numbering order.

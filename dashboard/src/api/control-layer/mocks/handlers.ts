@@ -2581,14 +2581,10 @@ export const handlers = [
     const newTransaction: Transaction = {
       id: `txn-${Date.now()}`,
       user_id: body.user_id,
-      transaction_type: body.transaction_type ?? "admin_grant",
+      transaction_type: "admin_grant",
       amount: body.amount,
       source_id: "admin",
-      description:
-        body.description ||
-        (body.transaction_type === "admin_removal"
-          ? "Funds removed by admin"
-          : "Funds added by admin"),
+      description: body.description || "Funds added by admin",
       created_at: new Date().toISOString(),
     };
 
