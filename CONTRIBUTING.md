@@ -41,6 +41,18 @@ before changing table columns or query projections. Transaction-pooled prepared
 statements can outlive application pods, so test compatibility with existing
 clients as well as a freshly started application.
 
+## Coding guides for contributors and agents
+
+The shared [repository skills](.claude/skills/) distill implementation patterns
+from the documentation into task-specific coding guidance. Claude discovers
+them directly; Codex uses the same files through `.agents/skills`. Each skill
+links to its source documentation, current code, and relevant regression tests.
+
+Use these guides for the subsystem you are changing. Historical design/rollout
+documents explain earlier decisions but may describe superseded code; the skills
+identify important differences. Verify current types, configuration, and tests
+before copying examples, and update the relevant skill when its contract changes.
+
 ## Developing
 
 ### 1. Install Prerequisites
