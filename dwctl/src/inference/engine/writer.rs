@@ -341,6 +341,9 @@ pub struct RequestsWriterSender {
 
 impl RequestsWriterSender {
     /// Send one completed-response record to the writer.
+    // Mirrors `mpsc::Sender::send`, which hands the record back on failure;
+    // boxing it would change the call sites for no benefit on a cold path.
+    #[allow(clippy::result_large_err)]
     pub async fn send(&self, record: RawCompletedRequest) -> Result<(), mpsc::error::SendError<RawCompletedRequest>> {
         let accounted = AccountedRecord::new_queued(record, self.accounting.clone());
         self.sender
