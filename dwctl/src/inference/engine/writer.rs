@@ -375,6 +375,9 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> RequestsWriter<P> {
         let (sender, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
         let accounting = Arc::new(WriterAccounting::default());
         describe_writer_gauges();
+        // Publish zeros so an idle writer reads 0 rather than absent.
+        accounting.publish_queued();
+        accounting.publish_batch();
         let writer = Self {
             request_manager,
             receiver,

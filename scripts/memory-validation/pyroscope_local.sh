@@ -97,6 +97,8 @@ if [[ -z "$PROFILE" ]]; then
   echo "==> generated test profile: $PROFILE"
 fi
 [[ -f "$PROFILE" ]] || die "profile not found: $PROFILE"
+# Resolve before the `cd` below so relative paths keep working.
+PROFILE="$(cd "$(dirname "$PROFILE")" && pwd)/$(basename "$PROFILE")"
 
 # Run from the temp dir so every relative default in the server config lands
 # there rather than in the checkout. `-enable-query-backend-from` pins the read

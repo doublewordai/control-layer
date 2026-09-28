@@ -82,7 +82,8 @@ Two independent switches, both required.
    `lg_prof_sample:19` samples on average once per 512 KiB allocated.
 2. **Serving**: `heap_profiling.enabled` (`DWCTL_HEAP_PROFILING__ENABLED=true`)
    starts a separate listener on `heap_profiling.bind_address` (default
-   `0.0.0.0:6060`) with one route, `GET /debug/pprof/heap`. It returns a
+   `127.0.0.1:6060`, reachable only through port-forwarding; set
+   `0.0.0.0:6060` for an in-cluster scraper) with one route, `GET /debug/pprof/heap`. It returns a
    gzip-compressed pprof protobuf of sampled in-use allocations with
    symbolized stacks. The listener is not part of the main router; do not
    expose it through a Service or ingress, and restrict it with a NetworkPolicy
@@ -160,7 +161,7 @@ not a benchmark of your workload.
 
 - CPU scales with bytes allocated, not with requests. In a synthetic
   allocation-only churn benchmark (4 threads, nothing but malloc/free), CPU rose
-  about 45–50%; with `lg_prof_sample:23` it rose about 20%. A service spends
+  about 45–52%; with `lg_prof_sample:23` it rose about 20%. A service spends
   a small fraction of its CPU in the allocator, so expect far less. Compare the
   profiled pod's CPU with its peers before drawing conclusions from it.
 - Memory: a few MiB of sampling metadata, plus the in-process symbolizer's cache

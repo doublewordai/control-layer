@@ -347,6 +347,17 @@ credits:
 # Optional feature toggles
 enable_metrics: true # Enable Prometheus metrics endpoint
 enable_request_logging: true # Enable request/response logging to database
+
+# Opt-in heap profile listener (GET /debug/pprof/heap, gzip pprof). Profiles exist
+# only if the process also starts with jemalloc sampling on, e.g.
+# _RJEM_MALLOC_CONF=prof:true,prof_active:true,lg_prof_sample:19.
+# The listener is unauthenticated: keep it on loopback (use port-forwarding) or,
+# for an in-cluster scraper, bind 0.0.0.0 behind a NetworkPolicy.
+# See docs/memory-observability.md. DWCTL_HEAP_PROFILING__ENABLED=true etc.
+heap_profiling:
+  enabled: false # Default: false
+  bind_address: "127.0.0.1:6060" # Default: 127.0.0.1:6060
+  dump_timeout: 30s # Default: 30s
 # Note: Environment variables can override top level setting, as long as they're supplied with the DWCTL_ prefix:
 # DWCTL_PORT=8080
 #
@@ -678,6 +689,12 @@ continuation:
 # Background services configuration
 # Controls which background services run on this instance
 background_services:
+  # jemalloc statistics sampler (Linux) for the dwctl_jemalloc_* gauges. Runs off
+  # the request path when enable_metrics is true. See docs/memory-observability.md.
+  allocator_metrics:
+    enabled: true # Default: true
+    sample_interval: 15s # Default: 15s (minimum 1s)
+
   # Onwards config sync - syncs database changes to the AI proxy routing layer
   # Disabling this will prevent the AI proxy from receiving config updates
   onwards_sync:

@@ -25,7 +25,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 CARGO="${CARGO:-$HOME/.cargo/bin/cargo}"
-if [[ ! -x "$CARGO" ]]; then
+CARGO="$(command -v "$CARGO" || true)"
+if [[ -z "$CARGO" ]]; then
   echo "error: cargo not found at $CARGO (set CARGO=...)" >&2
   exit 1
 fi
@@ -95,8 +96,8 @@ for run in 1 2 3; do
   run_overhead "overhead-on" "$PROF_CONF" "$run"
 done
 
-# Analyze any heap profiles scenario B produced. With the stubs in place there
-# are none, so this is a no-op until the heap-profiling workstream lands.
+# Analyze scenario B's heap profiles, then require the quiet-phase profile to
+# attribute most of the retained ballast (256 MiB) to its allocating function.
 profile_count=0
 for profile in "$OUT_DIR"/scenario-b-on/heap-*.pb.gz; do
   [[ -e "$profile" ]] || continue
@@ -104,9 +105,14 @@ for profile in "$OUT_DIR"/scenario-b-on/heap-*.pb.gz; do
   echo "==> analyze $profile"
   python3 "$SCRIPT_DIR/analyze_pprof.py" "$profile" --top 15 || true
 done
-if [[ "$profile_count" -eq 0 ]]; then
-  echo "==> no heap profiles were produced (profiling unavailable or inactive)"
+quiet_profile="$OUT_DIR/scenario-b-on/heap-quiet.pb.gz"
+if [[ ! -e "$quiet_profile" ]]; then
+  echo "error: sampling was on but no quiet-phase heap profile was produced" >&2
+  exit 1
 fi
+echo "==> assert retained stack in $quiet_profile"
+python3 "$SCRIPT_DIR/analyze_pprof.py" "$quiet_profile" --top 0 \
+  --assert-function retain_validation_ballast --min-bytes $((200 * 1024 * 1024))
 
 # Aggregate the overhead runs so on/off can be compared at a glance.
 python3 - "$OUT_DIR" <<'PY'

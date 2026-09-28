@@ -48,7 +48,9 @@ pub const HEAP_PROFILE_PATH: &str = "/debug/pprof/heap";
 pub struct HeapProfilingConfig {
     /// Start the profiling listener (default: false).
     pub enabled: bool,
-    /// Address of the separate profiling listener (default: 0.0.0.0:6060).
+    /// Address of the separate profiling listener (default: 127.0.0.1:6060,
+    /// reachable only through `kubectl port-forward`). Set `0.0.0.0:6060` for an
+    /// in-cluster scraper, and restrict it with a NetworkPolicy.
     /// Never routed by the Service or ingress; reached by in-cluster Alloy or
     /// `kubectl port-forward`.
     pub bind_address: String,
@@ -61,7 +63,7 @@ impl Default for HeapProfilingConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bind_address: "0.0.0.0:6060".to_string(),
+            bind_address: "127.0.0.1:6060".to_string(),
             dump_timeout: Duration::from_secs(30),
         }
     }

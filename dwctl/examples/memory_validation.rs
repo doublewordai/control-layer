@@ -30,7 +30,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use dwctl::allocator_metrics::read_allocator_stats;
-use dwctl::profiling::{HeapProfilingStatus, dump_heap_profile_pprof, heap_profiling_status};
+use dwctl::profiling::{HeapProfileError, HeapProfilingStatus, dump_heap_profile_pprof, heap_profiling_status};
 use serde::Serialize;
 
 // ---------------------------------------------------------------------------
@@ -388,7 +388,17 @@ async fn capture_profile(out_dir: &Path, phase: &str, status: HeapProfilingStatu
             error: None,
         };
     }
-    match dump_heap_profile_pprof(timeout).await {
+    // Dumps are rate limited to one start per second, so back-to-back phases
+    // retry `Busy` briefly rather than record a missing profile.
+    let mut result = dump_heap_profile_pprof(timeout).await;
+    for _ in 0..10 {
+        if !matches!(result, Err(HeapProfileError::Busy)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        result = dump_heap_profile_pprof(timeout).await;
+    }
+    match result {
         Ok(bytes) => {
             let path = out_dir.join(format!("heap-{phase}.pb.gz"));
             match std::fs::write(&path, &bytes) {

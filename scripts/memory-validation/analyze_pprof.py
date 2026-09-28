@@ -459,7 +459,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
 
     if args.assert_function:
         match = find_function(analysis.cumulative, args.assert_function)
-        key, found = match if match else (args.assert_function, 0)
+        if match is None:
+            print(f"ASSERT FAILED: {args.assert_function} not found in the profile", file=sys.stderr)
+            return 1
+        key, found = match
         if found < args.min_bytes:
             print(
                 f"ASSERT FAILED: {args.assert_function} cumulative inuse space "
