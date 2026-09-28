@@ -44,14 +44,16 @@ impl LeakConfig {
 /// Predicate function to determine if a response should be retried.
 pub type ShouldRetryFn = Arc<dyn Fn(&HttpResponse) -> bool + Send + Sync>;
 
-/// Default retry predicate: retry on server errors, rate limits, timeouts, and
-/// not found. dwctl converts semantic and streamed failures to real HTTP errors
-/// before returning daemon responses.
+/// Default retry predicate: retry on server errors, rate limits, and timeouts.
+///
+/// 404 is deliberately not retried. For a queued request it is terminal:
+/// onwards returns it as `model_not_found` ("does not exist or you do not
+/// have access"), an upstream target can return it for a model it does not
+/// serve, and dwctl returns it for a missing resource such as an input file.
+/// Retrying cannot change any of these, so a 404 under this predicate would
+/// cycle until the batch deadline instead of failing the row.
 pub fn default_should_retry(response: &HttpResponse) -> bool {
-    response.status >= 500
-        || response.status == 429
-        || response.status == 408
-        || response.status == 404
+    response.status >= 500 || response.status == 429 || response.status == 408
 }
 
 fn default_should_retry_fn() -> ShouldRetryFn {
@@ -954,12 +956,20 @@ mod tests {
     }
 
     #[test]
-    fn preserves_existing_default_retry_statuses() {
-        for status in [404, 408, 429, 500, 503] {
+    fn permanent_model_not_found_is_not_retried() {
+        // 404 is onwards' `model_not_found` ("does not exist or you do not have
+        // access") or a missing input resource. Neither clears on retry, so a
+        // 404 must be terminal or the request loops until the batch deadline.
+        assert!(!default_should_retry(&response(404, "")));
+    }
+
+    #[test]
+    fn transient_default_retry_statuses_are_retried() {
+        for status in [408, 429, 500, 503] {
             assert!(default_should_retry(&response(status, "")));
         }
 
-        for status in [200, 201, 204, 299, 400, 401, 403, 422, 498, 499] {
+        for status in [200, 201, 204, 299, 400, 401, 403, 404, 422, 498, 499] {
             assert!(!default_should_retry(&response(status, "")));
         }
     }
