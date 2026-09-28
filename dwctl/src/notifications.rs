@@ -36,7 +36,7 @@ use uuid::Uuid;
 use crate::config::NotificationsConfig;
 use crate::db::handlers::repository::Repository;
 use crate::db::handlers::users::{AutoTopupUser, LowBalanceUser, Users};
-use crate::db::handlers::{Credits, Webhooks};
+use crate::db::handlers::{Credits, Organizations, Webhooks};
 use crate::db::models::credits::{CreditTransactionCreateDBRequest, CreditTransactionType};
 use crate::db::models::webhooks::WebhookDeliveryCreateDBRequest;
 use crate::email::EmailService;
@@ -1190,6 +1190,12 @@ async fn process_auto_topups(
 }
 
 /// Send low-balance notification emails to the given users.
+///
+/// An organization's alert goes to its contact email and to every active
+/// owner and admin, since any of them can add credits. A personal account
+/// has no members, so it gets its own address only. The flag is set once
+/// any recipient was reached: retrying on a partial failure would mail the
+/// ones who already have it again every tick.
 async fn send_low_balance_notifications(
     email_service: &EmailService,
     users: &[&LowBalanceUser],
@@ -1202,19 +1208,35 @@ async fn send_low_balance_notifications(
         let Some(balance) = balance_for(user) else { continue };
         let name = user.display_name.as_deref().unwrap_or(&user.username);
 
-        if let Err(e) = email_service.send_low_balance_email(&user.email, Some(name), &balance).await {
+        let admin_emails = Organizations::new(&mut *conn).list_admin_emails(user.id).await.unwrap_or_else(|e| {
             crate::background_error!(
-                NOTIFICATIONS, "email_send", Warning,
+                NOTIFICATIONS, "low_balance_recipients", Warning,
                 user_id = %user.id,
-                email = %user.email,
                 error = %e,
-                "Failed to send low-balance notification email"
+                "Failed to list organization admins for a low-balance notification"
             );
-            continue;
+            Vec::new()
+        });
+
+        let mut delivered = false;
+        for recipient in low_balance_recipients(&user.email, admin_emails) {
+            if let Err(e) = email_service.send_low_balance_email(&recipient, Some(name), &balance).await {
+                crate::background_error!(
+                    NOTIFICATIONS, "email_send", Warning,
+                    user_id = %user.id,
+                    email = %recipient,
+                    error = %e,
+                    "Failed to send low-balance notification email"
+                );
+                continue;
+            }
+            tracing::info!(user_id = %user.id, email = %recipient, balance = %balance, "Sent low-balance notification");
+            delivered = true;
         }
 
-        tracing::info!(user_id = %user.id, email = %user.email, balance = %balance, "Sent low-balance notification");
-        sent_ids.push(user.id);
+        if delivered {
+            sent_ids.push(user.id);
+        }
     }
 
     // Bulk-mark all successfully sent notifications
@@ -1224,6 +1246,18 @@ async fn send_low_balance_notifications(
             crate::background_error!(NOTIFICATIONS, "mark_low_balance_sent", Warning, error = %e, "Failed to mark low-balance notifications as sent");
         }
     }
+}
+
+/// The account's own address first, then its owners and admins, each
+/// address once regardless of case.
+fn low_balance_recipients(account_email: &str, admin_emails: Vec<String>) -> Vec<String> {
+    let mut recipients: Vec<String> = Vec::with_capacity(admin_emails.len() + 1);
+    for email in std::iter::once(account_email.to_string()).chain(admin_emails) {
+        if !recipients.iter().any(|r| r.eq_ignore_ascii_case(&email)) {
+            recipients.push(email);
+        }
+    }
+    recipients
 }
 
 #[cfg(test)]
@@ -2014,5 +2048,94 @@ mod tests {
             1,
             "Should NOT have charged (limit fully exhausted, zero headroom)"
         );
+    }
+
+    #[test]
+    fn test_low_balance_recipients_lists_each_address_once() {
+        let recipients = low_balance_recipients(
+            "Billing@Example.com",
+            vec!["billing@example.com".into(), "owner@example.com".into(), "OWNER@example.com".into()],
+        );
+        assert_eq!(recipients, vec!["Billing@Example.com".to_string(), "owner@example.com".to_string()]);
+    }
+
+    /// An organization's low-balance alert reaches everyone who can add
+    /// credits (its contact address, owners and admins) and no plain members.
+    #[sqlx::test]
+    async fn test_low_balance_notification_reaches_org_owners_and_admins(pool: sqlx::PgPool) {
+        let scratch = std::env::temp_dir().join(format!("dwctl-test-emails-low-balance-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let mut config = crate::test::utils::create_test_config();
+        config.email.transport = crate::config::EmailTransportConfig::File {
+            path: scratch.to_string_lossy().to_string(),
+        };
+        let email_service = EmailService::new(&config).unwrap();
+
+        let owner = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let admin = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+        let member = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
+
+        let mut conn = pool.acquire().await.unwrap();
+        let org = {
+            let mut orgs = Organizations::new(&mut conn);
+            let org = orgs
+                .create(
+                    &crate::db::models::organizations::OrganizationCreateDBRequest {
+                        name: "low-balance-org".into(),
+                        email: "billing@low-balance.example.com".into(),
+                        display_name: Some("Low Balance Org".into()),
+                        avatar_url: None,
+                        created_by: owner.id,
+                    },
+                    &[Role::StandardUser],
+                )
+                .await
+                .unwrap();
+            orgs.add_member(org.id, admin.id, "admin").await.unwrap();
+            orgs.add_member(org.id, member.id, "member").await.unwrap();
+            org
+        };
+
+        let org_user = LowBalanceUser {
+            id: org.id,
+            email: org.email.clone(),
+            username: org.username.clone(),
+            display_name: org.display_name.clone(),
+            low_balance_threshold: Decimal::from(10),
+            low_balance_notification_sent: false,
+            checkpoint_balance: Some(Decimal::from(2)),
+        };
+        send_low_balance_notifications(&email_service, &[&org_user], &|u: &LowBalanceUser| u.checkpoint_balance, &mut conn).await;
+
+        let to_addresses: Vec<String> = std::fs::read_dir(&scratch)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("eml"))
+            .map(|path| std::fs::read_to_string(path).unwrap())
+            .flat_map(|body| {
+                body.lines()
+                    .filter_map(|line| line.strip_prefix("To: ").map(|rest| rest.trim().to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        // Lines read `To: "Name" <address>`; match on the address.
+        for expected in [&org.email, &owner.email, &admin.email] {
+            let hits = to_addresses.iter().filter(|to| to.contains(expected.as_str())).count();
+            assert_eq!(hits, 1, "{expected} gets exactly one email; got {to_addresses:?}");
+        }
+        assert_eq!(to_addresses.len(), 3, "nobody else is mailed; got {to_addresses:?}");
+        assert!(
+            !to_addresses.iter().any(|to| to.contains(member.email.as_str())),
+            "a plain member cannot add credits and is not mailed"
+        );
+
+        let sent: bool = sqlx::query_scalar("SELECT low_balance_notification_sent FROM users WHERE id = $1")
+            .bind(org.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(sent, "the org is marked as notified");
+
+        std::fs::remove_dir_all(&scratch).ok();
     }
 }
