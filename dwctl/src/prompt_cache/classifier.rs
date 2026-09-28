@@ -204,6 +204,20 @@ impl Classifier {
         Self { index, ..self.clone() }
     }
 
+    /// A request-scoped clone for the serving path: its tokenizer client retries HTTP 503s
+    /// (tokenize, render, and `/v1/models` metadata misses) for as long as the owning task is
+    /// alive, paced by the shared process-wide retry budget. The cache layer spawns classify on
+    /// this clone and owns that task's lifetime (inference time + the existing join grace), so
+    /// the retry loop needs no deadline of its own. Everything else — the versions cache
+    /// included — is shared with `self`. Non-serving callers (recompute, replay, admin) use the
+    /// plain classifier, whose tokenizer calls stay single-attempt.
+    pub fn serving_scoped(&self) -> Self {
+        Self {
+            tokenizer: self.tokenizer.serving_scoped(),
+            ..self.clone()
+        }
+    }
+
     /// The configured TTL-tier policy (enabled tiers + default ttl), exposed for the cache
     /// layer's synchronous request-path marker validation.
     pub fn tier_policy(&self) -> &TierPolicy {
@@ -1291,5 +1305,205 @@ mod tests {
         assert!(out.active, "enabled model with no markers still presents zero cache fields");
         assert!(out.stats.is_zero());
         assert!(out.pending.is_empty());
+    }
+
+    // ── Serving-scoped tokenizer retries (HTTP 503) ──────────────────────────────
+
+    /// Answers 503 until `fail` requests have been served (or forever while `stuck` is set),
+    /// then `ok`. Counts every request so tests can assert the exact number of HTTP attempts.
+    struct FlakyResponder {
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+        fail: usize,
+        stuck: Arc<std::sync::atomic::AtomicBool>,
+        ok: ResponseTemplate,
+    }
+
+    impl wiremock::Respond for FlakyResponder {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            use std::sync::atomic::Ordering;
+            let n = self.hits.fetch_add(1, Ordering::SeqCst);
+            if self.stuck.load(Ordering::SeqCst) || n < self.fail {
+                ResponseTemplate::new(503).set_body_json(serde_json::json!({"code": "OVERLOADED"}))
+            } else {
+                self.ok.clone()
+            }
+        }
+    }
+
+    struct Flaky {
+        hits: Arc<std::sync::atomic::AtomicUsize>,
+        stuck: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Flaky {
+        fn hits(&self) -> usize {
+            self.hits.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    async fn mount_flaky(server: &MockServer, http_method: &str, route: &str, fail: usize, ok: ResponseTemplate) -> Flaky {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stuck = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        Mock::given(method(http_method))
+            .and(path(route))
+            .respond_with(FlakyResponder {
+                hits: hits.clone(),
+                fail,
+                stuck: stuck.clone(),
+                ok,
+            })
+            .mount(server)
+            .await;
+        Flaky { hits, stuck }
+    }
+
+    fn models_ok() -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models": [{"alias": ALIAS, "hf_repo": "org/m", "tokenizer_version": TOK_VER}]
+        }))
+    }
+
+    fn tokenize_ok(total: u32) -> ResponseTemplate {
+        ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "virtual_model": ALIAS, "tokenizer_version": TOK_VER,
+            "segment_counts": [total], "cumulative": [total], "total": total
+        }))
+    }
+
+    /// Enabled model + key, and a classifier whose tokenizer client carries a fast shared
+    /// retry budget (retries are still OFF until `serving_scoped()`).
+    async fn retry_harness(pool: &PgPool, server: &MockServer) -> (Classifier, String) {
+        let user = create_test_user(pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(pool, user.id).await;
+        let endpoint = create_test_endpoint(pool, "ep", user.id).await;
+        let id = create_test_model(pool, "m", ALIAS, endpoint, user.id).await;
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens)
+               VALUES ($1, 1.25, 2.0, 2.5, 1024)"#,
+            id,
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+        let budget = crate::prompt_cache::TokenizerRetryBudget::new(crate::prompt_cache::TokenizerRetryPolicy {
+            initial_backoff: std::time::Duration::from_millis(1),
+            max_backoff: std::time::Duration::from_millis(5),
+            ..Default::default()
+        });
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new(server.uri()).with_retry_budget(budget),
+            Arc::new(PostgresIndex::new(pool.clone(), 0)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        (classifier, key.secret)
+    }
+
+    /// A serving-scoped classify rides out repeated 503s on BOTH the `/v1/models` metadata
+    /// miss and `/v1/tokenize`, and bills the counts from the eventual success — a metadata
+    /// miss must not short-circuit the recovery path.
+    #[sqlx::test]
+    async fn serving_scope_recovers_from_models_and_tokenize_503s(pool: PgPool) {
+        let server = MockServer::start().await;
+        let models = mount_flaky(&server, "GET", "/v1/models", 3, models_ok()).await;
+        let tokenize = mount_flaky(&server, "POST", "/v1/tokenize", 4, tokenize_ok(1500)).await;
+        let (classifier, secret) = retry_harness(&pool, &server).await;
+
+        let b = body();
+        let out = classifier.serving_scoped().classify(req(&secret, &b)).await.unwrap();
+        assert!(out.active);
+        assert!(!out.degraded, "recovered classification is real evidence");
+        assert_eq!(out.stats.creation_1h, 1500, "counts come from the successful attempt");
+        assert_eq!(models.hits(), 4, "3 × 503 then success");
+        assert_eq!(tokenize.hits(), 5, "4 × 503 then success");
+    }
+
+    /// The plain (non-serving) classifier keeps single-attempt semantics even with a budget
+    /// attached — recompute/replay/admin callers must not inherit an unbounded loop — and a
+    /// 503 on the metadata lookup is not memoised, so the next request recovers.
+    #[sqlx::test]
+    async fn plain_scope_is_single_attempt_and_503_does_not_poison_versions(pool: PgPool) {
+        let server = MockServer::start().await;
+        let models = mount_flaky(&server, "GET", "/v1/models", 1, models_ok()).await;
+        let tokenize = mount_flaky(&server, "POST", "/v1/tokenize", 0, tokenize_ok(1500)).await;
+        let (classifier, secret) = retry_harness(&pool, &server).await;
+
+        let b = body();
+        let out = classifier.classify(req(&secret, &b)).await.unwrap();
+        assert!(out.active && out.degraded, "one 503 → degraded, no retry");
+        assert_eq!(models.hits(), 1, "exactly one attempt outside the serving scope");
+        assert_eq!(tokenize.hits(), 0);
+
+        let out = classifier.classify(req(&secret, &b)).await.unwrap();
+        assert!(!out.degraded, "the 503 was not cached as 'unmapped'");
+        assert_eq!(out.stats.creation_1h, 1500);
+        assert_eq!(models.hits(), 2);
+    }
+
+    /// Cancelling a serving classify mid-retry (the layer aborting it at the join grace or on
+    /// disconnect) stops further attempts and leaves the shared versions cache clean: the next
+    /// request re-fetches `/v1/models` and succeeds.
+    #[sqlx::test]
+    async fn aborted_retry_stops_attempts_and_does_not_poison_versions(pool: PgPool) {
+        use std::sync::atomic::Ordering;
+        let server = MockServer::start().await;
+        let models = mount_flaky(&server, "GET", "/v1/models", 0, models_ok()).await;
+        models.stuck.store(true, Ordering::SeqCst);
+        let _tokenize = mount_flaky(&server, "POST", "/v1/tokenize", 0, tokenize_ok(1500)).await;
+        let (classifier, secret) = retry_harness(&pool, &server).await;
+
+        let serving = classifier.serving_scoped();
+        let task = tokio::spawn(async move {
+            let b = body();
+            serving.classify(req(&secret, &b)).await.map(|o| o.degraded)
+        });
+        while models.hits() < 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let settled = models.hits();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            models.hits() <= settled + 1,
+            "no retries after abort (one attempt may have been in flight)"
+        );
+        let settled = models.hits();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(models.hits(), settled, "no detached retry work");
+
+        models.stuck.store(false, Ordering::SeqCst);
+        let b = body();
+        let secret = create_test_api_key_for_user(&pool, create_test_user(&pool, Role::StandardUser).await.id)
+            .await
+            .secret;
+        // A different principal is fine: we only care that the alias lookup is not poisoned.
+        let out = classifier.serving_scoped().classify(req(&secret, &b)).await.unwrap();
+        assert!(!out.degraded);
+        assert_eq!(out.stats.creation_1h, 1500);
+    }
+
+    /// Validation failures are permanent: a serving-scoped 400 is not retried.
+    #[sqlx::test]
+    async fn serving_scope_does_not_retry_validation_errors(pool: PgPool) {
+        let server = MockServer::start().await;
+        let _models = mount_flaky(&server, "GET", "/v1/models", 0, models_ok()).await;
+        let tokenize = mount_flaky(
+            &server,
+            "POST",
+            "/v1/tokenize",
+            0,
+            ResponseTemplate::new(400).set_body_string("bad segments"),
+        )
+        .await;
+        let (classifier, secret) = retry_harness(&pool, &server).await;
+        let b = body();
+        let out = classifier.serving_scoped().classify(req(&secret, &b)).await.unwrap();
+        assert!(out.active && out.degraded);
+        assert_eq!(tokenize.hits(), 1);
     }
 }

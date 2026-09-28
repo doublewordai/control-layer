@@ -1277,15 +1277,25 @@ pub struct CacheConfig {
     /// Set via environment: `DWCTL_CACHE__DEFAULT_TTL=5m`
     pub default_ttl: String,
 
-    /// Deadline for joining the classify fork at response time. classify races the (slower)
-    /// model call, so this only bites when classification is still unresolved as the response
-    /// completes — a tokenizer/index hiccup — in which case the request bills un-cached
-    /// (fail-safe) once the deadline fires. Latency-sensitive realtime pods keep the tight
+    /// Join grace (seconds) for the classify fork, measured from the point cache accounting is
+    /// needed — the moment the response joins classify, not from request start or from the first
+    /// tokenizer attempt. classify races the (slower) model call, so this only bites when
+    /// classification is still unresolved as the response completes — a tokenizer/index hiccup —
+    /// in which case the request bills un-cached (fail-safe) once the grace expires. It is NOT an
+    /// overall retry deadline: serving-path tokenizer retries ([`TokenizerRetryConfig`]) have no
+    /// max attempt count and keep going for as long as the owning request's classify task lives
+    /// (inference time plus this join grace). Latency-sensitive realtime pods keep the tight
     /// default; the fusillade-batch pod (no first-token pressure; classify joins inline after
     /// the response) can afford a larger value (e.g. 10) so index retries have room to land.
     ///
     /// Set via environment: `DWCTL_CACHE__CLASSIFY_DEADLINE_SECS=10`
     pub classify_deadline_secs: u64,
+
+    /// Serving-path retry policy for tokenizer-svc HTTP 503 overloads. See
+    /// [`TokenizerRetryConfig`] for semantics and the operator-facing caveats.
+    ///
+    /// Set via environment: `DWCTL_CACHE__TOKENIZER_RETRY__ENABLED=false`
+    pub tokenizer_retry: TokenizerRetryConfig,
 
     /// How many times a cache-index DB op (lookup/write/refresh) retries after a
     /// connection-class failure (severed idle conn, TLS handshake EOF, auth timeout — the
@@ -1328,9 +1338,103 @@ impl Default for CacheConfig {
             enabled_ttls: vec!["5m".to_string(), "1h".to_string()],
             default_ttl: "5m".to_string(),
             classify_deadline_secs: 5,
+            tokenizer_retry: TokenizerRetryConfig::default(),
             index_conn_retries: 1,
             render_counting: false,
             telemetry_blocks: TelemetryBlockConfig::default(),
+        }
+    }
+}
+
+/// Serving-path tokenizer-svc retry policy (HTTP 503 only).
+///
+/// This governs ONLY the prompt-cache classification path (`/v1/tokenize`, `/v1/render` and the
+/// `/v1/models` lookup it calls): the classify fork spawned by the serving layer builds its
+/// tokenizer client `serving_scoped`. Non-serving callers (batch recompute/replay, prefix-chain
+/// capture, continuation render, admin/misc `TokenizerClient::new` users and tests) stay
+/// single-attempt and never consume this budget.
+///
+/// ## Lifetime (no max attempt count, no overall deadline)
+///
+/// A 503 means tokenizer-svc itself is overloaded, so the retry loop keeps trying until the owning
+/// request's classify task ends. That gives a retry window of the (usually long) upstream
+/// inference time plus the existing [`CacheConfig::classify_deadline_secs`] join grace. The grace
+/// is a JOIN grace measured from when cache accounting is needed — it bounds how long the response
+/// waits for classify — **not** an overall retry deadline, and retries get no unlimited
+/// post-inference wait of their own. Cancellation is prompt: a client disconnect or downstream
+/// failure drops the classify future, which stops all further attempts.
+///
+/// ## Budget
+///
+/// First attempts never touch the budget: only retries pay the backoff sleep, then acquire the
+/// shared rate token and concurrency permit before issuing the HTTP attempt (the permit is
+/// released when the attempt ends, never held through backoff). Per-HTTP-attempt timeout stays 5s;
+/// the operation as a whole has no timeout beyond the classify-task lifetime above. Each retry
+/// opens a fresh connection (no idle-pool reuse), so it is a chance to land on another backend via
+/// the Service — not a guarantee. `Retry-After` is not honored in this change.
+///
+/// These limits are **per control-layer process**, so a deployment of N replicas can issue up to
+/// N× the configured retry rate/concurrency against a shared tokenizer-svc; scale the settings
+/// down if tokenizer-svc is the bottleneck. The defaults are conservative starting points picked
+/// to protect a struggling service, not measured optima — tune from the metrics below.
+///
+/// ## Metrics
+///
+/// `dwctl_cache_tokenizer_attempts_total{op,attempt,result}`,
+/// `dwctl_cache_tokenizer_retry_recovered_total{op}`,
+/// `dwctl_cache_tokenizer_retry_budget_wait_seconds{op}`,
+/// `dwctl_cache_tokenizer_retry_budget_waits_total{op}` and
+/// `dwctl_cache_tokenizer_retry_inflight`; see the prompt-cache runbook for PromQL.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TokenizerRetryConfig {
+    /// Master switch for serving-path 503 retries. When false (or when the cache layer itself is
+    /// disabled), tokenizer calls are single-attempt exactly as before. `serving_scoped()` is a
+    /// no-op without a budget, so this flag alone controls whether the retry budget is built.
+    ///
+    /// Set via environment: `DWCTL_CACHE__TOKENIZER_RETRY__ENABLED=false`
+    pub enabled: bool,
+
+    /// First nominal backoff between retries, in milliseconds. Equal-jitter: the actual delay is
+    /// uniform in `[nominal/2, nominal]` (so near-simultaneous overloads don't re-storm in
+    /// lockstep), doubling per retry until `max_backoff_ms`.
+    ///
+    /// Set via environment: `DWCTL_CACHE__TOKENIZER_RETRY__INITIAL_BACKOFF_MS=100`
+    pub initial_backoff_ms: u64,
+
+    /// Cap on the nominal backoff, in milliseconds. Must be >= `initial_backoff_ms`.
+    ///
+    /// Set via environment: `DWCTL_CACHE__TOKENIZER_RETRY__MAX_BACKOFF_MS=2000`
+    pub max_backoff_ms: u64,
+
+    /// Shared token-bucket refill rate: retry starts per second, per process. This, not the
+    /// backoff, is what bounds sustained load on tokenizer-svc during a long overload.
+    ///
+    /// Set via environment: `DWCTL_CACHE__TOKENIZER_RETRY__RETRIES_PER_SECOND=10`
+    pub retries_per_second: u32,
+
+    /// Shared token-bucket capacity (burst). Total retries allowed to start back-to-back after
+    /// idle; must be >= 1.
+    ///
+    /// Set via environment: `DWCTL_CACHE__TOKENIZER_RETRY__RETRY_BURST=10`
+    pub retry_burst: u32,
+
+    /// Maximum simultaneous retry HTTP attempts per process. Bounds how many connections a
+    /// retry storm can hold open to tokenizer-svc; must be >= 1.
+    ///
+    /// Set via environment: `DWCTL_CACHE__TOKENIZER_RETRY__MAX_CONCURRENT_RETRIES=8`
+    pub max_concurrent_retries: u32,
+}
+
+impl Default for TokenizerRetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            initial_backoff_ms: 100,
+            max_backoff_ms: 2000,
+            retries_per_second: 10,
+            retry_burst: 10,
+            max_concurrent_retries: 8,
         }
     }
 }
@@ -3665,6 +3769,44 @@ impl Config {
             }
         }
 
+        // Serving-path tokenizer retries: only meaningful when the cache layer is on and the
+        // feature is enabled. A zero backoff busy-spins, a zero rate/burst/concurrency can
+        // never let a retry start, and an inverted backoff range can never cap — all are
+        // operator mistakes that would turn into silent no-retry or a hot loop, so fail fast.
+        if self.cache.enabled && self.cache.tokenizer_retry.enabled {
+            let retry = &self.cache.tokenizer_retry;
+            if retry.initial_backoff_ms < 1 {
+                return Err(Error::Internal {
+                    operation: "Config validation: cache.tokenizer_retry.initial_backoff_ms must be at least 1; \
+                         a zero backoff busy-spins retries."
+                        .to_string(),
+                });
+            }
+            if retry.max_backoff_ms < retry.initial_backoff_ms {
+                return Err(Error::Internal {
+                    operation: format!(
+                        "Config validation: cache.tokenizer_retry.max_backoff_ms ({}) must be >= initial_backoff_ms ({}).",
+                        retry.max_backoff_ms, retry.initial_backoff_ms
+                    ),
+                });
+            }
+            if retry.retries_per_second < 1 {
+                return Err(Error::Internal {
+                    operation: "Config validation: cache.tokenizer_retry.retries_per_second must be at least 1.".to_string(),
+                });
+            }
+            if retry.retry_burst < 1 {
+                return Err(Error::Internal {
+                    operation: "Config validation: cache.tokenizer_retry.retry_burst must be at least 1.".to_string(),
+                });
+            }
+            if retry.max_concurrent_retries < 1 {
+                return Err(Error::Internal {
+                    operation: "Config validation: cache.tokenizer_retry.max_concurrent_retries must be at least 1.".to_string(),
+                });
+            }
+        }
+
         // Validate JWT expiry duration is reasonable
         if self.auth.security.jwt_expiry.as_secs() < 300 {
             // Less than 5 minutes
@@ -4727,6 +4869,137 @@ secret_key: "test-secret-key"
         config.cache.default_ttl = "1h".to_string(); // not in enabled_ttls
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("default_ttl"), "{err}");
+    }
+
+    #[test]
+    fn test_tokenizer_retry_defaults() {
+        let retry = TokenizerRetryConfig::default();
+        assert!(retry.enabled);
+        assert_eq!(retry.initial_backoff_ms, 100);
+        assert_eq!(retry.max_backoff_ms, 2000);
+        assert_eq!(retry.retries_per_second, 10);
+        assert_eq!(retry.retry_burst, 10);
+        assert_eq!(retry.max_concurrent_retries, 8);
+
+        // And the cache config carries those defaults without any YAML/env input.
+        let cache = CacheConfig::default();
+        assert_eq!(cache.tokenizer_retry, retry);
+    }
+
+    #[test]
+    fn test_tokenizer_retry_yaml_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file(
+                "test.yaml",
+                r#"
+secret_key: "test-secret-key"
+cache:
+  tokenizer_retry:
+    initial_backoff_ms: 250
+    max_backoff_ms: 4000
+    retries_per_second: 3
+    max_concurrent_retries: 2
+"#,
+            )?;
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            let retry = config.cache.tokenizer_retry;
+            assert_eq!(retry.initial_backoff_ms, 250);
+            assert_eq!(retry.max_backoff_ms, 4000);
+            assert_eq!(retry.retries_per_second, 3);
+            assert_eq!(retry.max_concurrent_retries, 2);
+            // Unspecified keys fall back to defaults.
+            assert!(retry.enabled);
+            assert_eq!(retry.retry_burst, 10);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_tokenizer_retry_env_override() {
+        Jail::expect_with(|jail| {
+            jail.create_file("test.yaml", "secret_key: \"test-secret-key\"\n")?;
+            jail.set_env("DWCTL_CACHE__TOKENIZER_RETRY__ENABLED", "false");
+            jail.set_env("DWCTL_CACHE__TOKENIZER_RETRY__RETRY_BURST", "4");
+
+            let args = Args {
+                config: "test.yaml".into(),
+                validate: false,
+            };
+
+            let config = Config::load(&args)?;
+            let retry = config.cache.tokenizer_retry;
+            assert!(!retry.enabled);
+            assert_eq!(retry.retry_burst, 4);
+            assert_eq!(retry.initial_backoff_ms, 100);
+
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_tokenizer_retry_validation_skipped_when_cache_disabled() {
+        let mut config = cache_test_config();
+        config.cache.enabled = false;
+        config.cache.tokenizer_retry.initial_backoff_ms = 0; // bogus, but ignored
+        config.cache.tokenizer_retry.max_concurrent_retries = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tokenizer_retry_validation_skipped_when_disabled() {
+        let mut config = cache_test_config();
+        config.cache.tokenizer_retry.enabled = false;
+        config.cache.tokenizer_retry.initial_backoff_ms = 0; // bogus, but ignored
+        config.cache.tokenizer_retry.retries_per_second = 0;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tokenizer_retry_zero_initial_backoff_rejected() {
+        let mut config = cache_test_config();
+        config.cache.tokenizer_retry.initial_backoff_ms = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("initial_backoff_ms"), "{err}");
+    }
+
+    #[test]
+    fn test_tokenizer_retry_max_backoff_below_initial_rejected() {
+        let mut config = cache_test_config();
+        config.cache.tokenizer_retry.initial_backoff_ms = 500;
+        config.cache.tokenizer_retry.max_backoff_ms = 100;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_backoff_ms"), "{err}");
+    }
+
+    #[test]
+    fn test_tokenizer_retry_zero_rate_rejected() {
+        let mut config = cache_test_config();
+        config.cache.tokenizer_retry.retries_per_second = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("retries_per_second"), "{err}");
+    }
+
+    #[test]
+    fn test_tokenizer_retry_zero_burst_rejected() {
+        let mut config = cache_test_config();
+        config.cache.tokenizer_retry.retry_burst = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("retry_burst"), "{err}");
+    }
+
+    #[test]
+    fn test_tokenizer_retry_zero_concurrency_rejected() {
+        let mut config = cache_test_config();
+        config.cache.tokenizer_retry.max_concurrent_retries = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("max_concurrent_retries"), "{err}");
     }
 
     #[test]

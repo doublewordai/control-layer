@@ -23,6 +23,7 @@ pub mod query;
 pub mod sse;
 pub mod stats;
 pub mod tokenizer;
+pub mod tokenizer_retry;
 
 pub use classifier::{Classifier, ClassifyOutcome, ClassifyRequest};
 pub use index::{CacheEntry, CacheError, CacheIndex, CacheMatch, CacheResult, IndexScope, PrefixHash, TierPolicy, TtlTier};
@@ -35,3 +36,4 @@ pub use principal::PrincipalResolver;
 pub(crate) use stats::CacheBilling;
 pub use stats::{BilledCache, CacheReadSource, CacheStats, PendingWrite};
 pub use tokenizer::{ModelInfo, TokenizeResponse, TokenizerClient, TokenizerError, TokenizerResult};
+pub use tokenizer_retry::{TokenizerRetryBudget, TokenizerRetryPolicy};
