@@ -930,6 +930,34 @@ pub trait Storage: Send + Sync {
     /// Given a list of batch IDs, return those that have been cancelled (cancelling_at IS NOT NULL).
     async fn get_cancelled_batch_ids(&self, batch_ids: &[BatchId]) -> Result<Vec<BatchId>>;
 
+    /// Given a list of request IDs, return those whose row is now `canceled`.
+    ///
+    /// The batchless counterpart of [`get_cancelled_batch_ids`]: batchless
+    /// (flex/background) requests have no batch to carry a `cancelling_at`
+    /// flag, so the daemon watches the request rows themselves to learn that
+    /// a caller has cancelled in-flight work.
+    ///
+    /// [`get_cancelled_batch_ids`]: Storage::get_cancelled_batch_ids
+    async fn get_cancelled_request_ids(&self, request_ids: &[RequestId]) -> Result<Vec<RequestId>>;
+
+    /// Cancel a batchless (flex/background) request that nobody will collect.
+    ///
+    /// [`cancel_requests`] is batch-shaped: it rebuilds each request through
+    /// [`get_requests`], which only sees rows that belong to a batch. This is
+    /// the row-level equivalent for batchless work: a pending row is never
+    /// claimed, a claimed one is dropped before dispatch, and a processing
+    /// one is aborted by the daemon once its cancellation poll sees the row
+    /// (see [`get_cancelled_request_ids`]). `canceled` stays the soft
+    /// terminal: a completion that lands anyway supersedes it.
+    ///
+    /// Returns `true` if the row was moved to `canceled`, `false` if it was
+    /// already terminal, is not batchless, or does not exist.
+    ///
+    /// [`cancel_requests`]: Storage::cancel_requests
+    /// [`get_requests`]: Storage::get_requests
+    /// [`get_cancelled_request_ids`]: Storage::get_cancelled_request_ids
+    async fn cancel_batchless_request(&self, request_id: RequestId) -> Result<bool>;
+
     /// Cancel all pending/in-progress requests for a batch.
     async fn cancel_batch(&self, batch_id: BatchId) -> Result<()>;
 

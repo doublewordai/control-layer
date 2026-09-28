@@ -307,6 +307,76 @@ pub async fn poll_until_terminal<P: PoolProvider + Clone>(
     }
 }
 
+/// Cancel a blocking flex request whose caller has gone away.
+///
+/// A blocking or streaming flex request is only useful while its caller is
+/// still connected: the result is never fetched by ID later. Once the client
+/// drops (or the poll gives up and the client has been answered) the row is
+/// cancelled so the daemon does not claim it, or aborts the upstream call if
+/// it is already in flight. Best-effort: a row that already reached a
+/// terminal state is left alone, and a late daemon completion still
+/// supersedes the cancel (`canceled` is the soft terminal in
+/// `PostgresRequestManager::persist`).
+pub async fn cancel_abandoned_request<P: PoolProvider + Clone>(request_manager: &PostgresRequestManager<P>, request_id: Uuid) {
+    match request_manager.cancel_batchless_request(RequestId(request_id)).await {
+        Ok(true) => tracing::info!(request_id = %request_id, "Cancelled abandoned flex request"),
+        // Nothing to free: either the daemon already reached completed/failed,
+        // or the guard was armed before an enqueue that never committed.
+        Ok(false) => tracing::debug!(request_id = %request_id, "Abandoned flex request not cancellable (missing or already terminal)"),
+        // Off the request path (the caller is gone, and from the guard this
+        // runs in a detached task), so a plain log would be invisible: count
+        // it, since a failed cancel is engine time spent on abandoned work.
+        Err(e) => {
+            crate::background_error!(crate::metrics::errors::component::FLEX_CANCEL, "cancel_abandoned", Error, request_id = %request_id, error = %e, "Failed to cancel abandoned flex request")
+        }
+    }
+}
+
+/// Cancels a flex request if the handler awaiting it is dropped first.
+///
+/// hyper drops the handler future when the client disconnects, so a guard
+/// held from before the enqueue through `poll_until_terminal` turns a dropped
+/// flex request into a [`cancel_abandoned_request`]. Arm it before
+/// `create_flex`: a disconnect during the INSERT drops the future, but the
+/// row can still commit. Call [`AbandonGuard::disarm`] once a terminal state
+/// has been observed and rendered; let it drop otherwise (disconnect, enqueue
+/// or poll failure) and the cancel is issued — a no-op for a row that never
+/// made it in.
+pub struct AbandonGuard<P: PoolProvider + Clone + Send + Sync + 'static> {
+    request_manager: Option<Arc<PostgresRequestManager<P>>>,
+    request_id: Uuid,
+}
+
+impl<P: PoolProvider + Clone + Send + Sync + 'static> AbandonGuard<P> {
+    pub fn arm(request_manager: Arc<PostgresRequestManager<P>>, request_id: Uuid) -> Self {
+        Self {
+            request_manager: Some(request_manager),
+            request_id,
+        }
+    }
+
+    /// The request reached a terminal state and its result was delivered.
+    pub fn disarm(mut self) {
+        self.request_manager = None;
+    }
+}
+
+impl<P: PoolProvider + Clone + Send + Sync + 'static> Drop for AbandonGuard<P> {
+    fn drop(&mut self) {
+        let Some(request_manager) = self.request_manager.take() else {
+            return;
+        };
+        let request_id = self.request_id;
+        // Drop runs synchronously inside the dying handler future; the cancel
+        // is a DB write, so hand it to the runtime rather than block here.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move { cancel_abandoned_request(&request_manager, request_id).await });
+        } else {
+            tracing::warn!(request_id = %request_id, "No runtime to cancel abandoned flex request");
+        }
+    }
+}
+
 /// Poll a fusillade request until it reaches a terminal state and return a Responses-API-shaped object.
 pub async fn poll_until_complete<P: PoolProvider + Clone>(
     request_manager: &PostgresRequestManager<P>,
@@ -890,6 +960,115 @@ impl<P: PoolProvider + Clone + Send + Sync + 'static> ResponseStore for Fusillad
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Seed one pending flex row in a fresh fusillade schema and return the
+    /// manager plus a pool to inspect the row with.
+    async fn seed_flex_row(pool: &sqlx::PgPool) -> (Arc<PostgresRequestManager<sqlx_pool_router::TestDbPools>>, sqlx::PgPool, Uuid) {
+        let fusillade_pool = crate::test::utils::setup_fusillade_pool(pool).await;
+        let request_manager = Arc::new(PostgresRequestManager::new(
+            sqlx_pool_router::TestDbPools::new(fusillade_pool.clone()).await.unwrap(),
+            Default::default(),
+        ));
+        let request_id = Uuid::new_v4();
+        request_manager
+            .create_flex(fusillade::CreateFlexInput {
+                request_id,
+                body: r#"{"model":"m","messages":[]}"#.to_string(),
+                model: "m".to_string(),
+                endpoint: "http://localhost/ai".to_string(),
+                method: "POST".to_string(),
+                path: "/v1/chat/completions".to_string(),
+                api_key: "k".to_string(),
+                created_by: "owner".to_string(),
+                metadata: None,
+            })
+            .await
+            .unwrap();
+        (request_manager, fusillade_pool, request_id)
+    }
+
+    async fn request_state(pool: &sqlx::PgPool, request_id: Uuid) -> String {
+        sqlx::query_scalar("SELECT state FROM requests WHERE id = $1")
+            .bind(request_id)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Wait for the spawned cancel to land; it is issued from a drop, so it
+    /// completes on the runtime rather than inline.
+    async fn wait_for_state(pool: &sqlx::PgPool, request_id: Uuid, expected: &str) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = request_state(pool, request_id).await;
+            if state == expected {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "request stayed {state}, expected {expected}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    #[sqlx::test]
+    async fn abandon_guard_cancels_when_handler_is_dropped(pool: sqlx::PgPool) {
+        let (request_manager, fusillade_pool, request_id) = seed_flex_row(&pool).await;
+
+        // Stand-in for the blocking handler: guard held across the poll.
+        let rm = request_manager.clone();
+        let handler = tokio::spawn(async move {
+            let guard = AbandonGuard::arm(rm.clone(), request_id);
+            let result = poll_until_terminal(
+                &rm,
+                request_id,
+                std::time::Duration::from_millis(20),
+                std::time::Duration::from_secs(60),
+                None,
+            )
+            .await;
+            if result.is_ok() {
+                guard.disarm();
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(request_state(&fusillade_pool, request_id).await, "pending");
+
+        // Client disconnect: hyper drops the handler future.
+        handler.abort();
+        let _ = handler.await;
+
+        wait_for_state(&fusillade_pool, request_id, "canceled").await;
+    }
+
+    #[sqlx::test]
+    async fn abandon_guard_leaves_delivered_result_alone(pool: sqlx::PgPool) {
+        let (request_manager, fusillade_pool, request_id) = seed_flex_row(&pool).await;
+        sqlx::query(
+            "UPDATE requests SET state = 'completed', response_body = '{}', response_status = 200, completed_at = now() WHERE id = $1",
+        )
+        .bind(request_id)
+        .execute(&fusillade_pool)
+        .await
+        .unwrap();
+
+        let guard = AbandonGuard::arm(request_manager.clone(), request_id);
+        let detail = poll_until_terminal(
+            &request_manager,
+            request_id,
+            std::time::Duration::from_millis(20),
+            std::time::Duration::from_secs(5),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail.status, "completed");
+        guard.disarm();
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(request_state(&fusillade_pool, request_id).await, "completed");
+    }
 
     #[test]
     fn test_parse_response_id_with_prefix() {
