@@ -62,7 +62,9 @@ pub const DEFAULT_ARCHIVE_MOVE_CHUNK_ROWS: u32 = 5_000;
 /// Server-side budget for each statement of an archive move. The daemon's
 /// query timeout only drops the client connection; without this Postgres keeps
 /// running an abandoned copy — holding the batch row lock — until it next
-/// writes to the dead socket.
+/// writes to the dead socket. It stays above partition retirement's own 30s
+/// statement budget, so a move waiting behind a retirement fence on the
+/// bucket row is never cut off by it.
 const ARCHIVE_MOVE_STATEMENT_TIMEOUT: &str = "60s";
 
 // Retained graph representation and movement stay isolated from the main

@@ -1892,11 +1892,11 @@ pub trait DaemonStorage: Send + Sync {
     /// Preconditions are checked inside the transaction; violations return a
     /// `Skipped*` outcome rather than an error — the sweeper treats skips as
     /// normal flow:
-    /// - batch exists, not soft-deleted, `location = 'live'`, counts frozen
-    ///   (`counts_frozen_at` set). **Only frozen batches move**: freezing
-    ///   guarantees rows are settled and the counters are the durable
-    ///   record, and it carries Phase 2's `retry_version` protection — any
-    ///   retry un-freezes and bumps the version first.
+    /// - batch exists, not soft-deleted, `location IN ('live', 'split')`,
+    ///   counts frozen (`counts_frozen_at` set). **Only frozen batches
+    ///   move**: freezing guarantees rows are settled and the counters are
+    ///   the durable record, and it carries Phase 2's `retry_version`
+    ///   protection — any retry un-freezes and bumps the version first.
     /// - the weekly archive partition for the batch's bucket exists;
     ///   otherwise the batch simply stays live (fully served, exactly as
     ///   today) and the caller alerts — graceful degradation, no failure.
@@ -1914,8 +1914,8 @@ pub trait DaemonStorage: Send + Sync {
     ///   braces against future callers taking weaker locks.
     async fn archive_batch(&self, batch_id: BatchId) -> Result<ArchiveOutcome>;
 
-    /// List batches eligible for archiving (`location = 'live'`, counts
-    /// frozen, not soft-deleted). Both production movers — the steady-state
+    /// List batches eligible for archiving (`location IN ('live', 'split')`,
+    /// counts frozen, not soft-deleted). Both production movers — the steady-state
     /// sweeper AND the historical backfill — pass `oldest_first = true`: in
     /// steady state the sweeper drains its whole candidate set every few
     /// ticks so order is cosmetic, and under any backlog the
