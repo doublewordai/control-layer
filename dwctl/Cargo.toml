@@ -206,4 +206,11 @@ wiremock = "0.6"
 serde_urlencoded = "0.7"
 
 [target.'cfg(target_os = "linux")'.dependencies]
-tikv-jemallocator = "0.7.0"
+# `profiling` compiles jemalloc with --enable-prof. Sampling stays off unless
+# the process starts with `prof:true` in `_RJEM_MALLOC_CONF`; see
+# docs/memory-observability.md.
+tikv-jemallocator = { version = "0.7.0", features = ["profiling"] }
+# Allocator statistics (epoch refresh + stats.*) for the Prometheus gauges.
+tikv-jemalloc-ctl = { version = "0.7.0", features = ["stats"] }
+# Heap profile dumps converted to pprof protobuf, symbolized in-process.
+jemalloc_pprof = { version = "0.9.0", features = ["symbolize"] }
