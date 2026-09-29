@@ -855,8 +855,8 @@ const ARCHIVE_PASS_MAX_CONSECUTIVE_FAILURES: u32 = 2;
 ///
 /// Candidates are listed oldest-first, so without this a batch whose move
 /// keeps failing heads every pass and blocks every batch behind it. Kept in
-/// memory per mover: a restart forgets it, costing one more failed attempt
-/// per held batch.
+/// memory and shared by the sweep and backfill movers: a restart forgets it,
+/// costing one more failed attempt per held batch.
 #[derive(Default)]
 struct ArchiveBatchBackoff {
     failures: std::sync::Mutex<HashMap<BatchId, (u32, tokio::time::Instant)>>,
@@ -3619,6 +3619,9 @@ where
                 daemon_handles.push(("retained_response_route_cleanup", route_cleanup_handle));
             }
 
+            // Shared by both movers: a batch held back after a failed move
+            // must not be retried by the other worker in the meantime.
+            let archive_backoff = Arc::new(ArchiveBatchBackoff::default());
             for (
                 worker,
                 batch_enabled,
@@ -3657,6 +3660,7 @@ where
                 let shutdown = self.shutdown_token.clone();
                 let policy = retention_policy.clone();
                 let retained_runway_ready = retained_runway_ready.clone();
+                let backoff = archive_backoff.clone();
                 let tick = ArchiveMoverTick {
                     worker,
                     include_overdue: worker == "backfill",
@@ -3696,7 +3700,6 @@ where
                     // back-to-back passes of a multi-day drain is pure idle
                     // time on the critical path. Errors and empty passes fall
                     // back to the interval, so a failing pass never hot-loops.
-                    let backoff = ArchiveBatchBackoff::default();
                     let mut more_work = false;
                     loop {
                         if more_work {
@@ -3717,7 +3720,7 @@ where
                             &policy,
                             tick,
                             retained_runway_ready.as_ref(),
-                            &backoff,
+                            backoff.as_ref(),
                         )
                         .await;
                     }

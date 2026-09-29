@@ -59,10 +59,10 @@ use crate::request::{
 /// moves over several passes and stays `split` between them.
 pub const DEFAULT_ARCHIVE_MOVE_CHUNK_ROWS: u32 = 5_000;
 
-/// Server-side budget for each statement of an archive move. The daemon's
-/// query timeout only drops the client connection; without this Postgres keeps
-/// running an abandoned copy — holding the batch row lock — until it next
-/// writes to the dead socket. It stays above partition retirement's own 30s
+/// Server-side budget for each statement of an archive move, and for any idle
+/// gap between them. The daemon's query timeout only drops the client
+/// connection; without this Postgres keeps running an abandoned copy — holding
+/// the batch row lock — until it next writes to the dead socket. It stays above partition retirement's own 30s
 /// statement budget, so a move waiting behind a retirement fence on the
 /// bucket row is never cut off by it.
 const ARCHIVE_MOVE_STATEMENT_TIMEOUT: &str = "60s";
@@ -9164,9 +9164,14 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             .begin_write()
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
-        sqlx::query(&format!(
-            "SET LOCAL statement_timeout = '{ARCHIVE_MOVE_STATEMENT_TIMEOUT}'"
-        ))
+        // Both bounds are transaction-local. The statement bound covers an
+        // abandoned statement still running; the idle bound covers a severed
+        // connection whose transaction sits open between statements.
+        sqlx::query(
+            "SELECT set_config('statement_timeout', $1, true), \
+                    set_config('idle_in_transaction_session_timeout', $1, true)",
+        )
+        .bind(ARCHIVE_MOVE_STATEMENT_TIMEOUT)
         .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
