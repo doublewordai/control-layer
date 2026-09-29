@@ -959,10 +959,12 @@ async fn run_batch_archive_phase<S>(
         }
     };
 
+    // Latched: a wave's results arrive together, so a later success in the
+    // same wave must not reset a threshold the wave already reached.
     let mut consecutive_failures = 0;
+    let mut stop_pass = false;
     for wave in ids.chunks(tick.batch_concurrency.max(1)) {
-        if shutdown.is_cancelled() || consecutive_failures >= ARCHIVE_PASS_MAX_CONSECUTIVE_FAILURES
-        {
+        if shutdown.is_cancelled() || stop_pass {
             break;
         }
         let results = futures::future::join_all(wave.iter().map(|batch_id| {
@@ -1015,6 +1017,7 @@ async fn run_batch_archive_phase<S>(
                 Ok(None) => return,
                 Err(error) => {
                     consecutive_failures += 1;
+                    stop_pass |= consecutive_failures >= ARCHIVE_PASS_MAX_CONSECUTIVE_FAILURES;
                     let hold = backoff.record_failure(batch_id, tokio::time::Instant::now());
                     counter!("fusillade_archive_moves_total", "worker" => tick.worker, "outcome" => "error").increment(1);
                     crate::background_error!(
@@ -4498,6 +4501,27 @@ mod tests {
             storage.batch_move_calls.load(Ordering::SeqCst),
             ARCHIVE_PASS_MAX_CONSECUTIVE_FAILURES as usize
         );
+    }
+
+    /// With concurrent moves a wave's results are processed together: a
+    /// success after the threshold was reached must not re-open the pass.
+    #[tokio::test(start_paused = true)]
+    async fn archive_failure_threshold_latches_across_a_wave() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        let backoff = ArchiveBatchBackoff::default();
+        let ids = fixed_candidates(&storage, 6);
+        storage
+            .failing_batches
+            .lock()
+            .unwrap()
+            .extend([ids[0], ids[1]]);
+
+        let tick = ArchiveMoverTick {
+            batch_concurrency: 3,
+            ..sweep_tick(6)
+        };
+        run_sweep(&storage, tick, &backoff).await;
+        assert_eq!(storage.batch_move_calls.load(Ordering::SeqCst), 3);
     }
 
     #[test]
