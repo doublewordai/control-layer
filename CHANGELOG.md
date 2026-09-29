@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.7.0](https://github.com/doublewordai/control-layer/compare/v12.6.3...v12.7.0) (2026-09-29)
+
+
+### Features
+
+* add allocator metrics and opt-in jemalloc heap profiling ([#1862](https://github.com/doublewordai/control-layer/issues/1862)) ([da88718](https://github.com/doublewordai/control-layer/commit/da8871818f4e92c5f63db9b90c5ec8ebd2a4320b))
+
 ## [12.6.3](https://github.com/doublewordai/control-layer/compare/v12.6.2...v12.6.3) (2026-09-28)
 
 
