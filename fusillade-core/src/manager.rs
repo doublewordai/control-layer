@@ -639,7 +639,9 @@ mod retention_policy_tests {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveOutcome {
-    /// Rows moved and location stamped; carries the row count moved.
+    /// Rows moved and location stamped; carries the row count this call
+    /// moved. For a batch larger than one move chunk this may be a partial
+    /// move: the batch is left `'split'` and a later call continues it.
     Archived { rows: u64 },
     /// Batch missing or soft-deleted (purge owns its rows, not the archive).
     SkippedNotFound,
@@ -1878,18 +1880,23 @@ pub trait DaemonStorage: Send + Sync {
     }
 
     /// Move one terminal batch's request rows from `requests` (live) into
-    /// `batch_requests_archive` in a single bounded transaction (batches are
-    /// capped at 50k rows), stamping `batches.location = 'archive'` and
+    /// `batch_requests_archive`, stamping `batches.location` and
     /// `batches.archive_bucket`.
+    ///
+    /// Each call moves at most one bounded chunk of rows in one transaction,
+    /// so a move's duration does not grow with the batch. A batch larger than
+    /// the chunk is stamped `'split'` and stays a candidate; the call that
+    /// moves its last rows stamps `'archive'`. Every call that moves rows
+    /// returns [`ArchiveOutcome::Archived`] with that call's row count.
     ///
     /// Preconditions are checked inside the transaction; violations return a
     /// `Skipped*` outcome rather than an error — the sweeper treats skips as
     /// normal flow:
-    /// - batch exists, not soft-deleted, `location = 'live'`, counts frozen
-    ///   (`counts_frozen_at` set). **Only frozen batches move**: freezing
-    ///   guarantees rows are settled and the counters are the durable
-    ///   record, and it carries Phase 2's `retry_version` protection — any
-    ///   retry un-freezes and bumps the version first.
+    /// - batch exists, not soft-deleted, `location IN ('live', 'split')`,
+    ///   counts frozen (`counts_frozen_at` set). **Only frozen batches
+    ///   move**: freezing guarantees rows are settled and the counters are
+    ///   the durable record, and it carries Phase 2's `retry_version`
+    ///   protection — any retry un-freezes and bumps the version first.
     /// - the weekly archive partition for the batch's bucket exists;
     ///   otherwise the batch simply stays live (fully served, exactly as
     ///   today) and the caller alerts — graceful degradation, no failure.
@@ -1900,15 +1907,15 @@ pub trait DaemonStorage: Send + Sync {
     /// - forward move is `INSERT ... SELECT r.*, $bucket` with
     ///   `ON CONFLICT DO NOTHING` — idempotent under crash-resume replay.
     /// - the DELETE removes only rows verifiably present in the archive and
-    ///   the transaction aborts if any row would be left behind: a row lives
-    ///   in exactly one table, always.
+    ///   the transaction aborts if any row of the chunk would be left behind:
+    ///   a row lives in exactly one table, always.
     /// - the location stamp re-checks `retry_version` (CAS) even though the
     ///   batch-row lock makes a race impossible on this path — belt and
     ///   braces against future callers taking weaker locks.
     async fn archive_batch(&self, batch_id: BatchId) -> Result<ArchiveOutcome>;
 
-    /// List batches eligible for archiving (`location = 'live'`, counts
-    /// frozen, not soft-deleted). Both production movers — the steady-state
+    /// List batches eligible for archiving (`location IN ('live', 'split')`,
+    /// counts frozen, not soft-deleted). Both production movers — the steady-state
     /// sweeper AND the historical backfill — pass `oldest_first = true`: in
     /// steady state the sweeper drains its whole candidate set every few
     /// ticks so order is cosmetic, and under any backlog the

@@ -50,6 +50,23 @@ use crate::request::{
     RequestState, ServiceTierFilter,
 };
 
+/// Default upper bound on rows one batch-archive move transaction copies.
+///
+/// Moving a whole batch in one transaction ties the move's duration, lock hold
+/// and WAL burst to the batch's size: a large enough batch outlives the mover's
+/// query timeout, rolls back, and — being oldest-first — is retried on every
+/// pass, rewriting all its rows into WAL each time. A batch larger than this
+/// moves over several passes and stays `split` between them.
+pub const DEFAULT_ARCHIVE_MOVE_CHUNK_ROWS: u32 = 5_000;
+
+/// Server-side budget for each statement of an archive move, and for any idle
+/// gap between them. The daemon's query timeout only drops the client
+/// connection; without this Postgres keeps running an abandoned copy — holding
+/// the batch row lock — until it next writes to the dead socket. It stays above partition retirement's own 30s
+/// statement budget, so a move waiting behind a retirement fence on the
+/// bucket row is never cut off by it.
+const ARCHIVE_MOVE_STATEMENT_TIMEOUT: &str = "60s";
+
 // Retained graph representation and movement stay isolated from the main
 // repository wiring. Archive-aware readers consume the same boundary in a
 // later rollout step.
@@ -161,6 +178,9 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     query_schema: Option<Arc<str>>,
     download_buffer_size: usize,
     batch_insert_strategy: BatchInsertStrategy,
+    /// Upper bound on rows one `archive_batch` transaction moves. Larger
+    /// batches move over several passes; see [`DEFAULT_ARCHIVE_MOVE_CHUNK_ROWS`].
+    archive_move_chunk_rows: i64,
     /// TRANSITIONAL ZDR hook - see [`crate::transform`]. Transforms response/
     /// error bodies before persistence; `None` is identity. Remove when stream
     /// reassembly moves into dwctl.
@@ -397,6 +417,7 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             query_schema: None,
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
+            archive_move_chunk_rows: i64::from(DEFAULT_ARCHIVE_MOVE_CHUNK_ROWS),
             response_transformer: std::sync::OnceLock::new(),
         }
     }
@@ -1029,6 +1050,19 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
 
     pub fn set_download_buffer_size(&mut self, buffer_size: usize) {
         self.download_buffer_size = buffer_size;
+    }
+
+    /// Set the maximum rows one batch-archive move transaction copies.
+    ///
+    /// Default is [`DEFAULT_ARCHIVE_MOVE_CHUNK_ROWS`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rows` is 0.
+    pub fn with_archive_move_chunk_rows(mut self, rows: u32) -> Self {
+        assert!(rows > 0, "archive move chunk must be at least one row");
+        self.archive_move_chunk_rows = i64::from(rows);
+        self
     }
 
     /// Set the batch insert strategy for template insertion.
@@ -9130,6 +9164,17 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             .begin_write()
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
+        // Both bounds are transaction-local. The statement bound covers an
+        // abandoned statement still running; the idle bound covers a severed
+        // connection whose transaction sits open between statements.
+        sqlx::query(
+            "SELECT set_config('statement_timeout', $1, true), \
+                    set_config('idle_in_transaction_session_timeout', $1, true)",
+        )
+        .bind(ARCHIVE_MOVE_STATEMENT_TIMEOUT)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
 
         // Lock the batch row for the whole move. Retry / cancel / freeze all
         // UPDATE this row, so they queue behind the move (and vice versa) —
@@ -9255,6 +9300,21 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             return Ok(ArchiveOutcome::SkippedNoPartition);
         }
 
+        // Bound this transaction to one chunk. The extra row only tells us
+        // whether the batch finishes here; order is irrelevant because every
+        // row of the batch moves eventually.
+        let mut chunk: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM requests WHERE batch_id = $1 LIMIT $2")
+                .bind(*batch_id as Uuid)
+                .bind(self.archive_move_chunk_rows + 1)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to select archive chunk: {}", e))
+                })?;
+        let finishes = chunk.len() as i64 <= self.archive_move_chunk_rows;
+        chunk.truncate(self.archive_move_chunk_rows as usize);
+
         // Forward move. Positional alignment (`r.*, $bucket`) is guaranteed
         // by the schema-parity test suite (archive = requests' columns +
         // archive_bucket appended last). ON CONFLICT makes crash-resume
@@ -9264,45 +9324,53 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             INSERT INTO batch_requests_archive
             SELECT r.*, $2::date
             FROM requests r
-            WHERE r.batch_id = $1
+            WHERE r.id = ANY($3) AND r.batch_id = $1
             ON CONFLICT (id, archive_bucket) DO NOTHING
             "#,
         )
         .bind(*batch_id as Uuid)
         .bind(batch.bucket)
+        .bind(&chunk)
         .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to copy rows to archive: {}", e)))?
         .rows_affected();
 
         // Exactly-one-table invariant, enforced structurally: only delete
-        // rows that verifiably exist in the archive, then prove nothing was
-        // left behind. A row can never be deleted un-copied, and a torn
-        // state aborts the transaction instead of committing.
-        let deleted = sqlx::query!(
+        // rows that verifiably exist in the archive, then prove the whole
+        // chunk went. A row can never be deleted un-copied, and a torn state
+        // aborts the transaction instead of committing.
+        let deleted = sqlx::query(
             r#"
             DELETE FROM requests r
-            WHERE r.batch_id = $1
+            WHERE r.id = ANY($3) AND r.batch_id = $1
               AND EXISTS (
                   SELECT 1 FROM batch_requests_archive a
                   WHERE a.id = r.id AND a.archive_bucket = $2
               )
             "#,
-            *batch_id as Uuid,
-            batch.bucket,
         )
+        .bind(*batch_id as Uuid)
+        .bind(batch.bucket)
+        .bind(&chunk)
         .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete archived rows: {}", e)))?
         .rows_affected();
 
-        let left_behind = sqlx::query_scalar!(
-            r#"SELECT COUNT(*) AS "count!" FROM requests WHERE batch_id = $1"#,
-            *batch_id as Uuid,
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to verify move completeness: {}", e)))?;
+        let left_behind = if finishes {
+            sqlx::query_scalar!(
+                r#"SELECT COUNT(*) AS "count!" FROM requests WHERE batch_id = $1"#,
+                *batch_id as Uuid,
+            )
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to verify move completeness: {}", e))
+            })?
+        } else {
+            chunk.len() as i64 - deleted as i64
+        };
         if left_behind != 0 {
             // Rolls back via drop of `tx`.
             return Err(FusilladeError::Other(anyhow!(
@@ -9316,20 +9384,24 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // excludes racing writers on this path; the CAS is belt-and-braces
         // for any future caller that reaches this UPDATE via a weaker lock
         // (EvalPlanQual re-checks target-row conditions after lock waits —
-        // see the Phase 2 retry_version column comment).
-        let stamped = sqlx::query!(
+        // see the Phase 2 retry_version column comment). An unfinished batch
+        // is 'split' until its last chunk: every reader already resolves the
+        // bucket from the stamp and reads both tables for such a batch.
+        let stamped = sqlx::query(
             r#"
             UPDATE batches
-            SET location = 'archive', archive_bucket = $2
+            SET location = CASE WHEN $4 THEN 'archive' ELSE 'split' END,
+                archive_bucket = $2
             WHERE id = $1
               AND retry_version = $3
               AND counts_frozen_at IS NOT NULL
               AND location IN ('live', 'split')
             "#,
-            *batch_id as Uuid,
-            batch.bucket,
-            batch.retry_version,
         )
+        .bind(*batch_id as Uuid)
+        .bind(batch.bucket)
+        .bind(batch.retry_version)
+        .bind(finishes)
         .execute(&mut *tx)
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to stamp batch location: {}", e)))?
@@ -9342,7 +9414,10 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to commit archive move: {}", e)))?;
 
-        tracing::info!(%batch_id, rows = deleted, "Archived batch rows");
+        if !finishes {
+            metrics::counter!("fusillade_archive_partial_moves_total").increment(1);
+        }
+        tracing::info!(%batch_id, rows = deleted, finished = finishes, "Archived batch rows");
         Ok(ArchiveOutcome::Archived { rows: deleted })
     }
 
@@ -14771,6 +14846,55 @@ mod tests {
         // Idempotent: a second call is a clean no-op skip.
         let again = manager.archive_batch(batch_id).await.unwrap();
         assert_eq!(again, ArchiveOutcome::SkippedNotLive);
+    }
+
+    /// A batch larger than one chunk moves over several calls: 'split' and
+    /// fully readable in between, 'archive' once the last chunk lands —
+    /// including when the size is an exact multiple of the chunk.
+    #[sqlx::test]
+    async fn test_archive_batch_moves_large_batch_in_chunks(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        )
+        .with_archive_move_chunk_rows(2);
+        let batch_id = setup_frozen_batch(&manager, &pool, "arch-chunked", 5).await;
+        let output_file = sqlx::query_scalar!(
+            r#"SELECT output_file_id AS "o!" FROM batches WHERE id = $1"#,
+            *batch_id as Uuid
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        for (rows, location, live, archived) in
+            [(2, "split", 3, 2), (2, "split", 1, 4), (1, "archive", 0, 5)]
+        {
+            let outcome = manager.archive_batch(batch_id).await.unwrap();
+            assert_eq!(outcome, ArchiveOutcome::Archived { rows });
+            let (got_location, bucket, got_live, got_archived) =
+                archive_state(&pool, batch_id).await;
+            assert_eq!(got_location, location);
+            assert!(bucket.is_some(), "a split batch must carry its bucket");
+            assert_eq!((got_live, got_archived), (live, archived));
+            let output: Vec<_> = manager
+                .get_file_content_stream(FileId(output_file), 0, None)
+                .collect()
+                .await;
+            assert_eq!(output.len(), 5, "every row stays readable mid-move");
+        }
+        assert_eq!(
+            manager.archive_batch(batch_id).await.unwrap(),
+            ArchiveOutcome::SkippedNotLive
+        );
+
+        let exact = setup_frozen_batch(&manager, &pool, "arch-chunked-exact", 4).await;
+        manager.archive_batch(exact).await.unwrap();
+        assert_eq!(
+            manager.archive_batch(exact).await.unwrap(),
+            ArchiveOutcome::Archived { rows: 2 }
+        );
+        assert_eq!(archive_state(&pool, exact).await.0, "archive");
     }
 
     /// The mover must BOUNCE off a batch another mover holds, not queue

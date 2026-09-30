@@ -842,6 +842,59 @@ async fn run_retained_response_route_cleanup_loop<S>(
     }
 }
 
+/// How long a batch is set aside after a failed archive move, doubling with
+/// each consecutive failure up to [`ARCHIVE_FAILURE_BACKOFF_MAX`].
+const ARCHIVE_FAILURE_BACKOFF_BASE: Duration = Duration::from_secs(60);
+const ARCHIVE_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(3600);
+/// Consecutive failed moves after which a pass stops. One failing batch is
+/// that batch's problem and the pass moves on; a run of them points at the
+/// database, and the remaining candidates would fail the same way.
+const ARCHIVE_PASS_MAX_CONSECUTIVE_FAILURES: u32 = 2;
+
+/// Batches a mover has set aside after failed moves.
+///
+/// Candidates are listed oldest-first, so without this a batch whose move
+/// keeps failing heads every pass and blocks every batch behind it. Kept in
+/// memory and shared by the sweep and backfill movers: a restart forgets it,
+/// costing one more failed attempt per held batch.
+#[derive(Default)]
+struct ArchiveBatchBackoff {
+    failures: std::sync::Mutex<HashMap<BatchId, (u32, tokio::time::Instant)>>,
+}
+
+impl ArchiveBatchBackoff {
+    /// Batches still inside their hold at `now`.
+    fn held(&self, now: tokio::time::Instant) -> std::collections::HashSet<BatchId> {
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        // Forget batches long past their hold so the map stays bounded; a
+        // batch that fails again after that starts from the base hold.
+        failures.retain(|_, (_, until)| now < *until + ARCHIVE_FAILURE_BACKOFF_MAX);
+        failures
+            .iter()
+            .filter(|(_, (_, until))| now < *until)
+            .map(|(batch_id, _)| *batch_id)
+            .collect()
+    }
+
+    /// Record a failed move and return how long the batch is now held.
+    fn record_failure(&self, batch_id: BatchId, now: tokio::time::Instant) -> Duration {
+        let mut failures = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+        let attempts = failures.get(&batch_id).map_or(0, |(attempts, _)| *attempts) + 1;
+        let hold = ARCHIVE_FAILURE_BACKOFF_BASE
+            .saturating_mul(1 << (attempts - 1).min(6))
+            .min(ARCHIVE_FAILURE_BACKOFF_MAX);
+        failures.insert(batch_id, (attempts, now + hold));
+        hold
+    }
+
+    fn clear(&self, batch_id: BatchId) {
+        self.failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&batch_id);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ArchiveMoverTick {
     worker: &'static str,
@@ -867,15 +920,20 @@ async fn run_batch_archive_phase<S>(
     shutdown: &tokio_util::sync::CancellationToken,
     query_timeout: Duration,
     tick: ArchiveMoverTick,
+    backoff: &ArchiveBatchBackoff,
 ) where
     S: DaemonStorage + 'static,
 {
+    // Held batches still sort first, so widen the window by their count to
+    // keep a full budget of movable candidates behind them.
+    let held = backoff.held(tokio::time::Instant::now());
+    gauge!("fusillade_archive_held_batches", "worker" => tick.worker).set(held.len() as f64);
     let ids = match maintenance_query(
         shutdown,
         "batch archive candidate list",
         query_timeout,
         storage.list_archivable_batches(
-            tick.batch_limit,
+            tick.batch_limit.saturating_add(held.len() as i64),
             true,
             tick.cancel_grace_secs,
             tick.batch_dwell_secs,
@@ -883,7 +941,11 @@ async fn run_batch_archive_phase<S>(
     )
     .await
     {
-        Ok(Some(ids)) => ids,
+        Ok(Some(ids)) => ids
+            .into_iter()
+            .filter(|batch_id| !held.contains(batch_id))
+            .take(tick.batch_limit.max(0) as usize)
+            .collect::<Vec<_>>(),
         Ok(None) => return,
         Err(error) => {
             crate::background_error!(
@@ -897,9 +959,12 @@ async fn run_batch_archive_phase<S>(
         }
     };
 
-    let mut abort_phase = false;
+    // Latched: a wave's results arrive together, so a later success in the
+    // same wave must not reset a threshold the wave already reached.
+    let mut consecutive_failures = 0;
+    let mut stop_pass = false;
     for wave in ids.chunks(tick.batch_concurrency.max(1)) {
-        if shutdown.is_cancelled() || abort_phase {
+        if shutdown.is_cancelled() || stop_pass {
             break;
         }
         let results = futures::future::join_all(wave.iter().map(|batch_id| {
@@ -913,13 +978,15 @@ async fn run_batch_archive_phase<S>(
                     storage.archive_batch(*batch_id),
                 )
                 .await;
-                (started.elapsed(), result)
+                (*batch_id, started.elapsed(), result)
             }
         }))
         .await;
-        for (elapsed, result) in results {
+        for (batch_id, elapsed, result) in results {
             match result {
                 Ok(Some(ArchiveOutcome::Archived { rows })) => {
+                    consecutive_failures = 0;
+                    backoff.clear(batch_id);
                     counter!("fusillade_archive_moves_total", "worker" => tick.worker, "outcome" => "archived").increment(1);
                     counter!("fusillade_archive_moved_rows_total", "worker" => tick.worker)
                         .increment(rows);
@@ -927,6 +994,8 @@ async fn run_batch_archive_phase<S>(
                         .record(elapsed.as_secs_f64());
                 }
                 Ok(Some(outcome)) => {
+                    consecutive_failures = 0;
+                    backoff.clear(batch_id);
                     let label = match outcome {
                         ArchiveOutcome::Archived { .. } => unreachable!(),
                         ArchiveOutcome::SkippedNotFound => "skipped_not_found",
@@ -947,16 +1016,19 @@ async fn run_batch_archive_phase<S>(
                 }
                 Ok(None) => return,
                 Err(error) => {
-                    if !abort_phase {
-                        crate::background_error!(
-                            "archive_move_failed",
-                            Error,
-                            worker = tick.worker,
-                            error = %error,
-                            "Failed to archive a batch"
-                        );
-                    }
-                    abort_phase = true;
+                    consecutive_failures += 1;
+                    stop_pass |= consecutive_failures >= ARCHIVE_PASS_MAX_CONSECUTIVE_FAILURES;
+                    let hold = backoff.record_failure(batch_id, tokio::time::Instant::now());
+                    counter!("fusillade_archive_moves_total", "worker" => tick.worker, "outcome" => "error").increment(1);
+                    crate::background_error!(
+                        "archive_move_failed",
+                        Error,
+                        worker = tick.worker,
+                        %batch_id,
+                        held_secs = hold.as_secs(),
+                        error = %error,
+                        "Failed to archive a batch; holding it back"
+                    );
                 }
             }
         }
@@ -1105,13 +1177,14 @@ async fn run_archive_mover_tick<S>(
     retention_policy: &RetentionPolicy,
     tick: ArchiveMoverTick,
     retained_runway_ready: &AtomicBool,
+    backoff: &ArchiveBatchBackoff,
 ) -> bool
 where
     S: DaemonStorage + 'static,
 {
     let observed_at = chrono::Utc::now();
     if tick.batch_enabled {
-        run_batch_archive_phase(storage.clone(), shutdown, query_timeout, tick).await;
+        run_batch_archive_phase(storage.clone(), shutdown, query_timeout, tick, backoff).await;
     }
     let mut more_work = false;
     if tick.batchless_enabled {
@@ -3546,6 +3619,9 @@ where
                 daemon_handles.push(("retained_response_route_cleanup", route_cleanup_handle));
             }
 
+            // Shared by both movers: a batch held back after a failed move
+            // must not be retried by the other worker in the meantime.
+            let archive_backoff = Arc::new(ArchiveBatchBackoff::default());
             for (
                 worker,
                 batch_enabled,
@@ -3584,6 +3660,7 @@ where
                 let shutdown = self.shutdown_token.clone();
                 let policy = retention_policy.clone();
                 let retained_runway_ready = retained_runway_ready.clone();
+                let backoff = archive_backoff.clone();
                 let tick = ArchiveMoverTick {
                     worker,
                     include_overdue: worker == "backfill",
@@ -3643,6 +3720,7 @@ where
                             &policy,
                             tick,
                             retained_runway_ready.as_ref(),
+                            backoff.as_ref(),
                         )
                         .await;
                     }
@@ -4012,6 +4090,11 @@ mod tests {
         retained_contiguous_ahead: AtomicUsize,
         retained_required: AtomicUsize,
         batch_candidates: AtomicUsize,
+        /// When set, the stable oldest-first candidate list; moved batches
+        /// leave it. Otherwise `batch_candidates` fresh ids per list call.
+        fixed_batch_candidates: std::sync::Mutex<Option<Vec<BatchId>>>,
+        failing_batches: std::sync::Mutex<std::collections::HashSet<BatchId>>,
+        batch_move_attempts: std::sync::Mutex<Vec<BatchId>>,
         events: std::sync::Mutex<Vec<&'static str>>,
     }
 
@@ -4045,6 +4128,9 @@ mod tests {
                 retained_contiguous_ahead: AtomicUsize::new(7),
                 retained_required: AtomicUsize::new(7),
                 batch_candidates: AtomicUsize::new(0),
+                fixed_batch_candidates: std::sync::Mutex::new(None),
+                failing_batches: std::sync::Mutex::new(std::collections::HashSet::new()),
+                batch_move_attempts: std::sync::Mutex::new(Vec::new()),
                 events: std::sync::Mutex::new(Vec::new()),
             }
         }
@@ -4230,19 +4316,24 @@ mod tests {
             Ok(0)
         }
 
-        async fn archive_batch(&self, _batch_id: BatchId) -> Result<ArchiveOutcome> {
+        async fn archive_batch(&self, batch_id: BatchId) -> Result<ArchiveOutcome> {
             self.batch_move_calls.fetch_add(1, Ordering::SeqCst);
             self.record("batch_move");
-            if self.fail_batch_move.load(Ordering::SeqCst) {
-                Err(Self::fail())
-            } else {
-                Ok(ArchiveOutcome::Archived { rows: 1 })
+            self.batch_move_attempts.lock().unwrap().push(batch_id);
+            if self.fail_batch_move.load(Ordering::SeqCst)
+                || self.failing_batches.lock().unwrap().contains(&batch_id)
+            {
+                return Err(Self::fail());
             }
+            if let Some(candidates) = self.fixed_batch_candidates.lock().unwrap().as_mut() {
+                candidates.retain(|candidate| *candidate != batch_id);
+            }
+            Ok(ArchiveOutcome::Archived { rows: 1 })
         }
 
         async fn list_archivable_batches(
             &self,
-            _limit: i64,
+            limit: i64,
             _oldest_first: bool,
             _cancel_grace_secs: f64,
             _min_frozen_age_secs: f64,
@@ -4251,6 +4342,9 @@ mod tests {
             self.record("batch_list");
             if self.fail_batch_list.load(Ordering::SeqCst) {
                 return Err(Self::fail());
+            }
+            if let Some(candidates) = self.fixed_batch_candidates.lock().unwrap().as_ref() {
+                return Ok(candidates.iter().take(limit as usize).copied().collect());
             }
             Ok((0..self.batch_candidates.load(Ordering::SeqCst))
                 .map(|_| BatchId::from(uuid::Uuid::new_v4()))
@@ -4316,6 +4410,132 @@ mod tests {
             batchless_byte_limit: 1,
             batchless_concurrency: 1,
         }
+    }
+
+    fn sweep_tick(batch_limit: i64) -> ArchiveMoverTick {
+        ArchiveMoverTick {
+            batch_limit,
+            ..mover_tick(true, false)
+        }
+    }
+
+    fn fixed_candidates(storage: &FakeMaintenanceStorage, n: usize) -> Vec<BatchId> {
+        let ids: Vec<BatchId> = (0..n)
+            .map(|_| BatchId::from(uuid::Uuid::new_v4()))
+            .collect();
+        *storage.fixed_batch_candidates.lock().unwrap() = Some(ids.clone());
+        ids
+    }
+
+    async fn run_sweep(
+        storage: &Arc<FakeMaintenanceStorage>,
+        tick: ArchiveMoverTick,
+        backoff: &ArchiveBatchBackoff,
+    ) {
+        run_batch_archive_phase(
+            storage.clone(),
+            &tokio_util::sync::CancellationToken::new(),
+            Duration::from_secs(1),
+            tick,
+            backoff,
+        )
+        .await;
+    }
+
+    /// A batch whose move fails must not block the batches behind it, and
+    /// is held back from later passes until its backoff expires.
+    #[tokio::test(start_paused = true)]
+    async fn failing_archive_move_is_held_back_without_blocking_the_pass() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        let backoff = ArchiveBatchBackoff::default();
+        let ids = fixed_candidates(&storage, 3);
+        storage.failing_batches.lock().unwrap().insert(ids[0]);
+
+        run_sweep(&storage, sweep_tick(3), &backoff).await;
+        assert_eq!(*storage.batch_move_attempts.lock().unwrap(), ids);
+
+        // Held: the next pass does not touch it.
+        run_sweep(&storage, sweep_tick(3), &backoff).await;
+        assert_eq!(storage.batch_move_calls.load(Ordering::SeqCst), 3);
+
+        // After the hold it is retried, and a success clears it.
+        tokio::time::advance(ARCHIVE_FAILURE_BACKOFF_BASE).await;
+        storage.failing_batches.lock().unwrap().clear();
+        run_sweep(&storage, sweep_tick(3), &backoff).await;
+        assert_eq!(storage.batch_move_calls.load(Ordering::SeqCst), 4);
+        assert!(
+            storage
+                .fixed_batch_candidates
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(backoff.held(tokio::time::Instant::now()).is_empty());
+    }
+
+    /// Held batches still sort first, so the candidate window widens past
+    /// them instead of shrinking the pass's budget.
+    #[tokio::test(start_paused = true)]
+    async fn held_archive_batches_do_not_consume_the_candidate_window() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        let backoff = ArchiveBatchBackoff::default();
+        let ids = fixed_candidates(&storage, 3);
+        let now = tokio::time::Instant::now();
+        backoff.record_failure(ids[0], now);
+        backoff.record_failure(ids[1], now);
+
+        run_sweep(&storage, sweep_tick(1), &backoff).await;
+        assert_eq!(*storage.batch_move_attempts.lock().unwrap(), vec![ids[2]]);
+    }
+
+    /// A run of failures means the database, not the batch: the pass stops
+    /// instead of failing every remaining candidate.
+    #[tokio::test(start_paused = true)]
+    async fn consecutive_archive_failures_stop_the_pass() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        let backoff = ArchiveBatchBackoff::default();
+        fixed_candidates(&storage, 5);
+        storage.fail_batch_move.store(true, Ordering::SeqCst);
+
+        run_sweep(&storage, sweep_tick(5), &backoff).await;
+        assert_eq!(
+            storage.batch_move_calls.load(Ordering::SeqCst),
+            ARCHIVE_PASS_MAX_CONSECUTIVE_FAILURES as usize
+        );
+    }
+
+    /// With concurrent moves a wave's results are processed together: a
+    /// success after the threshold was reached must not re-open the pass.
+    #[tokio::test(start_paused = true)]
+    async fn archive_failure_threshold_latches_across_a_wave() {
+        let storage = Arc::new(FakeMaintenanceStorage::default());
+        let backoff = ArchiveBatchBackoff::default();
+        let ids = fixed_candidates(&storage, 6);
+        storage
+            .failing_batches
+            .lock()
+            .unwrap()
+            .extend([ids[0], ids[1]]);
+
+        let tick = ArchiveMoverTick {
+            batch_concurrency: 3,
+            ..sweep_tick(6)
+        };
+        run_sweep(&storage, tick, &backoff).await;
+        assert_eq!(storage.batch_move_calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn archive_failure_backoff_doubles_and_caps() {
+        let backoff = ArchiveBatchBackoff::default();
+        let batch_id = BatchId::from(uuid::Uuid::new_v4());
+        let now = tokio::time::Instant::now();
+        let holds: Vec<u64> = (0..8)
+            .map(|_| backoff.record_failure(batch_id, now).as_secs())
+            .collect();
+        assert_eq!(holds, vec![60, 120, 240, 480, 960, 1920, 3600, 3600]);
     }
 
     #[test]
@@ -4619,6 +4839,7 @@ mod tests {
             &policy,
             mover_tick(true, true),
             &retained_runway_ready,
+            &ArchiveBatchBackoff::default(),
         )
         .await;
         assert_eq!(storage.batchless_calls.load(Ordering::SeqCst), 1);
@@ -4633,6 +4854,7 @@ mod tests {
             &policy,
             mover_tick(true, true),
             &retained_runway_ready,
+            &ArchiveBatchBackoff::default(),
         )
         .await;
         assert_eq!(storage.batch_move_calls.load(Ordering::SeqCst), 1);
@@ -4667,6 +4889,7 @@ mod tests {
             &policy,
             tick,
             &std::sync::atomic::AtomicBool::new(true),
+            &ArchiveBatchBackoff::default(),
         )
         .await;
 
@@ -4694,6 +4917,7 @@ mod tests {
             &policy,
             mover_tick(false, true),
             &retained_runway_ready,
+            &ArchiveBatchBackoff::default(),
         )
         .await;
         assert_eq!(storage.batchless_calls.load(Ordering::SeqCst), 0);
@@ -4707,6 +4931,7 @@ mod tests {
             &policy,
             mover_tick(false, true),
             &retained_runway_ready,
+            &ArchiveBatchBackoff::default(),
         )
         .await;
         assert_eq!(storage.batchless_calls.load(Ordering::SeqCst), 0);
@@ -4719,6 +4944,7 @@ mod tests {
             &policy,
             mover_tick(false, true),
             &retained_runway_ready,
+            &ArchiveBatchBackoff::default(),
         )
         .await;
         assert_eq!(storage.batchless_calls.load(Ordering::SeqCst), 1);
@@ -4744,6 +4970,7 @@ mod tests {
             &policy,
             tick,
             &std::sync::atomic::AtomicBool::new(true),
+            &ArchiveBatchBackoff::default(),
         )
         .await;
 
@@ -4777,6 +5004,7 @@ mod tests {
             &policy,
             tick,
             &std::sync::atomic::AtomicBool::new(true),
+            &ArchiveBatchBackoff::default(),
         )
         .await;
 
@@ -4797,6 +5025,7 @@ mod tests {
         tick.worker = "backfill";
         tick.include_overdue = true;
         let ready = std::sync::atomic::AtomicBool::new(true);
+        let backoff = ArchiveBatchBackoff::default();
 
         let run = |storage: Arc<FakeMaintenanceStorage>| {
             run_archive_mover_tick(
@@ -4806,6 +5035,7 @@ mod tests {
                 &policy,
                 tick,
                 &ready,
+                &backoff,
             )
         };
 
