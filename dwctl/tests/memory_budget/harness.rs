@@ -15,6 +15,7 @@ use reqwest::{Client, Method};
 use serde_json::{Value, json};
 use sqlx::postgres::{PgConnectOptions, PgConnection};
 use sqlx::{ConnectOptions, Connection};
+use tokio::net::{TcpListener, TcpSocket};
 use tokio::runtime::Runtime;
 use tokio::sync::oneshot;
 
@@ -66,17 +67,18 @@ impl Harness {
         let tokenizer = driver.block_on(driver.spawn(Tokenizer::start(MODEL_ALIAS))).unwrap();
         let database = driver.block_on(driver.spawn(Database::create())).unwrap();
 
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .and_then(|listener| listener.local_addr())
-            .expect("free port")
-            .port();
+        let listener = {
+            let _runtime = app.enter();
+            listener()
+        };
+        let port = listener.local_addr().expect("listener address").port();
         let config = config(port, &database.url, &tokenizer.base_url);
 
         let application = app
             .block_on(Application::new_with_pool(config, None, None))
             .expect("start application");
         let (shutdown, shutdown_signal) = oneshot::channel::<()>();
-        app.spawn(application.serve(async move {
+        app.spawn(application.serve_with_listener(listener, async move {
             let _ = shutdown_signal.await;
         }));
 
@@ -120,6 +122,17 @@ impl Drop for Harness {
             .driver
             .block_on(self.driver.spawn(async move { drop_database(admin, &database).await }));
     }
+}
+
+/// A loopback listener with a small, fixed receive buffer. Accepted
+/// connections inherit it, so the application reads a request body in pieces
+/// of the same size on every machine rather than in whatever pieces the
+/// kernel's buffer tuning allows, and the heap it holds does not vary with that.
+fn listener() -> TcpListener {
+    let socket = TcpSocket::new_v4().expect("socket");
+    socket.set_recv_buffer_size(16 * 1024).expect("receive buffer size");
+    socket.bind("127.0.0.1:0".parse().unwrap()).expect("bind application listener");
+    socket.listen(1024).expect("listen")
 }
 
 /// Every request-path layer enabled, with each external dependency replaced

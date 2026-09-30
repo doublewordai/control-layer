@@ -3,8 +3,8 @@
 //! a known number of requests are in flight. Every response closes its
 //! connection, so the application keeps no idle upstream connections.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -15,7 +15,10 @@ use axum::routing::post;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
-use tokio::sync::watch;
+use tokio::sync::{Notify, watch};
+
+/// Streamed content is sent as events of this many bytes.
+pub const EVENT_BYTES: usize = 16 * 1024;
 
 /// What the upstream sends back once a request has arrived.
 #[derive(Clone, Copy, Debug)]
@@ -28,14 +31,47 @@ pub enum Reply {
     StreamThenHold { content_bytes: usize },
 }
 
+/// Streamed events the load generator has received through the application.
+///
+/// The upstream sends each event only once every stream has delivered the
+/// previous ones, so the application reads one event at a time on every
+/// machine rather than whatever the kernel has queued.
+#[derive(Clone, Default)]
+pub struct Delivered {
+    events: Arc<AtomicUsize>,
+    changed: Arc<Notify>,
+}
+
+impl Delivered {
+    pub fn add(&self, events: usize) {
+        if events > 0 {
+            self.events.fetch_add(events, Ordering::SeqCst);
+            self.changed.notify_waiters();
+        }
+    }
+
+    async fn at_least(&self, events: usize) {
+        loop {
+            let changed = self.changed.notified();
+            if self.events.load(Ordering::SeqCst) >= events {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
 #[derive(Clone)]
 struct Shared {
     model: String,
-    reply: Arc<std::sync::Mutex<Reply>>,
+    reply: Arc<Mutex<Reply>>,
+    /// Requests in the current round, which move through a stream together.
+    requests: Arc<AtomicUsize>,
     /// Requests whose body has been read and that are now waiting for release.
     parked: Arc<AtomicUsize>,
-    /// Streamed replies that have written everything they send before release.
+    /// Streams whose events before release have all reached the load generator.
     streamed: Arc<AtomicUsize>,
+    delivered: Delivered,
     release: watch::Receiver<u64>,
 }
 
@@ -53,9 +89,11 @@ impl Upstream {
         let (release, release_rx) = watch::channel(0u64);
         let shared = Shared {
             model: model.to_string(),
-            reply: Arc::new(std::sync::Mutex::new(Reply::Immediate)),
+            reply: Arc::new(Mutex::new(Reply::Immediate)),
+            requests: Arc::new(AtomicUsize::new(1)),
             parked: Arc::new(AtomicUsize::new(0)),
             streamed: Arc::new(AtomicUsize::new(0)),
+            delivered: Delivered::default(),
             release: release_rx,
         };
         let router = Router::new()
@@ -69,8 +107,17 @@ impl Upstream {
         }
     }
 
-    pub fn set_reply(&self, reply: Reply) {
+    /// Sets the reply for the next round of `requests` requests and resets the counters.
+    pub fn prepare(&self, reply: Reply, requests: usize) {
         *self.shared.reply.lock().unwrap() = reply;
+        self.shared.requests.store(requests, Ordering::SeqCst);
+        self.shared.parked.store(0, Ordering::SeqCst);
+        self.shared.streamed.store(0, Ordering::SeqCst);
+        self.shared.delivered.events.store(0, Ordering::SeqCst);
+    }
+
+    pub fn delivered(&self) -> Delivered {
+        self.shared.delivered.clone()
     }
 
     pub fn parked(&self) -> usize {
@@ -84,11 +131,6 @@ impl Upstream {
     /// Lets every request that is currently parked complete.
     pub fn release_all(&self) {
         self.release.send_modify(|generation| *generation += 1);
-    }
-
-    pub fn reset_counts(&self) {
-        self.shared.parked.store(0, Ordering::SeqCst);
-        self.shared.streamed.store(0, Ordering::SeqCst);
     }
 }
 
@@ -128,21 +170,20 @@ async fn completion(State(shared): State<Shared>, request: Request) -> Response 
             ([(header::CONNECTION, "close")], axum::Json(completion)).into_response()
         }
         Reply::StreamThenHold { content_bytes } => {
-            let model = shared.model.clone();
-            let streamed = shared.streamed.clone();
+            let requests = shared.requests.load(Ordering::SeqCst);
             let stream = async_stream::stream! {
-                const PIECE: usize = 16 * 1024;
-                let mut remaining = content_bytes;
-                while remaining > 0 {
-                    let len = remaining.min(PIECE);
-                    remaining -= len;
-                    yield Ok::<_, std::convert::Infallible>(sse(&chunk(&model, Some(&"a".repeat(len)), None, None)));
+                let events = content_bytes.div_ceil(EVENT_BYTES);
+                for event in 0..events {
+                    shared.delivered.at_least(event * requests).await;
+                    let len = EVENT_BYTES.min(content_bytes - event * EVENT_BYTES);
+                    yield Ok::<_, std::convert::Infallible>(sse(&chunk(&shared.model, Some(&"a".repeat(len)), None, None)));
                 }
-                streamed.fetch_add(1, Ordering::SeqCst);
+                shared.delivered.at_least(events * requests).await;
+                shared.streamed.fetch_add(1, Ordering::SeqCst);
                 wait_for_release(&mut release, generation).await;
-                yield Ok(sse(&chunk(&model, None, Some("stop"), None)));
+                yield Ok(sse(&chunk(&shared.model, None, Some("stop"), None)));
                 let usage = json!({ "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 });
-                yield Ok(sse(&chunk(&model, None, None, Some(usage))));
+                yield Ok(sse(&chunk(&shared.model, None, None, Some(usage))));
                 yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
             };
             Response::builder()

@@ -14,8 +14,11 @@
 //! (`idle copies`, `leaked`). It comes from request logging's writes to the
 //! database and varies between runs, so it is not budgeted.
 //!
-//! Connections are not reused between requests, so memory held by idle
-//! keep-alive connections is not part of the measurement. The allocator counts
+//! How much the application holds depends on the pieces its reads return, so
+//! the harness fixes them: request bodies arrive through a small receive
+//! buffer and streamed events one at a time. Connections are not reused
+//! between requests, so memory held by idle keep-alive connections is not part
+//! of the measurement. The allocator counts
 //! the whole process, so tests in this binary run one at a time.
 //!
 //! Run with `just test memory`.
@@ -127,8 +130,8 @@ fn chat_completion_request_body() {
         "chat completion request body",
         &scaling,
         Budget {
-            copies: 9.5,
-            fixed_kib: 275.0,
+            copies: 9.25,
+            fixed_kib: 245.0,
         },
     );
 }
@@ -153,8 +156,8 @@ fn chat_completion_streamed_response() {
         "chat completion streamed response",
         &scaling,
         Budget {
-            copies: 2.0,
-            fixed_kib: 185.0,
+            copies: 1.25,
+            fixed_kib: 165.0,
         },
     );
 }

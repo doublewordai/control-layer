@@ -102,8 +102,7 @@ pub fn scaling(harness: &Harness, load: impl Fn(usize) -> Load, small: usize, la
 
 pub fn round(harness: &Harness, load: Load) -> Round {
     let upstream = &harness.upstream;
-    upstream.set_reply(load.reply);
-    upstream.reset_counts();
+    upstream.prepare(load.reply, CONCURRENCY);
 
     let baseline = settle();
     alloc::reset_peak();
@@ -115,10 +114,12 @@ pub fn round(harness: &Harness, load: Load) -> Round {
     let key = harness.api_key.clone();
     let client = harness.client.clone();
     let body = load.body;
+    let delivered = upstream.delivered();
     let requests = harness.driver.spawn(async move {
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..CONCURRENCY {
             let (client, url, key, body) = (client.clone(), url.clone(), key.clone(), body.clone());
+            let delivered = delivered.clone();
             tasks.spawn(async move {
                 let mut response = client
                     .post(url)
@@ -130,7 +131,17 @@ pub fn round(harness: &Harness, load: Load) -> Round {
                     .expect("send request");
                 let status = response.status();
                 let mut error = Vec::new();
+                let mut previous = 0u8;
                 while let Some(chunk) = response.chunk().await.expect("read response") {
+                    // A blank line ends a server-sent event.
+                    let mut events = 0;
+                    for &byte in chunk.iter() {
+                        if byte == b'\n' && previous == b'\n' {
+                            events += 1;
+                        }
+                        previous = byte;
+                    }
+                    delivered.add(events);
                     if !status.is_success() && error.len() < 2048 {
                         error.extend_from_slice(&chunk);
                     }
