@@ -15,14 +15,61 @@
 //! inside the classify deadline (which still bounds the caller — a retry never extends it).
 //! Non-connection errors (constraint violations, bad data) are NOT retried. This mirrors
 //! the fix the batch daemon's own queries received for the same severed-conn failure mode.
+//!
+//! ## Refresh debounce
+//!
+//! Every successful request that reads a cached prefix slides that entry's expiry, so a
+//! prefix shared by many requests receives a refresh per request. The `UPDATE` already skips
+//! a move of less than 1% of the window, but issuing it still costs a round trip and a row
+//! lookup per request. Each index therefore remembers, per entry, a lower bound on the
+//! expiry it has just observed (from its own lookup, write or refresh) and applies the same
+//! 1% rule in process before sending anything.
+//!
+//! Refreshes only move an expiry forward, so a skip is exactly the `UPDATE`'s own decision
+//! unless something lowered the stored expiry after this process observed it. Only a write
+//! can do that: another request re-creating an entry it saw as expired, committing an
+//! expiry computed when that request started. Every request looks the entry up before it
+//! refreshes, and the lookup replaces this process's knowledge with the stored value, so a
+//! lowered expiry is seen by the next request here. At worst a request racing such a write
+//! misses the cache and writes the entry again, which is the index's safe failure mode.
+//! Knowledge also ages out after [`MAX_KNOWN_EXPIRY_AGE`] regardless.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use moka::future::Cache;
 use rand::RngExt;
 use tracing::instrument;
 
 use super::index::{CacheEntry, CacheError, CacheIndex, CacheMatch, CacheResult, IndexScope, PrefixHash, TtlTier};
 use super::metrics as cache_metrics;
+use crate::types::UserId;
+
+/// How long an observed expiry may stand in for the row (see the module docs). Kept well
+/// below the shortest TTL tier so stale knowledge cannot outlive an entry's window.
+const MAX_KNOWN_EXPIRY_AGE: Duration = Duration::from_secs(60);
+
+/// Bound on remembered entries. Entries age out after [`MAX_KNOWN_EXPIRY_AGE`], so this only
+/// caps a burst of distinct prefixes within that window.
+const KNOWN_EXPIRY_CAPACITY: u64 = 100_000;
+
+type EntryKey = (UserId, String, String, PrefixHash);
+
+fn entry_key(scope: &IndexScope, prefix_hash: &PrefixHash) -> EntryKey {
+    (
+        scope.principal_id,
+        scope.virtual_model.clone(),
+        scope.tokenizer_version.clone(),
+        prefix_hash.clone(),
+    )
+}
+
+/// The refresh `UPDATE`'s own rule: an entry whose expiry is already within 1% of the
+/// window of `new_expires_at` does not need the refresh.
+fn refresh_threshold(new_expires_at: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
+    new_expires_at - (new_expires_at - now) / 100
+}
 
 /// Postgres-backed prefix index over `prompt_cache_entries`.
 #[derive(Clone)]
@@ -31,6 +78,8 @@ pub struct PostgresIndex {
     pool: sqlx_pool_router::DynPools,
     /// Connection-error retries per op (`cache.index_conn_retries`; 0 = never retry).
     conn_retries: u32,
+    /// Lower bounds on entry expiries this process observed recently (see the module docs).
+    known_expiry: Cache<EntryKey, DateTime<Utc>>,
 }
 
 impl PostgresIndex {
@@ -38,6 +87,10 @@ impl PostgresIndex {
         Self {
             pool: sqlx_pool_router::DynPools::new(pool),
             conn_retries,
+            known_expiry: Cache::builder()
+                .max_capacity(KNOWN_EXPIRY_CAPACITY)
+                .time_to_live(MAX_KNOWN_EXPIRY_AGE)
+                .build(),
         }
     }
 }
@@ -132,7 +185,7 @@ impl PostgresIndex {
         .map(|_| ())
     }
 
-    async fn refresh_once(&self, scope: &IndexScope, prefix_hash: &PrefixHash, new_expires_at: DateTime<Utc>) -> Result<(), sqlx::Error> {
+    async fn refresh_once(&self, scope: &IndexScope, prefix_hash: &PrefixHash, new_expires_at: DateTime<Utc>) -> Result<u64, sqlx::Error> {
         // Slide the window forward (the sliding-TTL refresh). Every request that reads
         // a shared prefix refreshes the same row, so under load an unconditional UPDATE
         // queues every caller on that row's lock. Only write when the expiry would move
@@ -155,7 +208,7 @@ impl PostgresIndex {
         )
         .execute(&self.pool)
         .await
-        .map(|_| ())
+        .map(|result| result.rows_affected())
     }
 }
 
@@ -176,7 +229,8 @@ impl CacheIndex for PostgresIndex {
         }
         let rows = with_conn_retry!("lookup", self.conn_retries, self.lookup_once(scope, candidate_hashes))?;
 
-        rows.into_iter()
+        let matches = rows
+            .into_iter()
             .map(|r| {
                 let ttl_tier =
                     TtlTier::parse(&r.ttl_tier).ok_or_else(|| CacheError::Invalid(format!("unknown ttl_tier {:?}", r.ttl_tier)))?;
@@ -187,18 +241,40 @@ impl CacheIndex for PostgresIndex {
                     expires_at: r.expires_at,
                 })
             })
-            .collect()
+            .collect::<CacheResult<Vec<_>>>()?;
+        for m in &matches {
+            self.known_expiry.insert(entry_key(scope, &m.prefix_hash), m.expires_at).await;
+        }
+        Ok(matches)
     }
 
     #[instrument(skip_all, fields(model = %entry.scope.virtual_model, ttl = entry.ttl_tier.as_str()), err)]
     async fn write(&self, entry: &CacheEntry) -> CacheResult<()> {
         with_conn_retry!("write", self.conn_retries, self.write_once(entry))?;
+        self.known_expiry
+            .insert(entry_key(&entry.scope, &entry.prefix_hash), entry.expires_at)
+            .await;
         Ok(())
     }
 
     #[instrument(skip_all, fields(model = %scope.virtual_model), err)]
     async fn refresh(&self, scope: &IndexScope, prefix_hash: &PrefixHash, new_expires_at: DateTime<Utc>) -> CacheResult<()> {
-        with_conn_retry!("refresh", self.conn_retries, self.refresh_once(scope, prefix_hash, new_expires_at))?;
+        let key = entry_key(scope, prefix_hash);
+        if let Some(known) = self.known_expiry.get(&key).await
+            && known >= refresh_threshold(new_expires_at, Utc::now())
+        {
+            cache_metrics::record_refresh_skipped();
+            return Ok(());
+        }
+        let updated = with_conn_retry!("refresh", self.conn_retries, self.refresh_once(scope, prefix_hash, new_expires_at))?;
+        // Either this refresh wrote `new_expires_at`, or the row already met the threshold
+        // (or no longer exists, in which case there is nothing to refresh).
+        let known = if updated > 0 {
+            new_expires_at
+        } else {
+            refresh_threshold(new_expires_at, Utc::now())
+        };
+        self.known_expiry.insert(key, known).await;
         Ok(())
     }
 }
@@ -295,6 +371,90 @@ mod tests {
         idx.refresh(&s, &b"hot-prefix".to_vec(), later).await.unwrap();
         let hits = idx.lookup(&s, &[b"hot-prefix".to_vec()]).await.unwrap();
         assert_eq!(hits[0].expires_at.timestamp_micros(), later.timestamp_micros());
+    }
+
+    async fn stored_expiry(pool: &sqlx::PgPool, s: &IndexScope, hash: &[u8]) -> DateTime<Utc> {
+        sqlx::query_scalar("SELECT expires_at FROM prompt_cache_entries WHERE principal_id = $1 AND prefix_hash = $2")
+            .bind(s.principal_id)
+            .bind(hash)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// Lower the stored expiry behind the index's back, as a concurrent write from another
+    /// process could. Whether a later refresh moves it shows whether a statement was sent.
+    async fn lower_stored_expiry(pool: &sqlx::PgPool, s: &IndexScope, hash: &[u8], to: DateTime<Utc>) {
+        sqlx::query("UPDATE prompt_cache_entries SET expires_at = $3 WHERE principal_id = $1 AND prefix_hash = $2")
+            .bind(s.principal_id)
+            .bind(hash)
+            .bind(to)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test]
+    async fn refresh_after_own_write_sends_no_statement(pool: sqlx::PgPool) {
+        let idx = PostgresIndex::new(pool.clone(), 1);
+        let s = scope();
+        let written = Utc::now() + chrono::Duration::hours(1);
+        let mut e = entry(&s, b"hot-prefix", 7, TtlTier::OneHour);
+        e.expires_at = written;
+        idx.write(&e).await.unwrap();
+
+        let lowered = Utc::now() + chrono::Duration::minutes(10);
+        lower_stored_expiry(&pool, &s, b"hot-prefix", lowered).await;
+        idx.refresh(&s, &b"hot-prefix".to_vec(), written + chrono::Duration::seconds(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_expiry(&pool, &s, b"hot-prefix").await.timestamp_micros(),
+            lowered.timestamp_micros(),
+            "the refresh was answered from what this process just wrote"
+        );
+    }
+
+    #[sqlx::test]
+    async fn refresh_from_another_process_still_reaches_the_row(pool: sqlx::PgPool) {
+        let writer = PostgresIndex::new(pool.clone(), 1);
+        let other = PostgresIndex::new(pool.clone(), 1);
+        let s = scope();
+        let mut e = entry(&s, b"shared", 7, TtlTier::OneHour);
+        e.expires_at = Utc::now() + chrono::Duration::hours(1);
+        writer.write(&e).await.unwrap();
+
+        // Only an index's own observations stand in for the row.
+        lower_stored_expiry(&pool, &s, b"shared", Utc::now() + chrono::Duration::minutes(10)).await;
+        let target = Utc::now() + chrono::Duration::hours(1);
+        other.refresh(&s, &b"shared".to_vec(), target).await.unwrap();
+        assert_eq!(
+            stored_expiry(&pool, &s, b"shared").await.timestamp_micros(),
+            target.timestamp_micros()
+        );
+    }
+
+    #[sqlx::test]
+    async fn refresh_after_a_stale_lookup_reaches_the_row(pool: sqlx::PgPool) {
+        let idx = PostgresIndex::new(pool.clone(), 1);
+        let s = scope();
+        let mut e = entry(&s, b"aging", 7, TtlTier::OneHour);
+        e.expires_at = Utc::now() + chrono::Duration::minutes(10);
+        idx.write(&e).await.unwrap();
+        assert_eq!(idx.lookup(&s, &[b"aging".to_vec()]).await.unwrap().len(), 1);
+
+        // The lookup saw ten minutes left; a one-hour refresh is not negligible.
+        let target = Utc::now() + chrono::Duration::hours(1);
+        idx.refresh(&s, &b"aging".to_vec(), target).await.unwrap();
+        assert_eq!(
+            stored_expiry(&pool, &s, b"aging").await.timestamp_micros(),
+            target.timestamp_micros()
+        );
+    }
+
+    #[test]
+    fn known_expiry_ages_out_before_the_shortest_tier() {
+        assert!(chrono::Duration::from_std(MAX_KNOWN_EXPIRY_AGE).unwrap() < TtlTier::FiveMinutes.duration());
     }
 
     #[sqlx::test]
