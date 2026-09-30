@@ -14334,6 +14334,69 @@ mod tests {
         assert_eq!(version_after, version, "no retry_version churn on no-op");
     }
 
+    /// Pending notifications sit at the newest end of counts_frozen_at order,
+    /// behind a long already-notified history. The claim must reach them
+    /// through idx_batches_notification_due rather than walking that history.
+    #[sqlx::test]
+    async fn notification_claim_reads_only_pending_batches(pool: sqlx::PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO batches (id, endpoint, completion_window, created_by, created_at,
+                                 completed_at, counts_frozen_at, notification_sent_at,
+                                 total_requests, expires_at)
+            SELECT md5(i::text)::uuid, '/v1/chat/completions', '24h', 'owner',
+                   '2026-01-01'::timestamptz + i * interval '1 second',
+                   '2026-02-01'::timestamptz,
+                   '2026-02-01'::timestamptz + i * interval '1 second',
+                   CASE WHEN i <= 20000 THEN '2026-02-02'::timestamptz END,
+                   1, '2026-02-02'::timestamptz
+            FROM generate_series(1, 20005) i
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE batches").execute(&pool).await.unwrap();
+
+        // The candidate subquery of claim_batch_notifications, verbatim.
+        let plan: serde_json::Value = sqlx::query_scalar(
+            r#"
+            EXPLAIN (FORMAT JSON)
+            SELECT id FROM batches
+            WHERE counts_frozen_at IS NOT NULL
+              AND notification_sent_at IS NULL
+              AND cancelling_at IS NULL
+              AND deleted_at IS NULL
+              AND total_requests > 0
+            ORDER BY counts_frozen_at
+            LIMIT 100
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            plan.to_string()
+                .contains("\"Index Name\":\"idx_batches_notification_due\""),
+            "claim candidates must come from idx_batches_notification_due: {plan}"
+        );
+
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let claimed = manager.claim_batch_notifications().await.unwrap();
+        assert_eq!(claimed.len(), 5);
+        assert!(
+            manager
+                .claim_batch_notifications()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     /// The finalizer sweep freezes counts without any get_batch call, and the
     /// notifier then claims the frozen batch — the two halves of what the old
     /// combined poller did.
