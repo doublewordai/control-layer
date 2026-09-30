@@ -161,8 +161,9 @@ pub(super) async fn cleanup_retained_response_routes<P: PoolProvider>(
         )
     })?;
 
+    let deadline = manager.maintenance_deadline();
     let mut transaction = manager
-        .begin_maintenance_write()
+        .begin_maintenance_write_until(deadline)
         .await
         .map_err(|_| failed())?;
     let mut remaining = limit;
@@ -179,6 +180,9 @@ pub(super) async fn cleanup_retained_response_routes<P: PoolProvider>(
     deleted += u64::try_from(request_deleted).map_err(|_| failed())?;
 
     if remaining > 0 {
+        super::bound_to_deadline(&mut transaction, deadline)
+            .await
+            .map_err(|_| failed())?;
         let group_deleted =
             sqlx::query_scalar::<_, i64>(include_str!("retained_response_group_route_cleanup.sql"))
                 .bind(remaining)

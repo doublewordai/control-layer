@@ -142,17 +142,40 @@ impl Default for BatchInsertStrategy {
     }
 }
 
-/// Server-side bound for each statement of a daemon maintenance transaction.
+/// Server-side budget for one daemon maintenance call, derived from the
+/// daemon's client-side query timeout.
 ///
 /// The daemon gives up on a maintenance call after its query timeout
-/// (`claim_query_timeout_ms`, 180 s by default) by dropping the future. The
-/// backend does not notice: it keeps executing a transaction that can no
-/// longer commit, holding its snapshot (which stops vacuum everywhere) and its
-/// locks, while the next tick starts the same work again. Cancelling on the
-/// server just before the client gives up means an abandoned attempt stops
-/// and rolls back at the point it was going to be thrown away. Keep this below
-/// the configured query timeout.
-const MAINTENANCE_STATEMENT_BUDGET: &str = "SET LOCAL statement_timeout = '150s'";
+/// (`claim_query_timeout_ms`) by dropping the future. The backend does not
+/// notice: it keeps executing a transaction that can no longer commit, holding
+/// its snapshot (which stops vacuum everywhere) and its locks, while the next
+/// tick starts the same work again. Every statement a maintenance call runs is
+/// therefore bounded on the server to end before the call's deadline, a fixed
+/// fraction of the client timeout, so an abandoned attempt is cancelled and
+/// rolled back no later than the point the daemon throws it away.
+fn maintenance_budget(client_timeout: std::time::Duration) -> std::time::Duration {
+    (client_timeout * 5 / 6).max(std::time::Duration::from_millis(1))
+}
+
+/// Default client-side query timeout of the batch daemon, used until the
+/// daemon installs its configured value with
+/// [`PostgresRequestManager::with_maintenance_query_timeout`].
+const DEFAULT_MAINTENANCE_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Limit the next statement of a maintenance transaction to the time left
+/// before `deadline`. Once the deadline has passed, the statement is cancelled
+/// at once and the transaction rolls back.
+async fn bound_to_deadline(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    deadline: std::time::Instant,
+) -> std::result::Result<(), sqlx::Error> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let millis = remaining.as_millis().clamp(1, i32::MAX as u128);
+    sqlx::query(&format!("SET LOCAL statement_timeout = {millis}"))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
 
 pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
@@ -177,6 +200,7 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     /// error bodies before persistence; `None` is identity. Remove when stream
     /// reassembly moves into dwctl.
     response_transformer: std::sync::OnceLock<Arc<dyn crate::transform::ResponseTransformer>>,
+    maintenance_budget: std::time::Duration,
 }
 
 struct StateWriteLimiter {
@@ -410,7 +434,16 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             response_transformer: std::sync::OnceLock::new(),
+            maintenance_budget: maintenance_budget(DEFAULT_MAINTENANCE_QUERY_TIMEOUT),
         }
+    }
+
+    /// Bound daemon maintenance on the server inside the daemon's client-side
+    /// query timeout (`claim_query_timeout_ms`). Pass the same value the
+    /// daemon uses so abandoned maintenance cannot outlive the daemon's wait.
+    pub fn with_maintenance_query_timeout(mut self, client_timeout: std::time::Duration) -> Self {
+        self.maintenance_budget = maintenance_budget(client_timeout);
+        self
     }
 
     /// Read only status while a response is running, loading its payload once terminal.
@@ -710,15 +743,29 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
         .await
     }
 
-    /// Begin a primary transaction for daemon maintenance, bounded on the
-    /// server by [`MAINTENANCE_STATEMENT_BUDGET`].
+    /// Deadline for one daemon maintenance call that starts now.
+    fn maintenance_deadline(&self) -> std::time::Instant {
+        std::time::Instant::now() + self.maintenance_budget
+    }
+
+    /// Begin a primary transaction for daemon maintenance whose first statement
+    /// must end within the maintenance budget. Multi-statement callers bound
+    /// each later statement with [`bound_to_deadline`].
     async fn begin_maintenance_write(
         &self,
     ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+        self.begin_maintenance_write_until(self.maintenance_deadline())
+            .await
+    }
+
+    /// Begin a primary transaction for one step of a maintenance call that
+    /// must end by `deadline`.
+    async fn begin_maintenance_write_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
         let mut tx = self.begin_write().await?;
-        sqlx::query(MAINTENANCE_STATEMENT_BUDGET)
-            .execute(&mut *tx)
-            .await?;
+        bound_to_deadline(&mut tx, deadline).await?;
         Ok(tx)
     }
 
@@ -9150,8 +9197,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
 
     async fn archive_batch(&self, batch_id: BatchId) -> Result<ArchiveOutcome> {
         request_maintenance::before_archive(self).await?;
+        let deadline = self.maintenance_deadline();
         let mut tx = self
-            .begin_maintenance_write()
+            .begin_maintenance_write_until(deadline)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
@@ -9212,6 +9260,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             // to the caller the batch is simply not available, same as
             // already-archived), while a persisting NotFound for a listed
             // candidate would be odd.
+            bound_to_deadline(&mut tx, deadline).await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e))
+            })?;
             let exists = sqlx::query_scalar!(
                 r#"SELECT EXISTS(SELECT 1 FROM batches WHERE id = $1 AND deleted_at IS NULL) AS "exists!""#,
                 *batch_id as Uuid,
@@ -9239,6 +9290,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // of the move. Retirement fences a week by UPDATEing this row, so a
         // fence either waits for this move to commit or was already visible
         // here; rows can never land in a week after it was fenced.
+        bound_to_deadline(&mut tx, deadline)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
         let bucket_state: Option<String> = sqlx::query_scalar(
             "SELECT state FROM batch_archive_buckets WHERE week_start = $1 FOR SHARE",
         )
@@ -9254,6 +9308,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // means the batch stays live — fully served, exactly as today — and
         // the caller alerts. Name derivation must match
         // ensure_archive_partitions() exactly.
+        bound_to_deadline(&mut tx, deadline)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
         let partition_exists = sqlx::query_scalar!(
             r#"
             SELECT EXISTS (
@@ -9283,6 +9340,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // by the schema-parity test suite (archive = requests' columns +
         // archive_bucket appended last). ON CONFLICT makes crash-resume
         // replay a no-op for rows already copied.
+        bound_to_deadline(&mut tx, deadline)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
         let inserted = sqlx::query(
             r#"
             INSERT INTO batch_requests_archive
@@ -9303,6 +9363,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // rows that verifiably exist in the archive, then prove nothing was
         // left behind. A row can never be deleted un-copied, and a torn
         // state aborts the transaction instead of committing.
+        bound_to_deadline(&mut tx, deadline)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
         let deleted = sqlx::query!(
             r#"
             DELETE FROM requests r
@@ -9320,6 +9383,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete archived rows: {}", e)))?
         .rows_affected();
 
+        bound_to_deadline(&mut tx, deadline)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
         let left_behind = sqlx::query_scalar!(
             r#"SELECT COUNT(*) AS "count!" FROM requests WHERE batch_id = $1"#,
             *batch_id as Uuid,
@@ -9341,6 +9407,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // for any future caller that reaches this UPDATE via a weaker lock
         // (EvalPlanQual re-checks target-row conditions after lock waits —
         // see the Phase 2 retry_version column comment).
+        bound_to_deadline(&mut tx, deadline)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
         let stamped = sqlx::query!(
             r#"
             UPDATE batches
@@ -9575,10 +9644,19 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         })?;
 
         let mut finalized = 0i64;
+        // One deadline for the whole call: the daemon abandons the call, not
+        // each batch's transaction, at its query timeout.
+        let deadline = self.maintenance_deadline();
         for batch_id in candidates {
-            let mut tx = self.begin_maintenance_write().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let mut tx = self
+                .begin_maintenance_write_until(deadline)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+                })?;
 
             // Lock the batch row FIRST (uniform batch->requests lock order;
             // the retry path locks in the same order, so the two serialize
@@ -9609,6 +9687,12 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             // user-visible count: every count path already projects
             // pending/claimed/processing rows of a cancelling batch as
             // canceled.
+            bound_to_deadline(&mut tx, deadline).await.map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to bound cancelled batch finalization: {}",
+                    e
+                ))
+            })?;
             sqlx::query!(
                 r#"
                 UPDATE requests
@@ -9633,6 +9717,12 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             // (without any notification being sent) to keep cancelled batches
             // out of the notifier's pending set permanently — user-initiated
             // cancellations are deliberately never emailed.
+            bound_to_deadline(&mut tx, deadline).await.map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to bound cancelled batch finalization: {}",
+                    e
+                ))
+            })?;
             let froze = sqlx::query!(
                 r#"
                 UPDATE batches b
@@ -9959,18 +10049,25 @@ mod tests {
         assert_eq!(manager.pending_counts_statement_timeout_ms(), 12_345);
     }
 
+    async fn statement_timeout_ms(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> i64 {
+        sqlx::query_scalar(
+            "SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout'",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .unwrap()
+    }
+
     #[sqlx::test]
-    async fn maintenance_transactions_are_bounded_on_the_server(pool: sqlx::PgPool) {
+    async fn maintenance_budget_follows_the_client_timeout(pool: sqlx::PgPool) {
         let manager = PostgresRequestManager::with_client(
             TestDbPools::new(pool.clone()).await.unwrap(),
             Arc::new(MockHttpClient::new()),
         );
+        // Default client timeout 180 s -> 150 s on the server.
         let mut tx = manager.begin_maintenance_write().await.unwrap();
-        let budget: String = sqlx::query_scalar("SELECT current_setting('statement_timeout')")
-            .fetch_one(&mut *tx)
-            .await
-            .unwrap();
-        assert_eq!(budget, "150s");
+        let budget = statement_timeout_ms(&mut tx).await;
+        assert!((149_000..=150_000).contains(&budget), "{budget}");
         tx.commit().await.unwrap();
 
         // SET LOCAL ends with the transaction, so pooled connections return
@@ -9980,6 +10077,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session, "0");
+
+        // A shorter configured client timeout shrinks the server budget with it.
+        let manager = manager.with_maintenance_query_timeout(std::time::Duration::from_secs(60));
+        let mut tx = manager.begin_maintenance_write().await.unwrap();
+        let budget = statement_timeout_ms(&mut tx).await;
+        assert!((49_000..=50_000).contains(&budget), "{budget}");
+        tx.rollback().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn later_maintenance_statements_share_one_deadline(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let now = std::time::Instant::now();
+
+        // A later statement gets only what is left of the call's budget.
+        let mut tx = manager
+            .begin_maintenance_write_until(now + std::time::Duration::from_secs(150))
+            .await
+            .unwrap();
+        bound_to_deadline(&mut tx, now + std::time::Duration::from_secs(20))
+            .await
+            .unwrap();
+        let budget = statement_timeout_ms(&mut tx).await;
+        assert!((19_000..=20_000).contains(&budget), "{budget}");
+        tx.rollback().await.unwrap();
+
+        // Past the deadline the next statement is cancelled at once.
+        let mut tx = manager.begin_maintenance_write().await.unwrap();
+        bound_to_deadline(&mut tx, now).await.unwrap();
+        let error = sqlx::query("SELECT pg_sleep(1)")
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("statement timeout"), "{error}");
     }
 
     // =========================================================================
