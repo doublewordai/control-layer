@@ -4420,16 +4420,26 @@ impl Application {
         (server, self.bg_services)
     }
 
-    /// Start serving the application
-    pub async fn serve<F>(mut self, shutdown: F) -> anyhow::Result<()>
+    /// Start serving the application on the configured host and port
+    pub async fn serve<F>(self, shutdown: F) -> anyhow::Result<()>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let bind_addr = self.config.bind_address();
-        let listener = TcpListener::bind(&bind_addr).await?;
+        let listener = TcpListener::bind(self.config.bind_address()).await?;
+        self.serve_with_listener(listener, shutdown).await
+    }
+
+    /// Start serving the application on an already-bound listener. The
+    /// listener's port should match `config.port`, which the application uses
+    /// to call itself.
+    pub async fn serve_with_listener<F>(mut self, listener: TcpListener, shutdown: F) -> anyhow::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         info!(
             "Control layer listening on http://{}, available at http://localhost:{}",
-            bind_addr, self.config.port
+            listener.local_addr()?,
+            self.config.port
         );
 
         // Apply middleware before path matching
