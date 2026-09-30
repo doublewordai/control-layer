@@ -7,13 +7,16 @@
 //! it onto the writer's mpsc channel; the batched writer task then persists
 //! the row in fusillade.
 //!
-//! Channel-full backpressure flows back to the outlet handler via
-//! `Sender::send().await`, matching `AnalyticsHandler`'s shape. We prefer
-//! slowing outlet to dropping rows, since the `requests` table is the only
-//! place the responses listing reads from.
+//! When the writer's channel is full the record is dropped and counted rather
+//! than awaited. Outlet runs each capture in its own task that holds the
+//! captured request and response until every handler finishes, so waiting on a
+//! writer that has fallen behind a slow database keeps those bodies alive and
+//! memory grows without bound. The `requests` table feeds the responses listing
+//! and polling, not billing, so a dropped row costs observability only.
 
 use chrono::{DateTime, Utc};
 use outlet::{RequestData, RequestHandler, ResponseData};
+use tokio::sync::mpsc::error::TrySendError;
 use uuid::Uuid;
 
 use super::writer::{RawCompletedRequest, RequestsWriterSender};
@@ -157,6 +160,30 @@ impl FusilladeOutletHandler {
     }
 }
 
+/// Hand a record to the requests writer without waiting.
+///
+/// A full channel means the writer has fallen behind the database. Waiting
+/// there would keep this capture's request and response bodies alive in the
+/// outlet task for as long as the writer stays behind, and under a slow
+/// database those tasks pile up until the process runs out of memory. The
+/// `requests` rows are observability, not billing (see the writer's module
+/// docs), so the record is dropped and counted instead.
+fn queue_for_writer(sender: &RequestsWriterSender, record: RawCompletedRequest, response_id: &str, kind: &'static str) {
+    match sender.try_send(record) {
+        Ok(()) => {
+            metrics::counter!("dwctl_requests_writer_sends_total", "result" => "ok").increment(1);
+        }
+        Err(TrySendError::Full(_)) => {
+            metrics::counter!("dwctl_requests_writer_dropped_total", "reason" => "channel_full").increment(1);
+            tracing::debug!(response_id = %response_id, kind, "Dropping record: requests writer channel is full");
+        }
+        Err(TrySendError::Closed(_)) => {
+            metrics::counter!("dwctl_requests_writer_sends_total", "result" => "err").increment(1);
+            tracing::warn!(response_id = %response_id, kind, "Failed to send record to requests writer (channel closed)");
+        }
+    }
+}
+
 impl RequestHandler for FusilladeOutletHandler {
     async fn handle_request(&self, _data: RequestData) {}
 
@@ -205,8 +232,9 @@ impl RequestHandler for FusilladeOutletHandler {
             let started_at: DateTime<Utc> = request_data.timestamp.into();
             let completed_at = started_at + response_duration(&response_data);
 
-            if let Err(e) = sender
-                .send(RawCompletedRequest {
+            queue_for_writer(
+                &sender,
+                RawCompletedRequest {
                     request_id: ctx.request_id,
                     status_code,
                     response_body,
@@ -217,18 +245,10 @@ impl RequestHandler for FusilladeOutletHandler {
                     created_by,
                     started_at,
                     completed_at,
-                })
-                .await
-            {
-                metrics::counter!("dwctl_requests_writer_sends_total", "result" => "err").increment(1);
-                tracing::warn!(
-                    error = %e,
-                    response_id = %ctx.response_id,
-                    "Failed to send completed-response record to writer (channel closed)"
-                );
-            } else {
-                metrics::counter!("dwctl_requests_writer_sends_total", "result" => "ok").increment(1);
-            }
+                },
+                &ctx.response_id,
+                "completed-response",
+            );
         }
     }
 
@@ -270,8 +290,9 @@ impl RequestHandler for FusilladeOutletHandler {
             // is truthful here — no round-trip completed).
             let started_at: DateTime<Utc> = request_data.timestamp.into();
 
-            if let Err(e) = sender
-                .send(RawCompletedRequest {
+            queue_for_writer(
+                &sender,
+                RawCompletedRequest {
                     request_id: ctx.request_id,
                     status_code: STATUS_CLIENT_CLOSED,
                     response_body: abandoned_body,
@@ -282,18 +303,10 @@ impl RequestHandler for FusilladeOutletHandler {
                     created_by,
                     started_at,
                     completed_at: started_at,
-                })
-                .await
-            {
-                metrics::counter!("dwctl_requests_writer_sends_total", "result" => "err").increment(1);
-                tracing::warn!(
-                    error = %e,
-                    response_id = %ctx.response_id,
-                    "Failed to send abandoned-response record to writer (channel closed)"
-                );
-            } else {
-                metrics::counter!("dwctl_requests_writer_sends_total", "result" => "ok").increment(1);
-            }
+                },
+                &ctx.response_id,
+                "abandoned-response",
+            );
         }
     }
 }
@@ -400,6 +413,35 @@ mod tests {
             trace_id: None,
             span_id: None,
         }
+    }
+
+    fn writer_record() -> RawCompletedRequest {
+        let started_at = chrono::Utc::now();
+        RawCompletedRequest {
+            request_id: Uuid::new_v4(),
+            status_code: 200,
+            response_body: "x".repeat(64 * 1024),
+            request_body: "y".repeat(64 * 1024),
+            model: "test-model".to_string(),
+            endpoint: "/v1/responses".to_string(),
+            api_key: "key".to_string(),
+            created_by: Uuid::new_v4().to_string(),
+            started_at,
+            completed_at: started_at,
+        }
+    }
+
+    /// A writer that has fallen behind must not hold the caller: the record is
+    /// dropped on the spot, so the outlet task can release its captured bodies.
+    #[test]
+    fn test_queue_for_writer_drops_instead_of_waiting_when_the_writer_is_behind() {
+        let (sender, _receiver) = RequestsWriterSender::full_for_test(writer_record());
+        assert_eq!(sender.queued_records(), 1);
+
+        // Synchronous: returning at all proves it did not wait for room.
+        queue_for_writer(&sender, writer_record(), "resp_test", "completed-response");
+
+        assert_eq!(sender.queued_records(), 1, "the dropped record must not be counted as queued");
     }
 
     #[test]
