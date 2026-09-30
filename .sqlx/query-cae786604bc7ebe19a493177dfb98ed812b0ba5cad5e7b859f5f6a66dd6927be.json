@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS(SELECT 1 FROM requests WHERE batch_id = $1) AS \"remain!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "remain!",
+        "type_info": "Bool"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "cae786604bc7ebe19a493177dfb98ed812b0ba5cad5e7b859f5f6a66dd6927be"
+}
