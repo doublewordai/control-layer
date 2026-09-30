@@ -4127,6 +4127,7 @@ impl Application {
             fusillade_pools.clone(),
             fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
         )
+        .with_maintenance_query_timeout(std::time::Duration::from_millis(fusillade_daemon_config.claim_query_timeout_ms))
         .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
         .with_realtime_retention_seconds(
             config

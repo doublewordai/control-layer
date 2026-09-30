@@ -142,6 +142,41 @@ impl Default for BatchInsertStrategy {
     }
 }
 
+/// Server-side budget for one daemon maintenance call, derived from the
+/// daemon's client-side query timeout.
+///
+/// The daemon gives up on a maintenance call after its query timeout
+/// (`claim_query_timeout_ms`) by dropping the future. The backend does not
+/// notice: it keeps executing a transaction that can no longer commit, holding
+/// its snapshot (which stops vacuum everywhere) and its locks, while the next
+/// tick starts the same work again. Every statement a maintenance call runs is
+/// therefore bounded on the server to end before the call's deadline, a fixed
+/// fraction of the client timeout, so an abandoned attempt is cancelled and
+/// rolled back no later than the point the daemon throws it away.
+fn maintenance_budget(client_timeout: std::time::Duration) -> std::time::Duration {
+    (client_timeout * 5 / 6).max(std::time::Duration::from_millis(1))
+}
+
+/// Default client-side query timeout of the batch daemon, used until the
+/// daemon installs its configured value with
+/// [`PostgresRequestManager::with_maintenance_query_timeout`].
+const DEFAULT_MAINTENANCE_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Limit the next statement of a maintenance transaction to the time left
+/// before `deadline`. Once the deadline has passed, the statement is cancelled
+/// at once and the transaction rolls back.
+async fn bound_to_deadline(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    deadline: std::time::Instant,
+) -> std::result::Result<(), sqlx::Error> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let millis = remaining.as_millis().clamp(1, i32::MAX as u128);
+    sqlx::query(&format!("SET LOCAL statement_timeout = {millis}"))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
@@ -165,6 +200,7 @@ pub struct PostgresRequestManager<P: PoolProvider> {
     /// error bodies before persistence; `None` is identity. Remove when stream
     /// reassembly moves into dwctl.
     response_transformer: std::sync::OnceLock<Arc<dyn crate::transform::ResponseTransformer>>,
+    maintenance_budget: std::time::Duration,
 }
 
 struct StateWriteLimiter {
@@ -398,7 +434,16 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             download_buffer_size: 100,
             batch_insert_strategy: BatchInsertStrategy::default(),
             response_transformer: std::sync::OnceLock::new(),
+            maintenance_budget: maintenance_budget(DEFAULT_MAINTENANCE_QUERY_TIMEOUT),
         }
+    }
+
+    /// Bound daemon maintenance on the server inside the daemon's client-side
+    /// query timeout (`claim_query_timeout_ms`). Pass the same value the
+    /// daemon uses so abandoned maintenance cannot outlive the daemon's wait.
+    pub fn with_maintenance_query_timeout(mut self, client_timeout: std::time::Duration) -> Self {
+        self.maintenance_budget = maintenance_budget(client_timeout);
+        self
     }
 
     /// Read only status while a response is running, loading its payload once terminal.
@@ -696,6 +741,32 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             self.query_schema.as_deref(),
         )
         .await
+    }
+
+    /// Deadline for one daemon maintenance call that starts now.
+    fn maintenance_deadline(&self) -> std::time::Instant {
+        std::time::Instant::now() + self.maintenance_budget
+    }
+
+    /// Begin a primary transaction for daemon maintenance whose first statement
+    /// must end within the maintenance budget. Multi-statement callers bound
+    /// each later statement with [`bound_to_deadline`].
+    async fn begin_maintenance_write(
+        &self,
+    ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+        self.begin_maintenance_write_until(self.maintenance_deadline())
+            .await
+    }
+
+    /// Begin a primary transaction for one step of a maintenance call that
+    /// must end by `deadline`.
+    async fn begin_maintenance_write_until(
+        &self,
+        deadline: std::time::Instant,
+    ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+        let mut tx = self.begin_write().await?;
+        bound_to_deadline(&mut tx, deadline).await?;
+        Ok(tx)
     }
 
     async fn begin_response_write(
@@ -5137,21 +5208,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
         let uuids: Vec<Uuid> = batch_ids.iter().map(|id| **id).collect();
 
-        let rows = sqlx::query_scalar!(
-            r#"
-            SELECT id
-            FROM batches
-            WHERE id = ANY($1)
-              AND cancelling_at IS NOT NULL
-              AND deleted_at IS NULL
-            "#,
-            &uuids,
-        )
-        .fetch_all(self.read_executor())
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to fetch cancelled batch IDs: {}", e))
-        })?;
+        let rows = sqlx::query_file_scalar!("src/postgres/sql/get_cancelled_batch_ids.sql", &uuids)
+            .fetch_all(self.read_executor())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to fetch cancelled batch IDs: {}", e))
+            })?;
 
         Ok(rows.into_iter().map(BatchId::from).collect())
     }
@@ -7509,67 +7571,12 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// never emailed (the finalizer stamps their claim marker without any
     /// notification being sent).
     pub async fn claim_batch_notifications(&self) -> Result<Vec<BatchNotification>> {
-        let rows = sqlx::query!(
-            r#"
-            WITH claimed AS (
-                UPDATE batches b
-                SET notification_sent_at = NOW()
-                WHERE b.id IN (
-                    -- SKIP LOCKED so concurrent pollers on other replicas
-                    -- claim disjoint sets instead of queueing on row locks;
-                    -- oldest-frozen-first so nothing starves under a backlog.
-                    SELECT id FROM batches
-                    WHERE counts_frozen_at IS NOT NULL
-                      AND notification_sent_at IS NULL
-                      AND cancelling_at IS NULL
-                      AND deleted_at IS NULL
-                      AND total_requests > 0
-                    ORDER BY counts_frozen_at
-                    LIMIT 100
-                    FOR UPDATE SKIP LOCKED
-                )
-                  AND b.notification_sent_at IS NULL  -- Re-check to handle concurrent pollers
-                RETURNING b.id, b.file_id, b.endpoint, b.service_tier, b.completion_window, b.metadata,
-                          b.output_file_id, b.error_file_id, b.created_by, b.created_at,
-                          b.expires_at, b.cancelling_at, b.errors, b.total_requests,
-                          b.requests_started_at, b.finalizing_at, b.completed_at,
-                          b.failed_at, b.cancelled_at, b.deleted_at, b.notification_sent_at, b.api_key_id,
-                          b.completed_requests, b.failed_requests, b.canceled_requests,
-                          b.archive_bucket
-            )
-            SELECT u.id AS "id!", u.file_id, u.endpoint AS "endpoint!",
-                   u.service_tier AS "service_tier?",
-                   u.completion_window AS "completion_window?", u.metadata,
-                   u.output_file_id, u.error_file_id, u.created_by AS "created_by!",
-                   u.created_at AS "created_at!", u.expires_at AS "expires_at?", u.cancelling_at,
-                   u.errors, u.total_requests AS "total_requests!",
-                   u.requests_started_at, u.finalizing_at, u.completed_at,
-                   u.failed_at, u.cancelled_at, u.deleted_at,
-                   u.notification_sent_at, u.api_key_id,
-                   u.completed_requests AS "completed_requests!",
-                   u.failed_requests AS "failed_requests!",
-                   u.canceled_requests AS "canceled_requests!",
-                   0::BIGINT AS "pending_requests!",
-                   0::BIGINT AS "in_progress_requests!",
-                   f.name AS "input_file_name?",
-                   f.description as input_file_description,
-                   -- Frozen batches may already have archived their rows out
-                   -- of `requests` by claim time; fall back to the archive
-                   -- for the model summary.
-                   COALESCE(
-                       (SELECT string_agg(DISTINCT r.model, ', ') FROM requests r WHERE r.batch_id = u.id),
-                       (SELECT string_agg(DISTINCT a.model, ', ') FROM batch_requests_archive a
-                        WHERE a.archive_bucket = u.archive_bucket AND a.batch_id = u.id)
-                   ) as model
-            FROM claimed u
-            LEFT JOIN files f ON f.id = u.file_id
-            "#
-        )
-        .fetch_all(self.write_executor())
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to poll completed batches: {}", e))
-        })?;
+        let rows = sqlx::query_file!("src/postgres/sql/claim_batch_notifications.sql")
+            .fetch_all(self.write_executor())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to poll completed batches: {}", e))
+            })?;
 
         Ok(rows
             .into_iter()
@@ -9133,8 +9140,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
 
     async fn archive_batch(&self, batch_id: BatchId) -> Result<ArchiveOutcome> {
         request_maintenance::before_archive(self).await?;
+        let deadline = self.maintenance_deadline();
         let mut tx = self
-            .begin_write()
+            .begin_maintenance_write_until(deadline)
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
@@ -9195,6 +9203,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             // to the caller the batch is simply not available, same as
             // already-archived), while a persisting NotFound for a listed
             // candidate would be odd.
+            bound_to_deadline(&mut tx, deadline).await.map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e))
+            })?;
             let exists = sqlx::query_scalar!(
                 r#"SELECT EXISTS(SELECT 1 FROM batches WHERE id = $1 AND deleted_at IS NULL) AS "exists!""#,
                 *batch_id as Uuid,
@@ -9222,6 +9233,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // of the move. Retirement fences a week by UPDATEing this row, so a
         // fence either waits for this move to commit or was already visible
         // here; rows can never land in a week after it was fenced.
+        bound_to_deadline(&mut tx, deadline)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
         let bucket_state: Option<String> = sqlx::query_scalar(
             "SELECT state FROM batch_archive_buckets WHERE week_start = $1 FOR SHARE",
         )
@@ -9237,6 +9251,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // means the batch stays live — fully served, exactly as today — and
         // the caller alerts. Name derivation must match
         // ensure_archive_partitions() exactly.
+        bound_to_deadline(&mut tx, deadline)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
         let partition_exists = sqlx::query_scalar!(
             r#"
             SELECT EXISTS (
@@ -9266,6 +9283,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // by the schema-parity test suite (archive = requests' columns +
         // archive_bucket appended last). ON CONFLICT makes crash-resume
         // replay a no-op for rows already copied.
+        bound_to_deadline(&mut tx, deadline)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
         let inserted = sqlx::query(
             r#"
             INSERT INTO batch_requests_archive
@@ -9286,6 +9306,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // rows that verifiably exist in the archive, then prove nothing was
         // left behind. A row can never be deleted un-copied, and a torn
         // state aborts the transaction instead of committing.
+        bound_to_deadline(&mut tx, deadline)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
         let deleted = sqlx::query!(
             r#"
             DELETE FROM requests r
@@ -9303,6 +9326,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to delete archived rows: {}", e)))?
         .rows_affected();
 
+        bound_to_deadline(&mut tx, deadline)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
         let left_behind = sqlx::query_scalar!(
             r#"SELECT COUNT(*) AS "count!" FROM requests WHERE batch_id = $1"#,
             *batch_id as Uuid,
@@ -9324,6 +9350,9 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // for any future caller that reaches this UPDATE via a weaker lock
         // (EvalPlanQual re-checks target-row conditions after lock waits —
         // see the Phase 2 retry_version column comment).
+        bound_to_deadline(&mut tx, deadline)
+            .await
+            .map_err(|e| FusilladeError::Other(anyhow!("Failed to bound archive move: {}", e)))?;
         let stamped = sqlx::query!(
             r#"
             UPDATE batches
@@ -9494,6 +9523,16 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                   AND b.deleted_at IS NULL
                   AND b.cancelling_at IS NULL
                   AND b.total_requests > 0
+                  -- Most unfrozen batches still have work in flight. Rule
+                  -- them out on a live row before the lateral counts above
+                  -- read every row of every candidate; `state_check` makes
+                  -- these three the complement of the terminal states, and
+                  -- the live count below stays the authoritative check.
+                  AND NOT EXISTS (
+                      SELECT 1 FROM requests r
+                      WHERE r.batch_id = b.id
+                        AND r.state IN ('pending', 'claimed', 'processing')
+                  )
                   AND COALESCE(counts.live, 0) = 0
                   AND COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0)
                       + COALESCE(arch.completed, 0) + COALESCE(arch.failed, 0) + COALESCE(arch.canceled, 0)
@@ -9558,10 +9597,19 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         })?;
 
         let mut finalized = 0i64;
+        // One deadline for the whole call: the daemon abandons the call, not
+        // each batch's transaction, at its query timeout.
+        let deadline = self.maintenance_deadline();
         for batch_id in candidates {
-            let mut tx = self.begin_write().await.map_err(|e| {
-                FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
-            })?;
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let mut tx = self
+                .begin_maintenance_write_until(deadline)
+                .await
+                .map_err(|e| {
+                    FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
+                })?;
 
             // Lock the batch row FIRST (uniform batch->requests lock order;
             // the retry path locks in the same order, so the two serialize
@@ -9592,6 +9640,12 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             // user-visible count: every count path already projects
             // pending/claimed/processing rows of a cancelling batch as
             // canceled.
+            bound_to_deadline(&mut tx, deadline).await.map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to bound cancelled batch finalization: {}",
+                    e
+                ))
+            })?;
             sqlx::query!(
                 r#"
                 UPDATE requests
@@ -9616,6 +9670,12 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
             // (without any notification being sent) to keep cancelled batches
             // out of the notifier's pending set permanently — user-initiated
             // cancellations are deliberately never emailed.
+            bound_to_deadline(&mut tx, deadline).await.map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to bound cancelled batch finalization: {}",
+                    e
+                ))
+            })?;
             let froze = sqlx::query!(
                 r#"
                 UPDATE batches b
@@ -9940,6 +10000,179 @@ mod tests {
         .with_config(config);
 
         assert_eq!(manager.pending_counts_statement_timeout_ms(), 12_345);
+    }
+
+    async fn statement_timeout_ms(tx: &mut sqlx::Transaction<'_, sqlx::Postgres>) -> i64 {
+        sqlx::query_scalar(
+            "SELECT setting::bigint FROM pg_settings WHERE name = 'statement_timeout'",
+        )
+        .fetch_one(&mut **tx)
+        .await
+        .unwrap()
+    }
+
+    #[sqlx::test]
+    async fn maintenance_budget_follows_the_client_timeout(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        // Default client timeout 180 s -> 150 s on the server.
+        let mut tx = manager.begin_maintenance_write().await.unwrap();
+        let budget = statement_timeout_ms(&mut tx).await;
+        assert!((149_000..=150_000).contains(&budget), "{budget}");
+        tx.commit().await.unwrap();
+
+        // SET LOCAL ends with the transaction, so pooled connections return
+        // to the session default for ordinary work.
+        let session: String = sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(session, "0");
+
+        // A shorter configured client timeout shrinks the server budget with it.
+        let manager = manager.with_maintenance_query_timeout(std::time::Duration::from_secs(60));
+        let mut tx = manager.begin_maintenance_write().await.unwrap();
+        let budget = statement_timeout_ms(&mut tx).await;
+        assert!((49_000..=50_000).contains(&budget), "{budget}");
+        tx.rollback().await.unwrap();
+    }
+
+    #[sqlx::test]
+    async fn later_maintenance_statements_share_one_deadline(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let now = std::time::Instant::now();
+
+        // A later statement gets only what is left of the call's budget.
+        let mut tx = manager
+            .begin_maintenance_write_until(now + std::time::Duration::from_secs(150))
+            .await
+            .unwrap();
+        bound_to_deadline(&mut tx, now + std::time::Duration::from_secs(20))
+            .await
+            .unwrap();
+        let budget = statement_timeout_ms(&mut tx).await;
+        assert!((19_000..=20_000).contains(&budget), "{budget}");
+        tx.rollback().await.unwrap();
+
+        // Past the deadline the next statement is cancelled at once.
+        let mut tx = manager.begin_maintenance_write().await.unwrap();
+        bound_to_deadline(&mut tx, now).await.unwrap();
+        let error = sqlx::query("SELECT pg_sleep(1)")
+            .execute(&mut *tx)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("statement timeout"), "{error}");
+    }
+
+    /// The production statements, from the same files the query macros read.
+    const GET_CANCELLED_BATCH_IDS_SQL: &str =
+        include_str!("postgres/sql/get_cancelled_batch_ids.sql");
+    const CLAIM_BATCH_NOTIFICATIONS_SQL: &str =
+        include_str!("postgres/sql/claim_batch_notifications.sql");
+
+    /// Whether one plan node is a `node_type` scan of `index_name`. Matching
+    /// both on the same node keeps a bitmap scan of the index from passing
+    /// for an index-only scan.
+    fn plan_scans_index(plan: &serde_json::Value, node_type: &str, index_name: &str) -> bool {
+        match plan {
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| plan_scans_index(value, node_type, index_name)),
+            serde_json::Value::Object(fields) => {
+                (fields.get("Node Type").and_then(|value| value.as_str()) == Some(node_type)
+                    && fields.get("Index Name").and_then(|value| value.as_str())
+                        == Some(index_name))
+                    || fields
+                        .values()
+                        .any(|value| plan_scans_index(value, node_type, index_name))
+            }
+            _ => false,
+        }
+    }
+
+    #[sqlx::test]
+    async fn cancellation_poll_probes_only_cancelling_batches(pool: sqlx::PgPool) {
+        // Thousands of live batches polled at once, two cancelling, and one
+        // cancelling but deleted.
+        sqlx::query(
+            r#"
+            INSERT INTO batches (id, endpoint, completion_window, created_by,
+                                 created_at, expires_at, cancelling_at, deleted_at)
+            SELECT md5(i::text)::uuid, '/v1/chat/completions', '24h', 'owner',
+                   '2026-01-01'::timestamptz + i * interval '1 second',
+                   '2026-01-02'::timestamptz,
+                   CASE WHEN i IN (7, 4000, 9000) THEN '2026-01-01'::timestamptz END,
+                   CASE WHEN i = 9000 THEN '2026-01-01'::timestamptz END
+            FROM generate_series(1, 10000) i
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("VACUUM (ANALYZE) batches")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let polled: Vec<Uuid> =
+            sqlx::query_scalar("SELECT md5(i::text)::uuid FROM generate_series(1, 10000) i")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        // The daemon repeats this query, so SQLx ends up on a generic plan.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::raw_sql(&format!(
+            "PREPARE cancel_poll(uuid[]) AS {GET_CANCELLED_BATCH_IDS_SQL}"
+        ))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let ids = polled
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let plan: serde_json::Value = sqlx::query_scalar(&format!(
+            "EXPLAIN (FORMAT JSON) EXECUTE cancel_poll('{{{ids}}}'::uuid[])"
+        ))
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert!(
+            plan_scans_index(&plan, "Index Only Scan", "idx_batches_cancelling"),
+            "the cancellation poll must be an index-only scan of idx_batches_cancelling: {plan}"
+        );
+        tx.rollback().await.unwrap();
+
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let polled: Vec<BatchId> = polled.into_iter().map(BatchId).collect();
+        let expected: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT md5(i::text)::uuid FROM unnest(ARRAY[7, 4000]) i ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut cancelled: Vec<Uuid> = manager
+            .get_cancelled_batch_ids(&polled)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|id| *id)
+            .collect();
+        cancelled.sort();
+        assert_eq!(cancelled, expected);
     }
 
     // =========================================================================
@@ -14365,28 +14598,33 @@ mod tests {
         .unwrap();
         sqlx::query("ANALYZE batches").execute(&pool).await.unwrap();
 
-        // The candidate subquery of claim_batch_notifications, verbatim.
-        let plan: serde_json::Value = sqlx::query_scalar(
-            r#"
-            EXPLAIN (FORMAT JSON)
-            SELECT id FROM batches
-            WHERE counts_frozen_at IS NOT NULL
-              AND notification_sent_at IS NULL
-              AND cancelling_at IS NULL
-              AND deleted_at IS NULL
-              AND total_requests > 0
-            ORDER BY counts_frozen_at
-            LIMIT 100
-            FOR UPDATE SKIP LOCKED
-            "#,
+        // The index itself, independent of what the planner picks today.
+        let (usable, predicate): (bool, String) = sqlx::query_as(
+            "SELECT i.indisvalid AND i.indisready, pg_get_expr(i.indpred, i.indrelid)
+             FROM pg_index i WHERE i.indexrelid = 'idx_batches_notification_due'::regclass",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert!(
-            plan.to_string()
-                .contains("\"Index Name\":\"idx_batches_notification_due\""),
-            "claim candidates must come from idx_batches_notification_due: {plan}"
+            usable,
+            "idx_batches_notification_due must be valid and ready"
+        );
+        assert_eq!(
+            predicate,
+            "((counts_frozen_at IS NOT NULL) AND (notification_sent_at IS NULL) AND (cancelling_at IS NULL) AND (deleted_at IS NULL) AND (total_requests > 0))"
+        );
+
+        // Plan the production claim statement itself; EXPLAIN does not run it.
+        let plan: serde_json::Value = sqlx::query_scalar(&format!(
+            "EXPLAIN (FORMAT JSON) {CLAIM_BATCH_NOTIFICATIONS_SQL}"
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            plan_scans_index(&plan, "Index Scan", "idx_batches_notification_due"),
+            "claim candidates must come from an ordered scan of idx_batches_notification_due: {plan}"
         );
 
         let manager = PostgresRequestManager::with_client(
@@ -14402,6 +14640,131 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Busy batches (any live row) must be ruled out before the finalizer
+    /// counts rows, so a pass reads the idle candidates' rows rather than
+    /// every row of every unfrozen batch.
+    #[sqlx::test]
+    async fn finalizer_counts_only_batches_without_live_requests(pool: sqlx::PgPool) {
+        // 2,000 busy batches (19 completed rows + 1 pending) and 5 idle
+        // batches whose 20 rows are all completed.
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO batches (id, endpoint, completion_window, created_by, created_at,
+                                 total_requests, expires_at)
+            SELECT md5('b' || i)::uuid, '/v1/chat/completions', '24h', 'owner', now(), 20,
+                   now() + interval '1 day'
+            FROM generate_series(1, 2005) i;
+            INSERT INTO requests (batch_id, model, state, response_status, response_body,
+                                  completed_at)
+            SELECT md5('b' || i)::uuid, 'finalizer-test', s.state,
+                   CASE WHEN s.state = 'completed' THEN 200 END,
+                   CASE WHEN s.state = 'completed' THEN '{}' END,
+                   CASE WHEN s.state = 'completed' THEN now() END
+            FROM generate_series(1, 2005) i, generate_series(1, 20) j,
+                 LATERAL (SELECT CASE WHEN i <= 2000 AND j = 20 THEN 'pending'
+                                      ELSE 'completed' END AS state) s;
+            ANALYZE batches;
+            ANALYZE requests;
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The candidate selection of finalize_terminal_batches, verbatim.
+        let plan: serde_json::Value = sqlx::query_scalar(
+            r#"
+            EXPLAIN (ANALYZE, FORMAT JSON)
+            SELECT b.id
+            FROM batches b
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE state = 'completed') AS completed,
+                    COUNT(*) FILTER (WHERE state = 'failed') AS failed,
+                    COUNT(*) FILTER (WHERE state = 'canceled') AS canceled,
+                    COUNT(*) FILTER (WHERE state NOT IN ('completed', 'failed', 'canceled')) AS live
+                FROM requests WHERE batch_id = b.id
+            ) counts ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE state = 'completed') AS completed,
+                    COUNT(*) FILTER (WHERE state = 'failed') AS failed,
+                    COUNT(*) FILTER (WHERE state = 'canceled') AS canceled
+                FROM batch_requests_archive a
+                WHERE b.location = 'split'
+                  AND a.archive_bucket = b.archive_bucket
+                  AND a.batch_id = b.id
+            ) arch ON TRUE
+            WHERE b.counts_frozen_at IS NULL
+              AND b.deleted_at IS NULL
+              AND b.cancelling_at IS NULL
+              AND b.total_requests > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM requests r
+                  WHERE r.batch_id = b.id
+                    AND r.state IN ('pending', 'claimed', 'processing')
+              )
+              AND COALESCE(counts.live, 0) = 0
+              AND COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0)
+                  + COALESCE(arch.completed, 0) + COALESCE(arch.failed, 0) + COALESCE(arch.canceled, 0)
+                  = b.total_requests
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Rows every scan of `requests` visited across all loops: those it
+        // emitted plus those its filter or index recheck discarded, so a scan
+        // that reads everything and keeps a little still counts in full.
+        fn request_rows_visited(node: &serde_json::Value) -> f64 {
+            match node {
+                serde_json::Value::Array(values) => values.iter().map(request_rows_visited).sum(),
+                serde_json::Value::Object(fields) => {
+                    let visited = if fields.get("Relation Name").and_then(|v| v.as_str())
+                        == Some("requests")
+                    {
+                        [
+                            "Actual Rows",
+                            "Rows Removed by Filter",
+                            "Rows Removed by Index Recheck",
+                        ]
+                        .iter()
+                        .map(|key| fields.get(*key).and_then(|v| v.as_f64()).unwrap_or(0.0))
+                        .sum::<f64>()
+                            * fields
+                                .get("Actual Loops")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    visited + fields.values().map(request_rows_visited).sum::<f64>()
+                }
+                _ => 0.0,
+            }
+        }
+        let read = request_rows_visited(&plan);
+        // Counting every candidate would read all 40,100 rows; the probe
+        // leaves the 2,000 live rows plus the idle batches' 100.
+        assert!(
+            read < 10_000.0,
+            "finalizer read {read} request rows: {plan}"
+        );
+
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        assert_eq!(manager.finalize_terminal_batches().await.unwrap(), 5);
+        let frozen: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM batches WHERE counts_frozen_at IS NOT NULL AND completed_requests = 20",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(frozen, 5);
     }
 
     /// The finalizer sweep freezes counts without any get_batch call, and the

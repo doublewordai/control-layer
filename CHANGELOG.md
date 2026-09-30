@@ -1,5 +1,33 @@
 # Changelog
 
+## [12.7.3](https://github.com/doublewordai/control-layer/compare/v12.7.2...v12.7.3) (2026-09-30)
+
+
+### Performance Improvements
+
+* **fusillade:** probe live requests by id in trailing demand ([#1889](https://github.com/doublewordai/control-layer/issues/1889)) ([4e6209b](https://github.com/doublewordai/control-layer/commit/4e6209b50867dc2e54952f949b4c869f46e92b2f))
+* **fusillade:** skip batches with live requests before finalizer counts ([#1879](https://github.com/doublewordai/control-layer/issues/1879)) ([79193b3](https://github.com/doublewordai/control-layer/commit/79193b39dfe91ab68de8e832087e22f586ffab90))
+
+## [12.7.2](https://github.com/doublewordai/control-layer/compare/v12.7.1...v12.7.2) (2026-09-30)
+
+
+### Bug Fixes
+
+* **dwctl:** autovacuum underway.task on a fixed row count ([#1873](https://github.com/doublewordai/control-layer/issues/1873)) ([fc5e13b](https://github.com/doublewordai/control-layer/commit/fc5e13b90d1c7e1ae50126832b2d71fb9713f45c))
+* **dwctl:** bound dashboard analytics reads and keep outbox gauges live ([#1874](https://github.com/doublewordai/control-layer/issues/1874)) ([e08fa25](https://github.com/doublewordai/control-layer/commit/e08fa25fe8f78b66b28cc18b98347fea92a23714))
+* **dwctl:** drop realtime writer records instead of blocking outlet ([#1888](https://github.com/doublewordai/control-layer/issues/1888)) ([854c099](https://github.com/doublewordai/control-layer/commit/854c099e8051fe2258f96e11927fba9b49ca33dd))
+
+
+### Performance Improvements
+
+* **fusillade:** index cancelling batches for the cancellation poll ([#1877](https://github.com/doublewordai/control-layer/issues/1877)) ([04763b7](https://github.com/doublewordai/control-layer/commit/04763b7406743210a17bdff3ed928c4be83e50a9))
+* **fusillade:** index pending batch notifications ([#1876](https://github.com/doublewordai/control-layer/issues/1876)) ([57738ae](https://github.com/doublewordai/control-layer/commit/57738aea3abf9f5660b3ec8e91fbc449f57caf9a))
+
+
+### Tests
+
+* **dwctl:** heap budgets for requests in flight ([#1870](https://github.com/doublewordai/control-layer/issues/1870)) ([95715ca](https://github.com/doublewordai/control-layer/commit/95715ca7671a386f910ce39ebb773ebd7d4d41a5))
+
 ## [12.7.1](https://github.com/doublewordai/control-layer/compare/v12.7.0...v12.7.1) (2026-09-30)
 
 

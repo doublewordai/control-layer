@@ -137,7 +137,10 @@ pub(super) async fn expire_file_content<P: PoolProvider>(
     if retention_days < 1 || batch_size < 1 {
         return Ok(0);
     }
-    let mut transaction = manager.begin_write().await.map_err(|_| failed())?;
+    let mut transaction = manager
+        .begin_maintenance_write()
+        .await
+        .map_err(|_| failed())?;
     let expired = sqlx::query(
         r#"
         WITH candidates AS MATERIALIZED (
@@ -190,7 +193,10 @@ pub(super) async fn cleanup_retired_template_routes<P: PoolProvider>(
     if limit == 0 {
         return Ok(0);
     }
-    let mut transaction = manager.begin_write().await.map_err(|_| failed())?;
+    let mut transaction = manager
+        .begin_maintenance_write()
+        .await
+        .map_err(|_| failed())?;
     let deleted = sqlx::query_scalar::<_, i64>(
         r#"
         WITH candidates AS MATERIALIZED (
