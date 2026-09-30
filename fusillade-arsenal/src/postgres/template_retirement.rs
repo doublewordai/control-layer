@@ -124,6 +124,35 @@ pub(super) async fn retire_expired_template_partition<P: PoolProvider>(
     retire(manager, &TEMPLATE_FAMILY, select_new, Some(retention_days)).await
 }
 
+/// Candidate selection and tombstone for [`expire_file_content`], oldest
+/// upload first. The age bound is written against the bare column so
+/// `idx_files_content_expiry_due` can stop the scan at the retention horizon.
+const EXPIRE_FILE_CONTENT: &str = r#"
+    WITH candidates AS MATERIALIZED (
+        SELECT id
+        FROM files
+        WHERE purpose = 'batch'
+          AND deleted_at IS NULL
+          AND created_at <= statement_timestamp() - make_interval(days => $1)
+          AND NOT EXISTS (
+              SELECT 1 FROM batches b
+              WHERE b.file_id = files.id
+                AND b.deleted_at IS NULL
+                AND b.retention_expired_at IS NULL
+          )
+        ORDER BY created_at, id
+        LIMIT $2
+        FOR UPDATE SKIP LOCKED
+    )
+    UPDATE files
+    SET deleted_at = statement_timestamp(),
+        retention_expired_at = statement_timestamp(),
+        status = 'expired'
+    FROM candidates
+    WHERE files.id = candidates.id
+      AND files.deleted_at IS NULL
+    "#;
+
 /// Tombstone input files whose content has aged out: the file row survives
 /// with `retention_expired_at` set, downloads and new batch creation fail,
 /// and its template window becomes droppable. Runs in bounded chunks; a file
@@ -138,39 +167,13 @@ pub(super) async fn expire_file_content<P: PoolProvider>(
         return Ok(0);
     }
     let mut transaction = manager.begin_write().await.map_err(|_| failed())?;
-    let expired = sqlx::query(
-        r#"
-        WITH candidates AS MATERIALIZED (
-            SELECT id
-            FROM files
-            WHERE purpose = 'batch'
-              AND deleted_at IS NULL
-              AND created_at + make_interval(days => $1) <= statement_timestamp()
-              AND NOT EXISTS (
-                  SELECT 1 FROM batches b
-                  WHERE b.file_id = files.id
-                    AND b.deleted_at IS NULL
-                    AND b.retention_expired_at IS NULL
-              )
-            ORDER BY created_at, id
-            LIMIT $2
-            FOR UPDATE SKIP LOCKED
-        )
-        UPDATE files
-        SET deleted_at = statement_timestamp(),
-            retention_expired_at = statement_timestamp(),
-            status = 'expired'
-        FROM candidates
-        WHERE files.id = candidates.id
-          AND files.deleted_at IS NULL
-        "#,
-    )
-    .bind(retention_days)
-    .bind(batch_size)
-    .execute(&mut *transaction)
-    .await
-    .map_err(|_| failed())?
-    .rows_affected();
+    let expired = sqlx::query(EXPIRE_FILE_CONTENT)
+        .bind(retention_days)
+        .bind(batch_size)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|_| failed())?
+        .rows_affected();
     transaction.commit().await.map_err(|_| failed())?;
     Ok(expired)
 }
@@ -217,4 +220,58 @@ pub(super) async fn cleanup_retired_template_routes<P: PoolProvider>(
     .map_err(|_| failed())?;
     transaction.commit().await.map_err(|_| failed())?;
     u64::try_from(deleted).map_err(|_| failed())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::TestDbPools;
+
+    /// A long history of recent uploads must not be scanned to find the few
+    /// files past the retention horizon.
+    #[sqlx::test]
+    async fn expiry_reads_only_files_past_the_horizon(pool: sqlx::PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO files (name, purpose, created_at)
+            SELECT 'upload-' || i, 'batch',
+                   CASE WHEN i <= 5 THEN now() - interval '60 days' ELSE now() END
+            FROM generate_series(1, 20005) i
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE files").execute(&pool).await.unwrap();
+
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::raw_sql(&format!(
+            "PREPARE expire_file_content(int, bigint) AS {EXPIRE_FILE_CONTENT}"
+        ))
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let plan: serde_json::Value =
+            sqlx::query_scalar("EXPLAIN (FORMAT JSON) EXECUTE expire_file_content(30, 100)")
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap();
+        tx.rollback().await.unwrap();
+        assert!(
+            plan.to_string()
+                .contains("\"Index Name\":\"idx_files_content_expiry_due\""),
+            "expiry candidates must come from idx_files_content_expiry_due: {plan}"
+        );
+
+        let manager = PostgresRequestManager::new(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Default::default(),
+        );
+        assert_eq!(expire_file_content(&manager, 30, 100).await.unwrap(), 5);
+        assert_eq!(expire_file_content(&manager, 30, 100).await.unwrap(), 0);
+    }
 }
