@@ -5137,21 +5137,12 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
 
         let uuids: Vec<Uuid> = batch_ids.iter().map(|id| **id).collect();
 
-        let rows = sqlx::query_scalar!(
-            r#"
-            SELECT id
-            FROM batches
-            WHERE id = ANY($1)
-              AND cancelling_at IS NOT NULL
-              AND deleted_at IS NULL
-            "#,
-            &uuids,
-        )
-        .fetch_all(self.read_executor())
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to fetch cancelled batch IDs: {}", e))
-        })?;
+        let rows = sqlx::query_file_scalar!("src/postgres/sql/get_cancelled_batch_ids.sql", &uuids)
+            .fetch_all(self.read_executor())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to fetch cancelled batch IDs: {}", e))
+            })?;
 
         Ok(rows.into_iter().map(BatchId::from).collect())
     }
@@ -7509,67 +7500,12 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     /// never emailed (the finalizer stamps their claim marker without any
     /// notification being sent).
     pub async fn claim_batch_notifications(&self) -> Result<Vec<BatchNotification>> {
-        let rows = sqlx::query!(
-            r#"
-            WITH claimed AS (
-                UPDATE batches b
-                SET notification_sent_at = NOW()
-                WHERE b.id IN (
-                    -- SKIP LOCKED so concurrent pollers on other replicas
-                    -- claim disjoint sets instead of queueing on row locks;
-                    -- oldest-frozen-first so nothing starves under a backlog.
-                    SELECT id FROM batches
-                    WHERE counts_frozen_at IS NOT NULL
-                      AND notification_sent_at IS NULL
-                      AND cancelling_at IS NULL
-                      AND deleted_at IS NULL
-                      AND total_requests > 0
-                    ORDER BY counts_frozen_at
-                    LIMIT 100
-                    FOR UPDATE SKIP LOCKED
-                )
-                  AND b.notification_sent_at IS NULL  -- Re-check to handle concurrent pollers
-                RETURNING b.id, b.file_id, b.endpoint, b.service_tier, b.completion_window, b.metadata,
-                          b.output_file_id, b.error_file_id, b.created_by, b.created_at,
-                          b.expires_at, b.cancelling_at, b.errors, b.total_requests,
-                          b.requests_started_at, b.finalizing_at, b.completed_at,
-                          b.failed_at, b.cancelled_at, b.deleted_at, b.notification_sent_at, b.api_key_id,
-                          b.completed_requests, b.failed_requests, b.canceled_requests,
-                          b.archive_bucket
-            )
-            SELECT u.id AS "id!", u.file_id, u.endpoint AS "endpoint!",
-                   u.service_tier AS "service_tier?",
-                   u.completion_window AS "completion_window?", u.metadata,
-                   u.output_file_id, u.error_file_id, u.created_by AS "created_by!",
-                   u.created_at AS "created_at!", u.expires_at AS "expires_at?", u.cancelling_at,
-                   u.errors, u.total_requests AS "total_requests!",
-                   u.requests_started_at, u.finalizing_at, u.completed_at,
-                   u.failed_at, u.cancelled_at, u.deleted_at,
-                   u.notification_sent_at, u.api_key_id,
-                   u.completed_requests AS "completed_requests!",
-                   u.failed_requests AS "failed_requests!",
-                   u.canceled_requests AS "canceled_requests!",
-                   0::BIGINT AS "pending_requests!",
-                   0::BIGINT AS "in_progress_requests!",
-                   f.name AS "input_file_name?",
-                   f.description as input_file_description,
-                   -- Frozen batches may already have archived their rows out
-                   -- of `requests` by claim time; fall back to the archive
-                   -- for the model summary.
-                   COALESCE(
-                       (SELECT string_agg(DISTINCT r.model, ', ') FROM requests r WHERE r.batch_id = u.id),
-                       (SELECT string_agg(DISTINCT a.model, ', ') FROM batch_requests_archive a
-                        WHERE a.archive_bucket = u.archive_bucket AND a.batch_id = u.id)
-                   ) as model
-            FROM claimed u
-            LEFT JOIN files f ON f.id = u.file_id
-            "#
-        )
-        .fetch_all(self.write_executor())
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to poll completed batches: {}", e))
-        })?;
+        let rows = sqlx::query_file!("src/postgres/sql/claim_batch_notifications.sql")
+            .fetch_all(self.write_executor())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to poll completed batches: {}", e))
+            })?;
 
         Ok(rows
             .into_iter()
@@ -9945,16 +9881,27 @@ mod tests {
         assert_eq!(manager.pending_counts_statement_timeout_ms(), 12_345);
     }
 
-    fn plan_uses_index(plan: &serde_json::Value, index_name: &str) -> bool {
+    /// The production statements, from the same files the query macros read.
+    const GET_CANCELLED_BATCH_IDS_SQL: &str =
+        include_str!("postgres/sql/get_cancelled_batch_ids.sql");
+    const CLAIM_BATCH_NOTIFICATIONS_SQL: &str =
+        include_str!("postgres/sql/claim_batch_notifications.sql");
+
+    /// Whether one plan node is a `node_type` scan of `index_name`. Matching
+    /// both on the same node keeps a bitmap scan of the index from passing
+    /// for an index-only scan.
+    fn plan_scans_index(plan: &serde_json::Value, node_type: &str, index_name: &str) -> bool {
         match plan {
             serde_json::Value::Array(values) => values
                 .iter()
-                .any(|value| plan_uses_index(value, index_name)),
+                .any(|value| plan_scans_index(value, node_type, index_name)),
             serde_json::Value::Object(fields) => {
-                fields.get("Index Name").and_then(|value| value.as_str()) == Some(index_name)
+                (fields.get("Node Type").and_then(|value| value.as_str()) == Some(node_type)
+                    && fields.get("Index Name").and_then(|value| value.as_str())
+                        == Some(index_name))
                     || fields
                         .values()
-                        .any(|value| plan_uses_index(value, index_name))
+                        .any(|value| plan_scans_index(value, node_type, index_name))
             }
             _ => false,
         }
@@ -9979,7 +9926,10 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        sqlx::query("ANALYZE batches").execute(&pool).await.unwrap();
+        sqlx::query("VACUUM (ANALYZE) batches")
+            .execute(&pool)
+            .await
+            .unwrap();
         let polled: Vec<Uuid> =
             sqlx::query_scalar("SELECT md5(i::text)::uuid FROM generate_series(1, 10000) i")
                 .fetch_all(&pool)
@@ -9992,9 +9942,9 @@ mod tests {
             .execute(&mut *tx)
             .await
             .unwrap();
-        sqlx::raw_sql(
-            "PREPARE cancel_poll(uuid[]) AS SELECT id FROM batches WHERE id = ANY($1) AND cancelling_at IS NOT NULL AND deleted_at IS NULL",
-        )
+        sqlx::raw_sql(&format!(
+            "PREPARE cancel_poll(uuid[]) AS {GET_CANCELLED_BATCH_IDS_SQL}"
+        ))
         .execute(&mut *tx)
         .await
         .unwrap();
@@ -10010,8 +9960,8 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            plan_uses_index(&plan, "idx_batches_cancelling"),
-            "the cancellation poll must probe idx_batches_cancelling, not the batches heap: {plan}"
+            plan_scans_index(&plan, "Index Only Scan", "idx_batches_cancelling"),
+            "the cancellation poll must be an index-only scan of idx_batches_cancelling: {plan}"
         );
         tx.rollback().await.unwrap();
 
@@ -14460,28 +14410,33 @@ mod tests {
         .unwrap();
         sqlx::query("ANALYZE batches").execute(&pool).await.unwrap();
 
-        // The candidate subquery of claim_batch_notifications, verbatim.
-        let plan: serde_json::Value = sqlx::query_scalar(
-            r#"
-            EXPLAIN (FORMAT JSON)
-            SELECT id FROM batches
-            WHERE counts_frozen_at IS NOT NULL
-              AND notification_sent_at IS NULL
-              AND cancelling_at IS NULL
-              AND deleted_at IS NULL
-              AND total_requests > 0
-            ORDER BY counts_frozen_at
-            LIMIT 100
-            FOR UPDATE SKIP LOCKED
-            "#,
+        // The index itself, independent of what the planner picks today.
+        let (usable, predicate): (bool, String) = sqlx::query_as(
+            "SELECT i.indisvalid AND i.indisready, pg_get_expr(i.indpred, i.indrelid)
+             FROM pg_index i WHERE i.indexrelid = 'idx_batches_notification_due'::regclass",
         )
         .fetch_one(&pool)
         .await
         .unwrap();
         assert!(
-            plan.to_string()
-                .contains("\"Index Name\":\"idx_batches_notification_due\""),
-            "claim candidates must come from idx_batches_notification_due: {plan}"
+            usable,
+            "idx_batches_notification_due must be valid and ready"
+        );
+        assert_eq!(
+            predicate,
+            "((counts_frozen_at IS NOT NULL) AND (notification_sent_at IS NULL) AND (cancelling_at IS NULL) AND (deleted_at IS NULL) AND (total_requests > 0))"
+        );
+
+        // Plan the production claim statement itself; EXPLAIN does not run it.
+        let plan: serde_json::Value = sqlx::query_scalar(&format!(
+            "EXPLAIN (FORMAT JSON) {CLAIM_BATCH_NOTIFICATIONS_SQL}"
+        ))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            plan_scans_index(&plan, "Index Scan", "idx_batches_notification_due"),
+            "claim candidates must come from an ordered scan of idx_batches_notification_due: {plan}"
         );
 
         let manager = PostgresRequestManager::with_client(
