@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE prompt_cache_entries\n            SET expires_at = $5\n            WHERE principal_id = $1 AND virtual_model = $2 AND tokenizer_version = $3\n              AND prefix_hash = $4\n              AND expires_at < $6\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Bytea",
+        "Timestamptz",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f9b5208989d1cab4ace1fb234f7d2b66c408aa6736566c1d4516ef0106fffd70"
+}

@@ -19,25 +19,25 @@
 //! ## Refresh debounce
 //!
 //! Every successful request that reads a cached prefix slides that entry's expiry, so a
-//! prefix shared by many requests receives a refresh per request. The `UPDATE` already skips
-//! a move of less than 1% of the window, but issuing it still costs a round trip and a row
-//! lookup per request. Each index therefore remembers, per entry, a lower bound on the
-//! expiry it has just observed (from its own lookup, write or refresh) and applies the same
-//! 1% rule in process before sending anything.
+//! prefix shared by many requests receives a refresh per request. The `UPDATE` declines a
+//! move of less than 1% of the window, but issuing it still costs a round trip and a row
+//! lookup per request. Each index therefore remembers, per entry, an expiry it recently
+//! observed (through its own lookup, write or successful refresh) and applies the same rule
+//! in process before sending anything.
 //!
-//! Refreshes only move an expiry forward, so a skip is exactly the `UPDATE`'s own decision
-//! unless something lowered the stored expiry after this process observed it. Only a write
-//! can do that: another request re-creating an entry it saw as expired, committing an
-//! expiry computed when that request started. Every request looks the entry up before it
-//! refreshes, and the lookup replaces this process's knowledge with the stored value, so a
-//! lowered expiry is seen by the next request here. At worst a request racing such a write
-//! misses the cache and writes the entry again, which is the index's safe failure mode.
-//! Knowledge also ages out after [`MAX_KNOWN_EXPIRY_AGE`] regardless.
+//! A stored expiry never decreases: a refresh only moves it forward, and a write keeps the
+//! later of the stored and the written expiry. Every observation is therefore a lower bound
+//! on the stored value for as long as the row exists, whichever process or order produced
+//! it, and skipping when that bound already meets the threshold is exactly the decision
+//! the `UPDATE` would make, or a more conservative one. The rule itself lives in one place,
+//! [`refresh_threshold`]: the `UPDATE` receives the threshold as a parameter rather than
+//! recomputing it. Knowledge ages out after [`MAX_KNOWN_EXPIRY_AGE`], so only deleting and
+//! re-creating a live entry within that window could leave a bound above the row.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound, Utc};
 use moka::future::Cache;
 use rand::RngExt;
 use tracing::instrument;
@@ -65,10 +65,18 @@ fn entry_key(scope: &IndexScope, prefix_hash: &PrefixHash) -> EntryKey {
     )
 }
 
-/// The refresh `UPDATE`'s own rule: an entry whose expiry is already within 1% of the
-/// window of `new_expires_at` does not need the refresh.
+/// The sliding-TTL refresh rule, the only implementation of it: an entry whose expiry is
+/// already within 1% of the window of `new_expires_at` does not need the refresh. Truncated
+/// to Postgres's microsecond precision so the in-process check and the `UPDATE`, which
+/// receives this value as its threshold, compare the same instant.
 fn refresh_threshold(new_expires_at: DateTime<Utc>, now: DateTime<Utc>) -> DateTime<Utc> {
-    new_expires_at - (new_expires_at - now) / 100
+    (new_expires_at - (new_expires_at - now) / 100).trunc_subsecs(6)
+}
+
+/// Whether an entry whose stored expiry is `expires_at` needs no refresh at `threshold`.
+/// The `UPDATE` writes exactly when this is false (`expires_at < threshold`).
+fn already_fresh(expires_at: DateTime<Utc>, threshold: DateTime<Utc>) -> bool {
+    expires_at >= threshold
 }
 
 /// Postgres-backed prefix index over `prompt_cache_entries`.
@@ -138,6 +146,14 @@ macro_rules! with_conn_retry {
 }
 
 impl PostgresIndex {
+    /// Record an observed expiry for the refresh debounce. The latest observation replaces
+    /// any earlier one: every observation is a lower bound on the stored expiry (see the
+    /// module docs), so an observation published out of order can only make this process
+    /// send a refresh it could have skipped.
+    async fn remember(&self, key: EntryKey, expires_at: DateTime<Utc>) {
+        self.known_expiry.insert(key, expires_at.trunc_subsecs(6)).await;
+    }
+
     async fn lookup_once(&self, scope: &IndexScope, candidate_hashes: &[PrefixHash]) -> Result<Vec<LookupRow>, sqlx::Error> {
         // Point lookup on the (org, model, tok, hash) unique btree, filtered to live
         // entries. now() is applied here (it can't sit in a partial-index predicate).
@@ -159,7 +175,11 @@ impl PostgresIndex {
     }
 
     async fn write_once(&self, entry: &CacheEntry) -> Result<(), sqlx::Error> {
-        // Upsert: a re-write of the same prefix refreshes its count/tier/expiry.
+        // Upsert: a re-write of the same prefix refreshes its count and tier. The expiry
+        // keeps the later of the two: a write lands on a live entry only when concurrent
+        // requests both missed it, and the one committing last may carry the earlier
+        // expiry. Never shortening a window also keeps every observed expiry a lower bound
+        // for the refresh debounce (see the module docs).
         sqlx::query!(
             r#"
             INSERT INTO prompt_cache_entries
@@ -170,7 +190,7 @@ impl PostgresIndex {
             DO UPDATE SET
               cumulative_token_count = EXCLUDED.cumulative_token_count,
               ttl_tier               = EXCLUDED.ttl_tier,
-              expires_at             = EXCLUDED.expires_at
+              expires_at             = GREATEST(prompt_cache_entries.expires_at, EXCLUDED.expires_at)
             "#,
             entry.scope.principal_id,
             entry.scope.virtual_model,
@@ -185,26 +205,33 @@ impl PostgresIndex {
         .map(|_| ())
     }
 
-    async fn refresh_once(&self, scope: &IndexScope, prefix_hash: &PrefixHash, new_expires_at: DateTime<Utc>) -> Result<u64, sqlx::Error> {
+    async fn refresh_once(
+        &self,
+        scope: &IndexScope,
+        prefix_hash: &PrefixHash,
+        new_expires_at: DateTime<Utc>,
+        threshold: DateTime<Utc>,
+    ) -> Result<u64, sqlx::Error> {
         // Slide the window forward (the sliding-TTL refresh). Every request that reads
         // a shared prefix refreshes the same row, so under load an unconditional UPDATE
-        // queues every caller on that row's lock. Only write when the expiry would move
-        // by more than 1% of the window: a refresh that would change almost nothing
+        // queues every caller on that row's lock. Only write when the expiry is below
+        // `threshold` (see `refresh_threshold`): a refresh that would change almost nothing
         // matches no row and takes no lock, and the window still slides with at most
         // 1% lag.
         sqlx::query!(
             r#"
             UPDATE prompt_cache_entries
-            SET expires_at = $5::timestamptz
+            SET expires_at = $5
             WHERE principal_id = $1 AND virtual_model = $2 AND tokenizer_version = $3
               AND prefix_hash = $4
-              AND expires_at < $5::timestamptz - ($5::timestamptz - now()) / 100
+              AND expires_at < $6
             "#,
             scope.principal_id,
             scope.virtual_model,
             scope.tokenizer_version,
             prefix_hash,
             new_expires_at,
+            threshold,
         )
         .execute(&self.pool)
         .await
@@ -243,7 +270,7 @@ impl CacheIndex for PostgresIndex {
             })
             .collect::<CacheResult<Vec<_>>>()?;
         for m in &matches {
-            self.known_expiry.insert(entry_key(scope, &m.prefix_hash), m.expires_at).await;
+            self.remember(entry_key(scope, &m.prefix_hash), m.expires_at).await;
         }
         Ok(matches)
     }
@@ -251,30 +278,31 @@ impl CacheIndex for PostgresIndex {
     #[instrument(skip_all, fields(model = %entry.scope.virtual_model, ttl = entry.ttl_tier.as_str()), err)]
     async fn write(&self, entry: &CacheEntry) -> CacheResult<()> {
         with_conn_retry!("write", self.conn_retries, self.write_once(entry))?;
-        self.known_expiry
-            .insert(entry_key(&entry.scope, &entry.prefix_hash), entry.expires_at)
-            .await;
+        // The stored expiry is now at least the written one.
+        self.remember(entry_key(&entry.scope, &entry.prefix_hash), entry.expires_at).await;
         Ok(())
     }
 
     #[instrument(skip_all, fields(model = %scope.virtual_model), err)]
     async fn refresh(&self, scope: &IndexScope, prefix_hash: &PrefixHash, new_expires_at: DateTime<Utc>) -> CacheResult<()> {
         let key = entry_key(scope, prefix_hash);
+        let threshold = refresh_threshold(new_expires_at, Utc::now());
         if let Some(known) = self.known_expiry.get(&key).await
-            && known >= refresh_threshold(new_expires_at, Utc::now())
+            && already_fresh(known, threshold)
         {
             cache_metrics::record_refresh_skipped();
             return Ok(());
         }
-        let updated = with_conn_retry!("refresh", self.conn_retries, self.refresh_once(scope, prefix_hash, new_expires_at))?;
-        // Either this refresh wrote `new_expires_at`, or the row already met the threshold
-        // (or no longer exists, in which case there is nothing to refresh).
-        let known = if updated > 0 {
-            new_expires_at
-        } else {
-            refresh_threshold(new_expires_at, Utc::now())
-        };
-        self.known_expiry.insert(key, known).await;
+        let updated = with_conn_retry!(
+            "refresh",
+            self.conn_retries,
+            self.refresh_once(scope, prefix_hash, new_expires_at, threshold)
+        )?;
+        // A zero-row result cannot tell "already fresh" from "no such row", so it is not
+        // remembered; the next request's lookup records the stored expiry anyway.
+        if updated > 0 {
+            self.remember(key, new_expires_at).await;
+        }
         Ok(())
     }
 }
@@ -382,8 +410,8 @@ mod tests {
             .unwrap()
     }
 
-    /// Lower the stored expiry behind the index's back, as a concurrent write from another
-    /// process could. Whether a later refresh moves it shows whether a statement was sent.
+    /// Change the stored expiry behind the index's back. Whether a later refresh moves it
+    /// shows whether a statement was sent.
     async fn lower_stored_expiry(pool: &sqlx::PgPool, s: &IndexScope, hash: &[u8], to: DateTime<Utc>) {
         sqlx::query("UPDATE prompt_cache_entries SET expires_at = $3 WHERE principal_id = $1 AND prefix_hash = $2")
             .bind(s.principal_id)
@@ -450,6 +478,74 @@ mod tests {
             stored_expiry(&pool, &s, b"aging").await.timestamp_micros(),
             target.timestamp_micros()
         );
+    }
+
+    #[sqlx::test]
+    async fn write_never_shortens_a_live_entry(pool: sqlx::PgPool) {
+        let idx = PostgresIndex::new(pool.clone(), 1);
+        let s = scope();
+        let later = Utc::now() + chrono::Duration::hours(1);
+        let mut first = entry(&s, b"raced", 7, TtlTier::OneHour);
+        first.expires_at = later;
+        idx.write(&first).await.unwrap();
+
+        // A concurrent writer that computed its expiry earlier commits second.
+        let mut second = entry(&s, b"raced", 9, TtlTier::OneHour);
+        second.expires_at = Utc::now() + chrono::Duration::minutes(50);
+        PostgresIndex::new(pool.clone(), 1).write(&second).await.unwrap();
+
+        assert_eq!(
+            stored_expiry(&pool, &s, b"raced").await.timestamp_micros(),
+            later.timestamp_micros()
+        );
+        let hits = idx.lookup(&s, &[b"raced".to_vec()]).await.unwrap();
+        assert_eq!(hits[0].cumulative_token_count, 9, "count and tier still follow the latest write");
+
+        // An expired entry is re-created with the new expiry.
+        let mut expired = entry(&s, b"stale", 7, TtlTier::FiveMinutes);
+        expired.expires_at = Utc::now() - chrono::Duration::minutes(1);
+        idx.write(&expired).await.unwrap();
+        let revived = Utc::now() + chrono::Duration::minutes(5);
+        let mut again = entry(&s, b"stale", 7, TtlTier::FiveMinutes);
+        again.expires_at = revived;
+        idx.write(&again).await.unwrap();
+        assert_eq!(
+            stored_expiry(&pool, &s, b"stale").await.timestamp_micros(),
+            revived.timestamp_micros()
+        );
+    }
+
+    /// The in-process check and the `UPDATE` share one threshold; at and around it they
+    /// must reach the same decision.
+    #[sqlx::test]
+    async fn in_process_check_and_update_agree_at_the_threshold(pool: sqlx::PgPool) {
+        let idx = PostgresIndex::new(pool.clone(), 1);
+        let s = scope();
+        let new_expires_at = Utc::now() + chrono::Duration::hours(1);
+        let threshold = refresh_threshold(new_expires_at, Utc::now());
+        for (n, offset_micros) in [-1i64, 0, 1].into_iter().enumerate() {
+            let hash = format!("boundary-{n}").into_bytes();
+            let stored = threshold + chrono::Duration::microseconds(offset_micros);
+            let mut e = entry(&s, &hash, 7, TtlTier::OneHour);
+            e.expires_at = stored;
+            idx.write_once(&e).await.unwrap();
+
+            let updated = idx.refresh_once(&s, &hash, new_expires_at, threshold).await.unwrap();
+            assert_eq!(
+                updated == 0,
+                already_fresh(stored, threshold),
+                "offset {offset_micros}µs: the UPDATE and the in-process check disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn threshold_is_one_percent_of_the_window_at_microsecond_precision() {
+        let now = Utc::now();
+        let new_expires_at = now + chrono::Duration::hours(1);
+        let threshold = refresh_threshold(new_expires_at, now);
+        assert_eq!(threshold, (new_expires_at - chrono::Duration::seconds(36)).trunc_subsecs(6));
+        assert_eq!(threshold.timestamp_subsec_nanos() % 1_000, 0);
     }
 
     #[test]
