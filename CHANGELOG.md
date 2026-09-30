@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.7.1](https://github.com/doublewordai/control-layer/compare/v12.7.0...v12.7.1) (2026-09-30)
+
+
+### Bug Fixes
+
+* **prompt-cache:** skip negligible TTL refreshes so a hot prefix cannot queue on one row ([#1869](https://github.com/doublewordai/control-layer/issues/1869)) ([69849f0](https://github.com/doublewordai/control-layer/commit/69849f08e807be01a87ca678b124859de26496bd))
+
 ## [12.7.0](https://github.com/doublewordai/control-layer/compare/v12.6.3...v12.7.0) (2026-09-29)
 
 
