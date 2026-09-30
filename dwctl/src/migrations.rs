@@ -950,6 +950,25 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn underway_task_autovacuums_on_a_fixed_row_count(pool: PgPool) {
+        apply_underway(&pool).await.unwrap();
+        let options: Vec<String> = sqlx::query_scalar("SELECT unnest(reloptions) FROM pg_class WHERE oid = 'underway.task'::regclass")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        for expected in [
+            "autovacuum_vacuum_scale_factor=0.0",
+            "autovacuum_vacuum_threshold=20000",
+            "autovacuum_vacuum_insert_scale_factor=0.0",
+            "autovacuum_vacuum_insert_threshold=20000",
+            "autovacuum_analyze_scale_factor=0.0",
+            "autovacuum_analyze_threshold=20000",
+        ] {
+            assert!(options.iter().any(|option| option == expected), "missing {expected}: {options:?}");
+        }
+    }
+
+    #[sqlx::test]
     async fn underway_extensions_repair_interrupted_indexes(pool: PgPool) {
         underway::run_migrations(&pool).await.unwrap();
         // Reproduce the catalog state left by a cancelled concurrent build,
