@@ -1,5 +1,25 @@
 # Changelog
 
+## [12.7.4](https://github.com/doublewordai/control-layer/compare/v12.7.3...v12.7.4) (2026-09-30)
+
+
+### Bug Fixes
+
+* autovacuum large churning tables on a fixed row count ([#1883](https://github.com/doublewordai/control-layer/issues/1883)) ([43e1aae](https://github.com/doublewordai/control-layer/commit/43e1aae14904af4d333dd25e716f2d61462b74a4))
+* **fusillade:** bound maintenance transactions on the server ([#1878](https://github.com/doublewordai/control-layer/issues/1878)) ([e5b76af](https://github.com/doublewordai/control-layer/commit/e5b76af02688470048f6d56808ffdcc12b33ebb4))
+* **prompt-cache:** delete long-expired entries and vacuum on a fixed count ([#1881](https://github.com/doublewordai/control-layer/issues/1881)) ([a32b41a](https://github.com/doublewordai/control-layer/commit/a32b41af11040b6815677476cc37cd043245ff47))
+
+
+### Performance Improvements
+
+* **fusillade:** index deleted batches and files awaiting purge ([#1884](https://github.com/doublewordai/control-layer/issues/1884)) ([1a748c3](https://github.com/doublewordai/control-layer/commit/1a748c38ba7af880d5ecf7168ea7fb4f9c515859))
+* **fusillade:** index file-content expiry candidates ([#1882](https://github.com/doublewordai/control-layer/issues/1882)) ([7c2ce88](https://github.com/doublewordai/control-layer/commit/7c2ce8822f7a48dae7db5b899dd4c0ae945f172e))
+
+
+### Tests
+
+* **fusillade:** pin batch index plans to production statements ([#1886](https://github.com/doublewordai/control-layer/issues/1886)) ([301e131](https://github.com/doublewordai/control-layer/commit/301e131050ff46a77d6820a7c37f0a9325da75c1))
+
 ## [12.7.3](https://github.com/doublewordai/control-layer/compare/v12.7.2...v12.7.3) (2026-09-30)
 
 
