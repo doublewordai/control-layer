@@ -142,6 +142,18 @@ impl Default for BatchInsertStrategy {
     }
 }
 
+/// Server-side bound for each statement of a daemon maintenance transaction.
+///
+/// The daemon gives up on a maintenance call after its query timeout
+/// (`claim_query_timeout_ms`, 180 s by default) by dropping the future. The
+/// backend does not notice: it keeps executing a transaction that can no
+/// longer commit, holding its snapshot (which stops vacuum everywhere) and its
+/// locks, while the next tick starts the same work again. Cancelling on the
+/// server just before the client gives up means an abandoned attempt stops
+/// and rolls back at the point it was going to be thrown away. Keep this below
+/// the configured query timeout.
+const MAINTENANCE_STATEMENT_BUDGET: &str = "SET LOCAL statement_timeout = '150s'";
+
 pub struct PostgresRequestManager<P: PoolProvider> {
     pools: P,
     config: PostgresStorageConfig,
@@ -696,6 +708,18 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
             self.query_schema.as_deref(),
         )
         .await
+    }
+
+    /// Begin a primary transaction for daemon maintenance, bounded on the
+    /// server by [`MAINTENANCE_STATEMENT_BUDGET`].
+    async fn begin_maintenance_write(
+        &self,
+    ) -> std::result::Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+        let mut tx = self.begin_write().await?;
+        sqlx::query(MAINTENANCE_STATEMENT_BUDGET)
+            .execute(&mut *tx)
+            .await?;
+        Ok(tx)
     }
 
     async fn begin_response_write(
@@ -9127,7 +9151,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
     async fn archive_batch(&self, batch_id: BatchId) -> Result<ArchiveOutcome> {
         request_maintenance::before_archive(self).await?;
         let mut tx = self
-            .begin_write()
+            .begin_maintenance_write()
             .await
             .map_err(|e| FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e)))?;
 
@@ -9552,7 +9576,7 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
 
         let mut finalized = 0i64;
         for batch_id in candidates {
-            let mut tx = self.begin_write().await.map_err(|e| {
+            let mut tx = self.begin_maintenance_write().await.map_err(|e| {
                 FusilladeError::Other(anyhow!("Failed to begin transaction: {}", e))
             })?;
 
@@ -9933,6 +9957,29 @@ mod tests {
         .with_config(config);
 
         assert_eq!(manager.pending_counts_statement_timeout_ms(), 12_345);
+    }
+
+    #[sqlx::test]
+    async fn maintenance_transactions_are_bounded_on_the_server(pool: sqlx::PgPool) {
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let mut tx = manager.begin_maintenance_write().await.unwrap();
+        let budget: String = sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(budget, "150s");
+        tx.commit().await.unwrap();
+
+        // SET LOCAL ends with the transaction, so pooled connections return
+        // to the session default for ordinary work.
+        let session: String = sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(session, "0");
     }
 
     // =========================================================================

@@ -109,7 +109,10 @@ pub(super) async fn cleanup_expired_response_fences<P: PoolProvider>(
     // lifecycle action holding a fence row never blocks cleanup, and the
     // outer expiry predicate re-verifies each locked row version so a fence
     // renewed or upgraded after candidate selection survives.
-    let mut transaction = manager.begin_write().await.map_err(|_| failed())?;
+    let mut transaction = manager
+        .begin_maintenance_write()
+        .await
+        .map_err(|_| failed())?;
     let deleted = sqlx::query_scalar::<_, i64>(
         r#"
         WITH candidates AS MATERIALIZED (
@@ -158,7 +161,10 @@ pub(super) async fn cleanup_retained_response_routes<P: PoolProvider>(
         )
     })?;
 
-    let mut transaction = manager.begin_write().await.map_err(|_| failed())?;
+    let mut transaction = manager
+        .begin_maintenance_write()
+        .await
+        .map_err(|_| failed())?;
     let mut remaining = limit;
     let mut deleted = 0_u64;
 
