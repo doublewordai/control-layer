@@ -9487,6 +9487,16 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
                   AND b.deleted_at IS NULL
                   AND b.cancelling_at IS NULL
                   AND b.total_requests > 0
+                  -- Most unfrozen batches still have work in flight. Rule
+                  -- them out on a live row before the lateral counts above
+                  -- read every row of every candidate; `state_check` makes
+                  -- these three the complement of the terminal states, and
+                  -- the live count below stays the authoritative check.
+                  AND NOT EXISTS (
+                      SELECT 1 FROM requests r
+                      WHERE r.batch_id = b.id
+                        AND r.state IN ('pending', 'claimed', 'processing')
+                  )
                   AND COALESCE(counts.live, 0) = 0
                   AND COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0)
                       + COALESCE(arch.completed, 0) + COALESCE(arch.failed, 0) + COALESCE(arch.canceled, 0)
@@ -14487,6 +14497,131 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// Busy batches (any live row) must be ruled out before the finalizer
+    /// counts rows, so a pass reads the idle candidates' rows rather than
+    /// every row of every unfrozen batch.
+    #[sqlx::test]
+    async fn finalizer_counts_only_batches_without_live_requests(pool: sqlx::PgPool) {
+        // 2,000 busy batches (19 completed rows + 1 pending) and 5 idle
+        // batches whose 20 rows are all completed.
+        sqlx::raw_sql(
+            r#"
+            INSERT INTO batches (id, endpoint, completion_window, created_by, created_at,
+                                 total_requests, expires_at)
+            SELECT md5('b' || i)::uuid, '/v1/chat/completions', '24h', 'owner', now(), 20,
+                   now() + interval '1 day'
+            FROM generate_series(1, 2005) i;
+            INSERT INTO requests (batch_id, model, state, response_status, response_body,
+                                  completed_at)
+            SELECT md5('b' || i)::uuid, 'finalizer-test', s.state,
+                   CASE WHEN s.state = 'completed' THEN 200 END,
+                   CASE WHEN s.state = 'completed' THEN '{}' END,
+                   CASE WHEN s.state = 'completed' THEN now() END
+            FROM generate_series(1, 2005) i, generate_series(1, 20) j,
+                 LATERAL (SELECT CASE WHEN i <= 2000 AND j = 20 THEN 'pending'
+                                      ELSE 'completed' END AS state) s;
+            ANALYZE batches;
+            ANALYZE requests;
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // The candidate selection of finalize_terminal_batches, verbatim.
+        let plan: serde_json::Value = sqlx::query_scalar(
+            r#"
+            EXPLAIN (ANALYZE, FORMAT JSON)
+            SELECT b.id
+            FROM batches b
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE state = 'completed') AS completed,
+                    COUNT(*) FILTER (WHERE state = 'failed') AS failed,
+                    COUNT(*) FILTER (WHERE state = 'canceled') AS canceled,
+                    COUNT(*) FILTER (WHERE state NOT IN ('completed', 'failed', 'canceled')) AS live
+                FROM requests WHERE batch_id = b.id
+            ) counts ON TRUE
+            LEFT JOIN LATERAL (
+                SELECT
+                    COUNT(*) FILTER (WHERE state = 'completed') AS completed,
+                    COUNT(*) FILTER (WHERE state = 'failed') AS failed,
+                    COUNT(*) FILTER (WHERE state = 'canceled') AS canceled
+                FROM batch_requests_archive a
+                WHERE b.location = 'split'
+                  AND a.archive_bucket = b.archive_bucket
+                  AND a.batch_id = b.id
+            ) arch ON TRUE
+            WHERE b.counts_frozen_at IS NULL
+              AND b.deleted_at IS NULL
+              AND b.cancelling_at IS NULL
+              AND b.total_requests > 0
+              AND NOT EXISTS (
+                  SELECT 1 FROM requests r
+                  WHERE r.batch_id = b.id
+                    AND r.state IN ('pending', 'claimed', 'processing')
+              )
+              AND COALESCE(counts.live, 0) = 0
+              AND COALESCE(counts.completed, 0) + COALESCE(counts.failed, 0) + COALESCE(counts.canceled, 0)
+                  + COALESCE(arch.completed, 0) + COALESCE(arch.failed, 0) + COALESCE(arch.canceled, 0)
+                  = b.total_requests
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Rows every scan of `requests` visited across all loops: those it
+        // emitted plus those its filter or index recheck discarded, so a scan
+        // that reads everything and keeps a little still counts in full.
+        fn request_rows_visited(node: &serde_json::Value) -> f64 {
+            match node {
+                serde_json::Value::Array(values) => values.iter().map(request_rows_visited).sum(),
+                serde_json::Value::Object(fields) => {
+                    let visited = if fields.get("Relation Name").and_then(|v| v.as_str())
+                        == Some("requests")
+                    {
+                        [
+                            "Actual Rows",
+                            "Rows Removed by Filter",
+                            "Rows Removed by Index Recheck",
+                        ]
+                        .iter()
+                        .map(|key| fields.get(*key).and_then(|v| v.as_f64()).unwrap_or(0.0))
+                        .sum::<f64>()
+                            * fields
+                                .get("Actual Loops")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    visited + fields.values().map(request_rows_visited).sum::<f64>()
+                }
+                _ => 0.0,
+            }
+        }
+        let read = request_rows_visited(&plan);
+        // Counting every candidate would read all 40,100 rows; the probe
+        // leaves the 2,000 live rows plus the idle batches' 100.
+        assert!(
+            read < 10_000.0,
+            "finalizer read {read} request rows: {plan}"
+        );
+
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        assert_eq!(manager.finalize_terminal_batches().await.unwrap(), 5);
+        let frozen: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM batches WHERE counts_frozen_at IS NOT NULL AND completed_requests = 20",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(frozen, 5);
     }
 
     /// The finalizer sweep freezes counts without any get_batch call, and the
