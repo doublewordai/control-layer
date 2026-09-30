@@ -8480,6 +8480,90 @@ impl<P: PoolProvider> PostgresRequestManager<P> {
     }
 }
 
+// Statements of `purge_orphaned_rows`, one per step. Each starts from the
+// explicitly deleted batches or files (`deleted_at IS NOT NULL AND
+// retention_expired_at IS NULL`); the plan test prepares these same constants,
+// so a change here is checked against idx_batches_explicitly_deleted and
+// idx_files_explicitly_deleted.
+const PURGE_DELETED_BATCH_REQUESTS: &str = r#"
+            DELETE FROM requests
+            WHERE id IN (
+                SELECT r.id
+                FROM (SELECT id FROM batches
+                      WHERE deleted_at IS NOT NULL
+                        AND retention_expired_at IS NULL) b,
+                LATERAL (
+                    SELECT id FROM requests
+                    WHERE batch_id = b.id
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                ) r
+                LIMIT $1
+            )
+            "#;
+
+const PURGE_DELETED_BATCH_ARCHIVED_REQUESTS: &str = r#"
+            DELETE FROM batch_requests_archive
+            WHERE (id, archive_bucket) IN (
+                SELECT a.id, a.archive_bucket
+                FROM (SELECT id, archive_bucket FROM batches
+                      WHERE deleted_at IS NOT NULL
+                        AND retention_expired_at IS NULL
+                        AND archive_bucket IS NOT NULL) b,
+                LATERAL (
+                    SELECT id, archive_bucket FROM batch_requests_archive
+                    WHERE archive_bucket = b.archive_bucket AND batch_id = b.id
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                ) a
+                LIMIT $1
+            )
+            "#;
+
+const PURGE_DELETED_FILE_TEMPLATES: &str = r#"
+            DELETE FROM request_templates
+            WHERE id IN (
+                SELECT template.id
+                FROM (SELECT id FROM files
+                      WHERE deleted_at IS NOT NULL
+                        AND retention_expired_at IS NULL) file,
+                LATERAL (
+                    SELECT id
+                    FROM request_templates
+                    WHERE file_id = file.id
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                ) template
+                LIMIT $1
+            )
+            "#;
+
+const PURGE_DELETED_FILE_G2_TEMPLATES: &str = r#"
+            WITH doomed AS (
+                SELECT template.created_on, template.id
+                FROM (SELECT id FROM files
+                      WHERE deleted_at IS NOT NULL
+                        AND retention_expired_at IS NULL) file,
+                LATERAL (
+                    SELECT created_on, id
+                    FROM request_templates_g2
+                    WHERE file_id = file.id
+                    LIMIT $1
+                    FOR UPDATE SKIP LOCKED
+                ) template
+                LIMIT $1
+            ), removed AS (
+                DELETE FROM request_templates_g2 template
+                USING doomed
+                WHERE template.created_on = doomed.created_on
+                  AND template.id = doomed.id
+                RETURNING template.id
+            )
+            DELETE FROM request_template_routes route
+            USING removed
+            WHERE route.template_id = removed.id
+            "#;
+
 // Implement DaemonStorage trait
 #[async_trait]
 impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
@@ -8978,29 +9062,14 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // strict prefix of the smaller, hotter (batch_id, state) index.)
         // FOR UPDATE SKIP LOCKED enables concurrent daemons to partition work
         // without blocking.
-        let requests_deleted = sqlx::query!(
-            r#"
-            DELETE FROM requests
-            WHERE id IN (
-                SELECT r.id
-                FROM (SELECT id FROM batches
-                      WHERE deleted_at IS NOT NULL
-                        AND retention_expired_at IS NULL) b,
-                LATERAL (
-                    SELECT id FROM requests
-                    WHERE batch_id = b.id
-                    LIMIT $1
-                    FOR UPDATE SKIP LOCKED
-                ) r
-                LIMIT $1
-            )
-            "#,
-            batch_size,
-        )
-        .execute(self.write_executor())
-        .await
-        .map_err(|e| FusilladeError::Other(anyhow!("Failed to purge orphaned requests: {}", e)))?
-        .rows_affected() as i64;
+        let requests_deleted = sqlx::query(PURGE_DELETED_BATCH_REQUESTS)
+            .bind(batch_size)
+            .execute(self.write_executor())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to purge orphaned requests: {}", e))
+            })?
+            .rows_affected() as i64;
 
         // Step 1b: the ARCHIVE twin of step 1 — compliance, not optimization.
         // After a batch's rows move to batch_requests_archive, the erasure
@@ -9008,32 +9077,14 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // reached `requests` would silently stop erasing anything for
         // archived batches. Same tombstone-driven chunked pattern, and the
         // bucket equality prunes each batch's delete to one partition.
-        let archived_deleted = sqlx::query!(
-            r#"
-            DELETE FROM batch_requests_archive
-            WHERE (id, archive_bucket) IN (
-                SELECT a.id, a.archive_bucket
-                FROM (SELECT id, archive_bucket FROM batches
-                      WHERE deleted_at IS NOT NULL
-                        AND retention_expired_at IS NULL
-                        AND archive_bucket IS NOT NULL) b,
-                LATERAL (
-                    SELECT id, archive_bucket FROM batch_requests_archive
-                    WHERE archive_bucket = b.archive_bucket AND batch_id = b.id
-                    LIMIT $1
-                    FOR UPDATE SKIP LOCKED
-                ) a
-                LIMIT $1
-            )
-            "#,
-            batch_size,
-        )
-        .execute(self.write_executor())
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to purge orphaned archived requests: {}", e))
-        })?
-        .rows_affected() as i64;
+        let archived_deleted = sqlx::query(PURGE_DELETED_BATCH_ARCHIVED_REQUESTS)
+            .bind(batch_size)
+            .execute(self.write_executor())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to purge orphaned archived requests: {}", e))
+            })?
+            .rows_affected() as i64;
 
         // Step 2: Delete request_templates whose parent file has been soft-deleted.
         // Note: delete_file already cancels dependent batches and unlinks them (sets
@@ -9042,73 +9093,29 @@ impl<P: PoolProvider> DaemonStorage for PostgresRequestManager<P> {
         // requests.template_id via the FK, which is fine — requests are self-contained
         // once created (all template data is copied at claim time).
         // Same LATERAL pattern as step 1.
-        let templates_deleted = sqlx::query!(
-            r#"
-            DELETE FROM request_templates
-            WHERE id IN (
-                SELECT template.id
-                FROM (SELECT id FROM files
-                      WHERE deleted_at IS NOT NULL
-                        AND retention_expired_at IS NULL) file,
-                LATERAL (
-                    SELECT id
-                    FROM request_templates
-                    WHERE file_id = file.id
-                    LIMIT $1
-                    FOR UPDATE SKIP LOCKED
-                ) template
-                LIMIT $1
-            )
-            "#,
-            batch_size,
-        )
-        .execute(self.write_executor())
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!("Failed to purge orphaned request templates: {e}"))
-        })?
-        .rows_affected() as i64;
+        let templates_deleted = sqlx::query(PURGE_DELETED_FILE_TEMPLATES)
+            .bind(batch_size)
+            .execute(self.write_executor())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!("Failed to purge orphaned request templates: {e}"))
+            })?
+            .rows_affected() as i64;
 
         // Step 2b: the generation-2 twin of step 2. Same explicit-deletion
         // tombstone rule (`retention_expired_at IS NULL`); routes are removed
         // atomically with their template rows so no dangling location oracle
         // survives an erasure.
-        let g2_templates_deleted = sqlx::query(
-            r#"
-            WITH doomed AS (
-                SELECT template.created_on, template.id
-                FROM (SELECT id FROM files
-                      WHERE deleted_at IS NOT NULL
-                        AND retention_expired_at IS NULL) file,
-                LATERAL (
-                    SELECT created_on, id
-                    FROM request_templates_g2
-                    WHERE file_id = file.id
-                    LIMIT $1
-                    FOR UPDATE SKIP LOCKED
-                ) template
-                LIMIT $1
-            ), removed AS (
-                DELETE FROM request_templates_g2 template
-                USING doomed
-                WHERE template.created_on = doomed.created_on
-                  AND template.id = doomed.id
-                RETURNING template.id
-            )
-            DELETE FROM request_template_routes route
-            USING removed
-            WHERE route.template_id = removed.id
-            "#,
-        )
-        .bind(batch_size)
-        .execute(self.write_executor())
-        .await
-        .map_err(|e| {
-            FusilladeError::Other(anyhow!(
-                "Failed to purge orphaned generation-2 templates: {e}"
-            ))
-        })?
-        .rows_affected() as i64;
+        let g2_templates_deleted = sqlx::query(PURGE_DELETED_FILE_G2_TEMPLATES)
+            .bind(batch_size)
+            .execute(self.write_executor())
+            .await
+            .map_err(|e| {
+                FusilladeError::Other(anyhow!(
+                    "Failed to purge orphaned generation-2 templates: {e}"
+                ))
+            })?
+            .rows_affected() as i64;
         let total =
             (requests_deleted + archived_deleted + templates_deleted + g2_templates_deleted) as u64;
         if total > 0 {
@@ -21619,87 +21626,21 @@ mod tests {
         sqlx::query("ANALYZE batches").execute(&pool).await.unwrap();
         sqlx::query("ANALYZE files").execute(&pool).await.unwrap();
 
-        // The four purge_orphaned_rows statements, verbatim, with the index each
-        // driving set must come from.
+        // The four purge_orphaned_rows statements, as the daemon runs them, with
+        // the index each driving set must come from.
         let statements = [
             (
                 "idx_batches_explicitly_deleted",
-                r#"DELETE FROM requests
-                WHERE id IN (
-                    SELECT r.id
-                    FROM (SELECT id FROM batches
-                          WHERE deleted_at IS NOT NULL
-                            AND retention_expired_at IS NULL) b,
-                    LATERAL (
-                        SELECT id FROM requests
-                        WHERE batch_id = b.id
-                        LIMIT $1
-                        FOR UPDATE SKIP LOCKED
-                    ) r
-                    LIMIT $1
-                )"#,
+                PURGE_DELETED_BATCH_REQUESTS,
             ),
             (
                 "idx_batches_explicitly_deleted",
-                r#"DELETE FROM batch_requests_archive
-                WHERE (id, archive_bucket) IN (
-                    SELECT a.id, a.archive_bucket
-                    FROM (SELECT id, archive_bucket FROM batches
-                          WHERE deleted_at IS NOT NULL
-                            AND retention_expired_at IS NULL
-                            AND archive_bucket IS NOT NULL) b,
-                    LATERAL (
-                        SELECT id, archive_bucket FROM batch_requests_archive
-                        WHERE archive_bucket = b.archive_bucket AND batch_id = b.id
-                        LIMIT $1
-                        FOR UPDATE SKIP LOCKED
-                    ) a
-                    LIMIT $1
-                )"#,
+                PURGE_DELETED_BATCH_ARCHIVED_REQUESTS,
             ),
+            ("idx_files_explicitly_deleted", PURGE_DELETED_FILE_TEMPLATES),
             (
                 "idx_files_explicitly_deleted",
-                r#"DELETE FROM request_templates
-                WHERE id IN (
-                    SELECT template.id
-                    FROM (SELECT id FROM files
-                          WHERE deleted_at IS NOT NULL
-                            AND retention_expired_at IS NULL) file,
-                    LATERAL (
-                        SELECT id
-                        FROM request_templates
-                        WHERE file_id = file.id
-                        LIMIT $1
-                        FOR UPDATE SKIP LOCKED
-                    ) template
-                    LIMIT $1
-                )"#,
-            ),
-            (
-                "idx_files_explicitly_deleted",
-                r#"WITH doomed AS (
-                    SELECT template.created_on, template.id
-                    FROM (SELECT id FROM files
-                          WHERE deleted_at IS NOT NULL
-                            AND retention_expired_at IS NULL) file,
-                    LATERAL (
-                        SELECT created_on, id
-                        FROM request_templates_g2
-                        WHERE file_id = file.id
-                        LIMIT $1
-                        FOR UPDATE SKIP LOCKED
-                    ) template
-                    LIMIT $1
-                ), removed AS (
-                    DELETE FROM request_templates_g2 template
-                    USING doomed
-                    WHERE template.created_on = doomed.created_on
-                      AND template.id = doomed.id
-                    RETURNING template.id
-                )
-                DELETE FROM request_template_routes route
-                USING removed
-                WHERE route.template_id = removed.id"#,
+                PURGE_DELETED_FILE_G2_TEMPLATES,
             ),
         ];
         let mut tx = pool.begin().await.unwrap();
