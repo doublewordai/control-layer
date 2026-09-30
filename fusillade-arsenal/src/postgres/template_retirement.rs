@@ -261,10 +261,29 @@ mod tests {
                 .await
                 .unwrap();
         tx.rollback().await.unwrap();
+        // The index must bound the scan at the horizon, not merely supply the
+        // ordering: a plain Index Scan whose Index Cond carries the age bound.
+        fn find_node<'a>(
+            node: &'a serde_json::Value,
+            index: &str,
+        ) -> Option<&'a serde_json::Value> {
+            if node["Index Name"] == index {
+                return Some(node);
+            }
+            node["Plans"]
+                .as_array()?
+                .iter()
+                .find_map(|child| find_node(child, index))
+        }
+        let node =
+            find_node(&plan[0]["Plan"], "idx_files_content_expiry_due").unwrap_or_else(|| {
+                panic!("expiry candidates must come from idx_files_content_expiry_due: {plan}")
+            });
+        assert_eq!(node["Node Type"], "Index Scan", "{plan}");
+        let cond = node["Index Cond"].as_str().unwrap_or_default();
         assert!(
-            plan.to_string()
-                .contains("\"Index Name\":\"idx_files_content_expiry_due\""),
-            "expiry candidates must come from idx_files_content_expiry_due: {plan}"
+            cond.contains("created_at <="),
+            "age bound must be an index condition: {plan}"
         );
 
         let manager = PostgresRequestManager::new(
