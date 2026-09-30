@@ -3,7 +3,7 @@
 use chrono::{DateTime, Duration, Timelike, Utc};
 use moka::future::Cache;
 use once_cell::sync::Lazy;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use std::collections::HashMap;
 use tracing::instrument;
 
@@ -29,6 +29,24 @@ static METRICS_CACHE: Lazy<Cache<String, HashMap<String, ModelMetrics>>> = Lazy:
         .time_to_live(std::time::Duration::from_secs(60))
         .build()
 });
+
+/// Bounds every dashboard read over `http_analytics`.
+///
+/// These reads aggregate caller-chosen ranges of an append-only table that grows without
+/// limit. Postgres keeps executing a statement after its HTTP client has gone, and while it
+/// runs its snapshot holds back vacuum for the whole database: dead rows then pile up in
+/// hot queue tables such as `analytics_outbox`, and every claim from them slows down.
+const DASHBOARD_READ_TIMEOUT: &str = "SET LOCAL statement_timeout = '30s'";
+
+/// Begin a read transaction whose statements Postgres cancels after 30 seconds.
+///
+/// `SET LOCAL` scopes the limit to this transaction, so it holds behind a transaction-mode
+/// connection pooler and never leaks onto the pooled connection.
+async fn begin_dashboard_read(db: &PgPool) -> Result<Transaction<'static, Postgres>> {
+    let mut tx = db.begin().await?;
+    sqlx::query(DASHBOARD_READ_TIMEOUT).execute(&mut *tx).await?;
+    Ok(tx)
+}
 
 /// Time granularity for analytics queries
 #[derive(Debug, Clone, Copy)]
@@ -99,6 +117,7 @@ async fn get_total_requests(
     time_range_end: DateTime<Utc>,
     model_filter: Option<&str>,
 ) -> Result<i64> {
+    let mut tx = begin_dashboard_read(db).await?;
     let total_requests = if let Some(model) = model_filter {
         sqlx::query_as!(
             TotalRequestsRow,
@@ -107,7 +126,7 @@ async fn get_total_requests(
             time_range_end,
             model
         )
-        .fetch_one(db)
+        .fetch_one(&mut *tx)
         .await?
         .total_requests
         .unwrap_or(0)
@@ -118,11 +137,13 @@ async fn get_total_requests(
             time_range_start,
             time_range_end
         )
-        .fetch_one(db)
+        .fetch_one(&mut *tx)
         .await?
         .total_requests
         .unwrap_or(0)
     };
+    tx.commit().await?;
+
     Ok(total_requests)
 }
 
@@ -149,6 +170,7 @@ async fn get_time_series_hourly(
     time_range_end: DateTime<Utc>,
     model_filter: Option<&str>,
 ) -> Result<Vec<TimeSeriesPoint>> {
+    let mut tx = begin_dashboard_read(db).await?;
     let rows = if let Some(model) = model_filter {
         sqlx::query_as!(
             TimeSeriesRow,
@@ -170,7 +192,7 @@ async fn get_time_series_hourly(
             time_range_end,
             model
         )
-        .fetch_all(db)
+        .fetch_all(&mut *tx)
         .await?
     } else {
         sqlx::query_as!(
@@ -192,9 +214,11 @@ async fn get_time_series_hourly(
             time_range_start,
             time_range_end
         )
-        .fetch_all(db)
+        .fetch_all(&mut *tx)
         .await?
     };
+
+    tx.commit().await?;
 
     let time_series = rows
         .into_iter()
@@ -226,6 +250,7 @@ async fn get_time_series_ten_minutes(
     time_range_end: DateTime<Utc>,
     model_filter: Option<&str>,
 ) -> Result<Vec<TimeSeriesPoint>> {
+    let mut tx = begin_dashboard_read(db).await?;
     let rows = if let Some(model) = model_filter {
         sqlx::query_as!(
             TimeSeriesRow,
@@ -247,7 +272,7 @@ async fn get_time_series_ten_minutes(
             time_range_end,
             model
         )
-        .fetch_all(db)
+        .fetch_all(&mut *tx)
         .await?
     } else {
         sqlx::query_as!(
@@ -269,9 +294,11 @@ async fn get_time_series_ten_minutes(
             time_range_start,
             time_range_end
         )
-        .fetch_all(db)
+        .fetch_all(&mut *tx)
         .await?
     };
+
+    tx.commit().await?;
 
     let time_series = rows
         .into_iter()
@@ -435,6 +462,7 @@ async fn get_status_codes(
     time_range_end: DateTime<Utc>,
     model_filter: Option<&str>,
 ) -> Result<Vec<StatusCodeRow>> {
+    let mut tx = begin_dashboard_read(db).await?;
     let rows = if let Some(model) = model_filter {
         sqlx::query_as!(
             StatusCodeRow,
@@ -443,7 +471,7 @@ async fn get_status_codes(
             time_range_end,
             model
         )
-        .fetch_all(db)
+        .fetch_all(&mut *tx)
         .await?
     } else {
         sqlx::query_as!(
@@ -452,9 +480,11 @@ async fn get_status_codes(
             time_range_start,
             time_range_end
         )
-        .fetch_all(db)
+        .fetch_all(&mut *tx)
         .await?
     };
+
+    tx.commit().await?;
 
     Ok(rows)
 }
@@ -462,14 +492,17 @@ async fn get_status_codes(
 /// Get model usage data (raw counts, percentages calculated later)
 #[instrument(skip(db), err)]
 async fn get_model_usage(db: &PgPool, time_range_start: DateTime<Utc>, time_range_end: DateTime<Utc>) -> Result<Vec<ModelUsageRow>> {
+    let mut tx = begin_dashboard_read(db).await?;
     let rows = sqlx::query_as!(
         ModelUsageRow,
         "SELECT model as model_name, COUNT(*) as model_count, COALESCE(AVG(duration_ms), 0)::float8 as model_avg_latency_ms FROM http_analytics WHERE timestamp >= $1 AND timestamp <= $2 AND model IS NOT NULL GROUP BY model ORDER BY model_count DESC",
         time_range_start,
         time_range_end
     )
-    .fetch_all(db)
+    .fetch_all(&mut *tx)
     .await?;
+
+    tx.commit().await?;
 
     Ok(rows)
 }
@@ -596,6 +629,8 @@ async fn get_model_metrics_impl(db: &PgPool, model_aliases: Vec<String>) -> Resu
         );
     }
 
+    let mut tx = begin_dashboard_read(db).await?;
+
     // Get basic metrics for models that have activity
     let metrics_rows = sqlx::query_as!(
         ModelMetricsRow,
@@ -613,7 +648,7 @@ async fn get_model_metrics_impl(db: &PgPool, model_aliases: Vec<String>) -> Resu
         "#,
         &model_aliases
     )
-    .fetch_all(db)
+    .fetch_all(&mut *tx)
     .await?;
 
     // Update metrics for models that have actual data
@@ -651,8 +686,10 @@ async fn get_model_metrics_impl(db: &PgPool, model_aliases: Vec<String>) -> Resu
         two_hours_ago,
         now
     )
-    .fetch_all(db)
+    .fetch_all(&mut *tx)
     .await;
+
+    tx.commit().await?;
 
     // Process time series data if successful
     if let Ok(rows) = time_series_rows {
@@ -1527,6 +1564,26 @@ mod tests {
         .execute(pool)
         .await
         .expect("Failed to insert test analytics data");
+    }
+
+    #[sqlx::test]
+    async fn test_dashboard_read_timeout_is_scoped_to_its_transaction(pool: PgPool) {
+        // One connection, so the check after commit runs on the connection the limit was set on.
+        let single = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let before: String = sqlx::query_scalar("SHOW statement_timeout").fetch_one(&single).await.unwrap();
+        assert_eq!(before, "0");
+
+        let mut tx = begin_dashboard_read(&single).await.unwrap();
+        let inside: String = sqlx::query_scalar("SHOW statement_timeout").fetch_one(&mut *tx).await.unwrap();
+        assert_eq!(inside, "30s");
+        tx.commit().await.unwrap();
+
+        let after: String = sqlx::query_scalar("SHOW statement_timeout").fetch_one(&single).await.unwrap();
+        assert_eq!(after, "0");
     }
 
     #[sqlx::test]
