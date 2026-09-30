@@ -1123,6 +1123,81 @@ mod tests {
         check(&Target::fusillade(), &fusillade_pool).await.unwrap();
     }
 
+    /// Tables that churn continuously vacuum after a fixed number of changes,
+    /// however large they grow.
+    #[sqlx::test]
+    async fn churning_tables_autovacuum_on_fixed_row_counts(pool: PgPool) {
+        apply_underway(&pool).await.unwrap();
+        let cases: [(&str, &[&str]); 5] = [
+            (
+                "batch_aggregates",
+                &[
+                    "autovacuum_vacuum_scale_factor=0.0",
+                    "autovacuum_vacuum_threshold=50000",
+                    "autovacuum_analyze_scale_factor=0.0",
+                    "autovacuum_analyze_threshold=50000",
+                    "autovacuum_vacuum_insert_scale_factor=0.0",
+                    "autovacuum_vacuum_insert_threshold=50000",
+                ],
+            ),
+            (
+                "image_access",
+                &[
+                    "autovacuum_vacuum_scale_factor=0.0",
+                    "autovacuum_vacuum_threshold=20000",
+                    "autovacuum_analyze_scale_factor=0.0",
+                    "autovacuum_analyze_threshold=20000",
+                    "autovacuum_vacuum_insert_scale_factor=0.0",
+                    "autovacuum_vacuum_insert_threshold=20000",
+                ],
+            ),
+            (
+                "batch_capacity_reservations",
+                &[
+                    "autovacuum_vacuum_scale_factor=0.0",
+                    "autovacuum_vacuum_threshold=20000",
+                    "autovacuum_analyze_scale_factor=0.0",
+                    "autovacuum_analyze_threshold=20000",
+                    "autovacuum_vacuum_insert_scale_factor=0.0",
+                    "autovacuum_vacuum_insert_threshold=20000",
+                ],
+            ),
+            // Insert-only: only the insert-triggered vacuum is pinned.
+            (
+                "http_analytics",
+                &[
+                    "autovacuum_vacuum_insert_scale_factor=0.0",
+                    "autovacuum_vacuum_insert_threshold=100000",
+                ],
+            ),
+            (
+                "underway.task_attempt",
+                &[
+                    "autovacuum_vacuum_scale_factor=0.0",
+                    "autovacuum_vacuum_threshold=20000",
+                    "autovacuum_analyze_scale_factor=0.0",
+                    "autovacuum_analyze_threshold=20000",
+                    "autovacuum_vacuum_insert_scale_factor=0.0",
+                    "autovacuum_vacuum_insert_threshold=20000",
+                ],
+            ),
+        ];
+        for (table, expected) in cases {
+            let options: Vec<String> = sqlx::query_scalar("SELECT unnest(reloptions) FROM pg_class WHERE oid = $1::regclass")
+                .bind(table)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert_eq!(options.len(), expected.len(), "{table}: {options:?}");
+            for option in expected {
+                assert!(
+                    options.iter().any(|actual| actual == option),
+                    "{table} missing {option}: {options:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn describe_never_includes_credentials() {
         let options = PgConnectOptions::from_str("postgres://user:hunter2@db.example:5433/clay").unwrap();
