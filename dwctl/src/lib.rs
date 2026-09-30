@@ -3876,6 +3876,19 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         });
     }
 
+    // Start the prompt-cache retention daemon: bounded, oldest-first deletion of entries
+    // that expired more than the recompute grace ago. Without it the table only grows.
+    if config.background_services.prompt_cache_retention.enabled {
+        // Retention holds a session advisory lock, which requires a direct connection.
+        let daemon_pool = direct_pools.clone();
+        let daemon_config = config.background_services.prompt_cache_retention.clone();
+        let daemon_shutdown = shutdown_token.clone();
+        background_tasks.spawn("prompt-cache-retention", async move {
+            prompt_cache::retention::run_prompt_cache_retention_daemon(daemon_pool, daemon_config, daemon_shutdown).await;
+            Ok(())
+        });
+    }
+
     // Start analytics batcher if enabled
     let analytics_writer = if config.enable_analytics {
         let (batcher, writer) = request_logging::AnalyticsBatcher::new(dyn_pools.clone(), config.clone(), metrics_recorder);
