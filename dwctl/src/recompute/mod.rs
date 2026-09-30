@@ -95,9 +95,9 @@
 //!
 //! Two bounds on that, both of which belong in any report built on it:
 //!
-//! - **Retention.** `prompt_cache_entries` currently retains expired rows, so all history is
-//!   available. Once the sweeper ships with its grace period (7 days), anything older cannot
-//!   be reconstructed.
+//! - **Retention.** The prompt-cache retention daemon deletes entries once they have been
+//!   expired for its grace (`CACHE_GRACE_DAYS`, 7 days, or longer if configured), so
+//!   anything older cannot be reconstructed.
 //! - **Accuracy before the episode-per-row cutover.** A post-expiry write revives the same
 //!   row in place and keeps the original `created_at`, so `[created_at, expires_at]` can
 //!   contain dead gaps and over-approximates liveness. Answers for that period classify some

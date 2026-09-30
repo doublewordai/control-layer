@@ -174,7 +174,8 @@ pub struct RecomputeReport {
     pub rows: Vec<ReportRow>,
 }
 
-/// Days of `prompt_cache_entries` history the cache sweeper will retain.
+/// Days the prompt-cache retention daemon keeps an entry after it expires: its default
+/// grace, and the minimum its configuration accepts.
 ///
 /// Beyond this the entries backing a cache-split reconstruction are pruned, so a corpus older
 /// than the grace cannot have its split re-derived — only carried through from the response,

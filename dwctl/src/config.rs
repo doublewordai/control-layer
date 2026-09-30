@@ -2688,6 +2688,8 @@ pub struct BackgroundServicesConfig {
     pub task_workers: TaskWorkersConfig,
     /// Bounded deletion of expired Underway tasks
     pub task_retention: TaskRetentionConfig,
+    /// Bounded deletion of long-expired prompt-cache entries
+    pub prompt_cache_retention: PromptCacheRetentionConfig,
 }
 
 /// Underway task retention daemon configuration.
@@ -2742,6 +2744,70 @@ impl TaskRetentionConfig {
         }
         if self.min_age_days > Self::MAX_MIN_AGE_DAYS {
             return Err(format!("min_age_days must be at most {}", Self::MAX_MIN_AGE_DAYS));
+        }
+        Ok(())
+    }
+}
+
+/// Prompt-cache entry retention daemon configuration.
+///
+/// Expired prompt-cache entries serve no request, but nothing else deletes them. This
+/// daemon deletes entries that expired more than `grace_days` ago, oldest first, in bounded
+/// batches, so the table tracks the live cache plus the recompute grace instead of every
+/// prefix ever written.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PromptCacheRetentionConfig {
+    /// Enable the retention daemon (default: true).
+    pub enabled: bool,
+    /// Seconds between sweeps (default: 300).
+    pub interval_seconds: u64,
+    /// Rows deleted per statement (default: 1000). Each batch is its own transaction.
+    pub batch_size: u32,
+    /// Pause between consecutive batches of one sweep in milliseconds (default: 2000).
+    /// Throttles the sweep while a large backlog drains.
+    pub batch_pause_milliseconds: u64,
+    /// Days an entry is kept after it expires (default and minimum:
+    /// [`crate::recompute::report::CACHE_GRACE_DAYS`]). Usage recompute re-derives a past
+    /// request's cache split from the entries live at that time, so it needs this history.
+    pub grace_days: u64,
+}
+
+impl Default for PromptCacheRetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: 300,
+            batch_size: 1000,
+            batch_pause_milliseconds: 2000,
+            grace_days: crate::recompute::report::CACHE_GRACE_DAYS as u64,
+        }
+    }
+}
+
+impl PromptCacheRetentionConfig {
+    /// Upper bound on `grace_days` (a century): keeps the grace representable as a
+    /// `Duration`/`interval` and catches a unit mistake in configuration.
+    pub const MAX_GRACE_DAYS: u64 = 36_500;
+
+    /// The grace as a duration. `grace_days` is bounded by [`Self::validate`], so this
+    /// cannot overflow.
+    pub fn grace(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.grace_days.min(Self::MAX_GRACE_DAYS) * 86_400)
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.batch_size == 0 {
+            return Err("batch_size must be at least 1".to_string());
+        }
+        let minimum = crate::recompute::report::CACHE_GRACE_DAYS as u64;
+        if self.grace_days < minimum {
+            return Err(format!(
+                "grace_days must be at least {minimum}: usage recompute re-derives cache splits from that much history"
+            ));
+        }
+        if self.grace_days > Self::MAX_GRACE_DAYS {
+            return Err(format!("grace_days must be at most {}", Self::MAX_GRACE_DAYS));
         }
         Ok(())
     }
@@ -3456,6 +3522,11 @@ impl Config {
         if let Err(error) = self.background_services.task_retention.validate() {
             return Err(Error::Internal {
                 operation: format!("Config validation: task retention is invalid: {error}"),
+            });
+        }
+        if let Err(error) = self.background_services.prompt_cache_retention.validate() {
+            return Err(Error::Internal {
+                operation: format!("Config validation: prompt-cache retention is invalid: {error}"),
             });
         }
         if self.background_services.batch_daemon.retention.expire_files
@@ -5664,6 +5735,20 @@ background_services:
 
             Ok(())
         });
+    }
+
+    #[test]
+    fn prompt_cache_retention_keeps_at_least_the_recompute_grace() {
+        let config = PromptCacheRetentionConfig::default();
+        assert_eq!(config.grace_days, crate::recompute::report::CACHE_GRACE_DAYS as u64);
+        assert!(config.validate().is_ok());
+        let shorter = PromptCacheRetentionConfig {
+            grace_days: config.grace_days - 1,
+            ..config.clone()
+        };
+        assert!(shorter.validate().unwrap_err().contains("at least"));
+        let longer = PromptCacheRetentionConfig { grace_days: 30, ..config };
+        assert!(longer.validate().is_ok());
     }
 
     #[test]

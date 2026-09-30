@@ -476,6 +476,37 @@ The daemon uses direct database connections for its session-level advisory lock.
 backlog, run `scripts/purge_underway_tasks.sh` once beforehand so the first
 sweeps stay short.
 
+### Prompt Cache Retention
+
+Deletes prompt-cache entries that expired more than a grace period ago, in bounded
+batches. Expired entries serve no request, but nothing else removes them, so without
+this daemon the prefix table keeps every prefix ever written.
+
+```yaml
+background_services:
+  prompt_cache_retention:
+    enabled: true
+    interval_seconds: 300
+    batch_size: 1000
+    batch_pause_milliseconds: 2000
+    grace_days: 7
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `true` | Run the retention daemon. |
+| `interval_seconds` | integer | `300` | Seconds between sweeps. |
+| `batch_size` | integer | `1000` | Rows deleted per statement; each batch is its own short transaction. |
+| `batch_pause_milliseconds` | integer | `2000` | Pause between batches of one sweep, to throttle a large backlog. |
+| `grace_days` | integer | `7` | Days an entry is kept after it expires. Usage recompute re-derives a past request's cache split from the entries live at the time, so values below 7 are rejected. |
+
+Every instance runs the daemon; an advisory lock collapses concurrent sweeps to one.
+Entries are deleted oldest-expiry first; an entry that a request is refreshing or
+re-writing at that moment is skipped. Each batch has a 2-second lock timeout and a
+30-second statement timeout. At the default pace a sweep deletes at most about 1.8
+million entries an hour, so an installation with a long existing history clears it over
+several sweeps without a burst of write and vacuum load.
+
 ### Leader Election
 
 For multi-instance deployments:
