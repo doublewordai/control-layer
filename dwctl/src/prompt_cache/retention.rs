@@ -14,8 +14,8 @@
 //! Every pod runs the daemon. A sweep holds a session-level advisory lock on a dedicated
 //! connection for its whole duration, so concurrent sweeps collapse to one while each
 //! delete batch still commits on its own. `SKIP LOCKED` keeps the sweep off rows a request
-//! is refreshing or re-writing at that moment, and the delete re-checks the expiry so an
-//! entry revived in between is kept.
+//! is refreshing or re-writing at that moment. A request that reaches a row after the sweep
+//! locked it waits for the batch to commit; a write then inserts the entry afresh.
 
 use std::time::Duration;
 
@@ -56,7 +56,6 @@ async fn purge_expired_batch_on_connection(connection: &mut PgConnection, batch_
         DELETE FROM prompt_cache_entries e
         USING victims v
         WHERE e.id = v.id
-          AND e.expires_at < now() - make_interval(secs => $2)
         "#,
     )
     .bind(batch_size)

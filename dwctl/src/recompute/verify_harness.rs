@@ -73,10 +73,16 @@ mod tests {
             true,
         );
 
-        let report =
-            crate::recompute::recompute_corpus(&pool, &filter, CreationTier::FiveMinute, Some(&classifier), Some(&tokenizer_client))
-                .await
-                .expect("recompute");
+        let report = crate::recompute::recompute_corpus(
+            &pool,
+            &filter,
+            CreationTier::FiveMinute,
+            chrono::Duration::days(crate::recompute::report::CACHE_GRACE_DAYS),
+            Some(&classifier),
+            Some(&tokenizer_client),
+        )
+        .await
+        .expect("recompute");
 
         let s = &report.summary;
         println!("\n=== corpus ===");

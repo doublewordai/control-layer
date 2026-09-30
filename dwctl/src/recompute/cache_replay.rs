@@ -12,9 +12,9 @@
 //!
 //! # Two bounds on the answer
 //!
-//! - **Retention.** The prompt-cache retention daemon deletes entries once they have been
-//!   expired for its grace, so requests older than the grace have no entries left and the
-//!   split cannot be reconstructed at all.
+//! - **Retention.** The prompt-cache retention daemon deletes an entry once it has been
+//!   expired for longer than its grace. Entries for requests older than the grace may already
+//!   have been pruned, and a pruned entry reads back as a miss.
 //! - **Accuracy before the episode-per-row cutover.** Today a post-expiry write revives the
 //!   same row in place and keeps its original `created_at`, so `[created_at, expires_at]`
 //!   can span invisible dead gaps. Liveness is therefore *over*-approximated: some creations

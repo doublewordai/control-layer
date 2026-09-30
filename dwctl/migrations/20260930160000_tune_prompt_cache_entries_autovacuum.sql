@@ -13,6 +13,8 @@
 -- daemon clears an existing backlog at its default pace. The statement is metadata-only
 -- and takes effect on the next autovacuum cycle.
 
+SET LOCAL lock_timeout = '5s';
+
 ALTER TABLE prompt_cache_entries SET (
     autovacuum_vacuum_scale_factor        = 0.0,
     autovacuum_vacuum_threshold           = 1000000,
