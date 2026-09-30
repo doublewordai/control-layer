@@ -1,5 +1,13 @@
 # Changelog
 
+## [12.7.3](https://github.com/doublewordai/control-layer/compare/v12.7.2...v12.7.3) (2026-09-30)
+
+
+### Performance Improvements
+
+* **fusillade:** probe live requests by id in trailing demand ([#1889](https://github.com/doublewordai/control-layer/issues/1889)) ([4e6209b](https://github.com/doublewordai/control-layer/commit/4e6209b50867dc2e54952f949b4c869f46e92b2f))
+* **fusillade:** skip batches with live requests before finalizer counts ([#1879](https://github.com/doublewordai/control-layer/issues/1879)) ([79193b3](https://github.com/doublewordai/control-layer/commit/79193b39dfe91ab68de8e832087e22f586ffab90))
+
 ## [12.7.2](https://github.com/doublewordai/control-layer/compare/v12.7.1...v12.7.2) (2026-09-30)
 
 
