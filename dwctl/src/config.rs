@@ -2758,7 +2758,7 @@ impl TaskRetentionConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PromptCacheRetentionConfig {
-    /// Enable the retention daemon (default: true).
+    /// Enable the retention daemon (default: false).
     pub enabled: bool,
     /// Seconds between sweeps (default: 300).
     pub interval_seconds: u64,
@@ -2776,7 +2776,7 @@ pub struct PromptCacheRetentionConfig {
 impl Default for PromptCacheRetentionConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             interval_seconds: 300,
             batch_size: 1000,
             batch_pause_milliseconds: 2000,

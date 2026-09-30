@@ -485,7 +485,7 @@ this daemon the prefix table keeps every prefix ever written.
 ```yaml
 background_services:
   prompt_cache_retention:
-    enabled: true
+    enabled: false
     interval_seconds: 300
     batch_size: 1000
     batch_pause_milliseconds: 2000
@@ -494,7 +494,7 @@ background_services:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `enabled` | boolean | `true` | Run the retention daemon. |
+| `enabled` | boolean | `false` | Run the retention daemon. Off by default so a deployment chooses when to start clearing an existing history. |
 | `interval_seconds` | integer | `300` | Seconds between sweeps. |
 | `batch_size` | integer | `1000` | Rows deleted per statement; each batch is its own short transaction. |
 | `batch_pause_milliseconds` | integer | `2000` | Pause between batches of one sweep, to throttle a large backlog. |
