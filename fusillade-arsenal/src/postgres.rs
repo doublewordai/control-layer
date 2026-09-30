@@ -10116,6 +10116,98 @@ mod tests {
         assert!(error.to_string().contains("statement timeout"), "{error}");
     }
 
+    fn plan_uses_index(plan: &serde_json::Value, index_name: &str) -> bool {
+        match plan {
+            serde_json::Value::Array(values) => values
+                .iter()
+                .any(|value| plan_uses_index(value, index_name)),
+            serde_json::Value::Object(fields) => {
+                fields.get("Index Name").and_then(|value| value.as_str()) == Some(index_name)
+                    || fields
+                        .values()
+                        .any(|value| plan_uses_index(value, index_name))
+            }
+            _ => false,
+        }
+    }
+
+    #[sqlx::test]
+    async fn cancellation_poll_probes_only_cancelling_batches(pool: sqlx::PgPool) {
+        // Thousands of live batches polled at once, two cancelling, and one
+        // cancelling but deleted.
+        sqlx::query(
+            r#"
+            INSERT INTO batches (id, endpoint, completion_window, created_by,
+                                 created_at, expires_at, cancelling_at, deleted_at)
+            SELECT md5(i::text)::uuid, '/v1/chat/completions', '24h', 'owner',
+                   '2026-01-01'::timestamptz + i * interval '1 second',
+                   '2026-01-02'::timestamptz,
+                   CASE WHEN i IN (7, 4000, 9000) THEN '2026-01-01'::timestamptz END,
+                   CASE WHEN i = 9000 THEN '2026-01-01'::timestamptz END
+            FROM generate_series(1, 10000) i
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE batches").execute(&pool).await.unwrap();
+        let polled: Vec<Uuid> =
+            sqlx::query_scalar("SELECT md5(i::text)::uuid FROM generate_series(1, 10000) i")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+
+        // The daemon repeats this query, so SQLx ends up on a generic plan.
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("SET LOCAL plan_cache_mode = force_generic_plan")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "PREPARE cancel_poll(uuid[]) AS SELECT id FROM batches WHERE id = ANY($1) AND cancelling_at IS NOT NULL AND deleted_at IS NULL",
+        )
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        let ids = polled
+            .iter()
+            .map(Uuid::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let plan: serde_json::Value = sqlx::query_scalar(&format!(
+            "EXPLAIN (FORMAT JSON) EXECUTE cancel_poll('{{{ids}}}'::uuid[])"
+        ))
+        .fetch_one(&mut *tx)
+        .await
+        .unwrap();
+        assert!(
+            plan_uses_index(&plan, "idx_batches_cancelling"),
+            "the cancellation poll must probe idx_batches_cancelling, not the batches heap: {plan}"
+        );
+        tx.rollback().await.unwrap();
+
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let polled: Vec<BatchId> = polled.into_iter().map(BatchId).collect();
+        let expected: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT md5(i::text)::uuid FROM unnest(ARRAY[7, 4000]) i ORDER BY 1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let mut cancelled: Vec<Uuid> = manager
+            .get_cancelled_batch_ids(&polled)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|id| *id)
+            .collect();
+        cancelled.sort();
+        assert_eq!(cancelled, expected);
+    }
+
     // =========================================================================
     // sanitize_outbound_body — unit tests for the storage-layer body strip
     // =========================================================================
@@ -14513,6 +14605,69 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(version_after, version, "no retry_version churn on no-op");
+    }
+
+    /// Pending notifications sit at the newest end of counts_frozen_at order,
+    /// behind a long already-notified history. The claim must reach them
+    /// through idx_batches_notification_due rather than walking that history.
+    #[sqlx::test]
+    async fn notification_claim_reads_only_pending_batches(pool: sqlx::PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO batches (id, endpoint, completion_window, created_by, created_at,
+                                 completed_at, counts_frozen_at, notification_sent_at,
+                                 total_requests, expires_at)
+            SELECT md5(i::text)::uuid, '/v1/chat/completions', '24h', 'owner',
+                   '2026-01-01'::timestamptz + i * interval '1 second',
+                   '2026-02-01'::timestamptz,
+                   '2026-02-01'::timestamptz + i * interval '1 second',
+                   CASE WHEN i <= 20000 THEN '2026-02-02'::timestamptz END,
+                   1, '2026-02-02'::timestamptz
+            FROM generate_series(1, 20005) i
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("ANALYZE batches").execute(&pool).await.unwrap();
+
+        // The candidate subquery of claim_batch_notifications, verbatim.
+        let plan: serde_json::Value = sqlx::query_scalar(
+            r#"
+            EXPLAIN (FORMAT JSON)
+            SELECT id FROM batches
+            WHERE counts_frozen_at IS NOT NULL
+              AND notification_sent_at IS NULL
+              AND cancelling_at IS NULL
+              AND deleted_at IS NULL
+              AND total_requests > 0
+            ORDER BY counts_frozen_at
+            LIMIT 100
+            FOR UPDATE SKIP LOCKED
+            "#,
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            plan.to_string()
+                .contains("\"Index Name\":\"idx_batches_notification_due\""),
+            "claim candidates must come from idx_batches_notification_due: {plan}"
+        );
+
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            Arc::new(MockHttpClient::new()),
+        );
+        let claimed = manager.claim_batch_notifications().await.unwrap();
+        assert_eq!(claimed.len(), 5);
+        assert!(
+            manager
+                .claim_batch_notifications()
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// The finalizer sweep freezes counts without any get_batch call, and the
