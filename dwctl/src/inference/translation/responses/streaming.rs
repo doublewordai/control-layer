@@ -60,7 +60,8 @@ pub struct StreamingState {
     fn_call_item_for: HashMap<(usize, usize), usize>,
     /// Maps choice_index → items-vec index for reasoning items
     reasoning_item_for_choice: HashMap<usize, usize>,
-    /// Whether any choice has received a `finish_reason` from upstream
+    /// Whether any choice in the current iteration has received a `finish_reason`
+    /// from upstream. Reset by `prepare_next_iteration`.
     finish_reason_seen: bool,
 }
 
@@ -188,7 +189,10 @@ impl StreamingState {
     /// Emits `response.completed` only if upstream sent a `finish_reason`; a stream
     /// that closes without one was cut off, so it ends with `response.incomplete`.
     pub fn finalize(&mut self) -> Vec<StreamingEvent> {
-        if self.finish_reason_seen {
+        // A choice that finished has had its items closed by `finalize_for_choice`,
+        // so an item still in progress belongs to a choice that was cut off.
+        let cut_off = !self.finish_reason_seen || self.items.iter().any(|item| item.status == ItemStatus::InProgress);
+        if !cut_off {
             let mut events = self.close_open_items(ItemStatus::Completed);
             let response = self.build_final_response(ResponseStatus::Completed);
             events.push(self.terminal_event("response.completed", StreamingEventData::ResponseCompleted { response }));
@@ -278,6 +282,7 @@ impl StreamingState {
         self.msg_item_for_choice.clear();
         self.fn_call_item_for.clear();
         self.reasoning_item_for_choice.clear();
+        self.finish_reason_seen = false;
     }
 
     /// Process a single choice from a chunk
@@ -640,6 +645,7 @@ impl StreamingState {
 
     fn create_item_done_event(&mut self, index: usize) -> StreamingEvent {
         let item = &self.items[index];
+        let status = item.status;
         let output_index = (self.item_index_offset + index) as u32;
         let output_item = match &item.kind {
             StreamingItemKind::Message {
@@ -655,14 +661,14 @@ impl StreamingState {
                     annotations: vec![],
                     logprobs: logprobs.clone(),
                 }]),
-                status: Some(ItemStatus::Completed),
+                status: Some(status),
             }),
             StreamingItemKind::FunctionCall { call_id, name, arguments } => Item::FunctionCall(FunctionCallItem {
                 id: Some(item.id.clone()),
                 call_id: call_id.clone(),
                 name: name.clone(),
                 arguments: arguments.clone(),
-                status: Some(ItemStatus::Completed),
+                status: Some(status),
             }),
             StreamingItemKind::Reasoning { summary_text, .. } => Item::Reasoning(ReasoningItem {
                 id: Some(item.id.clone()),
@@ -673,7 +679,7 @@ impl StreamingState {
                 summary: Some(vec![SummaryContent::Text {
                     text: summary_text.clone(),
                 }]),
-                status: Some(ItemStatus::Completed),
+                status: Some(status),
             }),
         };
         StreamingEvent {
@@ -1127,6 +1133,79 @@ mod tests {
             usage.output_tokens_details.reasoning_tokens, 30,
             "reasoning_tokens should flow through to streaming state"
         );
+    }
+
+    fn chunk_for_choice(index: u32, content: Option<&str>, finish_reason: Option<&str>) -> ChatCompletionChunk {
+        let mut chunk = create_test_chunk("c", content, Some("assistant"), finish_reason);
+        chunk.choices[0].index = index;
+        chunk
+    }
+
+    /// Find the terminal event and pull its response status.
+    fn terminal_status(events: &[StreamingEvent]) -> (String, ResponseStatus) {
+        let event = events.last().expect("terminal event");
+        match &event.data {
+            StreamingEventData::ResponseCompleted { response }
+            | StreamingEventData::ResponseIncomplete { response }
+            | StreamingEventData::ResponseFailed { response } => (event.event_type.clone(), response.status.clone()),
+            other => panic!("last event is not terminal: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_finalize_incomplete_marks_output_item_done_incomplete() {
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
+        state.process_chunk(&create_test_chunk("c1", Some("Partial"), Some("assistant"), None));
+
+        let events = state.finalize();
+
+        let done = events
+            .iter()
+            .find(|e| e.event_type == "response.output_item.done")
+            .expect("item done");
+        let StreamingEventData::OutputItemDone {
+            item: Item::Message(message),
+            ..
+        } = &done.data
+        else {
+            panic!("expected a message item");
+        };
+        assert_eq!(message.status, Some(ItemStatus::Incomplete));
+        assert_eq!(terminal_status(&events).0, "response.incomplete");
+    }
+
+    #[test]
+    fn test_finalize_is_incomplete_when_only_one_choice_finished() {
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
+        state.process_chunk(&chunk_for_choice(0, Some("done"), Some("stop")));
+        state.process_chunk(&chunk_for_choice(1, Some("cut off"), None));
+
+        let events = state.finalize();
+
+        assert_eq!(terminal_status(&events).0, "response.incomplete");
+    }
+
+    #[test]
+    fn test_finalize_is_completed_when_every_choice_finished() {
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
+        state.process_chunk(&chunk_for_choice(0, Some("a"), Some("stop")));
+        state.process_chunk(&chunk_for_choice(1, Some("b"), Some("stop")));
+
+        let events = state.finalize();
+
+        assert_eq!(terminal_status(&events).0, "response.completed");
+    }
+
+    #[test]
+    fn test_finalize_after_next_iteration_needs_a_new_finish_reason() {
+        let mut state = StreamingState::new(&test_request("gpt-4"), None);
+        state.process_chunk(&create_test_chunk("c1", Some("first"), Some("assistant"), Some("tool_calls")));
+        state.prepare_next_iteration();
+        state.process_chunk(&create_test_chunk("c2", Some("cut off"), Some("assistant"), None));
+
+        let events = state.finalize();
+
+        assert_eq!(terminal_status(&events).0, "response.incomplete");
     }
 
     #[test]
