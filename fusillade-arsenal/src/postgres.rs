@@ -14480,21 +14480,37 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        // Rows produced by every scan of `requests`, across all loops.
-        fn request_rows(node: &serde_json::Value) -> f64 {
-            let own = if node.get("Relation Name").and_then(|v| v.as_str()) == Some("requests") {
-                node["Actual Rows"].as_f64().unwrap_or(0.0)
-                    * node["Actual Loops"].as_f64().unwrap_or(0.0)
-            } else {
-                0.0
-            };
-            own + node
-                .get("Plans")
-                .and_then(|plans| plans.as_array())
-                .map(|plans| plans.iter().map(request_rows).sum())
-                .unwrap_or(0.0)
+        // Rows every scan of `requests` visited across all loops: those it
+        // emitted plus those its filter or index recheck discarded, so a scan
+        // that reads everything and keeps a little still counts in full.
+        fn request_rows_visited(node: &serde_json::Value) -> f64 {
+            match node {
+                serde_json::Value::Array(values) => values.iter().map(request_rows_visited).sum(),
+                serde_json::Value::Object(fields) => {
+                    let visited = if fields.get("Relation Name").and_then(|v| v.as_str())
+                        == Some("requests")
+                    {
+                        [
+                            "Actual Rows",
+                            "Rows Removed by Filter",
+                            "Rows Removed by Index Recheck",
+                        ]
+                        .iter()
+                        .map(|key| fields.get(*key).and_then(|v| v.as_f64()).unwrap_or(0.0))
+                        .sum::<f64>()
+                            * fields
+                                .get("Actual Loops")
+                                .and_then(|v| v.as_f64())
+                                .unwrap_or(0.0)
+                    } else {
+                        0.0
+                    };
+                    visited + fields.values().map(request_rows_visited).sum::<f64>()
+                }
+                _ => 0.0,
+            }
         }
-        let read = request_rows(&plan[0]["Plan"]);
+        let read = request_rows_visited(&plan);
         // Counting every candidate would read all 40,100 rows; the probe
         // leaves the 2,000 live rows plus the idle batches' 100.
         assert!(
