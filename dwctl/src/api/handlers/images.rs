@@ -109,10 +109,19 @@ pub async fn get_image<P: PoolProvider + Clone + Send + Sync>(
     // Re-creating it per request would re-init the GCS client + ADC signer
     // on every dashboard image load.
     let ttl = Duration::from_secs(config.image_normalizer.signing.dashboard_ttl_secs);
-    let signed = state.image_normalizer.sign(token, ttl).await.map_err(|e| {
-        warn!(error = %e, "image_normalizer.sign failed for dashboard view");
-        Error::Internal {
-            operation: format!("image signing failed: {e}"),
+    let signed = state.image_normalizer.sign(token, ttl).await.map_err(|e| match e {
+        // The grant covers the content hash, but this reference names a copy
+        // the store does not have (e.g. a mistyped upload ID): same answer as
+        // an image the caller cannot see.
+        crate::image_normalizer::NormalizeError::NotFound => Error::NotFound {
+            resource: "image".to_string(),
+            id: sha256_hex.clone(),
+        },
+        e => {
+            warn!(error = %e, "image_normalizer.sign failed for dashboard view");
+            Error::Internal {
+                operation: format!("image signing failed: {e}"),
+            }
         }
     })?;
 

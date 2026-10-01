@@ -15,9 +15,10 @@
 //! Two-stage substitution:
 //!
 //! 1. **Ingest** ([`ImageNormalizer::ingest`]) — fetch (HTTP) or decode
-//!    (data URI), hash the bytes, store them under a key made of the content
-//!    hash plus a random per-ingest upload ID, return an opaque [`ImageToken`].
-//!    Identical bytes share the content hash but never an object key.
+//!    (data URI), hash the bytes, store them, return an opaque
+//!    [`ImageToken`]. Objects are keyed by the content hash, or — with
+//!    `unique_upload_keys` on — by the content hash plus a random per-ingest
+//!    upload ID, so identical bytes never share an object key.
 //! 2. **Sign** ([`ImageNormalizer::sign`]) — exchange a token for a
 //!    short-lived signed URL ready to hand to an upstream provider.
 //!
@@ -187,6 +188,8 @@ impl ImageNormalizer for DisabledNormalizer {
 pub struct DefaultImageNormalizer<S: ImageStore> {
     fetcher: fetcher::ImageFetcher,
     store: Arc<S>,
+    /// See [`ImageNormalizerConfig::unique_upload_keys`].
+    unique_upload_keys: bool,
 }
 
 impl<S: ImageStore> DefaultImageNormalizer<S> {
@@ -194,7 +197,15 @@ impl<S: ImageStore> DefaultImageNormalizer<S> {
         Self {
             fetcher: fetcher::ImageFetcher::new(fetcher_cfg),
             store,
+            unique_upload_keys: false,
         }
+    }
+
+    /// Give every ingest its own object key (see
+    /// [`ImageNormalizerConfig::unique_upload_keys`]).
+    pub fn with_unique_upload_keys(mut self, enabled: bool) -> Self {
+        self.unique_upload_keys = enabled;
+        self
     }
 }
 
@@ -232,13 +243,25 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
         let digest = hasher.finalize();
         let mut sha = [0u8; 32];
         sha.copy_from_slice(&digest);
-        // The content hash stays the image's identity (access grants, prompt
-        // cache); the random upload ID gives this upload its own object key, so
-        // writes never contend on a shared key and need no existence
-        // pre-check — ingest is a single PUT.
-        let token = ImageToken::new_unique(sha);
-
-        self.store.put(token, &mime, bytes).await?;
+        let token = if self.unique_upload_keys {
+            // The content hash stays the image's identity (access grants,
+            // prompt cache); the random upload ID gives this upload its own
+            // object key, so writes never contend on a shared key and need no
+            // existence check — ingest is a single PUT.
+            let token = ImageToken::new_unique(sha);
+            self.store.put(token, &mime, bytes).await?;
+            token
+        } else {
+            // Content-addressed: reuse the existing object on a dedup hit.
+            // exists() also reports an object the bucket lifecycle is about to
+            // expire as absent, so the re-upload here resets its age before a
+            // batch signs a reference to it.
+            let token = ImageToken(sha, None);
+            if !self.store.exists(token).await? {
+                self.store.put(token, &mime, bytes).await?;
+            }
+            token
+        };
         Ok(IngestResult { token, mime, bytes_len })
     }
 
@@ -282,18 +305,18 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalize
                  restart and are not shared across replicas — use gcs or s3_compatible in production"
             );
             let store = Arc::new(MemoryStore::new());
-            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
+            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store).with_unique_upload_keys(cfg.unique_upload_keys))
         }
         BackendConfig::Gcs { bucket, region } => {
             let store = Arc::new(store::GcsStore::new(bucket.clone(), region.clone()));
-            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
+            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store).with_unique_upload_keys(cfg.unique_upload_keys))
         }
         BackendConfig::S3Compatible {
             bucket,
             endpoint_url,
             region,
             force_path_style,
-            reuse_max_age_secs: _,
+            reuse_max_age_secs,
         } => {
             // Credentials are sourced from the environment (not the
             // serializable config) so they can't leak via a config dump.
@@ -315,15 +338,18 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalize
                      IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY environment variable"
                 )
             })?;
-            let store = Arc::new(store::S3CompatStore::new(
-                bucket.clone(),
-                endpoint_url.clone(),
-                region.clone(),
-                *force_path_style,
-                access_key_id,
-                secret_access_key,
-            ));
-            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
+            let store = Arc::new(
+                store::S3CompatStore::new(
+                    bucket.clone(),
+                    endpoint_url.clone(),
+                    region.clone(),
+                    *force_path_style,
+                    access_key_id,
+                    secret_access_key,
+                )
+                .with_reuse_max_age((*reuse_max_age_secs > 0).then(|| Duration::from_secs(*reuse_max_age_secs))),
+            );
+            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store).with_unique_upload_keys(cfg.unique_upload_keys))
         }
     })
 }
@@ -345,14 +371,13 @@ mod tests {
         let token = result.token;
         assert_eq!(result.mime, "image/png");
         assert!(result.bytes_len > 0, "bytes_len should be the actual decoded length, got 0");
+        assert_eq!(token.1, None, "unique_upload_keys is off by default: content-addressed token");
 
-        // Ingesting the same URI again yields the same content hash but a
-        // distinct upload ID, so the two uploads never share an object key.
+        // dedup: ingesting the same URI again yields the same token and
+        // does not duplicate the stored bytes.
         let result_again = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap();
-        assert_eq!(token.0, result_again.token.0);
-        assert_ne!(token, result_again.token);
+        assert_eq!(token, result_again.token);
         assert_eq!(result.bytes_len, result_again.bytes_len);
-        assert_eq!(n.read(result_again.token).await.unwrap().1, n.read(token).await.unwrap().1);
 
         // sign returns a usable URL with the token hex baked in.
         let signed = n.sign(token, Duration::from_secs(60)).await.unwrap();
@@ -362,6 +387,23 @@ mod tests {
         let (mime, bytes) = n.read(token).await.unwrap();
         assert_eq!(mime, "image/png");
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[tokio::test]
+    async fn ingest_with_unique_upload_keys_stores_each_ingest_separately() {
+        let store = Arc::new(MemoryStore::new());
+        let n = DefaultImageNormalizer::new(FetcherConfig::default(), store).with_unique_upload_keys(true);
+        let a = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap().token;
+        let b = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap().token;
+        // Same content hash, distinct upload IDs: two objects with the same bytes.
+        assert_eq!(a.0, b.0);
+        assert!(a.1.is_some() && b.1.is_some());
+        assert_ne!(a, b);
+        assert_eq!(n.read(a).await.unwrap().1, n.read(b).await.unwrap().1);
+        // Content-addressed tokens for the same image stay readable alongside.
+        let legacy = DefaultImageNormalizer::new(FetcherConfig::default(), Arc::new(MemoryStore::new()));
+        let t = legacy.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap().token;
+        assert_eq!(t, ImageToken(a.0, None));
     }
 
     #[tokio::test]
@@ -422,6 +464,7 @@ mod tests {
             backend: Some(BackendConfig::Memory),
             fetcher: FetcherConfig::default(),
             signing: SigningConfig::default(),
+            unique_upload_keys: false,
         };
         let _: Arc<dyn ImageNormalizer> = from_config(&cfg).expect("memory backend must build");
     }
@@ -433,6 +476,7 @@ mod tests {
             backend: None,
             fetcher: FetcherConfig::default(),
             signing: SigningConfig::default(),
+            unique_upload_keys: false,
         };
         // Manual match because the Ok arm holds `Arc<dyn ImageNormalizer>`
         // which doesn't implement Debug (required by `expect_err`).

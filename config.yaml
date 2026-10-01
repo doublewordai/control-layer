@@ -985,6 +985,20 @@ image_normalizer:
     # endpoint_url: https://<account_id>.r2.cloudflarestorage.com
     # region: auto            # R2 uses "auto"; AWS S3 uses e.g. us-east-1
     # force_path_style: true  # required by most S3-compatible endpoints
+    # reuse_max_age_secs: 432000   # 5 days. Objects are deduplicated by
+    #                               # content hash, and the R2 lifecycle deletes
+    #                               # them 14 days after upload regardless of use.
+    #                               # A batch reference can be dispatched up to
+    #                               # 24h + the 7-day retry buffer after ingest,
+    #                               # so a dedup hit older than this is re-uploaded
+    #                               # rather than left to expire mid-batch.
+    #                               # 0 disables. Ignored when
+    #                               # unique_upload_keys is on.
+  # Store each ingest under its own object key (dw-img://{sha256}.{upload_id})
+  # instead of reusing one object per content hash. Enable only once every
+  # replica runs a version that reads upload-ID tokens; disable before
+  # rolling back past it.
+  unique_upload_keys: false
   fetcher:
     max_bytes: 20971520        # 20 MiB
     timeout_secs: 30

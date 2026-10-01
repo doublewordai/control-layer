@@ -31,6 +31,24 @@ pub struct ImageNormalizerConfig {
     /// Signed-URL TTL policy.
     #[serde(default)]
     pub signing: SigningConfig,
+
+    /// Store each ingest under its own object key.
+    ///
+    /// Off (the default): tokens are content-addressed (`dw-img://{sha256}`)
+    /// and ingest reuses an existing object, skipping the upload.
+    ///
+    /// On: each ingest gets a random upload ID (`dw-img://{sha256}.{upload_id}`)
+    /// and its own object, uploaded with a single PUT and no existence check.
+    /// The content hash stays the image's identity for access grants and the
+    /// prompt cache.
+    ///
+    /// Every version that ships this setting reads both token forms, but older
+    /// versions read only content-addressed tokens. Turn it on only once every
+    /// replica runs a version that has this setting, and turn it off before
+    /// rolling back past that version — otherwise queued requests holding
+    /// upload-ID tokens fail on the older replicas.
+    #[serde(default)]
+    pub unique_upload_keys: bool,
 }
 
 /// Object-store backend selection.
@@ -79,11 +97,26 @@ pub enum BackendConfig {
         /// S3-compatible endpoints (R2, MinIO); defaults to true.
         #[serde(default = "default_true")]
         force_path_style: bool,
-        /// Deprecated and ignored. Every ingest now uploads its own object
-        /// (see [`ImageToken`](super::ImageToken)), so an object is never older
-        /// than its newest reference and nothing needs refreshing before the
-        /// bucket lifecycle rule expires it. Still accepted so existing
-        /// configs keep loading.
+        /// Re-upload an object on a dedup hit once it is this old, in
+        /// seconds. `0` disables the check. Applies only while
+        /// `unique_upload_keys` is off: with it on, every ingest uploads a
+        /// fresh object, so there are no dedup hits to refresh.
+        ///
+        /// Objects are content-addressed and deduplicated, so a customer who
+        /// reuses an image has it uploaded once and referenced from then on.
+        /// A bucket lifecycle rule (production R2: delete after 14 days,
+        /// counted from upload, not last use) then removes it while batch
+        /// requests still point at it. On 2026-09-24 three Qwen3-VL-235B
+        /// batch requests retried an image fetch 404 more than 600 times
+        /// each: the object had been uploaded 14 days earlier, the dedup
+        /// check found it an hour before expiry, and it vanished mid-batch.
+        ///
+        /// Set this to the lifecycle age minus the longest time a signed
+        /// reference can stay in use. In production a batch request can be
+        /// dispatched up to 24h after ingest plus the 7-day retry buffer
+        /// (`stop_before_deadline_ms` is -7 days), so 14 - 8 = 6 days is the
+        /// bound and the default of 5 days leaves the lifecycle sweep some
+        /// slack.
         #[serde(default = "default_s3_reuse_max_age_secs")]
         reuse_max_age_secs: u64,
     },
@@ -240,7 +273,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn s3_deprecated_reuse_max_age_still_loads() {
+    fn s3_reuse_max_age_defaults_to_five_days_and_can_be_disabled() {
         let cfg: BackendConfig = serde_yaml::from_str("type: s3_compatible\nbucket: b\nendpoint_url: https://example.invalid\n").unwrap();
         let BackendConfig::S3Compatible { reuse_max_age_secs, .. } = cfg else {
             panic!("expected s3_compatible");
@@ -296,6 +329,7 @@ mod tests {
                 dispatch_ttl_headroom_secs: 300,
                 dashboard_ttl_secs: 30,
             },
+            unique_upload_keys: true,
         };
         let json = serde_json::to_string(&cfg).expect("serialize");
         let back: ImageNormalizerConfig = serde_json::from_str(&json).expect("deserialize");
@@ -308,6 +342,13 @@ mod tests {
         assert!(back.fetcher.mime_allowed("image/png"));
         assert!(!back.fetcher.mime_allowed("image/jpeg"));
         assert_eq!(back.signing.realtime_ttl().as_secs(), 60);
+        assert!(back.unique_upload_keys);
+    }
+
+    #[test]
+    fn unique_upload_keys_defaults_off() {
+        let c: ImageNormalizerConfig = serde_yaml::from_str("enabled: true\nbackend:\n  type: memory\n").unwrap();
+        assert!(!c.unique_upload_keys);
     }
 
     #[test]

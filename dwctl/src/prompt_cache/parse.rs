@@ -698,9 +698,10 @@ fn canonical_block_bytes(role: &str, stripped_block: &serde_json::Value) -> Vec<
     out
 }
 
-/// `block` with its stored-image token rewritten to the content-only form
-/// (`dw-img://{sha256}`), if it is an image block whose URL is a token carrying an upload
-/// ID; `None` for every other block (no clone, no scan).
+/// `block` with its stored-image token rewritten to the canonical content-only form
+/// (lowercase `dw-img://{sha256}`), if it is an image block whose URL is a token in any
+/// other form (an upload ID, uppercase hex); `None` for every other block (no clone, no
+/// scan).
 fn image_block_without_upload_id(block: &serde_json::Value) -> Option<serde_json::Value> {
     use crate::image_normalizer::ImageToken;
     // The two image shapes the image normalizer substitutes (chat `image_url.url`,
@@ -715,9 +716,12 @@ fn image_block_without_upload_id(block: &serde_json::Value) -> Option<serde_json
         return None;
     }
     let token: ImageToken = url.parse().ok()?;
-    token.1?;
+    let canonical = ImageToken(token.0, None).to_dw_img_uri();
+    if canonical == url {
+        return None;
+    }
     let mut block = block.clone();
-    *block.pointer_mut(pointer)? = ImageToken(token.0, None).to_dw_img_uri().into();
+    *block.pointer_mut(pointer)? = canonical.into();
     Some(block)
 }
 
@@ -1881,6 +1885,17 @@ mod tests {
         let different = body(ImageToken::new_unique([8; 32]));
         assert_eq!(a.cumulative_hashes[1], b.cumulative_hashes[1]);
         assert_eq!(a.cumulative_hashes[1], legacy.cumulative_hashes[1]);
+        // Hex case is not identity either.
+        let upper = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": format!("dw-img://{}", hex::encode_upper([7u8; 32]))}}
+                ]}
+            ]
+        }));
+        assert_eq!(a.cumulative_hashes[1], upper.cumulative_hashes[1]);
         assert_ne!(a.cumulative_hashes[1], different.cumulative_hashes[1]);
     }
 

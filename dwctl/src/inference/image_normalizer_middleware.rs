@@ -443,7 +443,9 @@ mod tests {
 
     fn state_for_tests() -> ImageNormalizerMiddlewareState {
         let store = Arc::new(MemoryStore::new().with_base_url("http://test.local/dw-img"));
-        let normalizer = Arc::new(DefaultImageNormalizer::new(FetcherConfig::default(), store));
+        // Upload-ID tokens: the mode the cache / grant tests need to cover
+        // (a separately stored copy of the same image).
+        let normalizer = Arc::new(DefaultImageNormalizer::new(FetcherConfig::default(), store).with_unique_upload_keys(true));
         ImageNormalizerMiddlewareState {
             enabled: true,
             normalizer,
