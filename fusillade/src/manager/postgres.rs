@@ -77,7 +77,11 @@ where
     /// Use [`PostgresDaemon::new`] when the store needs custom Arsenal
     /// configuration, such as database retry cadence.
     pub fn from_pools(pools: P, config: DaemonConfig) -> Self {
-        let storage = Arc::new(PostgresStore::new(pools, (&config).into()));
+        let storage = Arc::new(
+            PostgresStore::new(pools, (&config).into()).with_maintenance_query_timeout(
+                Duration::from_millis(config.claim_query_timeout_ms),
+            ),
+        );
         Self::from_store(storage, config)
     }
 
@@ -98,6 +102,9 @@ where
         let retention_bounds = retention.policy().batchless_retention_bounds_seconds();
         let storage = Arc::new(
             PostgresStore::new(pools, (&config).into())
+                .with_maintenance_query_timeout(Duration::from_millis(
+                    config.claim_query_timeout_ms,
+                ))
                 .with_retained_response_fence_seconds(fence_seconds)
                 .with_retained_response_retention_bounds_seconds(retention_bounds),
         );

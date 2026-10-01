@@ -1970,12 +1970,23 @@ pub async fn delete_file<P: PoolProvider>(
     // Soft-delete the file: cancels non-terminal batches and unlinks them
     // (file_id = NULL), NULLs output_file_id/error_file_id, and marks the file
     // deleted (retained for audit). Existing batch results survive file deletion.
+    //
+    // `delete_file` reports `FileNotFound` when the row is already soft-deleted,
+    // which happens when a duplicate/concurrent DELETE loses the race. That is a
+    // client-visible `404`, not a server fault — matching the `get_file` check
+    // above, which already returns 404 once the row is gone.
     state
         .request_manager
         .delete_file(fusillade::FileId(file_id))
         .await
-        .map_err(|e| Error::Internal {
-            operation: format!("delete file: {}", e),
+        .map_err(|e| match e {
+            fusillade::FusilladeError::FileNotFound(_) => Error::NotFound {
+                resource: "File".to_string(),
+                id: file_id_str.clone(),
+            },
+            other => Error::Internal {
+                operation: format!("delete file: {}", other),
+            },
         })?;
 
     Ok(Json(FileDeleteResponse {

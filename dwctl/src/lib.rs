@@ -159,6 +159,8 @@ pub mod keystore;
 mod leader_election;
 pub mod limits;
 mod metrics;
+/// jemalloc statistics (re-exported for the memory validation harness).
+pub use metrics::allocator as allocator_metrics;
 pub mod migrations;
 pub mod modalities;
 pub mod model_provisioning;
@@ -169,6 +171,7 @@ mod payment_providers;
 pub mod prefix_chain;
 pub mod pricing;
 mod probes;
+pub mod profiling;
 pub mod prompt_cache;
 pub mod reasoning;
 mod recompute;
@@ -375,7 +378,15 @@ fn get_or_install_prometheus_handle() -> PrometheusHandle {
             // compliance ratios are only exact at a bucket edge.
             const SUBMISSION_LATENCY_BUCKETS: &[f64] = &[1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 900.0, 1800.0, 3600.0];
 
+            // Heap profile dump duration (1ms to 30s, the default dump timeout).
+            const HEAP_PROFILE_DUMP_BUCKETS: &[f64] = &[0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0];
+
             let handle = PrometheusBuilder::new()
+                .set_buckets_for_metric(
+                    Matcher::Full("dwctl_heap_profile_dump_duration_seconds".to_string()),
+                    HEAP_PROFILE_DUMP_BUCKETS,
+                )
+                .expect("Failed to set custom buckets for dwctl_heap_profile_dump_duration_seconds")
                 .set_buckets_for_metric(Matcher::Full("dwctl_analytics_lag_seconds".to_string()), ANALYTICS_LAG_BUCKETS)
                 .expect("Failed to set custom buckets for dwctl_analytics_lag_seconds")
                 .set_buckets_for_metric(Matcher::Full("dwctl_cache_sync_lag_seconds".to_string()), CACHE_SYNC_LAG_BUCKETS)
@@ -3839,6 +3850,26 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         });
     }
 
+    // jemalloc statistics gauges (Linux only; the sampler idles elsewhere).
+    if config.enable_metrics && config.background_services.allocator_metrics.enabled {
+        let allocator_config = config.background_services.allocator_metrics.clone();
+        let allocator_shutdown = shutdown_token.clone();
+        background_tasks.spawn("allocator-metrics-sampler", async move {
+            metrics::allocator::run_allocator_metrics_sampler(allocator_config, allocator_shutdown).await
+        });
+    }
+
+    // Opt-in heap profile listener. Serving is separate from sampling, which
+    // only happens when the process started with jemalloc `prof:true`.
+    profiling::log_heap_profiling_status();
+    if config.heap_profiling.enabled {
+        let profiling_config = config.heap_profiling.clone();
+        let profiling_shutdown = shutdown_token.clone();
+        background_tasks.spawn("heap-profiling-server", async move {
+            profiling::run_heap_profiling_server(profiling_config, profiling_shutdown).await
+        });
+    }
+
     // Start the usage-refresh daemon: incrementally folds new http_analytics rows into
     // user_model_usage_daily. The analytics batcher (below) nudges it after every flush;
     // this shares an in-process Notify with it rather than round-tripping through Postgres.
@@ -3863,6 +3894,19 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         let daemon_shutdown = shutdown_token.clone();
         background_tasks.spawn("task-retention", async move {
             task_retention::run_task_retention_daemon(daemon_pool, daemon_config, daemon_shutdown).await;
+            Ok(())
+        });
+    }
+
+    // Start the prompt-cache retention daemon: bounded, oldest-first deletion of entries
+    // that expired more than the recompute grace ago. Without it the table only grows.
+    if config.background_services.prompt_cache_retention.enabled {
+        // Retention holds a session advisory lock, which requires a direct connection.
+        let daemon_pool = direct_pools.clone();
+        let daemon_config = config.background_services.prompt_cache_retention.clone();
+        let daemon_shutdown = shutdown_token.clone();
+        background_tasks.spawn("prompt-cache-retention", async move {
+            prompt_cache::retention::run_prompt_cache_retention_daemon(daemon_pool, daemon_config, daemon_shutdown).await;
             Ok(())
         });
     }
@@ -4118,6 +4162,7 @@ impl Application {
             fusillade_pools.clone(),
             fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
         )
+        .with_maintenance_query_timeout(std::time::Duration::from_millis(fusillade_daemon_config.claim_query_timeout_ms))
         .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
         .with_realtime_retention_seconds(
             config
@@ -4411,16 +4456,26 @@ impl Application {
         (server, self.bg_services)
     }
 
-    /// Start serving the application
-    pub async fn serve<F>(mut self, shutdown: F) -> anyhow::Result<()>
+    /// Start serving the application on the configured host and port
+    pub async fn serve<F>(self, shutdown: F) -> anyhow::Result<()>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let bind_addr = self.config.bind_address();
-        let listener = TcpListener::bind(&bind_addr).await?;
+        let listener = TcpListener::bind(self.config.bind_address()).await?;
+        self.serve_with_listener(listener, shutdown).await
+    }
+
+    /// Start serving the application on an already-bound listener. The
+    /// listener's port should match `config.port`, which the application uses
+    /// to call itself.
+    pub async fn serve_with_listener<F>(mut self, listener: TcpListener, shutdown: F) -> anyhow::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         info!(
             "Control layer listening on http://{}, available at http://localhost:{}",
-            bind_addr, self.config.port
+            listener.local_addr()?,
+            self.config.port
         );
 
         // Apply middleware before path matching

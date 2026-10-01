@@ -47,6 +47,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use tracing::{info, instrument};
 
+pub mod affinity;
 pub mod aimd;
 pub mod auth;
 pub mod client;
