@@ -6,7 +6,7 @@ CREATE TABLE model_serving_classes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     deployed_model_id UUID NOT NULL REFERENCES deployed_models(id) ON DELETE RESTRICT,
     class_key TEXT NOT NULL CHECK (class_key ~ '^[a-z][a-z0-9_-]*$'),
-    display_name TEXT NOT NULL CHECK (btrim(display_name) <> ''),
+    display_name TEXT NOT NULL CHECK (display_name ~ '[^[:space:]]'),
     inference_endpoint_id UUID NOT NULL REFERENCES inference_endpoints(id) ON DELETE RESTRICT,
     upstream_model_name TEXT NOT NULL CHECK (upstream_model_name <> '' AND upstream_model_name !~ '[[:space:]]'),
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),

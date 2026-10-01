@@ -217,6 +217,23 @@ async fn class_keys_reject_suffix_syntax_and_unstable_spellings(pool: PgPool) {
 }
 
 #[sqlx::test]
+async fn class_display_names_reject_empty_or_whitespace_only_labels(pool: PgPool) {
+    let f = fixture(&pool).await;
+    let class = insert_class(&pool, f.model, f.endpoint, "fast", "configured-upstream")
+        .await
+        .unwrap();
+    for label in ["", " ", "\t", "\n", "\r", "\u{000b}\u{000c}", " \t\r\n "] {
+        let error = sqlx::query("UPDATE model_serving_classes SET display_name = $1 WHERE id = $2")
+            .bind(label)
+            .bind(class.id)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert_database_error(error, "23514", "model_serving_classes_display_name_check");
+    }
+}
+
+#[sqlx::test]
 async fn class_requires_an_existing_model(pool: PgPool) {
     let f = fixture(&pool).await;
     let error = insert_class(&pool, Uuid::new_v4(), f.endpoint, "fast", "example/model:fast")
@@ -232,6 +249,40 @@ async fn class_requires_an_existing_endpoint(pool: PgPool) {
         .await
         .unwrap_err();
     assert_database_error(error, "23503", "model_serving_classes_inference_endpoint_id_fkey");
+}
+
+#[sqlx::test]
+async fn an_endpoint_referenced_only_by_a_class_cannot_be_hard_deleted(pool: PgPool) {
+    let f = fixture(&pool).await;
+    // The parent models still use f.endpoint. No model or alias FK should mask
+    // the class-to-endpoint restriction under test.
+    let endpoint: Uuid = sqlx::query_scalar(
+        "INSERT INTO inference_endpoints (name, url, created_by)
+         SELECT 'class-only-upstream', 'http://localhost:8081', created_by
+         FROM deployed_models WHERE id = $1 RETURNING id",
+    )
+    .bind(f.model)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let class = insert_class(&pool, f.model, endpoint, "fast", "configured-upstream").await.unwrap();
+    let error = sqlx::query("DELETE FROM inference_endpoints WHERE id = $1")
+        .bind(endpoint)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    let database = error.as_database_error().unwrap();
+    assert!(matches!(database.code().as_deref(), Some("23001" | "23503")), "{error}");
+    assert_eq!(database.constraint(), Some("model_serving_classes_inference_endpoint_id_fkey"));
+    let retained: ModelServingClass = sqlx::query_as(
+        "SELECT id, deployed_model_id, class_key, display_name, inference_endpoint_id, upstream_model_name, created_at, updated_at
+         FROM model_serving_classes WHERE id = $1",
+    )
+    .bind(class.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(retained, class);
 }
 
 #[sqlx::test]

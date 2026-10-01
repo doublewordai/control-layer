@@ -3,7 +3,7 @@ SET LOCAL lock_timeout = '5s';
 
 CREATE TABLE model_aliases (
     alias TEXT PRIMARY KEY,
-    deployed_model_id UUID NOT NULL REFERENCES deployed_models(id) ON DELETE CASCADE,
+    deployed_model_id UUID NOT NULL REFERENCES deployed_models(id) ON DELETE RESTRICT,
     serving_class_id UUID NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
