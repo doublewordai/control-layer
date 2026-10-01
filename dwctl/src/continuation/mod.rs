@@ -358,7 +358,9 @@ impl InflightLimiter {
     pub fn try_acquire(self: &Arc<Self>, model: &str) -> Option<InflightGuard> {
         let entry = self.counts.entry(model.to_string()).or_default();
         // fetch_update gives a compare-and-swap; a plain load+store could let two
-        // concurrent deaths on the same model both see `max - 1`.
+        // concurrent deaths on the same model both see `max - 1`. Rust 1.99
+        // renames it `try_update`, which older compilers lack.
+        #[allow(deprecated)]
         let acquired = entry
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| (n < self.max).then_some(n + 1))
             .is_ok();
@@ -385,6 +387,7 @@ impl Drop for InflightGuard {
         if let Some(entry) = self.limiter.counts.get(&self.model) {
             // Saturating: a released-twice bug must not wrap to u32::MAX and
             // permanently wedge the model's resume path.
+            #[allow(deprecated)] // `try_update` from Rust 1.99; see `try_acquire`.
             let _ = entry.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| Some(n.saturating_sub(1)));
         }
     }

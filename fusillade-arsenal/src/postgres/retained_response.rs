@@ -2064,6 +2064,8 @@ impl ByteBudget {
     /// always the head of the queue rather than whichever mover serialised
     /// its payload first; a large head can then never be starved by smaller
     /// siblings that keep winning the race.
+    // Rust 1.99 renames `fetch_update` to `try_update`, which older compilers lack.
+    #[allow(deprecated)]
     fn try_reserve(&self, bytes: u64, allow_oversized: bool) -> bool {
         self.reserved
             .fetch_update(
