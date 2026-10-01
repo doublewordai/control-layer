@@ -1,40 +1,48 @@
 //! Heap budgets for requests in flight.
 //!
-//! Each test holds a round of identical requests open at a mock upstream and
-//! measures the heap the application keeps per request, at two payload sizes.
-//! From the two rounds it derives:
+//! Each test holds a round of identical requests open at one point in their
+//! life and measures the heap the application keeps per request, at two
+//! payload sizes:
+//!
+//! - a request body, while the upstream works on it;
+//! - a streamed response, after its output has reached the client and before
+//!   the stream finishes;
+//! - a complete response, while the client has not read it yet.
+//!
+//! Payloads are shaped like everyday traffic (see `payload`), because how much
+//! the application holds per byte depends on a body's structure as well as its
+//! size. From the two rounds each test derives:
 //!
 //! - `copies`: bytes held per payload byte while a request is in flight;
 //! - `fixed`: bytes held per in-flight request regardless of payload size.
 //!
 //! Budgets cap both, so a change that keeps another copy of a body in memory
-//! while the upstream is working fails here.
+//! while a request is in flight fails here.
 //!
 //! The output also reports what stays allocated after requests complete
 //! (`idle copies`, `leaked`). It comes from request logging's writes to the
 //! database and varies between runs, so it is not budgeted.
 //!
-//! How much the application holds depends on the pieces its reads return, so
-//! the harness fixes them: request bodies arrive through a small receive
-//! buffer and streamed events one at a time. Connections are not reused
-//! between requests, so memory held by idle keep-alive connections is not part
-//! of the measurement. The allocator counts
-//! the whole process, so tests in this binary run one at a time.
+//! How much the application holds depends on the pieces its reads and writes
+//! move, so the harness fixes them: request bodies arrive through a small
+//! receive buffer, streamed events arrive one at a time, and responses leave
+//! through small send and receive buffers. Connections are not reused between
+//! requests, so memory held by idle keep-alive connections is not part of the
+//! measurement. The allocator counts the whole process, so tests in this
+//! binary run one at a time.
 //!
 //! Run with `just test memory`.
 
 mod alloc;
 mod harness;
 mod measure;
+mod payload;
 mod tokenizer;
 mod upstream;
 
 use std::sync::{Mutex, MutexGuard};
 
-use axum::body::Bytes;
-use serde_json::json;
-
-use harness::{Harness, MODEL_ALIAS, Options};
+use harness::{Harness, MODEL_ALIAS, Options, UPSTREAM_MODEL};
 use measure::{Load, Scaling, Target, round, scaling};
 use upstream::Reply;
 
@@ -43,8 +51,14 @@ static ALLOCATOR: alloc::CountingAllocator = alloc::CountingAllocator;
 
 static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
 
-const SMALL: usize = 64 * 1024;
-const LARGE: usize = 256 * 1024;
+/// Request bodies, in bytes: a typical agent request and a long one.
+const REQUEST_BYTES: [usize; 2] = [96 * 1024, 300 * 1024];
+/// Streamed output, in tokens: a typical response and a long one.
+const STREAMED_TOKENS: [usize; 2] = [256, 2304];
+/// Complete output, in tokens. A typical complete response fits in socket
+/// buffers and leaves the application at once, so only long ones are held
+/// while the client reads them.
+const COMPLETE_TOKENS: [usize; 2] = [8192, 32768];
 /// Inference keys allowed to call the model; routing copies the key set per request.
 const API_KEYS: usize = 500;
 
@@ -65,15 +79,6 @@ fn check(name: &str, scaling: &Scaling, budget: Budget) {
     );
 }
 
-fn chat_request(content_bytes: usize, stream: bool) -> Bytes {
-    let body = json!({
-        "model": MODEL_ALIAS,
-        "stream": stream,
-        "messages": [{ "role": "user", "content": "a".repeat(content_bytes) }],
-    });
-    Bytes::from(serde_json::to_vec(&body).unwrap())
-}
-
 fn one_at_a_time() -> MutexGuard<'static, ()> {
     ONE_AT_A_TIME.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -84,7 +89,7 @@ fn one_at_a_time() -> MutexGuard<'static, ()> {
 fn load_generator_is_not_counted() {
     let _one_at_a_time = one_at_a_time();
     let harness = Harness::start(Options { api_keys: 1 });
-    let body = chat_request(LARGE, false);
+    let body = payload::chat_request(MODEL_ALIAS, REQUEST_BYTES[1], false);
     let round = round(
         &harness,
         Load {
@@ -107,6 +112,7 @@ fn load_generator_is_not_counted() {
     }
 }
 
+/// A request body, held while the upstream works on it.
 #[test]
 fn chat_completion_request_body() {
     let _one_at_a_time = one_at_a_time();
@@ -114,7 +120,7 @@ fn chat_completion_request_body() {
     let scaling = scaling(
         &harness,
         |size| {
-            let body = chat_request(size, false);
+            let body = payload::chat_request(MODEL_ALIAS, size, false);
             Load {
                 target: Target::Application,
                 path: "/ai/v1/chat/completions",
@@ -123,41 +129,68 @@ fn chat_completion_request_body() {
                 reply: Reply::Hold,
             }
         },
-        SMALL,
-        LARGE,
+        REQUEST_BYTES,
     );
     check(
         "chat completion request body",
         &scaling,
         Budget {
-            copies: 9.25,
-            fixed_kib: 245.0,
+            copies: 10.35,
+            fixed_kib: 365.0,
         },
     );
 }
 
+/// A streamed response, held after its output has reached the client and
+/// before the stream finishes. Sizes are the bytes of the events delivered.
 #[test]
 fn chat_completion_streamed_response() {
     let _one_at_a_time = one_at_a_time();
     let harness = Harness::start(Options { api_keys: API_KEYS });
     let scaling = scaling(
         &harness,
-        |size| Load {
+        |tokens| Load {
             target: Target::Application,
             path: "/ai/v1/chat/completions",
-            body: chat_request(64, true),
-            reply: Reply::StreamThenHold { content_bytes: size },
-            size,
+            body: payload::chat_request(MODEL_ALIAS, 0, true),
+            reply: Reply::StreamThenHold { tokens },
+            size: payload::stream(UPSTREAM_MODEL, tokens).content_bytes(),
         },
-        SMALL,
-        LARGE,
+        STREAMED_TOKENS,
     );
     check(
         "chat completion streamed response",
         &scaling,
         Budget {
             copies: 1.25,
-            fixed_kib: 165.0,
+            fixed_kib: 150.0,
+        },
+    );
+}
+
+/// A complete response, held while the client has not read it yet. Sizes are
+/// the bytes of the upstream's response body.
+#[test]
+fn chat_completion_response() {
+    let _one_at_a_time = one_at_a_time();
+    let harness = Harness::start(Options { api_keys: API_KEYS });
+    let scaling = scaling(
+        &harness,
+        |tokens| Load {
+            target: Target::Application,
+            path: "/ai/v1/chat/completions",
+            body: payload::chat_request(MODEL_ALIAS, 0, false),
+            reply: Reply::Complete { tokens },
+            size: payload::completion(UPSTREAM_MODEL, tokens).len(),
+        },
+        COMPLETE_TOKENS,
+    );
+    check(
+        "chat completion response",
+        &scaling,
+        Budget {
+            copies: 2.0,
+            fixed_kib: 70.0,
         },
     );
 }
