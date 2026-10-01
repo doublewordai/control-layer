@@ -47,7 +47,7 @@ pub enum StoreError {
 }
 
 /// Object-store backend for normalised image bytes, keyed by [`ImageToken`]
-/// (content SHA-256 plus a per-ingest nonce, so unique per ingest).
+/// (content SHA-256 plus a per-ingest upload ID, so unique per ingest).
 #[async_trait]
 pub trait ImageStore: Send + Sync {
     /// Store `bytes` under `token`. Returns `Ok(true)` if written. Remote

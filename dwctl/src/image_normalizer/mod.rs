@@ -16,7 +16,7 @@
 //!
 //! 1. **Ingest** ([`ImageNormalizer::ingest`]) — fetch (HTTP) or decode
 //!    (data URI), hash the bytes, store them under a key made of the content
-//!    hash plus a random per-ingest nonce, return an opaque [`ImageToken`].
+//!    hash plus a random per-ingest upload ID, return an opaque [`ImageToken`].
 //!    Identical bytes share the content hash but never an object key.
 //! 2. **Sign** ([`ImageNormalizer::sign`]) — exchange a token for a
 //!    short-lived signed URL ready to hand to an upstream provider.
@@ -38,8 +38,8 @@
 //! - [`fetcher`] — hardened reqwest fetcher with DNS pinning, IP
 //!   deny-list, redirect re-validation, MIME / size caps, retries.
 //! - [`ip_filter`] — pure IP deny-list predicate.
-//! - [`token`] — opaque `dw-img://{sha256}.{nonce}` token format (legacy
-//!   tokens omit `.{nonce}`).
+//! - [`token`] — opaque `dw-img://{sha256}.{upload_id}` token format (legacy
+//!   tokens omit `.{upload_id}`).
 //! - [`data_uri`] — minimal `data:` URI decoder.
 //! - [`walker`] — body-traversal helpers for both endpoint shapes and
 //!   for both ingest-time substitution and dispatch-time JIT signing.
@@ -233,7 +233,7 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
         let mut sha = [0u8; 32];
         sha.copy_from_slice(&digest);
         // The content hash stays the image's identity (access grants, prompt
-        // cache); the random nonce gives this upload its own object key, so
+        // cache); the random upload ID gives this upload its own object key, so
         // writes never contend on a shared key and need no existence
         // pre-check — ingest is a single PUT.
         let token = ImageToken::new_unique(sha);
@@ -347,7 +347,7 @@ mod tests {
         assert!(result.bytes_len > 0, "bytes_len should be the actual decoded length, got 0");
 
         // Ingesting the same URI again yields the same content hash but a
-        // distinct storage nonce, so the two uploads never share an object key.
+        // distinct upload ID, so the two uploads never share an object key.
         let result_again = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap();
         assert_eq!(token.0, result_again.token.0);
         assert_ne!(token, result_again.token);

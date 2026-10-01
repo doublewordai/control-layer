@@ -45,16 +45,16 @@ describe("splitDwImgTokens", () => {
     expect(segs).toEqual([{ kind: "token", raw: `dw-img://${upper}`, sha256: SHA, ref: SHA }]);
   });
 
-  it("captures the storage nonce in the reference", () => {
-    const nonce = "c".repeat(32);
-    expect(splitDwImgTokens(`"url": "dw-img://${SHA}.${nonce}"`)).toEqual([
+  it("captures the upload ID in the reference", () => {
+    const uploadId = "c".repeat(32);
+    expect(splitDwImgTokens(`"url": "dw-img://${SHA}.${uploadId}"`)).toEqual([
       { kind: "text", value: '"url": "' },
-      { kind: "token", raw: `dw-img://${SHA}.${nonce}`, sha256: SHA, ref: `${SHA}.${nonce}` },
+      { kind: "token", raw: `dw-img://${SHA}.${uploadId}`, sha256: SHA, ref: `${SHA}.${uploadId}` },
       { kind: "text", value: '"' },
     ]);
   });
 
-  it("leaves a token with a malformed nonce as text", () => {
+  it("leaves a token with a malformed upload ID as text", () => {
     for (const bad of [`dw-img://${SHA}.abc`, `dw-img://${SHA}.${"c".repeat(33)}`, `dw-img://${SHA}a`]) {
       expect(splitDwImgTokens(bad)).toEqual([{ kind: "text", value: bad }]);
     }

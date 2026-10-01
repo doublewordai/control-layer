@@ -292,7 +292,7 @@ pub async fn accessible_tokens(
     .fetch_all(pool)
     .await?;
     // Grants are keyed on the content hash, so a grant covers every stored
-    // copy of the image: return the requested tokens (nonce included) whose
+    // copy of the image: return the requested tokens (upload ID included) whose
     // hash is granted.
     let granted: std::collections::HashSet<[u8; 32]> = rows
         .into_iter()

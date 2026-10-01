@@ -21,7 +21,7 @@ describe("dwImgLinkRenderer", () => {
     expect(link.getAttribute("title")).toContain(`/admin/api/v1/images/${SHA}`);
   });
 
-  it("links a token with a storage nonce to its full reference", () => {
+  it("links a token with an upload ID to its full reference", () => {
     const ref = `${SHA}.${"c".repeat(32)}`;
     const json = JSON.stringify({ image_url: { url: `dw-img://${ref}` } }, null, 2);
     const { container } = render(
