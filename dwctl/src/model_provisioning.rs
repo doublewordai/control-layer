@@ -563,6 +563,11 @@ impl Catalog {
                     );
                     validate_tariffs(&class.tariffs, &model.source)?;
                     ensure!(
+                        key == "standard" || class.tariffs.iter().all(|t| t.purpose != TariffPurpose::Batch),
+                        "{}: class {key:?}: batch prices can only specialize standard",
+                        model.source
+                    );
+                    ensure!(
                         class.tariffs.iter().any(|t| t.purpose == TariffPurpose::Realtime),
                         "{}: class {key:?} requires a realtime tariff",
                         model.source

@@ -186,6 +186,10 @@ digits, hyphens and underscores, starting with a letter. The old numeric-target
 `serving_classes` declaration cannot be combined with `class_routes` on one model.
 Existing legacy-only catalogs remain valid.
 
+Batch tariffs are allowed only under `standard`: batch always resolves to that
+class regardless of the submitted name. Other classes cannot declare batch prices
+that would never be selected. Model-level batch tariffs remain supported.
+
 Optional aliases are exact synonyms, not discovery entries or extra model rows.
 Do not list the primary bare name or generated `:fast` name as synonyms. Validation
 reserves primary class names and rejects collisions with existing models and other

@@ -86,6 +86,39 @@ fn class_catalog_rejects_activation_in_yaml() {
     assert!(catalog(&v).is_err());
 }
 
+fn add_batch_price(value: &mut serde_yaml::Value, class: &str) {
+    let price = serde_yaml::from_str(
+        "name: Batch\npurpose: batch\ncompletion_window: 24h\ninput_per_million_tokens: '1'\noutput_per_million_tokens: '2'",
+    )
+    .unwrap();
+    value["clay"]["class_routes"][class]["tariffs"]
+        .as_sequence_mut()
+        .unwrap()
+        .push(price);
+}
+
+#[test]
+fn class_catalog_rejects_batch_prices_on_nonstandard_classes() {
+    for key in ["fast", "economy"] {
+        let mut value = fixture();
+        if key != "fast" {
+            value["clay"]["class_routes"][key] = value["clay"]["class_routes"]["fast"].clone();
+            value["clay"]["class_routes"][key]["aliases"] = serde_yaml::to_value(Vec::<String>::new()).unwrap();
+        }
+        add_batch_price(&mut value, key);
+        let error = catalog(&value).unwrap_err().to_string();
+        assert!(error.contains("batch prices can only specialize standard"), "{error}");
+        assert!(error.contains(key), "{error}");
+    }
+}
+
+#[test]
+fn class_catalog_accepts_batch_prices_on_standard() {
+    let mut value = fixture();
+    add_batch_price(&mut value, "standard");
+    catalog(&value).unwrap();
+}
+
 #[sqlx::test]
 async fn staging_classes_preserves_legacy_route_and_effective_price(pool: PgPool) {
     setup(&pool).await;
