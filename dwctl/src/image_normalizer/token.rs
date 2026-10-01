@@ -1,30 +1,46 @@
-//! Opaque token used to reference an image stored in our content-addressed
-//! object store.
+//! Opaque token used to reference an image stored in our object store.
 //!
 //! Tokens are stored in request bodies in place of the original
 //! user-supplied URL / data URI. They never reach an upstream provider —
 //! the dispatcher resolves them to a fresh signed URL just before sending.
 //!
-//! The token format is `dw-img://{lowercase-hex-sha256}`. Storing only the
-//! content hash means the bucket location is not encoded into request bodies,
-//! so the bucket / region can be rotated through config without a data
-//! migration.
+//! The token format is `dw-img://{sha256-hex}.{upload-id-hex}`:
+//!
+//! - `sha256` is the SHA-256 of the image bytes. It is the image's
+//!   *identity*: access grants (`image_access`) are keyed on it, and the
+//!   prompt cache hashes an image block's token with the upload ID removed, so
+//!   the same image submitted in different requests still shares cached
+//!   prefixes.
+//! - `upload_id` is 16 random bytes chosen at ingest. It only selects the stored
+//!   object: every ingest writes its own object, so concurrent submissions of
+//!   the same image never write to the same key, and ingest needs no
+//!   existence check before uploading.
+//!
+//! Legacy tokens carry no upload ID (`dw-img://{sha256-hex}`) and resolve to the
+//! object stored under the content hash alone; they remain valid.
+//!
+//! Storing only hashes means the bucket location is not encoded into request
+//! bodies, so the bucket / region can be rotated through config without a
+//! data migration.
 //!
 //! The leading `dw-img://` scheme is recognised by the dispatcher and the
 //! dashboard renderer; arbitrary HTTP clients will treat it as an opaque
 //! string and pass it through unchanged.
 //!
-//! Parsing also accepts bare hex (no scheme prefix) for robustness when
-//! reading legacy or hand-written values.
+//! Parsing also accepts the bare hex form (no scheme prefix) for robustness
+//! when reading legacy or hand-written values.
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
 const SCHEME: &str = "dw-img://";
+const SHA_HEX_LEN: usize = 64;
+const UPLOAD_ID_HEX_LEN: usize = 32;
 
-/// 32-byte SHA-256 of the image content. Cheap to clone; copy semantics.
+/// SHA-256 of the image content (`.0`) plus the per-ingest upload ID
+/// (`.1`; `None` for legacy tokens). Cheap to clone; copy semantics.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ImageToken(pub [u8; 32]);
+pub struct ImageToken(pub [u8; 32], pub Option<[u8; 16]>);
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum TokenParseError {
@@ -32,17 +48,29 @@ pub enum TokenParseError {
     WrongLength(usize),
     #[error("token hex contains non-hex characters")]
     InvalidHex,
+    #[error("token upload ID must be exactly 32 hex characters (got {0})")]
+    WrongUploadIdLength(usize),
 }
 
 impl ImageToken {
-    /// Render as the canonical `dw-img://{hex}` form.
-    pub fn to_dw_img_uri(self) -> String {
-        format!("{SCHEME}{}", hex::encode(self.0))
+    /// A fresh token for `sha256` with a random upload ID, so the upload
+    /// gets an object key no other ingest uses.
+    pub fn new_unique(sha256: [u8; 32]) -> Self {
+        ImageToken(sha256, Some(*uuid::Uuid::new_v4().as_bytes()))
     }
 
-    /// Bare hex form, no scheme — used as object-store keys.
+    /// Render as the canonical `dw-img://{hex}` form.
+    pub fn to_dw_img_uri(self) -> String {
+        format!("{SCHEME}{}", self.to_hex())
+    }
+
+    /// Bare hex form, no scheme: `{sha256}.{upload_id}`, or `{sha256}` for a
+    /// legacy token. Used as the object-store key.
     pub fn to_hex(self) -> String {
-        hex::encode(self.0)
+        match self.1 {
+            Some(upload_id) => format!("{}.{}", hex::encode(self.0), hex::encode(upload_id)),
+            None => hex::encode(self.0),
+        }
     }
 
     /// Returns true if `s` looks like a `dw-img://` token (regardless of
@@ -70,12 +98,25 @@ impl FromStr for ImageToken {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let hex_str = s.strip_prefix(SCHEME).unwrap_or(s);
-        if hex_str.len() != 64 {
-            return Err(TokenParseError::WrongLength(hex_str.len()));
+        let (sha_hex, upload_id_hex) = match hex_str.split_once('.') {
+            Some((sha, upload_id)) => (sha, Some(upload_id)),
+            None => (hex_str, None),
+        };
+        if sha_hex.len() != SHA_HEX_LEN {
+            return Err(TokenParseError::WrongLength(sha_hex.len()));
         }
-        let mut out = [0u8; 32];
-        hex::decode_to_slice(hex_str, &mut out).map_err(|_| TokenParseError::InvalidHex)?;
-        Ok(ImageToken(out))
+        let mut sha = [0u8; 32];
+        hex::decode_to_slice(sha_hex, &mut sha).map_err(|_| TokenParseError::InvalidHex)?;
+        let upload_id = match upload_id_hex {
+            None => None,
+            Some(n) if n.len() != UPLOAD_ID_HEX_LEN => return Err(TokenParseError::WrongUploadIdLength(n.len())),
+            Some(n) => {
+                let mut upload_id = [0u8; 16];
+                hex::decode_to_slice(n, &mut upload_id).map_err(|_| TokenParseError::InvalidHex)?;
+                Some(upload_id)
+            }
+        };
+        Ok(ImageToken(sha, upload_id))
     }
 }
 
@@ -88,7 +129,7 @@ mod tests {
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = i as u8;
         }
-        ImageToken(bytes)
+        ImageToken(bytes, None)
     }
 
     #[test]
@@ -108,6 +149,24 @@ mod tests {
     }
 
     #[test]
+    fn round_trip_with_upload_id() {
+        let t = ImageToken::new_unique(sample().0);
+        let s = t.to_dw_img_uri();
+        assert_eq!(s.len(), "dw-img://".len() + 64 + 1 + 32);
+        assert_eq!(s.parse::<ImageToken>().unwrap(), t);
+        assert_eq!(t.to_hex().parse::<ImageToken>().unwrap(), t);
+    }
+
+    #[test]
+    fn new_unique_keeps_content_hash_and_varies_upload_id() {
+        let a = ImageToken::new_unique(sample().0);
+        let b = ImageToken::new_unique(sample().0);
+        assert_eq!(a.0, b.0);
+        assert_ne!(a, b);
+        assert_ne!(a.to_hex(), b.to_hex());
+    }
+
+    #[test]
     fn rejects_wrong_length() {
         let err: TokenParseError = "dw-img://abcd".parse::<ImageToken>().unwrap_err();
         assert!(matches!(err, TokenParseError::WrongLength(4)));
@@ -118,6 +177,19 @@ mod tests {
         let bad = format!("dw-img://{}", "z".repeat(64));
         let err = bad.parse::<ImageToken>().unwrap_err();
         assert_eq!(err, TokenParseError::InvalidHex);
+    }
+
+    #[test]
+    fn rejects_bad_upload_id() {
+        let sha = sample().to_hex();
+        assert_eq!(
+            format!("dw-img://{sha}.abcd").parse::<ImageToken>().unwrap_err(),
+            TokenParseError::WrongUploadIdLength(4)
+        );
+        assert_eq!(
+            format!("dw-img://{sha}.{}", "z".repeat(32)).parse::<ImageToken>().unwrap_err(),
+            TokenParseError::InvalidHex
+        );
     }
 
     #[test]
