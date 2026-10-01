@@ -175,8 +175,6 @@ mod tests {
     use sqlx::PgPool;
 
     async fn setup(pool: &PgPool) {
-        underway::run_migrations(pool).await.unwrap();
-        crate::migrations::apply_underway(pool).await.unwrap();
         sqlx::raw_sql("INSERT INTO underway.task_queue(name) VALUES ('q') ON CONFLICT DO NOTHING")
             .execute(pool)
             .await

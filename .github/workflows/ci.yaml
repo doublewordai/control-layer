@@ -219,9 +219,10 @@ jobs:
           source <(cargo llvm-cov show-env --export-prefix)
           export LLVM_PROFILE_FILE="$PWD/target/dwctl-${{ matrix.partition }}-%32m.profraw"
 
+          BUILD_START=$(date +%s)
           cargo nextest run --package dwctl --cargo-profile ci --no-run
           BUILD_END=$(date +%s)
-          echo "dwctl compile/link: $((BUILD_END - START_TIME))s"
+          echo "dwctl compile/link: $((BUILD_END - BUILD_START))s"
           cargo nextest run --package dwctl \
             --cargo-profile ci \
             --partition "count:${{ matrix.partition }}/4"

@@ -15,8 +15,8 @@
 //! * **Logs (async/flex path)** — `zdr_sentinel_async_batch_failure_does_not_log_payload`
 //!   runs a batch end-to-end through the real fusillade daemon against a mock
 //!   upstream that returns a sentinel error body, capturing all tracing output
-//!   and asserting the sentinel does not appear. `#[sqlx::test]` runs on a
-//!   `current_thread` tokio runtime (sqlx `test_block_on`), so a thread-local
+//!   and asserting the sentinel does not appear. `#[dwctl_test_macros::test]` runs on a
+//!   `current_thread` tokio runtime (via `sqlx::test_block_on`), so a thread-local
 //!   subscriber reliably captures the daemon's spawned-task logs — the test
 //!   includes a positive control that proves capture works. The local fusillade
 //!   crate scrubs the provider error body before it reaches terminal-failure logs.
@@ -325,7 +325,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
 /// against a mock upstream that 400s with a sentinel body, capturing all tracing
 /// output and asserting neither the prompt nor the error-body sentinel appears.
 ///
-/// `#[sqlx::test]` uses a `current_thread` runtime (sqlx `test_block_on`), so the
+/// `#[dwctl_test_macros::test]` uses a `current_thread` runtime (via `sqlx::test_block_on`), so the
 /// thread-local subscriber installed here captures the daemon's spawned-task
 /// logs. A positive control (a marker logged from a spawned task) proves that.
 #[dwctl_test_macros::test]

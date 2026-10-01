@@ -972,7 +972,8 @@ mod pooled_schema_tests {
         );
     }
 
-    #[dwctl_test_macros::test]
+    // This test exercises initial component migrations and ledger separation.
+    #[sqlx::test]
     async fn pooled_component_endpoint_preserves_retained_response_lifecycle(pool: PgPool) {
         use fusillade_arsenal::manager::{RetainedResponseArchiveCutoffs, RetentionPolicy};
         use fusillade_arsenal::request::{PersistCompletedRealtimeInput, RequestId};

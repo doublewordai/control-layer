@@ -74,6 +74,43 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(calls[1][-2:], ["-E", "test(foo) | test(bar)"])
 
+    def test_explicit_package_replaces_workspace_default(self):
+        for selection in [("-p", "dwctl"), ("--package=dwctl",), ("-pdwctl",)]:
+            with self.subTest(selection=selection):
+                _, calls = self.run_runner(*selection)
+                for call in calls[1:]:
+                    self.assertNotIn("--workspace", call)
+                    self.assertIn("--all-features", call)
+                    self.assertEqual(call[-len(selection):], list(selection))
+
+    def test_explicit_features_replace_all_features_default(self):
+        for selection in [("--features", "foo"), ("--features=foo",), ("-Ffoo",),
+                          ("-F", "foo"), ("--no-default-features",)]:
+            with self.subTest(selection=selection):
+                _, calls = self.run_runner(*selection)
+                for call in calls[1:]:
+                    self.assertNotIn("--all-features", call)
+                    self.assertIn("--workspace", call)
+                    self.assertEqual(call[-len(selection):], list(selection))
+
+    def test_explicit_workspace_and_all_features_are_preserved(self):
+        _, calls = self.run_runner("-p", "dwctl", "--workspace", "--features", "foo", "--all-features")
+        for call in calls[1:]:
+            self.assertEqual(call.count("--workspace"), 1)
+            self.assertEqual(call.count("--all-features"), 1)
+
+    def test_just_without_target_dispatches_empty_default(self):
+        # Execute the actual dispatch recipe, replacing only its downstream
+        # integration runner so this check needs no running services.
+        recipe = (ROOT / "justfile").read_text().split("[positional-arguments]\ntest ", 1)[1].split("\n_test-other ", 1)[0]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "justfile"
+            path.write_text('[positional-arguments]\ntest ' + recipe +
+                            '\n_test-other target="" *args="":\n    @echo dispatched target="{{target}}"\n')
+            result = subprocess.run(["just", "--justfile", str(path), "test"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "dispatched target=")
+
 
 if __name__ == "__main__":
     unittest.main()

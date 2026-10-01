@@ -4,6 +4,15 @@
 `--coverage` runs share the same runner. Install it with
 `cargo install cargo-nextest --locked`; `just check` checks this prerequisite.
 
+Template-backed tests require PostgreSQL 15 or newer for `CREATE DATABASE ...
+STRATEGY FILE_COPY`, and a test role with database-creation privileges (also
+required by SQLx's database test harness). The local Docker configuration uses
+PostgreSQL 17. Run these tests against a development/test server.
+
+`just test rust -p dwctl` selects only that package, including its doctests.
+Explicit `--features`/`-F` or `--no-default-features` replace the default
+`--all-features`; explicit `--workspace` and `--all-features` remain supported.
+
 ## Local measurements
 
 Measured against commit `44863350` on macOS with Rust 1.97.1, PostgreSQL 17
@@ -51,6 +60,20 @@ Failed tests print their database name and retain it for inspection. Those
 failed databases and obsolete `dwctl_template_*` databases persist until
 manually removed from the local test server. Never clean them up during a run.
 
+To inspect retained databases on the test server:
+
+```bash
+psql "$DATABASE_URL" -c "SELECT datname, pg_size_pretty(pg_database_size(oid)) AS size
+  FROM pg_database WHERE datname ~ '^dwctl_(template|test)_[0-9a-f]{32}$'
+  ORDER BY datname"
+```
+
+After stopping test runs in **all worktrees using that server**, remove selected
+names with `dropdb --maintenance-db="$DATABASE_URL" 'EXACT_DATABASE_NAME'`.
+Replace the quoted placeholder with a name from the inspection query. Templates
+will be rebuilt on demand. There is deliberately no automatic pruning based on
+the current checkout's hash: another checkout may still be using another hash.
+
 The shared harness erases test-future types so migration and cleanup code is
 compiled once instead of repeated in more than a thousand tests. Full local
 debug symbols are retained. No reduced-debug profile was adopted or benchmarked;
@@ -65,8 +88,8 @@ and one new clone-isolation test.
 
 ## Validation and remaining failures
 
-`just lint rust` passed, including formatting, Clippy, SQLx preparation,
-repository checks, and seven runner tests. The final full run passed 3,802 tests,
+For the initial implementation, `just lint rust` passed, including formatting,
+Clippy, SQLx preparation, repository checks, and seven runner tests. Its full run passed 3,802 tests,
 failed four, and skipped the same four ignored tests. All doctests passed
 (17 passed, 27 ignored). The following failures also occurred in the saved,
 unmodified baseline binaries:
@@ -78,6 +101,12 @@ unmodified baseline binaries:
 
 No new failures remain, but the suite is not green. These assertions were not
 weakened to produce a passing performance result.
+
+Review fixes were validated with 23 focused Rust tests and 11 runner checks,
+all passing, plus a passing `just lint rust`. The subsequent full local run
+passed 3,803 tests and all doctests, with the same four baseline failures and
+four ignored tests. The added test covers fixture-failure diagnostics and pool
+cleanup. The initial PR's CI passed all four locally failing tests.
 
 ## Reproduce and inspect
 
@@ -99,10 +128,21 @@ The `timings` profile also retains successful test output in JUnit. Body timing
 includes application startup; setup includes cloning and fixtures. The first
 run after a template-key change also includes template construction.
 
-CI now logs dwctl compile/link and execution durations separately and uploads
+CI logs dwctl compile/link and execution durations separately and uploads
 per-shard JUnit reports. Pass multiple reports to `rust-test-timings.py` to
-summarize shards. CI before/after measurements remain pending an actual workflow
-run; local measurements should not be presented as CI speedups.
+summarize shards. The initial [PR CI run](https://github.com/doublewordai/control-layer/actions/runs/36926465776)
+passed, including all four locally failing tests. Compared with the
+[preceding merged PR](https://github.com/doublewordai/control-layer/actions/runs/36882204078),
+dwctl shard execution fell from 39–58 seconds to 26–33 seconds. Complete shard
+jobs took 3m01s–3m06s instead of 5m57s–6m35s. Both used Rust 1.99 and the CI
+profile, but only the newer run restored the Rust cache, so the observed build
+reduction (4m00s–4m23s to 1m23s–1m24s) is not a controlled comparison. These
+compile times come from Cargo's own duration, excluding coverage setup.
+
+The whole workflow took roughly 13 minutes versus 9 minutes: the dwctl image
+build grew from 4m38s to 10m21s. Faster test jobs do not establish faster overall
+PR completion. These are observations from the initial PR commit, not timings
+for subsequent review fixes.
 
 See [the Rust test efficiency skill](../.claude/skills/rust-test-efficiency/SKILL.md)
 for guidance when adding tests.

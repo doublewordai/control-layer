@@ -9,6 +9,7 @@ use std::panic::{AssertUnwindSafe, resume_unwind};
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use futures::FutureExt;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -62,8 +63,12 @@ async fn create_database() -> anyhow::Result<(PgPool, PgConnection, String)> {
         let pool = PgPoolOptions::new()
             .max_connections(5)
             .connect_with(options.database(&name))
-            .await?;
-        migrate(&pool).await?;
+            .await
+            .with_context(|| format!("failed to connect to retained test database {name}"))?;
+        if let Err(error) = migrate(&pool).await {
+            pool.close().await;
+            return Err(error.context(format!("failed to migrate retained test database {name}")));
+        }
         return Ok((pool, admin, name));
     }
     let template = template_name();
@@ -86,10 +91,11 @@ async fn create_database() -> anyhow::Result<(PgPool, PgConnection, String)> {
         let pool = PgPoolOptions::new()
             .max_connections(2)
             .connect_with(options.clone().database(&template))
-            .await?;
+            .await
+            .with_context(|| format!("failed to connect to unsealed template {template}"))?;
         let result = migrate(&pool).await;
         pool.close().await;
-        result?;
+        result.with_context(|| format!("failed to migrate unsealed template {template}"))?;
         admin
             .execute(format!("ALTER DATABASE {template} ALLOW_CONNECTIONS false").as_str())
             .await?;
@@ -108,7 +114,8 @@ async fn create_database() -> anyhow::Result<(PgPool, PgConnection, String)> {
         .max_connections(5)
         .idle_timeout(Duration::from_secs(1))
         .connect_with(options.database(&name))
-        .await?;
+        .await
+        .with_context(|| format!("failed to connect to retained test database {name}"))?;
     Ok((pool, admin, name))
 }
 
@@ -119,12 +126,23 @@ type TestFuture<T> = Pin<Box<dyn Future<Output = T>>>;
 pub async fn run<T: TestTermination>(path: &str, fixtures: &[(&str, &str)], test: fn(PgPool) -> TestFuture<T>) -> T {
     let start = Instant::now();
     let (pool, mut admin, name) = create_database().await.expect("failed to clone test database");
-    for (path, sql) in fixtures {
-        pool.execute(*sql).await.unwrap_or_else(|error| panic!("fixture {path}: {error}"));
-    }
-    let setup = start.elapsed();
-    let result = AssertUnwindSafe(test(pool.clone())).catch_unwind().await;
-    let body = start.elapsed() - setup;
+    let mut body_start = None;
+    // Fixture failures need the same bounded close and retention diagnostics as
+    // test-body failures. Include the database in the panic for filtered output.
+    let result = AssertUnwindSafe(async {
+        for (path, sql) in fixtures {
+            pool.execute(*sql)
+                .await
+                .unwrap_or_else(|error| panic!("fixture {path} failed in retained database {name}: {error}"));
+        }
+        body_start = Some(Instant::now());
+        test(pool.clone()).await
+    })
+    .catch_unwind()
+    .await;
+    let end = Instant::now();
+    let setup = body_start.unwrap_or(end) - start;
+    let body = body_start.map_or(Duration::ZERO, |start| end - start);
     // Match SQLx's bounded close and retain databases for failed assertions.
     if tokio::time::timeout(Duration::from_secs(10), pool.close()).await.is_err() {
         eprintln!("test {path} held onto its pool after exiting");
@@ -144,6 +162,33 @@ pub async fn run<T: TestTermination>(path: &str, fixtures: &[(&str, &str)], test
         Ok(result) => result,
         Err(panic) => resume_unwind(panic),
     }
+}
+
+#[tokio::test]
+async fn failed_fixture_reports_retained_database_and_closes_pool() {
+    let failure = AssertUnwindSafe(run::<()>("failed_fixture_regression", &[("invalid.sql", "SELECT FROM")], |_| {
+        Box::pin(async { panic!("test body must not run after a fixture failure") })
+    }))
+    .catch_unwind()
+    .await
+    .expect_err("invalid fixture must fail");
+    let message = failure.downcast_ref::<String>().expect("fixture panic should describe the failure");
+    assert!(message.contains("invalid.sql"), "{message}");
+    let name = message
+        .split_whitespace()
+        .find(|part| part.starts_with("dwctl_test_"))
+        .expect("fixture panic must identify the retained database")
+        .trim_end_matches(':');
+    let options: PgConnectOptions = dotenvy::var("DATABASE_URL").unwrap().parse().unwrap();
+    let mut admin = PgConnection::connect_with(&options).await.unwrap();
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+        .bind(name)
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+    assert!(exists, "failed fixture database should remain available for inspection");
+    // A successful non-FORCE drop also verifies setup closed its connections.
+    admin.execute(format!("DROP DATABASE {name}").as_str()).await.unwrap();
 }
 
 #[tokio::test]
