@@ -7,6 +7,7 @@
 //!
 //! Pool-level configuration (keys, rate limits) is shared across all providers.
 
+use crate::affinity::{self, AffinityConfig, Tracker};
 use crate::aimd::{AimdConfig, Controller, Observation};
 use crate::auth::KeySet;
 use crate::serving::{ServingOverlay, ServingPresets};
@@ -29,6 +30,18 @@ fn configured_aimd(
     fallback
         .filter(|f| f.enabled)
         .map(|f| f.aimd.clone().unwrap_or_default())
+        .filter(|c| c.enabled && c.validate().is_ok() && strategy == LoadBalanceStrategy::Priority)
+}
+
+/// The conversation-affinity configuration a pool would run with: fallback
+/// enabled, priority strategy, and an enabled, valid affinity config.
+fn configured_affinity(
+    fallback: Option<&FallbackConfig>,
+    strategy: LoadBalanceStrategy,
+) -> Option<AffinityConfig> {
+    fallback
+        .filter(|f| f.enabled)
+        .and_then(|f| f.affinity.clone())
         .filter(|c| c.enabled && c.validate().is_ok() && strategy == LoadBalanceStrategy::Priority)
 }
 
@@ -71,6 +84,9 @@ pub struct ProviderPool {
     /// later reload that restores the same preferred provider resumes it
     /// rather than starting over.
     parked: Option<ParkedController>,
+    /// Per-process view of the pool's active conversations, when the pool
+    /// routes by conversation (see [`crate::affinity`]).
+    affinity: Option<Arc<Mutex<Tracker>>>,
     /// Mark this pool as trusted to bypass strict mode error sanitization.
     /// When strict_mode is enabled globally AND trusted is true for a pool,
     /// error response sanitization is skipped, but success responses are still sanitized.
@@ -163,6 +179,7 @@ impl ProviderPool {
             strategy: LoadBalanceStrategy::default(),
             controller: None,
             parked: None,
+            affinity: None,
             trusted: false,
             routing_rules: Vec::new(),
             serving: AliasServing::default(),
@@ -184,9 +201,13 @@ impl ProviderPool {
         let controller = configured_aimd(fallback.as_ref(), strategy)
             .filter(|_| providers.len() > 1)
             .map(|c| Arc::new(Mutex::new(Controller::new(c, Instant::now()))));
+        let affinity = configured_affinity(fallback.as_ref(), strategy)
+            .filter(|_| providers.len() > 1)
+            .map(|c| Arc::new(Mutex::new(Tracker::new(c))));
         Self {
             controller,
             parked: None,
+            affinity,
             providers,
             keys,
             pool_limiter,
@@ -289,6 +310,23 @@ impl ProviderPool {
         self.controller.is_some()
     }
 
+    /// Whether this pool routes by conversation.
+    pub(crate) fn affinity_enabled(&self) -> bool {
+        self.affinity.is_some()
+    }
+
+    /// Keep the old pool's conversation tracker across a reload that leaves
+    /// its configuration unchanged, so the active set and share survive
+    /// routing-config updates.
+    fn adopt_affinity(&mut self, old: &ProviderPool) {
+        let (Some(new), Some(old)) = (&self.affinity, &old.affinity) else {
+            return;
+        };
+        if new.lock().unwrap().config() == old.lock().unwrap().config() {
+            self.affinity = Some(old.clone());
+        }
+    }
+
     /// Carry the old pool's controller (active or parked) into this pool.
     ///
     /// - Same configuration and the same preferred provider: adopt it, resuming
@@ -338,28 +376,83 @@ impl ProviderPool {
         }
     }
 
-    pub(crate) fn select_iter_aimd(
+    /// Select providers for a request, deciding whether the preferred provider
+    /// goes first.
+    ///
+    /// - With a conversation key and an affinity pool, the decision is
+    ///   deterministic per conversation: preferred first when the key's point
+    ///   is below the affinity share (capped by the AIMD share when the
+    ///   request is AIMD-eligible, so overload still sheds conversations).
+    /// - Otherwise an AIMD-eligible request draws against the AIMD share.
+    pub(crate) fn select_iter_routed(
         &self,
-        eligible: bool,
+        aimd_eligible: bool,
+        conversation: Option<u64>,
         model: &str,
         pool: &str,
     ) -> SelectIter<'_> {
+        self.select_iter_routed_at(aimd_eligible, conversation, model, pool, affinity::now_ms())
+    }
+
+    /// [`Self::select_iter_routed`] at an explicit wall-clock time (Unix ms).
+    pub(crate) fn select_iter_routed_at(
+        &self,
+        aimd_eligible: bool,
+        conversation: Option<u64>,
+        model: &str,
+        pool: &str,
+        now_ms: u64,
+    ) -> SelectIter<'_> {
         let mut iter = self.select_iter();
-        if eligible && let Some(controller) = &self.controller {
-            let mut controller = controller.lock().unwrap();
-            if !controller.active() {
-                return iter;
+        let aimd_share = if aimd_eligible {
+            self.aimd_share(model, pool)
+        } else {
+            None
+        };
+        match (conversation, &self.affinity) {
+            (Some(key), Some(tracker)) => {
+                let mut tracker = tracker.lock().unwrap();
+                let (_, updated) = tracker.route(key, now_ms);
+                if updated {
+                    let snapshot = tracker.snapshot();
+                    metrics::gauge!("onwards_affinity_share", "model" => model.to_string(), "pool" => pool.to_string())
+                        .set(snapshot.share);
+                    metrics::gauge!("onwards_affinity_active_conversations", "model" => model.to_string(), "pool" => pool.to_string())
+                        .set(snapshot.active as f64);
+                    metrics::gauge!("onwards_affinity_admitted_conversations", "model" => model.to_string(), "pool" => pool.to_string())
+                        .set(snapshot.admitted as f64);
+                }
+                let threshold = tracker.share().min(aimd_share.unwrap_or(1.0));
+                let preferred = affinity::point(key) < threshold;
+                iter.alternate_first = !preferred;
+                metrics::counter!("onwards_affinity_routed_total", "model" => model.to_string(), "pool" => pool.to_string(), "side" => if preferred { "preferred" } else { "alternate" })
+                    .increment(1);
             }
-            controller.remember_labels(model, pool);
-            // Idle recovery runs on the request path, so a pool that sees
-            // traffic but too little to judge still climbs back to full share.
-            if let Some(direction) = controller.tick(Instant::now()) {
-                metrics::counter!("onwards_share_adjustments_total", "model" => model.to_string(), "pool" => pool.to_string(), "direction" => direction).increment(1);
+            _ => {
+                if let Some(share) = aimd_share {
+                    iter.alternate_first = rand::rng().random::<f64>() >= share;
+                }
             }
-            controller.publish();
-            iter.alternate_first = rand::rng().random::<f64>() >= controller.share();
         }
         iter
+    }
+
+    /// The AIMD share for an eligible request, after the controller's
+    /// request-path bookkeeping; `None` without an active controller.
+    fn aimd_share(&self, model: &str, pool: &str) -> Option<f64> {
+        let controller = self.controller.as_ref()?;
+        let mut controller = controller.lock().unwrap();
+        if !controller.active() {
+            return None;
+        }
+        controller.remember_labels(model, pool);
+        // Idle recovery runs on the request path, so a pool that sees
+        // traffic but too little to judge still climbs back to full share.
+        if let Some(direction) = controller.tick(Instant::now()) {
+            metrics::counter!("onwards_share_adjustments_total", "model" => model.to_string(), "pool" => pool.to_string(), "direction" => direction).increment(1);
+        }
+        controller.publish();
+        Some(controller.share())
     }
 
     pub(crate) fn observe(
@@ -606,6 +699,7 @@ impl ProviderPool {
     /// The pool-level concurrency limiter is also preserved if present in both.
     pub fn adopt_provider_state(&mut self, old: &ProviderPool) {
         self.adopt_aimd(old);
+        self.adopt_affinity(old);
         for new_provider in &mut self.providers {
             if let Some(old_provider) = old.providers.iter().find(|old_p| {
                 old_p.target.url == new_provider.target.url
@@ -807,6 +901,140 @@ mod tests {
                 .unwrap()
                 .status(529);
         }
+    }
+
+    fn affinity_pool(
+        target: usize,
+        aimd: Option<crate::aimd::AimdConfig>,
+        strategy: LoadBalanceStrategy,
+    ) -> ProviderPool {
+        ProviderPool::with_config(
+            vec![
+                Provider::new(create_test_target("https://preferred.example"), 1),
+                Provider::new(create_test_target("https://alternate.example"), 1),
+            ],
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                first_token_timeout_ms: Some(0),
+                aimd,
+                affinity: Some(AffinityConfig {
+                    target_conversations: target,
+                    margin: Some(1),
+                    ..AffinityConfig::default()
+                }),
+                ..Default::default()
+            }),
+            strategy,
+            false,
+            vec![],
+        )
+    }
+
+    fn conversation_keys(n: usize) -> Vec<u64> {
+        (0..n)
+            .map(|i| {
+                affinity::conversation_key(
+                    Some(&format!("conversation-{i}")),
+                    &serde_json::json!({}),
+                )
+                .unwrap()
+            })
+            .collect()
+    }
+
+    fn first_member(pool: &ProviderPool, aimd: bool, key: Option<u64>, now_ms: u64) -> usize {
+        pool.select_iter_routed_at(aimd, key, "model", "default", now_ms)
+            .next()
+            .unwrap()
+            .0
+    }
+
+    #[test]
+    fn affinity_sends_each_conversation_to_one_side() {
+        let disabled = crate::aimd::AimdConfig {
+            enabled: false,
+            ..crate::aimd::AimdConfig::default()
+        };
+        let pool = affinity_pool(10, Some(disabled), LoadBalanceStrategy::Priority);
+        let keys = conversation_keys(100);
+        for key in &keys {
+            first_member(&pool, false, Some(*key), 1_000);
+        }
+        let first: Vec<usize> = keys
+            .iter()
+            .map(|k| first_member(&pool, false, Some(*k), 61_000))
+            .collect();
+        assert_eq!(first.iter().filter(|m| **m == 0).count(), 10);
+        // The same conversations keep their side while the population is steady.
+        let later: Vec<usize> = keys
+            .iter()
+            .map(|k| first_member(&pool, false, Some(*k), 121_000))
+            .collect();
+        assert_eq!(first, later);
+        // A request without a conversation key keeps ordinary priority order.
+        assert_eq!(first_member(&pool, false, None, 121_000), 0);
+    }
+
+    #[tokio::test]
+    async fn aimd_overload_caps_the_affinity_share() {
+        let pool = affinity_pool(
+            1_000,
+            Some(aimd_test_config()),
+            LoadBalanceStrategy::Priority,
+        );
+        // A decrease waits one dwell after the controller starts.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        demote(&pool);
+        let share = pool.controller.as_ref().unwrap().lock().unwrap().share();
+        assert!((share - 0.5).abs() < 1e-9, "share after demotion: {share}");
+        for key in conversation_keys(200) {
+            let expected = if affinity::point(key) < share { 0 } else { 1 };
+            assert_eq!(first_member(&pool, true, Some(key), 1_000), expected);
+            // Without AIMD eligibility only the affinity share (still 1.0) applies.
+            assert_eq!(first_member(&pool, false, Some(key), 1_000), 0);
+        }
+    }
+
+    #[test]
+    fn affinity_tracker_survives_a_reload_with_the_same_configuration() {
+        let old = affinity_pool(10, None, LoadBalanceStrategy::Priority);
+        let tracker = old.affinity.clone().unwrap();
+        let mut same = affinity_pool(10, None, LoadBalanceStrategy::Priority);
+        same.adopt_provider_state(&old);
+        assert!(Arc::ptr_eq(same.affinity.as_ref().unwrap(), &tracker));
+        let mut changed = affinity_pool(20, None, LoadBalanceStrategy::Priority);
+        changed.adopt_provider_state(&old);
+        assert!(!Arc::ptr_eq(changed.affinity.as_ref().unwrap(), &tracker));
+    }
+
+    #[test]
+    fn affinity_needs_a_priority_pool_with_an_alternate() {
+        assert!(affinity_pool(10, None, LoadBalanceStrategy::Priority).affinity_enabled());
+        assert!(!affinity_pool(10, None, LoadBalanceStrategy::WeightedRandom).affinity_enabled());
+        let single = ProviderPool::with_config(
+            vec![Provider::new(
+                create_test_target("https://preferred.example"),
+                1,
+            )],
+            None,
+            None,
+            None,
+            Some(FallbackConfig {
+                enabled: true,
+                affinity: Some(AffinityConfig {
+                    target_conversations: 10,
+                    ..AffinityConfig::default()
+                }),
+                ..Default::default()
+            }),
+            LoadBalanceStrategy::Priority,
+            false,
+            vec![],
+        );
+        assert!(!single.affinity_enabled());
     }
 
     #[tokio::test(start_paused = true)]
@@ -1020,7 +1248,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(
-            old.select_iter_aimd(false, "model", "default")
+            old.select_iter_routed(false, None, "model", "default")
                 .next()
                 .unwrap()
                 .0,

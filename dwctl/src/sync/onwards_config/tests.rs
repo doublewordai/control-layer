@@ -1476,6 +1476,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
             backoff_max_total_ms: None,
             first_token_timeout_ms: None,
             aimd: None,
+            affinity: None,
             sanitize_responses: true,
             trusted: false,
             reasoning_translation_overrides: None,
@@ -1703,6 +1704,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             backoff_max_total_ms: None,
             first_token_timeout_ms: None,
             aimd: None,
+            affinity: None,
             allowed_batch_completion_windows: None,
             metadata: None,
             sanitize_responses: true,
@@ -1750,6 +1752,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
             backoff_max_total_ms: None,
             first_token_timeout_ms: None,
             aimd: None,
+            affinity: None,
             metadata: None,
             sanitize_responses: true,
             trusted: false,
@@ -2266,6 +2269,27 @@ async fn aimd_and_first_token_deadline_survive_database_sync(pool: sqlx::PgPool)
         standard.value().default_pool().fallback().unwrap().first_token_timeout_ms,
         Some(300)
     );
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn affinity_survives_database_sync(pool: sqlx::PgPool) {
+    let config = serde_json::json!({"target_conversations": 40, "margin": 4});
+    sqlx::query("UPDATE deployed_models SET affinity = $1, fallback_enabled = true WHERE alias = 'composite-priority'")
+        .bind(config.clone())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let targets = super::load_targets_from_db(&pool, &[], true, &RateLimitTiersConfig::default())
+        .await
+        .unwrap();
+    let composite = targets.targets.get("composite-priority").unwrap();
+    let fallback = composite.value().default_pool().fallback().unwrap();
+    assert_eq!(
+        fallback.affinity.as_ref().unwrap(),
+        &serde_json::from_value::<onwards::affinity::AffinityConfig>(config).unwrap()
+    );
+    let standard = targets.targets.get("regular-public").unwrap();
+    assert!(standard.value().default_pool().fallback().is_none_or(|f| f.affinity.is_none()));
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]

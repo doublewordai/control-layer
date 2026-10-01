@@ -13,6 +13,7 @@
 //!
 //! Pool-level configuration (keys, rate_limit) applies to all providers in the pool.
 //! Provider-level configuration (url, onwards_key, weight) is specific to each provider.
+use crate::affinity::AffinityConfig;
 use crate::aimd::AimdConfig;
 use crate::auth::KeySet;
 use crate::load_balancer::{Provider, ProviderPool};
@@ -253,6 +254,11 @@ pub struct FallbackConfig {
     /// Priority-only share controller overrides. None uses defaults; enabled=false opts out.
     #[serde(default)]
     pub aimd: Option<AimdConfig>,
+    /// Priority-only conversation affinity: decide preferred-first once per
+    /// conversation rather than per request (see [`crate::affinity`]). None
+    /// keeps per-request selection.
+    #[serde(default)]
+    pub affinity: Option<AffinityConfig>,
 }
 
 impl FallbackConfig {

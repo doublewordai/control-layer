@@ -321,12 +321,12 @@ impl<'c> ModelProvisioning<'c> {
                    backoff_max_ms, backoff_factor, backoff_jitter, backoff_max_total_ms,
                    sanitize_responses, trusted, allowed_batch_completion_windows, metadata,
                    reasoning_translation_overrides, provisioning_source, deleted, updated_at, serving_classes,
-                   fallback_realtime_on_status
+                   fallback_realtime_on_status, affinity
                ) VALUES (
                    $1,$2,$3,$4,$5,$6,'00000000-0000-0000-0000-000000000000',$7,
                    $8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,
                    $27,$28,$29,$30,$31,$32,$33,$34,$35,$36,FALSE,$37,$38,
-                   COALESCE($39::INTEGER[], '{}')
+                   COALESCE($39::INTEGER[], '{}'), $40::JSONB
                )
                ON CONFLICT (alias) DO UPDATE SET
                    model_name = EXCLUDED.model_name,
@@ -350,6 +350,15 @@ impl<'c> ModelProvisioning<'c> {
                        AND (EXCLUDED.lb_strategy <> 'priority' OR NOT EXCLUDED.fallback_enabled)
                        AND COALESCE(deployed_models.aimd->'enabled' = 'false'::JSONB, FALSE) IS FALSE
                        THEN NULL ELSE deployed_models.aimd END,
+                   -- A declared catalog value replaces the stored one; an omitted one keeps
+                   -- it while the routing stays compatible.
+                   affinity = CASE
+                       WHEN EXCLUDED.is_composite AND $40::JSONB IS NOT NULL THEN $40::JSONB
+                       WHEN EXCLUDED.is_composite
+                           AND (EXCLUDED.lb_strategy <> 'priority' OR NOT EXCLUDED.fallback_enabled)
+                           AND COALESCE(deployed_models.affinity->'enabled' = 'false'::JSONB, FALSE) IS FALSE
+                           THEN NULL
+                       ELSE deployed_models.affinity END,
                    lb_strategy = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.lb_strategy ELSE deployed_models.lb_strategy END,
                    fallback_enabled = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_enabled ELSE deployed_models.fallback_enabled END,
                    fallback_on_rate_limit = CASE WHEN EXCLUDED.is_composite THEN EXCLUDED.fallback_on_rate_limit ELSE deployed_models.fallback_on_rate_limit END,
@@ -389,7 +398,8 @@ impl<'c> ModelProvisioning<'c> {
                        deployed_models.allowed_batch_completion_windows, deployed_models.metadata,
                        deployed_models.reasoning_translation_overrides, deployed_models.deleted,
                        deployed_models.serving_classes,
-                       deployed_models.fallback_realtime_on_status
+                       deployed_models.fallback_realtime_on_status,
+                       deployed_models.affinity
                    ) IS DISTINCT FROM ROW(
                        EXCLUDED.model_name, EXCLUDED.display_name, EXCLUDED.description,
                        EXCLUDED.type, EXCLUDED.capabilities, EXCLUDED.hosted_on,
@@ -413,7 +423,14 @@ impl<'c> ModelProvisioning<'c> {
                        EXCLUDED.metadata, EXCLUDED.reasoning_translation_overrides, FALSE,
                        EXCLUDED.serving_classes,
                        CASE WHEN EXCLUDED.is_composite AND $39::INTEGER[] IS NOT NULL
-                           THEN EXCLUDED.fallback_realtime_on_status ELSE deployed_models.fallback_realtime_on_status END
+                           THEN EXCLUDED.fallback_realtime_on_status ELSE deployed_models.fallback_realtime_on_status END,
+                       CASE
+                           WHEN EXCLUDED.is_composite AND $40::JSONB IS NOT NULL THEN $40::JSONB
+                           WHEN EXCLUDED.is_composite
+                               AND (EXCLUDED.lb_strategy <> 'priority' OR NOT EXCLUDED.fallback_enabled)
+                               AND COALESCE(deployed_models.affinity->'enabled' = 'false'::JSONB, FALSE) IS FALSE
+                               THEN NULL
+                           ELSE deployed_models.affinity END
                    ) THEN $37 ELSE deployed_models.updated_at END"#,
         )
         .bind(model_name)
@@ -455,6 +472,7 @@ impl<'c> ModelProvisioning<'c> {
         .bind(effective_at)
         .bind(serving_classes)
         .bind(if is_composite { fallback.realtime_on_status.as_deref() } else { None })
+        .bind(if is_composite { fallback.affinity.as_ref().map(sqlx::types::Json) } else { None })
         .execute(&mut *self.db)
         .await
         .with_context(|| format!("upsert model alias {alias:?}"))?;
