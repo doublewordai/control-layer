@@ -174,7 +174,8 @@ pub struct RecomputeReport {
     pub rows: Vec<ReportRow>,
 }
 
-/// Days of `prompt_cache_entries` history the cache sweeper will retain.
+/// Days the prompt-cache retention daemon keeps an entry after it expires: its default
+/// grace, and the minimum its configuration accepts.
 ///
 /// Beyond this the entries backing a cache-split reconstruction are pruned, so a corpus older
 /// than the grace cannot have its split re-derived — only carried through from the response,
@@ -182,15 +183,22 @@ pub struct RecomputeReport {
 pub const CACHE_GRACE_DAYS: i64 = 7;
 
 /// Warnings that depend on the corpus rather than any individual row.
-pub fn corpus_warnings(oldest: Option<DateTime<Utc>>) -> Vec<String> {
+///
+/// `cache_retention_grace` is the configured prompt-cache retention grace. An entry is
+/// deleted once it has been expired for longer than the grace, and an entry that served a
+/// request expired no earlier than that request, so entries for a request can only have
+/// been pruned once the request is older than the grace.
+pub fn corpus_warnings(oldest: Option<DateTime<Utc>>, cache_retention_grace: chrono::Duration) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(oldest) = oldest {
-        let age = (Utc::now() - oldest).num_days();
-        if age > CACHE_GRACE_DAYS {
+        let age = Utc::now() - oldest;
+        if age > cache_retention_grace {
             out.push(format!(
-                "corpus reaches {age} days back, beyond the {CACHE_GRACE_DAYS}-day cache retention grace: \
+                "corpus reaches {} days back, beyond the {}-day cache retention grace: \
                  prompt_cache_entries for the older rows may already be pruned, so the cache split \
-                 cannot be re-derived for them and the tier cannot be resolved from ttl_tier"
+                 may not be re-derivable for them and the tier may not resolve from ttl_tier",
+                age.num_days(),
+                cache_retention_grace.num_days()
             ));
         }
     }
@@ -336,11 +344,33 @@ impl ReportRow {
 mod tests {
     use super::*;
 
+    fn grace() -> chrono::Duration {
+        chrono::Duration::days(CACHE_GRACE_DAYS)
+    }
+
     #[test]
     fn corpus_within_the_grace_warns_about_nothing() {
-        let recent = Utc::now() - chrono::Duration::days(CACHE_GRACE_DAYS - 1);
-        assert!(corpus_warnings(Some(recent)).is_empty());
-        assert!(corpus_warnings(None).is_empty(), "an empty corpus has nothing to warn about");
+        let recent = Utc::now() - grace() + chrono::Duration::minutes(1);
+        assert!(corpus_warnings(Some(recent), grace()).is_empty());
+        assert!(
+            corpus_warnings(None, grace()).is_empty(),
+            "an empty corpus has nothing to warn about"
+        );
+    }
+
+    /// The comparison is exact: a corpus just past the grace warns, even though its age
+    /// rounds down to the grace in whole days.
+    #[test]
+    fn corpus_just_past_the_grace_warns() {
+        let just_past = Utc::now() - grace() - chrono::Duration::hours(1);
+        assert_eq!(corpus_warnings(Some(just_past), grace()).len(), 1);
+    }
+
+    /// A longer configured grace keeps more history, so the same corpus is not flagged.
+    #[test]
+    fn corpus_warning_follows_the_configured_grace() {
+        let old = Utc::now() - chrono::Duration::days(CACHE_GRACE_DAYS + 3);
+        assert!(corpus_warnings(Some(old), chrono::Duration::days(30)).is_empty());
     }
 
     /// Beyond the grace the cache entries backing a split reconstruction may already be
@@ -349,7 +379,7 @@ mod tests {
     #[test]
     fn corpus_beyond_the_grace_warns() {
         let old = Utc::now() - chrono::Duration::days(CACHE_GRACE_DAYS + 3);
-        let warnings = corpus_warnings(Some(old));
+        let warnings = corpus_warnings(Some(old), grace());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("cache retention grace"), "got: {}", warnings[0]);
     }
