@@ -111,6 +111,30 @@ def verify_models_schema_change(app, direct):
             ), f"model update failed: {response.status_code} {response.text[:300]}"
             assert response.json()["description"] == "schema compatibility"
 
+            # Catalog aliases and ordinary model writes use a transaction-scoped
+            # namespace lock, including through a pool that discards session state.
+            class_id = direct.execute(
+                "INSERT INTO model_serving_classes "
+                "(deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) "
+                "VALUES (%s,'fast','Fast',%s,'pooled-fast-upstream') RETURNING id",
+                (model["id"], endpoint),
+            ).fetchone()[0]
+            synonym = alias + "-fast"
+            direct.execute(
+                "INSERT INTO model_aliases (alias,deployed_model_id,serving_class_id) VALUES (%s,%s,%s)",
+                (synonym, model["id"], class_id),
+            )
+            for reserved in (synonym, alias + ":fast"):
+                response = session.post(
+                    base + "/admin/api/v1/models",
+                    json={"type": "standard", "model_name": reserved,
+                          "alias": reserved, "hosted_on": endpoint},
+                    timeout=20,
+                )
+                assert response.status_code == 409, (
+                    f"reserved class name accepted: {response.status_code} {response.text[:300]}"
+                )
+
     def aimd_settings():
         alias = "schema-aimd-" + uuid.uuid4().hex
         # Every member is explicit: responses carry the full config, including

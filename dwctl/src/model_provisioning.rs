@@ -84,6 +84,26 @@ pub struct ClayModel {
     /// asks for; without one, standard sends no targets. Empty = standard only.
     #[serde(default)]
     pub serving_classes: BTreeMap<PresetClass, ServingPreset>,
+    /// Explicit class destinations and prices, staged independently of legacy routing.
+    /// Declaring these does not activate routes or advertise additional model names.
+    #[serde(default)]
+    pub class_routes: BTreeMap<String, ClassRoute>,
+}
+
+/// Complete catalog declaration for a stable class of the existing public model.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClassRoute {
+    pub display_name: String,
+    pub endpoint: String,
+    pub upstream_model_name: String,
+    /// Optional exact ingress spellings, never additional discovery entries.
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    pub tariffs: Vec<Tariff>,
+    /// Omit to inherit the model's all-class multipliers; does not enable caching.
+    #[serde(default)]
+    pub cache_tariff: Option<CachePrices>,
 }
 
 /// The two elevated serving classes a model can activate and an org can be
@@ -410,6 +430,28 @@ pub struct CacheTariff {
     pub min_prefix_tokens: i32,
 }
 
+/// Scoped cache tariffs change multipliers only. The model owns enablement and
+/// the minimum prefix length used by the classifier.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CachePrices {
+    pub write_multiplier_5m: String,
+    pub write_multiplier_1h: String,
+    pub write_multiplier_24h: String,
+    pub read_multiplier: String,
+}
+impl CachePrices {
+    pub(crate) fn as_tariff(&self) -> CacheTariff {
+        CacheTariff {
+            write_multiplier_5m: self.write_multiplier_5m.clone(),
+            write_multiplier_1h: self.write_multiplier_1h.clone(),
+            write_multiplier_24h: self.write_multiplier_24h.clone(),
+            read_multiplier: self.read_multiplier.clone(),
+            min_prefix_tokens: 1,
+        }
+    }
+}
+
 fn default_read_multiplier() -> String {
     "0.1".to_string()
 }
@@ -492,6 +534,69 @@ impl Catalog {
         }
 
         for model in &self.models {
+            if !model.clay.class_routes.is_empty() {
+                ensure!(
+                    model.clay.serving_classes.is_empty(),
+                    "{}: class_routes cannot be combined with legacy serving_classes targets",
+                    model.source
+                );
+                ensure!(
+                    model.clay.class_routes.contains_key("standard") && model.clay.class_routes.contains_key("fast"),
+                    "{}: class_routes requires standard and fast",
+                    model.source
+                );
+                for (key, class) in &model.clay.class_routes {
+                    ensure!(
+                        key.bytes().next().is_some_and(|c| c.is_ascii_lowercase())
+                            && key
+                                .bytes()
+                                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-'),
+                        "{}: invalid class key {key:?}",
+                        model.source
+                    );
+                    ensure_nonempty(&class.display_name, &model.source, "class display_name")?;
+                    ensure_nonempty(&class.endpoint, &model.source, "class endpoint")?;
+                    ensure!(
+                        !class.upstream_model_name.is_empty() && !class.upstream_model_name.chars().any(char::is_whitespace),
+                        "{}: class upstream_model_name must be nonempty without whitespace",
+                        model.source
+                    );
+                    validate_tariffs(&class.tariffs, &model.source)?;
+                    ensure!(
+                        class.tariffs.iter().any(|t| t.purpose == TariffPurpose::Realtime),
+                        "{}: class {key:?} requires a realtime tariff",
+                        model.source
+                    );
+                    if let Some(cache) = &class.cache_tariff {
+                        ensure!(
+                            model.clay.cache_tariff.is_some(),
+                            "{}: class cache multipliers require a model cache_tariff",
+                            model.source
+                        );
+                        validate_cache_tariff(&cache.as_tariff(), &model.source)?;
+                    }
+                    if key != "standard" {
+                        validate_alias(
+                            &mut aliases,
+                            &format!("{}:{key}", model.clay.alias),
+                            &model.source,
+                            "primary class name",
+                        )?;
+                    }
+                }
+            }
+        }
+        for model in &self.models {
+            for class in model.clay.class_routes.values() {
+                for alias in &class.aliases {
+                    ensure!(
+                        !alias.is_empty() && !alias.chars().any(char::is_whitespace),
+                        "{}: class alias must be nonempty without whitespace",
+                        model.source
+                    );
+                    validate_alias(&mut aliases, alias, &model.source, "class synonym")?;
+                }
+            }
             let mut component_keys = HashSet::new();
             for (pool, components) in &model.clay.routing.pools {
                 ensure!(
@@ -1374,3 +1479,6 @@ clay:
         }
     }
 }
+
+#[cfg(test)]
+mod class_routes_tests;

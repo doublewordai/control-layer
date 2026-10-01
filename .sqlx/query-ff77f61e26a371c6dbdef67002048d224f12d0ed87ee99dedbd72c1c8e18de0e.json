@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT write_multiplier_5m, write_multiplier_1h, write_multiplier_24h,\n                      read_multiplier, min_prefix_tokens, valid_from, valid_until\n               FROM model_cache_tariffs\n               WHERE deployed_model_id = $1\n                 AND user_id IS NULL\n                 AND valid_from <= now()\n                 AND (valid_until IS NULL OR valid_until > now())\n               ORDER BY valid_from DESC\n               LIMIT 1",
+  "query": "SELECT write_multiplier_5m, write_multiplier_1h, write_multiplier_24h,\n                      read_multiplier, min_prefix_tokens, valid_from, valid_until\n               FROM model_cache_tariffs\n               WHERE deployed_model_id = $1\n                 AND user_id IS NULL AND serving_class IS NULL\n                 AND valid_from <= now()\n                 AND (valid_until IS NULL OR valid_until > now())\n               ORDER BY valid_from DESC\n               LIMIT 1",
   "describe": {
     "columns": [
       {
@@ -54,5 +54,5 @@
       true
     ]
   },
-  "hash": "4793ddec9749dfdcaf1820ba8e04664a749c79f366b4ed91294dcdd99933f245"
+  "hash": "ff77f61e26a371c6dbdef67002048d224f12d0ed87ee99dedbd72c1c8e18de0e"
 }

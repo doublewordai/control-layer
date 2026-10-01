@@ -141,6 +141,81 @@ its pools; repeating the deployment declaration would be an alias collision.
 Every virtual model requires a non-empty `routing.pools.default`. The only pool
 names currently supported are `default` and `completions`.
 
+## Staging class destinations and public prices
+
+`clay.class_routes` stages explicit destinations on the existing model UUID. This
+is preparatory storage: this release continues using the legacy route, general
+price, cache configuration and model discovery. It does not accept new inference
+names or enable class routing. Keep the existing `deployments`, `routing`,
+`tariffs` and `cache_tariff` definitions while staging classes.
+
+```yaml
+# Add beneath clay in an existing model document:
+class_routes:
+  standard:
+    display_name: Standard
+    endpoint: gateway
+    upstream_model_name: dynamo-example/model:throughput
+    tariffs:
+      - name: Standard realtime
+        purpose: realtime
+        input_per_million_tokens: "1.00"
+        output_per_million_tokens: "2.00"
+  fast:
+    display_name: Fast
+    endpoint: gateway
+    upstream_model_name: dynamo-example/model:fast
+    aliases: [example/model-fast]
+    tariffs:
+      - name: Fast realtime
+        purpose: realtime
+        input_per_million_tokens: "2.00"
+        output_per_million_tokens: "4.00"
+    cache_tariff:
+      write_multiplier_5m: "1.25"
+      write_multiplier_1h: "2.0"
+      write_multiplier_24h: "3.0"
+      read_multiplier: "0.1"
+```
+
+The endpoint must exist. Upstream names are arbitrary, endpoint-scoped strings;
+classes may share a destination. Class keys retain their IDs when a display name,
+destination or price changes. Nonempty class configuration requires `standard`
+and `fast`, each with a realtime tariff. Additional keys may use lowercase letters,
+digits, hyphens and underscores, starting with a letter. The old numeric-target
+`serving_classes` declaration cannot be combined with `class_routes` on one model.
+Existing legacy-only catalogs remain valid.
+
+Optional aliases are exact synonyms, not discovery entries or extra model rows.
+Do not list the primary bare name or generated `:fast` name as synonyms. Validation
+reserves primary class names and rejects collisions with existing models and other
+synonyms. Ordinary model creates/renames share the catalog lock and collision check.
+Synonyms cannot be rebound to another model/class by a catalog edit; deliberate
+private-name migration requires a later, separately validated procedure.
+
+For a model present in the catalog, class routes and synonyms are complete desired
+state. Omitted synonyms are removed; omitted classes are removed and their public
+prices retired, preserving tariff history. An unchanged declaration preserves IDs,
+timestamps and price versions. A whole model omitted from the catalog follows the
+existing ownership-release rule below, rather than deleting its classes.
+
+Public class tariffs use the existing ledger with `user_id = NULL` and a class
+key. The future resolver order is account/class, account/all-classes, public/class,
+then general compatibility price. Batch still exhausts exact completion-window
+prices before its standard realtime fallback; zero is a price. Class cache tariffs
+contain multipliers, not token prices. They inherit model-level cache enablement
+and minimum prefix length; omission inherits the model's multipliers. Declaring
+class multipliers requires a model-level `cache_tariff`.
+
+The database's `routing_mode` defaults to `legacy` and is outside catalog ownership;
+putting it in YAML is rejected. This release is **not activation-ready**: request
+resolution, billing snapshots, reactive forwarding and writer support must land
+before switching any model. The catalog refuses edits to models already set to
+`class_routes`, instead of overwriting an active route with a composite definition.
+Deploy this support release and update the catalog validator before publishing
+catalogs containing the new field. Do not run an older binary against staged public
+class prices: its readers do not distinguish them from general prices.
+
 ## Authoritative behavior
 
 The complete catalog is loaded and validated before a transaction starts. The
@@ -171,8 +246,10 @@ endpoint synchronization does not delete or rewrite YAML-owned rows.
 
 ## Tariff history
 
-Tariffs retain their temporal history. Their natural key is `(model, purpose,
-completion_window)`, with `completion_window` required only for `batch`:
+Tariffs retain their temporal history. Within an account/class scope, their natural
+key is `(model, purpose, completion_window)`, with `completion_window` required only
+for `batch`. Model-level `tariffs` remain the public all-class compatibility scope;
+each `class_routes.<key>.tariffs` declaration owns its public class scope:
 
 - An identical active tariff is left untouched, retaining its ID and
   `valid_from`.

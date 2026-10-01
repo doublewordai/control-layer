@@ -81,3 +81,8 @@ through the direct connection, and verifies unchanged HTTP responses from the
 running application and after an application restart. PgBouncer stays alive.
 Both shared and scoped CI jobs run this phase. Reintroducing `SELECT dm.*` in the
 models list must fail the HTTP assertion after the column is added.
+
+This phase also exercises model writes and rejects collisions with dormant class
+primary names and catalog synonyms, before DDL, after DDL and after restart. These
+checks use the ordinary model API through transaction-pooled connections; merely
+checking catalog validation would miss model writers that bypass its name lock.

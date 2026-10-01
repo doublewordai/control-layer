@@ -28,7 +28,7 @@ use sqlx::{PgConnection, PgPool, Row};
 use uuid::Uuid;
 
 use crate::db::handlers::ModelProvisioning;
-use crate::model_provisioning::{CacheTariff, ServingClassName, ServingPreset, Tariff, validate_cache_tariff, validate_tariffs};
+use crate::model_provisioning::{ServingClassName, ServingPreset, Tariff, validate_cache_tariff, validate_tariffs};
 
 /// Prefix of the `provisioning_source` marker on rows this catalog owns.
 const SOURCE_PREFIX: &str = "org-overlays:";
@@ -81,27 +81,7 @@ impl PricingClass {
     }
 }
 
-/// Organization cache deals change prices only. The model owns enablement and
-/// the minimum prefix length used by the classifier.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-pub struct CachePrices {
-    pub write_multiplier_5m: String,
-    pub write_multiplier_1h: String,
-    pub write_multiplier_24h: String,
-    pub read_multiplier: String,
-}
-impl CachePrices {
-    fn as_tariff(&self) -> CacheTariff {
-        CacheTariff {
-            write_multiplier_5m: self.write_multiplier_5m.clone(),
-            write_multiplier_1h: self.write_multiplier_1h.clone(),
-            write_multiplier_24h: self.write_multiplier_24h.clone(),
-            read_multiplier: self.read_multiplier.clone(),
-            min_prefix_tokens: 1,
-        }
-    }
-}
+pub use crate::model_provisioning::CachePrices;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

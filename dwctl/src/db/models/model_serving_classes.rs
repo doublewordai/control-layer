@@ -1,6 +1,6 @@
 //! Additive storage for canonical serving classes, separate from realtime/flex/batch tiers.
 //!
-//! These rows are not yet consumed by request resolution or catalog reconciliation.
+//! The catalog reconciles these rows; request resolution does not consume them yet.
 //! The initial offerings use `standard` and `fast`; public entry points are the
 //! model's existing alias and that alias with `:fast`. Additional registered names
 //! select the same class. Upstream selection is configuration, not class identity.

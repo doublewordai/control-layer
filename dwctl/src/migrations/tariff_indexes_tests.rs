@@ -19,9 +19,20 @@ async fn assert_valid(pool: &PgPool) {
     check(&Target::main(), pool).await.unwrap();
     for build in index_builds() {
         let name = build.sql.split("IF NOT EXISTS ").nth(1).unwrap().split_whitespace().next().unwrap();
-        let (valid, comment): (bool, Option<String>) = sqlx::query_as(
+        let state: Option<(bool, Option<String>)> = sqlx::query_as(
             "SELECT i.indisvalid AND i.indisready, obj_description(i.indexrelid, 'pg_class') FROM pg_index i WHERE i.indexrelid = to_regclass($1)",
-        ).bind(name).fetch_one(pool).await.unwrap();
+        ).bind(name).fetch_optional(pool).await.unwrap();
+        let Some((valid, comment)) = state else {
+            // Later class-pricing migrations replace these historical general guards.
+            assert!(
+                Target::main()
+                    .migrator
+                    .iter()
+                    .any(|m| m.sql.contains(&format!("DROP INDEX CONCURRENTLY IF EXISTS {name};"))),
+                "missing index {name}"
+            );
+            continue;
+        };
         assert!(valid, "{name}");
         assert!(comment.is_some(), "{name}");
     }

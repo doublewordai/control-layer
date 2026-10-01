@@ -211,7 +211,7 @@ export interface ModelTariff {
   is_active: boolean;
   /** Set on an organisation's own price (a deal); absent on the model's general price. */
   organization_id?: string | null;
-  serving_class?: ServingClassName | "standard" | "custom" | null;
+  serving_class?: string | null;
 }
 
 // Cache pricing (Anthropic-style prompt-cache multipliers). Multipliers are decimal
@@ -378,7 +378,7 @@ export interface OrganizationCacheTariff {
   write_multiplier_1h: string;
   write_multiplier_24h: string;
   read_multiplier: string;
-  serving_class?: ServingClassName | "standard" | "custom";
+  serving_class?: string;
   valid_from: string;
 }
 
