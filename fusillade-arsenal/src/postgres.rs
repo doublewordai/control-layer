@@ -4611,7 +4611,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
         .await
         .map_err(|e| FusilladeError::Other(anyhow!("Failed to lock file: {}", e)))?;
         if !exists {
-            return Err(FusilladeError::Other(anyhow!("File not found")));
+            return Err(FusilladeError::FileNotFound(file_id));
         }
 
         // Step 1: Cancel non-terminal batches associated with this file
@@ -4697,7 +4697,7 @@ impl<P: PoolProvider> Storage for PostgresRequestManager<P> {
             tx.rollback()
                 .await
                 .map_err(|e| FusilladeError::Other(anyhow!("Failed to rollback: {}", e)))?;
-            return Err(FusilladeError::Other(anyhow!("File not found")));
+            return Err(FusilladeError::FileNotFound(file_id));
         }
 
         tx.commit()
@@ -16848,6 +16848,43 @@ mod tests {
         // Verify requests still exist but are skipped when template is deleted
         let requests_after = manager.get_batch_requests(batch.id).await.unwrap();
         assert_eq!(requests_after.len(), 0); // Requests with deleted templates are skipped
+    }
+
+    #[sqlx::test]
+    async fn test_delete_file_twice_is_file_not_found(pool: sqlx::PgPool) {
+        let http_client = Arc::new(MockHttpClient::new());
+        let manager = PostgresRequestManager::with_client(
+            TestDbPools::new(pool.clone()).await.unwrap(),
+            http_client,
+        );
+
+        let file_id = manager
+            .create_file(
+                "double-delete".to_string(),
+                None,
+                vec![RequestTemplateInput {
+                    custom_id: None,
+                    endpoint: "https://api.example.com".to_string(),
+                    method: "POST".to_string(),
+                    path: "/test".to_string(),
+                    body: r#"{"n":1}"#.to_string(),
+                    model: "test".to_string(),
+                    api_key: "key".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        manager.delete_file(file_id).await.unwrap();
+
+        // A duplicate DELETE, or a concurrent one that lost the race, must be
+        // reported as a typed not-found so the API layer can answer 404 rather
+        // than a spurious 500.
+        let second = manager.delete_file(file_id).await;
+        assert!(
+            matches!(second, Err(FusilladeError::FileNotFound(id)) if id == file_id),
+            "expected FileNotFound on the second delete, got {second:?}"
+        );
     }
 
     // =========================================================================
