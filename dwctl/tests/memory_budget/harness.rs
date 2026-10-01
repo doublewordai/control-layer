@@ -9,9 +9,14 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use axum::body::Bytes;
 use dwctl::Application;
 use dwctl::config::Config;
-use reqwest::{Client, Method};
+use http_body_util::Full;
+use hyper_util::client::legacy::Client;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::rt::TokioExecutor;
+use reqwest::Method;
 use serde_json::{Value, json};
 use sqlx::postgres::{PgConnectOptions, PgConnection};
 use sqlx::{ConnectOptions, Connection};
@@ -24,10 +29,17 @@ use crate::tokenizer::Tokenizer;
 use crate::upstream::Upstream;
 
 pub const MODEL_ALIAS: &str = "memory-budget-model";
-const UPSTREAM_MODEL: &str = "upstream-model";
+pub const UPSTREAM_MODEL: &str = "upstream-model";
 const ADMIN_EMAIL: &str = "admin@memory-budget.test";
 const ADMIN_PASSWORD: &str = "memory-budget-password";
 const EVERYONE_GROUP: &str = "00000000-0000-0000-0000-000000000000";
+/// Socket buffer sizes on the connections between the load generator and the
+/// application. The kernel doubles them.
+const APPLICATION_RECEIVE_BUFFER: u32 = 16 * 1024;
+const APPLICATION_SEND_BUFFER: u32 = 4 * 1024;
+const LOAD_RECEIVE_BUFFER: usize = 4 * 1024;
+
+pub type LoadClient = Client<HttpConnector, Full<Bytes>>;
 
 pub struct Options {
     /// Inference keys allowed to call the model. The routing layer keeps them
@@ -38,7 +50,7 @@ pub struct Options {
 pub struct Harness {
     pub driver: Runtime,
     pub upstream: Upstream,
-    pub client: Client,
+    pub client: LoadClient,
     pub base_url: String,
     pub api_key: String,
     app: Option<Runtime>,
@@ -82,22 +94,14 @@ impl Harness {
             let _ = shutdown_signal.await;
         }));
 
-        // A new connection per request keeps idle keep-alive buffers out of the count.
-        let client = Client::builder().pool_max_idle_per_host(0).build().expect("http client");
         let base_url = format!("http://127.0.0.1:{port}");
-        let setup = setup(
-            client.clone(),
-            base_url.clone(),
-            upstream.base_url.clone(),
-            database.url.clone(),
-            options,
-        );
+        let setup = setup(base_url.clone(), upstream.base_url.clone(), database.url.clone(), options);
         let api_key = driver.block_on(driver.spawn(setup)).unwrap();
 
         Harness {
             driver,
             upstream,
-            client,
+            client: load_client(),
             base_url,
             api_key,
             app: Some(app),
@@ -124,15 +128,29 @@ impl Drop for Harness {
     }
 }
 
-/// A loopback listener with a small, fixed receive buffer. Accepted
-/// connections inherit it, so the application reads a request body in pieces
-/// of the same size on every machine rather than in whatever pieces the
-/// kernel's buffer tuning allows, and the heap it holds does not vary with that.
+/// A loopback listener with small, fixed socket buffers, which accepted
+/// connections inherit. The application reads a request body in pieces of the
+/// same size on every machine rather than in whatever pieces the kernel's
+/// buffer tuning allows, so the heap it holds does not vary with that. A
+/// response the load generator has not read yet stays with the application
+/// rather than in kernel buffers.
 fn listener() -> TcpListener {
     let socket = TcpSocket::new_v4().expect("socket");
-    socket.set_recv_buffer_size(16 * 1024).expect("receive buffer size");
+    socket
+        .set_recv_buffer_size(APPLICATION_RECEIVE_BUFFER)
+        .expect("receive buffer size");
+    socket.set_send_buffer_size(APPLICATION_SEND_BUFFER).expect("send buffer size");
     socket.bind("127.0.0.1:0".parse().unwrap()).expect("bind application listener");
     socket.listen(1024).expect("listen")
+}
+
+/// The load generator's client. A new connection per request keeps idle
+/// keep-alive buffers out of the count, and a small receive buffer means a
+/// response it has not read yet stays with the application.
+fn load_client() -> LoadClient {
+    let mut connector = HttpConnector::new();
+    connector.set_recv_buffer_size(Some(LOAD_RECEIVE_BUFFER));
+    Client::builder(TokioExecutor::new()).pool_max_idle_per_host(0).build(connector)
 }
 
 /// Every request-path layer enabled, with each external dependency replaced
@@ -160,7 +178,8 @@ fn config(port: u16, database_url: &str, tokenizer_url: &str) -> Config {
 
 /// Registers the mock upstream as a model open to every key, creates the
 /// inference keys, and waits until the model is routable. Returns one key.
-async fn setup(client: Client, base_url: String, upstream_url: String, database_url: String, options: Options) -> String {
+async fn setup(base_url: String, upstream_url: String, database_url: String, options: Options) -> String {
+    let client = reqwest::Client::builder().pool_max_idle_per_host(0).build().expect("http client");
     wait_for(&client, &format!("{base_url}/health")).await;
 
     let login = client
@@ -257,7 +276,7 @@ async fn insert_api_keys(database_url: &str, user_id: &str, count: usize) -> Str
     secrets.into_iter().next().expect("at least one key").0
 }
 
-async fn wait_for(client: &Client, url: &str) {
+async fn wait_for(client: &reqwest::Client, url: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     while !matches!(client.get(url).send().await, Ok(response) if response.status().is_success()) {
         assert!(tokio::time::Instant::now() < deadline, "{url} never became healthy");
