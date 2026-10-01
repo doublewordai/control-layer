@@ -29,6 +29,7 @@ from psycopg.rows import dict_row
 from schema_change import (
     characterize_stale_plans,
     characterize_returning_and_type_changes,
+    verify_concurrent_model_name_writes,
     verify_models_schema_change,
 )
 
@@ -868,6 +869,7 @@ ignore_startup_parameters=extra_float_digits
             "PASS: shared application role retains public schema without CREATEROLE",
             flush=True,
         )
+        verify_concurrent_model_name_writes(app, direct, dsn(roles[0], True))
         # Keep the hostile reset mode above for session-routing regressions. This
         # second phase models production prepared statements surviving clients.
         ini.write_text(

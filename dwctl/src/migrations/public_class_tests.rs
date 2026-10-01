@@ -1,11 +1,38 @@
 //! Recovery and definition checks for public-class tariff indexes, via SQLx.
+use uuid::Uuid;
+
 use super::*;
 
-const INDEXES: [(&str, i64); 3] = [
+const INDEXES: [(&str, i64); 4] = [
     ("idx_model_tariffs_public_class_active", 20261001150110),
     ("idx_model_cache_tariffs_public_class_active", 20261001150210),
     ("idx_model_cache_tariffs_public_class_version", 20261001150310),
+    ("idx_model_tariffs_public_nonbatch_class_active", 20261001153610),
 ];
+
+#[sqlx::test]
+async fn public_class_nonbatch_uniqueness_ignores_completion_window(pool: PgPool) {
+    let model: Uuid = sqlx::query_scalar(
+        "INSERT INTO deployed_models (alias,model_name,is_composite,created_by)
+         VALUES ('example/unique','example/unique',true,'00000000-0000-0000-0000-000000000000') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    for class in [None, Some("standard"), Some("fast")] {
+        for purpose in ["realtime", "playground", "platform", "continuation"] {
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,serving_class,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,'first',$2,$3,1,1)")
+                .bind(model).bind(class).bind(purpose).execute(&pool).await.unwrap();
+            let error = sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,serving_class,api_key_purpose,completion_window,input_price_per_token,output_price_per_token) VALUES ($1,'duplicate',$2,$3,'24h',2,2)")
+                .bind(model).bind(class).bind(purpose).execute(&pool).await.unwrap_err();
+            assert_eq!(error.as_database_error().unwrap().code().as_deref(), Some("23505"));
+        }
+        for window in ["1h", "24h"] {
+            sqlx::query("INSERT INTO model_tariffs (deployed_model_id,name,serving_class,api_key_purpose,completion_window,input_price_per_token,output_price_per_token) VALUES ($1,'batch',$2,'batch',$3,1,1)")
+                .bind(model).bind(class).bind(window).execute(&pool).await.unwrap();
+        }
+    }
+}
 
 #[sqlx::test(migrations = false)]
 async fn public_class_indexes_recover_invalid_prebuilds(pool: PgPool) {

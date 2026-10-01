@@ -247,7 +247,10 @@
           "additionalProperties": {
             "$ref": "#/$defs/ClassRoute"
           },
-          "default": {}
+          "default": {},
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9_-]*$"
+          }
         },
         "deployments": {
           "type": "array",

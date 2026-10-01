@@ -1,5 +1,8 @@
 //! Dormant catalog class reconciliation. The parent owns the transaction and lock.
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    iter::once,
+};
 
 use anyhow::{Result, ensure};
 use chrono::{DateTime, Utc};
@@ -72,9 +75,19 @@ impl ModelProvisioning<'_> {
             .map(|(id, _, _)| *id)
             .collect();
         let mut primary: HashSet<String> = models.iter().map(|(_, a, _)| a.to_lowercase()).collect();
+        let stored_primary: HashMap<String, &str> = models.iter().map(|(_, a, _)| (a.to_lowercase(), a.as_str())).collect();
         for m in &catalog.models {
-            primary.insert(m.clay.alias.to_lowercase());
-            primary.extend(m.clay.deployments.iter().map(|d| d.alias.to_lowercase()));
+            for alias in once(&m.clay.alias).chain(m.clay.deployments.iter().map(|d| &d.alias)) {
+                // PostgreSQL's alias conflict target is case-sensitive, while
+                // catalog names are not. Only the exact spelling is an upsert.
+                if let Some(stored) = stored_primary.get(&alias.to_lowercase()) {
+                    ensure!(
+                        *stored == alias,
+                        "catalog name {alias:?} conflicts with stored model name {stored:?}; use its exact spelling"
+                    );
+                }
+                primary.insert(alias.to_lowercase());
+            }
         }
         let existing: Vec<(Uuid,String)> = sqlx::query_as("SELECT c.deployed_model_id, dm.alias || ':' || c.class_key FROM model_serving_classes c JOIN deployed_models dm ON dm.id=c.deployed_model_id WHERE c.class_key <> 'standard'")
             .fetch_all(&mut *self.db).await?;
