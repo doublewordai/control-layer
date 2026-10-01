@@ -591,8 +591,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // then run on the chosen pool exactly as they ran on the single pool
     // before. A composite with no pool for this class resolves to its default,
     // which is byte-identically today's behaviour. Resolution happens INSIDE
-    // the map guard so only the chosen pool is cloned: KeySets are owned, so a
-    // whole-TargetPools clone would deep-copy every pool's keys per request.
+    // the map guard so only the chosen pool is cloned, not every pool.
     let request_class = RequestClass::from_path(&canonical_request_path);
     // The alias's serving policy (presets, overlays) is declared on its
     // default pool and applies whichever pool serves this request's class.
