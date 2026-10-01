@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.8.0](https://github.com/doublewordai/control-layer/compare/v12.7.4...v12.8.0) (2026-10-01)
+
+
+### Features
+
+* **onwards:** conversation affinity for priority pools ([#1892](https://github.com/doublewordai/control-layer/issues/1892)) ([b2ff624](https://github.com/doublewordai/control-layer/commit/b2ff624480cade3f985b1a02045304add2339705))
+
 ## [12.7.4](https://github.com/doublewordai/control-layer/compare/v12.7.3...v12.7.4) (2026-09-30)
 
 
