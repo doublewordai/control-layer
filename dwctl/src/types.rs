@@ -50,6 +50,7 @@ use uuid::Uuid;
 pub type UserId = Uuid;
 pub type ApiKeyId = Uuid;
 pub type DeploymentId = Uuid;
+pub type ModelServingClassId = Uuid;
 pub type GroupId = Uuid;
 pub type InferenceEndpointId = Uuid;
 #[allow(dead_code)] // TODO: Remove if not needed (currently using fusillade::FileId instead)
