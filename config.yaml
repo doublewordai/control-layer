@@ -992,7 +992,13 @@ image_normalizer:
     #                               # 24h + the 7-day retry buffer after ingest,
     #                               # so a dedup hit older than this is re-uploaded
     #                               # rather than left to expire mid-batch.
-    #                               # 0 disables.
+    #                               # 0 disables. Ignored when
+    #                               # unique_upload_keys is on.
+  # Store each ingest under its own object key (dw-img://{sha256}.{upload_id})
+  # instead of reusing one object per content hash. Enable only once every
+  # replica runs a version that reads upload-ID tokens; disable before
+  # rolling back past it.
+  unique_upload_keys: false
   fetcher:
     max_bytes: 20971520        # 20 MiB
     timeout_secs: 30

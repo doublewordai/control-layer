@@ -109,10 +109,19 @@ pub async fn get_image<P: PoolProvider + Clone + Send + Sync>(
     // Re-creating it per request would re-init the GCS client + ADC signer
     // on every dashboard image load.
     let ttl = Duration::from_secs(config.image_normalizer.signing.dashboard_ttl_secs);
-    let signed = state.image_normalizer.sign(token, ttl).await.map_err(|e| {
-        warn!(error = %e, "image_normalizer.sign failed for dashboard view");
-        Error::Internal {
-            operation: format!("image signing failed: {e}"),
+    let signed = state.image_normalizer.sign(token, ttl).await.map_err(|e| match e {
+        // The grant covers the content hash, but this reference names a copy
+        // the store does not have (e.g. a mistyped upload ID): same answer as
+        // an image the caller cannot see.
+        crate::image_normalizer::NormalizeError::NotFound => Error::NotFound {
+            resource: "image".to_string(),
+            id: sha256_hex.clone(),
+        },
+        e => {
+            warn!(error = %e, "image_normalizer.sign failed for dashboard view");
+            Error::Internal {
+                operation: format!("image signing failed: {e}"),
+            }
         }
     })?;
 
@@ -291,10 +300,14 @@ pub async fn accessible_tokens(
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows
+    // Grants are keyed on the content hash, so a grant covers every stored
+    // copy of the image: return the requested tokens (upload ID included) whose
+    // hash is granted.
+    let granted: std::collections::HashSet<[u8; 32]> = rows
         .into_iter()
-        .filter_map(|row| <[u8; 32]>::try_from(row.sha256.as_slice()).ok().map(ImageToken))
-        .collect())
+        .filter_map(|row| <[u8; 32]>::try_from(row.sha256.as_slice()).ok())
+        .collect();
+    Ok(tokens.iter().filter(|t| granted.contains(&t.0)).copied().collect())
 }
 
 /// Whether `viewer` — optionally acting in organization `active_org` — is
@@ -340,7 +353,7 @@ mod tests {
     use sqlx::PgPool;
 
     fn token(b: u8) -> ImageToken {
-        ImageToken([b; 32])
+        ImageToken([b; 32], None)
     }
 
     async fn can_view(pool: &PgPool, tok: ImageToken, viewer: uuid::Uuid, active_org: Option<uuid::Uuid>) -> bool {

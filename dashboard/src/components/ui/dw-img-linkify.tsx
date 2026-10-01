@@ -15,11 +15,11 @@ import { dwImageUrl, splitDwImgTokens } from "../../utils/dwImage";
  * `@types/react-syntax-highlighter`.
  */
 
-function tokenTooltip(sha256: string): string {
+function tokenTooltip(sha256: string, ref: string): string {
   return (
     "Stored image reference — the original image is held in your control plane " +
     `(content hash ${sha256.slice(0, 12)}…). Open to retrieve it via ` +
-    `GET ${dwImageUrl(sha256)} (management API; dashboard session or platform API key).`
+    `GET ${dwImageUrl(ref)} (management API; dashboard session or platform API key).`
   );
 }
 
@@ -39,10 +39,10 @@ function linkifyNode(node: rendererNode): rendererNode | rendererNode[] {
             tagName: "a",
             properties: {
               className: ["dw-img-link"],
-              href: dwImageUrl(seg.sha256),
+              href: dwImageUrl(seg.ref),
               target: "_blank",
               rel: "noreferrer noopener",
-              title: tokenTooltip(seg.sha256),
+              title: tokenTooltip(seg.sha256, seg.ref),
               style: { textDecoration: "underline", cursor: "pointer" },
             },
             children: [{ type: "text", value: seg.raw }],
