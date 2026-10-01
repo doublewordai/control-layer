@@ -2632,6 +2632,7 @@ mod tests {
             clickhouse: None,
             prefix_chain: crate::prefix_chain::PrefixChainConfig::default(),
             continuation: Default::default(),
+            heap_profiling: Default::default(),
             keystore: None,
         };
         crate::seed_database(&config.model_sources, &pool).await.unwrap();

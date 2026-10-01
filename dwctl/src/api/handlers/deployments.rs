@@ -4,8 +4,8 @@ use sqlx_pool_router::PoolProvider;
 
 use crate::api::models::deployments::{ModelFacets, ModelListResponse, TariffDefinition, TrafficRoutingAction, TrafficRoutingRule};
 use crate::db::models::deployments::{
-    AimdConfig, LoadBalancingStrategy, MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS, ModelCatalogMetadata,
-    TrafficRuleAction,
+    AffinityConfig, AimdConfig, LoadBalancingStrategy, MODEL_CATALOG_METADATA_MAX_BYTES, MODEL_CATALOG_METADATA_MAX_EXTRA_KEYS,
+    ModelCatalogMetadata, TrafficRuleAction,
 };
 use crate::db::models::tariffs::TariffCreateDBRequest;
 use crate::{
@@ -33,6 +33,7 @@ use axum::{
     extract::{Path, Query, State},
     response::Json,
 };
+use onwards::affinity::AffinityConfig as OnwardsAffinityConfig;
 use onwards::aimd::AimdConfig as OnwardsAimdConfig;
 use sqlx::Acquire;
 
@@ -90,6 +91,23 @@ fn validate_aimd(timeout: Option<i64>, config: Option<&AimdConfig>, composite: b
                 message: "AIMD requires an explicit first_token_timeout_ms of 0 or at least latency_budget_ms".into(),
             });
         }
+    }
+    Ok(())
+}
+
+fn validate_affinity(config: Option<&AffinityConfig>, composite: bool, priority: bool, fallback: bool) -> Result<()> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    let config: OnwardsAffinityConfig = config.clone().into();
+    if !config.enabled {
+        return Ok(());
+    }
+    config.validate().map_err(|message| Error::BadRequest { message: message.into() })?;
+    if !composite || !priority || !fallback {
+        return Err(Error::BadRequest {
+            message: "conversation affinity requires a priority composite model with fallback enabled".into(),
+        });
     }
     Ok(())
 }
@@ -673,13 +691,21 @@ pub async fn create_deployed_model<P: PoolProvider>(
     }
     match &create {
         DeployedModelCreate::Standard(s) => validate_aimd(s.first_token_timeout_ms, s.aimd.as_ref(), false, false, s.backoff_enabled)?,
-        DeployedModelCreate::Composite(c) => validate_aimd(
-            c.first_token_timeout_ms,
-            c.aimd.as_ref(),
-            true,
-            c.lb_strategy == LoadBalancingStrategy::Priority,
-            c.fallback_enabled,
-        )?,
+        DeployedModelCreate::Composite(c) => {
+            validate_aimd(
+                c.first_token_timeout_ms,
+                c.aimd.as_ref(),
+                true,
+                c.lb_strategy == LoadBalancingStrategy::Priority,
+                c.fallback_enabled,
+            )?;
+            validate_affinity(
+                c.affinity.as_ref(),
+                true,
+                c.lb_strategy == LoadBalancingStrategy::Priority,
+                c.fallback_enabled,
+            )?;
+        }
     }
 
     let mut tx = state.db.write().begin().await.map_err(|e| Error::Database(e.into()))?;
@@ -848,7 +874,19 @@ pub async fn update_deployed_model<P: PoolProvider>(
     // We also keep the current row so we can (a) validate the *merged* backoff
     // state — not just the fields in this PATCH — and (b) derive the
     // standard-model fallback invariant below.
-    let (model_alias, is_composite, prev_lb_strategy, cur_initial, cur_max, cur_factor, cur_total, cur_timeout, cur_aimd, cur_fallback) = {
+    let (
+        model_alias,
+        is_composite,
+        prev_lb_strategy,
+        cur_initial,
+        cur_max,
+        cur_factor,
+        cur_total,
+        cur_timeout,
+        cur_aimd,
+        cur_affinity,
+        cur_fallback,
+    ) = {
         let mut repo = Deployments::new(tx.acquire().await.map_err(|e| Error::Database(e.into()))?);
         match repo.get_by_id(deployment_id).await {
             Ok(Some(model)) => {
@@ -868,6 +906,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
                     model.backoff_max_total_ms,
                     model.first_token_timeout_ms,
                     model.aimd,
+                    model.affinity,
                     model.fallback_enabled,
                 )
             }
@@ -885,6 +924,12 @@ pub async fn update_deployed_model<P: PoolProvider>(
     validate_aimd(
         update.first_token_timeout_ms.unwrap_or(cur_timeout),
         update.aimd.as_ref().map(|v| v.as_ref()).unwrap_or(cur_aimd.as_ref()),
+        is_composite,
+        update.lb_strategy.as_ref().unwrap_or(&prev_lb_strategy) == &LoadBalancingStrategy::Priority,
+        update.fallback_enabled.unwrap_or(cur_fallback),
+    )?;
+    validate_affinity(
+        update.affinity.as_ref().map(|v| v.as_ref()).unwrap_or(cur_affinity.as_ref()),
         is_composite,
         update.lb_strategy.as_ref().unwrap_or(&prev_lb_strategy) == &LoadBalancingStrategy::Priority,
         update.fallback_enabled.unwrap_or(cur_fallback),
@@ -1719,6 +1764,85 @@ mod tests {
         response.assert_status_ok();
         let model: DeployedModelResponse = response.json();
         assert_eq!(model.fallback.unwrap().realtime_on_status, vec![529]);
+    }
+
+    #[sqlx::test]
+    async fn affinity_api_create_patch_clear_and_validate(pool: PgPool) {
+        let (app, _bg) = create_test_app(pool.clone(), false).await;
+        let user = create_test_admin_user(&pool, Role::PlatformManager).await;
+        let headers = add_auth_headers(&user);
+        let response = app
+            .post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"type":"composite","model_name":"affinity-model","lb_strategy":"priority",
+                "fallback_enabled":true,"affinity":{"target_conversations":40}}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert_eq!(model.fallback.as_ref().unwrap().affinity.as_ref().unwrap().target_conversations, 40);
+        let path = format!("/admin/api/v1/models/{}", model.id);
+
+        // Typed deserialization rejects unknown members before persistence.
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"affinity":{"target":5}}))
+            .await
+            .assert_status_unprocessable_entity();
+        // Invalid settings, and routing that affinity cannot run on.
+        for patch in [
+            json!({"affinity":{"target_conversations":0}}),
+            json!({"lb_strategy":"weighted_random"}),
+            json!({"fallback_enabled":false}),
+        ] {
+            app.patch(&path)
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&patch)
+                .await
+                .assert_status_bad_request();
+        }
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"affinity":{"target_conversations":60,"margin":5}}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        let affinity = model.fallback.unwrap().affinity.unwrap();
+        assert_eq!((affinity.target_conversations, affinity.margin), (60, Some(5)));
+        // An unrelated change keeps the setting.
+        let response = app
+            .patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"description":"unchanged routing"}))
+            .await;
+        response.assert_status_ok();
+        let model: DeployedModelResponse = response.json();
+        assert!(model.fallback.unwrap().affinity.is_some());
+        // Null returns the model to per-request selection.
+        app.patch(&path)
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(&json!({"affinity":null}))
+            .await
+            .assert_status_ok();
+        let mut conn = pool.acquire().await.unwrap();
+        let stored = Deployments::new(&mut conn).get_by_id(model.id).await.unwrap().unwrap();
+        assert!(stored.affinity.is_none());
+        // A weighted composite cannot be created with affinity.
+        app.post("/admin/api/v1/models")
+            .add_header(&headers[0].0, &headers[0].1)
+            .add_header(&headers[1].0, &headers[1].1)
+            .json(
+                &json!({"type":"composite","model_name":"weighted-affinity","lb_strategy":"weighted_random",
+                "fallback_enabled":true,"affinity":{"target_conversations":10}}),
+            )
+            .await
+            .assert_status_bad_request();
     }
 
     /// Helper function to find a model by ID in a paginated response

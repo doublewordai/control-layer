@@ -950,6 +950,25 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn underway_task_autovacuums_on_a_fixed_row_count(pool: PgPool) {
+        apply_underway(&pool).await.unwrap();
+        let options: Vec<String> = sqlx::query_scalar("SELECT unnest(reloptions) FROM pg_class WHERE oid = 'underway.task'::regclass")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        for expected in [
+            "autovacuum_vacuum_scale_factor=0.0",
+            "autovacuum_vacuum_threshold=20000",
+            "autovacuum_vacuum_insert_scale_factor=0.0",
+            "autovacuum_vacuum_insert_threshold=20000",
+            "autovacuum_analyze_scale_factor=0.0",
+            "autovacuum_analyze_threshold=20000",
+        ] {
+            assert!(options.iter().any(|option| option == expected), "missing {expected}: {options:?}");
+        }
+    }
+
+    #[sqlx::test]
     async fn underway_extensions_repair_interrupted_indexes(pool: PgPool) {
         underway::run_migrations(&pool).await.unwrap();
         // Reproduce the catalog state left by a cancelled concurrent build,
@@ -1121,6 +1140,81 @@ mod tests {
     async fn fusillade_test_helper_stays_compatible(pool: PgPool) {
         let fusillade_pool = setup_fusillade_pool(&pool).await;
         check(&Target::fusillade(), &fusillade_pool).await.unwrap();
+    }
+
+    /// Tables that churn continuously vacuum after a fixed number of changes,
+    /// however large they grow.
+    #[sqlx::test]
+    async fn churning_tables_autovacuum_on_fixed_row_counts(pool: PgPool) {
+        apply_underway(&pool).await.unwrap();
+        let cases: [(&str, &[&str]); 5] = [
+            (
+                "batch_aggregates",
+                &[
+                    "autovacuum_vacuum_scale_factor=0.0",
+                    "autovacuum_vacuum_threshold=50000",
+                    "autovacuum_analyze_scale_factor=0.0",
+                    "autovacuum_analyze_threshold=50000",
+                    "autovacuum_vacuum_insert_scale_factor=0.0",
+                    "autovacuum_vacuum_insert_threshold=50000",
+                ],
+            ),
+            (
+                "image_access",
+                &[
+                    "autovacuum_vacuum_scale_factor=0.0",
+                    "autovacuum_vacuum_threshold=20000",
+                    "autovacuum_analyze_scale_factor=0.0",
+                    "autovacuum_analyze_threshold=20000",
+                    "autovacuum_vacuum_insert_scale_factor=0.0",
+                    "autovacuum_vacuum_insert_threshold=20000",
+                ],
+            ),
+            (
+                "batch_capacity_reservations",
+                &[
+                    "autovacuum_vacuum_scale_factor=0.0",
+                    "autovacuum_vacuum_threshold=20000",
+                    "autovacuum_analyze_scale_factor=0.0",
+                    "autovacuum_analyze_threshold=20000",
+                    "autovacuum_vacuum_insert_scale_factor=0.0",
+                    "autovacuum_vacuum_insert_threshold=20000",
+                ],
+            ),
+            // Insert-only: only the insert-triggered vacuum is pinned.
+            (
+                "http_analytics",
+                &[
+                    "autovacuum_vacuum_insert_scale_factor=0.0",
+                    "autovacuum_vacuum_insert_threshold=100000",
+                ],
+            ),
+            (
+                "underway.task_attempt",
+                &[
+                    "autovacuum_vacuum_scale_factor=0.0",
+                    "autovacuum_vacuum_threshold=20000",
+                    "autovacuum_analyze_scale_factor=0.0",
+                    "autovacuum_analyze_threshold=20000",
+                    "autovacuum_vacuum_insert_scale_factor=0.0",
+                    "autovacuum_vacuum_insert_threshold=20000",
+                ],
+            ),
+        ];
+        for (table, expected) in cases {
+            let options: Vec<String> = sqlx::query_scalar("SELECT unnest(reloptions) FROM pg_class WHERE oid = $1::regclass")
+                .bind(table)
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+            assert_eq!(options.len(), expected.len(), "{table}: {options:?}");
+            for option in expected {
+                assert!(
+                    options.iter().any(|actual| actual == option),
+                    "{table} missing {option}: {options:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -383,6 +383,7 @@ pub fn create_test_config() -> crate::config::Config {
         openapi: Default::default(),
         cache: Default::default(),
         continuation: Default::default(),
+        heap_profiling: Default::default(),
         keystore: None,
     }
 }

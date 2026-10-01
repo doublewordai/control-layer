@@ -29,6 +29,55 @@
     "model"
   ],
   "$defs": {
+    "AffinityConfig": {
+      "description": "Priority-only conversation affinity: the preferred provider keeps about\n`target_conversations` of the active conversations, decided per\nconversation rather than per request. Missing/null keeps per-request\nselection.",
+      "type": "object",
+      "properties": {
+        "active_window_ms": {
+          "description": "A conversation stays active this long after its last request.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 600000,
+          "minimum": 0
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true
+        },
+        "margin": {
+          "description": "Drift allowed around the target before the share moves; defaults to a\ntenth of the target.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint",
+          "default": null,
+          "minimum": 0
+        },
+        "max_tracked": {
+          "description": "Upper bound on conversations tracked per gateway process.",
+          "type": "integer",
+          "format": "uint",
+          "default": 100000,
+          "minimum": 0
+        },
+        "target_conversations": {
+          "description": "Conversations to keep on the preferred provider. Size it to the\npreferred provider's concurrency.",
+          "type": "integer",
+          "format": "uint",
+          "default": 0,
+          "minimum": 0
+        },
+        "update_interval_ms": {
+          "description": "The share is recomputed at multiples of this much wall-clock time.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 60000,
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
     "Backoff": {
       "type": "object",
       "properties": {
@@ -271,6 +320,17 @@
     "Fallback": {
       "type": "object",
       "properties": {
+        "affinity": {
+          "description": "Conversation affinity (priority strategy only). Omit to keep the value\nalready stored for the model. `target_conversations` must match what\nthe preferred member can serve concurrently.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AffinityConfig"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "backoff": {
           "anyOf": [
             {
