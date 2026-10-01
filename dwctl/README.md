@@ -311,3 +311,18 @@ statuses that fail a realtime request over to the next provider, in addition to
 it as `routing.fallback.realtime_on_status`; omitting it keeps the stored value.
 See [configuration, observation coverage and rollout](../onwards/docs/src/load-aware-failover.md)
 before enabling a model. The existing histogram is not the controller denominator.
+
+### Conversation affinity
+
+Priority composite models can keep each conversation on one side of the
+preferred/alternate split instead of choosing per request, so the provider that
+holds a conversation's prefix cache keeps serving it. Set it through the model
+API's `affinity` object or the catalog's `routing.fallback.affinity`, with
+`target_conversations` sized to what the preferred member can serve
+concurrently; it does not adapt on its own. `PATCH {"affinity": null}` returns the
+model to per-request selection. Gateway replicas agree without shared state.
+
+`onwards_affinity_share{model,pool}`, `onwards_affinity_active_conversations` and
+`onwards_affinity_admitted_conversations` report each process's view;
+`onwards_affinity_routed_total{model,pool,side}` counts decisions. See
+[conversation affinity](../onwards/docs/src/load-balancing.md#conversation-affinity).

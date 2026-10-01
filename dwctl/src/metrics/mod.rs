@@ -6,6 +6,7 @@
 //! Additional metrics (credits, analytics lag) are recorded inline using the `metrics`
 //! facade in the request_logging module.
 
+pub mod allocator;
 mod cache_info;
 pub mod errors;
 mod gen_ai;
