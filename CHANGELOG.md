@@ -1,5 +1,32 @@
 # Changelog
 
+## [12.10.0](https://github.com/doublewordai/control-layer/compare/v12.9.0...v12.10.0) (2026-10-01)
+
+
+### Features
+
+* **db:** add dormant model serving class and alias storage ([#1896](https://github.com/doublewordai/control-layer/issues/1896)) ([fc10154](https://github.com/doublewordai/control-layer/commit/fc1015429b53354d4b36929e3a30287c649150eb))
+
+
+### Performance Improvements
+
+* **onwards:** share a pool's key set between requests ([#1901](https://github.com/doublewordai/control-layer/issues/1901)) ([18cd38c](https://github.com/doublewordai/control-layer/commit/18cd38c64a5f6af25a85d29120a3ca186e382226))
+
+
+### Build System
+
+* keep clippy clean on Rust 1.99 ([#1900](https://github.com/doublewordai/control-layer/issues/1900)) ([9d14bee](https://github.com/doublewordai/control-layer/commit/9d14beec7ecadbba51a0e8e18ac3d3556d34bcd8))
+
+
+### Continuous Integration
+
+* run the test suite when a pull request changes dependencies ([#1899](https://github.com/doublewordai/control-layer/issues/1899)) ([eef7079](https://github.com/doublewordai/control-layer/commit/eef7079c064503342a0864423b2979c92e18996d))
+
+
+### Tests
+
+* **dwctl:** budget complete responses and use realistic payloads ([#1897](https://github.com/doublewordai/control-layer/issues/1897)) ([4307200](https://github.com/doublewordai/control-layer/commit/4307200c38c1a6a1f6948870804e402fe06d1b8b))
+
 ## [12.9.0](https://github.com/doublewordai/control-layer/compare/v12.8.0...v12.9.0) (2026-10-01)
 
 
