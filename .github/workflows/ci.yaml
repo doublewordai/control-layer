@@ -379,6 +379,8 @@ jobs:
         # Rust 1.99 reports double_must_use in async-trait's generated code.
         # Restore stable once it includes https://github.com/rust-lang/rust-clippy/pull/17547.
         uses: dtolnay/rust-toolchain@1.98.0
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
