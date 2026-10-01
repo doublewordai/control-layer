@@ -59,8 +59,10 @@ const STREAMED_TOKENS: [usize; 2] = [256, 2304];
 /// buffers and leaves the application at once, so only long ones are held
 /// while the client reads them.
 const COMPLETE_TOKENS: [usize; 2] = [8192, 32768];
-/// Inference keys allowed to call the model; routing copies the key set per request.
-const API_KEYS: usize = 500;
+/// Inference keys allowed to call the model, as many as a widely shared model
+/// has. Requests share the model's key set, so a copy of it per request would
+/// show in `fixed`.
+const API_KEYS: usize = 10_000;
 
 struct Budget {
     copies: f64,
@@ -136,7 +138,7 @@ fn chat_completion_request_body() {
         &scaling,
         Budget {
             copies: 10.35,
-            fixed_kib: 365.0,
+            fixed_kib: 310.0,
         },
     );
 }

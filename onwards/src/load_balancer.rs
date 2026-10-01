@@ -68,8 +68,9 @@ struct ParkedController {
 pub struct ProviderPool {
     /// The list of providers in this pool
     providers: Vec<Provider>,
-    /// Pool-level access control keys (who can call this alias)
-    keys: Option<KeySet>,
+    /// Pool-level access control keys (who can call this alias). Shared, since
+    /// every request clones the pool that serves it.
+    keys: Option<Arc<KeySet>>,
     /// Pool-level rate limiter (applies to all requests to this alias)
     pool_limiter: Option<Arc<dyn RateLimiter>>,
     /// Pool-level concurrency limiter (applies to all requests to this alias)
@@ -209,7 +210,7 @@ impl ProviderPool {
             parked: None,
             affinity,
             providers,
-            keys,
+            keys: keys.map(Arc::new),
             pool_limiter,
             pool_concurrency_limiter,
             fallback,
@@ -594,7 +595,7 @@ impl ProviderPool {
 
     /// Get pool-level access control keys
     pub fn keys(&self) -> Option<&KeySet> {
-        self.keys.as_ref()
+        self.keys.as_deref()
     }
 
     /// Get pool-level rate limiter
