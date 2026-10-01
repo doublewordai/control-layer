@@ -256,10 +256,10 @@ population is steady.
 | Option | Default | Description |
 |--------|---------|-------------|
 | `target_conversations` | required | Conversations to keep on the preferred provider |
-| `margin` | a tenth of the target | Drift allowed before the share moves |
+| `margin` | a tenth of the target | Drift allowed before the share moves; at most the target |
 | `active_window_ms` | `600000` | How long a conversation stays active after its last request |
 | `update_interval_ms` | `60000` | The share is recomputed at multiples of this wall-clock interval |
-| `max_tracked` | `100000` | Conversations tracked per process |
+| `max_tracked` | `100000` | Conversations tracked per process; when full, the tracker keeps the ones that decide the share |
 | `enabled` | `true` | Set `false` to keep per-request selection |
 
 Replicas share no state. Each records the conversations it sees and recomputes

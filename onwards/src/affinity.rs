@@ -34,7 +34,7 @@
 //!   identifies the conversation for its whole life.
 //!
 //! Requests without a key use ordinary priority selection.
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,12 @@ impl AffinityConfig {
         }
         if self.update_interval_ms < 1_000 || self.update_interval_ms > self.active_window_ms {
             return Err("affinity update_interval_ms must be 1000..=active_window_ms");
+        }
+        if self
+            .margin
+            .is_some_and(|margin| margin > self.target_conversations)
+        {
+            return Err("affinity margin must be at most target_conversations");
         }
         if self.max_tracked < self.target_conversations + self.margin()
             || self.max_tracked > 10_000_000
@@ -218,7 +224,8 @@ pub struct Snapshot {
 pub struct Tracker {
     config: AffinityConfig,
     /// Conversation key → last time a request from it was seen (Unix ms).
-    seen: HashMap<u64, u64>,
+    /// Ordered by key, which orders the conversations by point.
+    seen: BTreeMap<u64, u64>,
     share: f64,
     epoch: Option<u64>,
     snapshot: Snapshot,
@@ -228,7 +235,7 @@ impl Tracker {
     pub fn new(config: AffinityConfig) -> Self {
         Self {
             config,
-            seen: HashMap::new(),
+            seen: BTreeMap::new(),
             share: 1.0,
             epoch: None,
             snapshot: Snapshot {
@@ -255,9 +262,7 @@ impl Tracker {
     /// conversation belongs on the preferred provider, and whether the share was
     /// recomputed by this call.
     pub fn route(&mut self, key: u64, now_ms: u64) -> (bool, bool) {
-        if self.seen.len() < self.config.max_tracked || self.seen.contains_key(&key) {
-            self.seen.insert(key, now_ms);
-        }
+        self.record(key, now_ms);
         let epoch = now_ms / self.config.update_interval_ms;
         let updated = self.epoch != Some(epoch);
         if updated {
@@ -267,28 +272,43 @@ impl Tracker {
         (point(key) < self.share, updated)
     }
 
+    /// Track `key`. A full tracker keeps the conversations with the smallest
+    /// points: only those decide the share, so it stays exact however many
+    /// conversations are active, and only the active count saturates.
+    fn record(&mut self, key: u64, now_ms: u64) {
+        if let Some(last) = self.seen.get_mut(&key) {
+            *last = now_ms;
+            return;
+        }
+        if self.seen.len() >= self.config.max_tracked {
+            match self.seen.last_key_value() {
+                Some((&largest, _)) if largest > key => {
+                    self.seen.remove(&largest);
+                }
+                _ => return,
+            }
+        }
+        self.seen.insert(key, now_ms);
+    }
+
     fn update(&mut self, now_ms: u64) {
         let cutoff = now_ms.saturating_sub(self.config.active_window_ms);
         self.seen.retain(|_, last| *last >= cutoff);
-        let mut points: Vec<f64> = self.seen.keys().map(|k| point(*k)).collect();
-        let admitted = points.iter().filter(|p| **p < self.share).count();
+        // Ascending, because the keys are.
+        let points: Vec<f64> = self.seen.keys().map(|k| point(*k)).collect();
+        let admitted = points.partition_point(|p| *p < self.share);
         let target = self.config.target_conversations;
         let margin = self.config.margin();
         let over = admitted > target + margin;
         let under = admitted + margin < target && self.share < 1.0;
         if over || under {
-            self.share = if points.len() <= target {
-                1.0
-            } else {
-                // The (target+1)-th smallest point: exactly `target` lie below it.
-                let (_, nth, _) = points.select_nth_unstable_by(target, f64::total_cmp);
-                *nth
-            };
+            // The (target+1)-th smallest point: exactly `target` lie below it.
+            self.share = points.get(target).copied().unwrap_or(1.0);
         }
         self.snapshot = Snapshot {
             share: self.share,
             active: points.len(),
-            admitted: points.iter().filter(|p| **p < self.share).count(),
+            admitted: points.partition_point(|p| *p < self.share),
         };
     }
 }
@@ -417,6 +437,23 @@ mod tests {
     }
 
     #[test]
+    fn a_full_tracker_still_admits_about_target() {
+        let mut t = Tracker::new(AffinityConfig {
+            max_tracked: 50,
+            ..config(10)
+        });
+        let keys: Vec<u64> = (0..1_000u64).map(|k| hash(&[&k.to_le_bytes()])).collect();
+        for minute in 0..2 {
+            for k in &keys {
+                t.route(*k, 1_000 + minute * 60_000);
+            }
+        }
+        let preferred = keys.iter().filter(|k| point(**k) < t.share()).count();
+        assert!((10..=11).contains(&preferred), "{preferred}");
+        assert_eq!(t.snapshot().active, 50);
+    }
+
+    #[test]
     fn decisions_are_stable_while_the_population_is_steady() {
         let mut t = Tracker::new(config(100));
         let keys: Vec<u64> = (0..300u64).map(|k| hash(&[&k.to_le_bytes()])).collect();
@@ -489,6 +526,13 @@ mod tests {
     fn validation() {
         assert!(config(10).validate().is_ok());
         assert!(AffinityConfig::default().validate().is_err());
+        for (margin, ok) in [(0, true), (10, true), (11, false), (usize::MAX, false)] {
+            let config = AffinityConfig {
+                margin: Some(margin),
+                ..config(10)
+            };
+            assert_eq!(config.validate().is_ok(), ok, "margin {margin}");
+        }
         assert!(
             AffinityConfig {
                 update_interval_ms: 999,

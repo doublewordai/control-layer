@@ -1373,6 +1373,18 @@ fn build_pool(
             enabled: false,
             ..crate::aimd::AimdConfig::default()
         });
+        fallback.affinity = None;
+    }
+    if let Some(fallback) = &pool_config.fallback
+        && let Some(config) = &fallback.affinity
+        && config.enabled
+    {
+        config.validate().map_err(|e| anyhow!(e))?;
+        if !fallback.enabled || pool_config.strategy != LoadBalanceStrategy::Priority {
+            return Err(anyhow!(
+                "affinity requires enabled fallback and priority strategy"
+            ));
+        }
     }
     if let Some(fallback) = &pool_config.fallback
         && let Some(config) = &fallback.aimd
@@ -3561,6 +3573,38 @@ mod tests {
             Some(COMPLETIONS_POOL)
         );
         assert!(entry.resolved_name(RequestClass::Normal).is_none());
+    }
+
+    /// Affinity belongs to the default pool of a priority pool with fallback:
+    /// an invalid or misplaced block is a configuration error, and named pools
+    /// drop it.
+    #[test]
+    fn affinity_is_validated_and_kept_only_on_the_default_pool() {
+        let config = |strategy: &str, affinity: &str| {
+            let pool = format!(
+                r#"{{
+                    "strategy": "{strategy}",
+                    "fallback": {{"enabled": true, "on_status": [5], "affinity": {affinity}}},
+                    "providers": [
+                        {{"url": "https://hosted.example.com/"}},
+                        {{"url": "https://overflow.example.com/"}}
+                    ]
+                }}"#
+            );
+            format!(
+                r#"{{"targets": {{"m": {{"pools": {{"default": {pool}, "completions": {pool}}}}}}}}}"#
+            )
+        };
+        let build = |json: String| Targets::from_config(serde_json::from_str(&json).unwrap());
+
+        let targets = build(config("priority", r#"{"target_conversations": 10}"#)).unwrap();
+        let entry = targets.targets.get("m").unwrap();
+        assert!(entry.resolve(RequestClass::Normal).affinity_enabled());
+        assert!(!entry.resolve(RequestClass::Completions).affinity_enabled());
+
+        assert!(build(config("priority", r#"{"target_conversations": 0}"#)).is_err());
+        assert!(build(config("weighted_random", r#"{"target_conversations": 10}"#)).is_err());
+        assert!(build(config("weighted_random", r#"{"enabled": false}"#)).is_ok());
     }
 
     /// Access control belongs to the alias: a pool added for one request class
