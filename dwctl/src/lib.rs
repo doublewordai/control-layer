@@ -3876,6 +3876,19 @@ async fn setup_background_services(input: BackgroundServicesInput) -> anyhow::Re
         });
     }
 
+    // Start the prompt-cache retention daemon: bounded, oldest-first deletion of entries
+    // that expired more than the recompute grace ago. Without it the table only grows.
+    if config.background_services.prompt_cache_retention.enabled {
+        // Retention holds a session advisory lock, which requires a direct connection.
+        let daemon_pool = direct_pools.clone();
+        let daemon_config = config.background_services.prompt_cache_retention.clone();
+        let daemon_shutdown = shutdown_token.clone();
+        background_tasks.spawn("prompt-cache-retention", async move {
+            prompt_cache::retention::run_prompt_cache_retention_daemon(daemon_pool, daemon_config, daemon_shutdown).await;
+            Ok(())
+        });
+    }
+
     // Start analytics batcher if enabled
     let analytics_writer = if config.enable_analytics {
         let (batcher, writer) = request_logging::AnalyticsBatcher::new(dyn_pools.clone(), config.clone(), metrics_recorder);
@@ -4127,6 +4140,7 @@ impl Application {
             fusillade_pools.clone(),
             fusillade_arsenal::PostgresStorageConfig::from(&fusillade_daemon_config),
         )
+        .with_maintenance_query_timeout(std::time::Duration::from_millis(fusillade_daemon_config.claim_query_timeout_ms))
         .with_retained_response_fence_seconds(config.background_services.batch_daemon.retention.max_late_writer_seconds)
         .with_realtime_retention_seconds(
             config
@@ -4420,16 +4434,26 @@ impl Application {
         (server, self.bg_services)
     }
 
-    /// Start serving the application
-    pub async fn serve<F>(mut self, shutdown: F) -> anyhow::Result<()>
+    /// Start serving the application on the configured host and port
+    pub async fn serve<F>(self, shutdown: F) -> anyhow::Result<()>
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let bind_addr = self.config.bind_address();
-        let listener = TcpListener::bind(&bind_addr).await?;
+        let listener = TcpListener::bind(self.config.bind_address()).await?;
+        self.serve_with_listener(listener, shutdown).await
+    }
+
+    /// Start serving the application on an already-bound listener. The
+    /// listener's port should match `config.port`, which the application uses
+    /// to call itself.
+    pub async fn serve_with_listener<F>(mut self, listener: TcpListener, shutdown: F) -> anyhow::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
         info!(
             "Control layer listening on http://{}, available at http://localhost:{}",
-            bind_addr, self.config.port
+            listener.local_addr()?,
+            self.config.port
         );
 
         // Apply middleware before path matching

@@ -41,7 +41,7 @@ use metrics::{counter, histogram};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
-use sqlx::Row;
+use sqlx::{PgPool, Row};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Notify;
@@ -268,6 +268,23 @@ impl AnalyticsOutboxWriter {
     }
 }
 
+/// Reads the outbox backlog as (depth, age in seconds of the oldest row).
+///
+/// Depth is the statistics system's live-row estimate. An exact `COUNT(*)` has to
+/// visit every dead row a backlog leaves behind, so it gets slowest exactly when the
+/// gauge matters. The oldest age is exact: `MIN(created_at)` reads one end of an index.
+async fn read_outbox_observation(pool: &PgPool) -> sqlx::Result<(i64, f64)> {
+    sqlx::query_as(
+        r#"
+        SELECT
+            COALESCE((SELECT n_live_tup FROM pg_stat_user_tables WHERE relid = 'analytics_outbox'::regclass), 0)::bigint,
+            COALESCE(EXTRACT(EPOCH FROM (NOW() - (SELECT MIN(created_at) FROM analytics_outbox))), 0)::float8
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+}
+
 /// Background projector for already-durable analytics rows.
 pub struct AnalyticsBatcher<M = crate::metrics::GenAiMetrics>
 where
@@ -329,15 +346,20 @@ where
         self
     }
 
+    /// Projects durable rows and reports the outbox backlog until shutdown.
+    pub async fn run(self, shutdown_token: CancellationToken) {
+        tokio::join!(self.project(&shutdown_token), self.observe_outbox_periodically(&shutdown_token));
+    }
+
     /// Projects durable rows immediately after publication. The periodic wake
     /// also recovers rows left behind by a process restart or another instance.
-    pub async fn run(self, shutdown_token: CancellationToken) {
+    async fn project(&self, shutdown_token: &CancellationToken) {
         info!(max_batch_size = self.batch_size, "Analytics outbox projector started");
         let mut outbox_tick = tokio::time::interval(std::time::Duration::from_secs(30));
         outbox_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            let observe = tokio::select! {
+            tokio::select! {
                 _ = shutdown_token.cancelled() => {
                     let drained = loop {
                         match self.project_outbox_batch().await {
@@ -359,13 +381,9 @@ where
                     info!(drained, "Analytics outbox projector shutdown complete");
                     break;
                 }
-                _ = outbox_tick.tick() => {
-                    true
-                }
-                _ = self.projector_notify.notified() => {
-                    false
-                }
-            };
+                _ = outbox_tick.tick() => {}
+                _ = self.projector_notify.notified() => {}
+            }
 
             loop {
                 match self.project_outbox_batch().await {
@@ -384,10 +402,6 @@ where
                         break;
                     }
                 }
-            }
-
-            if observe {
-                self.observe_outbox().await;
             }
         }
     }
@@ -468,23 +482,28 @@ where
         Ok(projected)
     }
 
+    /// Refreshes the outbox depth and oldest-age gauges every 30 seconds.
+    ///
+    /// Runs beside the projector rather than between its drains: under a sustained
+    /// backlog every claim returns a full batch, the projector never goes idle, and
+    /// a gauge refreshed only between drains would freeze exactly when it matters.
+    async fn observe_outbox_periodically(&self, shutdown_token: &CancellationToken) {
+        let mut observe_tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        observe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => break,
+                _ = observe_tick.tick() => self.observe_outbox().await,
+            }
+        }
+    }
+
     async fn observe_outbox(&self) {
-        let observation = sqlx::query(
-            r#"
-            SELECT COUNT(*)::bigint AS depth,
-                   COALESCE(EXTRACT(EPOCH FROM (NOW() - MIN(created_at))), 0)::float8 AS oldest_age_seconds
-            FROM analytics_outbox
-            "#,
-        )
         // The outbox is writer-owned mutable state. Reading it from a replica
         // could report stale depth/age and create a false stalled-outbox alert.
-        .fetch_one(&self.pool.write())
-        .await;
-
-        match observation {
-            Ok(row) => {
-                let depth = row.try_get::<i64, _>("depth").unwrap_or_default();
-                let age = row.try_get::<f64, _>("oldest_age_seconds").unwrap_or_default();
+        match read_outbox_observation(&self.pool.write()).await {
+            Ok((depth, age)) => {
                 metrics::gauge!("dwctl_analytics_outbox_depth").set(depth as f64);
                 metrics::gauge!("dwctl_analytics_outbox_oldest_age_seconds").set(age);
             }
@@ -2024,6 +2043,7 @@ mod integration_tests {
                 backoff_max_total_ms: None,
                 first_token_timeout_ms: None,
                 aimd: None,
+                affinity: None,
                 sanitize_responses: true,
                 trusted: false,
                 reasoning_translation_overrides: None,
@@ -2357,6 +2377,42 @@ mod integration_tests {
         assert_eq!(payload["api_key_id"], api_key_id.to_string());
         assert!(payload.get("user_id").is_none());
         assert!(payload.get("total_cost").is_none());
+    }
+
+    #[sqlx::test]
+    async fn test_outbox_observation_reports_backlog(pool: sqlx::PgPool) {
+        assert_eq!(read_outbox_observation(&pool).await.unwrap(), (0, 0.0));
+
+        let mut conn = pool.acquire().await.unwrap();
+        for correlation_id in 0..3i64 {
+            sqlx::query(
+                "INSERT INTO analytics_outbox (instance_id, correlation_id, payload, created_at) \
+                 VALUES ($1, $2, '{}', NOW() - INTERVAL '10 minutes')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(correlation_id)
+            .execute(&mut *conn)
+            .await
+            .unwrap();
+        }
+        // Live-row counts reach the statistics system when the inserting session goes idle.
+        sqlx::query("SELECT pg_stat_force_next_flush()").execute(&mut *conn).await.unwrap();
+        drop(conn);
+
+        let mut observation = read_outbox_observation(&pool).await.unwrap();
+        for _ in 0..100 {
+            if observation.0 == 3 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            observation = read_outbox_observation(&pool).await.unwrap();
+        }
+        let (depth, oldest_age_seconds) = observation;
+        assert_eq!(depth, 3);
+        assert!(
+            oldest_age_seconds >= 600.0,
+            "oldest row is ten minutes old, got {oldest_age_seconds}s"
+        );
     }
 
     #[sqlx::test]

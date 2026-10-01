@@ -236,8 +236,8 @@ mod tests {
 
     #[test]
     fn tokens_collects_every_token_over_both_shapes_and_nothing_else() {
-        let a = ImageToken([1u8; 32]);
-        let b = ImageToken([2u8; 32]);
+        let a = ImageToken([1u8; 32], None);
+        let b = ImageToken([2u8; 32], None);
         let body = json!({
             "messages": [{"role": "user", "content": [
                 {"type": "text", "text": "hi"},

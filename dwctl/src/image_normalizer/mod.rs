@@ -15,8 +15,10 @@
 //! Two-stage substitution:
 //!
 //! 1. **Ingest** ([`ImageNormalizer::ingest`]) — fetch (HTTP) or decode
-//!    (data URI), hash the bytes, store in our object store keyed by
-//!    SHA-256, return an opaque [`ImageToken`]. Idempotent on content.
+//!    (data URI), hash the bytes, store them, return an opaque
+//!    [`ImageToken`]. Objects are keyed by the content hash, or — with
+//!    `unique_upload_keys` on — by the content hash plus a random per-ingest
+//!    upload ID, so identical bytes never share an object key.
 //! 2. **Sign** ([`ImageNormalizer::sign`]) — exchange a token for a
 //!    short-lived signed URL ready to hand to an upstream provider.
 //!
@@ -37,7 +39,8 @@
 //! - [`fetcher`] — hardened reqwest fetcher with DNS pinning, IP
 //!   deny-list, redirect re-validation, MIME / size caps, retries.
 //! - [`ip_filter`] — pure IP deny-list predicate.
-//! - [`token`] — opaque `dw-img://{sha256}` token format.
+//! - [`token`] — opaque `dw-img://{sha256}.{upload_id}` token format (legacy
+//!   tokens omit `.{upload_id}`).
 //! - [`data_uri`] — minimal `data:` URI decoder.
 //! - [`walker`] — body-traversal helpers for both endpoint shapes and
 //!   for both ingest-time substitution and dispatch-time JIT signing.
@@ -185,6 +188,8 @@ impl ImageNormalizer for DisabledNormalizer {
 pub struct DefaultImageNormalizer<S: ImageStore> {
     fetcher: fetcher::ImageFetcher,
     store: Arc<S>,
+    /// See [`ImageNormalizerConfig::unique_upload_keys`].
+    unique_upload_keys: bool,
 }
 
 impl<S: ImageStore> DefaultImageNormalizer<S> {
@@ -192,7 +197,15 @@ impl<S: ImageStore> DefaultImageNormalizer<S> {
         Self {
             fetcher: fetcher::ImageFetcher::new(fetcher_cfg),
             store,
+            unique_upload_keys: false,
         }
+    }
+
+    /// Give every ingest its own object key (see
+    /// [`ImageNormalizerConfig::unique_upload_keys`]).
+    pub fn with_unique_upload_keys(mut self, enabled: bool) -> Self {
+        self.unique_upload_keys = enabled;
+        self
     }
 }
 
@@ -230,15 +243,25 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
         let digest = hasher.finalize();
         let mut sha = [0u8; 32];
         sha.copy_from_slice(&digest);
-        let token = ImageToken(sha);
-
-        // exists() short-circuit avoids re-uploading dedup hits. It also
-        // reports an object the bucket lifecycle is about to expire as
-        // absent, so the re-upload here resets its age before a batch
-        // signs a reference to it.
-        if !self.store.exists(token).await? {
+        let token = if self.unique_upload_keys {
+            // The content hash stays the image's identity (access grants,
+            // prompt cache); the random upload ID gives this upload its own
+            // object key, so writes never contend on a shared key and need no
+            // existence check — ingest is a single PUT.
+            let token = ImageToken::new_unique(sha);
             self.store.put(token, &mime, bytes).await?;
-        }
+            token
+        } else {
+            // Content-addressed: reuse the existing object on a dedup hit.
+            // exists() also reports an object the bucket lifecycle is about to
+            // expire as absent, so the re-upload here resets its age before a
+            // batch signs a reference to it.
+            let token = ImageToken(sha, None);
+            if !self.store.exists(token).await? {
+                self.store.put(token, &mime, bytes).await?;
+            }
+            token
+        };
         Ok(IngestResult { token, mime, bytes_len })
     }
 
@@ -282,11 +305,11 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalize
                  restart and are not shared across replicas — use gcs or s3_compatible in production"
             );
             let store = Arc::new(MemoryStore::new());
-            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
+            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store).with_unique_upload_keys(cfg.unique_upload_keys))
         }
         BackendConfig::Gcs { bucket, region } => {
             let store = Arc::new(store::GcsStore::new(bucket.clone(), region.clone()));
-            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
+            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store).with_unique_upload_keys(cfg.unique_upload_keys))
         }
         BackendConfig::S3Compatible {
             bucket,
@@ -326,7 +349,7 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalize
                 )
                 .with_reuse_max_age((*reuse_max_age_secs > 0).then(|| Duration::from_secs(*reuse_max_age_secs))),
             );
-            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
+            Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store).with_unique_upload_keys(cfg.unique_upload_keys))
         }
     })
 }
@@ -348,6 +371,7 @@ mod tests {
         let token = result.token;
         assert_eq!(result.mime, "image/png");
         assert!(result.bytes_len > 0, "bytes_len should be the actual decoded length, got 0");
+        assert_eq!(token.1, None, "unique_upload_keys is off by default: content-addressed token");
 
         // dedup: ingesting the same URI again yields the same token and
         // does not duplicate the stored bytes.
@@ -363,6 +387,27 @@ mod tests {
         let (mime, bytes) = n.read(token).await.unwrap();
         assert_eq!(mime, "image/png");
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[tokio::test]
+    async fn ingest_with_unique_upload_keys_stores_each_ingest_separately() {
+        let store = Arc::new(MemoryStore::new());
+        let n = DefaultImageNormalizer::new(FetcherConfig::default(), store).with_unique_upload_keys(true);
+        let a = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap().token;
+        let b = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap().token;
+        // Same content hash, distinct upload IDs: two objects with the same bytes.
+        assert_eq!(a.0, b.0);
+        assert!(a.1.is_some() && b.1.is_some());
+        assert_ne!(a, b);
+        assert_eq!(n.read(a).await.unwrap().1, n.read(b).await.unwrap().1);
+        // Content-addressed tokens for the same image stay readable alongside.
+        let legacy = DefaultImageNormalizer::new(FetcherConfig::default(), Arc::new(MemoryStore::new()));
+        let t = legacy
+            .ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string()))
+            .await
+            .unwrap()
+            .token;
+        assert_eq!(t, ImageToken(a.0, None));
     }
 
     #[tokio::test]
@@ -423,6 +468,7 @@ mod tests {
             backend: Some(BackendConfig::Memory),
             fetcher: FetcherConfig::default(),
             signing: SigningConfig::default(),
+            unique_upload_keys: false,
         };
         let _: Arc<dyn ImageNormalizer> = from_config(&cfg).expect("memory backend must build");
     }
@@ -434,6 +480,7 @@ mod tests {
             backend: None,
             fetcher: FetcherConfig::default(),
             signing: SigningConfig::default(),
+            unique_upload_keys: false,
         };
         // Manual match because the Ok arm holds `Arc<dyn ImageNormalizer>`
         // which doesn't implement Debug (required by `expect_err`).

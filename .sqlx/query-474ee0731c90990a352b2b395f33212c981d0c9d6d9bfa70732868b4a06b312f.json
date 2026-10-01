@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT id\n            FROM batches\n            WHERE id = ANY($1)\n              AND cancelling_at IS NOT NULL\n              AND deleted_at IS NULL\n            ",
+  "query": "SELECT id\nFROM batches\nWHERE id = ANY($1)\n  AND cancelling_at IS NOT NULL\n  AND deleted_at IS NULL\n",
   "describe": {
     "columns": [
       {
@@ -18,5 +18,5 @@
       false
     ]
   },
-  "hash": "ee19d064ef1def6b4ab817cd475ad49df95ade38172f93fe7fdc95cfa96c5f2b"
+  "hash": "474ee0731c90990a352b2b395f33212c981d0c9d6d9bfa70732868b4a06b312f"
 }

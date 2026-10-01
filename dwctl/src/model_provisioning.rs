@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use crate::db::handlers::ModelProvisioning;
+use crate::db::models::deployments::AffinityConfig;
 
 const PER_MILLION: i64 = 1_000_000;
 
@@ -270,6 +271,11 @@ pub struct Fallback {
     /// value already stored for the model.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub realtime_on_status: Option<Vec<i32>>,
+    /// Conversation affinity (priority strategy only). Omit to keep the value
+    /// already stored for the model. `target_conversations` must match what
+    /// the preferred member can serve concurrently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<AffinityConfig>,
     pub with_replacement: bool,
     pub max_attempts: Option<i32>,
     pub backoff: Option<Backoff>,
@@ -283,6 +289,7 @@ impl Default for Fallback {
             on_rate_limit: true,
             on_status: default_fallback_statuses(),
             realtime_on_status: None,
+            affinity: None,
             with_replacement: false,
             max_attempts: None,
             backoff: None,
@@ -524,6 +531,16 @@ impl Catalog {
                 model.source
             );
             validate_fallback(&model.clay.routing.fallback, &model.source)?;
+            if let Some(affinity) = model.clay.routing.fallback.affinity.as_ref().filter(|a| a.enabled) {
+                ensure!(
+                    matches!(model.clay.routing.strategy, RoutingStrategy::Priority) && model.clay.routing.fallback.enabled,
+                    "{}: routing.fallback.affinity requires the priority strategy with fallback enabled",
+                    model.source
+                );
+                onwards::affinity::AffinityConfig::from(affinity.clone())
+                    .validate()
+                    .map_err(|e| anyhow::anyhow!("{}: routing.fallback.affinity: {e}", model.source))?;
+            }
 
             validate_tariffs(&model.clay.tariffs, &model.source)?;
             if let Some(cache) = &model.clay.cache_tariff {
@@ -1108,6 +1125,46 @@ clay:
         write(directory.path(), "model.yaml", &declared);
         apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
         assert_eq!(realtime_statuses().await, Vec::<i32>::new());
+    }
+
+    #[sqlx::test]
+    async fn catalog_declares_affinity_and_keeps_it_unless_redeclared(pool: PgPool) {
+        sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
+            .execute(&pool).await.unwrap();
+        let stored = || async {
+            sqlx::query_scalar::<_, Option<serde_json::Value>>("SELECT affinity FROM deployed_models WHERE alias = 'org/model'")
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        };
+        let directory = tempdir().unwrap();
+        let weighted = catalog_yaml("0.50", false, "0.1");
+        let priority = weighted.replace("  routing:\n", "  routing:\n    strategy: priority\n");
+        let declared = weighted.replace(
+            "  routing:\n",
+            "  routing:\n    strategy: priority\n    fallback:\n      affinity:\n        target_conversations: 40\n",
+        );
+        write(directory.path(), "model.yaml", &declared);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(stored().await.unwrap()["target_conversations"], 40);
+
+        // Omitted: the stored value stays while the routing remains compatible.
+        write(directory.path(), "model.yaml", &priority);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert_eq!(stored().await.unwrap()["target_conversations"], 40);
+
+        // Leaving the priority strategy clears it.
+        write(directory.path(), "model.yaml", &weighted);
+        apply(&pool, &Catalog::load(directory.path()).unwrap()).await.unwrap();
+        assert!(stored().await.is_none());
+
+        // Declaring it on a weighted model is rejected.
+        let invalid = weighted.replace(
+            "  routing:\n",
+            "  routing:\n    fallback:\n      affinity:\n        target_conversations: 40\n",
+        );
+        write(directory.path(), "model.yaml", &invalid);
+        assert!(Catalog::load(directory.path()).is_err());
     }
 
     #[sqlx::test]

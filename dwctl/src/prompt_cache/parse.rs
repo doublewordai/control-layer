@@ -684,12 +684,45 @@ pub(crate) const TELEMETRY_ROLE: &str = "system";
 /// and two blocks that differ only in key insertion order (common across SDKs/languages)
 /// hash identically. If a dependency ever enables `preserve_order` (→ `IndexMap`,
 /// insertion order), this would need explicit key-sorting to keep the cache-hit rate up.
+///
+/// An image block whose URL is a stored image token (`dw-img://{sha256}.{upload_id}`) is hashed
+/// without the upload ID: the upload ID only picks which stored copy of the bytes to sign,
+/// so two requests carrying the same image must share the prefix. Only the image URL field
+/// is rewritten — token-shaped strings anywhere else hash as written.
 fn canonical_block_bytes(role: &str, stripped_block: &serde_json::Value) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(role.as_bytes());
     out.push(0x00);
-    out.extend_from_slice(&serde_json::to_vec(stripped_block).unwrap_or_default());
+    let content_only = image_block_without_upload_id(stripped_block);
+    out.extend_from_slice(&serde_json::to_vec(content_only.as_ref().unwrap_or(stripped_block)).unwrap_or_default());
     out
+}
+
+/// `block` with its stored-image token rewritten to the canonical content-only form
+/// (lowercase `dw-img://{sha256}`), if it is an image block whose URL is a token in any
+/// other form (an upload ID, uppercase hex); `None` for every other block (no clone, no
+/// scan).
+fn image_block_without_upload_id(block: &serde_json::Value) -> Option<serde_json::Value> {
+    use crate::image_normalizer::ImageToken;
+    // The two image shapes the image normalizer substitutes (chat `image_url.url`,
+    // responses `input_image.image_url`).
+    let pointer = match block.get("type")?.as_str()? {
+        "image_url" => "/image_url/url",
+        "input_image" => "/image_url",
+        _ => return None,
+    };
+    let url = block.pointer(pointer)?.as_str()?;
+    if !ImageToken::looks_like_token(url) {
+        return None;
+    }
+    let token: ImageToken = url.parse().ok()?;
+    let canonical = ImageToken(token.0, None).to_dw_img_uri();
+    if canonical == url {
+        return None;
+    }
+    let mut block = block.clone();
+    *block.pointer_mut(pointer)? = canonical.into();
+    Some(block)
 }
 
 #[cfg(test)]
@@ -1827,6 +1860,61 @@ mod tests {
             ]
         }));
         assert_ne!(p.cumulative_hashes[1], other.cumulative_hashes[1]);
+    }
+
+    #[test]
+    fn stored_image_tokens_hash_by_content_not_by_upload_id() {
+        // Each ingest stores its own copy of an image (`dw-img://{sha256}.{upload_id}`). Two
+        // requests carrying the same image through different stored copies must share the
+        // prefix; a different image must not.
+        use crate::image_normalizer::ImageToken;
+        let body = |token: ImageToken| {
+            parse(serde_json::json!({
+                "cache_control": {"type": "ephemeral"},
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "what is this?"},
+                        {"type": "image_url", "image_url": {"url": token.to_dw_img_uri()}}
+                    ]}
+                ]
+            }))
+        };
+        let a = body(ImageToken::new_unique([7; 32]));
+        let b = body(ImageToken::new_unique([7; 32]));
+        let legacy = body(ImageToken([7; 32], None));
+        let different = body(ImageToken::new_unique([8; 32]));
+        assert_eq!(a.cumulative_hashes[1], b.cumulative_hashes[1]);
+        assert_eq!(a.cumulative_hashes[1], legacy.cumulative_hashes[1]);
+        // Hex case is not identity either.
+        let upper = parse(serde_json::json!({
+            "cache_control": {"type": "ephemeral"},
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is this?"},
+                    {"type": "image_url", "image_url": {"url": format!("dw-img://{}", hex::encode_upper([7u8; 32]))}}
+                ]}
+            ]
+        }));
+        assert_eq!(a.cumulative_hashes[1], upper.cumulative_hashes[1]);
+        assert_ne!(a.cumulative_hashes[1], different.cumulative_hashes[1]);
+    }
+
+    #[test]
+    fn token_shaped_text_outside_image_urls_hashes_as_written() {
+        // Only the image block's URL field is normalised. The same token-shaped string in a
+        // text block is ordinary prompt content: with and without the upload ID suffix it must
+        // hash differently, or two different prompts would share a cached prefix.
+        use crate::image_normalizer::ImageToken;
+        let text_body = |text: String| {
+            parse(serde_json::json!({
+                "cache_control": {"type": "ephemeral"},
+                "messages": [{"role": "user", "content": [{"type": "text", "text": text}]}]
+            }))
+        };
+        let with_upload_id = ImageToken::new_unique([7; 32]);
+        let a = text_body(format!("see {}", with_upload_id.to_dw_img_uri()));
+        let b = text_body(format!("see {}", ImageToken(with_upload_id.0, None).to_dw_img_uri()));
+        assert_ne!(a.cumulative_hashes[0], b.cumulative_hashes[0]);
     }
 
     #[test]

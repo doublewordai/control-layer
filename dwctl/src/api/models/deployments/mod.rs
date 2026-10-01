@@ -7,8 +7,8 @@ use crate::api::models::cache_pricing::CachePricingResponse;
 use crate::api::models::groups::GroupResponse;
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::models::deployments::{
-    AimdConfig, BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy, ModelCatalogMetadata,
-    ModelType, ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
+    AffinityConfig, AimdConfig, BackoffConfig, DeploymentDBResponse, FallbackConfig, JitterStrategy, LoadBalancingStrategy,
+    ModelCatalogMetadata, ModelType, ProviderPricing, ProviderPricingUpdate, TrafficRuleDBRow,
 };
 use crate::reasoning::{ReasoningTranslationOverrides, SupportedReasoningEfforts};
 use crate::types::{DeploymentId, InferenceEndpointId, UserId};
@@ -357,6 +357,10 @@ pub struct CompositeModelCreate {
     /// Set enabled=false to disable. Explicit enabled overrides require a compatible deadline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aimd: Option<AimdConfig>,
+    /// Priority-only conversation affinity; absent/null keeps per-request selection.
+    /// Set `target_conversations` to what the preferred provider can serve concurrently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<AffinityConfig>,
     /// Whether to sanitize/filter sensitive data from model responses (defaults to false, used when strict_mode=false)
     #[serde(default)]
     pub sanitize_responses: bool,
@@ -478,6 +482,10 @@ pub struct DeployedModelUpdate {
     /// Use {"enabled":false} to disable.
     #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
     pub aimd: Option<Option<AimdConfig>>,
+    /// Omitted = unchanged; null = per-request selection; object = replace the
+    /// affinity configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "double_option")]
+    pub affinity: Option<Option<AffinityConfig>>,
     /// Whether to sanitize/filter sensitive data from model responses (null = no change, used when strict_mode=false)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sanitize_responses: Option<bool>,
@@ -654,6 +662,7 @@ impl From<DeploymentDBResponse> for DeployedModelResponse {
             max_total_backoff_ms: db.backoff_max_total_ms,
             first_token_timeout_ms: db.first_token_timeout_ms,
             aimd: db.aimd,
+            affinity: db.affinity,
         });
 
         Self {

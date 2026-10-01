@@ -325,6 +325,8 @@ mod tests {
         (user_id, analytics_id)
     }
 
+    const GRACE: chrono::Duration = chrono::Duration::days(crate::recompute::report::CACHE_GRACE_DAYS);
+
     fn filter_for(user_id: Uuid) -> CorpusFilter {
         CorpusFilter {
             start: Utc::now() - chrono::Duration::hours(1),
@@ -355,7 +357,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, GRACE, None, None)
             .await
             .unwrap();
 
@@ -383,7 +385,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, GRACE, None, None)
             .await
             .unwrap();
 
@@ -436,7 +438,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, GRACE, None, None)
             .await
             .unwrap();
 
@@ -485,7 +487,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, GRACE, None, None)
             .await
             .unwrap();
 
@@ -514,7 +516,7 @@ mod tests {
         )
         .await;
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, GRACE, None, None)
             .await
             .unwrap();
 
@@ -551,7 +553,7 @@ mod tests {
 
         // Render says 2000 against a reported 1000 — a 50% divergence, far beyond tolerance.
         let (_server, tokenizer) = mock_tokenizer(2000, 0).await;
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, Some(&tokenizer))
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, GRACE, None, Some(&tokenizer))
             .await
             .unwrap();
 
@@ -582,7 +584,7 @@ mod tests {
 
         // 1005 vs 1000 = 50 bps, inside the 1% tolerance.
         let (_server, tokenizer) = mock_tokenizer(1005, 0).await;
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, Some(&tokenizer))
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, GRACE, None, Some(&tokenizer))
             .await
             .unwrap();
 
@@ -613,7 +615,7 @@ mod tests {
         .await;
 
         let (_server, tokenizer) = mock_tokenizer(4096, 512).await;
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, Some(&tokenizer))
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, GRACE, None, Some(&tokenizer))
             .await
             .unwrap();
 
@@ -662,7 +664,7 @@ mod tests {
         .await
         .unwrap();
 
-        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, None, None)
+        let report = recompute_corpus(&pool, &filter_for(user_id), CreationTier::FiveMinute, GRACE, None, None)
             .await
             .unwrap();
 

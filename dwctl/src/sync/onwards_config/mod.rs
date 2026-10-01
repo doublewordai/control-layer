@@ -10,6 +10,7 @@ use std::{
 };
 
 use metrics::histogram;
+use onwards::affinity::AffinityConfig;
 use onwards::aimd::AimdConfig;
 use onwards::target::{
     Auth, BackoffConfig as OnwardsBackoffConfig, ConcurrencyLimitParameters, ConfigFile, FallbackConfig as OnwardsFallbackConfig,
@@ -703,6 +704,7 @@ struct OnwardsCompositeModel {
     backoff_max_total_ms: Option<i32>,
     first_token_timeout_ms: Option<i64>,
     aimd: Option<AimdConfig>,
+    affinity: Option<AffinityConfig>,
     /// Whether to sanitize/filter sensitive data from model responses
     sanitize_responses: bool,
     /// Whether to mark provider as trusted in strict mode
@@ -950,6 +952,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
             backoff_max_total_ms,
             first_token_timeout_ms,
             aimd,
+            affinity,
             sanitize_responses,
             trusted,
             serving_classes
@@ -994,6 +997,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                 backoff_max_total_ms: row.backoff_max_total_ms,
                 first_token_timeout_ms: row.first_token_timeout_ms,
                 aimd: row.aimd.map(serde_json::from_value).transpose()?,
+                affinity: row.affinity.map(serde_json::from_value).transpose()?,
                 sanitize_responses: row.sanitize_responses,
                 trusted: row.trusted,
                 routing_rules: Vec::new(), // Populated from separate query below
@@ -1200,6 +1204,7 @@ fn convert_composite_to_target_spec(
             max_total_backoff_ms,
             first_token_timeout_ms: composite.first_token_timeout_ms.map(|ms| ms as u64),
             aimd: composite.aimd.clone(),
+            affinity: composite.affinity.clone(),
         })
     } else {
         None
@@ -1312,6 +1317,7 @@ fn convert_composite_to_target_spec(
                     enabled: false,
                     ..AimdConfig::default()
                 });
+                config.affinity = None;
             }
             config
         }),
@@ -1525,6 +1531,7 @@ fn convert_to_config_file(
                     // (there is no other provider to fail over to).
                     first_token_timeout_ms: target.first_token_timeout_ms.map(|ms| ms as u64),
                     aimd: target.aimd.clone(),
+                    affinity: None,
                 })
             } else {
                 None
