@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE batches\n        SET location = $4, archive_bucket = $2\n        WHERE id = $1\n          AND retry_version = $3\n          AND counts_frozen_at IS NOT NULL\n          AND location IN ('live', 'split')\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Date",
+        "Int8",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2a9d5cf08d6a634d4ec59cd10d3ae1186e9da7e7737e1b43dce411ad1c121150"
+}

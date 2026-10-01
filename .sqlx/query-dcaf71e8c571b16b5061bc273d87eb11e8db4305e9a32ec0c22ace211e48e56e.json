@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        DELETE FROM requests r\n        WHERE r.batch_id = $1\n          AND r.id = ANY($3)\n          AND EXISTS (\n              SELECT 1 FROM batch_requests_archive a\n              WHERE a.id = r.id AND a.archive_bucket = $2\n          )\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Date",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "dcaf71e8c571b16b5061bc273d87eb11e8db4305e9a32ec0c22ace211e48e56e"
+}

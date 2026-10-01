@@ -156,7 +156,7 @@
     "reason": "Intermediate typed input, fixed count/ranking CTE, or template lookup; enclosing statement explicitly projects its final results."
   },
   {
-    "path": "fusillade-arsenal/src/postgres.rs",
+    "path": "fusillade-arsenal/src/postgres/batch_archive_move.rs",
     "source": "SELECT r.*, $2::date",
     "count": 1,
     "reason": "Archive INSERT SELECT (or its test fixture) returns no row descriptor to the client. Archive/request column parity is covered by the archive schema tests; this is not a reader projection."

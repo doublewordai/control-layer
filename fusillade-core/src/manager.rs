@@ -639,8 +639,14 @@ mod retention_policy_tests {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveOutcome {
-    /// Rows moved and location stamped; carries the row count moved.
+    /// The batch's last rows moved and `location` is stamped `'archive'`;
+    /// carries the rows moved by this call.
     Archived { rows: u64 },
+    /// Some rows moved but the batch is not finished: the call's time budget
+    /// ran out, or the batch stopped being a candidate between chunks. The
+    /// batch is left `'split'` (moved rows in the archive, the rest live) and
+    /// a later pass resumes it. Carries the rows moved by this call.
+    Progressed { rows: u64 },
     /// Batch missing or soft-deleted (purge owns its rows, not the archive).
     SkippedNotFound,
     /// The batch is not available to this mover: either `location` is
@@ -655,12 +661,14 @@ pub enum ArchiveOutcome {
     /// Counts not frozen: the batch is active again (retry) or was never
     /// finalized. It will re-candidate once frozen.
     SkippedNotFrozen,
-    /// The weekly partition for this batch's bucket does not exist. The
-    /// batch stays live and fully served; fix partition creation and it
-    /// archives on a later pass. Alert-worthy.
+    /// The weekly partition for this batch's bucket does not exist or is
+    /// fenced. The batch stays where it is and fully served (`live`, or
+    /// `split` when an earlier chunk of this or a previous call already
+    /// moved some rows); fix partition creation and it archives on a later
+    /// pass. Alert-worthy.
     SkippedNoPartition,
-    /// The `retry_version` CAS on the final stamp failed — a retry raced
-    /// the move. Transaction rolled back; nothing moved.
+    /// The `retry_version` CAS on a chunk's location stamp failed — a retry
+    /// raced the move. That chunk rolled back; nothing more moved.
     SkippedRetryRaced,
 }
 
@@ -1878,14 +1886,19 @@ pub trait DaemonStorage: Send + Sync {
     }
 
     /// Move one terminal batch's request rows from `requests` (live) into
-    /// `batch_requests_archive` in a single bounded transaction (batches are
-    /// capped at 50k rows), stamping `batches.location = 'archive'` and
-    /// `batches.archive_bucket`.
+    /// `batch_requests_archive` in bounded chunks, one transaction per chunk,
+    /// stamping `batches.archive_bucket`, `batches.location = 'split'` while
+    /// rows remain and `'archive'` once the last row has moved. A call stops
+    /// starting chunks after a time budget and returns
+    /// [`ArchiveOutcome::Progressed`]; the `'split'` batch stays a candidate
+    /// and a later call resumes it. A batch that fits in one chunk moves in a
+    /// single transaction.
     ///
     /// Preconditions are checked inside the transaction; violations return a
     /// `Skipped*` outcome rather than an error — the sweeper treats skips as
     /// normal flow:
-    /// - batch exists, not soft-deleted, `location = 'live'`, counts frozen
+    /// - batch exists, not soft-deleted, `location` is `'live'` or `'split'`
+    ///   (part-moved, or mid-retry and re-frozen), counts frozen
     ///   (`counts_frozen_at` set). **Only frozen batches move**: freezing
     ///   guarantees rows are settled and the counters are the durable
     ///   record, and it carries Phase 2's `retry_version` protection — any
@@ -1896,19 +1909,21 @@ pub trait DaemonStorage: Send + Sync {
     /// - no row is referenced by `response_steps` (those stay live until the
     ///   batchless store gives them a home).
     ///
-    /// Transaction invariants (fusillade-requests-phase3-plan.md §1):
-    /// - forward move is `INSERT ... SELECT r.*, $bucket` with
-    ///   `ON CONFLICT DO NOTHING` — idempotent under crash-resume replay.
+    /// Per-chunk transaction invariants (fusillade-requests-phase3-plan.md §1):
+    /// - each chunk copies its rows with `INSERT ... SELECT r.*, $bucket` and
+    ///   deletes exactly those rows from `requests` in the same transaction,
+    ///   so a committed chunk never leaves a row in both tables and an
+    ///   aborted chunk discards only its own work.
     /// - the DELETE removes only rows verifiably present in the archive and
-    ///   the transaction aborts if any row would be left behind: a row lives
+    ///   the chunk aborts if any of its rows would be left behind: a row lives
     ///   in exactly one table, always.
     /// - the location stamp re-checks `retry_version` (CAS) even though the
     ///   batch-row lock makes a race impossible on this path — belt and
     ///   braces against future callers taking weaker locks.
     async fn archive_batch(&self, batch_id: BatchId) -> Result<ArchiveOutcome>;
 
-    /// List batches eligible for archiving (`location = 'live'`, counts
-    /// frozen, not soft-deleted). Both production movers — the steady-state
+    /// List batches eligible for archiving (`location` `'live'` or
+    /// `'split'`, counts frozen, not soft-deleted). Both production movers — the steady-state
     /// sweeper AND the historical backfill — pass `oldest_first = true`: in
     /// steady state the sweeper drains its whole candidate set every few
     /// ticks so order is cosmetic, and under any backlog the

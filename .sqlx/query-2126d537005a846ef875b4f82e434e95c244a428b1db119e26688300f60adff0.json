@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT retry_version,\n               location,\n               counts_frozen_at,\n               COALESCE(\n                   archive_bucket,\n                   -- A batch that outlived its own week's retirement (it\n                   -- was blocked from moving until after the week was\n                   -- dropped) is routed into the current week instead:\n                   -- a retired week never receives rows, and a later\n                   -- retirement date is the safe direction.\n                   CASE\n                       WHEN EXISTS (\n                           SELECT 1\n                           FROM batch_archive_buckets bucket\n                           WHERE bucket.week_start =\n                                 date_trunc('week', created_at AT TIME ZONE 'UTC')::date\n                             AND bucket.state <> 'active'\n                       )\n                       THEN date_trunc('week', now() AT TIME ZONE 'UTC')::date\n                       ELSE date_trunc('week', created_at AT TIME ZONE 'UTC')::date\n                   END\n               ) AS \"bucket!\"\n        FROM batches\n        WHERE id = $1 AND deleted_at IS NULL\n        FOR UPDATE SKIP LOCKED\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "retry_version",
+        "type_info": "Int8"
+      },
+      {
+        "ordinal": 1,
+        "name": "location",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 2,
+        "name": "counts_frozen_at",
+        "type_info": "Timestamptz"
+      },
+      {
+        "ordinal": 3,
+        "name": "bucket!",
+        "type_info": "Date"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "2126d537005a846ef875b4f82e434e95c244a428b1db119e26688300f60adff0"
+}

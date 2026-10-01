@@ -919,8 +919,16 @@ async fn run_batch_archive_phase<S>(
         .await;
         for (elapsed, result) in results {
             match result {
-                Ok(Some(ArchiveOutcome::Archived { rows })) => {
-                    counter!("fusillade_archive_moves_total", "worker" => tick.worker, "outcome" => "archived").increment(1);
+                Ok(Some(
+                    outcome @ (ArchiveOutcome::Archived { rows }
+                    | ArchiveOutcome::Progressed { rows }),
+                )) => {
+                    let label = if matches!(outcome, ArchiveOutcome::Archived { .. }) {
+                        "archived"
+                    } else {
+                        "progressed"
+                    };
+                    counter!("fusillade_archive_moves_total", "worker" => tick.worker, "outcome" => label).increment(1);
                     counter!("fusillade_archive_moved_rows_total", "worker" => tick.worker)
                         .increment(rows);
                     histogram!("fusillade_archive_move_duration_seconds", "worker" => tick.worker)
@@ -928,7 +936,9 @@ async fn run_batch_archive_phase<S>(
                 }
                 Ok(Some(outcome)) => {
                     let label = match outcome {
-                        ArchiveOutcome::Archived { .. } => unreachable!(),
+                        ArchiveOutcome::Archived { .. } | ArchiveOutcome::Progressed { .. } => {
+                            unreachable!()
+                        }
                         ArchiveOutcome::SkippedNotFound => "skipped_not_found",
                         ArchiveOutcome::SkippedNotLive => "skipped_not_live",
                         ArchiveOutcome::SkippedNotFrozen => "skipped_not_frozen",
