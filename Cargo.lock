@@ -7413,8 +7413,7 @@ dependencies = [
 [[package]]
 name = "underway"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23fb5ddbfb7aa972b046337c7392bd6c6f6571381bb57fb60632a1bd5573bb03"
+source = "git+https://github.com/doublewordai/underway?rev=d4899d5f0e2bfb341ba7886958d09b6665a848ea#d4899d5f0e2bfb341ba7886958d09b6665a848ea"
 dependencies = [
  "jiff 0.1.29",
  "jiff-cron",
