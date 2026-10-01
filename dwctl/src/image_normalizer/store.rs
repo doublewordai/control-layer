@@ -48,13 +48,14 @@ pub enum StoreError {
     Unimplemented,
 }
 
-/// Object-store backend for normalised image bytes. Content-addressed by
-/// SHA-256.
+/// Object-store backend for normalised image bytes, keyed by [`ImageToken`]
+/// (content SHA-256 plus a per-ingest nonce, so unique per ingest).
 #[async_trait]
 pub trait ImageStore: Send + Sync {
-    /// Idempotently store `bytes` under `token`. If the object already
-    /// exists, this is a no-op and returns `Ok(false)`. Otherwise stores
-    /// and returns `Ok(true)`.
+    /// Store `bytes` under `token`. Returns `Ok(true)` if written. Remote
+    /// backends write unconditionally (tokens are unique per ingest, so no
+    /// existence pre-check); [`MemoryStore`] returns `Ok(false)` if the token
+    /// is already present.
     async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError>;
 
     /// Generate a short-lived signed URL pointing at the bytes for `token`.
@@ -245,10 +246,6 @@ impl GcsStore {
 #[async_trait]
 impl ImageStore for GcsStore {
     async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError> {
-        // Idempotency: short-circuit if the object already exists.
-        if self.exists(token).await? {
-            return Ok(false);
-        }
         let client = self.client().await?;
         let key = Self::key(token);
         client
@@ -423,10 +420,6 @@ impl S3CompatStore {
 #[async_trait]
 impl ImageStore for S3CompatStore {
     async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError> {
-        // Idempotency: short-circuit if the object already exists.
-        if self.exists(token).await? {
-            return Ok(false);
-        }
         let key = Self::key(token);
         self.client
             .put_object()
@@ -546,7 +539,7 @@ mod tests {
     use super::*;
 
     fn tok(b: u8) -> ImageToken {
-        ImageToken([b; 32])
+        ImageToken([b; 32], None)
     }
 
     #[tokio::test]
@@ -645,6 +638,18 @@ mod tests {
     fn s3_key_uses_two_level_prefix() {
         let key = S3CompatStore::key(tok(0xab));
         assert!(key.starts_with("images/ab/ab/abab"));
+    }
+
+    #[test]
+    fn copies_of_the_same_image_get_distinct_keys_under_its_prefix() {
+        let a = ImageToken::new_unique([0xab; 32]);
+        let b = ImageToken::new_unique([0xab; 32]);
+        let (ka, kb) = (S3CompatStore::key(a), S3CompatStore::key(b));
+        assert_ne!(ka, kb);
+        assert!(ka.starts_with(&format!("images/ab/ab/{}.", hex::encode([0xab; 32]))));
+        assert_eq!(GcsStore::key(a), ka);
+        // Legacy tokens keep resolving to the content-hash-only key.
+        assert_eq!(S3CompatStore::key(tok(0xab)), format!("images/ab/ab/{}", hex::encode([0xab; 32])));
     }
 
     #[test]

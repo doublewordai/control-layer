@@ -12,7 +12,7 @@ describe("splitDwImgTokens", () => {
   it("splits a token out of surrounding text", () => {
     expect(splitDwImgTokens(`"url": "dw-img://${SHA}"`)).toEqual([
       { kind: "text", value: '"url": "' },
-      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA },
+      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA, ref: SHA },
       { kind: "text", value: '"' },
     ]);
   });
@@ -21,16 +21,16 @@ describe("splitDwImgTokens", () => {
     const segs = splitDwImgTokens(`a dw-img://${SHA} b dw-img://${SHA2} c`);
     expect(segs).toEqual([
       { kind: "text", value: "a " },
-      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA },
+      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA, ref: SHA },
       { kind: "text", value: " b " },
-      { kind: "token", raw: `dw-img://${SHA2}`, sha256: SHA2 },
+      { kind: "token", raw: `dw-img://${SHA2}`, sha256: SHA2, ref: SHA2 },
       { kind: "text", value: " c" },
     ]);
   });
 
   it("handles a token at the very start and end", () => {
     expect(splitDwImgTokens(`dw-img://${SHA}`)).toEqual([
-      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA },
+      { kind: "token", raw: `dw-img://${SHA}`, sha256: SHA, ref: SHA },
     ]);
   });
 
@@ -42,7 +42,16 @@ describe("splitDwImgTokens", () => {
   it("lower-cases the captured hash", () => {
     const upper = "A".repeat(64);
     const segs = splitDwImgTokens(`dw-img://${upper}`);
-    expect(segs).toEqual([{ kind: "token", raw: `dw-img://${upper}`, sha256: SHA }]);
+    expect(segs).toEqual([{ kind: "token", raw: `dw-img://${upper}`, sha256: SHA, ref: SHA }]);
+  });
+
+  it("captures the storage nonce in the reference", () => {
+    const nonce = "c".repeat(32);
+    expect(splitDwImgTokens(`"url": "dw-img://${SHA}.${nonce}"`)).toEqual([
+      { kind: "text", value: '"url": "' },
+      { kind: "token", raw: `dw-img://${SHA}.${nonce}`, sha256: SHA, ref: `${SHA}.${nonce}` },
+      { kind: "text", value: '"' },
+    ]);
   });
 });
 

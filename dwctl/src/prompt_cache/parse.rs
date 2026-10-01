@@ -684,11 +684,16 @@ pub(crate) const TELEMETRY_ROLE: &str = "system";
 /// and two blocks that differ only in key insertion order (common across SDKs/languages)
 /// hash identically. If a dependency ever enables `preserve_order` (→ `IndexMap`,
 /// insertion order), this would need explicit key-sorting to keep the cache-hit rate up.
+///
+/// Stored image tokens (`dw-img://{sha256}.{nonce}`) are hashed without their storage
+/// nonce: the nonce only picks which stored copy of the bytes to sign, so two requests
+/// carrying the same image must share the prefix.
 fn canonical_block_bytes(role: &str, stripped_block: &serde_json::Value) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(role.as_bytes());
     out.push(0x00);
-    out.extend_from_slice(&serde_json::to_vec(stripped_block).unwrap_or_default());
+    let block = serde_json::to_vec(stripped_block).unwrap_or_default();
+    out.extend_from_slice(&crate::image_normalizer::ImageToken::strip_storage_nonces(&block));
     out
 }
 
@@ -1827,6 +1832,32 @@ mod tests {
             ]
         }));
         assert_ne!(p.cumulative_hashes[1], other.cumulative_hashes[1]);
+    }
+
+    #[test]
+    fn stored_image_tokens_hash_by_content_not_by_storage_nonce() {
+        // Each ingest stores its own copy of an image (`dw-img://{sha256}.{nonce}`). Two
+        // requests carrying the same image through different stored copies must share the
+        // prefix; a different image must not.
+        use crate::image_normalizer::ImageToken;
+        let body = |token: ImageToken| {
+            parse(serde_json::json!({
+                "cache_control": {"type": "ephemeral"},
+                "messages": [
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "what is this?"},
+                        {"type": "image_url", "image_url": {"url": token.to_dw_img_uri()}}
+                    ]}
+                ]
+            }))
+        };
+        let a = body(ImageToken::new_unique([7; 32]));
+        let b = body(ImageToken::new_unique([7; 32]));
+        let legacy = body(ImageToken([7; 32], None));
+        let different = body(ImageToken::new_unique([8; 32]));
+        assert_eq!(a.cumulative_hashes[1], b.cumulative_hashes[1]);
+        assert_eq!(a.cumulative_hashes[1], legacy.cumulative_hashes[1]);
+        assert_ne!(a.cumulative_hashes[1], different.cumulative_hashes[1]);
     }
 
     #[test]

@@ -15,8 +15,9 @@
 //! Two-stage substitution:
 //!
 //! 1. **Ingest** ([`ImageNormalizer::ingest`]) — fetch (HTTP) or decode
-//!    (data URI), hash the bytes, store in our object store keyed by
-//!    SHA-256, return an opaque [`ImageToken`]. Idempotent on content.
+//!    (data URI), hash the bytes, store them under a key made of the content
+//!    hash plus a random per-ingest nonce, return an opaque [`ImageToken`].
+//!    Identical bytes share the content hash but never an object key.
 //! 2. **Sign** ([`ImageNormalizer::sign`]) — exchange a token for a
 //!    short-lived signed URL ready to hand to an upstream provider.
 //!
@@ -230,15 +231,13 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
         let digest = hasher.finalize();
         let mut sha = [0u8; 32];
         sha.copy_from_slice(&digest);
-        let token = ImageToken(sha);
+        // The content hash stays the image's identity (access grants, prompt
+        // cache); the random nonce gives this upload its own object key, so
+        // writes never contend on a shared key and need no existence
+        // pre-check — ingest is a single PUT.
+        let token = ImageToken::new_unique(sha);
 
-        // exists() short-circuit avoids re-uploading dedup hits. It also
-        // reports an object the bucket lifecycle is about to expire as
-        // absent, so the re-upload here resets its age before a batch
-        // signs a reference to it.
-        if !self.store.exists(token).await? {
-            self.store.put(token, &mime, bytes).await?;
-        }
+        self.store.put(token, &mime, bytes).await?;
         Ok(IngestResult { token, mime, bytes_len })
     }
 
@@ -349,11 +348,13 @@ mod tests {
         assert_eq!(result.mime, "image/png");
         assert!(result.bytes_len > 0, "bytes_len should be the actual decoded length, got 0");
 
-        // dedup: ingesting the same URI again yields the same token and
-        // does not duplicate the stored bytes.
+        // Ingesting the same URI again yields the same content hash but a
+        // distinct storage nonce, so the two uploads never share an object key.
         let result_again = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap();
-        assert_eq!(token, result_again.token);
+        assert_eq!(token.0, result_again.token.0);
+        assert_ne!(token, result_again.token);
         assert_eq!(result.bytes_len, result_again.bytes_len);
+        assert_eq!(n.read(result_again.token).await.unwrap().1, n.read(token).await.unwrap().1);
 
         // sign returns a usable URL with the token hex baked in.
         let signed = n.sign(token, Duration::from_secs(60)).await.unwrap();

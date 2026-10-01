@@ -21,6 +21,19 @@ describe("dwImgLinkRenderer", () => {
     expect(link.getAttribute("title")).toContain(`/admin/api/v1/images/${SHA}`);
   });
 
+  it("links a token with a storage nonce to its full reference", () => {
+    const ref = `${SHA}.${"c".repeat(32)}`;
+    const json = JSON.stringify({ image_url: { url: `dw-img://${ref}` } }, null, 2);
+    const { container } = render(
+      <CodeBlock language="json" renderer={dwImgLinkRenderer}>
+        {json}
+      </CodeBlock>,
+    );
+    const link = within(container).getByRole("link");
+    expect(link).toHaveAttribute("href", `/admin/api/v1/images/${ref}`);
+    expect(link).toHaveTextContent(`dw-img://${ref}`);
+  });
+
   it("produces no links when the body has no tokens", () => {
     const json = JSON.stringify({ messages: [{ content: "hello" }] }, null, 2);
     const { container } = render(
