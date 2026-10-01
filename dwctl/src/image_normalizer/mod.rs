@@ -402,7 +402,11 @@ mod tests {
         assert_eq!(n.read(a).await.unwrap().1, n.read(b).await.unwrap().1);
         // Content-addressed tokens for the same image stay readable alongside.
         let legacy = DefaultImageNormalizer::new(FetcherConfig::default(), Arc::new(MemoryStore::new()));
-        let t = legacy.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap().token;
+        let t = legacy
+            .ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string()))
+            .await
+            .unwrap()
+            .token;
         assert_eq!(t, ImageToken(a.0, None));
     }
 
