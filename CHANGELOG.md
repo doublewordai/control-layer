@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.10.1](https://github.com/doublewordai/control-layer/compare/v12.10.0...v12.10.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* **dwctl:** reap completed underway worker tasks ([#1867](https://github.com/doublewordai/control-layer/issues/1867)) ([3cd8524](https://github.com/doublewordai/control-layer/commit/3cd8524122b40a84ba155877beecd9ffdff6af81))
+
 ## [12.10.0](https://github.com/doublewordai/control-layer/compare/v12.9.0...v12.10.0) (2026-10-01)
 
 
