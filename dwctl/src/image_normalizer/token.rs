@@ -8,9 +8,9 @@
 //!
 //! - `sha256` is the SHA-256 of the image bytes. It is the image's
 //!   *identity*: access grants (`image_access`) are keyed on it, and the
-//!   prompt cache hashes tokens with the nonce removed
-//!   ([`ImageToken::strip_storage_nonces`]), so the same image submitted in
-//!   different requests still shares cached prefixes.
+//!   prompt cache hashes an image block's token with the nonce removed, so
+//!   the same image submitted in different requests still shares cached
+//!   prefixes.
 //! - `nonce` is 16 random bytes chosen at ingest. It only selects the stored
 //!   object: every ingest writes its own object, so concurrent submissions of
 //!   the same image never write to the same key, and ingest needs no
@@ -30,7 +30,6 @@
 //! Parsing also accepts the bare hex form (no scheme prefix) for robustness
 //! when reading legacy or hand-written values.
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
@@ -78,38 +77,6 @@ impl ImageToken {
     /// whether the hex parses). Useful for fast rejection in walkers.
     pub fn looks_like_token(s: &str) -> bool {
         s.starts_with(SCHEME)
-    }
-
-    /// Rewrite every `dw-img://{sha256}.{nonce}` in `bytes` to
-    /// `dw-img://{sha256}`, leaving everything else untouched. Used by the
-    /// prompt cache so a token hashes by image content, not by which stored
-    /// copy it points at. Borrows when there is nothing to rewrite.
-    pub fn strip_storage_nonces(bytes: &[u8]) -> Cow<'_, [u8]> {
-        let scheme = SCHEME.as_bytes();
-        let is_hex = |b: &[u8]| b.iter().all(u8::is_ascii_hexdigit);
-        let mut out: Option<Vec<u8>> = None;
-        let mut copied = 0;
-        let mut i = 0;
-        while let Some(pos) = bytes[i..].windows(scheme.len()).position(|w| w == scheme) {
-            let sha_start = i + pos + scheme.len();
-            let dot = sha_start + SHA_HEX_LEN;
-            let end = dot + 1 + NONCE_HEX_LEN;
-            if end <= bytes.len() && is_hex(&bytes[sha_start..dot]) && bytes[dot] == b'.' && is_hex(&bytes[dot + 1..end]) {
-                let buf = out.get_or_insert_with(|| Vec::with_capacity(bytes.len()));
-                buf.extend_from_slice(&bytes[copied..dot]);
-                copied = end;
-                i = end;
-            } else {
-                i = sha_start;
-            }
-        }
-        match out {
-            Some(mut buf) => {
-                buf.extend_from_slice(&bytes[copied..]);
-                Cow::Owned(buf)
-            }
-            None => Cow::Borrowed(bytes),
-        }
     }
 }
 
@@ -231,26 +198,5 @@ mod tests {
         assert!(!ImageToken::looks_like_token("https://example.com/foo"));
         assert!(!ImageToken::looks_like_token("data:image/png;base64,iVB="));
         assert!(!ImageToken::looks_like_token(""));
-    }
-
-    #[test]
-    fn strip_storage_nonces_maps_tokens_to_content_form() {
-        let content = sample();
-        let a = ImageToken::new_unique(content.0);
-        let b = ImageToken::new_unique(content.0);
-        let body = |t: ImageToken| format!(r#"{{"url":"{}","x":"{}"}}"#, t.to_dw_img_uri(), t.to_dw_img_uri());
-        let stripped_a = ImageToken::strip_storage_nonces(body(a).as_bytes()).into_owned();
-        let stripped_b = ImageToken::strip_storage_nonces(body(b).as_bytes()).into_owned();
-        assert_eq!(stripped_a, stripped_b);
-        assert_eq!(stripped_a, body(content).into_bytes());
-    }
-
-    #[test]
-    fn strip_storage_nonces_leaves_other_bytes_alone() {
-        let legacy = format!(r#"{{"url":"{}"}}"#, sample().to_dw_img_uri());
-        assert!(matches!(ImageToken::strip_storage_nonces(legacy.as_bytes()), Cow::Borrowed(_)));
-        for s in ["no tokens here", "dw-img://", "dw-img://abc.def", "dw-img://dw-img://"] {
-            assert!(matches!(ImageToken::strip_storage_nonces(s.as_bytes()), Cow::Borrowed(b) if b == s.as_bytes()));
-        }
     }
 }

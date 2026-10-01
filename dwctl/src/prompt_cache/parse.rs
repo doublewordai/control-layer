@@ -685,16 +685,40 @@ pub(crate) const TELEMETRY_ROLE: &str = "system";
 /// hash identically. If a dependency ever enables `preserve_order` (→ `IndexMap`,
 /// insertion order), this would need explicit key-sorting to keep the cache-hit rate up.
 ///
-/// Stored image tokens (`dw-img://{sha256}.{nonce}`) are hashed without their storage
-/// nonce: the nonce only picks which stored copy of the bytes to sign, so two requests
-/// carrying the same image must share the prefix.
+/// An image block whose URL is a stored image token (`dw-img://{sha256}.{nonce}`) is hashed
+/// without the storage nonce: the nonce only picks which stored copy of the bytes to sign,
+/// so two requests carrying the same image must share the prefix. Only the image URL field
+/// is rewritten — token-shaped strings anywhere else hash as written.
 fn canonical_block_bytes(role: &str, stripped_block: &serde_json::Value) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(role.as_bytes());
     out.push(0x00);
-    let block = serde_json::to_vec(stripped_block).unwrap_or_default();
-    out.extend_from_slice(&crate::image_normalizer::ImageToken::strip_storage_nonces(&block));
+    let content_only = image_block_without_storage_nonce(stripped_block);
+    out.extend_from_slice(&serde_json::to_vec(content_only.as_ref().unwrap_or(stripped_block)).unwrap_or_default());
     out
+}
+
+/// `block` with its stored-image token rewritten to the content-only form
+/// (`dw-img://{sha256}`), if it is an image block whose URL is a token carrying a storage
+/// nonce; `None` for every other block (no clone, no scan).
+fn image_block_without_storage_nonce(block: &serde_json::Value) -> Option<serde_json::Value> {
+    use crate::image_normalizer::ImageToken;
+    // The two image shapes the image normalizer substitutes (chat `image_url.url`,
+    // responses `input_image.image_url`).
+    let pointer = match block.get("type")?.as_str()? {
+        "image_url" => "/image_url/url",
+        "input_image" => "/image_url",
+        _ => return None,
+    };
+    let url = block.pointer(pointer)?.as_str()?;
+    if !ImageToken::looks_like_token(url) {
+        return None;
+    }
+    let token: ImageToken = url.parse().ok()?;
+    token.1?;
+    let mut block = block.clone();
+    *block.pointer_mut(pointer)? = ImageToken(token.0, None).to_dw_img_uri().into();
+    Some(block)
 }
 
 #[cfg(test)]
@@ -1858,6 +1882,24 @@ mod tests {
         assert_eq!(a.cumulative_hashes[1], b.cumulative_hashes[1]);
         assert_eq!(a.cumulative_hashes[1], legacy.cumulative_hashes[1]);
         assert_ne!(a.cumulative_hashes[1], different.cumulative_hashes[1]);
+    }
+
+    #[test]
+    fn token_shaped_text_outside_image_urls_hashes_as_written() {
+        // Only the image block's URL field is normalised. The same token-shaped string in a
+        // text block is ordinary prompt content: with and without the nonce suffix it must
+        // hash differently, or two different prompts would share a cached prefix.
+        use crate::image_normalizer::ImageToken;
+        let text_body = |text: String| {
+            parse(serde_json::json!({
+                "cache_control": {"type": "ephemeral"},
+                "messages": [{"role": "user", "content": [{"type": "text", "text": text}]}]
+            }))
+        };
+        let with_nonce = ImageToken::new_unique([7; 32]);
+        let a = text_body(format!("see {}", with_nonce.to_dw_img_uri()));
+        let b = text_body(format!("see {}", ImageToken(with_nonce.0, None).to_dw_img_uri()));
+        assert_ne!(a.cumulative_hashes[0], b.cumulative_hashes[0]);
     }
 
     #[test]

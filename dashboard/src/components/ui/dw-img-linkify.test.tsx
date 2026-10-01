@@ -32,6 +32,7 @@ describe("dwImgLinkRenderer", () => {
     const link = within(container).getByRole("link");
     expect(link).toHaveAttribute("href", `/admin/api/v1/images/${ref}`);
     expect(link).toHaveTextContent(`dw-img://${ref}`);
+    expect(link.getAttribute("title")).toContain(`/admin/api/v1/images/${ref}`);
   });
 
   it("produces no links when the body has no tokens", () => {

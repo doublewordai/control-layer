@@ -26,10 +26,12 @@ export function dwImageUrl(ref: string): string {
 
 /** Split a string into plain-text runs and `dw-img://<sha256>` tokens, in
  *  order. A token is the scheme followed by exactly 64 hex chars, optionally
- *  followed by `.` and a 32-hex-char nonce.
+ *  followed by `.` and a 32-hex-char nonce. A hash followed by anything else
+ *  that continues the token (a malformed nonce, extra hex) is left as text
+ *  rather than linked to the wrong object.
  *  Returns a single text segment when there are no tokens. */
 export function splitDwImgTokens(text: string): DwImgSegment[] {
-  const re = /dw-img:\/\/([a-f0-9]{64})(\.[a-f0-9]{32})?/gi;
+  const re = /dw-img:\/\/([a-f0-9]{64})(\.[a-f0-9]{32})?(?![.a-f0-9])/gi;
   const segments: DwImgSegment[] = [];
   let cursor = 0;
   for (const match of text.matchAll(re)) {

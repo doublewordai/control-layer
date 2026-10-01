@@ -38,7 +38,8 @@
 //! - [`fetcher`] — hardened reqwest fetcher with DNS pinning, IP
 //!   deny-list, redirect re-validation, MIME / size caps, retries.
 //! - [`ip_filter`] — pure IP deny-list predicate.
-//! - [`token`] — opaque `dw-img://{sha256}` token format.
+//! - [`token`] — opaque `dw-img://{sha256}.{nonce}` token format (legacy
+//!   tokens omit `.{nonce}`).
 //! - [`data_uri`] — minimal `data:` URI decoder.
 //! - [`walker`] — body-traversal helpers for both endpoint shapes and
 //!   for both ingest-time substitution and dispatch-time JIT signing.
@@ -292,7 +293,7 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalize
             endpoint_url,
             region,
             force_path_style,
-            reuse_max_age_secs,
+            reuse_max_age_secs: _,
         } => {
             // Credentials are sourced from the environment (not the
             // serializable config) so they can't leak via a config dump.
@@ -314,17 +315,14 @@ pub fn from_config(cfg: &ImageNormalizerConfig) -> Result<Arc<dyn ImageNormalize
                      IMAGE_NORMALIZER_S3_SECRET_ACCESS_KEY environment variable"
                 )
             })?;
-            let store = Arc::new(
-                store::S3CompatStore::new(
-                    bucket.clone(),
-                    endpoint_url.clone(),
-                    region.clone(),
-                    *force_path_style,
-                    access_key_id,
-                    secret_access_key,
-                )
-                .with_reuse_max_age((*reuse_max_age_secs > 0).then(|| Duration::from_secs(*reuse_max_age_secs))),
-            );
+            let store = Arc::new(store::S3CompatStore::new(
+                bucket.clone(),
+                endpoint_url.clone(),
+                region.clone(),
+                *force_path_style,
+                access_key_id,
+                secret_access_key,
+            ));
             Arc::new(DefaultImageNormalizer::new(cfg.fetcher.clone(), store))
         }
     })

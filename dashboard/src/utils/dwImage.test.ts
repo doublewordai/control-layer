@@ -53,6 +53,12 @@ describe("splitDwImgTokens", () => {
       { kind: "text", value: '"' },
     ]);
   });
+
+  it("leaves a token with a malformed nonce as text", () => {
+    for (const bad of [`dw-img://${SHA}.abc`, `dw-img://${SHA}.${"c".repeat(33)}`, `dw-img://${SHA}a`]) {
+      expect(splitDwImgTokens(bad)).toEqual([{ kind: "text", value: bad }]);
+    }
+  });
 });
 
 describe("dwImageUrl", () => {

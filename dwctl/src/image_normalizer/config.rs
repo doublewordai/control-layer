@@ -79,24 +79,11 @@ pub enum BackendConfig {
         /// S3-compatible endpoints (R2, MinIO); defaults to true.
         #[serde(default = "default_true")]
         force_path_style: bool,
-        /// Re-upload an object on a dedup hit once it is this old, in
-        /// seconds. `0` disables the check.
-        ///
-        /// Objects are content-addressed and deduplicated, so a customer who
-        /// reuses an image has it uploaded once and referenced from then on.
-        /// A bucket lifecycle rule (production R2: delete after 14 days,
-        /// counted from upload, not last use) then removes it while batch
-        /// requests still point at it. On 2026-09-24 three Qwen3-VL-235B
-        /// batch requests retried an image fetch 404 more than 600 times
-        /// each: the object had been uploaded 14 days earlier, the dedup
-        /// check found it an hour before expiry, and it vanished mid-batch.
-        ///
-        /// Set this to the lifecycle age minus the longest time a signed
-        /// reference can stay in use. In production a batch request can be
-        /// dispatched up to 24h after ingest plus the 7-day retry buffer
-        /// (`stop_before_deadline_ms` is -7 days), so 14 - 8 = 6 days is the
-        /// bound and the default of 5 days leaves the lifecycle sweep some
-        /// slack.
+        /// Deprecated and ignored. Every ingest now uploads its own object
+        /// (see [`ImageToken`](super::ImageToken)), so an object is never older
+        /// than its newest reference and nothing needs refreshing before the
+        /// bucket lifecycle rule expires it. Still accepted so existing
+        /// configs keep loading.
         #[serde(default = "default_s3_reuse_max_age_secs")]
         reuse_max_age_secs: u64,
     },
@@ -253,7 +240,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn s3_reuse_max_age_defaults_to_five_days_and_can_be_disabled() {
+    fn s3_deprecated_reuse_max_age_still_loads() {
         let cfg: BackendConfig = serde_yaml::from_str("type: s3_compatible\nbucket: b\nendpoint_url: https://example.invalid\n").unwrap();
         let BackendConfig::S3Compatible { reuse_max_age_secs, .. } = cfg else {
             panic!("expected s3_compatible");
