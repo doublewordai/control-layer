@@ -1,9 +1,14 @@
 //! Measures the application's heap while a fixed number of requests are held
-//! open at the mock upstream.
+//! open, at the mock upstream or, for complete responses, at the load generator.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
+use axum::http::{Request, header};
+use http_body_util::{BodyExt, Full};
+use tokio::sync::watch;
 
 use crate::alloc;
 use crate::harness::Harness;
@@ -81,9 +86,9 @@ impl std::fmt::Display for Scaling {
     }
 }
 
-/// Runs two rounds at each size. The first round at a size lets pools,
-/// caches and buffers grow to it; the second is the one measured.
-pub fn scaling(harness: &Harness, load: impl Fn(usize) -> Load, small: usize, large: usize) -> Scaling {
+/// Runs two rounds at each of a small and a large size. The first round at a
+/// size lets pools, caches and buffers grow to it; the second is the one measured.
+pub fn scaling(harness: &Harness, load: impl Fn(usize) -> Load, [small, large]: [usize; 2]) -> Scaling {
     round(harness, load(small));
     let small = round(harness, load(small));
     let first_large = round(harness, load(large));
@@ -111,28 +116,41 @@ pub fn round(harness: &Harness, load: Load) -> Round {
         Target::Application => format!("{}{}", harness.base_url, load.path),
         Target::Upstream => format!("{}/chat/completions", upstream.base_url),
     };
-    let key = harness.api_key.clone();
+    let authorization = format!("Bearer {}", harness.api_key);
     let client = harness.client.clone();
     let body = load.body;
     let delivered = upstream.delivered();
+    // A complete response is held by the load generator: it reads the headers,
+    // then leaves the body unread until release.
+    let hold_response = matches!(load.reply, Reply::Complete { .. });
+    let responding = Arc::new(AtomicUsize::new(0));
+    let (release_responses, responses_released) = watch::channel(false);
+    let load_responding = responding.clone();
     let requests = harness.driver.spawn(async move {
         let mut tasks = tokio::task::JoinSet::new();
         for _ in 0..CONCURRENCY {
-            let (client, url, key, body) = (client.clone(), url.clone(), key.clone(), body.clone());
-            let delivered = delivered.clone();
+            let (client, url, authorization, body) = (client.clone(), url.clone(), authorization.clone(), body.clone());
+            let (delivered, responding) = (delivered.clone(), load_responding.clone());
+            let mut responses_released = responses_released.clone();
             tasks.spawn(async move {
-                let mut response = client
-                    .post(url)
-                    .bearer_auth(key)
-                    .header("content-type", "application/json")
-                    .body(body)
-                    .send()
-                    .await
-                    .expect("send request");
+                let request = Request::post(url)
+                    .header(header::AUTHORIZATION, authorization)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Full::new(body))
+                    .expect("request");
+                let response = client.request(request).await.expect("send request");
+                responding.fetch_add(1, Ordering::SeqCst);
+                if hold_response {
+                    let _ = responses_released.wait_for(|released| *released).await;
+                }
                 let status = response.status();
+                let mut response = response.into_body();
                 let mut error = Vec::new();
                 let mut previous = 0u8;
-                while let Some(chunk) = response.chunk().await.expect("read response") {
+                while let Some(frame) = response.frame().await {
+                    let Ok(chunk) = frame.expect("read response").into_data() else {
+                        continue;
+                    };
                     // A blank line ends a server-sent event.
                     let mut events = 0;
                     for &byte in chunk.iter() {
@@ -152,15 +170,23 @@ pub fn round(harness: &Harness, load: Load) -> Round {
         tasks.join_all().await
     });
 
-    let streaming = matches!(load.reply, Reply::StreamThenHold { .. });
-    wait_until("every request to reach the upstream", Duration::from_secs(60), || {
-        upstream.parked() >= CONCURRENCY && (!streaming || upstream.streamed() >= CONCURRENCY)
-    });
+    match load.reply {
+        Reply::Hold => wait_until("every request to reach the upstream", Duration::from_secs(60), || {
+            upstream.parked() >= CONCURRENCY
+        }),
+        Reply::StreamThenHold { .. } => wait_until("every stream to deliver its content", Duration::from_secs(60), || {
+            upstream.streamed() >= CONCURRENCY
+        }),
+        Reply::Complete { .. } => wait_until("every response to reach the load generator", Duration::from_secs(60), || {
+            responding.load(Ordering::SeqCst) >= CONCURRENCY
+        }),
+    }
     let held = settle() - baseline;
     let peak = alloc::peak_bytes() - baseline;
-    assert_eq!(upstream.parked(), CONCURRENCY, "requests other than the load reached the upstream");
+    assert_eq!(upstream.arrived(), CONCURRENCY, "requests other than the load reached the upstream");
 
     upstream.release_all();
+    release_responses.send_replace(true);
     let results = harness.driver.block_on(requests).expect("request tasks");
     for (status, error) in &results {
         assert!(status.is_success(), "request failed with {status}: {error}");

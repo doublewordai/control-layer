@@ -13,29 +13,28 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use http_body_util::BodyExt;
-use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, watch};
 
-/// Streamed content is sent as events of this many bytes.
-pub const EVENT_BYTES: usize = 16 * 1024;
+use crate::payload;
 
 /// What the upstream sends back once a request has arrived.
 #[derive(Clone, Copy, Debug)]
 pub enum Reply {
-    /// Send a complete non-streaming response straight away.
-    Immediate,
-    /// Wait for release, then send a complete non-streaming response.
+    /// Wait for release, then send a short complete response.
     Hold,
-    /// Send `content_bytes` of streamed content, wait for release, then finish the stream.
-    StreamThenHold { content_bytes: usize },
+    /// Send a complete response with `tokens` tokens of output straight away.
+    Complete { tokens: usize },
+    /// Stream `tokens` tokens of output, wait for release, then finish the stream.
+    StreamThenHold { tokens: usize },
 }
 
 /// Streamed events the load generator has received through the application.
 ///
 /// The upstream sends each event only once every stream has delivered the
 /// previous ones, so the application reads one event at a time on every
-/// machine rather than whatever the kernel has queued.
+/// machine rather than whatever the kernel has queued, as it does when tokens
+/// arrive from a real model.
 #[derive(Clone, Default)]
 pub struct Delivered {
     events: Arc<AtomicUsize>,
@@ -67,6 +66,8 @@ struct Shared {
     reply: Arc<Mutex<Reply>>,
     /// Requests in the current round, which move through a stream together.
     requests: Arc<AtomicUsize>,
+    /// Requests whose body has been read.
+    arrived: Arc<AtomicUsize>,
     /// Requests whose body has been read and that are now waiting for release.
     parked: Arc<AtomicUsize>,
     /// Streams whose events before release have all reached the load generator.
@@ -89,8 +90,9 @@ impl Upstream {
         let (release, release_rx) = watch::channel(0u64);
         let shared = Shared {
             model: model.to_string(),
-            reply: Arc::new(Mutex::new(Reply::Immediate)),
+            reply: Arc::new(Mutex::new(Reply::Complete { tokens: 1 })),
             requests: Arc::new(AtomicUsize::new(1)),
+            arrived: Arc::new(AtomicUsize::new(0)),
             parked: Arc::new(AtomicUsize::new(0)),
             streamed: Arc::new(AtomicUsize::new(0)),
             delivered: Delivered::default(),
@@ -111,6 +113,7 @@ impl Upstream {
     pub fn prepare(&self, reply: Reply, requests: usize) {
         *self.shared.reply.lock().unwrap() = reply;
         self.shared.requests.store(requests, Ordering::SeqCst);
+        self.shared.arrived.store(0, Ordering::SeqCst);
         self.shared.parked.store(0, Ordering::SeqCst);
         self.shared.streamed.store(0, Ordering::SeqCst);
         self.shared.delivered.events.store(0, Ordering::SeqCst);
@@ -118,6 +121,10 @@ impl Upstream {
 
     pub fn delivered(&self) -> Delivered {
         self.shared.delivered.clone()
+    }
+
+    pub fn arrived(&self) -> usize {
+        self.shared.arrived.load(Ordering::SeqCst)
     }
 
     pub fn parked(&self) -> usize {
@@ -146,45 +153,31 @@ async fn completion(State(shared): State<Shared>, request: Request) -> Response 
     let reply = *shared.reply.lock().unwrap();
     let mut release = shared.release.clone();
     let generation = *release.borrow_and_update();
-    if !matches!(reply, Reply::Immediate) {
-        shared.parked.fetch_add(1, Ordering::SeqCst);
-    }
+    shared.arrived.fetch_add(1, Ordering::SeqCst);
 
     match reply {
-        Reply::Immediate | Reply::Hold => {
-            if matches!(reply, Reply::Hold) {
-                wait_for_release(&mut release, generation).await;
-            }
-            let completion = json!({
-                "id": "chatcmpl-memory",
-                "object": "chat.completion",
-                "created": 0,
-                "model": shared.model,
-                "choices": [{
-                    "index": 0,
-                    "message": { "role": "assistant", "content": "ok" },
-                    "finish_reason": "stop"
-                }],
-                "usage": { "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 }
-            });
-            ([(header::CONNECTION, "close")], axum::Json(completion)).into_response()
+        Reply::Hold => {
+            shared.parked.fetch_add(1, Ordering::SeqCst);
+            wait_for_release(&mut release, generation).await;
+            complete(payload::completion(&shared.model, 1))
         }
-        Reply::StreamThenHold { content_bytes } => {
+        Reply::Complete { tokens } => complete(payload::completion(&shared.model, tokens)),
+        Reply::StreamThenHold { tokens } => {
+            shared.parked.fetch_add(1, Ordering::SeqCst);
             let requests = shared.requests.load(Ordering::SeqCst);
+            let payload::Stream { content, finish } = payload::stream(&shared.model, tokens);
             let stream = async_stream::stream! {
-                let events = content_bytes.div_ceil(EVENT_BYTES);
-                for event in 0..events {
+                let events = content.len();
+                for (event, bytes) in content.into_iter().enumerate() {
                     shared.delivered.at_least(event * requests).await;
-                    let len = EVENT_BYTES.min(content_bytes - event * EVENT_BYTES);
-                    yield Ok::<_, std::convert::Infallible>(sse(&chunk(&shared.model, Some(&"a".repeat(len)), None, None)));
+                    yield Ok::<_, std::convert::Infallible>(bytes);
                 }
                 shared.delivered.at_least(events * requests).await;
                 shared.streamed.fetch_add(1, Ordering::SeqCst);
                 wait_for_release(&mut release, generation).await;
-                yield Ok(sse(&chunk(&shared.model, None, Some("stop"), None)));
-                let usage = json!({ "prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2 });
-                yield Ok(sse(&chunk(&shared.model, None, None, Some(usage))));
-                yield Ok(Bytes::from_static(b"data: [DONE]\n\n"));
+                for bytes in finish {
+                    yield Ok(bytes);
+                }
             };
             Response::builder()
                 .header(header::CONTENT_TYPE, "text/event-stream")
@@ -199,29 +192,10 @@ async fn wait_for_release(release: &mut watch::Receiver<u64>, generation: u64) {
     let _ = release.wait_for(|current| *current > generation).await;
 }
 
-fn chunk(model: &str, content: Option<&str>, finish_reason: Option<&str>, usage: Option<Value>) -> Value {
-    let choices = if usage.is_some() {
-        json!([])
-    } else {
-        let delta = match content {
-            Some(content) => json!({ "content": content }),
-            None => json!({}),
-        };
-        json!([{ "index": 0, "delta": delta, "finish_reason": finish_reason }])
-    };
-    let mut value = json!({
-        "id": "chatcmpl-memory",
-        "object": "chat.completion.chunk",
-        "created": 0,
-        "model": model,
-        "choices": choices,
-    });
-    if let Some(usage) = usage {
-        value["usage"] = usage;
-    }
-    value
-}
-
-fn sse(value: &Value) -> Bytes {
-    Bytes::from(format!("data: {value}\n\n"))
+fn complete(body: Bytes) -> Response {
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CONNECTION, "close")
+        .body(Body::from(body))
+        .unwrap()
 }
