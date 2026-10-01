@@ -196,7 +196,7 @@ mod tests {
             .await
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn customers_see_their_effective_price_and_operators_see_every_scope(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -298,7 +298,7 @@ mod tests {
         assert_eq!(body["cache_pricing"]["read_multiplier"], "0.5000");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn serving_views_are_platform_manager_only(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -390,7 +390,7 @@ mod tests {
             .await
             .assert_status_not_found();
     }
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn new_models_and_token_only_deals_are_readable_together(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -426,7 +426,7 @@ mod tests {
         assert_eq!(response.json::<Value>()["model_aliases"], json!({}));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn organization_edits_are_visible_in_the_next_serving_read(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -456,7 +456,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn pricing_lookup_errors_are_not_successful_empty_quotes(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;

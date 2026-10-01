@@ -617,7 +617,7 @@ mod tests {
         matchers::{method, path},
     };
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_inference_endpoints(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -653,7 +653,7 @@ mod tests {
         endpoints.iter().find(|e| e.name == "test").expect("Test endpoint should exist").id
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_inference_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -673,7 +673,7 @@ mod tests {
         assert_eq!(endpoint.name, "test");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_nonexistent_inference_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -690,7 +690,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_inference_endpoint_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -714,7 +714,7 @@ mod tests {
         assert_eq!(updated_endpoint.name, "Updated Default");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_inference_endpoint_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -737,7 +737,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_nonexistent_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -758,7 +758,7 @@ mod tests {
         response.assert_status_not_found(); // Repository propagates NotFound error
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_endpoint_with_empty_payload(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -779,7 +779,7 @@ mod tests {
         assert_eq!(endpoint.name, "test"); // Name should remain unchanged
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_endpoint_with_null_name(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -802,7 +802,7 @@ mod tests {
         assert_eq!(endpoint.name, "test"); // Name should remain unchanged when null
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_default_endpoint_exists(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -835,7 +835,7 @@ mod tests {
         assert_eq!(endpoint.id, test_endpoint_id);
         assert_eq!(endpoint.name, "test");
     }
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_endpoints_with_pagination(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -875,7 +875,7 @@ mod tests {
         let endpoints: Vec<InferenceEndpointResponse> = response.json();
         assert!(endpoints.is_empty());
     }
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_new_valid_url(pool: PgPool) {
         // Start mock HTTP server for endpoint validation
@@ -917,7 +917,7 @@ mod tests {
         response.assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_new_invalid_url(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -939,7 +939,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_existing_endpoint(pool: PgPool) {
         // Start mock HTTP server for endpoint validation
@@ -995,7 +995,7 @@ mod tests {
         response.assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_nonexistent_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1017,7 +1017,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_validate_inference_endpoint_as_non_admin_forbidden(pool: PgPool) {
         // Start mock HTTP server for endpoint validation
@@ -1059,7 +1059,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_inference_endpoint_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1090,7 +1090,7 @@ mod tests {
         assert_eq!(endpoint.created_by, admin_user.id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_inference_endpoint_minimal_fields(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1118,7 +1118,7 @@ mod tests {
         assert_eq!(endpoint.created_by, admin_user.id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_inference_endpoint_invalid_url(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1139,7 +1139,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_inference_endpoint_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1160,7 +1160,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_inference_endpoint_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1201,7 +1201,7 @@ mod tests {
         get_response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_nonexistent_inference_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1217,7 +1217,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_inference_endpoint_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1259,7 +1259,7 @@ mod tests {
         get_response.assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_synchronize_endpoint_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1279,7 +1279,7 @@ mod tests {
         assert!(response.status_code() != axum::http::StatusCode::NOT_FOUND);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_synchronize_nonexistent_endpoint(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1296,7 +1296,7 @@ mod tests {
         assert!(response.status_code() != axum::http::StatusCode::OK);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_synchronize_endpoint_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1315,7 +1315,7 @@ mod tests {
     }
 
     // Update permission test to correctly reflect that StandardUser CANNOT read endpoints
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_can_read_endpoints_only(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1404,7 +1404,7 @@ mod tests {
     }
 
     // Update RequestViewer test - they also cannot read endpoints
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_viewer_can_read_endpoints_only(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1466,7 +1466,7 @@ mod tests {
     }
 
     // Update multi-role test
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multi_role_user_endpoint_permissions(pool: PgPool) {
         // Setup wiremock server to mock the inference endpoint
@@ -1575,7 +1575,7 @@ mod tests {
         bg_services.shutdown().await;
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_endpoint_crud_permission_isolation(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1658,7 +1658,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_validation_permission_requirements(pool: PgPool) {
         // Start mock HTTP server for endpoint validation
@@ -1767,7 +1767,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_synchronization_permission_requirements(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1815,7 +1815,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_endpoint_access(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1843,7 +1843,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_viewer_endpoint_access(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1873,7 +1873,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multi_role_user_endpoint_access(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1901,7 +1901,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_endpoint_access(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1940,7 +1940,7 @@ mod tests {
 
     // Alias mapping dedupe/uniqueness tests
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_endpoint_with_unique_aliases(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1968,7 +1968,7 @@ mod tests {
         assert_eq!(endpoint.name, "Alias Endpoint");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_endpoint_with_duplicate_alias_conflict(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2011,7 +2011,7 @@ mod tests {
         assert!(body["message"].as_str().unwrap().contains("Alias conflicts"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_endpoint_with_alias_conflict(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2063,7 +2063,7 @@ mod tests {
         assert!(body["message"].as_str().unwrap().contains("Alias conflicts"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_endpoint_with_unique_aliases(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2100,7 +2100,7 @@ mod tests {
         assert_eq!(updated.name, "Endpoint C");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_alias_uniqueness_is_global(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2137,7 +2137,7 @@ mod tests {
         resp2.assert_status(axum::http::StatusCode::CONFLICT);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_alias_can_match_model_name_if_unique(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2159,7 +2159,7 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_alias_update_noop_is_ok(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2194,7 +2194,7 @@ mod tests {
         resp_update.assert_status(axum::http::StatusCode::OK);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multiple_same_model_different_endpoints_unique_aliases(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2237,7 +2237,7 @@ mod tests {
         resp2.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_default_alias_conflict_when_no_alias_mapping(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2276,7 +2276,7 @@ mod tests {
         assert!(body["message"].as_str().unwrap().contains("Alias conflicts"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_endpoint_name_conflict_bounces_before_alias_conflict(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2319,7 +2319,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_endpoint_no_alias_mapping_defaults_to_model_name(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;

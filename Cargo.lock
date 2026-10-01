@@ -1923,6 +1923,8 @@ dependencies = [
  "ctor",
  "dashmap",
  "deadpool-redis",
+ "dotenvy",
+ "dwctl-test-macros",
  "eventsource-stream",
  "figment",
  "flate2",
@@ -1998,6 +2000,15 @@ dependencies = [
  "utoipa-scalar",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "dwctl-test-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

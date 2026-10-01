@@ -1105,7 +1105,7 @@ mod tests {
     use rust_decimal::Decimal;
     use sqlx::PgPool;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_dummy_payment_flow(pool: PgPool) {
         // Setup config with dummy payment provider
         let mut config = create_test_config();
@@ -1212,7 +1212,7 @@ mod tests {
         assert_eq!(count.count.unwrap(), 1, "Should only have one transaction (idempotent)");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_no_provider_configured(pool: PgPool) {
         // Setup config WITHOUT payment provider
         let config = create_test_config();
@@ -1237,7 +1237,7 @@ mod tests {
         assert!(error_response["message"].as_str().unwrap().contains("unavailable"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_with_creditee_id(pool: PgPool) {
         // Test that creditee_id query parameter works
         let mut config = create_test_config();
@@ -1286,7 +1286,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_billing_portal_success(pool: PgPool) {
         // Setup config with dummy provider
         let mut config = create_test_config();
@@ -1336,7 +1336,7 @@ mod tests {
         assert!(url.contains(&format!("customer_id=cus_test_{}", user.id)));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_billing_portal_no_customer_id(pool: PgPool) {
         // Setup config with dummy provider
         let mut config = create_test_config();
@@ -1370,7 +1370,7 @@ mod tests {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_billing_portal_no_provider_configured(pool: PgPool) {
         // Setup config WITHOUT payment provider
         let config = create_test_config();
@@ -1411,7 +1411,7 @@ mod tests {
         response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_topup_checkout_success(pool: PgPool) {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
@@ -1449,7 +1449,7 @@ mod tests {
         assert!(url.contains("autoTopup=true"), "URL should contain autoTopup param");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_topup_checkout_no_provider(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1472,7 +1472,7 @@ mod tests {
         response.assert_status(StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topup_success(pool: PgPool) {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
@@ -1544,7 +1544,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topup_invalid_params(pool: PgPool) {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
@@ -1583,7 +1583,7 @@ mod tests {
         response.assert_status(StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_enable_auto_topup_with_payment_method(pool: PgPool) {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
@@ -1650,7 +1650,7 @@ mod tests {
         assert_eq!(row.auto_topup_retry_after, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_enable_auto_topup_no_customer(pool: PgPool) {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
@@ -1690,7 +1690,7 @@ mod tests {
         assert!(row.payment_provider_id.is_some(), "Customer ID should be saved");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_enable_auto_topup_in_org_context(pool: PgPool) {
         let mut config = create_test_config();
         config.payment = Some(PaymentConfig::Dummy(DummyConfig {
@@ -1750,7 +1750,7 @@ mod tests {
         assert_eq!(user_row.auto_topup_threshold, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_disable_auto_topup(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), create_test_config()).await;
 
@@ -1794,7 +1794,7 @@ mod tests {
         assert_eq!(row.auto_topup_monthly_limit, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_disable_auto_topup_in_org_context(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), create_test_config()).await;
 
@@ -1866,7 +1866,7 @@ mod tests {
     /// An invoice-billed account must not be able to run a card checkout: they
     /// may have no card at all, and taking the payment would bill them twice
     /// for credits their monthly invoice already covers.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_create_payment_refuses_invoice_billed_accounts(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::ZERO)).await;
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -1899,7 +1899,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_setup_returns_checkout_url(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::ZERO)).await;
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -1924,7 +1924,7 @@ mod tests {
         assert!(url.contains("session_id="), "URL should carry the session id back");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_setup_no_provider(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), create_test_config()).await;
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -1943,7 +1943,7 @@ mod tests {
     /// The whole onboarding round trip: create the setup session, come back
     /// through the same `PATCH /payments/{id}` a top-up uses, and end up
     /// verified with signup credits but *no* purchase on the ledger.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_setup_verifies_user_and_grants_signup_credits(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::new(25, 0))).await;
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -2008,7 +2008,7 @@ mod tests {
 
     /// The SPA's front-channel PATCH races the provider webhook; both call the
     /// same code path, so replaying it must not pay out twice.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_setup_processing_is_idempotent(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::new(25, 0))).await;
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
@@ -2046,7 +2046,7 @@ mod tests {
         assert_eq!(count, Some(1), "replaying the return must not double-grant");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_payment_setup_without_verification_credits_still_verifies(pool: PgPool) {
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), setup_flow_config(Decimal::ZERO)).await;
         let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;

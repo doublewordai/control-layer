@@ -1566,7 +1566,7 @@ mod tests {
         .expect("Failed to insert test analytics data");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_dashboard_read_timeout_is_scoped_to_its_transaction(pool: PgPool) {
         // One connection, so the check after commit runs on the connection the limit was set on.
         let single = sqlx::postgres::PgPoolOptions::new()
@@ -1586,7 +1586,7 @@ mod tests {
         assert_eq!(after, "0");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_total_requests_no_filter(pool: PgPool) {
         let now = Utc::now();
         let one_hour_ago = now - Duration::hours(1);
@@ -1601,7 +1601,7 @@ mod tests {
         assert_eq!(result, 3);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_total_requests_with_model_filter(pool: PgPool) {
         let now = Utc::now();
         let one_hour_ago = now - Duration::hours(1);
@@ -1621,7 +1621,7 @@ mod tests {
         assert_eq!(result, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_time_series_basic(pool: PgPool) {
         let base_time = Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap();
         let hour1 = base_time;
@@ -1663,7 +1663,7 @@ mod tests {
         assert_eq!(h2.output_tokens, 30);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_status_codes(pool: PgPool) {
         let now = Utc::now();
         let one_hour_ago = now - Duration::hours(1);
@@ -1690,7 +1690,7 @@ mod tests {
         assert_eq!(result[1].status_count, Some(1));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_model_usage(pool: PgPool) {
         let now = Utc::now();
         let one_hour_ago = now - Duration::hours(1);
@@ -1713,7 +1713,7 @@ mod tests {
         assert_eq!(result[1].model_avg_latency_ms, Some(300.0));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_requests_aggregate_full_integration(pool: PgPool) {
         let base_time = Utc.with_ymd_and_hms(2024, 1, 1, 10, 0, 0).unwrap();
 
@@ -1751,7 +1751,7 @@ mod tests {
         assert!(!result.time_series.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_requests_aggregate_with_model_filter(pool: PgPool) {
         let base_time = Utc::now() - Duration::hours(2);
 
@@ -1774,7 +1774,7 @@ mod tests {
         assert_eq!(result.status_codes[0].status, "200");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_requests_aggregate_empty_database(pool: PgPool) {
         let base_time = Utc::now() - Duration::hours(24);
         let end_time = Utc::now();
@@ -1790,7 +1790,7 @@ mod tests {
         assert!(result.time_series.iter().all(|p| p.requests == 0));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_percentage_calculations_precision(pool: PgPool) {
         let base_time = Utc::now() - Duration::hours(1);
 
@@ -1930,7 +1930,7 @@ mod tests {
         .expect("Failed to fold test batch_aggregates row");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_single_request(pool: PgPool) {
         let batch_id = Uuid::new_v4();
         let now = Utc::now();
@@ -1974,7 +1974,7 @@ mod tests {
         assert!((cost_f64 - 0.0025).abs() < 0.00001);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_serves_billed_cost_not_list_price(pool: PgPool) {
         // The regression a customer caught from outside (2026-07): the endpoint served
         // `total_list_cost` (un-discounted list price) as `total_cost`, while the ledger billed
@@ -2016,7 +2016,7 @@ mod tests {
         assert!(billed < list, "cache-discounted billed cost sits below list price");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_multiple_requests(pool: PgPool) {
         let batch_id = Uuid::new_v4();
         let now = Utc::now();
@@ -2107,7 +2107,7 @@ mod tests {
         assert!((cost_f64 - 0.00665).abs() < 0.00001);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_nonexistent_batch_id(pool: PgPool) {
         let nonexistent_batch_id = Uuid::new_v4();
 
@@ -2118,7 +2118,7 @@ mod tests {
         assert!(result.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_filters_by_batch_id(pool: PgPool) {
         let batch_id_1 = Uuid::new_v4();
         let batch_id_2 = Uuid::new_v4();
@@ -2178,7 +2178,7 @@ mod tests {
         assert_eq!(result.avg_duration_ms, Some(100.0));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_missing_optional_fields(pool: PgPool) {
         let batch_id = Uuid::new_v4();
         let now = Utc::now();
@@ -2221,7 +2221,7 @@ mod tests {
         assert_eq!(cost_f64, 0.0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batch_analytics_multiple_requests_same_batch(pool: PgPool) {
         let batch_id = Uuid::new_v4();
         let other_batch_id = Uuid::new_v4();
@@ -2299,14 +2299,14 @@ mod tests {
         assert_eq!(result.avg_duration_ms, Some(125.0)); // (100 + 150) / 2
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batches_analytics_bulk_empty_input(pool: PgPool) {
         // Empty batch IDs should return empty HashMap
         let result = get_batches_analytics_bulk(&pool, &[]).await.unwrap();
         assert!(result.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_batches_analytics_bulk_multiple_batches(pool: PgPool) {
         let batch_id_1 = Uuid::new_v4();
         let batch_id_2 = Uuid::new_v4();
@@ -2504,7 +2504,7 @@ mod tests {
         user_id
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_all_time_breakdown_includes_realtime_requests(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
@@ -2551,7 +2551,7 @@ mod tests {
         assert_eq!(breakdown[0].output_tokens, 150); // 50 + 100
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_refresh_user_model_usage_daily_aggregates_per_day(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let day1_am = Utc.with_ymd_and_hms(2026, 1, 1, 10, 0, 0).unwrap();
@@ -2619,7 +2619,7 @@ mod tests {
         assert_eq!(rows[1].request_count, 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_refresh_user_model_usage_daily_is_additive_across_runs(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let day = Utc.with_ymd_and_hms(2026, 2, 3, 12, 0, 0).unwrap();
@@ -2669,7 +2669,7 @@ mod tests {
         assert_eq!(row.request_count, 2);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_user_model_breakdown_for_range_includes_realtime_requests(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
@@ -2716,7 +2716,7 @@ mod tests {
         assert_eq!(breakdown[0].output_tokens, 100); // 40 + 60
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_user_model_breakdown_for_range_spans_utc_midnight(pool: PgPool) {
         // The range is matched at UTC-day granularity, so a window straddling UTC
         // midnight must include BOTH days it touches. Seed one request just before
@@ -2773,7 +2773,7 @@ mod tests {
         .expect("Failed to insert batch_aggregate");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_batch_count_for_range_counts_batches_in_window(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
@@ -2788,7 +2788,7 @@ mod tests {
         assert_eq!(count, 2);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_all_time_breakdown_excludes_errors(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
@@ -2877,7 +2877,7 @@ mod tests {
         assert_eq!(breakdown[0].output_tokens, 150); // 50 + 100
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_user_model_breakdown_for_range_excludes_errors(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();
@@ -2939,7 +2939,7 @@ mod tests {
         assert_eq!(breakdown[0].output_tokens, 40);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_batch_count_for_range_respects_window(pool: PgPool) {
         let user_id = create_usage_test_user(&pool).await;
         let now = Utc::now();

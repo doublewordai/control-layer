@@ -312,7 +312,7 @@ mod tests {
     use sqlx::PgPool;
     use std::str::FromStr;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_multiple_batch_tariffs_per_sla(pool: PgPool) {
         // Seed the database with test infrastructure
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -390,7 +390,7 @@ mod tests {
         assert_eq!(tariff_1h_found.name, "Batch 1h");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_duplicate_batch_tariff_same_sla_rejected(pool: PgPool) {
         // Seed the database with test infrastructure
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -450,7 +450,7 @@ mod tests {
         assert!(result.is_err(), "Should not allow duplicate batch tariff with same SLA");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_single_realtime_tariff_still_enforced(pool: PgPool) {
         // Seed the database with test infrastructure
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -510,7 +510,7 @@ mod tests {
         assert!(result.is_err(), "Should still enforce single realtime tariff per model");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_batch_tariff_without_completion_window_rejected(pool: PgPool) {
         // Seed the database with test infrastructure
         let base_url = url::Url::parse("http://localhost:8080").unwrap();

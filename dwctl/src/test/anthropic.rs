@@ -95,7 +95,7 @@ async fn wait_for_model(server: &TestServer, api_key: &str) {
     assert!(ok, "onwards did not pick up gpt-4 within 3s");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn anthropic_models_uses_control_layer_model_discovery(pool: PgPool) {
     let mock = wiremock::MockServer::start().await;
 
@@ -126,7 +126,7 @@ async fn anthropic_models_uses_control_layer_model_discovery(pool: PgPool) {
     assert_eq!(body["data"][0]["display_name"], "gpt-4");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn anthropic_messages_blocking_end_to_end(pool: PgPool) {
     let mock = wiremock::MockServer::start().await;
     wiremock::Mock::given(wiremock::matchers::method("POST"))
@@ -177,7 +177,7 @@ async fn anthropic_messages_blocking_end_to_end(pool: PgPool) {
     assert_eq!(body["usage"]["output_tokens"], 4);
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn anthropic_messages_streaming_end_to_end(pool: PgPool) {
     let sse = concat!(
         "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null}]}\n\n",

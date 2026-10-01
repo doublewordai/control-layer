@@ -12,7 +12,7 @@ use sqlx::PgPool;
 
 /// Reject before inference parsing, logging, or daemon-header bypasses, with
 /// cache pricing disabled so enforcement cannot depend on its inner reader.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_inference_body_limit_precedes_processing_in_all_modes(pool: PgPool) {
     for strict_mode in [true, false] {
         let mut config = create_test_config();
@@ -54,7 +54,7 @@ async fn test_inference_body_limit_precedes_processing_in_all_modes(pool: PgPool
 }
 
 /// Test that strict mode rejects unknown endpoints with 404
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_rejects_unknown_endpoints(pool: PgPool) {
     // Setup wiremock server (won't be reached for unknown endpoints)
@@ -122,7 +122,7 @@ async fn test_strict_mode_rejects_unknown_endpoints(pool: PgPool) {
 }
 
 /// Test that strict mode allows GET /v1/models endpoint
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_allows_models_endpoint(pool: PgPool) {
     // Create test app with strict mode enabled
@@ -200,7 +200,7 @@ async fn test_strict_mode_allows_models_endpoint(pool: PgPool) {
 }
 
 /// Test that strict mode allows POST /v1/chat/completions with valid request
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -413,7 +413,7 @@ async fn test_strict_mode_allows_chat_completions(pool: PgPool) {
 /// Test that strict mode enforces the configured request body limit rather
 /// than Axum's 2 MB default: a 3 MB body (over the old default) is accepted,
 /// while a body over the configured limit is rejected with 413.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_body_limit_uses_configured_max_body_size(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -625,7 +625,7 @@ async fn test_strict_mode_body_limit_uses_configured_max_body_size(pool: PgPool)
 }
 
 /// Test that strict mode allows POST /v1/completions (legacy completions endpoint)
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_allows_completions(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -803,7 +803,7 @@ async fn test_strict_mode_allows_completions(pool: PgPool) {
 }
 
 /// Test that strict mode allows POST /v1/embeddings with valid request
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_allows_embeddings(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -962,7 +962,7 @@ async fn test_strict_mode_allows_embeddings(pool: PgPool) {
 }
 
 /// Test that strict mode rejects malformed requests
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_rejects_malformed_requests(pool: PgPool) {
     let mut config = create_test_config();
@@ -1036,7 +1036,7 @@ async fn test_strict_mode_rejects_malformed_requests(pool: PgPool) {
 // in this file.
 
 /// Test that errors from non-trusted providers are sanitized in strict mode
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -1198,7 +1198,7 @@ async fn test_strict_mode_sanitizes_provider_errors(pool: PgPool) {
 }
 
 /// Upstream 429s keep their status and use the public message, even for trusted providers.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_upstream_rate_limit_uses_custom_message(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -1355,7 +1355,7 @@ async fn test_strict_mode_upstream_rate_limit_uses_custom_message(pool: PgPool) 
 }
 
 /// Test various upstream error scenarios are handled correctly
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_strict_mode_handles_various_provider_errors(pool: PgPool) {
     // Test different error responses

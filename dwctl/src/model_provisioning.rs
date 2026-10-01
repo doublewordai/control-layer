@@ -939,7 +939,7 @@ clay:
         assert_eq!(presets[&PresetClass::Throughput].priority, 0, "priority defaults to 0");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn apply_materialises_offered_classes(pool: PgPool) {
         sqlx::query(
             "INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')",
@@ -995,7 +995,7 @@ clay:
         assert!(Catalog::load(directory.path()).unwrap().models.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn empty_catalog_does_not_clear_provisioning_sources(pool: PgPool) {
         let model_id: Uuid = sqlx::query_scalar(
             "INSERT INTO deployed_models (model_name, alias, created_by, is_composite, provisioning_source) VALUES ('existing', 'existing', '00000000-0000-0000-0000-000000000000', TRUE, 'existing.yaml') RETURNING id",
@@ -1059,7 +1059,7 @@ clay:
         )
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn catalog_reconciles_incompatible_aimd_overrides(pool: PgPool) {
         sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
             .execute(&pool).await.unwrap();
@@ -1098,7 +1098,7 @@ clay:
         assert_eq!(disabled, Some(serde_json::json!({"enabled":false})));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn catalog_keeps_realtime_fallback_statuses_unless_declared(pool: PgPool) {
         sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
             .execute(&pool).await.unwrap();
@@ -1127,7 +1127,7 @@ clay:
         assert_eq!(realtime_statuses().await, Vec::<i32>::new());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn catalog_declares_affinity_and_keeps_it_unless_redeclared(pool: PgPool) {
         sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
             .execute(&pool).await.unwrap();
@@ -1167,7 +1167,7 @@ clay:
         assert!(Catalog::load(directory.path()).is_err());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn catalog_sets_component_enabled_only_on_create(pool: PgPool) {
         sqlx::query("INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')")
             .execute(&pool).await.unwrap();
@@ -1200,7 +1200,7 @@ clay:
         assert_eq!(component().await, (true, 5));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn startup_apply_is_idempotent_and_versions_tariffs(pool: PgPool) {
         sqlx::query(
             "INSERT INTO inference_endpoints (name, url, created_by) VALUES ('onwards', 'http://onwards.test', '00000000-0000-0000-0000-000000000000')",
@@ -1339,7 +1339,7 @@ clay:
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn waiting_replica_uses_time_after_catalog_lock(pool: PgPool) {
         sqlx::query("INSERT INTO inference_endpoints (name,url,created_by) VALUES ('onwards','http://onwards.test','00000000-0000-0000-0000-000000000000')").execute(&pool).await.unwrap();
         let directory = tempdir().unwrap();

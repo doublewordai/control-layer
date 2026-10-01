@@ -383,7 +383,7 @@ mod tests {
     /// organizations' members can use it, and a later personal submission
     /// revokes neither. (Rows are keyed by the principal, so nothing is
     /// overwritten.)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn the_same_image_submitted_under_two_organizations_grants_both(pool: PgPool) {
         let alice = create_test_user(&pool, Role::StandardUser).await;
         let bob = create_test_user(&pool, Role::StandardUser).await; // member of org A only
@@ -435,7 +435,7 @@ mod tests {
         assert!(!can_view(&pool, img, dave.id, None).await, "dave");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn personal_image_is_private_org_image_is_org_visible(pool: PgPool) {
         let p = create_test_user(&pool, Role::StandardUser).await; // submits personally
         let q = create_test_user(&pool, Role::StandardUser).await; // submits under the org key
@@ -508,7 +508,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn resolve_attribution_distinguishes_personal_and_org_keys(pool: PgPool) {
         // Personal key: created_by == user_id -> no org.
         let person = create_test_user(&pool, Role::StandardUser).await;

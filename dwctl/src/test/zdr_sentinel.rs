@@ -241,7 +241,7 @@ async fn all_rows_json(pool: &PgPool, table: &str) -> String {
 
 /// A ZDR realtime request must not persist prompt or response content into
 /// `http_analytics`, while still recording the allowed billing/ops metadata.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn zdr_sentinel_realtime_request_does_not_persist_to_analytics(pool: PgPool) {
     let fixture = setup_sentinel_fixture(&pool).await;
     send_sentinel_request(&fixture).await;
@@ -273,7 +273,7 @@ async fn zdr_sentinel_realtime_request_does_not_persist_to_analytics(pool: PgPoo
 /// this assertion is expected to fail and is `#[ignore]`d. Un-ignore it (and
 /// enable `enable_request_logging`) when the capture gate exists.
 #[ignore = "ZDR request-logging capture gate not yet implemented"]
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn zdr_sentinel_realtime_request_not_in_request_logs(pool: PgPool) {
     let fixture = setup_sentinel_fixture(&pool).await;
     send_sentinel_request(&fixture).await;
@@ -328,7 +328,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
 /// `#[sqlx::test]` uses a `current_thread` runtime (sqlx `test_block_on`), so the
 /// thread-local subscriber installed here captures the daemon's spawned-task
 /// logs. A positive control (a marker logged from a spawned task) proves that.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
     // Capture every tracing event on this (single) test thread for the whole test.
     let log_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));

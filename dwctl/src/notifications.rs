@@ -1268,7 +1268,7 @@ mod tests {
     /// immediately (post-pay) without any card being involved. `cus_test_soft_decline`
     /// is the dummy provider's "this card always declines" customer, so if the
     /// branch leaked into the card path this would decline instead of crediting.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_invoices_instead_of_charging(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
@@ -1304,7 +1304,7 @@ mod tests {
     }
 
     /// The flag defaults false, so every existing account keeps the card path.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_defaults_to_charging_a_card(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
@@ -1326,7 +1326,7 @@ mod tests {
         assert_eq!(state, 1, "unchanged behaviour for card-billed accounts");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_first_soft_decline_pauses_without_charging(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 0).await;
@@ -1361,7 +1361,7 @@ mod tests {
         assert_eq!(transaction_count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_second_soft_decline_disables_without_charging(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_soft_decline", 1).await;
@@ -1381,7 +1381,7 @@ mod tests {
         assert_eq!(state.auto_topup_monthly_limit, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_hard_decline_disables_immediately(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_hard_decline", 0).await;
@@ -1401,7 +1401,7 @@ mod tests {
         assert_eq!(state.auto_topup_monthly_limit, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_provider_error_pauses_without_advancing_decline_state(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_provider_error", 1).await;
@@ -1430,7 +1430,7 @@ mod tests {
         assert_eq!(transaction_count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_payment_method_lookup_error_pauses_without_advancing_decline_state(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_payment_method_lookup_error", 0).await;
@@ -1449,7 +1449,7 @@ mod tests {
         assert!(state.auto_topup_retry_after > Some(Utc::now()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_without_payment_method_disables_auto_topup(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_no_payment_method", 0).await;
@@ -1475,7 +1475,7 @@ mod tests {
         assert_eq!(state.auto_topup_retry_after, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_success_resets_soft_decline_state(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
         configure_auto_topup_decline_test_user(&pool, user.id, "cus_test_success_after_decline", 1).await;
@@ -1643,7 +1643,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_skips_when_charge_already_in_flight(pool: sqlx::PgPool) {
         // A concurrent sweep on another replica already owns this charge. We must
         // skip without crediting the user, rather than treating it as a failure.
@@ -1676,7 +1676,7 @@ mod tests {
         assert_eq!(count.count, 0, "must not credit the user when another replica owns the charge");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_charges_below_threshold(pool: sqlx::PgPool) {
         // Create a test user with auto top-up configured
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
@@ -1714,7 +1714,7 @@ mod tests {
         assert!(txn.source_id.contains(&user.id.to_string()), "source_id should contain user ID");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_skips_above_threshold(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
@@ -1764,7 +1764,7 @@ mod tests {
         assert_eq!(count.count.unwrap(), 1, "Should only have the seed transaction");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_idempotent(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
@@ -1805,7 +1805,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_respects_monthly_limit(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
@@ -1873,7 +1873,7 @@ mod tests {
         assert_eq!(count.count.unwrap(), 2, "Should have charged (total $50 = limit)");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_blocks_when_limit_exceeded(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 
@@ -1945,7 +1945,7 @@ mod tests {
         assert_eq!(rows[1].description.as_deref(), Some("Automatic top-up (capped by monthly limit)"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_process_auto_topups_skips_when_limit_fully_exhausted(pool: sqlx::PgPool) {
         let user = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
 

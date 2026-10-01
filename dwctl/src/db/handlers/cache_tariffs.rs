@@ -294,7 +294,7 @@ mod tests {
     use crate::test::utils::{create_test_endpoint, create_test_model, create_test_user};
     use sqlx::PgPool;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn enable_then_disable_toggles_resolver(pool: PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -325,7 +325,7 @@ mod tests {
         assert!(!ModelConfigResolver::new(pool).resolve("enable-alias").await.unwrap().enabled);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn enable_twice_supersedes_keeping_history(pool: PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -362,7 +362,7 @@ mod tests {
         assert_eq!(active, Some(1), "exactly one active version");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn partial_unique_index_rejects_two_active_versions(pool: PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -392,7 +392,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn get_active_reflects_enable_disable(pool: PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;

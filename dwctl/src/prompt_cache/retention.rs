@@ -196,7 +196,7 @@ mod tests {
             .unwrap()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn purges_only_entries_expired_beyond_the_grace(pool: PgPool) {
         let long_expired = insert(&pool, "long-expired", 30 * DAY).await;
         let within_grace = insert(&pool, "within-grace", 3 * DAY).await;
@@ -209,7 +209,7 @@ mod tests {
         assert!(left.contains(&within_grace) && left.contains(&live));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn purge_is_bounded_by_batch_size_and_oldest_first(pool: PgPool) {
         let oldest = insert(&pool, "a", 40 * DAY).await;
         let middle = insert(&pool, "b", 30 * DAY).await;
@@ -222,7 +222,7 @@ mod tests {
         let _ = (oldest, middle);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn purge_skips_an_entry_a_request_holds(pool: PgPool) {
         let held = insert(&pool, "held", 30 * DAY).await;
         let free = insert(&pool, "free", 30 * DAY).await;
@@ -239,7 +239,7 @@ mod tests {
         let _ = free;
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn purge_walks_the_expiry_index(pool: PgPool) {
         sqlx::raw_sql(
             "INSERT INTO prompt_cache_entries
@@ -272,7 +272,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn entries_autovacuum_on_a_fixed_row_count(pool: PgPool) {
         let options: Vec<String> =
             sqlx::query_scalar("SELECT unnest(reloptions) FROM pg_class WHERE oid = 'prompt_cache_entries'::regclass")
@@ -289,7 +289,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn sweep_drains_in_batches_and_reports_the_total(pool: PgPool) {
         for n in 0..7 {
             insert(&pool, &format!("old-{n}"), 30 * DAY).await;
@@ -305,7 +305,7 @@ mod tests {
         assert_eq!(remaining(&pool).await.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn sweep_yields_when_another_sweep_holds_the_lock(pool: PgPool) {
         insert(&pool, "old", 30 * DAY).await;
         let mut holder = pool.acquire().await.unwrap().detach();

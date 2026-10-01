@@ -524,7 +524,7 @@ mod tests {
             .unwrap()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_claim_picks_up_due_deliveries(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -538,7 +538,7 @@ mod tests {
         assert_eq!(claimed[0].id, delivery.id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_claim_skips_future_deliveries(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
 
@@ -553,7 +553,7 @@ mod tests {
         assert_eq!(claimed.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_claim_bumps_next_attempt_at(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         create_test_delivery(&pool, webhook.id, None).await;
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(claimed_again.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_claim_skips_delivered(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(claimed.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_claim_skips_exhausted(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -600,7 +600,7 @@ mod tests {
         assert_eq!(claimed.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_mark_failed_sets_retry_schedule(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -625,7 +625,7 @@ mod tests {
         assert!((280..=320).contains(&delay), "expected ~300s delay, got {}s", delay);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_mark_failed_exhausts_at_max_retries(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -640,7 +640,7 @@ mod tests {
         assert_eq!(d.attempt_count, 7);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_mark_failed_respects_custom_max_retries(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -655,7 +655,7 @@ mod tests {
         assert_eq!(d.attempt_count, 3);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_full_retry_lifecycle(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -702,7 +702,7 @@ mod tests {
         assert_eq!(claimed.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_successful_delivery_resets_failures(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;
@@ -732,7 +732,7 @@ mod tests {
         assert_eq!(claimed.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_mark_exhausted_is_terminal(pool: PgPool) {
         let (webhook, _) = create_test_webhook(&pool).await;
         let delivery = create_test_delivery(&pool, webhook.id, None).await;

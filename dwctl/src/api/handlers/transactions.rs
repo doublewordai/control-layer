@@ -337,124 +337,57 @@ mod tests {
             .id
     }
 
-    // Test: BillingManager can create transactions
-    #[sqlx::test]
+    // Exercise the same endpoint for each role with one app, retaining separate
+    // actors and recipients so earlier grants cannot affect later cases.
+    #[dwctl_test_macros::test]
     #[test_log::test]
-    async fn test_billing_manager_can_create_transaction(pool: PgPool) {
+    async fn test_create_transaction_permission_matrix(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let billing_manager = create_test_user(&pool, Role::BillingManager).await;
-        let user = create_test_user(&pool, Role::StandardUser).await;
-
-        let transaction_data = json!({
-            "user_id": user.id.to_string(),
-            "transaction_type": "admin_grant",
-            "amount": "100.0",
-            "source_id": user.id.to_string(),
-            "description": "Test credit grant"
-        });
-
-        let response = app
-            .post("/admin/api/v1/transactions")
-            .add_header(&add_auth_headers(&billing_manager)[0].0, &add_auth_headers(&billing_manager)[0].1)
-            .add_header(&add_auth_headers(&billing_manager)[1].0, &add_auth_headers(&billing_manager)[1].1)
-            .json(&transaction_data)
-            .await;
-
-        response.assert_status(axum::http::StatusCode::CREATED);
-        let transaction: CreditTransactionResponse = response.json();
-        assert_eq!(transaction.user_id, user.id);
-        assert_eq!(transaction.amount, Decimal::from_str("100.0").unwrap());
-        assert_eq!(transaction.transaction_type, CreditTransactionType::AdminGrant);
-        assert_eq!(transaction.source_id, user.id.to_string());
-        assert_eq!(transaction.description, Some("Test credit grant".to_string()));
-    }
-
-    // Test: Standard user cannot create transactions
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_standard_user_cannot_create_transaction(pool: PgPool) {
-        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user(&pool, Role::StandardUser).await;
-        let other_user = create_test_user(&pool, Role::StandardUser).await;
-
-        let transaction_data = json!({
-            "user_id": other_user.id.to_string(),
-            "transaction_type": "admin_grant",
-            "amount": "100.0",
-            "source_id": user.id.to_string(),
-            "description": "Unauthorized attempt"
-        });
-
-        let response = app
-            .post("/admin/api/v1/transactions")
-            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
-            .json(&transaction_data)
-            .await;
-
-        response.assert_status_forbidden();
-    }
-
-    // Test: PlatformManager can create transactions (has same permissions as BillingManager)
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_platform_manager_can_create_transaction(pool: PgPool) {
-        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let platform_manager = create_test_user(&pool, Role::PlatformManager).await;
-        let user = create_test_user(&pool, Role::StandardUser).await;
-
-        let transaction_data = json!({
-            "user_id": user.id.to_string(),
-            "transaction_type": "admin_grant",
-            "amount": "100.0",
-            "source_id": platform_manager.id.to_string(),
-            "description": "Test credit grant from PlatformManager"
-        });
-
-        let response = app
-            .post("/admin/api/v1/transactions")
-            .add_header(&add_auth_headers(&platform_manager)[0].0, &add_auth_headers(&platform_manager)[0].1)
-            .add_header(&add_auth_headers(&platform_manager)[1].0, &add_auth_headers(&platform_manager)[1].1)
-            .json(&transaction_data)
-            .await;
-
-        response.assert_status(axum::http::StatusCode::CREATED);
-        let transaction: CreditTransactionResponse = response.json();
-        assert_eq!(transaction.user_id, user.id);
-        assert_eq!(transaction.amount, Decimal::from_str("100.0").unwrap());
-        assert_eq!(transaction.transaction_type, CreditTransactionType::AdminGrant);
-        assert_eq!(transaction.source_id, platform_manager.id.to_string());
-        assert_eq!(transaction.description, Some("Test credit grant from PlatformManager".to_string()));
-    }
-
-    // Test: RequestViewer user cannot create transactions
-    #[sqlx::test]
-    #[test_log::test]
-    async fn test_request_viewer_cannot_create_transaction(pool: PgPool) {
-        let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        let user = create_test_user(&pool, Role::RequestViewer).await;
-        let other_user = create_test_user(&pool, Role::StandardUser).await;
-
-        let transaction_data = json!({
-            "user_id": other_user.id.to_string(),
-            "transaction_type": "admin_grant",
-            "amount": "100.0",
-            "source_id": user.id.to_string(),
-            "description": "Unauthorized attempt"
-        });
-
-        let response = app
-            .post("/admin/api/v1/transactions")
-            .add_header(&add_auth_headers(&user)[0].0, &add_auth_headers(&user)[0].1)
-            .add_header(&add_auth_headers(&user)[1].0, &add_auth_headers(&user)[1].1)
-            .json(&transaction_data)
-            .await;
-
-        response.assert_status_forbidden();
+        for (role, allowed, description) in [
+            (Role::BillingManager, true, "Test credit grant"),
+            (Role::StandardUser, false, "Unauthorized attempt"),
+            (Role::PlatformManager, true, "Test credit grant from PlatformManager"),
+            (Role::RequestViewer, false, "Unauthorized attempt"),
+        ] {
+            let actor = create_test_user(&pool, role.clone()).await;
+            let user = create_test_user(&pool, Role::StandardUser).await;
+            let source_id = if role == Role::PlatformManager || !allowed {
+                actor.id
+            } else {
+                user.id
+            };
+            let headers = add_auth_headers(&actor);
+            let response = app
+                .post("/admin/api/v1/transactions")
+                .add_header(&headers[0].0, &headers[0].1)
+                .add_header(&headers[1].0, &headers[1].1)
+                .json(&json!({
+                    "user_id": user.id.to_string(),
+                    "transaction_type": "admin_grant",
+                    "amount": "100.0",
+                    "source_id": source_id.to_string(),
+                    "description": description
+                }))
+                .await;
+            let expected = if allowed {
+                axum::http::StatusCode::CREATED
+            } else {
+                axum::http::StatusCode::FORBIDDEN
+            };
+            assert_eq!(response.status_code(), expected, "role {role:?}");
+            if allowed {
+                let transaction: CreditTransactionResponse = response.json();
+                assert_eq!(transaction.user_id, user.id, "role {role:?}");
+                assert_eq!(transaction.amount, Decimal::from_str("100.0").unwrap(), "role {role:?}");
+                assert_eq!(transaction.transaction_type, CreditTransactionType::AdminGrant, "role {role:?}");
+                assert_eq!(transaction.source_id, source_id.to_string(), "role {role:?}");
+                assert_eq!(transaction.description.as_deref(), Some(description), "role {role:?}");
+            }
+        }
     }
 
     // Test: GET /transactions/{id} returns own transaction for standard user
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_own_transaction_as_standard_user(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -479,7 +412,7 @@ mod tests {
     }
 
     // Test: GET /transactions/{id} returns 404 for other user's transaction (not 403)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_other_user_transaction_returns_404(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -501,7 +434,7 @@ mod tests {
     }
 
     // Test: BillingManager can view any user's transaction
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_billing_manager_can_view_any_transaction(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -526,7 +459,7 @@ mod tests {
     }
 
     // Test: GET /transactions without query params returns only own transactions for standard user
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_transactions_returns_own_for_standard_user(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -553,7 +486,7 @@ mod tests {
     }
 
     // Test: GET /transactions?user_id=X returns 403 for standard user querying another user
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_transactions_with_other_user_id_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -571,7 +504,7 @@ mod tests {
     }
 
     // Test: BillingManager without params returns only own transactions (changed behavior)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_billing_manager_can_list_all_transactions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -600,7 +533,7 @@ mod tests {
     }
 
     // Test: BillingManager can filter transactions by user_id
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_billing_manager_can_filter_by_user_id(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -627,7 +560,7 @@ mod tests {
     }
 
     // Test: Create transaction validates amount > 0 (zero amount)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_transaction_validates_amount_zero(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -654,7 +587,7 @@ mod tests {
     }
 
     // Test: Create transaction validates amount > 0 (negative amount)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_transaction_validates_amount_negative(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -681,7 +614,7 @@ mod tests {
     }
 
     // Test: Create transaction validates transaction type (rejects invalid types at deserialization)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_transaction_validates_type(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -708,7 +641,7 @@ mod tests {
     }
 
     // Test: Create transaction validates user_id is provided, provides 422
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_transaction_requires_user_id(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -732,7 +665,7 @@ mod tests {
     }
 
     // Test: Create transaction checks for insufficient balance on removal
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_transaction_insufficient_balance(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -770,7 +703,7 @@ mod tests {
     }
 
     // Test: GET /transactions/{id} returns own transaction for RequestViewer
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_own_transaction_as_request_viewer(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -792,7 +725,7 @@ mod tests {
     }
 
     // Test: GET /transactions/{id} returns 404 for other user's transaction (RequestViewer)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_other_user_transaction_returns_404_request_viewer(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -814,7 +747,7 @@ mod tests {
     }
 
     // Test: PlatformManager can view any user's transaction (has ReadAll permission)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_view_any_transaction(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -836,7 +769,7 @@ mod tests {
     }
 
     // Test: GET /transactions without query params returns only own transactions for RequestViewer
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_transactions_returns_own_for_request_viewer(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -863,7 +796,7 @@ mod tests {
     }
 
     // Test: PlatformManager without params returns only own transactions (changed behavior)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_list_all_transactions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -892,7 +825,7 @@ mod tests {
     }
 
     // Test: GET /transactions?user_id=X returns 403 for RequestViewer querying another user
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_transactions_with_other_user_id_forbidden_request_viewer(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -910,7 +843,7 @@ mod tests {
     }
 
     // Test: PlatformManager can filter transactions by user_id (has ReadAll permission)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_filter_by_user_id(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -937,7 +870,7 @@ mod tests {
     }
 
     // Test: Pagination works for GET /transactions
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_transactions_pagination(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -974,7 +907,7 @@ mod tests {
     }
 
     // Test: BillingManager without params returns own transactions (not all)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_billing_manager_without_params_returns_own(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1003,7 +936,7 @@ mod tests {
     }
 
     // Test: BillingManager with all=true returns all transactions
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_billing_manager_with_all_returns_all_transactions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1033,7 +966,7 @@ mod tests {
     }
 
     // Test: Standard user with all=true returns 403
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_with_all_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1049,7 +982,7 @@ mod tests {
     }
 
     // Test: all=true takes precedence over user_id parameter
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_all_takes_precedence_over_user_id(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1078,7 +1011,7 @@ mod tests {
     }
 
     // Test: PlatformManager with all=true returns all transactions
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_with_all_returns_all_transactions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1108,7 +1041,7 @@ mod tests {
     }
 
     // Test: RequestViewer with all=true returns 403
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_viewer_with_all_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1126,7 +1059,7 @@ mod tests {
     // Regression test: Ensure high-precision decimals can be serialized to JSON without panic
     // Previously, DECIMAL(64,32) values caused "CapacityError: insufficient capacity" panic
     // during rust_decimal string conversion in JSON serialization
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_high_precision_decimal_serialization(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1169,7 +1102,7 @@ mod tests {
     }
 
     // Test: Verify that Decimal serialization preserves arbitrary precision
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_decimal_precision_preserved_in_json(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1223,7 +1156,7 @@ mod tests {
     }
 
     // Test: Batch grouping aggregates correctly with mixed transaction types
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_grouping_with_mixed_transactions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1447,7 +1380,7 @@ mod tests {
     }
 
     // Test: Batch grouping pagination works correctly
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_batch_grouping_pagination(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1561,7 +1494,7 @@ mod tests {
     // Test: page_start_balance is calculated correctly with batch grouping
     // This is a regression test for the bug where page_start_balance was calculated using
     // raw transaction counts instead of grouped transaction counts
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_page_start_balance_with_batch_grouping(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1857,7 +1790,7 @@ mod tests {
     // Test: page_start_balance is calculated correctly when filtering by date range
     // This is a regression test for the bug where page_start_balance showed current balance
     // instead of the balance at the end of the filtered date range
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_page_start_balance_with_date_filter(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;

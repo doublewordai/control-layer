@@ -457,7 +457,7 @@ mod tests {
     /// ownership the onwards keyset queries exempt from the group-access and
     /// balance gates, without which resume legs 403 on any group-restricted or
     /// priced composite.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn provision_global_key_is_idempotent_hidden_and_system_owned(pool: PgPool) {
         let first = provision_global_key(&pool).await.unwrap();
         let second = provision_global_key(&pool).await.unwrap();
@@ -508,7 +508,7 @@ mod tests {
         id
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn routes_only_include_composites_with_a_completions_pool(pool: PgPool) {
         let user = create_test_user(&pool, Role::PlatformManager).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -558,7 +558,7 @@ mod tests {
         assert!(routes.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn per_route_config_reaches_the_cache(pool: PgPool) {
         let user = create_test_user(&pool, Role::PlatformManager).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -589,7 +589,7 @@ mod tests {
     /// before onwards picks a member of it. The route's config therefore comes
     /// from the member that exists only to serve completions — the validated
     /// target — not from the free first hop it shares with the default pool.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn the_route_config_comes_from_the_completions_only_member(pool: PgPool) {
         let user = create_test_user(&pool, Role::PlatformManager).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -628,7 +628,7 @@ mod tests {
     /// to state one states it for the pool. A silent (NULL) member ahead of it
     /// must not win by position: that is exactly how a chat-mode route rendered
     /// its resume prefix in thinking mode and leaked a `</think>` to a client.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn the_first_non_null_render_kwargs_in_the_pool_wins(pool: PgPool) {
         let user = create_test_user(&pool, Role::PlatformManager).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -704,7 +704,7 @@ mod tests {
         assert_eq!(bare.merged_render_kwargs(None), None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn purpose_resolver_reads_through_and_memoises(pool: PgPool) {
         let user = create_test_user(&pool, Role::StandardUser).await;
         let key = crate::test::utils::create_test_api_key_for_user(&pool, user.id).await;

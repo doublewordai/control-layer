@@ -58,7 +58,7 @@ async fn captures(pool: &sqlx::PgPool, expected: usize) -> Vec<Capture> {
     .expect("analytics captures did not arrive")
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn gateway_capture_anchors(pool: sqlx::PgPool) {
     // The app spawns tasks that only see the process-wide subscriber. Re-exec so
     // this test owns the global default without affecting parallel tests.
@@ -215,7 +215,7 @@ async fn gateway_capture_anchors(pool: sqlx::PgPool) {
 
 // Without a local OTel context dwctl is a transparent hop: the caller's W3C
 // headers reach a trusted upstream unchanged.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn trace_headers_pass_through_without_local_tracing(pool: sqlx::PgPool) {
     let mock = wiremock::MockServer::start().await;
     super::mount_chat_completions_mock(&mock).await;

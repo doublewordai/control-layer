@@ -718,7 +718,7 @@ mod tests {
 
     // -- CRUD --
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_connection(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -740,7 +740,7 @@ mod tests {
         assert!(body["id"].as_str().is_some());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_connection_requires_platform_manager(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -757,7 +757,7 @@ mod tests {
         resp.assert_status(StatusCode::FORBIDDEN);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_connections(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -789,7 +789,7 @@ mod tests {
         assert_eq!(body["data"].as_array().unwrap().len(), 2);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_connection(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -816,7 +816,7 @@ mod tests {
         assert_eq!(body["name"], "my-conn");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_connection(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -848,7 +848,7 @@ mod tests {
 
     // -- Ownership isolation --
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_connection_not_visible_to_other_user(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -883,7 +883,7 @@ mod tests {
         assert_eq!(list["data"].as_array().unwrap().len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cannot_delete_other_users_connection(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -910,7 +910,7 @@ mod tests {
 
     // -- Sync scoping --
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_trigger_sync(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -939,7 +939,7 @@ mod tests {
         assert_eq!(body["strategy"], "snapshot");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_sync_cross_connection_rejected(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -982,7 +982,7 @@ mod tests {
             .assert_status(StatusCode::NOT_FOUND);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_sync_entries_cross_connection_rejected(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -1026,7 +1026,7 @@ mod tests {
 
     // -- Validation --
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_connection_invalid_provider(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -1045,7 +1045,7 @@ mod tests {
             .assert_status(StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_trigger_sync_invalid_strategy(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -1069,7 +1069,7 @@ mod tests {
             .assert_status(StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_select_strategy_requires_file_keys(pool: PgPool) {
         let (app, _bg) = create_test_app(pool.clone(), false).await;

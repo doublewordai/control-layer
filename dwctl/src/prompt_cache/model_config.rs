@@ -114,7 +114,7 @@ mod tests {
         .unwrap();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn disabled_without_tariff_and_unknown_model(pool: sqlx::PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -127,7 +127,7 @@ mod tests {
         assert_eq!(r.resolve("nope").await.unwrap(), ModelCacheConfig::DISABLED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn active_tariff_enables_with_its_floor(pool: sqlx::PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;
@@ -139,7 +139,7 @@ mod tests {
         assert_eq!(cfg.min_prefix_tokens, 2048);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn expired_tariff_is_disabled(pool: sqlx::PgPool) {
         let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
         let endpoint = create_test_endpoint(&pool, "ep", user.id).await;

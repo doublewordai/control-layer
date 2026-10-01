@@ -3035,7 +3035,7 @@ mod tests {
 
     // ── Self-serve org creation ────────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_can_create_organization(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3061,7 +3061,7 @@ mod tests {
 
     /// A workspace cannot be created naming a contact address its owner does
     /// not reach - otherwise its notifications land on a stranger.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_contact_email_must_be_at_the_owners_domain(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3090,7 +3090,7 @@ mod tests {
 
     /// On a personal domain "same domain" would admit every other customer of
     /// that provider, so the rule tightens to the owner's exact address.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_personal_email_owner_must_use_their_own_address(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3119,7 +3119,7 @@ mod tests {
     /// Domains are case-insensitive; the things we compare them against are
     /// not. Without normalising, `Alice@Acme.test` claims `Acme.test` and a
     /// later `bob@acme.test` matches nothing.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_domain_claim_is_case_insensitive(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3153,7 +3153,7 @@ mod tests {
 
     /// A domain can hold several workspaces - prod and dev, say - and a join
     /// request goes to the oldest surviving one.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_domain_can_hold_several_workspaces(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3192,7 +3192,7 @@ mod tests {
     /// username verbatim, and `find_by_domain`'s `username = $1` arm would
     /// match it on every future signup at that domain - hijacking the domain.
     /// The name the user typed still becomes the display name.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_personal_email_owner_username_is_opaque(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3234,7 +3234,7 @@ mod tests {
     /// proxy-header auth. The victim's signup finds no workspace for the
     /// domain, so no membership is granted and the attacker's member list
     /// discloses no victim PII.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_personal_email_owner_cannot_hijack_unclaimed_domain(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3321,7 +3321,7 @@ mod tests {
     /// comment calls a legacy shape, and which is the tempting minimal fix -
     /// would leave this open, so the guard has to be that user-supplied text
     /// never reaches the username at all.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_personal_email_owner_cannot_plant_a_suffixed_domain(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3350,7 +3350,7 @@ mod tests {
     /// The fix preserves the business-email path: an owner on a non-personal
     /// domain still claims that domain as `{domain}~{suffix}` and remains
     /// findable by colleagues. (Regression guard.)
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_business_email_owner_still_claims_domain(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3383,7 +3383,7 @@ mod tests {
 
     /// A soft-deleted workspace must never receive join requests - nobody is
     /// left to approve them.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_deleted_workspace_is_not_matched_by_domain(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3431,7 +3431,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_becomes_owner_of_created_org(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3465,7 +3465,7 @@ mod tests {
     /// Paying as an org admin verifies the organization rather than the human
     /// who clicked, so a client asking "can this workspace pay" has to read the
     /// summary. This pins that the two never get conflated.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_user_organizations_summary_reflects_org_verification(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3520,7 +3520,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_user_organizations_summary_reflects_org_zero_data_retention(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3572,7 +3572,7 @@ mod tests {
         assert_eq!(orgs[0]["zero_data_retention"].as_bool(), Some(true));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_organization_owner_can_update_zero_data_retention(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3598,7 +3598,7 @@ mod tests {
         assert_eq!(resp.json::<serde_json::Value>()["zero_data_retention"].as_bool(), Some(true));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_organization_owners_cannot_touch_serving_settings_only_platform_managers(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3662,7 +3662,7 @@ mod tests {
         assert_eq!(body["self_hosted_only"].as_bool(), Some(true));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_organization_non_owners_cannot_update_zero_data_retention(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3728,7 +3728,7 @@ mod tests {
         assert_eq!(resp.json::<serde_json::Value>()["zero_data_retention"].as_bool(), Some(false));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_standard_user_cannot_set_owner_id(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3747,7 +3747,7 @@ mod tests {
 
     // ── Org membership limit ──────────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cannot_create_org_when_at_limit(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3777,7 +3777,7 @@ mod tests {
         assert!(body.contains("maximum"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_resend_invite_rotates_the_token(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3917,7 +3917,7 @@ mod tests {
     /// Scenario 3: the domain matches, auto-join is off, and the user is told
     /// so and left to decide. Nothing is filed for them — that silent filing
     /// is precisely what this replaces.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_onboarding_context_offers_the_choice_on_a_domain_match(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3950,7 +3950,7 @@ mod tests {
     /// Receiving mail at acme.test earns you "your company has a workspace"
     /// and no more. Leaking the workspace's display name, size or owner would
     /// turn every signup into a lookup of what a given company runs.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_domain_match_names_only_the_domain(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3976,7 +3976,7 @@ mod tests {
     /// Scenario 4: a personal address matches nothing, even if some workspace
     /// has claimed gmail.com. Otherwise every consumer signup would be told
     /// their "company" already has a workspace.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_onboarding_context_ignores_personal_domains(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -3994,7 +3994,7 @@ mod tests {
     /// Scenario 1: an explicit invitation is surfaced, with enough to render
     /// the accept screen — this one *was* a deliberate human decision, so it
     /// names the organization.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_onboarding_context_surfaces_an_invitation(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4014,7 +4014,7 @@ mod tests {
     }
 
     /// Once you're in, there is no decision left to offer.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_onboarding_context_goes_quiet_for_a_member(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4045,7 +4045,7 @@ mod tests {
     ///
     /// The button is real UI: a double-click, a retry after a flaky network,
     /// or a reloaded tab must not produce a second row or a spurious failure.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_access_is_opt_in_and_idempotent(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4095,7 +4095,7 @@ mod tests {
 
     /// Scenario 2, late: the owner switched auto-join on after this user
     /// signed up, so there is nobody left to ask and they go straight in.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_access_joins_immediately_when_auto_join_is_on(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4139,7 +4139,7 @@ mod tests {
     /// slot the request would. The idempotent insert hands that row back, and
     /// reporting it as `requested` would tell the user to wait for an approval
     /// they don't need — they hold an invitation they could accept now.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_access_reports_an_outstanding_invitation(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4191,7 +4191,7 @@ mod tests {
 
     /// The organization is resolved from the caller's own address, so a caller
     /// with no matching domain has nothing to ask and no way to name a target.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_access_needs_a_matching_domain(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4211,7 +4211,7 @@ mod tests {
     /// Scenario 1's acceptance path. The invitee never opened the emailed
     /// link — and could not be handed it, since only its hash is stored — so
     /// they accept by id, proving the mailbox with their own address instead.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_invitation_can_be_accepted_by_id_without_its_token(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4246,7 +4246,7 @@ mod tests {
     ///
     /// Reported as 404 rather than 403 — telling a caller "that invitation is
     /// real, just not yours" confirms a live invitation into a named org.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_invitation_by_id_is_refused_to_anyone_else(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4277,7 +4277,7 @@ mod tests {
     }
 
     /// Declining clears it, so onboarding falls through to ordinary setup.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_invitation_can_be_declined_by_id(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4310,7 +4310,7 @@ mod tests {
 
     /// Auto-join decides who gets in with nobody reviewing them, so it sits
     /// beside zero data retention on the owner-only side of the line.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_auto_join_is_owner_only(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4359,7 +4359,7 @@ mod tests {
 
     /// Off unless someone turns it on — including for every organization that
     /// existed before the setting did.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_auto_join_defaults_off(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4377,7 +4377,7 @@ mod tests {
     }
 
     /// Someone else's onboarding context is not readable.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_onboarding_context_is_not_readable_for_others(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4407,7 +4407,7 @@ mod tests {
 
     /// The queue names people who share your email domain, so it's gated on
     /// managing the org — being a member of it isn't enough.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_join_requests_hidden_from_ordinary_members(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4445,7 +4445,7 @@ mod tests {
     /// Who gets told about a join request. Owners and admins can act on one;
     /// plain members cannot, and a pending or requested row is not a person
     /// with authority to approve anything.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_list_admin_emails_covers_only_those_who_can_decide(pool: PgPool) {
         let owner = create_test_user(&pool, Role::StandardUser).await;
         let admin = create_test_user(&pool, Role::StandardUser).await;
@@ -4472,7 +4472,7 @@ mod tests {
 
     /// A soft-deleted owner keeps their `users` row and their membership, so
     /// without the filter the workspace would keep mailing a closed account.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_list_admin_emails_skips_deleted_accounts(pool: PgPool) {
         let owner = create_test_user(&pool, Role::StandardUser).await;
         let admin = create_test_user(&pool, Role::StandardUser).await;
@@ -4501,7 +4501,7 @@ mod tests {
     /// mail them. A second, racing approval finds nothing to update and gets
     /// `None` — otherwise every admin who pressed the button would send a
     /// duplicate "you're in" email.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_approve_join_request_returns_the_approved_user_once(pool: PgPool) {
         let owner = create_test_user(&pool, Role::StandardUser).await;
         let joiner = create_test_user(&pool, Role::StandardUser).await;
@@ -4517,7 +4517,7 @@ mod tests {
         assert_eq!(again, None, "a second approval has nobody new to notify");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_approve_join_request_makes_an_active_member(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4560,7 +4560,7 @@ mod tests {
     /// Declining removes the row rather than tombstoning it, so the user can
     /// ask again - a permanent record would silently block them forever via
     /// the unique constraint on (user_id, organization_id).
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_decline_join_request_allows_asking_again(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4586,7 +4586,7 @@ mod tests {
     }
 
     /// Managing one org must not grant authority over another's queue.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_join_request_decisions_are_scoped_to_their_org(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4619,7 +4619,7 @@ mod tests {
     /// managing the org, which they can't do until they're approved. Without a
     /// user-scoped view, a request filed on their behalf at signup would be
     /// invisible to the only person waiting on it.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_user_sees_their_own_pending_join_request(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4657,7 +4657,7 @@ mod tests {
 
     /// Approval is the end of the request, so the banner it drives must clear
     /// on its own rather than lingering after the user is already inside.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_own_join_requests_clear_once_decided(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4709,7 +4709,7 @@ mod tests {
 
     /// Requests are the caller's own business: one user must not be able to
     /// enumerate which organizations another has asked to join.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_own_join_requests_are_not_readable_by_other_users(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4736,7 +4736,7 @@ mod tests {
         assert!(resp.json::<serde_json::Value>().as_array().unwrap().is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_member_can_leave_organization(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4785,7 +4785,7 @@ mod tests {
         assert_eq!(members.len(), 1); // Only owner remains
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_last_owner_cannot_leave(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4813,7 +4813,7 @@ mod tests {
         assert!(body.contains("last owner"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_non_member_cannot_leave(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4845,7 +4845,7 @@ mod tests {
 
     // ── Last-owner guard ─────────────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cannot_remove_last_owner(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4875,7 +4875,7 @@ mod tests {
         assert!(body.contains("last owner"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_can_remove_owner_when_another_exists(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4913,7 +4913,7 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::NO_CONTENT);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cannot_demote_last_owner(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4946,7 +4946,7 @@ mod tests {
 
     // ── Privilege escalation prevention ──────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_admin_cannot_assign_owner_role(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -4996,7 +4996,7 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::FORBIDDEN);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_admin_cannot_add_member_as_owner(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5037,7 +5037,7 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::FORBIDDEN);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_owner_can_assign_owner_role(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5070,7 +5070,7 @@ mod tests {
         assert_eq!(body["role"].as_str().unwrap(), "owner");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_assign_owner_role(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5104,7 +5104,7 @@ mod tests {
 
     // ── Validation endpoint ──────────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_set_active_organization_validates_membership(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5156,7 +5156,7 @@ mod tests {
         resp.assert_status(axum::http::StatusCode::OK);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_set_active_org_cookie_includes_domain_when_configured(pool: PgPool) {
         let mut config = create_test_config();
@@ -5204,7 +5204,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_set_active_org_cookie_omits_domain_when_not_configured(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5298,7 +5298,7 @@ mod tests {
             .await
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_org_with_invalid_email_rejected(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5330,7 +5330,7 @@ mod tests {
         assert_eq!(body["email"].as_str().unwrap(), "billing@example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_org_email_does_not_apply_immediately(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5376,7 +5376,7 @@ mod tests {
         assert_eq!(body["email"].as_str().unwrap(), "billing@example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_org_display_name_still_applies_when_email_pending(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5400,7 +5400,7 @@ mod tests {
         assert_eq!(body["pending_email_change"]["new_email"].as_str().unwrap(), "new@example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_org_with_same_email_is_noop(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5433,7 +5433,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_neither_side_alone_applies_email_change(pool: PgPool) {
         // The security claim of double-opt-in: confirming only ONE side
@@ -5478,7 +5478,7 @@ mod tests {
         assert!(row.1.is_none(), "old side should NOT be confirmed");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_both_sides_confirm_applies_change_in_any_order(pool: PgPool) {
         // Two scenarios in one test: click new-then-old, and click old-then-new.
@@ -5542,7 +5542,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_confirm_email_change_invalid_token(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5552,7 +5552,7 @@ mod tests {
         assert!(resp.text().contains("invalid"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_expired_token_returns_not_found(pool: PgPool) {
         // The UPDATE in confirm_*_email_side filters `expires_at > NOW()`, so
@@ -5585,7 +5585,7 @@ mod tests {
         assert_eq!(resp.json::<serde_json::Value>()["email"].as_str().unwrap(), "billing@example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_second_email_change_supersedes_first(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5618,7 +5618,7 @@ mod tests {
         assert_eq!(rows, vec![("two@example.com".to_string(), owner.id)]);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_superseded_tokens_become_inert(pool: PgPool) {
         // After a second PATCH, BOTH of the *first* request's tokens must be
@@ -5660,7 +5660,7 @@ mod tests {
         assert_eq!(resp.json::<serde_json::Value>()["email"].as_str().unwrap(), "billing@example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_confirm_token_cannot_be_replayed(pool: PgPool) {
         // Each side's UPDATE filters on `*_confirmed_at IS NULL`, so replaying
@@ -5685,7 +5685,7 @@ mod tests {
             .assert_status(axum::http::StatusCode::NOT_FOUND);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_org_with_invalid_email_rejected(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5707,7 +5707,7 @@ mod tests {
     // flow. A future refactor of `can_manage_org_resource` that broadens
     // access would be caught here.
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_plain_member_cannot_patch_org_email(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5746,7 +5746,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_non_member_cannot_patch_org_email(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -5774,7 +5774,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_can_patch_org_email_without_membership(pool: PgPool) {
         // A platform manager who is NOT a member of the org must still be able
@@ -5800,7 +5800,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_token_for_one_org_cannot_affect_another(pool: PgPool) {
         // Per-row tenancy: a token issued for org A must never change org B's
@@ -5840,7 +5840,7 @@ mod tests {
         assert_eq!(resp.json::<serde_json::Value>()["email"].as_str().unwrap(), "b@example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_soft_deleted_org_cannot_have_email_changed_via_token(pool: PgPool) {
         // If an org is soft-deleted between PATCH and click, both tokens must
@@ -5878,7 +5878,7 @@ mod tests {
         assert_eq!(count, 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_writes_both_verification_emails(pool: PgPool) {
         // The file transport in the default test config writes each email to
@@ -5945,7 +5945,7 @@ mod tests {
 
     // ── MX-record deliverability check ─────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_mx_check_rejects_undeliverable_domain(pool: PgPool) {
         // RFC 6761 reserves `.invalid` as a TLD that must always NXDOMAIN.
@@ -5977,7 +5977,7 @@ mod tests {
 
     // ── Pending state visibility ──────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_org_surfaces_pending_email_change(pool: PgPool) {
         // A dashboard refresh mid-verification should still see the pending
@@ -6016,7 +6016,7 @@ mod tests {
         assert!(body["pending_email_change"]["expires_at"].is_string());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_other_fields_still_reports_pending_email_change(pool: PgPool) {
         // After initiating an email change, a follow-up PATCH that touches
@@ -6058,7 +6058,7 @@ mod tests {
 
     // ── Additive manage_keys org role (per-member key governance) ─────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_member_manage_keys_grant_lifecycle(pool: PgPool) {
         let (server, _bg) = create_test_app(pool.clone(), false).await;

@@ -67,7 +67,7 @@ fn jsonl_upload() -> axum_test::multipart::MultipartForm {
         .add_part("file", axum_test::multipart::Part::bytes(jsonl.as_bytes()).file_name("in.jsonl"))
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn owner_sets_disabled_modalities_and_the_org_reports_them(pool: PgPool) {
     let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -149,7 +149,7 @@ async fn owner_sets_disabled_modalities_and_the_org_reports_them(pool: PgPool) {
     assert!(resp.status_code().is_client_error(), "got {}", resp.status_code());
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn only_owners_change_disabled_modalities(pool: PgPool) {
     let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -196,7 +196,7 @@ async fn only_owners_change_disabled_modalities(pool: PgPool) {
     assert_eq!(resp.json::<serde_json::Value>()["disabled_modalities"], json!([]));
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn batch_entry_points_refuse_an_org_with_batch_disabled(pool: PgPool) {
     let (server, _bg) = create_test_app(pool.clone(), false).await;
@@ -264,7 +264,7 @@ async fn batch_entry_points_refuse_an_org_with_batch_disabled(pool: PgPool) {
     assert!(resp.text().contains("has not been configured"), "{}", resp.text());
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn realtime_endpoints_refuse_org_keys_with_realtime_disabled(pool: PgPool) {
     let (server, bg) = create_test_app(pool.clone(), false).await;

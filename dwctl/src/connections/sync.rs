@@ -1492,7 +1492,7 @@ mod tests {
     ///   Line 5: valid JSON missing model (tier 2) → template 3 → should be failed
     ///
     /// After activation, templates 1 and 3 should be "failed"; templates 0 and 2 "pending".
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_three_tier_ingestion_and_activation(pool: PgPool) {
         use crate::test::utils::{create_test_endpoint, create_test_model};
@@ -1610,7 +1610,7 @@ mod tests {
 
     /// Verify that skipped_lines and validation_errors are stored correctly in
     /// the sync_entry after ingestion (simulated producer output → DB).
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_validation_errors_stored_correctly(pool: PgPool) {
         let state = setup_task_state(pool.clone()).await;
@@ -1671,7 +1671,7 @@ mod tests {
 
     /// A sync-created batch whose file spans several models caches the
     /// collapsed `"mixed"` label rather than any one alias.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_activate_batch_stamps_mixed_model_label(pool: PgPool) {
         use crate::api::models::users::Role;
@@ -1733,7 +1733,7 @@ mod tests {
 
     /// Verify that run_activate_batch returns a retryable error when the model
     /// queue is at capacity, and does NOT mark the sync entry as failed.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_activate_batch_rejects_on_insufficient_capacity(pool: PgPool) {
         use crate::api::models::users::Role;
@@ -1808,7 +1808,7 @@ mod tests {
     /// An unverified creditor's connection sync must honour the upload-volume
     /// cap: an over-cap file is marked `skipped` (re-attemptable on the next
     /// sync) with an actionable message, and no batch row is created.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_activate_batch_skips_over_unverified_cap(pool: PgPool) {
         // cap = per_hour * window_hours; with a 1h window and per_hour = 1, cap = 1.

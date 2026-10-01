@@ -765,7 +765,7 @@ mod tests {
         parts
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_existing_user_extraction(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -786,7 +786,7 @@ mod tests {
         assert!(current_user.roles.contains(&Role::StandardUser));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_create_nonexistent_user(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -820,7 +820,7 @@ mod tests {
         assert_eq!(db_user.display_name.as_deref(), Some("newuser"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_missing_header_returns_unauthorized(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -837,7 +837,7 @@ mod tests {
         assert_eq!(error.status_code(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_backwards_compatibility_single_header(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -872,7 +872,7 @@ mod tests {
         assert_eq!(db_user.external_user_id, Some(email.to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_multiple_federated_identities_same_email(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -922,7 +922,7 @@ mod tests {
         assert_ne!(user1.id, user2.id, "Should be different users");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_migration_backfill_external_user_id(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -981,7 +981,7 @@ mod tests {
         assert_eq!(db_user.external_user_id, Some(federated_external_id.to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_backwards_compat_no_backfill(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1061,7 +1061,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_only_email_header_sent_fails(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1082,7 +1082,7 @@ mod tests {
         assert_eq!(result.unwrap_err().status_code(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_create_disabled_existing_user(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.auto_create_users = false;
@@ -1109,7 +1109,7 @@ mod tests {
         assert_eq!(current_user.email, test_user.email);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_auto_create_disabled_new_user_fails(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.auto_create_users = false;
@@ -1132,7 +1132,7 @@ mod tests {
         assert_eq!(result.unwrap_err().status_code(), axum::http::StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_existing_user_email_update(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1179,7 +1179,7 @@ mod tests {
         assert_eq!(db_user.email, new_email);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_idempotent_logins(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1211,7 +1211,7 @@ mod tests {
         assert_eq!(db_user.email, email);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_special_characters_in_external_user_id(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1302,7 +1302,7 @@ mod tests {
         assert_eq!(error.status_code(), axum::http::StatusCode::FORBIDDEN);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_jwt_reflects_current_user_state(pool: PgPool) {
         use crate::auth::session;
 
@@ -1379,7 +1379,7 @@ mod tests {
         assert!(extracted_user.roles.contains(&Role::PlatformManager));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_jwt_invalidated_when_user_deleted(pool: PgPool) {
         use crate::auth::session;
 
@@ -1438,7 +1438,7 @@ mod tests {
         assert!(matches!(error, Error::Unauthenticated { .. }));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_proxy_header_user_receives_initial_credits(pool: PgPool) {
         use crate::db::handlers::credits::Credits;
         use crate::db::models::credits::CreditTransactionType;
@@ -1497,7 +1497,7 @@ mod tests {
         assert_eq!(balance, rust_decimal::Decimal::new(10000, 2));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_proxy_header_existing_user_no_duplicate_credits(pool: PgPool) {
         use crate::db::handlers::credits::Credits;
 
@@ -1549,7 +1549,7 @@ mod tests {
 
     // ── X-Organization-Id header tests ───────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_org_context_from_header(pool: PgPool) {
         use crate::db::handlers::Organizations;
         use crate::db::models::organizations::OrganizationCreateDBRequest;
@@ -1606,7 +1606,7 @@ mod tests {
     /// the domain-routing key (`{domain}~{suffix}`, or an opaque `user~{suffix}`
     /// for a workspace with no domain to claim), so rendering it showed
     /// "acme.com~a1b2c3d4" where the company name belonged.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_org_context_names_the_org_by_display_name(pool: PgPool) {
         use crate::db::handlers::Organizations;
         use crate::db::models::organizations::OrganizationCreateDBRequest;
@@ -1654,7 +1654,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_org_context_invalid_org_id_ignored(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1681,7 +1681,7 @@ mod tests {
         assert_eq!(current_user.active_organization, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_org_context_no_header_means_personal(pool: PgPool) {
         use crate::db::handlers::Organizations;
         use crate::db::models::organizations::OrganizationCreateDBRequest;
@@ -1731,7 +1731,7 @@ mod tests {
         assert_eq!(current_user.organizations.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_org_context_malformed_header_ignored(pool: PgPool) {
         let config = create_test_config();
         let state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config).await;
@@ -1757,7 +1757,7 @@ mod tests {
         assert_eq!(current_user.active_organization, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_last_login_updated_on_first_auth(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
@@ -1803,7 +1803,7 @@ mod tests {
         assert!(last_login.is_some(), "Background task should have set last_login");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_last_login_not_updated_when_recent(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
@@ -1845,7 +1845,7 @@ mod tests {
     /// evaluating it, not whoever should hold the billing account. The user
     /// now starts in Personal context and claims the domain deliberately, by
     /// creating a workspace.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_proxy_header_signup_does_not_create_an_org(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
@@ -1888,7 +1888,7 @@ mod tests {
         org.id
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     /// Sharing an email domain gets you nothing at all, by default.
     ///
     /// This has now been wrong in two different directions. It used to add the
@@ -1948,7 +1948,7 @@ mod tests {
         assert_eq!(members[0].user_id, Some(first.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     /// With auto-join on, the same signup lands inside the organization.
     ///
     /// The old behaviour, back as a choice the organization makes for itself
@@ -1996,7 +1996,7 @@ mod tests {
     ///
     /// Only the first login runs the domain match at all, but the unique
     /// constraint is what makes that safe to get wrong, so pin the outcome.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_proxy_header_repeat_login_does_not_duplicate_auto_join(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;
@@ -2025,7 +2025,7 @@ mod tests {
         assert_eq!(members.len(), 2, "the owner and the joiner, once each");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_proxy_header_signup_skips_personal_email(pool: PgPool) {
         let mut config = create_test_config();
         config.auth.proxy_header.enabled = true;

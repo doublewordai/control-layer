@@ -972,7 +972,7 @@ mod pooled_schema_tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn pooled_component_endpoint_preserves_retained_response_lifecycle(pool: PgPool) {
         use fusillade_arsenal::manager::{RetainedResponseArchiveCutoffs, RetentionPolicy};
         use fusillade_arsenal::request::{PersistCompletedRealtimeInput, RequestId};
