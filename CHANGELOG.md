@@ -1,5 +1,17 @@
 # Changelog
 
+## [12.9.0](https://github.com/doublewordai/control-layer/compare/v12.8.0...v12.9.0) (2026-10-01)
+
+
+### Features
+
+* **image-normalizer:** store each ingested image under its own key ([#1894](https://github.com/doublewordai/control-layer/issues/1894)) ([71dffe1](https://github.com/doublewordai/control-layer/commit/71dffe14df99fe457f834a5eef8a0af97464c2a4))
+
+
+### Bug Fixes
+
+* **files:** return 404 when a file delete loses the race ([#1887](https://github.com/doublewordai/control-layer/issues/1887)) ([5d41b2a](https://github.com/doublewordai/control-layer/commit/5d41b2ad86fc776751850fe9f9df6b1ebf04fee6))
+
 ## [12.8.0](https://github.com/doublewordai/control-layer/compare/v12.7.4...v12.8.0) (2026-10-01)
 
 
