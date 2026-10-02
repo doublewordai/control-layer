@@ -197,6 +197,31 @@ impl OnwardsErrorResponse {
         }
     }
 
+    /// The upstream engine could not fetch or decode a media input (image,
+    /// video or audio) of this request. A property of the request, so 422 and
+    /// terminal: not failed over, not retried, not an overload signal.
+    pub fn upstream_media_failure(kind: crate::media_failure::MediaFailureKind) -> Self {
+        let message = match kind {
+            crate::media_failure::MediaFailureKind::Decode => {
+                "The upstream provider could not decode a media input (image, video or audio) of this request."
+            }
+            _ => {
+                "The upstream provider could not fetch a media input (image, video or audio) of this request from its URL."
+            }
+        };
+        OnwardsErrorResponse {
+            body: Some(ErrorResponseBody {
+                message: message.to_string(),
+                r#type: "invalid_request_error".to_string(),
+                param: Some("image_url".to_string()),
+                code: "upstream_media_fetch_failed".to_string(),
+            }),
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            serving_outcome: None,
+            authenticated_api_key_id: None,
+        }
+    }
+
     pub fn bad_request(message: &str, param: Option<&str>) -> Self {
         Self::invalid_request(message, param, "bad_request")
     }
