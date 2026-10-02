@@ -151,3 +151,115 @@ describe("operator effective pricing", () => {
     ).toBeUndefined();
   });
 });
+
+describe("public class prices", () => {
+  it("ignores staged public classes until explicitly enabled", () => {
+    const rows = [
+      tariff("general"),
+      tariff("staged", { serving_class: "standard" }),
+    ];
+    expect(
+      resolveTokenPrice(rows, undefined, "standard", "realtime", null, now)?.id,
+    ).toBe("general");
+  });
+  it("inherits public cache multipliers below account deals without enabling caching", () => {
+    const general: CachePricing = {
+      enabled: true,
+      read_multiplier: "0.1",
+      write_multiplier_5m: "1",
+      write_multiplier_1h: "2",
+      write_multiplier_24h: "3",
+      min_prefix_tokens: 1024,
+      valid_from: null,
+      valid_until: null,
+    };
+    const fast: OrganizationCacheTariff = {
+      deployed_model_id: "model",
+      alias: "example",
+      serving_class: "fast",
+      read_multiplier: "0",
+      write_multiplier_5m: "1",
+      write_multiplier_1h: "2",
+      write_multiplier_24h: "3",
+      valid_from: "2026-01-01T00:00:00Z",
+    };
+    const deal = { ...fast, serving_class: undefined, read_multiplier: "0.2" };
+    expect(
+      resolveCachePrice(general, [], "fast", now, [fast])?.values
+        .read_multiplier,
+    ).toBe("0");
+    expect(
+      resolveCachePrice(general, [deal], "fast", now, [fast])?.values
+        .read_multiplier,
+    ).toBe("0.2");
+    expect(
+      resolveCachePrice(general, [], "standard", now, [fast])?.values
+        .read_multiplier,
+    ).toBe("0.1");
+    expect(
+      resolveCachePrice({ ...general, enabled: false }, [], "fast", now, [
+        fast,
+      ]),
+    ).toBeUndefined();
+  });
+  it("resolves class prices without an organisation and preserves account-first precedence", () => {
+    const general = tariff("general");
+    const fast = tariff("fast", { serving_class: "fast" });
+    const deal = tariff("deal", { organization_id: "a" });
+    const free = tariff("free", {
+      organization_id: "a",
+      serving_class: "fast",
+      input_price_per_token: "0",
+      output_price_per_token: "0",
+    });
+    expect(
+      resolveTokenPrice(
+        [general, fast],
+        undefined,
+        "fast",
+        "realtime",
+        null,
+        now,
+        true,
+      )?.id,
+    ).toBe("fast");
+    expect(
+      resolveTokenPrice(
+        [general, fast, deal],
+        "a",
+        "fast",
+        "realtime",
+        null,
+        now,
+        true,
+      )?.id,
+    ).toBe("deal");
+    expect(
+      resolveTokenPrice(
+        [general, fast, deal, free],
+        "a",
+        "fast",
+        "realtime",
+        null,
+        now,
+        true,
+      )?.id,
+    ).toBe("free");
+  });
+  it("exhausts public exact-window batch prices before an account realtime deal", () => {
+    const rows = [
+      tariff("deal", { organization_id: "a" }),
+      tariff("batch", {
+        serving_class: "standard",
+        api_key_purpose: "batch",
+        completion_window: "1h",
+      }),
+    ];
+    expect(
+      resolveTokenPrice(rows, "a", "fast", "batch", "1h", now, true)?.id,
+    ).toBe("batch");
+    expect(
+      resolveTokenPrice(rows, "a", "fast", "batch", "24h", now, true)?.id,
+    ).toBe("deal");
+  });
+});

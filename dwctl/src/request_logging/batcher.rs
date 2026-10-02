@@ -776,6 +776,7 @@ where
             LEFT JOIN inference_endpoints ie ON dm.hosted_on = ie.id
             LEFT JOIN model_tariffs mt ON mt.deployed_model_id = dm.id
                 AND (mt.user_id IS NULL OR mt.user_id = ANY($2))
+                AND (mt.user_id IS NOT NULL OR mt.serving_class IS NULL)
             WHERE dm.alias = ANY($1)
             ORDER BY dm.alias, mt.valid_from DESC
             "#,

@@ -2,8 +2,9 @@
 
 A tier is an ingestion/execution offering: realtime, flex or batch. A serving
 class distinguishes service within a tier. The initial new classes are standard
-and fast. This foundation adds dormant storage only; it has no new routing,
-pricing, catalog-authoring or discovery consumers.
+and fast. The foundation added dormant storage; the catalog now authors classes,
+synonyms and public class prices. Request routing and discovery still do not consume
+them. See [staged catalog configuration](src/reference/model-provisioning.md#staging-class-destinations-and-public-prices).
 
 ## Representation
 
@@ -37,10 +38,10 @@ synonym cannot be removed. Models/endpoints referenced by classes cannot be
 hard-deleted. Existing ledger foreign keys and history remain unchanged.
 
 Cross-table collisions with primary model/class names are **not** enforced by
-this migration. Before exposing alias authoring or enabling request resolution,
-catalog validation and supported model writers must enforce an unambiguous name
-policy, including concurrent edits. A unique synonym key alone is insufficient.
-Reject accidental shadowing of primary names. Deliberate private-name remapping
+the foundation migration. Catalog reconciliation and ordinary model create/rename
+writers now serialize on the same transaction advisory lock and reject collisions
+with primary class names and synonyms. Direct SQL must perform the same preflight;
+a unique synonym key alone is insufficient. Deliberate private-name remapping
 requires a separately validated migration preserving access and historical identity.
 There is no user-facing API for these tables in this foundation.
 
@@ -58,8 +59,10 @@ See [migration guidance](migrations.md).
 
 ## Subsequent integration
 
-- Catalog-authoritative classes and optional synonyms, with complete collision
-  validation before activation. Primary names work without synonym rows.
+- Catalog-authoritative classes and optional synonyms are implemented as dormant
+  configuration. Primary names need no synonym rows. Deploy the new readers to
+  every pod before staging public class prices; old binaries do not distinguish
+  them from general prices. Runtime activation requires the following integration.
 - A small startup-loaded synonym lookup before prompt caching, retaining the
   submitted name for responses/diagnostics. Canonical routing, class availability,
   authentication and admission remain reactive. No synonym polling is required
@@ -88,7 +91,7 @@ tests, not routing acceptance or a full previous-binary rollout test.
 
 ## Legacy replacement boundaries
 
-The old implementation remains operational in this storage-only change. Remove its
+The old implementation remains operational while classes are dormant. Remove its
 unused behavior in the corresponding replacement, rather than keeping parallel
 resolvers indefinitely:
 

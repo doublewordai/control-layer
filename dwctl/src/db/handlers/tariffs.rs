@@ -90,7 +90,7 @@ impl<'c> Tariffs<'c> {
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
                    valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id, serving_class
             FROM model_tariffs
-            WHERE deployed_model_id = $1 AND (api_key_purpose IS NULL OR api_key_purpose IN ('realtime','batch','playground')) AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW()) AND user_id IS NULL
+            WHERE deployed_model_id = $1 AND (api_key_purpose IS NULL OR api_key_purpose IN ('realtime','batch','playground')) AND valid_from <= NOW() AND (valid_until IS NULL OR valid_until > NOW()) AND user_id IS NULL AND serving_class IS NULL
             ORDER BY api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
             deployed_model_id
@@ -222,7 +222,7 @@ impl<'c> Tariffs<'c> {
             SELECT id, deployed_model_id, name, input_price_per_token, output_price_per_token,
                    valid_from, valid_until, api_key_purpose as "api_key_purpose: _", completion_window, user_id, serving_class
             FROM model_tariffs
-            WHERE deployed_model_id = $1 AND user_id IS NULL
+            WHERE deployed_model_id = $1 AND user_id IS NULL AND serving_class IS NULL
             ORDER BY valid_from DESC, api_key_purpose ASC NULLS LAST, completion_window ASC NULLS LAST, name ASC
             "#,
             deployed_model_id

@@ -1,6 +1,7 @@
 //! Database repository for model deployments.
 
 use crate::api::models::deployments::{ModelSortField, SortDirection};
+use crate::db::handlers::model_provisioning::classes::{lock_model_names, validate_model_name};
 use crate::db::models::api_keys::ApiKeyPurpose;
 use crate::db::{
     errors::{DbError, Result},
@@ -17,7 +18,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
-use sqlx::{FromRow, PgConnection, Row, query_builder::QueryBuilder};
+use sqlx::{Connection, FromRow, PgConnection, Row, query_builder::QueryBuilder};
 use std::collections::HashMap;
 use tracing::instrument;
 
@@ -294,6 +295,9 @@ impl<'c> Repository for Deployments<'c> {
 
     #[instrument(skip(self, request), fields(model_name = %request.model_name, alias = %request.alias), err)]
     async fn create(&mut self, request: &Self::CreateRequest) -> Result<Self::Response> {
+        let mut tx = self.db.begin().await?;
+        lock_model_names(&mut tx).await?;
+        validate_model_name(&mut tx, None, request.alias.trim()).await?;
         let created_at = Utc::now();
         let updated_at = created_at;
 
@@ -398,7 +402,7 @@ impl<'c> Repository for Deployments<'c> {
         .bind(request.aimd.as_ref().map(Json))
         .bind(request.fallback_realtime_on_status.as_deref())
         .bind(request.affinity.as_ref().map(Json))
-        .fetch_one(&mut *self.db)
+        .fetch_one(&mut *tx)
         .await?;
 
         let model_type = model.r#type.as_ref().and_then(|s| match s.as_str() {
@@ -408,6 +412,7 @@ impl<'c> Repository for Deployments<'c> {
             _ => None,
         });
 
+        tx.commit().await?;
         Ok(DeploymentDBResponse::from((model_type, model)))
     }
 
@@ -471,6 +476,11 @@ impl<'c> Repository for Deployments<'c> {
 
     #[instrument(skip(self, request), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
+        let mut tx = self.db.begin().await?;
+        if let Some(alias) = &request.alias {
+            lock_model_names(&mut tx).await?;
+            validate_model_name(&mut tx, Some(id), alias.trim()).await?;
+        }
         if let Some(model_name) = &request.model_name
             && model_name.trim().is_empty()
         {
@@ -724,7 +734,7 @@ impl<'c> Repository for Deployments<'c> {
         .bind(request.fallback_realtime_on_status.as_deref())
         .bind(request.affinity.is_some())
         .bind(request.affinity.as_ref().and_then(Option::as_ref).map(Json))
-        .fetch_one(&mut *self.db)
+        .fetch_one(&mut *tx)
         .await?;
 
         // Convert DB model_type back to enum
@@ -735,6 +745,7 @@ impl<'c> Repository for Deployments<'c> {
             _ => None,
         });
 
+        tx.commit().await?;
         Ok(DeploymentDBResponse::from((model_type, model)))
     }
 
@@ -766,7 +777,7 @@ impl<'c> Repository for Deployments<'c> {
             Some(ModelSortField::ContextWindow) => ("(dm.metadata->>'context_window')::bigint", "DESC"),
             Some(ModelSortField::Provider) => ("dm.metadata->>'provider'", "ASC"),
             Some(ModelSortField::PriceFrom) => (
-                "(SELECT MIN(mt.input_price_per_token + mt.output_price_per_token) FROM model_tariffs mt WHERE mt.deployed_model_id = dm.id AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW()) AND mt.user_id IS NULL AND (mt.api_key_purpose IS NULL OR mt.api_key_purpose IN ('realtime','batch','playground')))",
+                "(SELECT MIN(mt.input_price_per_token + mt.output_price_per_token) FROM model_tariffs mt WHERE mt.deployed_model_id = dm.id AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW()) AND mt.user_id IS NULL AND mt.serving_class IS NULL AND (mt.api_key_purpose IS NULL OR mt.api_key_purpose IN ('realtime','batch','playground')))",
                 "ASC",
             ),
             Some(ModelSortField::CreatedAt) | None => ("dm.created_at", "DESC"),

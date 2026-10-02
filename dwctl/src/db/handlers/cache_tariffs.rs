@@ -86,7 +86,7 @@ impl<'c> CacheTariffs<'c> {
                 own.deployed_model_id, own.serving_class, own.write_multiplier_5m, own.write_multiplier_1h,
                 own.write_multiplier_24h, own.read_multiplier, general.min_prefix_tokens, own.valid_from, own.valid_until
              FROM model_cache_tariffs own JOIN model_cache_tariffs general ON general.deployed_model_id = own.deployed_model_id
-                AND general.user_id IS NULL AND general.valid_from <= NOW() AND (general.valid_until IS NULL OR general.valid_until > NOW())
+                AND general.user_id IS NULL AND general.serving_class IS NULL AND general.valid_from <= NOW() AND (general.valid_until IS NULL OR general.valid_until > NOW())
              WHERE own.deployed_model_id = ANY($1) AND own.user_id = $2 AND own.serving_class IS NOT NULL
                 AND own.valid_from <= NOW() AND (own.valid_until IS NULL OR own.valid_until > NOW())
              ORDER BY own.deployed_model_id, own.serving_class, own.valid_from DESC, general.valid_from DESC",
@@ -130,7 +130,7 @@ impl<'c> CacheTariffs<'c> {
         sqlx::query!(
             r#"UPDATE model_cache_tariffs SET valid_until = now()
                WHERE deployed_model_id = $1
-                 AND user_id IS NULL
+                 AND user_id IS NULL AND serving_class IS NULL
                  AND valid_from <= now()
                  AND (valid_until IS NULL OR valid_until > now())"#,
             model_id,
@@ -167,7 +167,7 @@ impl<'c> CacheTariffs<'c> {
         let res = sqlx::query!(
             r#"UPDATE model_cache_tariffs SET valid_until = now()
                WHERE deployed_model_id = $1
-                 AND user_id IS NULL
+                 AND user_id IS NULL AND serving_class IS NULL
                  AND valid_from <= now()
                  AND (valid_until IS NULL OR valid_until > now())"#,
             model_id,
@@ -187,7 +187,7 @@ impl<'c> CacheTariffs<'c> {
                       read_multiplier, min_prefix_tokens, valid_from, valid_until
                FROM model_cache_tariffs
                WHERE deployed_model_id = $1
-                 AND user_id IS NULL
+                 AND user_id IS NULL AND serving_class IS NULL
                  AND valid_from <= now()
                  AND (valid_until IS NULL OR valid_until > now())
                ORDER BY valid_from DESC
@@ -258,7 +258,7 @@ impl<'c> CacheTariffs<'c> {
                       read_multiplier, min_prefix_tokens, valid_from, valid_until
                FROM model_cache_tariffs
                WHERE deployed_model_id = ANY($1)
-                 AND user_id IS NULL
+                 AND user_id IS NULL AND serving_class IS NULL
                  AND valid_from <= now()
                  AND (valid_until IS NULL OR valid_until > now())
                ORDER BY deployed_model_id, valid_from DESC"#,

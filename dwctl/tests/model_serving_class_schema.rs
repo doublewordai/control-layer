@@ -11,7 +11,6 @@ use dwctl::db::models::model_serving_classes::ModelServingClass;
 use dwctl::migrations::{Target, apply, check};
 
 const CLASS_MIGRATION: i64 = 20261001120000;
-const ALIAS_MIGRATION: i64 = 20261001120010;
 
 struct Fixture {
     model: Uuid,
@@ -372,7 +371,11 @@ async fn migration_preserves_legacy_rows_and_prepared_reads_without_activating_c
     };
     assert_eq!(
         check(&previous_release, &pool).await.unwrap().ahead,
-        vec![CLASS_MIGRATION, ALIAS_MIGRATION]
+        current
+            .iter()
+            .filter(|m| m.version >= CLASS_MIGRATION)
+            .map(|m| m.version)
+            .collect::<Vec<_>>()
     );
     let classes: i64 = sqlx::query_scalar("SELECT count(*) FROM model_serving_classes")
         .fetch_one(&pool)
@@ -402,7 +405,15 @@ async fn migration_runner_resumes_after_class_storage_without_reapplying_it(pool
     assert!(!aliases_exist);
 
     let report = apply(&target, &pool).await.unwrap();
-    assert_eq!(report.applied, vec![ALIAS_MIGRATION]);
+    assert_eq!(
+        report.applied,
+        target
+            .migrator
+            .iter()
+            .filter(|m| m.version > CLASS_MIGRATION)
+            .map(|m| m.version)
+            .collect::<Vec<_>>()
+    );
     let alias = insert_alias(&pool, "example/model-fast", f.model, Some(class.id)).await.unwrap();
     assert_eq!(alias.serving_class_id, class.id);
     assert!(apply(&target, &pool).await.unwrap().applied.is_empty());

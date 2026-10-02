@@ -781,3 +781,99 @@ async fn batch_exhausts_exact_scopes_before_realtime_safety_net(pool: PgPool) {
         "no other batch window or elevated realtime class may leak into fallback"
     );
 }
+
+#[sqlx::test]
+async fn public_class_prices_follow_account_deals_and_preserve_exact_batch_windows(pool: PgPool) {
+    let account: Uuid =
+        sqlx::query_scalar("INSERT INTO users (username,email) VALUES ('public-class-test','public-class@example.invalid') RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let model:Uuid=sqlx::query_scalar("INSERT INTO deployed_models (model_name,alias,is_composite,created_by,routing_mode) VALUES ('public-class-test','public-class-test',true,$1,'class_routes') RETURNING id").bind(account).fetch_one(&pool).await.unwrap();
+    let now = Utc::now();
+    let mut rows = Vec::new();
+    for (owner, class, purpose, window, price) in [
+        (None, None, ApiKeyPurpose::Realtime, None, 9),
+        (None, Some("fast"), ApiKeyPurpose::Realtime, None, 6),
+        (None, Some("standard"), ApiKeyPurpose::Realtime, None, 5),
+        (Some(account), None, ApiKeyPurpose::Realtime, None, 4),
+        (Some(account), Some("fast"), ApiKeyPurpose::Realtime, None, 0),
+        (None, None, ApiKeyPurpose::Batch, Some("24h"), 2),
+        (None, Some("standard"), ApiKeyPurpose::Batch, Some("1h"), 3),
+    ] {
+        let start = now - chrono::Duration::hours(1);
+        let amount = Decimal::from(price);
+        let id:Uuid=sqlx::query_scalar("INSERT INTO model_tariffs (deployed_model_id,user_id,serving_class,name,api_key_purpose,completion_window,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,$2,$3,'class-price',$4,$5,$6,$6,$7) RETURNING id")
+            .bind(model).bind(owner).bind(class).bind(&purpose).bind(window).bind(amount).bind(start).fetch_one(&pool).await.unwrap();
+        rows.push(TariffInfo {
+            id,
+            account: owner,
+            serving_class: class.map(str::to_owned),
+            purpose,
+            completion_window: window.map(str::to_owned),
+            input_price_per_token: amount,
+            output_price_per_token: amount,
+            effective_from: start,
+            valid_until: None,
+        });
+    }
+    for (owner, class, purpose, window, expected) in [
+        (None, "fast", ApiKeyPurpose::Realtime, None, 6),
+        (None, "standard", ApiKeyPurpose::Realtime, None, 5),
+        (None, "other", ApiKeyPurpose::Realtime, None, 9),
+        (Some(account), "fast", ApiKeyPurpose::Realtime, None, 0),
+        (Some(account), "standard", ApiKeyPurpose::Realtime, None, 4),
+        (Some(account), "fast", ApiKeyPurpose::Playground, None, 0),
+        (Some(account), "fast", ApiKeyPurpose::Batch, Some("24h"), 2),
+        (Some(account), "fast", ApiKeyPurpose::Batch, Some("1h"), 3),
+        (Some(account), "fast", ApiKeyPurpose::Batch, Some("12h"), 4),
+        (None, "fast", ApiKeyPurpose::Batch, Some("12h"), 5),
+    ] {
+        let rust = find_best_tariff(&rows, Some(&purpose), window, now, owner, Some(class));
+        let sql: Decimal = sqlx::query_scalar("SELECT input_price_per_token FROM effective_model_tariff($1,$2,$3,$4,$5,$6)")
+            .bind(model)
+            .bind(owner)
+            .bind(&purpose)
+            .bind(window)
+            .bind(class)
+            .bind(now)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sql, Decimal::from(expected));
+        assert_eq!(rust.0, Some(sql));
+    }
+}
+
+#[test]
+fn public_class_cache_multipliers_inherit_enablement_and_follow_account_deals() {
+    let now = Utc::now();
+    let account = Uuid::new_v4();
+    let row = |owner, class: Option<&str>, read| CacheTariffRow {
+        account: owner,
+        serving_class: class.map(str::to_owned),
+        read_multiplier: Decimal::from(read),
+        write_multiplier_5m: Decimal::ONE,
+        write_multiplier_1h: Decimal::ONE,
+        write_multiplier_24h: Decimal::ONE,
+        valid_from: now,
+        valid_until: None,
+    };
+    let mut rows = vec![row(None, Some("fast"), 2)];
+    assert!(resolve_cache_multipliers(&rows, now, None, Some("fast")).is_none());
+    rows.push(row(None, None, 3));
+    assert_eq!(
+        resolve_cache_multipliers(&rows, now, None, Some("fast")).unwrap().read,
+        Decimal::from(2)
+    );
+    rows.push(row(Some(account), None, 1));
+    assert_eq!(
+        resolve_cache_multipliers(&rows, now, Some(account), Some("fast")).unwrap().read,
+        Decimal::ONE
+    );
+    rows.push(row(Some(account), Some("fast"), 0));
+    assert_eq!(
+        resolve_cache_multipliers(&rows, now, Some(account), Some("fast")).unwrap().read,
+        Decimal::ZERO
+    );
+}
