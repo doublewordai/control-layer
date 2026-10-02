@@ -78,6 +78,8 @@ pub struct CorpusRow {
     /// the read multiplier) to reproduce live semantics.
     pub cache_read_source: Option<String>,
     pub resolved_serving_class: Option<String>,
+    pub canonical_model_id: Option<uuid::Uuid>,
+    pub serving_class_id: Option<uuid::Uuid>,
 
     /// The payload, when fusillade still holds it. `None` means not replayable — a ZDR row,
     /// a row with no fusillade link, or one whose bodies have been purged.
@@ -129,6 +131,8 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
             ha.output_price_per_token,
             ha.cache_read_source,
             ha.resolved_serving_class,
+            ha.canonical_model_id,
+            ha.serving_class_id,
             -- `?` overrides sqlx's nullability inference: rt.body is NOT NULL in its own
             -- table, but this is a LEFT JOIN, so it is absent for any row with no fusillade
             -- link. Without the override sqlx types it as String and the None case vanishes.
@@ -206,6 +210,8 @@ pub async fn load_corpus(pool: &PgPool, filter: &CorpusFilter) -> Result<Vec<Cor
                 output_price_per_token: r.output_price_per_token,
                 cache_read_source: r.cache_read_source,
                 resolved_serving_class: r.resolved_serving_class,
+                canonical_model_id: r.canonical_model_id,
+                serving_class_id: r.serving_class_id,
                 exchange,
             }
         })

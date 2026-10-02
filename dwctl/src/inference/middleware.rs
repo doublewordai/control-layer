@@ -80,6 +80,10 @@ pub struct InferenceMiddlewareState<P: PoolProvider + Clone = sqlx_pool_router::
     /// Read by [`super::zdr::is_zdr_request`] on the submit path. Defaults to
     /// empty (every key reads as non-ZDR) when the sync is not wired.
     pub key_policy_cache: crate::sync::key_policy::KeyPolicyCache,
+    /// Startup identity lookup shared with batch ingestion. Consumers must still
+    /// check the live class route and authorization before accepting a synonym.
+    pub model_aliases: super::model_aliases::ModelAliasMap,
+    pub model_targets: onwards::target::Targets,
 }
 
 /// Middleware that routes inference requests based on service_tier and background.
@@ -104,16 +108,18 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         return next.run(req).await;
     }
 
-    // Skip if this is a fusillade daemon request (already tracked)
-    if let Some(request_id) = req.headers().get("x-fusillade-request-id") {
-        if let Some(request_id) = request_id.to_str().ok().and_then(|s| s.parse::<uuid::Uuid>().ok()) {
-            tracing::Span::current().set_attribute("doubleword.request_id", request_id.to_string());
-        }
-        return next.run(req).await;
+    let daemon_request = req.headers().contains_key("x-fusillade-request-id");
+    if let Some(request_id) = req
+        .headers()
+        .get("x-fusillade-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<uuid::Uuid>().ok())
+    {
+        tracing::Span::current().set_attribute("doubleword.request_id", request_id.to_string());
     }
 
     // Read and parse the request body
-    let (parts, body) = req.into_parts();
+    let (mut parts, body) = req.into_parts();
     let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -142,6 +148,48 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     };
     let is_daemon_processed = matches!(service_tier, ServiceTier::Flex | ServiceTier::Background);
 
+    let submitted_model = request_value["model"].as_str().map(str::to_owned);
+    let class_route = match submitted_model
+        .as_deref()
+        .map(|model| {
+            super::model_aliases::resolve_class_route(
+                &state.model_aliases,
+                &state.model_targets,
+                model,
+                is_daemon_processed || daemon_request,
+            )
+        })
+        .transpose()
+    {
+        Ok(route) => route.flatten(),
+        Err(message) => return invalid_request_response(&message, "model_not_found", "model"),
+    };
+    let class_route_changed = class_route
+        .as_ref()
+        .is_some_and(|(name, _)| Some(name.as_str()) != submitted_model.as_deref());
+    if let Some((name, identity)) = &class_route {
+        request_value["model"] = name.clone().into();
+        parts.extensions.insert(identity.clone());
+        parts
+            .extensions
+            .insert(onwards::serving::SubmittedModel(submitted_model.clone().unwrap()));
+    }
+    // Daemon loopback still needs class normalization, but its trusted deadline
+    // priority must survive. Do not run the untrusted-ingress scrubbers again.
+    if daemon_request {
+        let body = if class_route_changed {
+            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+            parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
+            bytes::Bytes::from(request_value.to_string())
+        } else {
+            body_bytes
+        };
+        // Do not retain a second, parsed copy of a queued prompt while its
+        // upstream request is running.
+        drop(request_value);
+        return next.run(Request::from_parts(parts, Body::from(body))).await;
+    }
+
     // Strip client-supplied completion/response id fields before the request is
     // re-serialised and forwarded. dwctl owns the single parse-and-shape now, so
     // onwards forwards the bytes verbatim (COR-522); this preserves the guarantee
@@ -156,7 +204,11 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // so analytics, the prompt cache and billing all key on the bare alias,
     // and hand the class to onwards as a request extension. An unknown class
     // is a 400 (a typo must not silently change how a request is served).
-    let (requested_class, scrubbed_class) = match strip_serving_class_suffix(&mut request_value, is_daemon_processed) {
+    let (requested_class, scrubbed_class) = match if class_route.is_some() {
+        Ok((None, false))
+    } else {
+        strip_serving_class_suffix(&mut request_value, is_daemon_processed)
+    } {
         Ok(result) => result,
         Err(err) => {
             return Response::builder()
@@ -175,7 +227,9 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     // `request_value` only stays removed if the bytes are rebuilt from it.
     // Every scrubber reports whether it changed something; the common case
     // (nothing to scrub, no suffix) keeps the caller's bytes untouched.
-    let body_bytes = if scrubbed_class || scrubbed_ids || scrubbed_scheduling {
+    let body_bytes = if class_route_changed || scrubbed_class || scrubbed_ids || scrubbed_scheduling {
+        parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+        parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
         bytes::Bytes::from(request_value.to_string())
     } else {
         body_bytes

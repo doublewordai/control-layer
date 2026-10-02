@@ -68,6 +68,7 @@ pub mod deployments;
 pub mod feature_flags;
 pub mod groups;
 pub mod inference_endpoints;
+pub mod model_aliases;
 pub mod model_provisioning;
 pub mod organizations;
 pub mod password_reset_tokens;
@@ -93,3 +94,5 @@ pub use repository::Repository;
 pub use tariffs::Tariffs;
 pub use users::Users;
 pub use webhooks::Webhooks;
+
+pub mod model_class_routes;

@@ -64,6 +64,21 @@ pub async fn error_enrichment_middleware(
     request: Request<Body>,
     next: Next,
 ) -> Response<Body> {
+    let class = request.extensions().get::<onwards::serving::ClassRouteIdentity>().cloned();
+    let submitted = request.extensions().get::<onwards::serving::SubmittedModel>().cloned();
+    let mut response = enrich_response(pools, request, next).await;
+    if response.extensions().get::<onwards::serving::ClassRouteIdentity>().is_none()
+        && let Some(class) = class
+    {
+        response.extensions_mut().insert(class);
+    }
+    if let Some(submitted) = submitted {
+        response.extensions_mut().insert(submitted);
+    }
+    response
+}
+
+async fn enrich_response(pools: sqlx_pool_router::DynPools, request: Request<Body>, next: Next) -> Response<Body> {
     // Extract API key from request headers before passing to onwards
     let api_key = request
         .headers()
@@ -83,7 +98,11 @@ pub async fn error_enrichment_middleware(
         }
     };
 
-    let model_name = serde_json::from_slice::<ChatRequest>(&bytes).ok().map(|req| req.model);
+    let model_name = parts
+        .extensions
+        .get::<onwards::serving::ClassRouteIdentity>()
+        .map(|c| c.canonical_alias.clone())
+        .or_else(|| serde_json::from_slice::<ChatRequest>(&bytes).ok().map(|req| req.model));
 
     // Reconstruct the request with the body
     let reconstructed = Request::from_parts(parts, Body::from(bytes));

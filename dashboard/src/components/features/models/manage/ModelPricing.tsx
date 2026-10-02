@@ -92,10 +92,13 @@ export function ModelPricing({
   const selectedOverlay = own.data?.overlays.find(
     (row) => row.deployed_model_id === model.id,
   );
+  const classRoutesActive = model.class_routes?.some((route) => route.routing_mode === "class_routes") ?? false;
+  const configuredClasses = model.class_routes?.map((route) => route.class_key) ?? [];
   const classes = organization
     ? [
         ...new Set([
           "standard",
+          ...configuredClasses,
           ...Object.keys(model.serving_classes ?? {}),
           ...(selectedOverlay?.targets ? ["custom"] : []),
           ...rows
@@ -106,7 +109,7 @@ export function ModelPricing({
           ),
         ]),
       ]
-    : ["standard"];
+    : [...new Set(["standard", ...configuredClasses])];
   const windows = [
     ...new Set([
       ...(model.allowed_batch_completion_windows ?? []),
@@ -124,7 +127,7 @@ export function ModelPricing({
     purpose: TariffApiKeyPurpose,
     window: string | null = null,
   ) => {
-    const row = resolveTokenPrice(rows, organization, cls, purpose, window);
+    const row = resolveTokenPrice(rows, organization, cls, purpose, window, Date.now(), classRoutesActive);
     return (
       <PriceRow
         key={`${purpose}:${window}:${cls}`}
@@ -132,12 +135,13 @@ export function ModelPricing({
         label={
           purpose === "batch"
             ? `${getTariffDisplayName(purpose, window)} · ${window}`
-            : organization
+            : organization || configuredClasses.length
               ? cls
               : "All classes"
         }
         source={`${priceSource(row, !!organization)}${purpose !== "realtime" && row?.api_key_purpose === "realtime" ? " · realtime fallback" : ""}`}
         note={
+          !classRoutesActive &&
           purpose !== "batch" &&
           cls !== "standard" &&
           cls !== "custom" &&
@@ -240,7 +244,7 @@ export function ModelPricing({
               </section>
             )}
             {classes.some((cls) =>
-              resolveTokenPrice(rows, organization, cls, "playground"),
+              resolveTokenPrice(rows, organization, cls, "playground", null, Date.now(), classRoutesActive),
             ) && (
               <section aria-label="Playground prices">
                 <h4 className="text-sm font-medium mb-2">Playground</h4>
@@ -296,7 +300,7 @@ export function ModelPricing({
                   Retry
                 </button>
               </p>
-            ) : !cache.data?.enabled ? (
+            ) : !cache.data?.enabled && !model.class_routes?.some((route) => classRoutesActive && route.cache_pricing.enabled) ? (
               <p className="text-sm text-muted-foreground">
                 Cache pricing is disabled on this model. Organisation
                 multipliers do not enable it.
@@ -304,16 +308,18 @@ export function ModelPricing({
             ) : (
               <>
                 {classes.map((cls) => {
+                  const classCache = classRoutesActive ? model.class_routes?.find((route) => route.class_key === cls)?.cache_pricing : cache.data;
                   const resolved = resolveCachePrice(
-                    cache.data,
+                    classCache,
                     orgCache,
                     cls,
-                  )!;
+                  );
+                  if (!resolved) return <p key={cls}>{cls}: cache pricing disabled.</p>;
                   return (
                     <div key={cls} className="rounded-lg border p-3 space-y-3">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="font-medium text-sm">
-                          {organization ? cls : "All classes"}
+                          {organization || configuredClasses.length ? cls : "All classes"}
                         </span>
                         <Badge variant="outline">
                           {resolved.own
@@ -345,7 +351,7 @@ export function ModelPricing({
                 })}
                 <p className="text-xs text-muted-foreground">
                   Minimum prefix:{" "}
-                  {cache.data.min_prefix_tokens?.toLocaleString() ?? "—"} tokens
+                  {cache.data?.min_prefix_tokens?.toLocaleString() ?? "—"} tokens
                   · general model setting. Batch and flex use standard-class
                   multipliers.
                 </p>
@@ -357,7 +363,11 @@ export function ModelPricing({
             aria-label="Serving classes"
           >
             <h3 className="text-sm font-medium">Serving classes</h3>
-            {Object.keys(model.serving_classes ?? {}).length ? (
+            {model.class_routes?.length ? (
+              <p className="text-sm text-muted-foreground">
+                {classRoutesActive ? "Active" : "Staged"}: {configuredClasses.join(", ")}. See the configured destinations above.
+              </p>
+            ) : Object.keys(model.serving_classes ?? {}).length ? (
               <div className="grid gap-3 sm:grid-cols-3">
                 {Object.entries(model.serving_classes ?? {}).map(
                   ([name, preset]) => (

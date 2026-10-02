@@ -29,6 +29,8 @@ use super::tokenizer::{TokenizerClient, TokenizerError, WirePrefix};
 pub struct ClassifyRequest<'a> {
     /// The virtual model (the `deployed_models.alias` = the cache key dimension).
     pub virtual_model: &'a str,
+    /// Captured live class identity; absent for the legacy path.
+    pub class_route: Option<&'a onwards::serving::ClassRouteIdentity>,
     /// The raw request body (with `cache_control` markers intact).
     pub body: &'a [u8],
     /// The validated bearer token, or `None` (un-scopable → no caching).
@@ -241,7 +243,11 @@ impl Classifier {
                 resolved
             }
         };
-        let cfg = self.model_config.resolve(req.virtual_model).await?;
+        let cfg = match req.class_route {
+            Some(class) => self.model_config.resolve_class(class).await?,
+            None => self.model_config.resolve(req.virtual_model).await?,
+        };
+        let tokenizer_model = req.class_route.map_or(req.virtual_model, |c| c.canonical_alias.as_str());
         if !cfg.enabled {
             return Ok(ClassifyOutcome::inactive());
         }
@@ -289,7 +295,7 @@ impl Classifier {
             cache_metrics::record_skip("no_markers");
             return Ok(ClassifyOutcome::zero_active()); // markers are required to cache
         }
-        let versions = match self.tokenizer_versions(req.virtual_model).await? {
+        let versions = match self.tokenizer_versions(tokenizer_model).await? {
             VersionsLookup::Mapped(v) => v,
             // Not in the service's model list: a stable fact — the serving path degrades to
             // zeros for every such request, so a replay reaching the same zeros is faithful.
@@ -314,7 +320,16 @@ impl Classifier {
         };
         let scope = IndexScope {
             principal_id,
-            virtual_model: req.virtual_model.to_string(),
+            virtual_model: req.class_route.map_or_else(
+                || req.virtual_model.to_string(),
+                |c| {
+                    if c.class_key == "standard" {
+                        c.canonical_alias.clone()
+                    } else {
+                        format!("class:{}:{}", c.model_id, c.class_id)
+                    }
+                },
+            ),
             tokenizer_version,
         };
 
@@ -431,7 +446,11 @@ impl Classifier {
 
         // Tokenize the suffix (the only tokenization; reads needed none). Failure →
         // degrade to no caching (safe under the best-effort contract).
-        let tok = match self.tokenizer.tokenize(req.virtual_model, &segments).await {
+        let tok = match self
+            .tokenizer
+            .tokenize(req.class_route.map_or(req.virtual_model, |c| c.canonical_alias.as_str()), &segments)
+            .await
+        {
             Ok(tok) => tok,
             Err(e) => {
                 cache_metrics::record_skip("tokenize_failed");
@@ -520,7 +539,17 @@ impl Classifier {
             }
         }
 
-        let resp = match self.tokenizer.render(req.virtual_model, &messages, tools, true, &prefixes).await {
+        let resp = match self
+            .tokenizer
+            .render(
+                req.class_route.map_or(req.virtual_model, |c| c.canonical_alias.as_str()),
+                &messages,
+                tools,
+                true,
+                &prefixes,
+            )
+            .await
+        {
             Ok(r) => r,
             Err(TokenizerError::Unmapped(_)) => {
                 cache_metrics::record_skip("tokenizer_unmapped");
@@ -587,7 +616,11 @@ impl Classifier {
         // confined to the span the template refused.
         if slots.iter().zip(per_breakpoint.iter()).any(|(s, c)| s.is_some() && c.is_none()) {
             let segments: Vec<String> = parsed.blocks.iter().map(|b| b.text.clone()).collect();
-            match self.tokenizer.tokenize(req.virtual_model, &segments).await {
+            match self
+                .tokenizer
+                .tokenize(req.class_route.map_or(req.virtual_model, |c| c.canonical_alias.as_str()), &segments)
+                .await
+            {
                 Ok(tok) if tok.cumulative.len() == segments.len() => {
                     let raw_at = |block: usize| u64::from(tok.cumulative[block]);
                     for i in 0..per_breakpoint.len() {
@@ -1102,12 +1135,76 @@ mod tests {
 
     fn req<'a>(secret: &'a str, body: &'a [u8]) -> ClassifyRequest<'a> {
         ClassifyRequest {
+            class_route: None,
             virtual_model: ALIAS,
             body,
             api_key: Some(secret),
             principal: None,
             route_has_blocks: true,
         }
+    }
+
+    #[sqlx::test]
+    async fn class_synonyms_share_fast_cache_but_standard_keeps_legacy_namespace(pool: PgPool) {
+        let h = harness(&pool, true, 1500, 1024).await;
+        let model_id = sqlx::query_scalar("SELECT id FROM deployed_models WHERE alias=$1")
+            .bind(ALIAS)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let fast = onwards::serving::ClassRouteIdentity {
+            model_id,
+            class_id: uuid::Uuid::new_v4(),
+            canonical_alias: ALIAS.into(),
+            class_key: "fast".into(),
+            endpoint_id: uuid::Uuid::new_v4(),
+            upstream_model_name: "gateway/fast".into(),
+        };
+        let b = body();
+        let first = h
+            .classifier
+            .classify(ClassifyRequest {
+                virtual_model: "cache-model:fast",
+                class_route: Some(&fast),
+                ..req(&h.secret, &b)
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.stats.creation_1h, 1500);
+        assert_eq!(
+            first.pending.writes[0].scope.virtual_model,
+            format!("class:{}:{}", model_id, fast.class_id)
+        );
+        h.classifier.commit(&first.pending).await.unwrap();
+        let synonym = h
+            .classifier
+            .classify(ClassifyRequest {
+                virtual_model: "cache-model-fast",
+                class_route: Some(&fast),
+                ..req(&h.secret, &b)
+            })
+            .await
+            .unwrap();
+        assert_eq!(synonym.stats.read, 1500);
+        let standard = onwards::serving::ClassRouteIdentity {
+            class_id: uuid::Uuid::new_v4(),
+            class_key: "standard".into(),
+            ..fast
+        };
+        let normal = h
+            .classifier
+            .classify(ClassifyRequest {
+                class_route: Some(&standard),
+                ..req(&h.secret, &b)
+            })
+            .await
+            .unwrap();
+        assert_eq!(normal.stats.read, 0, "classes must not share cache entries");
+        assert_eq!(normal.stats.creation_1h, 1500);
+        assert_eq!(normal.pending.writes[0].scope.virtual_model, ALIAS);
+        h.classifier.commit(&normal.pending).await.unwrap();
+        let legacy = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        assert_eq!(legacy.stats.read, 1500, "activation/rollback preserves standard cache");
     }
 
     #[sqlx::test]

@@ -557,6 +557,7 @@ mod tests {
         let mut state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config.clone()).await;
         state = crate::AppState {
             db: state.db,
+            model_aliases: state.model_aliases,
             config: state.config,
             outlet_db: None,
             metrics_recorder: None,
@@ -672,6 +673,7 @@ mod tests {
         let mut state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config.clone()).await;
         state = crate::AppState {
             db: state.db,
+            model_aliases: state.model_aliases,
             config: state.config,
             outlet_db: None,
             metrics_recorder: None,
@@ -789,6 +791,7 @@ mod tests {
         let mut state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config.clone()).await;
         state = crate::AppState {
             db: state.db,
+            model_aliases: state.model_aliases,
             config: state.config,
             outlet_db: None,
             metrics_recorder: None,
@@ -975,6 +978,7 @@ mod tests {
         let mut state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config.clone()).await;
         state = crate::AppState {
             db: state.db,
+            model_aliases: state.model_aliases,
             config: state.config,
             outlet_db: None,
             metrics_recorder: None,
@@ -1092,6 +1096,7 @@ mod tests {
         let mut state = crate::test::utils::create_test_app_state_with_config(pool.clone(), config.clone()).await;
         state = crate::AppState {
             db: state.db,
+            model_aliases: state.model_aliases,
             config: state.config,
             outlet_db: None,
             metrics_recorder: None,

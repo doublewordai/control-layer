@@ -183,6 +183,9 @@ pub struct UsageMetrics {
     /// after entitlement. `None` only when the request never reached the
     /// resolver.
     pub resolved_serving_class: Option<String>,
+    pub class_route: Option<onwards::serving::ClassRouteIdentity>,
+    pub upstream_model_name: Option<String>,
+    pub submitted_model: Option<String>,
 }
 
 /// Content-free request parameters, read off the parsed request body.
@@ -592,7 +595,11 @@ impl UsageMetrics {
             timestamp: chrono::DateTime::<chrono::Utc>::from(request_data.timestamp),
             method: request_data.method.to_string(),
             uri: request_data.uri.to_string(),
-            request_model,
+            request_model: response_data
+                .extensions
+                .get::<onwards::serving::ClassRouteIdentity>()
+                .map(|c| c.canonical_alias.clone())
+                .or_else(|| request_model.clone()),
             response_model: metrics.response_model,
             status_code,
             duration_ms: response_data.duration.as_millis() as i64,
@@ -615,13 +622,35 @@ impl UsageMetrics {
             request_params,
             requested_serving_class: response_data
                 .extensions
-                .get::<onwards::ServingClassOutcome>()
-                .and_then(|o| o.requested)
-                .map(|c| c.as_str().to_string()),
+                .get::<onwards::serving::ClassRouteIdentity>()
+                .map(|c| c.class_key.clone())
+                .or_else(|| {
+                    response_data
+                        .extensions
+                        .get::<onwards::ServingClassOutcome>()
+                        .and_then(|o| o.requested)
+                        .map(|c| c.as_str().to_string())
+                }),
+            upstream_model_name: response_data
+                .extensions
+                .get::<onwards::ServedBy>()
+                .and_then(|s| s.onwards_model.clone()),
+            submitted_model: response_data
+                .extensions
+                .get::<onwards::serving::SubmittedModel>()
+                .map(|s| s.0.clone())
+                .or_else(|| request_model.clone()),
+            class_route: response_data.extensions.get::<onwards::serving::ClassRouteIdentity>().cloned(),
             resolved_serving_class: response_data
                 .extensions
-                .get::<onwards::ServingClassOutcome>()
-                .map(|o| o.resolved.as_str().to_string()),
+                .get::<onwards::serving::ClassRouteIdentity>()
+                .map(|c| c.class_key.clone())
+                .or_else(|| {
+                    response_data
+                        .extensions
+                        .get::<onwards::ServingClassOutcome>()
+                        .map(|o| o.resolved.as_str().to_string())
+                }),
         }
     }
 }

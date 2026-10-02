@@ -191,9 +191,13 @@ pub async fn list_ai_models<P: PoolProvider>(
     let mut models_query = QueryBuilder::new(
         r#"
         SELECT DISTINCT
-            dm.alias,
+            dm.alias AS canonical_alias,
+            CASE WHEN class.class_key IS NULL OR class.class_key = 'standard' THEN dm.alias
+                 ELSE dm.alias || ':' || class.class_key END AS alias,
             EXTRACT(EPOCH FROM dm.created_at)::BIGINT AS created
         FROM deployed_models dm
+        LEFT JOIN model_serving_classes class
+          ON class.deployed_model_id = dm.id AND dm.routing_mode = 'class_routes'
         INNER JOIN deployment_groups dg ON dg.deployment_id = dm.id
         WHERE dm.deleted = FALSE
           AND dm.status = 'active'
@@ -244,7 +248,9 @@ pub async fn list_ai_models<P: PoolProvider>(
         }
     }
 
-    models_query.push(" ORDER BY dm.alias");
+    // Only primary class names are discoverable. Never enumerate model_aliases:
+    // synonyms (including future private compatibility names) are ingress only.
+    models_query.push(" ORDER BY alias");
 
     let rows = models_query
         .build()
@@ -253,7 +259,7 @@ pub async fn list_ai_models<P: PoolProvider>(
         .map_err(|e| database_error("list_accessible_models", e))?;
 
     let reasoning_policies = if include_reasoning_capabilities {
-        let aliases = rows.iter().map(|row| row.get("alias")).collect::<Vec<String>>();
+        let aliases = rows.iter().map(|row| row.get("canonical_alias")).collect::<Vec<String>>();
         Deployments::new(&mut conn)
             .get_reasoning_policies(&aliases)
             .await
@@ -268,8 +274,13 @@ pub async fn list_ai_models<P: PoolProvider>(
             .into_iter()
             .map(|row| {
                 let id: String = row.get("alias");
+                let canonical_alias: String = row.get("canonical_alias");
                 let supported_reasoning_efforts = include_reasoning_capabilities
-                    .then(|| reasoning_policies.get(&id).and_then(|policy| policy.supported_efforts()))
+                    .then(|| {
+                        reasoning_policies
+                            .get(&canonical_alias)
+                            .and_then(|policy| policy.supported_efforts())
+                    })
                     .flatten();
                 ModelObject {
                     id,

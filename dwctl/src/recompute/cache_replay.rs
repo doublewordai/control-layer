@@ -269,10 +269,12 @@ pub async fn reconstruct_split(
     principal: crate::types::UserId,
     at: DateTime<Utc>,
     route_has_blocks: bool,
+    class_route: Option<&onwards::serving::ClassRouteIdentity>,
 ) -> CacheResult<Option<ReconstructedSplit>> {
     let outcome = classifier
         .classify(crate::prompt_cache::ClassifyRequest {
             virtual_model,
+            class_route,
             body: request_body,
             api_key: None,
             principal: Some(principal),

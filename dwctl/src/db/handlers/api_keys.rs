@@ -977,7 +977,7 @@ impl<'c> ApiKeys<'c> {
                 )
                 OR (NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
-                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND (mt.serving_class IS NULL OR dm.routing_mode = 'class_routes')
                       AND mt.valid_until IS NULL
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                 ) AND NOT EXISTS (
@@ -1027,7 +1027,7 @@ impl<'c> ApiKeys<'c> {
                 )
                 OR (NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
-                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND (mt.serving_class IS NULL OR dm.routing_mode = 'class_routes')
                       AND mt.valid_until IS NULL
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                 ) AND NOT EXISTS (

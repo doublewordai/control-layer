@@ -53,6 +53,32 @@ impl ModelConfigResolver {
         }
     }
 
+    /// A public class row overrides the all-class enablement/floor. Account
+    /// multipliers do not independently enable the billing prefix index.
+    pub async fn resolve_class(&self, class: &onwards::serving::ClassRouteIdentity) -> CacheResult<ModelCacheConfig> {
+        let key = format!("class:{}:{}", class.model_id, class.class_id);
+        if let Some(c) = self.cache.get(&key).await {
+            return Ok(c);
+        }
+        let floor = sqlx::query_scalar!(
+            r#"SELECT min_prefix_tokens FROM model_cache_tariffs
+               WHERE deployed_model_id=$1 AND user_id IS NULL
+                 AND (serving_class=$2 OR serving_class IS NULL)
+                 AND valid_from<=now() AND (valid_until IS NULL OR valid_until>now())
+               ORDER BY (serving_class IS NOT NULL) DESC, valid_from DESC LIMIT 1"#,
+            class.model_id,
+            class.class_key,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        let config = floor.map_or(ModelCacheConfig::DISABLED, |floor| ModelCacheConfig {
+            enabled: true,
+            min_prefix_tokens: floor.max(0) as u32,
+        });
+        self.cache.insert(key, config).await;
+        Ok(config)
+    }
+
     /// Resolve the cache config for `virtual_model` (the `deployed_models.alias`).
     pub async fn resolve(&self, virtual_model: &str) -> CacheResult<ModelCacheConfig> {
         if let Some(c) = self.cache.get(virtual_model).await {

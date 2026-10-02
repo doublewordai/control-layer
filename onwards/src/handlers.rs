@@ -545,7 +545,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // base alias (e.g. turn nonexistent `model:interactive` into `model`). A
     // Model-Override header is a separate selector and still needs resolution.
     let has_model_override = req.headers().get("model-override").and_then(|value| value.to_str().ok()).is_some();
-    let selected_model = if suffix_class.is_some() && !has_model_override {
+    let selected_model = if state.targets.targets.contains_key(&model_name) || (suffix_class.is_some() && !has_model_override) {
         Ok((model_name.as_str(), None))
     } else {
         serving::split_class_suffix(&model_name)
@@ -570,8 +570,8 @@ pub async fn target_message_handler<T: HttpClient>(
     tracing::Span::current().record("gen_ai.request.model", &model_name);
 
     // Store original model in request extensions for response sanitization
-    req.extensions_mut()
-        .insert(OriginalModel(model_name.clone()));
+    let submitted_model = req.extensions().get::<serving::SubmittedModel>().map(|m| m.0.clone()).unwrap_or_else(|| model_name.clone());
+    req.extensions_mut().insert(OriginalModel(submitted_model));
 
     trace!("Received request for model: {}", model_name);
     trace!(
@@ -732,7 +732,18 @@ pub async fn target_message_handler<T: HttpClient>(
     // against the pool that will serve it. Strict: a class named on the
     // request that the account does not hold, or the alias does not offer,
     // is refused rather than quietly downgraded.
-    let serving_resolution: ServingResolution = {
+    let class_identity = pool.class_identity().cloned();
+    // Ingress has already used this identity for cache classification. A reload
+    // between layers may change routing, but must not change the product/class
+    // under an accepted request. Ask the client to retry across that boundary.
+    if let Some(expected) = req.extensions().get::<serving::ClassRouteIdentity>() {
+        if class_identity.as_ref().is_none_or(|actual| actual.model_id != expected.model_id || actual.class_id != expected.class_id) {
+            return Err(OnwardsErrorResponse::service_unavailable());
+        }
+    }
+    let serving_resolution: ServingResolution = if class_identity.is_some() {
+        ServingResolution { requested: None, resolved: serving::ServingClass::Standard, targets: None, self_hosted_only: false }
+    } else {
         let (account_id, key_purpose) = bearer_token
             .as_ref()
             .and_then(|token| state.targets.key_labels.get(token))
@@ -791,6 +802,10 @@ pub async fn target_message_handler<T: HttpClient>(
         .increment(1);
         resolution
     };
+
+    if let Some(identity) = &class_identity {
+        metrics::counter!("onwards_class_requests_total", "model" => identity.canonical_alias.clone(), "class" => identity.class_key.clone(), "upstream" => identity.upstream_model_name.clone()).increment(1);
+    }
 
     let canonical_reasoning = if let Some(reasoning) = req
         .extensions()
@@ -1090,6 +1105,7 @@ pub async fn target_message_handler<T: HttpClient>(
             .get::<OriginalModel>()
             .map(|m| m.0.to_string());
 
+        let submitted = req.extensions().get::<serving::SubmittedModel>().cloned();
         let action = async {
 
         // Check provider-level rate limit (skip to next if configured for rate limit fallback)
@@ -1168,6 +1184,12 @@ pub async fn target_message_handler<T: HttpClient>(
                     return LoopAction::Done(Err(error.clone()));
                 }
             }
+            // On the class path, combine the model rewrite and trusted default
+            // priority in one transformation. Numeric targets no longer apply.
+            if class_identity.is_some() && target.kind == ProviderKind::Dynamo && !scheduling_fields_refused
+                && let Some(object) = body_serialized.as_object_mut() {
+                serving::stamp_default_priority(object);
+            }
             attempt_body = match serde_json::to_vec(&body_serialized) {
                 Ok(bytes) => axum::body::Bytes::from(bytes),
                 Err(_) => return LoopAction::Done(Err(OnwardsErrorResponse::internal())),
@@ -1215,7 +1237,7 @@ pub async fn target_message_handler<T: HttpClient>(
         // what the first hop set. Client-supplied targets are scrubbed at
         // dwctl's ingress, alongside the body priority (the same perimeter
         // the priority strip relies on).
-        if target.kind == ProviderKind::Dynamo && !attempt_body.is_empty() {
+        if target.kind == ProviderKind::Dynamo && class_identity.is_none() && !attempt_body.is_empty() {
             match serde_json::from_slice::<serde_json::Value>(&attempt_body) {
                 Ok(mut body) => {
                     if let Some(object) = body.as_object_mut() {
@@ -2009,6 +2031,10 @@ pub async fn target_message_handler<T: HttpClient>(
         response
             .extensions_mut()
             .insert(ResolvedTrust(resolved_trust));
+        if let Some(identity) = class_identity.clone() { response.extensions_mut().insert(identity); }
+        if let Some(submitted) = submitted.clone() {
+            response.extensions_mut().insert(submitted);
+        }
         response.extensions_mut().insert(ServedBy {
             url: target.url.to_string(),
             onwards_model: target.onwards_model.clone(),

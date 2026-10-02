@@ -1,0 +1,20 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT dm.alias FROM deployed_models dm\n        WHERE dm.routing_mode='class_routes' AND NOT dm.deleted\n          AND (NOT EXISTS (SELECT 1 FROM model_serving_classes c WHERE c.deployed_model_id=dm.id AND c.class_key='standard')\n            OR NOT EXISTS (SELECT 1 FROM model_serving_classes c WHERE c.deployed_model_id=dm.id AND c.class_key='fast')\n            OR EXISTS (SELECT 1 FROM model_traffic_rules r WHERE r.action='redirect'\n                       AND (r.deployed_model_id=dm.id OR r.redirect_target_id=dm.id))) LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "alias",
+        "type_info": "Varchar"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "2075b2f35fb26e51310672b78e26f65cb58a8e0e7df09a09c2e35f629ac6e1de"
+}

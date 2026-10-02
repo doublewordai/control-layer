@@ -152,7 +152,8 @@ pub async fn recompute_corpus(
     let mut accounts: Vec<_> = corpus.iter().filter_map(|r| r.user_id).collect();
     accounts.sort();
     accounts.dedup();
-    let cache_tariffs = crate::pricing::lookup_cache_tariffs(pool, &aliases, &accounts).await?;
+    let class_models: Vec<_> = corpus.iter().filter_map(|r| r.canonical_model_id).collect();
+    let cache_tariffs = crate::pricing::lookup_cache_tariffs_for_models(pool, &aliases, &accounts, &class_models).await?;
     // Rows that recorded cache tokens but whose tariff history no longer resolves (e.g. the
     // deployed model was deleted, cascading its tariffs away). Those re-price at list rate,
     // which is NOT what the live path charged — the report must say so rather than present
@@ -227,8 +228,10 @@ pub async fn recompute_corpus(
         let report_row = match replayed {
             Ok(usage) => {
                 let cache_mults = row
-                    .model
-                    .as_deref()
+                    .canonical_model_id
+                    .map(|id| id.to_string())
+                    .or_else(|| row.model.clone())
+                    .as_ref()
                     .and_then(|alias| cache_tariffs.get(alias))
                     .and_then(|versions| {
                         crate::pricing::resolve_cache_multipliers(
@@ -277,8 +280,10 @@ pub async fn recompute_corpus(
                 match rescued {
                     Some(usage) => {
                         let cache_mults = row
-                            .model
-                            .as_deref()
+                            .canonical_model_id
+                            .map(|id| id.to_string())
+                            .or_else(|| row.model.clone())
+                            .as_ref()
                             .and_then(|alias| cache_tariffs.get(alias))
                             .and_then(|versions| {
                                 crate::pricing::resolve_cache_multipliers(
@@ -345,7 +350,30 @@ pub async fn recompute_corpus(
             // module blocks — it reached the cache layer as chat completions).
             let route_has_blocks = !crate::prompt_cache::path_is_plain_completions(&exchange.endpoint);
             let historical = base.with_index(std::sync::Arc::new(cache_replay::HistoricalIndex::new(pool.clone(), row.timestamp)));
-            match cache_replay::reconstruct_split(&historical, model, body, principal, row.timestamp, route_has_blocks).await {
+            let class_route = row
+                .canonical_model_id
+                .zip(row.serving_class_id)
+                .zip(row.resolved_serving_class.as_ref())
+                .map(|((model_id, class_id), class)| onwards::serving::ClassRouteIdentity {
+                    model_id,
+                    class_id,
+                    canonical_alias: model.to_string(),
+                    class_key: class.clone(),
+                    // Replay uses identity/cache settings only; it never dispatches.
+                    endpoint_id: uuid::Uuid::nil(),
+                    upstream_model_name: String::new(),
+                });
+            match cache_replay::reconstruct_split(
+                &historical,
+                model,
+                body,
+                principal,
+                row.timestamp,
+                route_has_blocks,
+                class_route.as_ref(),
+            )
+            .await
+            {
                 Ok(Some(split)) => {
                     report_row.reconstructed_cache = Some(report::ReconstructedCache::compare(&split, row));
                 }

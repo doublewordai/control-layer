@@ -477,6 +477,18 @@ impl<'c> Repository for Deployments<'c> {
     #[instrument(skip(self, request), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         let mut tx = self.db.begin().await?;
+        let active = sqlx::query_scalar!(
+            r#"SELECT routing_mode='class_routes' AS "active!" FROM deployed_models WHERE id=$1"#,
+            id
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+        if active {
+            return Err(DbError::InvalidModelField {
+                field: "class-routed models must be edited through their catalog",
+            });
+        }
         if let Some(alias) = &request.alias {
             lock_model_names(&mut tx).await?;
             validate_model_name(&mut tx, Some(id), alias.trim()).await?;
@@ -1568,7 +1580,7 @@ impl<'c> Deployments<'c> {
                 SELECT
                     requested.hosted_on,
                     requested.reasoning_translation_overrides
-                WHERE requested.is_composite = FALSE
+                WHERE requested.is_composite = FALSE AND requested.routing_mode = 'legacy'
 
                 UNION ALL
 
@@ -1577,9 +1589,15 @@ impl<'c> Deployments<'c> {
                     component.reasoning_translation_overrides
                 FROM deployed_model_components link
                 INNER JOIN deployed_models component ON component.id = link.deployed_model_id
-                WHERE requested.is_composite = TRUE
+                WHERE requested.is_composite = TRUE AND requested.routing_mode = 'legacy'
                   AND link.composite_model_id = requested.id
                   AND component.deleted = FALSE
+
+                UNION ALL
+
+                SELECT class.inference_endpoint_id, requested.reasoning_translation_overrides
+                FROM model_serving_classes class
+                WHERE class.deployed_model_id=requested.id AND requested.routing_mode='class_routes'
             ) provider ON TRUE
             INNER JOIN inference_endpoints endpoint ON endpoint.id = provider.hosted_on
             WHERE requested.alias = ANY($1)

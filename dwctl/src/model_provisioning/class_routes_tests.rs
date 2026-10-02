@@ -279,7 +279,7 @@ fn class_catalog_schema_restricts_class_keys() {
 }
 
 #[sqlx::test]
-async fn catalog_refuses_activated_models_without_resetting_operator_mode(pool: PgPool) {
+async fn catalog_updates_activated_models_without_resetting_operator_mode(pool: PgPool) {
     setup(&pool).await;
     let c = catalog(&fixture()).unwrap();
     apply(&pool, &c).await.unwrap();
@@ -287,8 +287,7 @@ async fn catalog_refuses_activated_models_without_resetting_operator_mode(pool: 
         .execute(&pool)
         .await
         .unwrap();
-    let error = apply(&pool, &c).await.unwrap_err();
-    assert!(error.to_string().contains("activated"));
+    apply(&pool, &c).await.unwrap();
     let mode: String = sqlx::query_scalar("SELECT routing_mode FROM deployed_models WHERE alias='example/model'")
         .fetch_one(&pool)
         .await

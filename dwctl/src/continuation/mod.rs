@@ -278,7 +278,7 @@ impl ContinuationRoutes {
             FROM deployed_model_components dmc
             JOIN deployed_models cm ON cm.id = dmc.composite_model_id
             JOIN deployed_models dm ON dm.id = dmc.deployed_model_id
-            WHERE dmc.pool = 'completions'
+            WHERE dmc.pool = 'completions' AND cm.routing_mode = 'legacy'
               AND dmc.enabled = true
               AND cm.deleted = false
               AND dm.deleted = false

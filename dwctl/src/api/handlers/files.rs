@@ -197,18 +197,23 @@ impl OpenAIBatchRequest {
             })?
             .to_string();
 
-        // Batches use deadline scheduling, so all serving-class suffixes
-        // are ignored. Resolve the base model before validating access.
-        let (model, _) = onwards::serving::split_model_suffix(&model).map_err(|error| Error::BadRequest {
-            message: error.to_string(),
-        })?;
-        let model = model.to_string();
-
-        // Validate model access
-        let accessible_model = accessible_models.get(&model).ok_or_else(|| Error::ModelAccessDenied {
+        // Known class names/synonyms have already been resolved once per file.
+        // Legacy suffix handling remains only for unmigrated models.
+        let selected = if accessible_models.contains_key(&model) {
+            model.clone()
+        } else {
+            onwards::serving::split_model_suffix(&model)
+                .map_err(|error| Error::BadRequest {
+                    message: error.to_string(),
+                })?
+                .0
+                .to_string()
+        };
+        let accessible_model = accessible_models.get(&selected).ok_or_else(|| Error::ModelAccessDenied {
             model_name: model.clone(),
             message: format!("Model '{}' has not been configured or is not available to user.", model),
         })?;
+        let model = accessible_model.canonical_alias.clone();
 
         // Validate endpoint matches model type (skip if model type is unknown)
         if let Some(model_type) = &accessible_model.model_type {
@@ -691,7 +696,9 @@ struct FileRequestContext {
     allowed_url_paths: Vec<String>,
 }
 
+#[derive(Clone)]
 struct AccessibleBatchModel {
+    canonical_alias: String,
     model_type: Option<ModelType>,
     reasoning_policy: ModelReasoningPolicy,
 }
@@ -1244,19 +1251,39 @@ pub async fn upload_file<P: PoolProvider>(
         .map(|deployment| deployment.alias.clone())
         .collect::<Vec<_>>();
     let mut reasoning_policies = deployments_repo.get_reasoning_policies(&aliases).await.map_err(Error::Database)?;
-    let accessible_models: HashMap<String, AccessibleBatchModel> = accessible_deployments
+    let mut accessible_models: HashMap<String, AccessibleBatchModel> = accessible_deployments
         .into_iter()
         .map(|deployment| {
             let reasoning_policy = reasoning_policies.remove(&deployment.alias).unwrap_or_default();
             (
-                deployment.alias,
+                deployment.alias.clone(),
                 AccessibleBatchModel {
+                    canonical_alias: deployment.alias,
                     model_type: deployment.model_type,
                     reasoning_policy,
                 },
             )
         })
         .collect();
+
+    let primary_names = crate::db::handlers::model_aliases::ModelAliases::new(&mut conn)
+        .active_primary_names()
+        .await
+        .map_err(Error::Database)?;
+    for name in &primary_names {
+        if let Some(model) = accessible_models.get(&name.canonical_alias).cloned() {
+            accessible_models.insert(name.alias.clone(), model);
+        }
+    }
+    for name in state.model_aliases.entries() {
+        if primary_names
+            .iter()
+            .any(|p| p.deployed_model_id == name.deployed_model_id && p.serving_class_id == name.serving_class_id)
+            && let Some(model) = accessible_models.get(&name.canonical_alias).cloned()
+        {
+            accessible_models.insert(name.alias.clone(), model);
+        }
+    }
 
     // drop conn so it isn't persisted for entire upload process
     drop(conn);
