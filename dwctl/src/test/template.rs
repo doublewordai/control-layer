@@ -93,7 +93,8 @@ async fn create_database() -> anyhow::Result<(PgPool, PgConnection, String)> {
     let name = format!("dwctl_test_{}", Uuid::new_v4().simple());
     admin
         .execute(format!("CREATE DATABASE {name} TEMPLATE {template} STRATEGY FILE_COPY").as_str())
-        .await?;
+        .await
+        .context("failed to clone the test template (requires PostgreSQL 15+ and CREATEDB, like sqlx::test)")?;
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .idle_timeout(Duration::from_secs(1))

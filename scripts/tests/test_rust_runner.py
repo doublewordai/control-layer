@@ -102,7 +102,13 @@ class RunnerTests(unittest.TestCase):
     def test_just_without_target_dispatches_empty_default(self):
         # Execute the actual dispatch recipe, replacing only its downstream
         # integration runner so this check needs no running services.
-        recipe = (ROOT / "justfile").read_text().split("[positional-arguments]\ntest ", 1)[1].split("\n_test-other ", 1)[0]
+        justfile = (ROOT / "justfile").read_text()
+        start, end = "[positional-arguments]\ntest ", "\n_test-other "
+        # Fail clearly if a justfile refactor moves either marker, rather than
+        # splicing the wrong text and no longer exercising the dispatch path.
+        self.assertEqual(justfile.count(start), 1, f"expected one {start!r} in justfile")
+        self.assertEqual(justfile.count(end), 1, f"expected one {end!r} in justfile")
+        recipe = justfile.split(start, 1)[1].split(end, 1)[0]
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "justfile"
             path.write_text('[positional-arguments]\ntest ' + recipe +
