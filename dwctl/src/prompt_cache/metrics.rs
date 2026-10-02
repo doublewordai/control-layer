@@ -177,6 +177,12 @@ pub fn record_commit_vetoed(reason: &'static str) {
     counter!("dwctl_cache_commit_vetoed_total", "reason" => reason).increment(1);
 }
 
+/// A sliding-TTL refresh skipped in process because this process had just observed the
+/// entry's expiry within 1% of the window of the requested one (see `postgres.rs`).
+pub fn record_refresh_skipped() {
+    counter!("dwctl_cache_refresh_skipped_total").increment(1);
+}
+
 /// Commit (index write/refresh) latency.
 pub fn record_commit_duration(seconds: f64) {
     histogram!("dwctl_cache_commit_duration_seconds").record(seconds);

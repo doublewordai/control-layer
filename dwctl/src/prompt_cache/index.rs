@@ -153,7 +153,8 @@ pub trait CacheIndex: Send + Sync {
     /// scope+hash unique key.
     async fn write(&self, entry: &CacheEntry) -> CacheResult<()>;
 
-    /// Slide an entry's expiry forward on read (the sliding window). A direct
-    /// `UPDATE` in Postgres; write-behind / debounced in the Redis accelerator.
+    /// Slide an entry's expiry forward on read (the sliding window). A conditional
+    /// `UPDATE` in Postgres, skipped in process when this process has just observed the
+    /// entry fresh; write-behind / debounced in the Redis accelerator.
     async fn refresh(&self, scope: &IndexScope, prefix_hash: &PrefixHash, new_expires_at: DateTime<Utc>) -> CacheResult<()>;
 }
