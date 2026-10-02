@@ -110,6 +110,16 @@ async fn enrich_response(pools: sqlx_pool_router::DynPools, request: Request<Bod
     // Let the request proceed through onwards
     let response = next.run(reconstructed).await;
 
+    // This is an explicit policy refusal, not a missing key/credit diagnosis.
+    // In particular a free-model account must not receive a spurious 402 here.
+    if response
+        .extensions()
+        .get::<onwards::errors::ErrorResponseBody>()
+        .is_some_and(|error| error.code == "hosting_restriction_unavailable")
+    {
+        return response;
+    }
+
     // Only enrich 403 errors when we have an API key
     // Note: This middleware is applied only to the onwards router (AI proxy paths),
     // so no path filtering is needed here

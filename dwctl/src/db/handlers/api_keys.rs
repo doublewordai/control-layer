@@ -987,7 +987,17 @@ impl<'c> ApiKeys<'c> {
                 OR (NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
                     WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
-                      AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL)
+                      AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM model_tariffs class_price
+                                WHERE dm.routing_mode = 'class_routes'
+                                  AND class_price.deployed_model_id = mt.deployed_model_id
+                                  AND class_price.user_id IS NULL AND class_price.serving_class = $3
+                                  AND class_price.api_key_purpose = mt.api_key_purpose
+                                  AND class_price.completion_window IS NOT DISTINCT FROM mt.completion_window
+                                  AND class_price.valid_from <= NOW()
+                                  AND (class_price.valid_until IS NULL OR class_price.valid_until > NOW())
+                            ))
                         OR (dm.routing_mode = 'class_routes' AND mt.serving_class = $3
                             AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())))
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
@@ -1040,7 +1050,17 @@ impl<'c> ApiKeys<'c> {
                 OR (NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
                     WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
-                      AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL)
+                      AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM model_tariffs class_price
+                                WHERE dm.routing_mode = 'class_routes'
+                                  AND class_price.deployed_model_id = mt.deployed_model_id
+                                  AND class_price.user_id IS NULL AND class_price.serving_class = $3
+                                  AND class_price.api_key_purpose = mt.api_key_purpose
+                                  AND class_price.completion_window IS NOT DISTINCT FROM mt.completion_window
+                                  AND class_price.valid_from <= NOW()
+                                  AND (class_price.valid_until IS NULL OR class_price.valid_until > NOW())
+                            ))
                         OR (dm.routing_mode = 'class_routes' AND mt.serving_class = $3
                             AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())))
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)

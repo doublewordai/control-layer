@@ -4,7 +4,7 @@ use crate::db::models::deployments::DEFAULT_COMPONENT_POOL;
 use crate::metrics::errors::component::ONWARDS_SYNC;
 use crate::types::UserId;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     num::NonZeroU32,
     sync::Arc,
 };
@@ -1557,8 +1557,16 @@ fn convert_to_config_file(
                 trusted: false,
                 routing_rules: target.routing_rules,
                 serving_classes: target.serving_classes,
+                overlays: overlays
+                    .get(
+                        target
+                            .class_identity
+                            .as_ref()
+                            .map_or(target.alias.as_str(), |identity| identity.canonical_alias.as_str()),
+                    )
+                    .cloned()
+                    .unwrap_or_default(),
                 class_identity: target.class_identity,
-                overlays: overlays.get(&target.alias).cloned().unwrap_or_default(),
             };
 
             (target.alias, TargetSpecOrList::Pool(pool_spec))
@@ -1636,23 +1644,26 @@ async fn load_targets_from_snapshot(
     let query_start = std::time::Instant::now();
     debug!("Loading onwards targets from database (with composite models)");
 
-    // Refuse incomplete activation rather than publishing half a product and
-    // dropping working legacy targets. Failed reloads retain the last good view.
-    let invalid = sqlx::query_scalar!(
-        r#"SELECT dm.alias FROM deployed_models dm
+    // Quarantine malformed activations without freezing key revocations and
+    // balance changes for every other model. Never fall back to legacy routing.
+    let invalid = sqlx::query!(
+        r#"SELECT dm.id, dm.alias FROM deployed_models dm
         WHERE dm.routing_mode='class_routes' AND NOT dm.deleted
           AND (NOT EXISTS (SELECT 1 FROM model_serving_classes c WHERE c.deployed_model_id=dm.id AND c.class_key='standard')
             OR NOT EXISTS (SELECT 1 FROM model_serving_classes c WHERE c.deployed_model_id=dm.id AND c.class_key='fast')
             OR EXISTS (SELECT 1 FROM model_traffic_rules r WHERE r.action='redirect'
-                       AND (r.deployed_model_id=dm.id OR r.redirect_target_id=dm.id))) LIMIT 1"#
+                       AND (r.deployed_model_id=dm.id OR r.redirect_target_id=dm.id)))"#
     )
-    .fetch_optional(&mut *db)
+    .fetch_all(&mut *db)
     .await?;
-    anyhow::ensure!(
-        invalid.is_none(),
-        "class activation requires standard/fast routes and no legacy redirects: {:?}",
-        invalid
-    );
+    let invalid_ids: HashSet<_> = invalid.iter().map(|model| model.id).collect();
+    for model in invalid {
+        crate::background_error!(
+            ONWARDS_SYNC, "invalid_class_activation", Error,
+            model_id = %model.id, model = %model.alias,
+            "Model quarantined: class activation requires standard/fast routes and no legacy redirects"
+        );
+    }
 
     // Load regular deployed models (existing logic)
     // Note: We pass escalation_models to grant batch API keys access to escalation models
@@ -1770,7 +1781,16 @@ async fn load_targets_from_snapshot(
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
-                          AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL)
+                          AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM model_tariffs class_price
+                                    WHERE class_price.deployed_model_id = mt.deployed_model_id
+                                      AND class_price.user_id IS NULL AND class_price.serving_class = c.class_key
+                                      AND class_price.api_key_purpose = mt.api_key_purpose
+                                      AND class_price.completion_window IS NOT DISTINCT FROM mt.completion_window
+                                      AND class_price.valid_from <= NOW()
+                                      AND (class_price.valid_until IS NULL OR class_price.valid_until > NOW())
+                                ))
                             OR (mt.serving_class = c.class_key AND mt.valid_from <= NOW()
                                 AND (mt.valid_until IS NULL OR mt.valid_until > NOW())))
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
@@ -1809,7 +1829,16 @@ async fn load_targets_from_snapshot(
                       AND (EXISTS (
                         SELECT 1 FROM model_tariffs mt
                         WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
-                          AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL)
+                          AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM model_tariffs class_price
+                                    WHERE class_price.deployed_model_id = mt.deployed_model_id
+                                      AND class_price.user_id IS NULL AND class_price.serving_class = c.class_key
+                                      AND class_price.api_key_purpose = mt.api_key_purpose
+                                      AND class_price.completion_window IS NOT DISTINCT FROM mt.completion_window
+                                      AND class_price.valid_from <= NOW()
+                                      AND (class_price.valid_until IS NULL OR class_price.valid_until > NOW())
+                                ))
                             OR (mt.serving_class = c.class_key AND mt.valid_from <= NOW()
                                 AND (mt.valid_until IS NULL OR mt.valid_until > NOW())))
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
@@ -1851,6 +1880,9 @@ async fn load_targets_from_snapshot(
     // Group results into targets
     let mut targets_map: HashMap<(DeploymentId, Option<uuid::Uuid>), OnwardsTarget> = HashMap::new();
     for row in rows {
+        if invalid_ids.contains(&row.deployment_id) {
+            continue;
+        }
         let deployment_id = row.deployment_id;
         let aimd = row.aimd.map(serde_json::from_value).transpose()?;
         let target = targets_map.entry((deployment_id, row.class_id)).or_insert_with(|| {

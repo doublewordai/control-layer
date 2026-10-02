@@ -42,6 +42,14 @@ impl ModelAliasMap {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ClassRouteError {
+    #[error("Model class is not configured")]
+    UnknownClass,
+    #[error("{0}")]
+    Unavailable(&'static str),
+}
+
 /// Resolve an activated primary name or synonym against the live Onwards entry.
 /// No database lookup and no access grant: Onwards still authenticates the key.
 pub fn resolve_class_route(
@@ -49,7 +57,7 @@ pub fn resolve_class_route(
     targets: &onwards::target::Targets,
     submitted: &str,
     asynchronous: bool,
-) -> std::result::Result<Option<(String, onwards::serving::ClassRouteIdentity)>, String> {
+) -> std::result::Result<Option<(String, onwards::serving::ClassRouteIdentity)>, ClassRouteError> {
     let synonym = aliases.resolve(submitted);
     let selected = match synonym {
         Some(alias) if alias.class_key == "standard" => alias.canonical_alias.clone(),
@@ -68,10 +76,10 @@ pub fn resolve_class_route(
                 .get(base)
                 .is_some_and(|pool| pool.default_pool().class_identity().is_some())
         {
-            return Err("Model class is not configured".into());
+            return Err(ClassRouteError::UnknownClass);
         }
         return if synonym.is_some() {
-            Err("Model alias is not active".into())
+            Err(ClassRouteError::Unavailable("Model alias is not active"))
         } else {
             Ok(None)
         };
@@ -79,7 +87,9 @@ pub fn resolve_class_route(
     if let Some(alias) = synonym
         && (identity.model_id != alias.deployed_model_id || identity.class_id != alias.serving_class_id)
     {
-        return Err("Model alias configuration changed; retry after rollout".into());
+        return Err(ClassRouteError::Unavailable(
+            "Model alias configuration changed; retry after rollout",
+        ));
     }
     let selected = if asynchronous {
         let standard = targets
@@ -87,7 +97,7 @@ pub fn resolve_class_route(
             .get(&identity.canonical_alias)
             .and_then(|p| p.default_pool().class_identity().cloned())
             .filter(|c| c.model_id == identity.model_id && c.class_key == "standard")
-            .ok_or_else(|| "Standard model class is not available".to_owned())?;
+            .ok_or(ClassRouteError::Unavailable("Standard model class is not available"))?;
         identity = standard;
         identity.canonical_alias.clone()
     } else {

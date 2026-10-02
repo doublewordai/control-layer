@@ -746,25 +746,42 @@ pub async fn target_message_handler<T: HttpClient>(
             return Err(OnwardsErrorResponse::service_unavailable());
         }
     }
+    let (account_id, key_purpose) = bearer_token
+        .as_ref()
+        .and_then(|token| state.targets.key_labels.get(token))
+        .map(|labels| {
+            (
+                labels.get(serving::ACCOUNT_LABEL).cloned(),
+                labels.get("purpose").cloned(),
+            )
+        })
+        .unwrap_or((None, None));
+    let account = account_id
+        .as_deref()
+        .and_then(|id| state.targets.accounts.get(id).map(|r| r.value().clone()));
+    let overlay = account_id
+        .as_deref()
+        .and_then(|id| alias_serving.overlays().get(id).cloned());
     let serving_resolution: ServingResolution = if class_identity.is_some() {
+        // The gateway's endpoint kind cannot prove where its workers run.
+        // Until worker restrictions are propagated, refuse restricted accounts
+        // rather than silently allowing external spillover.
+        let restricted = overlay.as_ref().and_then(|o| o.self_hosted_only)
+            .unwrap_or_else(|| account.as_ref().is_some_and(|a| a.self_hosted_only));
+        if restricted {
+            record_response_status(403);
+            return Err(OnwardsErrorResponse::builder()
+                .body(ErrorResponseBody {
+                    message: "This model route cannot enforce the account's hosting restriction".into(),
+                    r#type: "invalid_request_error".into(),
+                    param: Some("model".into()),
+                    code: "hosting_restriction_unavailable".into(),
+                })
+                .status(StatusCode::FORBIDDEN)
+                .build());
+        }
         ServingResolution { requested: None, resolved: serving::ServingClass::Standard, targets: None, self_hosted_only: false }
     } else {
-        let (account_id, key_purpose) = bearer_token
-            .as_ref()
-            .and_then(|token| state.targets.key_labels.get(token))
-            .map(|labels| {
-                (
-                    labels.get(serving::ACCOUNT_LABEL).cloned(),
-                    labels.get("purpose").cloned(),
-                )
-            })
-            .unwrap_or((None, None));
-        let account = account_id
-            .as_deref()
-            .and_then(|id| state.targets.accounts.get(id).map(|r| r.value().clone()));
-        let overlay = account_id
-            .as_deref()
-            .and_then(|id| alias_serving.overlays().get(id).cloned());
         let resolution = match serving::resolve(
             suffix_class,
             account.as_ref(),

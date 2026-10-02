@@ -145,18 +145,16 @@ async fn live_destination_edits_do_not_reload_synonym_snapshot(pool: PgPool) {
 }
 
 #[sqlx::test]
-async fn incomplete_activation_refuses_to_build_a_partial_route_view(pool: PgPool) {
+async fn incomplete_activation_is_quarantined_without_failing_sync(pool: PgPool) {
     let (model, _) = add_fast_alias(&pool).await;
     sqlx::query("UPDATE deployed_models SET routing_mode='class_routes' WHERE id=$1")
         .bind(model)
         .execute(&pool)
         .await
         .unwrap();
-    assert!(
-        crate::sync::onwards_config::load_targets_from_db(&pool, &[], false, &Default::default())
-            .await
-            .is_err()
-    );
+    let view = targets(&pool).await;
+    assert!(!view.targets.contains_key("example/model"));
+    assert!(!view.targets.contains_key("example/model:fast"));
 }
 
 #[sqlx::test]
@@ -236,7 +234,7 @@ async fn class_requests_translate_once_keep_public_responses_and_preserve_deadli
         })
         .mount(&upstream)
         .await;
-    active_model(&pool).await;
+    let (model, _) = active_model(&pool).await;
     sqlx::query("UPDATE inference_endpoints SET url=$1,kind='dynamo',accepts_scheduling_priority=true WHERE name='gateway'")
         .bind(upstream.uri())
         .execute(&pool)
@@ -247,12 +245,15 @@ async fn class_requests_translate_once_keep_public_responses_and_preserve_deadli
     config.background_services.onwards_sync.enabled = true;
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None).await.unwrap();
     let (server, background) = app.into_test_server();
+    let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+    let key = crate::test::utils::create_test_api_key_for_user(&pool, user.id).await.secret;
+    sqlx::query("INSERT INTO deployment_groups (deployment_id,group_id) VALUES ($1,$2)")
+        .bind(model)
+        .bind(Uuid::nil())
+        .execute(&pool)
+        .await
+        .unwrap();
     background.sync_onwards_config(&pool).await.unwrap();
-    let key: String =
-        sqlx::query_scalar("SELECT secret FROM api_keys WHERE user_id='00000000-0000-0000-0000-000000000000' AND NOT is_deleted LIMIT 1")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
     for alias in ["example/model", "example/model:fast", "example/model-fast"] {
         let response = server
             .post("/ai/v1/chat/completions")
@@ -289,6 +290,42 @@ async fn class_requests_translate_once_keep_public_responses_and_preserve_deadli
     let body: serde_json::Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
     assert_eq!(body["model"], "dynamo-example/throughput");
     assert_eq!(body["nvext"]["agent_hints"]["priority"], -42);
+
+    // New queued work stores the bare execution name separately from its echo.
+    let queued = server
+        .post("/ai/v1/responses")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({"model":"example/model-fast","input":"queued rollback", "service_tier":"flex", "background":true}))
+        .await;
+    assert_eq!(queued.status_code(), 202, "{}", queued.text());
+    let (body, metadata): (String, Option<serde_json::Value>) = sqlx::query_as(
+        "SELECT body,metadata FROM fusillade.request_templates WHERE metadata->>'dw_submitted_model'='example/model-fast' LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["model"], "example/model");
+    let echo = metadata.unwrap()["dw_submitted_model"].as_str().unwrap().to_string();
+    sqlx::query("UPDATE deployed_models SET routing_mode='legacy' WHERE alias='example/model'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    background.sync_onwards_config(&pool).await.unwrap();
+    let unavailable = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({"model":"example/model-fast","messages":[{"role":"user","content":"retry"}]}))
+        .await;
+    assert_eq!(unavailable.status_code(), 503);
+    let response = server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .add_header("x-fusillade-request-id", Uuid::new_v4().to_string())
+        .add_header("x-fusillade-batch-dw-submitted-model", echo)
+        .json(&json!({"model":"example/model","messages":[{"role":"user","content":"queued rollback"}]}))
+        .await;
+    assert_eq!(response.status_code(), 200, "{}", response.text());
+    assert_eq!(response.json::<serde_json::Value>()["model"], "example/model-fast");
 }
 
 #[sqlx::test]
@@ -497,7 +534,9 @@ async fn class_activation_serializes_with_model_edits(pool: PgPool) {
         });
         // Observe the editor blocked on the activation transaction before releasing it.
         tokio::time::timeout(Duration::from_secs(5), async {
+            let mut poll = tokio::time::interval(Duration::from_millis(10));
             loop {
+                poll.tick().await;
                 let blocked: bool = sqlx::query_scalar("SELECT cardinality(pg_blocking_pids($1))>0")
                     .bind(pid)
                     .fetch_one(&pool)
@@ -507,7 +546,6 @@ async fn class_activation_serializes_with_model_edits(pool: PgPool) {
                     break;
                 }
                 assert!(!task.is_finished(), "edit bypassed the held model lock");
-                tokio::task::yield_now().await;
             }
         })
         .await
@@ -526,5 +564,53 @@ async fn class_activation_serializes_with_model_edits(pool: PgPool) {
             .unwrap();
         assert_eq!(alias, "example/model");
         assert_eq!(description, None);
+    }
+}
+
+#[sqlx::test]
+async fn class_routes_refuse_hosting_restrictions_until_worker_filtering_exists(pool: PgPool) {
+    use serde_json::json;
+    let (model, _) = active_model(&pool).await;
+    let mut config = crate::test::utils::create_test_config();
+    config.background_services.onwards_sync.enabled = true;
+    let app = crate::Application::new_with_pool(config, Some(pool.clone()), None).await.unwrap();
+    let (server, background) = app.into_test_server();
+    let user = crate::test::utils::create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+    let key = crate::test::utils::create_test_api_key_for_user(&pool, user.id).await.secret;
+    sqlx::query("INSERT INTO deployment_groups (deployment_id,group_id) VALUES ($1,$2)")
+        .bind(model)
+        .bind(Uuid::nil())
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET self_hosted_only=true WHERE id=$1")
+        .bind(user.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for overlay in [false, true] {
+        if overlay {
+            sqlx::query("UPDATE users SET self_hosted_only=false WHERE id=$1")
+                .bind(user.id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO model_overlays (user_id,deployed_model_id,self_hosted_only) VALUES ($1,$2,true)")
+                .bind(user.id)
+                .bind(model)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        background.sync_onwards_config(&pool).await.unwrap();
+        for alias in ["example/model", "example/model:fast", "example/model-fast"] {
+            let response = server
+                .post("/ai/v1/chat/completions")
+                .add_header("Authorization", format!("Bearer {key}"))
+                .json(&json!({"model":alias,"messages":[{"role":"user","content":"hello"}]}))
+                .await;
+            assert_eq!(response.status_code(), 403, "{}", response.text());
+            assert!(response.text().contains("hosting_restriction_unavailable"), "{}", response.text());
+        }
     }
 }

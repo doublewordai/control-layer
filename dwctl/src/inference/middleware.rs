@@ -146,14 +146,22 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             .transpose()
         {
             Ok(route) => route.flatten(),
-            Err(message) => return invalid_request_response(&message, "model_not_found", "model"),
+            Err(error) => return class_route_error_response(error),
         };
+        // The execution body stays canonical even across a routing rollback.
+        // Echo metadata is trusted only on the daemon loopback, like its deadline.
+        let submitted = parts
+            .headers
+            .get("x-fusillade-batch-dw-submitted-model")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned)
+            .or_else(|| route.as_ref().and(selected.model.clone()));
+        if let Some(submitted) = submitted {
+            parts.extensions.insert(onwards::serving::SubmittedModel(submitted));
+        }
         let mut bytes = body_bytes;
         if let Some((name, identity)) = route {
             parts.extensions.insert(identity);
-            parts
-                .extensions
-                .insert(onwards::serving::SubmittedModel(selected.model.clone().unwrap()));
             if selected.model.as_deref() != Some(name.as_str()) {
                 let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("validated JSON");
                 value["model"] = name.into();
@@ -193,7 +201,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         .transpose()
     {
         Ok(route) => route.flatten(),
-        Err(message) => return invalid_request_response(&message, "model_not_found", "model"),
+        Err(error) => return class_route_error_response(error),
     };
     let class_route_changed = class_route
         .as_ref()
@@ -702,13 +710,10 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 obj.remove("stream_options");
             }
 
-            // Keep the accepted spelling in the queued body for response echo.
-            // The queue's model column remains canonical for scheduling/access;
-            // dispatch resolves this body again and enforces standard.
+            // Persist the standard execution name, not a fast/synonym spelling
+            // that may disappear during rollback. Keep response echo in metadata.
             let response_model = if class_route.is_some() {
-                let submitted = submitted_model.as_deref().unwrap_or(model);
-                request_value["model"] = submitted.into();
-                submitted
+                submitted_model.as_deref().unwrap_or(model)
             } else {
                 model
             };
@@ -755,13 +760,16 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             // here the analytics row for the dispatch has no client at all. Same key and
             // same 256-char truncation as the batch path (`batches::create_batch`), so both
             // arrive as `x-fusillade-batch-dw-user-agent` and read identically downstream.
-            let queued_metadata = parts
+            let mut queued_metadata = parts
                 .headers
                 .get(axum::http::header::USER_AGENT)
                 .and_then(|value| value.to_str().ok())
                 .map(|ua| ua.chars().take(256).collect::<String>())
                 .filter(|ua| !ua.is_empty())
                 .map(|ua| serde_json::json!({ "dw_user_agent": ua }));
+            if class_route.is_some() {
+                queued_metadata.get_or_insert_with(|| serde_json::json!({}))["dw_submitted_model"] = response_model.into();
+            }
             if is_background_tier {
                 let background_input = fusillade::CreateBackgroundInput {
                     request_id,
@@ -807,6 +815,18 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 (false, false) => handle_flex(&state, flex_input, &resp_id, response_model, background).await,
             }
         }
+    }
+}
+
+fn class_route_error_response(error: super::model_aliases::ClassRouteError) -> Response {
+    match error {
+        super::model_aliases::ClassRouteError::UnknownClass => invalid_request_response(&error.to_string(), "model_not_found", "model"),
+        super::model_aliases::ClassRouteError::Unavailable(message) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(axum::http::header::RETRY_AFTER, "1")],
+            Json(serde_json::json!({"error": {"message": message, "type": "server_error", "code": "model_route_unavailable"}})),
+        )
+            .into_response(),
     }
 }
 

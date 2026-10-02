@@ -262,6 +262,11 @@ impl IntoResponse for OnwardsErrorResponse {
             Some(ref body) => (self.status, Json(ErrorEnvelope { error: body })).into_response(),
             None => self.status.into_response(), // No body, just status
         };
+        // Let embedding middleware distinguish a specific policy rejection from
+        // generic key admission without consuming or reparsing the response body.
+        if let Some(body) = self.body {
+            response.extensions_mut().insert(body);
+        }
         if let Some(outcome) = self.serving_outcome {
             response.extensions_mut().insert(outcome);
         }
