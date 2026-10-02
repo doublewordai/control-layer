@@ -1058,6 +1058,43 @@ db-stop *args="":
         echo "ℹ️  test-postgres container does not exist"
     fi
 
+# Drop databases left behind by template-backed dwctl tests
+#
+# Lists, and with --yes drops, retained failed-test clones (dwctl_test_*),
+# interrupted template builds (dwctl_build_*) and cached templates
+# (dwctl_template_*, rebuilt on demand). Stop test runs in ALL worktrees using
+# this server first: a running test's database would be dropped from under it.
+#
+# Examples:
+#   just db-prune-tests        # List what would be dropped
+#   just db-prune-tests --yes  # Drop them
+db-prune-tests *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    DB_HOST="${DB_HOST:-localhost}"
+    DB_PORT="${DB_PORT:-5432}"
+    DB_USER="${DB_USER:-postgres}"
+    export PGPASSWORD="${DB_PASS:-password}"
+    psql_args=(-X -q -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres)
+    pattern='^dwctl_(template|test|build)_[0-9a-f]{32}$'
+
+    names=$(psql "${psql_args[@]}" -tAc "SELECT datname FROM pg_database WHERE datname ~ '$pattern' ORDER BY datname")
+    if [ -z "$names" ]; then
+        echo "✅ No test databases to prune"
+        exit 0
+    fi
+    psql "${psql_args[@]}" -c "SELECT count(*) AS databases, pg_size_pretty(sum(pg_database_size(oid))) AS size
+        FROM pg_database WHERE datname ~ '$pattern'"
+    if [[ "{{args}}" != *"--yes"* ]]; then
+        echo "Re-run with --yes to drop them, after stopping test runs in all worktrees using this server."
+        exit 0
+    fi
+    for name in $names; do
+        psql "${psql_args[@]}" -c "DROP DATABASE IF EXISTS $name WITH (FORCE)"
+    done
+    echo "✅ Dropped $(echo "$names" | wc -l | tr -d ' ') test databases"
+
 # Start a local Redis for the ZDR keystore (append-only on, named volume for
 # durability). Mirrors the prod keystore shape (single instance, AOF). Point
 # config.yaml's keystore.redis_url at redis://localhost:6379 to use it.

@@ -69,7 +69,9 @@ build against a warm run. Record compile/link time separately with
 For a controlled comparison of migration setup versus cloning, repeat the
 same test with `DW_TEST_FRESH_DATABASES=1 DW_TEST_TIMINGS=1`. This builds
 the same schemas without using the cache. Templates are named from migration
-checksums and `Cargo.lock`; migration changes select a new template automatically.
+checksums and Underway's migration versions; migration changes select a new
+template automatically. `just db-prune-tests` lists (and with `--yes` drops)
+retained failed-test databases and obsolete templates.
 Changing the template construction procedure also requires changing its format
 version in the helper.
 

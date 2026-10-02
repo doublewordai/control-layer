@@ -50,29 +50,33 @@ that time is included in test bodies, and excludes direct application builders.
 `#[dwctl_test_macros::test]` clones an immutable migrated PostgreSQL template
 for each dwctl unit test, then loads that test's fixtures. Templates include the
 main, Fusillade, Outlet, Underway, and Underway extension migrations. Migration
-checksums and `Cargo.lock` select the template; a session advisory lock
-coordinates concurrent builders. A test verifies concurrent clones cannot
-observe each other's mutations and checks every migration ledger.
+checksums and Underway's migration versions select the template, so unrelated
+dependency bumps reuse it. A session advisory lock avoids duplicate builds
+between sessions in one database. Builders migrate a private `dwctl_build_*`
+database and rename it to the template only once sealed, so builders whose
+`DATABASE_URL`s name different databases on one server cannot drop each other's
+work. A failed build is recorded for the rest of the nextest run, so later tests
+report it instead of each rebuilding the template. Tests verify concurrent clones
+cannot observe each other's mutations, check every migration ledger, and cover
+the build race and failure record.
 
 Migration tests, component-schema precondition tests, other crates, and external
 integration tests retain SQLx's existing harness. Successful clones are dropped.
 Failed tests print their database name and retain it for inspection. Those
-failed databases and obsolete `dwctl_template_*` databases persist until
-manually removed from the local test server. Never clean them up during a run.
+failed databases, interrupted `dwctl_build_*` databases, and obsolete
+`dwctl_template_*` databases persist until removed from the local test server.
+Never clean them up during a run.
 
-To inspect retained databases on the test server:
+`just db-prune-tests` lists them with their total size; after stopping test runs
+in **all worktrees using that server**, `just db-prune-tests --yes` drops them.
+Templates are rebuilt on demand. There is deliberately no automatic pruning
+based on the current checkout's hash: another checkout may still be using
+another hash.
 
-```bash
-psql "$DATABASE_URL" -c "SELECT datname, pg_size_pretty(pg_database_size(oid)) AS size
-  FROM pg_database WHERE datname ~ '^dwctl_(template|test)_[0-9a-f]{32}$'
-  ORDER BY datname"
-```
-
-After stopping test runs in **all worktrees using that server**, remove selected
-names with `dropdb --maintenance-db="$DATABASE_URL" 'EXACT_DATABASE_NAME'`.
-Replace the quoted placeholder with a name from the inspection query. Templates
-will be rebuilt on demand. There is deliberately no automatic pruning based on
-the current checkout's hash: another checkout may still be using another hash.
+CI's dwctl shards start PostgreSQL without fsync, matching `just db-start`.
+Cloning with `STRATEGY FILE_COPY` requests a checkpoint per clone: with fsync
+off it was clearly faster than `WAL_LOG` (160 clones from 16 workers: 4.4–7.1s
+versus 9.9–11.8s), while with fsync on it was 12–23% slower.
 
 The shared harness erases test-future types so migration and cleanup code is
 compiled once instead of repeated in more than a thousand tests. Full local

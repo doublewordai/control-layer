@@ -15,6 +15,15 @@ pub fn test(args: TokenStream, input: TokenStream) -> TokenStream {
     }
 }
 
+/// Resolve a fixture name like SQLx: optional directory, `.sql` appended if absent.
+fn fixture_path(dir: Option<&str>, name: &str) -> String {
+    let suffix = if name.ends_with(".sql") { "" } else { ".sql" };
+    match dir {
+        Some(dir) => format!("{dir}/{name}{suffix}"),
+        None => format!("{name}{suffix}"),
+    }
+}
+
 fn expand(args: proc_macro2::TokenStream, input: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
     let mut fixtures = Vec::<LitStr>::new();
     let parser = syn::meta::parser(|meta| {
@@ -26,13 +35,8 @@ fn expand(args: proc_macro2::TokenStream, input: ItemFn) -> syn::Result<proc_mac
         if content.peek(LitStr) {
             for fixture in content.parse_terminated(|input| input.parse::<LitStr>(), Token![,])? {
                 let value = fixture.value();
-                let suffix = if value.ends_with(".sql") { "" } else { ".sql" };
-                let path = if value.contains('/') {
-                    format!("{value}{suffix}")
-                } else {
-                    format!("fixtures/{value}{suffix}")
-                };
-                fixtures.push(LitStr::new(&path, fixture.span()));
+                let dir = if value.contains('/') { None } else { Some("fixtures") };
+                fixtures.push(LitStr::new(&fixture_path(dir, &value), fixture.span()));
             }
         } else {
             let path_name: syn::Ident = content.parse()?;
@@ -49,9 +53,7 @@ fn expand(args: proc_macro2::TokenStream, input: ItemFn) -> syn::Result<proc_mac
             let names;
             syn::parenthesized!(names in content);
             for fixture in Punctuated::<LitStr, Token![,]>::parse_terminated(&names)? {
-                let name = fixture.value();
-                let suffix = if name.ends_with(".sql") { "" } else { ".sql" };
-                fixtures.push(LitStr::new(&format!("{}/{name}{suffix}", path.value()), fixture.span()));
+                fixtures.push(LitStr::new(&fixture_path(Some(&path.value()), &fixture.value()), fixture.span()));
             }
             if !content.is_empty() {
                 content.parse::<Token![,]>()?;

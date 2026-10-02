@@ -1290,11 +1290,12 @@ async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
 
-    // Create the outlet logging tables (http_requests / http_responses). Apply
-    // the DDL directly rather than via `.run()`: `#[sqlx::test]` already ran
-    // dwctl's migrations into this database's shared `_sqlx_migrations`, and
-    // outlet's migrator would reject that unknown history (in production outlet
-    // gets its own schema/DB with its own migration table).
+    // Create the outlet logging tables (http_requests / http_responses) in
+    // `public`, where this pool resolves unqualified names. The template's
+    // `outlet` schema is not on that search path. Apply the DDL directly rather
+    // than via `.run()`: `public._sqlx_migrations` already holds dwctl's
+    // history, which outlet's migrator would reject (in production outlet gets
+    // its own schema/DB with its own migration table).
     for migration in outlet_postgres::migrator().iter() {
         sqlx::raw_sql(migration.sql.as_ref())
             .execute(&pool)

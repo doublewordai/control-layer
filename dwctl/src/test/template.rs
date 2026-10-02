@@ -1,15 +1,17 @@
 //! Reuse migrated schemas, while keeping an isolated database for every test.
 //!
-//! Templates are immutable and keyed by migration checksums and Cargo.lock
-//! (Underway's migrator is private). A session lock coordinates builders across
-//! nextest processes. Only a fully migrated, disconnected database is sealed.
+//! Templates are immutable and keyed by migration checksums and Underway's
+//! migration versions (its migrator is private). A session lock avoids duplicate
+//! builds across nextest processes. Templates are built under a private name and
+//! renamed only once fully migrated, disconnected and sealed.
 
 use std::future::Future;
 use std::panic::{AssertUnwindSafe, resume_unwind};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::time::{Duration, Instant};
 
-use anyhow::Context;
+use anyhow::{Context, bail};
 use futures::FutureExt;
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
@@ -17,13 +19,16 @@ use sqlx::testing::TestTermination;
 use sqlx::{Connection, Executor, PgConnection, PgPool};
 use uuid::Uuid;
 
-use crate::migrations::{Target, apply_underway};
+use crate::migrations::{Target, UNDERWAY_MIGRATION_VERSIONS, apply_underway};
 
 fn template_name() -> String {
     let mut hash = Sha256::new();
     // Change this version when the template construction procedure changes.
-    hash.update(b"dwctl-test-template-v1");
-    hash.update(include_str!("../../../Cargo.lock"));
+    hash.update(b"dwctl-test-template-v2");
+    // `underway_versions_match_crate` keeps this list in step with the crate.
+    for version in UNDERWAY_MIGRATION_VERSIONS {
+        hash.update(version.to_le_bytes());
+    }
     for target in [Target::main(), Target::fusillade(), Target::outlet(), Target::underway_extensions()] {
         hash.update(target.name);
         for migration in target.migrator.iter() {
@@ -72,34 +77,13 @@ async fn create_database() -> anyhow::Result<(PgPool, PgConnection, String)> {
         return Ok((pool, admin, name));
     }
     let template = template_name();
+    // The lock only avoids duplicate builds between sessions in this database;
+    // `ensure_template` stays correct for builders connected to other databases.
     sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
         .bind(&template)
         .execute(&mut admin)
         .await?;
-    let allows_connections: Option<bool> = sqlx::query_scalar("SELECT datallowconn FROM pg_database WHERE datname = $1")
-        .bind(&template)
-        .fetch_optional(&mut admin)
-        .await?;
-    if allows_connections != Some(false) {
-        // A prior builder may have failed or been interrupted before sealing.
-        admin
-            .execute(format!("DROP DATABASE IF EXISTS {template} WITH (FORCE)").as_str())
-            .await?;
-        admin
-            .execute(format!("CREATE DATABASE {template} TEMPLATE template0").as_str())
-            .await?;
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect_with(options.clone().database(&template))
-            .await
-            .with_context(|| format!("failed to connect to unsealed template {template}"))?;
-        let result = migrate(&pool).await;
-        pool.close().await;
-        result.with_context(|| format!("failed to migrate unsealed template {template}"))?;
-        admin
-            .execute(format!("ALTER DATABASE {template} ALLOW_CONNECTIONS false").as_str())
-            .await?;
-    }
+    ensure_template(&mut admin, &options, &template).await?;
     sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
         .bind(&template)
         .execute(&mut admin)
@@ -117,6 +101,68 @@ async fn create_database() -> anyhow::Result<(PgPool, PgConnection, String)> {
         .await
         .with_context(|| format!("failed to connect to retained test database {name}"))?;
     Ok((pool, admin, name))
+}
+
+/// Make a sealed `template` exist. It is built under a private name and renamed
+/// only once fully migrated and sealed, so a database carrying the template's
+/// name is always complete and concurrent builders cannot drop each other's work.
+async fn ensure_template(admin: &mut PgConnection, options: &PgConnectOptions, template: &str) -> anyhow::Result<()> {
+    let sealed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1 AND NOT datallowconn)")
+        .bind(template)
+        .fetch_one(&mut *admin)
+        .await?;
+    if sealed {
+        return Ok(());
+    }
+    let marker = failure_marker(template);
+    if let Ok(error) = std::fs::read_to_string(&marker) {
+        bail!("test template {template} already failed to build in this run: {error}");
+    }
+    let build = format!("dwctl_build_{}", Uuid::new_v4().simple());
+    admin
+        .execute(format!("CREATE DATABASE {build} TEMPLATE template0").as_str())
+        .await?;
+    let built = async {
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect_with(options.clone().database(&build))
+            .await?;
+        let migrated = migrate(&pool).await;
+        pool.close().await;
+        migrated?;
+        admin
+            .execute(format!("ALTER DATABASE {build} ALLOW_CONNECTIONS false").as_str())
+            .await?;
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(error) = built {
+        let _ = admin
+            .execute(format!("DROP DATABASE IF EXISTS {build} WITH (FORCE)").as_str())
+            .await;
+        let error = error.context(format!("failed to build test template {template}"));
+        // Migrations are deterministic for a template key, so later tests in
+        // this run report the failure instead of each rebuilding it serially.
+        let _ = std::fs::write(&marker, format!("{error:#}"));
+        return Err(error);
+    }
+    match admin.execute(format!("ALTER DATABASE {build} RENAME TO {template}").as_str()).await {
+        Ok(_) => Ok(()),
+        // A builder outside this database's advisory lock sealed it first.
+        Err(sqlx::Error::Database(error)) if error.code().as_deref() == Some("42P04") => {
+            admin.execute(format!("DROP DATABASE {build}").as_str()).await?;
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Records a failed template build for the rest of the run. Nextest runs each
+/// test in its own process, so the record lives on disk, keyed by run ID so the
+/// next run retries.
+fn failure_marker(template: &str) -> PathBuf {
+    let run = std::env::var("NEXTEST_RUN_ID").unwrap_or_else(|_| std::process::id().to_string());
+    std::env::temp_dir().join(format!("{template}-{run}.failed"))
 }
 
 type TestFuture<T> = Pin<Box<dyn Future<Output = T>>>;
@@ -225,4 +271,45 @@ async fn clones_are_isolated_and_all_migrators_are_already_applied() {
     second.close().await;
     admin.execute(format!("DROP DATABASE {first_name}").as_str()).await.unwrap();
     admin.execute(format!("DROP DATABASE {second_name}").as_str()).await.unwrap();
+}
+
+#[tokio::test]
+async fn concurrent_builders_outside_the_lock_share_one_sealed_template() {
+    let options: PgConnectOptions = dotenvy::var("DATABASE_URL").unwrap().parse().unwrap();
+    let template = format!("dwctl_template_{}", Uuid::new_v4().simple());
+    let mut first = PgConnection::connect_with(&options).await.unwrap();
+    let mut second = PgConnection::connect_with(&options).await.unwrap();
+    // No advisory lock, as for builders whose DATABASE_URLs name different databases.
+    let (first_result, second_result) = tokio::join!(
+        ensure_template(&mut first, &options, &template),
+        ensure_template(&mut second, &options, &template)
+    );
+    first_result.unwrap();
+    second_result.unwrap();
+    let sealed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1 AND NOT datallowconn)")
+        .bind(&template)
+        .fetch_one(&mut first)
+        .await
+        .unwrap();
+    assert!(sealed);
+    first.execute(format!("DROP DATABASE {template}").as_str()).await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_build_is_reported_for_the_rest_of_the_run() {
+    let options: PgConnectOptions = dotenvy::var("DATABASE_URL").unwrap().parse().unwrap();
+    let template = format!("dwctl_template_{}", Uuid::new_v4().simple());
+    let marker = failure_marker(&template);
+    std::fs::write(&marker, "migration 42 failed").unwrap();
+    let mut admin = PgConnection::connect_with(&options).await.unwrap();
+    let result = ensure_template(&mut admin, &options, &template).await;
+    std::fs::remove_file(&marker).unwrap();
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("migration 42 failed"), "{error}");
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)")
+        .bind(&template)
+        .fetch_one(&mut admin)
+        .await
+        .unwrap();
+    assert!(!exists, "a recorded failure must not start another build");
 }

@@ -342,19 +342,24 @@ mod tests {
     #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_transaction_permission_matrix(pool: PgPool) {
+        // Which user the request names as the transaction source.
+        enum Source {
+            Actor,
+            Recipient,
+        }
+
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
-        for (role, allowed, description) in [
-            (Role::BillingManager, true, "Test credit grant"),
-            (Role::StandardUser, false, "Unauthorized attempt"),
-            (Role::PlatformManager, true, "Test credit grant from PlatformManager"),
-            (Role::RequestViewer, false, "Unauthorized attempt"),
+        for (role, allowed, source, description) in [
+            (Role::BillingManager, true, Source::Recipient, "Test credit grant"),
+            (Role::StandardUser, false, Source::Actor, "Unauthorized attempt"),
+            (Role::PlatformManager, true, Source::Actor, "Test credit grant from PlatformManager"),
+            (Role::RequestViewer, false, Source::Actor, "Unauthorized attempt"),
         ] {
             let actor = create_test_user(&pool, role.clone()).await;
             let user = create_test_user(&pool, Role::StandardUser).await;
-            let source_id = if role == Role::PlatformManager || !allowed {
-                actor.id
-            } else {
-                user.id
+            let source_id = match source {
+                Source::Actor => actor.id,
+                Source::Recipient => user.id,
             };
             let headers = add_auth_headers(&actor);
             let response = app
