@@ -13,6 +13,17 @@
 //! correlation id, no trait injected into onwards. Failures degrade to "no caching"; the
 //! commit is success-gated.
 //!
+//! Classification is spawned on a serving-scoped classifier whose tokenizer client retries HTTP
+//! 503s until cancelled. That retry loop has no attempt cap and no deadline of its own, so this
+//! layer's task ownership *is* the retry window: the [`AbortOnDrop`] guard around the classify
+//! [`tokio::task::JoinHandle`] is created at spawn and owned continuously (across `next.run`, the
+//! non-streaming join, and — moved in at construction — the SSE generator), and any early drop
+//! aborts the task. Classification (and its tokenizer retries) therefore run for the whole
+//! inference plus, at most, the existing join grace (`cache.classify_deadline_secs`, applied once
+//! the accounting is needed). It is deliberately *not* an unlimited post-inference wait: the grace
+//! bounds the join, a downstream failure resolves classify promptly instead of waiting it out, and
+//! a classify that finishes just as the grace fires is consumed rather than discarded.
+//!
 //! Inactive requests (cache-disabled model, degraded classify) are NOT forwarded untouched:
 //! their usage still gets provider-written cache fields scrubbed
 //! ([`super::inject::scrub_provider_cache_fields`]). This layer is the sole writer of
@@ -299,10 +310,19 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
 
     // Fork classify, parallel with the upstream call. Owns its inputs so the task is
     // `'static`; this is the one body clone (a future parse-once refactor would remove it).
-    let classify_handle = virtual_model.map(|model| {
-        let classifier = state.classifier.clone();
+    //
+    // The classify task runs on `serving_scoped()`, whose tokenizer client retries HTTP 503s
+    // until the task is cancelled (no attempt cap / no retry deadline of its own). Because
+    // the retry loop has no deadline, THIS task's lifetime is the retry window — so the
+    // `JoinHandle` is wrapped in [`AbortOnDrop`] the instant it is spawned, before we await
+    // `next.run`, and that guard stays owned continuously until classify is resolved. If the
+    // middleware future is dropped at any await (e.g. the client disconnects before response
+    // headers), the guard aborts the task instead of detaching it into an orphan that would
+    // keep retrying for the rest of the process's life.
+    let classify_guard = virtual_model.map(|model| {
+        let classifier = state.classifier.serving_scoped();
         let body = body_bytes.to_vec();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             classifier
                 .classify(ClassifyRequest {
                     virtual_model: &model,
@@ -316,7 +336,8 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
                     route_has_blocks: chat_route,
                 })
                 .await
-        })
+        });
+        AbortOnDrop::new(handle)
     });
 
     // Sanitise the outbound body: strip markers + ensure include_usage (no-op → keep).
@@ -347,10 +368,14 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     //   the full completion generated, so classify (which raced that generation) has almost always
     //   finished — the join here is typically instant. We then buffer the JSON body to edit it.
     // - STREAMING: joining here would hold the *first* token until classify resolves. But the
-    //   stats are only needed at the *terminal* usage frame, so we hand the classify handle into
-    //   the SSE stream and resolve it there (bounded by the deadline). The first token flows
-    //   untouched; at worst only the final frame waits.
-    let Some(mut handle) = classify_handle else {
+    //   stats are only needed at the *terminal* usage frame, so we move the already-constructed
+    //   [`AbortOnDrop`] guard into the SSE generator (constructed here, OUTSIDE the `stream!`
+    //   macro) and resolve classify there (bounded by the deadline). The first token flows
+    //   untouched; at worst only the final frame waits. Building the guard outside matters: a
+    //   never-polled response body drops the generator and, with the guard captured at
+    //   construction, aborts the classify task rather than dropping a raw `JoinHandle`
+    //   (which would detach it).
+    let Some(mut guard) = classify_guard else {
         // No `model` field → classify was never spawned → nothing cacheable.
         cache_metrics::record_request_outcome("inactive");
         return response;
@@ -359,7 +384,7 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
     if is_streaming(&response) {
         return defer_classify_into_stream(
             response,
-            handle,
+            guard,
             state.deadline,
             model_label,
             state.classifier.clone(),
@@ -370,7 +395,15 @@ pub async fn cache_middleware(State(state): State<CacheLayerState>, request: Req
         );
     }
 
-    let outcome = join_classify(&mut handle, state.deadline, &model_label).await;
+    // A non-2xx downstream already failed the request: don't wait out the join grace for a
+    // classify that may be retrying a 503 forever. Consume a result that happens to be ready,
+    // otherwise abort immediately and take the inactive (scrub) path. A 2xx uses the full grace
+    // so a classify racing generation can still land.
+    let outcome = if response.status().is_success() {
+        join_classify(&mut guard, state.deadline, &model_label).await
+    } else {
+        resolve_classify_now(&mut guard, &model_label).await
+    };
     if !outcome.active {
         // Disabled model (or a degraded classify) → no injection, but the upstream's own cache
         // accounting must still be scrubbed: this module is the only writer of customer-visible
@@ -407,47 +440,35 @@ fn is_streaming(response: &Response) -> bool {
         .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
-/// Join the spawned classify task under the deadline, recording the classify result, the
-/// request-outcome label, and (for an active request) the per-model token volumes. A timeout,
-/// task error, or panic resolves to `inactive` (no caching) — never an error to the customer.
-/// Used by both transports: joined inline for non-streaming, and lazily at the terminal usage
-/// frame for streaming. Borrows `&mut handle` (rather than taking ownership) so the caller can
-/// keep it inside [`AbortOnDrop`] across this await — if the client disconnects mid-join, the
-/// guard drops with the handle still in it and aborts the task, instead of this future dropping an
-/// owned handle and *detaching* it into an orphan. Also times out against the handle so we can
-/// `abort()` it on the deadline.
-async fn join_classify(
-    handle: &mut tokio::task::JoinHandle<CacheResult<ClassifyOutcome>>,
-    deadline: Duration,
-    model_label: &str,
-) -> ClassifyOutcome {
-    let outcome = match tokio::time::timeout(deadline, &mut *handle).await {
-        Ok(Ok(Ok(result))) => {
+/// Interpret a completed classify task's join result: record the classify outcome series and
+/// degrade every failure (tokenizer/index error, panic, cancellation) to `inactive` — never a
+/// customer-facing error.
+fn classify_join_result(result: Result<CacheResult<ClassifyOutcome>, tokio::task::JoinError>) -> ClassifyOutcome {
+    match result {
+        Ok(Ok(result)) => {
             cache_metrics::record_classify("ok");
             result
         }
-        Ok(Ok(Err(e))) => {
+        Ok(Err(e)) => {
             cache_metrics::record_classify("error");
             warn!(error = %e, "cache classify failed — billing un-cached");
             ClassifyOutcome::inactive()
         }
-        Ok(Err(e)) => {
+        Err(e) => {
             // JoinError is a panic OR a cancellation (e.g. runtime shutdown); only the former is
             // a bug, so don't fold cancellations into the "panicked" series.
             cache_metrics::record_classify(if e.is_panic() { "panicked" } else { "error" });
             warn!(error = %e, "cache classify task failed");
             ClassifyOutcome::inactive()
         }
-        Err(_) => {
-            cache_metrics::record_classify("deadline_exceeded");
-            handle.abort(); // best-effort, reconciliation backstops; don't leak the task
-            ClassifyOutcome::inactive()
-        }
-    };
+    }
+}
 
-    // Request-level outcome across ALL traffic (incl. inactive). No model label: `inactive` covers
-    // unknown/typo models (raw client input) → unbounded cardinality; per-model volumes are below.
-    cache_metrics::record_request_outcome(outcome_label(&outcome));
+/// Record the request-level outcome and (for an active request) the per-model token volumes for a
+/// resolved classify. No model label on the request outcome: `inactive` covers unknown/typo models
+/// (raw client input) → unbounded cardinality.
+fn record_classify_metrics(outcome: &ClassifyOutcome, model_label: &str) {
+    cache_metrics::record_request_outcome(outcome_label(outcome));
     if outcome.active && !model_label.is_empty() {
         cache_metrics::record_token_volumes(
             model_label,
@@ -457,7 +478,79 @@ async fn join_classify(
             outcome.stats.creation_24h,
         );
     }
+}
+
+/// Join the spawned classify task under the join grace, recording the classify result, the
+/// request-outcome label, and (for an active request) the per-model token volumes. A timeout,
+/// task error, or panic resolves to `inactive` (no caching) — never an error to the customer.
+/// Used by both transports: joined inline for non-streaming (2xx), and lazily at the terminal
+/// usage frame / EOF for streaming. Borrows `&mut guard` (rather than taking ownership) so the
+/// guard keeps owning the handle across this await — if the client disconnects mid-join, the
+/// future drops and the guard aborts the task, instead of detaching it into an orphan. On grace
+/// expiry it first checks `is_finished()`: a classify that won the race is consumed rather than
+/// discarded (we already paid for it), and only a still-running task is aborted.
+///
+/// The grace STARTS here — i.e. once the caller actually needs the accounting (non-streaming:
+/// after `next.run` returns; streaming: at the terminal usage frame or the EOF fallback). It is
+/// NOT an overall budget for classification: classify (and its tokenizer retries) run for the
+/// whole inference, and this grace is the bounded extra wait after the response is otherwise
+/// ready to ship.
+async fn join_classify(guard: &mut AbortOnDrop<CacheResult<ClassifyOutcome>>, deadline: Duration, model_label: &str) -> ClassifyOutcome {
+    let outcome = {
+        // Already resolved (defused) → nothing to wait for; callers only resolve once.
+        let Some(handle) = guard.as_mut() else {
+            return ClassifyOutcome::inactive();
+        };
+        match tokio::time::timeout(deadline, &mut *handle).await {
+            Ok(result) => classify_join_result(result),
+            Err(_) => {
+                if handle.is_finished() {
+                    // Finished in the race window right as the grace fired — use it.
+                    classify_join_result(handle.await)
+                } else {
+                    cache_metrics::record_classify("deadline_exceeded");
+                    handle.abort(); // best-effort, reconciliation backstops; don't leak the task
+                    ClassifyOutcome::inactive()
+                }
+            }
+        }
+    };
+    // Defuse the guard now the task has no reason to outlive this await.
+    guard.take();
+    record_classify_metrics(&outcome, model_label);
     outcome
+}
+
+/// Promptly resolve classify when the downstream has already failed (non-2xx response, or a
+/// mid-stream transport error): consume a result that is already ready, otherwise abort the task
+/// immediately and take the inactive path. This is what stops a serving-scoped tokenizer retry
+/// from running until the join grace when the request it belongs to is already dead. Records the
+/// cancellation as classify outcome `downstream_failed` (request outcome `aborted`: unknown).
+async fn resolve_classify_now(guard: &mut AbortOnDrop<CacheResult<ClassifyOutcome>>, model_label: &str) -> ClassifyOutcome {
+    let ready = {
+        let Some(handle) = guard.as_mut() else {
+            return ClassifyOutcome::inactive();
+        };
+        if handle.is_finished() { Some(handle.await) } else { None }
+    };
+    match ready {
+        Some(result) => {
+            let outcome = classify_join_result(result);
+            guard.take();
+            record_classify_metrics(&outcome, model_label);
+            outcome
+        }
+        None => {
+            if let Some(handle) = guard.take() {
+                // Distinct from `abandoned` (client disconnect): an upstream outage must not read
+                // as a disconnect storm.
+                cache_metrics::record_classify("downstream_failed");
+                handle.abort();
+                cache_metrics::record_request_outcome("aborted");
+            }
+            ClassifyOutcome::inactive()
+        }
+    }
 }
 
 fn outcome_label(outcome: &ClassifyOutcome) -> &'static str {
@@ -474,14 +567,22 @@ fn outcome_label(outcome: &ClassifyOutcome) -> &'static str {
     }
 }
 
-/// RAII guard for the deferred classify handle: aborts the spawned task on drop. If the client
-/// disconnects before the stream reaches the terminal usage frame, the wrapping `async_stream` is
-/// dropped — without this, dropping the bare `JoinHandle` would *detach* the (possibly stalled)
-/// classify task into an orphan that bypasses the deadline. Aborting cancels it at its next await.
-/// `take()` hands the handle to `join_classify` on the normal path, defusing the guard.
+/// RAII guard for a requested classify handle: aborts the spawned task on drop. The task runs a
+/// serving-scoped tokenizer client that retries 503s with no deadline of its own, so the task's
+/// lifetime IS the retry window — this guard is the cancellation edge. It is constructed at spawn
+/// time (before the layer ever awaits `next.run`) and kept owned continuously: across the upstream
+/// call, across a non-streaming join, and moved into the SSE generator for a stream. Dropping it
+/// before classify is resolved — a client disconnect before response headers, a never-polled SSE
+/// body, a drop mid-stream, or a drop during the final join — aborts the task instead of detaching
+/// it into an orphan that would retry for the rest of the process's life. `take()` defuses the
+/// guard once a result has been consumed.
 struct AbortOnDrop<T>(Option<tokio::task::JoinHandle<T>>);
 
 impl<T> AbortOnDrop<T> {
+    fn new(handle: tokio::task::JoinHandle<T>) -> Self {
+        Self(Some(handle))
+    }
+
     fn take(&mut self) -> Option<tokio::task::JoinHandle<T>> {
         self.0.take()
     }
@@ -497,11 +598,11 @@ impl<T> AbortOnDrop<T> {
 impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         if let Some(h) = self.0.take() {
-            // The guard was never defused via `take()`, so the stream was dropped before classify
-            // was joined — a client disconnect ahead of the terminal usage frame. Abort the task so
-            // it can't outlive the request, and record the abandonment: without this, classify and
-            // request-outcome dashboards silently undercount under high disconnect rates (the join,
-            // and its metrics, never run on this path). Cheaper and safer than a detached
+            // The guard was never defused via `take()`, so the owning future/stream was dropped
+            // before classify was resolved — a client disconnect. Abort the task so it can't
+            // outlive the request, and record the abandonment: without this, classify and
+            // request-outcome dashboards silently undercount under high disconnect rates (the
+            // join, and its metrics, never run on this path). Cheaper and safer than a detached
             // join-for-metrics, which would re-orphan the very task this guard exists to cancel.
             h.abort();
             cache_metrics::record_classify("abandoned");
@@ -512,14 +613,18 @@ impl<T> Drop for AbortOnDrop<T> {
 
 /// Defer the classify-await into the SSE stream so it never holds the first token. Returns the
 /// response immediately; as frames flow it resolves classify lazily at the terminal usage frame
-/// (bounded by the deadline — classify has almost always finished during generation), injects the
+/// (bounded by the join grace — classify has almost always finished during generation), injects the
 /// stats there, and commits the index write on a billing-success completion. Every failure path
 /// (deadline, classify error, mid-stream error frame, no usage frame, client disconnect) degrades
 /// to no caching with the request unharmed.
+///
+/// The caller passes the already-constructed [`AbortOnDrop`] guard (built at spawn time, OUTSIDE
+/// the `stream!` macro) so a never-polled body still drops a guard that aborts the task. The guard
+/// is moved into the generator at construction; `take()` defuses it once classify is resolved.
 #[allow(clippy::too_many_arguments)]
 fn defer_classify_into_stream(
     response: Response,
-    handle: tokio::task::JoinHandle<CacheResult<ClassifyOutcome>>,
+    guard: AbortOnDrop<CacheResult<ClassifyOutcome>>,
     deadline: Duration,
     model_label: String,
     classifier: Classifier,
@@ -537,9 +642,9 @@ fn defer_classify_into_stream(
 
     let stream = async_stream::stream! {
         futures::pin_mut!(buffered);
-        // Aborts the classify task if the stream is dropped early (client disconnect) instead of
-        // detaching it into an orphan; `take()` defuses it on the normal terminal-frame path.
-        let mut handle = AbortOnDrop(Some(handle));
+        // The guard is moved in here at construction (captured by the `async move` block), so
+        // dropping the body before it is ever polled still aborts the classify task.
+        let mut handle = guard;
         let mut outcome: Option<ClassifyOutcome> = None;
         let mut edited = false;
         let mut saw_error = false;
@@ -548,9 +653,14 @@ fn defer_classify_into_stream(
         while let Some(item) = buffered.next().await {
             let chunk = match item {
                 Ok(c) => c,
-                // A transport error mid-stream is a failure: forward it and veto the write.
+                // A transport error mid-stream is a failure: forward it and veto the write. The
+                // request is already dead, so resolve classify promptly (consume-if-ready, else
+                // abort) rather than letting a 503 retry run to the grace.
                 Err(e) => {
                     saw_error = true;
+                    if outcome.is_none() {
+                        outcome = Some(resolve_classify_now(&mut handle, &model_label).await);
+                    }
                     yield Err(e);
                     continue;
                 }
@@ -562,14 +672,17 @@ fn defer_classify_into_stream(
             }
             saw_error |= probe.saw_error;
             // The terminal usage frame is the only place the stats are needed: resolve classify now
-            // — the single blocking await, on the *last* frame, bounded by the deadline. Borrow the
-            // handle from the guard (don't `take()` it) so a disconnect *during* this await still
-            // drops the guard → abort + metrics; defuse it only once the join has completed.
+            // — the single blocking await, on the *last* frame, bounded by the join grace. A 2xx
+            // body uses the full grace so a classify racing generation can still land; a non-2xx
+            // status is already a failed request, so consume-if-ready / abort instead of waiting.
+            // Borrow the handle from the guard (don't `take()` it) so a disconnect *during* this
+            // await still drops the guard → abort + metrics; the join defuses it once complete.
             if probe.saw_usage && outcome.is_none() {
-                if let Some(h) = handle.as_mut() {
-                    outcome = Some(join_classify(h, deadline, &model_label).await);
-                }
-                handle.take();
+                outcome = Some(if status_ok {
+                    join_classify(&mut handle, deadline, &model_label).await
+                } else {
+                    resolve_classify_now(&mut handle, &model_label).await
+                });
             }
             saw_usage |= probe.saw_usage;
             // Edit the (single) usage frame: inject the stats for an active (cache-enabled)
@@ -605,16 +718,15 @@ fn defer_classify_into_stream(
         // Stream drained cleanly. Resolve classify even if no usage frame ever arrived (e.g. an
         // error-only stream) so its metrics are still recorded, then decide the commit. Borrow from
         // the guard across the await (as above) — the consumer can still drop us mid-join here — and
-        // defuse only once it completes.
+        // defuse only once it completes. A non-2xx status takes the prompt path (consume-if-ready /
+        // abort) instead of waiting out the grace.
         let outcome = match outcome {
             Some(o) => o,
             None => {
-                if let Some(h) = handle.as_mut() {
-                    let o = join_classify(h, deadline, &model_label).await;
-                    handle.take();
-                    o
+                if status_ok {
+                    join_classify(&mut handle, deadline, &model_label).await
                 } else {
-                    ClassifyOutcome::inactive()
+                    resolve_classify_now(&mut handle, &model_label).await
                 }
             }
         };
@@ -2067,5 +2179,483 @@ mod tests {
         let t = r.text();
         assert!(t.contains("\"cache_creation_input_tokens\":1510"), "creation injected: {t}");
         assert!(t.contains("data: [DONE]"), "DONE preserved: {t}");
+    }
+
+    // ── Serving-scope tokenizer retries: the classify task's lifetime is the retry window ──────
+
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    type SseSender = tokio::sync::mpsc::UnboundedSender<Result<bytes::Bytes, std::io::Error>>;
+
+    /// `/v1/tokenize` mock: 503 while `stuck` is set or for the first `fail` requests, then 1500.
+    /// `hits` counts every HTTP attempt; `ok` counts successful answers.
+    struct TokenizeFlaky {
+        hits: Arc<AtomicUsize>,
+        ok: Arc<AtomicUsize>,
+        fail: usize,
+        stuck: Arc<AtomicBool>,
+    }
+
+    impl wiremock::Respond for TokenizeFlaky {
+        fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
+            let n = self.hits.fetch_add(1, Ordering::SeqCst);
+            if self.stuck.load(Ordering::SeqCst) || n < self.fail {
+                return ResponseTemplate::new(503).set_body_json(serde_json::json!({"code": "OVERLOADED"}));
+            }
+            self.ok.fetch_add(1, Ordering::SeqCst);
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "virtual_model": ALIAS, "tokenizer_version": TOK_VER,
+                "segment_counts": [1500], "cumulative": [1500], "total": 1500
+            }))
+        }
+    }
+
+    struct RetryRig {
+        key: String,
+        hits: Arc<AtomicUsize>,
+        ok: Arc<AtomicUsize>,
+        stuck: Arc<AtomicBool>,
+        classifier: Classifier,
+        _tok: MockServer,
+    }
+
+    /// Enabled model + key, a flaky tokenizer, and a classifier whose client carries a fast
+    /// shared retry budget (the layer turns retries on via `serving_scoped()`).
+    async fn retry_rig(pool: &PgPool, fail: usize, stuck: bool) -> RetryRig {
+        let user = create_test_user(pool, Role::StandardUser).await;
+        let key = create_test_api_key_for_user(pool, user.id).await;
+        let endpoint = create_test_endpoint(pool, "ep", user.id).await;
+        let id = create_test_model(pool, "m", ALIAS, endpoint, user.id).await;
+        sqlx::query!(
+            r#"INSERT INTO model_cache_tariffs
+                 (deployed_model_id, write_multiplier_5m, write_multiplier_1h, write_multiplier_24h, min_prefix_tokens)
+               VALUES ($1, 1.25, 2.0, 2.5, 1024)"#,
+            id
+        )
+        .execute(pool)
+        .await
+        .unwrap();
+
+        let tok = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"alias": ALIAS, "hf_repo": "o/m", "tokenizer_version": TOK_VER}]
+            })))
+            .mount(&tok)
+            .await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let ok = Arc::new(AtomicUsize::new(0));
+        let stuck = Arc::new(AtomicBool::new(stuck));
+        Mock::given(method("POST"))
+            .and(path("/v1/tokenize"))
+            .respond_with(TokenizeFlaky {
+                hits: hits.clone(),
+                ok: ok.clone(),
+                fail,
+                stuck: stuck.clone(),
+            })
+            .mount(&tok)
+            .await;
+
+        let budget = crate::prompt_cache::TokenizerRetryBudget::new(crate::prompt_cache::TokenizerRetryPolicy {
+            initial_backoff: Duration::from_millis(1),
+            max_backoff: Duration::from_millis(5),
+            retries_per_second: 1_000,
+            retry_burst: 1_000,
+            max_concurrent_retries: 8,
+        });
+        let classifier = Classifier::new(
+            PrincipalResolver::new(pool.clone()),
+            ModelConfigResolver::new(pool.clone()),
+            TokenizerClient::new(tok.uri()).with_retry_budget(budget),
+            Arc::new(PostgresIndex::new(pool.clone(), 1)),
+            all_tiers(),
+            TelemetryPolicy::default(),
+            false,
+        );
+        RetryRig {
+            key: key.secret,
+            hits,
+            ok,
+            stuck,
+            classifier,
+            _tok: tok,
+        }
+    }
+
+    impl RetryRig {
+        fn app(&self, upstream: axum::routing::MethodRouter, grace: Duration) -> Router {
+            Router::new().route("/v1/chat/completions", upstream).layer(from_fn_with_state(
+                CacheLayerState::new(self.classifier.clone(), usize::MAX, grace),
+                cache_middleware,
+            ))
+        }
+
+        fn request(&self, body: &serde_json::Value) -> Request {
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/chat/completions")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {}", self.key))
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        }
+    }
+
+    /// Poll until `counter >= n` (fails after 10s rather than hanging the suite).
+    async fn wait_for(counter: &AtomicUsize, n: usize, what: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while counter.load(Ordering::SeqCst) < n {
+            assert!(std::time::Instant::now() < deadline, "{what}: waited 10s for {n}");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// After cancellation, no further tokenizer attempts may start. A live retry loop at this
+    /// policy (≤5 ms backoff, 1000 retries/s) would add dozens of attempts in the window.
+    async fn assert_no_more_attempts(hits: &AtomicUsize, what: &str) {
+        // Let an attempt that was already on the wire when the task was aborted land.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let settled = hits.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            settled,
+            "{what}: tokenizer attempts continued after cancellation"
+        );
+    }
+
+    fn sse_usage_frame() -> &'static str {
+        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":2000,\"completion_tokens\":2,\"total_tokens\":2002}}\n\n"
+    }
+
+    /// An SSE upstream whose body the test feeds frame by frame over a channel; the sender is
+    /// handed back through `tx_slot` when the request arrives.
+    fn channel_sse_upstream(tx_slot: Arc<Mutex<Option<SseSender>>>) -> axum::routing::MethodRouter {
+        post(move || {
+            let tx_slot = tx_slot.clone();
+            async move {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+                *tx_slot.lock().unwrap() = Some(tx);
+                let stream = async_stream::stream! {
+                    while let Some(item) = rx.recv().await {
+                        yield item;
+                    }
+                };
+                Response::builder()
+                    .header("content-type", "text/event-stream")
+                    .body(Body::from_stream(stream))
+                    .unwrap()
+            }
+        })
+    }
+
+    async fn wait_for_sender(tx_slot: &Mutex<Option<SseSender>>) -> SseSender {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            // take(), not clone(): the test must hold the ONLY sender so dropping it ends the body.
+            if let Some(tx) = tx_slot.lock().unwrap().take() {
+                return tx;
+            }
+            assert!(std::time::Instant::now() < deadline, "upstream never received the request");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    async fn next_data(body: &mut Body) -> String {
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(10), body.frame())
+                .await
+                .expect("frame within 10s")
+                .expect("body not finished")
+                .expect("frame ok");
+            if let Ok(data) = frame.into_data() {
+                return String::from_utf8(data.to_vec()).unwrap();
+            }
+        }
+    }
+
+    fn delta_frame() -> bytes::Bytes {
+        bytes::Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n")
+    }
+
+    /// Non-streaming: the tokenizer 503s several times while inference is still running; the
+    /// upstream only answers once the classify retries have recovered, and billing uses the
+    /// eventual successful count.
+    #[sqlx::test]
+    async fn nonstreaming_recovers_from_503s_during_inference(pool: PgPool) {
+        let rig = retry_rig(&pool, 4, false).await;
+        let ok = rig.ok.clone();
+        let upstream = post(move || {
+            let ok = ok.clone();
+            async move {
+                wait_for(&ok, 1, "tokenizer recovery during inference").await;
+                mock_upstream().await
+            }
+        });
+        let resp = rig
+            .app(upstream, Duration::from_secs(5))
+            .oneshot(rig.request(&body()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["usage"]["cache_creation_input_tokens"], 1500,
+            "billed from the successful attempt: {v}"
+        );
+        assert_eq!(rig.hits.load(Ordering::SeqCst), 5, "4 × 503 then success — more than two attempts");
+    }
+
+    /// Streaming: headers and early tokens reach the client while the tokenizer is still
+    /// overloaded; retries keep running during generation, and the terminal usage frame carries
+    /// the eventual successful classification.
+    #[sqlx::test]
+    async fn streaming_tokens_flow_while_retries_recover(pool: PgPool) {
+        let rig = retry_rig(&pool, 0, true).await;
+        let tx_slot = Arc::new(Mutex::new(None));
+        let app = rig.app(channel_sse_upstream(tx_slot.clone()), Duration::from_secs(5));
+        let resp = app.oneshot(rig.request(&body_streaming())).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "headers are not held by classify");
+        let tx = wait_for_sender(&tx_slot).await;
+        let mut body = resp.into_body();
+
+        tx.send(Ok(delta_frame())).unwrap();
+        let first = next_data(&mut body).await;
+        assert!(first.contains("\"content\":\"hi\""), "first token delivered: {first}");
+        wait_for(&rig.hits, 3, "retries continue while tokens stream").await;
+        assert_eq!(
+            rig.ok.load(Ordering::SeqCst),
+            0,
+            "tokenizer still overloaded when the token arrived"
+        );
+
+        rig.stuck.store(false, Ordering::SeqCst);
+        wait_for(&rig.ok, 1, "tokenizer recovery").await;
+        tx.send(Ok(bytes::Bytes::from_static(sse_usage_frame().as_bytes()))).unwrap();
+        tx.send(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"))).unwrap();
+        drop(tx);
+        let rest = String::from_utf8(body.collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(
+            rest.contains("\"cache_creation_input_tokens\":1500"),
+            "eventual success injected: {rest}"
+        );
+        assert!(rest.contains("data: [DONE]"));
+        assert!(rig.hits.load(Ordering::SeqCst) > 2);
+    }
+
+    /// Persistent overload: retries run throughout inference, then stop at the (unchanged) join
+    /// grace: the request degrades to the un-cached fallback and no further attempts are made.
+    #[sqlx::test]
+    async fn persistent_503_stops_at_join_grace(pool: PgPool) {
+        let rig = retry_rig(&pool, 0, true).await;
+        let tx_slot = Arc::new(Mutex::new(None));
+        let grace = Duration::from_millis(300);
+        let app = rig.app(channel_sse_upstream(tx_slot.clone()), grace);
+        let resp = app.oneshot(rig.request(&body_streaming())).await.unwrap();
+        let tx = wait_for_sender(&tx_slot).await;
+        wait_for(&rig.hits, 3, "retrying during inference").await;
+        tx.send(Ok(bytes::Bytes::from_static(sse_usage_frame().as_bytes()))).unwrap();
+        tx.send(Ok(bytes::Bytes::from_static(b"data: [DONE]\n\n"))).unwrap();
+        drop(tx);
+
+        let started = std::time::Instant::now();
+        let text = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(started.elapsed() >= grace, "the usage frame waited out the join grace");
+        assert!(started.elapsed() < Duration::from_secs(4), "and no longer");
+        assert!(
+            !text.contains("cache_creation_input_tokens"),
+            "degraded to the un-cached fallback: {text}"
+        );
+        assert!(text.contains("\"prompt_tokens\":2000") && text.contains("data: [DONE]"));
+        assert_eq!(rig.ok.load(Ordering::SeqCst), 0);
+        assert_no_more_attempts(&rig.hits, "after join grace").await;
+    }
+
+    /// A client that disconnects before response headers (the middleware future is dropped while
+    /// the upstream is still generating) takes the retrying classify task down with it.
+    #[sqlx::test]
+    async fn disconnect_before_headers_cancels_retries(pool: PgPool) {
+        let rig = retry_rig(&pool, 0, true).await;
+        let entered = Arc::new(AtomicUsize::new(0));
+        let e = entered.clone();
+        let upstream = post(move || {
+            let e = e.clone();
+            async move {
+                e.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<Response>().await
+            }
+        });
+        let app = rig.app(upstream, Duration::from_secs(30));
+        let req = rig.request(&body());
+        let client = tokio::spawn(async move { app.oneshot(req).await });
+        wait_for(&entered, 1, "upstream reached").await;
+        wait_for(&rig.hits, 3, "classify retrying before headers").await;
+        client.abort();
+        assert!(client.await.unwrap_err().is_cancelled());
+        assert_no_more_attempts(&rig.hits, "disconnect before headers").await;
+    }
+
+    /// A streaming response whose body is dropped without ever being polled still cancels
+    /// classification: the guard lives outside the (never-started) generator.
+    #[sqlx::test]
+    async fn dropping_unpolled_sse_body_cancels_retries(pool: PgPool) {
+        let rig = retry_rig(&pool, 0, true).await;
+        let tx_slot = Arc::new(Mutex::new(None));
+        let app = rig.app(channel_sse_upstream(tx_slot.clone()), Duration::from_secs(30));
+        let resp = app.oneshot(rig.request(&body_streaming())).await.unwrap();
+        let _tx = wait_for_sender(&tx_slot).await;
+        wait_for(&rig.hits, 3, "classify retrying").await;
+        drop(resp);
+        assert_no_more_attempts(&rig.hits, "never-polled SSE body").await;
+    }
+
+    /// Disconnect mid-stream (after some tokens were delivered) cancels classification.
+    #[sqlx::test]
+    async fn disconnect_mid_stream_cancels_retries(pool: PgPool) {
+        let rig = retry_rig(&pool, 0, true).await;
+        let tx_slot = Arc::new(Mutex::new(None));
+        let app = rig.app(channel_sse_upstream(tx_slot.clone()), Duration::from_secs(30));
+        let resp = app.oneshot(rig.request(&body_streaming())).await.unwrap();
+        let tx = wait_for_sender(&tx_slot).await;
+        let mut body = resp.into_body();
+        tx.send(Ok(delta_frame())).unwrap();
+        next_data(&mut body).await;
+        wait_for(&rig.hits, 3, "classify retrying mid-stream").await;
+        drop(body);
+        assert_no_more_attempts(&rig.hits, "mid-stream disconnect").await;
+    }
+
+    /// Disconnect while the stream is parked in the final join (terminal usage frame waiting on
+    /// classify) cancels classification rather than leaving it to the grace or beyond.
+    #[sqlx::test]
+    async fn disconnect_during_final_join_cancels_retries(pool: PgPool) {
+        let rig = retry_rig(&pool, 0, true).await;
+        let tx_slot = Arc::new(Mutex::new(None));
+        let app = rig.app(channel_sse_upstream(tx_slot.clone()), Duration::from_secs(30));
+        let resp = app.oneshot(rig.request(&body_streaming())).await.unwrap();
+        let tx = wait_for_sender(&tx_slot).await;
+        let mut body = resp.into_body();
+        tx.send(Ok(bytes::Bytes::from_static(sse_usage_frame().as_bytes()))).unwrap();
+        // The usage frame parks the stream in the join: no frame within a short window.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), body.frame()).await.is_err(),
+            "terminal frame waits for classify"
+        );
+        wait_for(&rig.hits, 3, "classify retrying during the join").await;
+        drop(body);
+        assert_no_more_attempts(&rig.hits, "disconnect during final join").await;
+    }
+
+    /// A body transport error mid-stream cancels a still-retrying classify promptly.
+    #[sqlx::test]
+    async fn stream_transport_error_cancels_retries(pool: PgPool) {
+        let rig = retry_rig(&pool, 0, true).await;
+        let tx_slot = Arc::new(Mutex::new(None));
+        let app = rig.app(channel_sse_upstream(tx_slot.clone()), Duration::from_secs(30));
+        let resp = app.oneshot(rig.request(&body_streaming())).await.unwrap();
+        let tx = wait_for_sender(&tx_slot).await;
+        wait_for(&rig.hits, 3, "classify retrying").await;
+        tx.send(Err(std::io::Error::other("upstream reset"))).unwrap();
+        let mut body = resp.into_body();
+        let got = tokio::time::timeout(Duration::from_secs(5), body.frame())
+            .await
+            .expect("error surfaces promptly");
+        assert!(matches!(got, Some(Err(_))), "transport error forwarded");
+        // Keep the body (and its generator) alive: cancellation must come from the error itself.
+        assert_no_more_attempts(&rig.hits, "after body transport error").await;
+        drop(tx);
+        drop(body);
+    }
+
+    /// A non-2xx downstream is already a failed request: it returns promptly (well inside the
+    /// join grace) instead of waiting on a still-retrying classify, and cancels it.
+    #[sqlx::test]
+    async fn nonstreaming_error_status_returns_promptly_and_cancels(pool: PgPool) {
+        let rig = retry_rig(&pool, 0, true).await;
+        let hits = rig.hits.clone();
+        let upstream = post(move || {
+            let hits = hits.clone();
+            async move {
+                wait_for(&hits, 3, "classify retrying").await;
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": {"message": "boom"}})),
+                )
+                    .into_response()
+            }
+        });
+        let started = std::time::Instant::now();
+        let resp = rig
+            .app(upstream, Duration::from_secs(30))
+            .oneshot(rig.request(&body()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let _ = resp.into_body().collect().await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5), "did not wait out the 30s grace");
+        assert_no_more_attempts(&rig.hits, "after non-2xx").await;
+    }
+
+    fn active_outcome(read: u64) -> ClassifyOutcome {
+        ClassifyOutcome {
+            stats: crate::prompt_cache::CacheStats {
+                read,
+                ..Default::default()
+            },
+            pending: Default::default(),
+            active: true,
+            degraded: false,
+        }
+    }
+
+    /// Drop-detector for spawned tasks: proves an aborted task was actually torn down.
+    struct SetOnDrop(Arc<AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A classify that completes inside the join grace is used; one still running at the
+    /// boundary is aborted and falls back to inactive. Virtual time: no network involved.
+    #[tokio::test(start_paused = true)]
+    async fn join_grace_uses_completed_result_and_aborts_running_one() {
+        let grace = Duration::from_secs(5);
+        let mut guard = AbortOnDrop::new(tokio::spawn(async move {
+            tokio::time::sleep(grace - Duration::from_millis(1)).await;
+            Ok(active_outcome(42))
+        }));
+        let out = join_classify(&mut guard, grace, "m").await;
+        assert!(out.active && out.stats.read == 42, "finished before the boundary → used");
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let flag = SetOnDrop(dropped.clone());
+        let mut guard = AbortOnDrop::new(tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<CacheResult<ClassifyOutcome>>().await
+        }));
+        let out = join_classify(&mut guard, grace, "m").await;
+        assert!(!out.active, "still running at the boundary → fallback");
+        tokio::task::yield_now().await;
+        assert!(dropped.load(Ordering::SeqCst), "the task was aborted, not detached");
+    }
+
+    /// A result that is already complete is consumed on the prompt (downstream-failed) path rather
+    /// than discarded, and resolving an already-defused guard degrades instead of panicking.
+    #[tokio::test]
+    async fn resolve_now_consumes_ready_result() {
+        let mut guard = AbortOnDrop::new(tokio::spawn(async { Ok(active_outcome(7)) }));
+        while !guard.as_mut().unwrap().is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let out = resolve_classify_now(&mut guard, "m").await;
+        assert!(out.active && out.stats.read == 7);
+        assert!(!resolve_classify_now(&mut guard, "m").await.active);
+        assert!(!join_classify(&mut guard, Duration::from_secs(1), "m").await.active);
     }
 }

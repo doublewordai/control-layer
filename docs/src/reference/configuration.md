@@ -365,6 +365,118 @@ batches:
 | `files.max_file_size` | integer | `104857600` | Maximum upload size in bytes. |
 | `files.default_expiry_seconds` | integer | `86400` | Default file retention. |
 
+## Cached-Input Pricing (Prompt Cache)
+
+Enables Anthropic-style `cache_control` markers: the classifier forks concurrently with the
+upstream model call, strips the markers, injects `cache_*` usage fields for billing, and commits
+prefix writes on success. Per-model activation additionally requires an active
+`model_cache_tariffs` row, so enabling this alone changes nothing until a model is enabled.
+
+```yaml
+cache:
+  enabled: true
+  tokenizer_url: "http://tokenizer-svc:8088"
+  enabled_ttls: ["5m", "1h"]
+  default_ttl: "5m"
+  classify_deadline_secs: 5
+  index_conn_retries: 1
+  tokenizer_retry:
+    enabled: true
+    initial_backoff_ms: 100
+    max_backoff_ms: 2000
+    retries_per_second: 10
+    retry_burst: 10
+    max_concurrent_retries: 8
+```
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `enabled` | boolean | `false` | Add the cache layer. Off = byte-identical request path. |
+| `tokenizer_url` | string | `http://localhost:8088` | tokenizer-svc base URL. |
+| `enabled_ttls` | list | `["5m", "1h"]` | TTL tiers accepted in markers; unknown tiers are a 400. |
+| `default_ttl` | string | `"5m"` | Tier used when a marker omits `ttl`; must be in `enabled_ttls`. |
+| `classify_deadline_secs` | integer | `5` | **Join grace** for the classify fork at response time (see below). |
+| `index_conn_retries` | integer | `1` | Retries for a cache-index DB op after a connection-class failure. |
+| `tokenizer_retry.enabled` | boolean | `true` | Retry tokenizer-svc HTTP 503 during serving classification. |
+| `tokenizer_retry.initial_backoff_ms` | integer | `100` | First nominal backoff (equal-jitter in `[nominal/2, nominal]`). |
+| `tokenizer_retry.max_backoff_ms` | integer | `2000` | Cap on the nominal (doubling) backoff; ≥ `initial_backoff_ms`. |
+| `tokenizer_retry.retries_per_second` | integer | `10` | Shared token-bucket refill rate, retry starts/second. |
+| `tokenizer_retry.retry_burst` | integer | `10` | Shared token-bucket capacity (burst). |
+| `tokenizer_retry.max_concurrent_retries` | integer | `8` | Max simultaneous retry HTTP attempts per process. |
+
+Every key can be overridden by environment, e.g.
+`DWCTL_CACHE__TOKENIZER_RETRY__MAX_CONCURRENT_RETRIES=4`.
+
+### Tokenizer-svc 503 retries
+
+When tokenizer-svc is overloaded it returns HTTP 503. During prompt-cache classification the
+gateway retries those calls instead of failing the request's cache accounting.
+
+- **What is retried:** HTTP 503 only, for `tokenize`, `render`, and the initial `/v1/models`
+  lookup, and only on the serving path. A 400/422, any other non-2xx, a malformed 2xx, a transport
+  error, or a timeout is not retried. Non-serving callers — batch recompute/replay, prefix-chain
+  capture, continuation render, admin callers and tests — remain single-attempt.
+- **Lifetime:** retries continue until the owning request's classify task ends, i.e. upstream
+  inference time plus the `classify_deadline_secs` join grace. `classify_deadline_secs` is a
+  **join grace** measured from the point cache accounting is needed; it is **not** an overall
+  retry deadline, and this feature does not add an unlimited post-inference wait. A client
+  disconnect or downstream failure cancels the classify task, which stops further attempts
+  promptly. There is no maximum attempt count and no overall retry deadline in the loop.
+- **Per-attempt vs. operation:** every HTTP attempt keeps the existing 5s request timeout, so one
+  overloaded backend cannot pin an attempt forever. The logical `tokenize()`/`render()` call is
+  measured across all of its attempts, including backoff and budget waits.
+- **Budget:** first attempts never consume budget. Each retry sleeps, then acquires a shared rate
+  token and a concurrency permit without hoarding one while waiting for the other; the permit is
+  released as soon as the attempt ends, including on cancellation. `retries_per_second`,
+  `retry_burst`, and `max_concurrent_retries` are **per control-layer process** — a deployment of
+  N replicas can offer up to N× these limits to a shared tokenizer-svc, so size against the
+  replica count.
+- **Fresh connections:** each retry opens a new connection (no idle-pool reuse), so it is a
+  chance to land on a different backend via the Service — not a guarantee.
+- **`Retry-After` is not honored** in this change; backoff is equal-jitter exponential regardless.
+
+> **Note**
+>
+> These are conservative starting settings chosen to protect an already-struggling service, not
+> measured optima. Roll out with `enabled: true`, watch the metrics below, and tune. When cache is
+> disabled or retries are disabled, calls are single-attempt as before.
+
+### Retry metrics and rollout queries
+
+The retry loop emits (all labels are fixed, low-cardinality strings):
+
+| Metric | Type | Labels | Meaning |
+|--------|------|--------|---------|
+| `dwctl_cache_tokenizer_attempts_total` | counter | `op`, `attempt` (`first`/`retry`), `result` | Every completed HTTP attempt. |
+| `dwctl_cache_tokenizer_retry_recovered_total` | counter | `op` | Logical calls that succeeded after ≥1 503 retry. |
+| `dwctl_cache_tokenizer_retry_budget_wait_seconds` | histogram | `op` | Time each retry queued for rate/concurrency budget. |
+| `dwctl_cache_tokenizer_retry_budget_waits_total` | counter | `op` | Retries whose budget wait was > 0. |
+| `dwctl_cache_tokenizer_retry_inflight` | gauge | — | In-flight retry attempts (saturates at `max_concurrent_retries`). |
+
+Suggested PromQL:
+
+```promql
+# Retry attempt rate (5m), split by operation
+sum by (op) (rate(dwctl_cache_tokenizer_attempts_total{attempt="retry"}[5m]))
+
+# Share of logical operations rescued by retries (every logical operation makes exactly one
+# `attempt="first"` HTTP attempt, so that series counts operations per `op`)
+sum by (op) (rate(dwctl_cache_tokenizer_retry_recovered_total[5m]))
+  / sum by (op) (rate(dwctl_cache_tokenizer_attempts_total{attempt="first"}[5m]))
+
+# Budget queue depth p95 — rising means the budget, not tokenizer-svc, is throttling recovery
+histogram_quantile(
+  0.95,
+  sum by (le, op) (rate(dwctl_cache_tokenizer_retry_budget_wait_seconds_bucket[5m]))
+)
+
+# In-flight retry attempts — a flat top at the configured limit means permits are exhausted
+max by (instance) (dwctl_cache_tokenizer_retry_inflight)
+
+# Classify join-grace misses (cache accounting gave up waiting)
+sum(rate(dwctl_cache_classify_total{outcome="deadline_exceeded"}[5m]))
+```
+
 ## Background Services
 
 ### Onwards Sync
@@ -577,7 +689,8 @@ metadata:
 enable_metrics: true
 ```
 
-Exposes Prometheus metrics at `/internal/metrics`.
+Exposes Prometheus metrics at `/internal/metrics`. Cached-input-pricing retry metrics are
+listed under [Cached-Input Pricing (Prompt Cache)](#retry-metrics-and-rollout-queries).
 
 ### Request Logging
 
@@ -625,6 +738,7 @@ The system validates configuration on startup and fails if:
 - `jwt_expiry` is outside 5min-30day range
 - CORS uses wildcard origin with credentials enabled
 - Database URL is invalid or unreachable
+- `cache.tokenizer_retry` backoff/rate/burst/concurrency values are zero or inverted while cache and retries are enabled
 
 Run validation without starting the server:
 
