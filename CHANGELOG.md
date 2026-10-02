@@ -1,5 +1,17 @@
 # Changelog
 
+## [12.11.0](https://github.com/doublewordai/control-layer/compare/v12.10.1...v12.11.0) (2026-10-02)
+
+
+### Features
+
+* **catalog:** stage model class routes and public class pricing ([#1902](https://github.com/doublewordai/control-layer/issues/1902)) ([62693eb](https://github.com/doublewordai/control-layer/commit/62693eb52a7e3b182b636a968e2940331884a8a4))
+
+
+### Continuous Integration
+
+* pin every workflow to Rust 1.99.0 ([#1904](https://github.com/doublewordai/control-layer/issues/1904)) ([4486335](https://github.com/doublewordai/control-layer/commit/4486335098975c43cabe52e938aa130f3914cf69))
+
 ## [12.10.1](https://github.com/doublewordai/control-layer/compare/v12.10.0...v12.10.1) (2026-10-01)
 
 
