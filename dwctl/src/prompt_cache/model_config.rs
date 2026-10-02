@@ -32,12 +32,18 @@ impl ModelCacheConfig {
     };
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ModelConfigKey {
+    Alias(String),
+    Class(uuid::Uuid, uuid::Uuid),
+}
+
 /// Resolves a virtual model (alias) to its [`ModelCacheConfig`], read-through cached.
 #[derive(Clone)]
 pub struct ModelConfigResolver {
     /// Live provider (not a pinned pool): survives runtime pool swaps.
     pool: sqlx_pool_router::DynPools,
-    cache: Cache<String, ModelCacheConfig>,
+    cache: Cache<ModelConfigKey, ModelCacheConfig>,
 }
 
 impl ModelConfigResolver {
@@ -56,10 +62,12 @@ impl ModelConfigResolver {
     /// A public class row overrides the all-class enablement/floor. Account
     /// multipliers do not independently enable the billing prefix index.
     pub async fn resolve_class(&self, class: &onwards::serving::ClassRouteIdentity) -> CacheResult<ModelCacheConfig> {
-        let key = format!("class:{}:{}", class.model_id, class.class_id);
+        let key = ModelConfigKey::Class(class.model_id, class.class_id);
         if let Some(c) = self.cache.get(&key).await {
+            cache_metrics::record_model_config_resolve("hit");
             return Ok(c);
         }
+        cache_metrics::record_model_config_resolve("miss");
         let floor = sqlx::query_scalar!(
             r#"SELECT min_prefix_tokens FROM model_cache_tariffs
                WHERE deployed_model_id=$1 AND user_id IS NULL
@@ -81,7 +89,8 @@ impl ModelConfigResolver {
 
     /// Resolve the cache config for `virtual_model` (the `deployed_models.alias`).
     pub async fn resolve(&self, virtual_model: &str) -> CacheResult<ModelCacheConfig> {
-        if let Some(c) = self.cache.get(virtual_model).await {
+        let key = ModelConfigKey::Alias(virtual_model.to_owned());
+        if let Some(c) = self.cache.get(&key).await {
             cache_metrics::record_model_config_resolve("hit");
             return Ok(c);
         }
@@ -115,7 +124,7 @@ impl ModelConfigResolver {
             None => ModelCacheConfig::DISABLED,
         };
 
-        self.cache.insert(virtual_model.to_string(), config).await;
+        self.cache.insert(key, config).await;
         Ok(config)
     }
 }
@@ -174,5 +183,26 @@ mod tests {
 
         let cfg = ModelConfigResolver::new(pool).resolve("alias-expired").await.unwrap();
         assert!(!cfg.enabled, "an expired tariff version no longer enables caching");
+    }
+    #[sqlx::test]
+    async fn alias_and_class_configuration_cache_keys_cannot_collide(pool: sqlx::PgPool) {
+        let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let endpoint = create_test_endpoint(&pool, "gateway", user.id).await;
+        let model_id = create_test_model(&pool, "model", "example/model", endpoint, user.id).await;
+        add_tariff(&pool, model_id, 1024, false).await;
+        let class = onwards::serving::ClassRouteIdentity {
+            model_id,
+            class_id: uuid::Uuid::new_v4(),
+            canonical_alias: "example/model".into(),
+            class_key: "fast".into(),
+            endpoint_id: endpoint,
+            upstream_model_name: "gateway/fast".into(),
+        };
+        let collision = format!("class:{}:{}", model_id, class.class_id);
+        create_test_model(&pool, "other", &collision, endpoint, user.id).await;
+        let resolver = ModelConfigResolver::new(pool);
+        assert!(resolver.resolve_class(&class).await.unwrap().enabled);
+        assert_eq!(resolver.resolve(&collision).await.unwrap(), ModelCacheConfig::DISABLED);
+        assert!(resolver.resolve_class(&class).await.unwrap().enabled);
     }
 }

@@ -531,8 +531,12 @@ pub async fn list_deployed_models<P: PoolProvider>(
         let routes = crate::db::handlers::model_class_routes::ModelClassRoutes::new(&mut conn)
             .list_for_models(&ids)
             .await?;
+        let mut routes_by_model: std::collections::HashMap<_, Vec<_>> = std::collections::HashMap::new();
+        for route in routes {
+            routes_by_model.entry(route.model_id).or_default().push(route);
+        }
         for model in &mut models {
-            model.class_routes = Some(routes.iter().filter(|r| r.model_id == model.id).cloned().collect());
+            model.class_routes = Some(routes_by_model.remove(&model.id).unwrap_or_default());
         }
     }
 

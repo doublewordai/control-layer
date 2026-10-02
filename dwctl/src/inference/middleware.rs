@@ -128,6 +128,44 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
         }
     };
 
+    if daemon_request {
+        // Read only the model field; serde skips queued prompt values without
+        // constructing a second full JSON tree. Parse a full tree only to rewrite.
+        #[derive(serde::Deserialize)]
+        struct QueuedModel {
+            model: Option<String>,
+        }
+        let selected: QueuedModel = match serde_json::from_slice(&body_bytes) {
+            Ok(value) => value,
+            Err(_) => return invalid_request_response("Request body must be valid JSON", "invalid_json", "model"),
+        };
+        let route = match selected
+            .model
+            .as_deref()
+            .map(|name| super::model_aliases::resolve_class_route(&state.model_aliases, &state.model_targets, name, true))
+            .transpose()
+        {
+            Ok(route) => route.flatten(),
+            Err(message) => return invalid_request_response(&message, "model_not_found", "model"),
+        };
+        let mut bytes = body_bytes;
+        if let Some((name, identity)) = route {
+            parts.extensions.insert(identity);
+            parts
+                .extensions
+                .insert(onwards::serving::SubmittedModel(selected.model.clone().unwrap()));
+            if selected.model.as_deref() != Some(name.as_str()) {
+                let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("validated JSON");
+                value["model"] = name.into();
+                bytes = bytes::Bytes::from(value.to_string());
+                parts.headers.remove(axum::http::header::CONTENT_LENGTH);
+                parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
+            }
+        }
+        // Deadline priority is trusted on loopback; do not reapply ingress scrubbing.
+        return next.run(Request::from_parts(parts, Body::from(bytes))).await;
+    }
+
     let mut request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(v) => v,
         Err(e) => {
@@ -151,14 +189,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
     let submitted_model = request_value["model"].as_str().map(str::to_owned);
     let class_route = match submitted_model
         .as_deref()
-        .map(|model| {
-            super::model_aliases::resolve_class_route(
-                &state.model_aliases,
-                &state.model_targets,
-                model,
-                is_daemon_processed || daemon_request,
-            )
-        })
+        .map(|model| super::model_aliases::resolve_class_route(&state.model_aliases, &state.model_targets, model, is_daemon_processed))
         .transpose()
     {
         Ok(route) => route.flatten(),
@@ -174,22 +205,6 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
             .extensions
             .insert(onwards::serving::SubmittedModel(submitted_model.clone().unwrap()));
     }
-    // Daemon loopback still needs class normalization, but its trusted deadline
-    // priority must survive. Do not run the untrusted-ingress scrubbers again.
-    if daemon_request {
-        let body = if class_route_changed {
-            parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-            parts.headers.remove(axum::http::header::TRANSFER_ENCODING);
-            bytes::Bytes::from(request_value.to_string())
-        } else {
-            body_bytes
-        };
-        // Do not retain a second, parsed copy of a queued prompt while its
-        // upstream request is running.
-        drop(request_value);
-        return next.run(Request::from_parts(parts, Body::from(body))).await;
-    }
-
     // Strip client-supplied completion/response id fields before the request is
     // re-serialised and forwarded. dwctl owns the single parse-and-shape now, so
     // onwards forwards the bytes verbatim (COR-522); this preserves the guarantee
@@ -687,6 +702,17 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 obj.remove("stream_options");
             }
 
+            // Keep the accepted spelling in the queued body for response echo.
+            // The queue's model column remains canonical for scheduling/access;
+            // dispatch resolves this body again and enforces standard.
+            let response_model = if class_route.is_some() {
+                let submitted = submitted_model.as_deref().unwrap_or(model);
+                request_value["model"] = submitted.into();
+                submitted
+            } else {
+                model
+            };
+
             // For ZDR, encrypt the body and store the per-request keys; any
             // failure fails the request rather than falling back to plaintext.
             let flex_body = if zdr {
@@ -748,7 +774,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                     created_by: queued_created_by,
                     metadata: queued_metadata,
                 };
-                return handle_background(&state, background_input, &resp_id, model).await;
+                return handle_background(&state, background_input, &resp_id, response_model).await;
             }
 
             // INVARIANT: the daemon dispatches this job back through the loopback
@@ -778,7 +804,7 @@ pub async fn inference_middleware<P: PoolProvider + Clone + Send + Sync + 'stati
                 (true, false) => handle_chat_completion_flex(&state, flex_input, request_id).await,
                 // Responses (embeddings flex was downgraded to realtime above).
                 (false, true) => handle_responses_flex_streaming(&state, flex_input, request_id).await,
-                (false, false) => handle_flex(&state, flex_input, &resp_id, model, background).await,
+                (false, false) => handle_flex(&state, flex_input, &resp_id, response_model, background).await,
             }
         }
     }

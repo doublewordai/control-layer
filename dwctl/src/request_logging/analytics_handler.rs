@@ -285,7 +285,9 @@ impl RequestHandler for AnalyticsHandler {
             let api_key_id = response_data.extensions.get::<AuthenticatedApiKeyId>().map(|id| id.0);
 
             // Product/class and destination are separate dimensions. These labels
-            // are configured model names, never account IDs or submitted synonyms.
+            // are configured model/class/destination identities, never account IDs
+            // or submitted synonyms. Keep endpoint identity: upstream names are
+            // only unique within an endpoint, and recreating it is a new destination.
             if let Some(class) = &metrics.class_route {
                 let labels = [
                     ("model", class.canonical_alias.clone()),

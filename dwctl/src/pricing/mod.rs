@@ -152,7 +152,22 @@ pub(crate) async fn lookup_cache_tariffs<'e, E>(
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
-    lookup_cache_tariffs_for_models(executor, aliases, accounts, &[]).await
+    Ok(lookup_cache_tariffs_for_models(executor, aliases, accounts, &[])
+        .await?
+        .into_iter()
+        .filter_map(|(key, rows)| match key {
+            ModelPricingKey::Alias(alias) => Some((alias, rows)),
+            ModelPricingKey::Canonical(_) => None,
+        })
+        .collect())
+}
+
+/// Aliases are arbitrary strings and may themselves be UUIDs. Keep the two
+/// lookup domains distinct when projecting mixed legacy and class receipts.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ModelPricingKey {
+    Alias(String),
+    Canonical(uuid::Uuid),
 }
 
 pub(crate) async fn lookup_cache_tariffs_for_models<'e, E>(
@@ -160,7 +175,7 @@ pub(crate) async fn lookup_cache_tariffs_for_models<'e, E>(
     aliases: &[String],
     accounts: &[uuid::Uuid],
     class_models: &[uuid::Uuid],
-) -> Result<std::collections::HashMap<String, Vec<CacheTariffRow>>, sqlx::Error>
+) -> Result<std::collections::HashMap<ModelPricingKey, Vec<CacheTariffRow>>, sqlx::Error>
 where
     E: sqlx::Executor<'e, Database = sqlx::Postgres>,
 {
@@ -206,14 +221,14 @@ where
     .await?;
 
     let class_model_ids: std::collections::HashSet<_> = class_models.iter().copied().collect();
-    let mut map: std::collections::HashMap<String, Vec<CacheTariffRow>> = std::collections::HashMap::new();
+    let mut map: std::collections::HashMap<ModelPricingKey, Vec<CacheTariffRow>> = std::collections::HashMap::new();
     for row in rows {
         let mut keys = Vec::with_capacity(2);
         if class_model_ids.contains(&row.model_id) {
-            keys.push(row.model_id.to_string());
+            keys.push(ModelPricingKey::Canonical(row.model_id));
         }
         if row.account.is_some() || row.serving_class.is_none() {
-            keys.push(row.alias);
+            keys.push(ModelPricingKey::Alias(row.alias));
         }
         for key in keys {
             map.entry(key).or_default().push(CacheTariffRow {

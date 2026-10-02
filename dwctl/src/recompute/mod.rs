@@ -229,8 +229,8 @@ pub async fn recompute_corpus(
             Ok(usage) => {
                 let cache_mults = row
                     .canonical_model_id
-                    .map(|id| id.to_string())
-                    .or_else(|| row.model.clone())
+                    .map(crate::pricing::ModelPricingKey::Canonical)
+                    .or_else(|| row.model.clone().map(crate::pricing::ModelPricingKey::Alias))
                     .as_ref()
                     .and_then(|alias| cache_tariffs.get(alias))
                     .and_then(|versions| {
@@ -281,8 +281,8 @@ pub async fn recompute_corpus(
                     Some(usage) => {
                         let cache_mults = row
                             .canonical_model_id
-                            .map(|id| id.to_string())
-                            .or_else(|| row.model.clone())
+                            .map(crate::pricing::ModelPricingKey::Canonical)
+                            .or_else(|| row.model.clone().map(crate::pricing::ModelPricingKey::Alias))
                             .as_ref()
                             .and_then(|alias| cache_tariffs.get(alias))
                             .and_then(|versions| {

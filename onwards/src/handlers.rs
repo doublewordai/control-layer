@@ -733,11 +733,16 @@ pub async fn target_message_handler<T: HttpClient>(
     // request that the account does not hold, or the alias does not offer,
     // is refused rather than quietly downgraded.
     let class_identity = pool.class_identity().cloned();
+    if class_identity.is_some() && suffix_class.is_some() {
+        record_response_status(400);
+        return Err(OnwardsErrorResponse::bad_request("Model class is not configured", Some("model")));
+    }
     // Ingress has already used this identity for cache classification. A reload
     // between layers may change routing, but must not change the product/class
     // under an accepted request. Ask the client to retry across that boundary.
     if let Some(expected) = req.extensions().get::<serving::ClassRouteIdentity>() {
         if class_identity.as_ref().is_none_or(|actual| actual.model_id != expected.model_id || actual.class_id != expected.class_id) {
+            record_response_status(503);
             return Err(OnwardsErrorResponse::service_unavailable());
         }
     }
@@ -1237,7 +1242,7 @@ pub async fn target_message_handler<T: HttpClient>(
         // what the first hop set. Client-supplied targets are scrubbed at
         // dwctl's ingress, alongside the body priority (the same perimeter
         // the priority strip relies on).
-        if target.kind == ProviderKind::Dynamo && class_identity.is_none() && !attempt_body.is_empty() {
+        if target.kind == ProviderKind::Dynamo && (class_identity.is_none() || target.onwards_model.is_none()) && !attempt_body.is_empty() {
             match serde_json::from_slice::<serde_json::Value>(&attempt_body) {
                 Ok(mut body) => {
                     if let Some(object) = body.as_object_mut() {

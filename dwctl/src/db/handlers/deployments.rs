@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
-use sqlx::{Connection, FromRow, PgConnection, Row, query_builder::QueryBuilder};
+use sqlx::{Connection, FromRow, PgConnection, query_builder::QueryBuilder};
 use std::collections::HashMap;
 use tracing::instrument;
 
@@ -467,10 +467,24 @@ impl<'c> Repository for Deployments<'c> {
 
     #[instrument(skip(self), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn delete(&mut self, id: Self::Id) -> Result<bool> {
+        let mut tx = self.db.begin().await?;
+        let active = sqlx::query_scalar!(
+            r#"SELECT routing_mode='class_routes' AS "active!" FROM deployed_models WHERE id=$1 FOR UPDATE"#,
+            id
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+        if active {
+            return Err(DbError::InvalidModelField {
+                field: "class-routed models must be edited through their catalog",
+            });
+        }
         let result = sqlx::query!("DELETE FROM deployed_models WHERE id = $1", id)
-            .execute(&mut *self.db)
+            .execute(&mut *tx)
             .await?;
 
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -1561,23 +1575,25 @@ impl<'c> Deployments<'c> {
         Ok(info)
     }
 
-    /// Load effective reasoning mappings for every configured provider behind
-    /// each requested model alias, including disabled components.
+    /// Load reasoning policies by primary request name. For class-routed models,
+    /// the bare name selects only standard and each suffix selects its own endpoint.
+    /// Legacy composites still validate every configured provider, including disabled ones.
     #[instrument(skip(self, aliases), fields(count = aliases.len()), err)]
     pub async fn get_reasoning_policies(&mut self, aliases: &[String]) -> Result<HashMap<String, ModelReasoningPolicy>> {
         if aliases.is_empty() {
             return Ok(HashMap::new());
         }
 
-        let rows = sqlx::query(
+        let rows = sqlx::query!(
             r#"
             SELECT
-                requested.alias AS routing_alias,
+                provider.routing_alias AS "routing_alias!",
                 endpoint.reasoning_translation AS endpoint_reasoning_translation,
                 provider.reasoning_translation_overrides AS model_reasoning_translation_overrides
             FROM deployed_models requested
             JOIN LATERAL (
                 SELECT
+                    requested.alias AS routing_alias,
                     requested.hosted_on,
                     requested.reasoning_translation_overrides
                 WHERE requested.is_composite = FALSE AND requested.routing_mode = 'legacy'
@@ -1585,6 +1601,7 @@ impl<'c> Deployments<'c> {
                 UNION ALL
 
                 SELECT
+                    requested.alias,
                     component.hosted_on,
                     component.reasoning_translation_overrides
                 FROM deployed_model_components link
@@ -1595,28 +1612,33 @@ impl<'c> Deployments<'c> {
 
                 UNION ALL
 
-                SELECT class.inference_endpoint_id, requested.reasoning_translation_overrides
+                SELECT
+                    CASE WHEN class.class_key = 'standard' THEN requested.alias
+                         ELSE requested.alias || ':' || class.class_key END,
+                    class.inference_endpoint_id,
+                    requested.reasoning_translation_overrides
                 FROM model_serving_classes class
-                WHERE class.deployed_model_id=requested.id AND requested.routing_mode='class_routes'
+                WHERE class.deployed_model_id = requested.id AND requested.routing_mode = 'class_routes'
             ) provider ON TRUE
             INNER JOIN inference_endpoints endpoint ON endpoint.id = provider.hosted_on
-            WHERE requested.alias = ANY($1)
+            WHERE provider.routing_alias = ANY($1)
               AND requested.deleted = FALSE
-            ORDER BY requested.alias
+            ORDER BY provider.routing_alias
             "#,
+            aliases
         )
-        .bind(aliases)
         .fetch_all(&mut *self.db)
         .await?;
 
         let mut providers: HashMap<String, Vec<Option<crate::reasoning::ReasoningTranslationConfig>>> =
             aliases.iter().cloned().map(|alias| (alias, Vec::new())).collect();
         for row in rows {
-            let alias: String = row.try_get("routing_alias")?;
-            let endpoint_value: Option<serde_json::Value> = row.try_get("endpoint_reasoning_translation")?;
-            let model_value: Option<serde_json::Value> = row.try_get("model_reasoning_translation_overrides")?;
-            let resolved = resolve_reasoning_translation(endpoint_value, model_value, &alias);
-            providers.entry(alias).or_default().push(resolved);
+            let resolved = resolve_reasoning_translation(
+                row.endpoint_reasoning_translation,
+                row.model_reasoning_translation_overrides,
+                &row.routing_alias,
+            );
+            providers.entry(row.routing_alias).or_default().push(resolved);
         }
 
         Ok(providers

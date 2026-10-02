@@ -259,7 +259,7 @@ pub async fn list_ai_models<P: PoolProvider>(
         .map_err(|e| database_error("list_accessible_models", e))?;
 
     let reasoning_policies = if include_reasoning_capabilities {
-        let aliases = rows.iter().map(|row| row.get("canonical_alias")).collect::<Vec<String>>();
+        let aliases = rows.iter().map(|row| row.get("alias")).collect::<Vec<String>>();
         Deployments::new(&mut conn)
             .get_reasoning_policies(&aliases)
             .await
@@ -274,13 +274,8 @@ pub async fn list_ai_models<P: PoolProvider>(
             .into_iter()
             .map(|row| {
                 let id: String = row.get("alias");
-                let canonical_alias: String = row.get("canonical_alias");
                 let supported_reasoning_efforts = include_reasoning_capabilities
-                    .then(|| {
-                        reasoning_policies
-                            .get(&canonical_alias)
-                            .and_then(|policy| policy.supported_efforts())
-                    })
+                    .then(|| reasoning_policies.get(&id).and_then(|policy| policy.supported_efforts()))
                     .flatten();
                 ModelObject {
                     id,

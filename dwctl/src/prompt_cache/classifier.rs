@@ -334,7 +334,12 @@ impl Classifier {
         };
 
         // Longest cached prefix across all breakpoints' walk-back windows.
-        let read = self.find_longest_read(&scope, &parsed).await?;
+        // A live entry may predate activation or a tariff-floor increase.
+        // Recheck the current floor before counting reads or refreshing its TTL.
+        let read = self
+            .find_longest_read(&scope, &parsed)
+            .await?
+            .filter(|entry| entry.tokens >= cfg.min_prefix_tokens);
         let read_block = read.as_ref().map(|r| r.block); // index into parsed.blocks
         let read_tokens = read.as_ref().map(|r| r.tokens).unwrap_or(0);
 
@@ -358,7 +363,7 @@ impl Classifier {
 
         // Pure read: the deepest declared prefix is already cached → no write.
         if read_block == Some(deepest) {
-            // Floor is a write-time gate; a live read entry was already above it.
+            // The active floor was checked before accepting this read.
             return Ok(ClassifyOutcome::active(stats, pending));
         }
 
@@ -1205,6 +1210,39 @@ mod tests {
         h.classifier.commit(&normal.pending).await.unwrap();
         let legacy = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
         assert_eq!(legacy.stats.read, 1500, "activation/rollback preserves standard cache");
+    }
+
+    #[sqlx::test]
+    async fn standard_activation_rechecks_a_higher_floor_before_reusing_legacy_entries(pool: PgPool) {
+        let h = harness(&pool, true, 1500, 1024).await;
+        let b = body();
+        let legacy = h.classifier.classify(req(&h.secret, &b)).await.unwrap();
+        h.classifier.commit(&legacy.pending).await.unwrap();
+        let model_id = sqlx::query_scalar("SELECT id FROM deployed_models WHERE alias=$1")
+            .bind(ALIAS)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,serving_class,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,read_multiplier,min_prefix_tokens) VALUES ($1,'standard',1,1,1,0.1,2048)")
+            .bind(model_id).execute(&pool).await.unwrap();
+        let standard = onwards::serving::ClassRouteIdentity {
+            model_id,
+            class_id: uuid::Uuid::new_v4(),
+            canonical_alias: ALIAS.into(),
+            class_key: "standard".into(),
+            endpoint_id: uuid::Uuid::new_v4(),
+            upstream_model_name: "gateway/model".into(),
+        };
+        let class = h
+            .classifier
+            .classify(ClassifyRequest {
+                class_route: Some(&standard),
+                ..req(&h.secret, &b)
+            })
+            .await
+            .unwrap();
+        assert!(class.stats.is_zero(), "a legacy hit below the new floor must not be discounted");
+        assert!(class.pending.is_empty(), "below-floor entries must not be refreshed");
     }
 
     #[sqlx::test]

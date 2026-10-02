@@ -61,6 +61,15 @@ pub fn resolve_class_route(
         .get(&selected)
         .and_then(|p| p.default_pool().class_identity().cloned());
     let Some(mut identity) = identity else {
+        if !targets.targets.contains_key(&selected)
+            && let Some((base, _)) = selected.rsplit_once(':')
+            && targets
+                .targets
+                .get(base)
+                .is_some_and(|pool| pool.default_pool().class_identity().is_some())
+        {
+            return Err("Model class is not configured".into());
+        }
         return if synonym.is_some() {
             Err("Model alias is not active".into())
         } else {

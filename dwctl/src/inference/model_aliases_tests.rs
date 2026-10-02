@@ -284,8 +284,182 @@ async fn class_requests_translate_once_keep_public_responses_and_preserve_deadli
         )
         .await;
     assert_eq!(response.status_code(), StatusCode::OK, "{}", response.text());
+    assert_eq!(response.json::<serde_json::Value>()["model"], "example/model-fast");
     let requests = upstream.received_requests().await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&requests.last().unwrap().body).unwrap();
     assert_eq!(body["model"], "dynamo-example/throughput");
     assert_eq!(body["nvext"]["agent_hints"]["priority"], -42);
+}
+
+#[sqlx::test]
+async fn class_reasoning_capabilities_and_async_validation_use_the_selected_route(pool: PgPool) {
+    use crate::db::handlers::Deployments;
+    use crate::test::utils::{create_test_api_key_for_user, create_test_user_with_roles};
+    let (model, _) = active_model(&pool).await;
+    for (class, effort, rejected) in [
+        ("standard", "low", vec!["none", "minimal", "medium", "high", "xhigh", "max"]),
+        ("fast", "high", vec!["none", "minimal", "low", "medium", "xhigh", "max"]),
+    ] {
+        let endpoint = Uuid::new_v4();
+        let config = serde_json::json!({"chat_completions": {
+            "unsupported_efforts": rejected,
+            "writes": [{"target_path": "/reasoning_effort", "values": {(effort): effort}}]
+        }});
+        sqlx::query(
+            "INSERT INTO inference_endpoints (id,name,url,created_by,reasoning_translation) VALUES ($1,$2,'http://gateway.test',$3,$4)",
+        )
+        .bind(endpoint)
+        .bind(class)
+        .bind(Uuid::nil())
+        .bind(config)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE model_serving_classes SET inference_endpoint_id=$1 WHERE deployed_model_id=$2 AND class_key=$3")
+            .bind(endpoint)
+            .bind(model)
+            .bind(class)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+    // File upload and batch creation validate the canonical bare name, even
+    // when a submitted fast alias was normalized to standard at ingestion.
+    let mut conn = pool.acquire().await.unwrap();
+    let policies = Deployments::new(&mut conn)
+        .get_reasoning_policies(&["example/model".into(), "example/model:fast".into()])
+        .await
+        .unwrap();
+    let request = serde_json::json!({"reasoning_effort":"low"});
+    assert!(policies["example/model"].validate_request("/v1/chat/completions", &request).is_ok());
+    assert!(
+        policies["example/model:fast"]
+            .validate_request("/v1/chat/completions", &request)
+            .is_err()
+    );
+    drop(conn);
+
+    sqlx::query("INSERT INTO deployment_groups (deployment_id,group_id,granted_by) VALUES ($1,$2,$2)")
+        .bind(model)
+        .bind(Uuid::nil())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let app = crate::Application::new_with_pool(crate::test::utils::create_test_config(), Some(pool.clone()), None)
+        .await
+        .unwrap();
+    let (server, _background) = app.into_test_server();
+    let user = create_test_user_with_roles(
+        &pool,
+        vec![
+            crate::api::models::users::Role::StandardUser,
+            crate::api::models::users::Role::BatchAPIUser,
+        ],
+    )
+    .await;
+    let key = create_test_api_key_for_user(&pool, user.id).await;
+    let response = server
+        .get("/ai/v1/models?include_reasoning_capabilities=true")
+        .add_header("Authorization", format!("Bearer {}", key.secret))
+        .await;
+    response.assert_status_ok();
+    let body = response.json::<serde_json::Value>();
+    for (alias, effort) in [("example/model", "low"), ("example/model:fast", "high")] {
+        let model = body["data"].as_array().unwrap().iter().find(|m| m["id"] == alias).unwrap();
+        assert_eq!(
+            model["supported_reasoning_efforts"]["chat_completions"],
+            serde_json::json!([effort])
+        );
+    }
+    // Even fast spellings submitted to batch upload must validate standard's
+    // policy after normalization, not the class selected for realtime.
+    for alias in ["example/model", "example/model:fast", "example/model-fast"] {
+        let line = serde_json::json!({
+            "custom_id": "request-1", "method": "POST", "url": "/v1/chat/completions",
+            "body": {"model": alias, "messages": [{"role":"user","content":"Hello"}],
+                "reasoning_effort": "low", "max_completion_tokens": 10}
+        })
+        .to_string();
+        let response = server
+            .post("/ai/v1/files")
+            .add_header("Authorization", format!("Bearer {}", key.secret))
+            .multipart(axum_test::multipart::MultipartForm::new().add_text("purpose", "batch").add_part(
+                "file",
+                axum_test::multipart::Part::bytes(line.into_bytes()).file_name("class-reasoning.jsonl"),
+            ))
+            .await;
+        response.assert_status(axum::http::StatusCode::CREATED);
+    }
+}
+
+#[sqlx::test]
+async fn unconfigured_suffixes_do_not_fall_back_to_an_active_standard_class(pool: PgPool) {
+    active_model(&pool).await;
+    let aliases = ModelAliasMap::load(&pool).await.unwrap();
+    let live = targets(&pool).await;
+    for asynchronous in [false, true] {
+        for name in [
+            "example/model:interactive",
+            "example/model:throughput",
+            "example/model:standard",
+            "example/model:unknown",
+        ] {
+            assert!(
+                super::model_aliases::resolve_class_route(&aliases, &live, name, asynchronous).is_err(),
+                "{name}"
+            );
+        }
+    }
+}
+
+#[sqlx::test]
+async fn credit_repository_scopes_class_prices_and_their_effective_time(pool: PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+    use crate::test::utils::{create_test_api_key_for_user, create_test_user};
+    let (model, _) = active_model(&pool).await;
+    sqlx::query("INSERT INTO deployment_groups (deployment_id,group_id,granted_by) VALUES ($1,$2,$2)")
+        .bind(model)
+        .bind(Uuid::nil())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+    let key = create_test_api_key_for_user(&pool, user.id).await;
+    sqlx::query("INSERT INTO model_tariffs (deployed_model_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token,valid_from) VALUES ($1,'fast','Fast','realtime',0.001,0.001,now()+interval '1 day')")
+        .bind(model).execute(&pool).await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    for active in [false, true] {
+        if active {
+            sqlx::query("UPDATE model_tariffs SET valid_from=now()-interval '1 day' WHERE deployed_model_id=$1")
+                .bind(model)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        let standard = ApiKeys::new(&mut conn)
+            .get_api_keys_for_deployment_with_sufficient_credit(model)
+            .await
+            .unwrap();
+        assert!(standard.iter().any(|k| k.secret == key.secret));
+        let fast = ApiKeys::new(&mut conn)
+            .get_api_keys_for_class_with_sufficient_credit(model, "fast")
+            .await
+            .unwrap();
+        assert_eq!(fast.iter().any(|k| k.secret == key.secret), !active);
+    }
+}
+
+#[sqlx::test]
+async fn activated_model_delete_returns_catalog_guard_without_removing_identity(pool: PgPool) {
+    use crate::db::handlers::{Deployments, Repository};
+    let (model, _) = active_model(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let error = Deployments::new(&mut conn).delete(model).await.unwrap_err();
+    assert!(matches!(error, crate::db::errors::DbError::InvalidModelField { .. }));
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM deployed_models WHERE id=$1)")
+        .bind(model)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(exists);
 }

@@ -287,7 +287,12 @@ async fn catalog_updates_activated_models_without_resetting_operator_mode(pool: 
         .execute(&pool)
         .await
         .unwrap();
-    apply(&pool, &c).await.unwrap();
+    let mut updated = fixture();
+    updated["clay"]["class_routes"]["fast"]["upstream_model_name"] = "gateway/updated-fast".into();
+    apply(&pool, &catalog(&updated).unwrap()).await.unwrap();
+    let upstream: String = sqlx::query_scalar("SELECT upstream_model_name FROM model_serving_classes c JOIN deployed_models dm ON dm.id=c.deployed_model_id WHERE dm.alias='example/model' AND c.class_key='fast'")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(upstream, "gateway/updated-fast");
     let mode: String = sqlx::query_scalar("SELECT routing_mode FROM deployed_models WHERE alias='example/model'")
         .fetch_one(&pool)
         .await

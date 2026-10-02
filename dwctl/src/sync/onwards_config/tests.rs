@@ -2911,7 +2911,11 @@ async fn class_route_edits_notify_but_zero_row_catalog_writes_do_not(pool: sqlx:
         .await
         .unwrap()
         .unwrap();
-    assert!(notification.payload().contains("model_serving_classes"));
+    assert_eq!(notification.payload(), "model_serving_classes");
+    assert!(
+        parse_notify_payload(notification.payload()).is_none(),
+        "transaction age must not be reported as notification lag"
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(100), listener.recv()).await.is_err(),
         "one notification per transaction, not per class row"

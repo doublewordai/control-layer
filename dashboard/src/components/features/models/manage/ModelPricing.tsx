@@ -98,7 +98,7 @@ export function ModelPricing({
     ? [
         ...new Set([
           "standard",
-          ...configuredClasses,
+          ...(classRoutesActive ? configuredClasses : []),
           ...Object.keys(model.serving_classes ?? {}),
           ...(selectedOverlay?.targets ? ["custom"] : []),
           ...rows
@@ -109,7 +109,7 @@ export function ModelPricing({
           ),
         ]),
       ]
-    : [...new Set(["standard", ...configuredClasses])];
+    : [...new Set(["standard", ...(classRoutesActive ? configuredClasses : [])])];
   const windows = [
     ...new Set([
       ...(model.allowed_batch_completion_windows ?? []),
@@ -135,7 +135,7 @@ export function ModelPricing({
         label={
           purpose === "batch"
             ? `${getTariffDisplayName(purpose, window)} · ${window}`
-            : organization || configuredClasses.length
+            : organization || classRoutesActive
               ? cls
               : "All classes"
         }
@@ -319,7 +319,7 @@ export function ModelPricing({
                     <div key={cls} className="rounded-lg border p-3 space-y-3">
                       <div className="flex flex-wrap items-center gap-2">
                         <span className="font-medium text-sm">
-                          {organization || configuredClasses.length ? cls : "All classes"}
+                          {organization || classRoutesActive ? cls : "All classes"}
                         </span>
                         <Badge variant="outline">
                           {resolved.own

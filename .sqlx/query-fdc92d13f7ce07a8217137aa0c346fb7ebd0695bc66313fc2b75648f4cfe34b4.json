@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT\n                provider.routing_alias AS \"routing_alias!\",\n                endpoint.reasoning_translation AS endpoint_reasoning_translation,\n                provider.reasoning_translation_overrides AS model_reasoning_translation_overrides\n            FROM deployed_models requested\n            JOIN LATERAL (\n                SELECT\n                    requested.alias AS routing_alias,\n                    requested.hosted_on,\n                    requested.reasoning_translation_overrides\n                WHERE requested.is_composite = FALSE AND requested.routing_mode = 'legacy'\n\n                UNION ALL\n\n                SELECT\n                    requested.alias,\n                    component.hosted_on,\n                    component.reasoning_translation_overrides\n                FROM deployed_model_components link\n                INNER JOIN deployed_models component ON component.id = link.deployed_model_id\n                WHERE requested.is_composite = TRUE AND requested.routing_mode = 'legacy'\n                  AND link.composite_model_id = requested.id\n                  AND component.deleted = FALSE\n\n                UNION ALL\n\n                SELECT\n                    CASE WHEN class.class_key = 'standard' THEN requested.alias\n                         ELSE requested.alias || ':' || class.class_key END,\n                    class.inference_endpoint_id,\n                    requested.reasoning_translation_overrides\n                FROM model_serving_classes class\n                WHERE class.deployed_model_id = requested.id AND requested.routing_mode = 'class_routes'\n            ) provider ON TRUE\n            INNER JOIN inference_endpoints endpoint ON endpoint.id = provider.hosted_on\n            WHERE provider.routing_alias = ANY($1)\n              AND requested.deleted = FALSE\n            ORDER BY provider.routing_alias\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "routing_alias!",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "endpoint_reasoning_translation",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 2,
+        "name": "model_reasoning_translation_overrides",
+        "type_info": "Jsonb"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      null,
+      true,
+      null
+    ]
+  },
+  "hash": "fdc92d13f7ce07a8217137aa0c346fb7ebd0695bc66313fc2b75648f4cfe34b4"
+}

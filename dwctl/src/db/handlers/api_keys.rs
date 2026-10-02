@@ -914,6 +914,15 @@ impl<'c> ApiKeys<'c> {
         &mut self,
         deployment_id: DeploymentId,
     ) -> Result<Vec<ApiKeyDBResponse>> {
+        self.get_api_keys_for_class_with_sufficient_credit(deployment_id, "standard").await
+    }
+
+    /// Class-scoped equivalent of the legacy model admission lookup.
+    pub async fn get_api_keys_for_class_with_sufficient_credit(
+        &mut self,
+        deployment_id: DeploymentId,
+        class_key: &str,
+    ) -> Result<Vec<ApiKeyDBResponse>> {
         let api_keys = sqlx::query_as!(
             ApiKey,
             r#"
@@ -977,12 +986,15 @@ impl<'c> ApiKeys<'c> {
                 )
                 OR (NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
-                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND (mt.serving_class IS NULL OR dm.routing_mode = 'class_routes')
-                      AND mt.valid_until IS NULL
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                      AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL)
+                        OR (dm.routing_mode = 'class_routes' AND mt.serving_class = $3
+                            AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())))
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                 ) AND NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
                     WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                      AND (dm.routing_mode = 'legacy' OR mt.serving_class IS NULL OR mt.serving_class = $3)
                       AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                 ))
@@ -1027,19 +1039,23 @@ impl<'c> ApiKeys<'c> {
                 )
                 OR (NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
-                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND (mt.serving_class IS NULL OR dm.routing_mode = 'class_routes')
-                      AND mt.valid_until IS NULL
+                    WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                      AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL)
+                        OR (dm.routing_mode = 'class_routes' AND mt.serving_class = $3
+                            AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())))
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                 ) AND NOT EXISTS (
                     SELECT 1 FROM model_tariffs mt
                     WHERE mt.deployed_model_id = dm.id AND mt.user_id = ak.user_id
+                      AND (dm.routing_mode = 'legacy' OR mt.serving_class IS NULL OR mt.serving_class = $3)
                       AND mt.valid_from <= NOW() AND (mt.valid_until IS NULL OR mt.valid_until > NOW())
                       AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                 ))
             )
             "#,
             deployment_id,
-            Uuid::nil() // System user ID
+            Uuid::nil(), // System user ID
+            class_key
         )
         .fetch_all(&mut *self.db)
         .await?;
