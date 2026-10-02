@@ -24,6 +24,11 @@ The application checks cover:
   detach/drop through the direct maintenance connection. A database event trigger
   on the disposable partition verifies nonzero session timeout bounds during DDL.
 - Completed batch and output persistence, migration replay, and graceful shutdown.
+- A pooled catalog-style transaction holds the model-name lock while an API model
+  writer attempts a conflicting primary class name or synonym. Observe the writer
+  blocked in PostgreSQL, commit the reservation, then require HTTP 409. This runs
+  before disabling `server_reset_query_always`; the Rust integration test exercises
+  the actual catalog reconciler with a concurrent repository writer.
 
 Only the external model provider is replaced by a deterministic local HTTP server.
 Primary and replica query pools target the same PostgreSQL instance; this job does

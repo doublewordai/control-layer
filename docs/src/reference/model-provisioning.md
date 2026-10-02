@@ -145,41 +145,45 @@ names currently supported are `default` and `completions`.
 
 `clay.class_routes` stages explicit destinations on the existing model UUID. This
 is preparatory storage: this release continues using the legacy route, general
-price, cache configuration and model discovery. It does not accept new inference
-names or enable class routing. Keep the existing `deployments`, `routing`,
+price, cache configuration and model discovery. Public class prices are deliberately
+excluded from runtime tariff/cache histories and existing dashboard price panels;
+customer-specific class deals retain their established billing and credit checks.
+This release does not accept new inference names or enable class routing. Keep the existing `deployments`, `routing`,
 `tariffs` and `cache_tariff` definitions while staging classes.
 
 ```yaml
-# Add beneath clay in an existing model document:
-class_routes:
-  standard:
-    display_name: Standard
-    endpoint: gateway
-    upstream_model_name: dynamo-example/model:throughput
-    tariffs:
-      - name: Standard realtime
-        purpose: realtime
-        input_per_million_tokens: "1.00"
-        output_per_million_tokens: "2.00"
-  fast:
-    display_name: Fast
-    endpoint: gateway
-    upstream_model_name: dynamo-example/model:fast
-    aliases: [example/model-fast]
-    tariffs:
-      - name: Fast realtime
-        purpose: realtime
-        input_per_million_tokens: "2.00"
-        output_per_million_tokens: "4.00"
-    cache_tariff:
-      write_multiplier_5m: "1.25"
-      write_multiplier_1h: "2.0"
-      write_multiplier_24h: "3.0"
-      read_multiplier: "0.1"
+# Merge into the existing clay block, retaining its other fields:
+clay:
+  class_routes:
+    standard:
+      display_name: Standard
+      endpoint: gateway
+      upstream_model_name: dynamo-example/model:throughput
+      tariffs:
+        - name: Standard realtime
+          purpose: realtime
+          input_per_million_tokens: "1.00"
+          output_per_million_tokens: "2.00"
+    fast:
+      display_name: Fast
+      endpoint: gateway
+      upstream_model_name: dynamo-example/model:fast
+      aliases: [example/model-fast]
+      tariffs:
+        - name: Fast realtime
+          purpose: realtime
+          input_per_million_tokens: "2.00"
+          output_per_million_tokens: "4.00"
+      cache_tariff:
+        write_multiplier_5m: "1.25"
+        write_multiplier_1h: "2.0"
+        write_multiplier_24h: "3.0"
+        read_multiplier: "0.1"
 ```
 
-The endpoint must exist. Upstream names are arbitrary, endpoint-scoped strings;
-classes may share a destination. Class keys retain their IDs when a display name,
+The endpoint must exist. Upstream names are configurable, endpoint-scoped strings
+that must be nonempty and contain no whitespace. Classes may share a destination.
+Class keys retain their IDs when a display name,
 destination or price changes. Nonempty class configuration requires `standard`
 and `fast`, each with a realtime tariff. Additional keys may use lowercase letters,
 digits, hyphens and underscores, starting with a letter. The old numeric-target
@@ -216,6 +220,10 @@ putting it in YAML is rejected. This release is **not activation-ready**: reques
 resolution, billing snapshots, reactive forwarding and writer support must land
 before switching any model. The catalog refuses edits to models already set to
 `class_routes`, instead of overwriting an active route with a composite definition.
+The class-aware SQL resolver is not an activation mechanism: switching this flag
+manually would bypass the supported rollout boundary. Class-aware admission,
+durable billing/cache context and dashboard readers must be integrated together
+before enabling it. Do not enable individual public-price readers in this release.
 Deploy this support release and update the catalog validator before publishing
 catalogs containing the new field. Do not run an older binary against staged public
 class prices: its readers do not distinguish them from general prices.

@@ -244,6 +244,41 @@ async fn synonym_collision_with_existing_private_model_rolls_back_catalog(pool: 
 }
 
 #[sqlx::test]
+async fn catalog_primary_names_reject_case_only_collisions_before_writing(pool: PgPool) {
+    setup(&pool).await;
+    for name in ["EXAMPLE/model", "LEGACY-example/model"] {
+        let mut tx = pool.begin().await.unwrap();
+        sqlx::query("INSERT INTO deployed_models (alias,model_name,is_composite,created_by) VALUES ($1,'existing',true,'00000000-0000-0000-0000-000000000000')")
+            .bind(name).execute(&mut *tx).await.unwrap();
+        let error = ModelProvisioning::new(&mut tx)
+            .apply(&catalog(&fixture()).unwrap())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exact spelling"), "{error:#}");
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM model_serving_classes")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        tx.rollback().await.unwrap();
+    }
+}
+
+#[test]
+fn class_catalog_schema_restricts_class_keys() {
+    let schema: serde_json::Value = serde_json::from_str(&Catalog::json_schema().unwrap()).unwrap();
+    assert_eq!(
+        schema["$defs"]["ClayModel"]["properties"]["class_routes"]["propertyNames"]["pattern"],
+        "^[a-z][a-z0-9_-]*$"
+    );
+    for key in ["Fast", "0fast", "fast:extra", ""] {
+        let mut value = fixture();
+        value["clay"]["class_routes"][key] = value["clay"]["class_routes"]["fast"].clone();
+        assert!(catalog(&value).unwrap_err().to_string().contains("invalid class key"));
+    }
+}
+
+#[sqlx::test]
 async fn catalog_refuses_activated_models_without_resetting_operator_mode(pool: PgPool) {
     setup(&pool).await;
     let c = catalog(&fixture()).unwrap();

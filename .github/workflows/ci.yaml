@@ -178,7 +178,7 @@ jobs:
           done
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: llvm-tools-preview
 
@@ -315,7 +315,7 @@ jobs:
 
       - name: Install Rust
         if: env.RUN_CI == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: llvm-tools-preview
 
@@ -395,9 +395,10 @@ jobs:
           done
 
       - name: Install Rust
-        # Rust 1.99 reports double_must_use in async-trait's generated code.
-        # Restore stable once it includes https://github.com/rust-lang/rust-clippy/pull/17547.
-        uses: dtolnay/rust-toolchain@1.98.0
+        # Every workflow pins this same Rust release (search for
+        # `rust-toolchain@`). A new stable can add lints that fail
+        # `-D warnings`, so upgrade them together, deliberately.
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: rustfmt, clippy
 
@@ -999,7 +1000,7 @@ jobs:
 
       - name: Install Rust
         if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Build onwards
         if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
@@ -1447,7 +1448,7 @@ jobs:
       # the checked-out application locally without registry write privileges.
       - name: Install Rust for unpublished builds
         if: needs.build.result == 'skipped'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Cache unpublished application build
         if: needs.build.result == 'skipped'

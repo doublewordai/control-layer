@@ -87,6 +87,7 @@ pub struct ClayModel {
     /// Explicit class destinations and prices, staged independently of legacy routing.
     /// Declaring these does not activate routes or advertise additional model names.
     #[serde(default)]
+    #[schemars(extend("propertyNames" = {"pattern": "^[a-z][a-z0-9_-]*$"}))]
     pub class_routes: BTreeMap<String, ClassRoute>,
 }
 
