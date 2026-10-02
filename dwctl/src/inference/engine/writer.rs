@@ -887,7 +887,7 @@ mod tests {
         assert_eq!(accounting.batch_body_bytes.load(Ordering::Relaxed), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_writer_persists_completed_record(pool: sqlx::PgPool) {
         let (writer, sender, manager) = build_writer(pool).await;
         let shutdown = CancellationToken::new();
@@ -942,7 +942,7 @@ mod tests {
         assert_accounting_zero(&sender.accounting);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_writer_batches_multiple_records_in_one_flush(pool: sqlx::PgPool) {
         // Send N records faster than the writer can flush so they buffer up;
         // confirm all N land in the DB. Using batch_size=8 (from build_writer)
@@ -982,7 +982,7 @@ mod tests {
             .expect("writer task should not panic");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_writer_splits_unavailable_record_without_losing_valid_sibling(pool: sqlx::PgPool) {
         let fusillade_pool = crate::test::utils::setup_fusillade_pool(&pool).await;
         let unavailable_id = Uuid::new_v4();
@@ -1030,7 +1030,7 @@ mod tests {
         ));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_writer_failure_logs_are_content_free(pool: sqlx::PgPool) {
         const REQUEST_SENTINEL: &str = "private-request-payload-b83b1a";
         const RESPONSE_SENTINEL: &str = "private-response-payload-66f319";
@@ -1118,7 +1118,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_writer_drains_channel_on_shutdown(pool: sqlx::PgPool) {
         // Exercises the shutdown-cancellation arm specifically: cancel the
         // token while the sender is still alive, so `run` exits via

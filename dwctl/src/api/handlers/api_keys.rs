@@ -1030,7 +1030,7 @@ mod tests {
         resp.spend.expect("capped key should carry a spend value")
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_api_key_with_spend_cap(pool: PgPool) {
         use crate::db::handlers::api_keys::ApiKeys;
@@ -1081,7 +1081,7 @@ mod tests {
         assert_eq!(Some(resolved), child);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_api_key_cap_validation(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1122,7 +1122,7 @@ mod tests {
         ok.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_api_key_spend_cap_matrix(pool: PgPool) {
         use rust_decimal::Decimal;
@@ -1215,7 +1215,7 @@ mod tests {
             .assert_status(axum::http::StatusCode::BAD_REQUEST);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_patch_api_key_permissions_and_system_keys(pool: PgPool) {
         use crate::db::handlers::api_keys::ApiKeys;
@@ -1266,7 +1266,7 @@ mod tests {
     /// End-to-end acceptance path: a cap set through the real API, once
     /// exhausted, excludes the whole scope from the onwards key set on the
     /// next reload, and the proxy path answers with the explicit 402.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_capped_key_end_to_end_402(pool: PgPool) {
         use crate::config::RateLimitTiersConfig;
@@ -1389,7 +1389,7 @@ mod tests {
         assert!(body.contains("spend_cap_exceeded"), "expected explicit cap code, got: {body}");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_api_key_for_self(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1417,7 +1417,7 @@ mod tests {
         assert!(api_key.key.starts_with("sk-"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_api_key_for_other_user_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1445,7 +1445,7 @@ mod tests {
         assert!(api_key.key.starts_with("sk-"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_api_key_for_other_user_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1468,7 +1468,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_user_api_keys(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1491,7 +1491,7 @@ mod tests {
     }
 
     // Add new pagination test for the handler
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_user_api_keys_with_pagination_query_params(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1554,7 +1554,7 @@ mod tests {
         assert_eq!(paginated.total_count, 5);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_user_api_key_for_self(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1584,7 +1584,7 @@ mod tests {
         assert_eq!(paginated.total_count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_rejects_cap_scope_child_key(pool: PgPool) {
         use crate::db::handlers::api_keys::ApiKeys;
@@ -1624,7 +1624,7 @@ mod tests {
         assert!(ApiKeys::new(&mut conn).get_by_id(child_id).await.unwrap().is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_user_api_key_for_other_user_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1655,7 +1655,7 @@ mod tests {
         assert_eq!(paginated.total_count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_user_api_key_for_other_user_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1686,7 +1686,7 @@ mod tests {
         assert_eq!(paginated.total_count, 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_nonexistent_api_key_returns_not_found(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1704,7 +1704,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_api_key_belonging_to_different_user_returns_not_found(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1727,7 +1727,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_api_keys_for_other_user_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1757,7 +1757,7 @@ mod tests {
         assert!(returned_ids.contains(&api_key2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_api_keys_for_other_user_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1776,7 +1776,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_api_key_for_other_user_as_admin(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1798,7 +1798,7 @@ mod tests {
         assert_eq!(returned_key.name, api_key.name);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_api_key_for_other_user_as_non_admin_forbidden(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1817,7 +1817,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_request_viewer_api_key_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1861,7 +1861,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multi_role_user_api_key_permissions(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1920,7 +1920,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_full_api_key_access(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -1989,7 +1989,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_key_isolation_between_users(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2039,7 +2039,7 @@ mod tests {
         response.assert_status_not_found(); // 404 because the key doesn't belong to user1
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_error_messages_are_user_friendly(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2062,7 +2062,7 @@ mod tests {
         assert!(!body.contains("ReadOwn"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_specific_api_key_for_self(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2085,7 +2085,7 @@ mod tests {
         // ApiKeyInfoResponse intentionally does not have a key field (security feature)
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_api_key_creation_returns_key_value_only_once(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2145,7 +2145,7 @@ mod tests {
 
     // ── Organization API key tests ────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_member_can_create_api_key(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2174,7 +2174,7 @@ mod tests {
         assert!(api_key.key.starts_with("sk-"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_non_member_cannot_create_org_api_key(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2198,7 +2198,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_member_list_only_own_keys(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2248,7 +2248,7 @@ mod tests {
         assert_eq!(paginated.data[0].name, "Bob Key");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_created_by_filter_server_side(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2329,7 +2329,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_issued_key_first_reveal_flow(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2424,7 +2424,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::CONFLICT);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_key_get_scoping_manager_sees_member_key(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2462,7 +2462,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_key_delete_scoping(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2500,7 +2500,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::NO_CONTENT);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_member_can_delete_own_key(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2538,7 +2538,7 @@ mod tests {
         assert_eq!(paginated.data.len(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_platform_manager_sees_all_org_keys(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2577,7 +2577,7 @@ mod tests {
 
     // ── created_by attribution tests ──────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_member_key_created_by_is_member_not_org(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2599,7 +2599,7 @@ mod tests {
         assert_eq!(key.user_id, org.id, "user_id should be the org");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_pm_org_member_key_created_by_is_pm_not_org(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2621,7 +2621,7 @@ mod tests {
         assert_eq!(key.user_id, org.id, "user_id should be the org");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_pm_creates_org_key_with_member_id(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2644,7 +2644,7 @@ mod tests {
         assert_eq!(key.user_id, org.id, "user_id should be the org");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_pm_member_id_rejected_for_non_org_target(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2663,7 +2663,7 @@ mod tests {
         response.assert_status_bad_request();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_pm_member_id_rejected_for_non_member(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2682,7 +2682,7 @@ mod tests {
         response.assert_status_bad_request();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_plain_member_cannot_use_member_id(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2701,7 +2701,7 @@ mod tests {
         response.assert_status_forbidden();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_pm_creates_key_for_individual_user_created_by_is_target(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2741,7 +2741,7 @@ mod tests {
         .unwrap();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_manager_creates_key_with_member_id(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2786,7 +2786,7 @@ mod tests {
         assert!(secret.key.starts_with("sk-"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_org_manager_can_update_member_key(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2818,7 +2818,7 @@ mod tests {
         assert_eq!(updated.created_by, bob.id, "managing a key never re-attributes it");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_member_without_manage_keys_cannot_create_keys(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2856,7 +2856,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::CREATED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_issued_keys_are_view_and_rotate_only_without_grant(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -2920,7 +2920,7 @@ mod tests {
             .assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_rotate_api_key(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -3023,7 +3023,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_reset_window_fires_onwards_rearm_notify(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;

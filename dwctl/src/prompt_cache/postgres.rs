@@ -224,7 +224,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn write_then_lookup_returns_match(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(hits[0].ttl_tier, TtlTier::OneHour);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn lookup_excludes_expired_and_other_scopes(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
@@ -257,7 +257,7 @@ mod tests {
         assert!(idx.lookup(&other, &[b"shared".to_vec()]).await.unwrap().is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn refresh_slides_expiry(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
@@ -274,7 +274,7 @@ mod tests {
         assert!(hits[0].expires_at > Utc::now() + chrono::Duration::minutes(30));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn refresh_skips_a_negligible_extension(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();
@@ -297,7 +297,7 @@ mod tests {
         assert_eq!(hits[0].expires_at.timestamp_micros(), later.timestamp_micros());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn write_upserts_on_conflict(pool: sqlx::PgPool) {
         let idx = PostgresIndex::new(pool, 1);
         let s = scope();

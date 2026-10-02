@@ -154,7 +154,7 @@ mod tests {
     use metrics_exporter_prometheus::PrometheusBuilder;
     use sqlx::PgPool;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn cached_result_shape_failure_is_counted_without_retry(pool: PgPool) {
         let mut connection = pool.acquire().await.unwrap();
         sqlx::query("CREATE TABLE cached_shape (id integer)")
@@ -189,7 +189,7 @@ mod tests {
         assert!(repeated.to_string().contains("cached plan must not change result type"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn unrelated_unsupported_feature_does_not_count_as_cached_plan(pool: PgPool) {
         let error = sqlx::query("SELECT count(*) FROM pg_class FOR UPDATE")
             .fetch_all(&pool)

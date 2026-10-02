@@ -175,8 +175,6 @@ mod tests {
     use sqlx::PgPool;
 
     async fn setup(pool: &PgPool) {
-        underway::run_migrations(pool).await.unwrap();
-        crate::migrations::apply_underway(pool).await.unwrap();
         sqlx::raw_sql("INSERT INTO underway.task_queue(name) VALUES ('q') ON CONFLICT DO NOTHING")
             .execute(pool)
             .await
@@ -206,7 +204,7 @@ mod tests {
             .unwrap()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn purges_only_expired_finished_tasks(pool: PgPool) {
         setup(&pool).await;
         let old_done = insert(&pool, "succeeded", 30, 14).await;
@@ -230,7 +228,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn purge_is_bounded_by_batch_size_and_oldest_first(pool: PgPool) {
         setup(&pool).await;
         let oldest = insert(&pool, "succeeded", 40, 14).await;
@@ -244,7 +242,7 @@ mod tests {
         let _ = (oldest, middle);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn purge_times_out_on_table_locks_without_deleting(pool: PgPool) {
         setup(&pool).await;
         let id = insert(&pool, "succeeded", 30, 14).await;
@@ -263,7 +261,7 @@ mod tests {
         assert_eq!(purge_expired_batch(&pool, 100, Duration::ZERO).await.unwrap(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn purge_cascades_attempt_history(pool: PgPool) {
         setup(&pool).await;
         let id = insert(&pool, "succeeded", 30, 14).await;
@@ -281,7 +279,7 @@ mod tests {
         assert_eq!(attempts, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn purge_skips_old_live_tasks_with_terminal_retention_index(pool: PgPool) {
         setup(&pool).await;
         sqlx::raw_sql(
@@ -333,7 +331,7 @@ mod tests {
         assert!(!seq_scans_task(victims), "{rendered}");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn sweep_drains_in_batches_and_reports_the_total(pool: PgPool) {
         setup(&pool).await;
         for _ in 0..7 {
@@ -352,7 +350,7 @@ mod tests {
         assert_eq!(remaining(&pool).await.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn sweep_yields_when_another_sweep_holds_the_lock(pool: PgPool) {
         setup(&pool).await;
         insert(&pool, "succeeded", 30, 14).await;
@@ -372,7 +370,7 @@ mod tests {
         assert_eq!(sweep(&pool, &config, &CancellationToken::new()).await.unwrap(), Some(0));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn sweep_stops_when_its_lock_connection_is_lost(pool: PgPool) {
         setup(&pool).await;
         for _ in 0..3 {
@@ -412,7 +410,7 @@ mod tests {
         assert_eq!(sweep(&pool, &config, &CancellationToken::new()).await.unwrap(), Some(2));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn sweep_holds_its_lock_across_batches(pool: PgPool) {
         // While a multi-batch sweep runs, a competing sweep must be refused even between
         // batches (the lock is session-level, not per delete transaction). Probe from a

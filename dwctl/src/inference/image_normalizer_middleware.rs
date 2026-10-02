@@ -793,7 +793,7 @@ mod tests {
     /// the prompt cache). The bearer is the hidden batch key, which resolves
     /// to the principal that submitted the image, so the grant matches; the
     /// URL is signed with the dispatch TTL.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn a_daemon_dispatch_signs_a_token_its_principal_submitted_with_the_dispatch_ttl(pool: sqlx::PgPool) {
         use crate::api::models::users::Role;
         use crate::test::utils::create_test_user;
@@ -815,7 +815,7 @@ mod tests {
     /// No trusted path: a dispatch whose stored body carries a token its
     /// principal never submitted (a body queued before the submission-time
     /// checks existed, or while normalisation was off) is refused, not signed.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn a_daemon_dispatch_is_refused_a_token_its_principal_never_submitted(pool: sqlx::PgPool) {
         use crate::api::models::users::Role;
         use crate::test::utils::create_test_user;
@@ -834,7 +834,7 @@ mod tests {
     /// A synced record keeps its raw image until dispatch, so the daemon's
     /// loopback reaches the ingest path too: the URL it produces must also
     /// outlive a full processing attempt (dispatch TTL), not a realtime one.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn a_daemon_dispatch_ingesting_a_raw_image_signs_it_with_the_dispatch_ttl(pool: sqlx::PgPool) {
         use crate::api::models::users::Role;
         use crate::test::utils::create_test_user;
@@ -861,7 +861,7 @@ mod tests {
     /// A client re-sending a request it downloaded: its own token is signed,
     /// but authorised against `image_access` and with the REALTIME TTL — this
     /// is an ordinary request, not a dispatch.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn a_client_resending_its_own_token_is_signed_with_the_realtime_ttl(pool: sqlx::PgPool) {
         use crate::api::models::users::Role;
         use crate::test::utils::{create_test_api_key_for_user, create_test_user};
@@ -882,7 +882,7 @@ mod tests {
     /// Ownership is by principal, not by human: an image submitted under an
     /// organization key by one member is re-sendable by any member of that
     /// organization.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn a_client_may_resend_a_token_another_member_of_its_organization_submitted(pool: sqlx::PgPool) {
         use crate::api::models::users::Role;
         use crate::test::utils::{add_org_member, create_test_org, create_test_user};
@@ -905,7 +905,7 @@ mod tests {
 
     /// A token names bytes; signing it hands out a URL to them. A different
     /// principal presenting someone else's token is refused, not served.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn a_client_is_refused_a_token_it_never_submitted(pool: sqlx::PgPool) {
         use crate::api::models::users::Role;
         use crate::test::utils::{create_test_api_key_for_user, create_test_user};
@@ -925,7 +925,7 @@ mod tests {
 
     /// No attributable caller (no bearer at all) means no owner to check
     /// against, so the token is refused rather than signed on trust.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn an_unattributable_client_is_refused_a_token(pool: sqlx::PgPool) {
         use crate::api::models::users::Role;
         use crate::test::utils::{create_test_api_key_for_user, create_test_user};
@@ -965,7 +965,7 @@ mod tests {
         }))
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn a_repeated_dispatch_reads_the_image_prefix_it_wrote_while_upstream_gets_signed_urls(pool: sqlx::PgPool) {
         use crate::api::models::users::Role;
         use crate::prompt_cache::{

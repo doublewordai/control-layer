@@ -106,7 +106,7 @@ mod tests {
     use axum::http::StatusCode;
     use sqlx::PgPool;
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_list_daemons_requires_system_read_all_permission(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -122,7 +122,7 @@ mod tests {
         response.assert_status(StatusCode::FORBIDDEN);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_list_daemons_platform_manager_can_access(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::PlatformManager).await;
@@ -142,7 +142,7 @@ mod tests {
         assert!(json.daemons.is_empty() || !json.daemons.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_list_daemons_without_authentication(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
 
@@ -151,7 +151,7 @@ mod tests {
         response.assert_status(StatusCode::UNAUTHORIZED);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_list_daemons_with_status_filter(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::PlatformManager).await;
@@ -172,7 +172,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_list_daemons_returns_onwards_daemon(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
         let user = create_test_user(&pool, Role::PlatformManager).await;

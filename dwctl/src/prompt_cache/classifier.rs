@@ -929,7 +929,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn render_mode_counts_exact_boundaries(pool: PgPool) {
         // The marker sits on message 0's final block → wire prefix {"message": 0}. ONE
         // render call returns the marker's count (prefix_counts[0] = 1600, the write)
@@ -962,7 +962,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn render_prices_tool_definition_markers(pool: PgPool) {
         // A marker on a tool DEFINITION becomes the wire prefix {"tools": 1} (first
         // definition, no messages) — every marker position raw counting prices, exact
@@ -995,7 +995,7 @@ mod tests {
         assert_eq!(pending.writes[0].cumulative_token_count, 1400);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn render_unsupported_falls_back_to_raw_counting(pool: PgPool) {
         // 400 TEMPLATE_RENDER_FAILED → today's raw-segment counting takes over.
         let h = render_harness(
@@ -1016,7 +1016,7 @@ mod tests {
         assert_eq!(pending.writes.len(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn render_transport_error_degrades_to_no_cache(pool: PgPool) {
         // 503 → exactly like a tokenize outage: no caching for this request.
         let h = render_harness(&pool, 1024, 1500, None, ResponseTemplate::new(503)).await;
@@ -1027,7 +1027,7 @@ mod tests {
         assert!(out.pending.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn render_floor_uses_exact_count(pool: PgPool) {
         // Boundary count under the floor → no caching, even if raw counting would clear it.
         let h = render_harness(
@@ -1048,7 +1048,7 @@ mod tests {
         assert!(out.pending.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn render_null_prefix_backfills_from_raw_counts(pool: PgPool) {
         // A null prefix_counts entry (template refused that truncated view) backfills
         // from raw tokenize — with no non-null neighbour, the marker's raw cumulative
@@ -1075,7 +1075,7 @@ mod tests {
         assert_eq!(pending.writes[0].cumulative_token_count, 1500);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn render_non_monotonic_counts_fall_back_to_raw(pool: PgPool) {
         // A prefix count above the full-render total means the template/impl is lying —
         // fall back to raw counting rather than bill on it.
@@ -1110,7 +1110,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn blockless_route_never_reaches_the_chat_parser(pool: PgPool) {
         // A plain /completions body can smuggle chat-shaped marked `messages` past the
         // router; the completions engine ignores them, so module entries keyed on them
@@ -1144,7 +1144,7 @@ mod tests {
     /// port-forward turned a healthy 25-row corpus into 25 false disagreements). A genuine
     /// zero — a marked request on an enabled model is not one, so use a markerless body —
     /// stays un-degraded, because a replay CAN trust it.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn unreachable_tokenizer_is_degraded_but_no_markers_is_not(pool: PgPool) {
         let h = harness(&pool, true, 4096, 1024).await;
 
@@ -1174,7 +1174,7 @@ mod tests {
         assert!(!out.degraded, "a genuine no-marker zero is evidence, not degradation");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn no_prior_entry_is_all_creation(pool: PgPool) {
         let h = harness(&pool, true, 1500, 1024).await;
         let b = body();
@@ -1193,7 +1193,7 @@ mod tests {
         assert!(pending.refresh.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn read_hit_is_pure_read(pool: PgPool) {
         let h = harness(&pool, true, 1500, 1024).await;
         // Seed the entry this prefix would write, as if a prior request created it.
@@ -1224,7 +1224,7 @@ mod tests {
         assert!(pending.refresh.is_some(), "a read slides the entry's TTL");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn below_floor_is_no_cache(pool: PgPool) {
         let h = harness(&pool, true, 500, 1024).await; // 500 < 1024
         let b = body();
@@ -1235,7 +1235,7 @@ mod tests {
         assert!(out.pending.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn disabled_model_is_inactive(pool: PgPool) {
         let h = harness(&pool, false, 1500, 1024).await; // not enabled
         let b = body();
@@ -1245,7 +1245,7 @@ mod tests {
         assert!(out.pending.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn automatic_marker_caches_on_last_block(pool: PgPool) {
         // A top-level (automatic) cache_control with NO block markers synthesizes a breakpoint on the
         // last block and writes the prefix at the marker's tier. (Single block so the write span is
@@ -1277,7 +1277,7 @@ mod tests {
         assert_eq!(pending.writes[0].prefix_hash, parsed.cumulative_hashes[0]);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn no_markers_is_zero_active(pool: PgPool) {
         let h = harness(&pool, true, 1500, 1024).await;
         let b = serde_json::json!({

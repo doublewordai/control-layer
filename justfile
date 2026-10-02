@@ -16,6 +16,7 @@ get-admin-email:
 # First-time setup (cargo comes from rustup, not Homebrew):
 #   brew install hurl postgresql pnpm
 #   brew install --cask docker
+#   cargo install cargo-nextest --locked
 #   cargo install sqlx-cli --version '^0.8' --no-default-features --features native-tls,postgres --locked
 #   just check
 check:
@@ -38,6 +39,10 @@ check:
     # Check docker compose (subcommand, not separate binary)
     if ! docker compose version >/dev/null 2>&1; then
         missing_tools+=("docker compose-plugin")
+    fi
+
+    if ! cargo nextest --version >/dev/null 2>&1; then
+        missing_tools+=("cargo-nextest (cargo install cargo-nextest --locked)")
     fi
 
     # Report missing tools
@@ -341,7 +346,18 @@ down *args="":
 #   just test rust               # Backend unit tests
 #   just test ts                 # Frontend tests
 #   just test memory             # Request memory budgets
+[positional-arguments]
 test target="" *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    target="$1"
+    shift
+    if [[ "$target" == rust ]]; then
+        exec ./scripts/test-rust.sh "$@"
+    fi
+    exec just _test-other "$target" "$@"
+
+_test-other target="" *args="":
     #!/usr/bin/env bash
     set -euo pipefail
     # Check if target is actually a flag (starts with --)
@@ -566,30 +582,6 @@ test target="" *args="":
             echo "   • Cleanup: $((END_TIME - TESTS_DONE_TIME))s"
             echo "   • Total:   $((END_TIME - START_TIME))s"
             ;;
-        rust)
-            echo "Running Rust tests..."
-            if [[ "{{args}}" == *"--watch"* ]]; then
-                if ! command -v cargo-watch >/dev/null 2>&1; then
-                    echo "❌ Error: cargo-watch not found. Install with:"
-                    echo "  cargo install cargo-watch"
-                    exit 1
-                fi
-                # Remove --watch from args and pass remaining to cargo test
-                remaining_args=$(echo "{{args}}" | sed 's/--watch//g' | xargs)
-                cargo watch -x "test --workspace --all-features $remaining_args"
-            elif [[ "{{args}}" == *"--coverage"* ]]; then
-                if ! command -v cargo-llvm-cov >/dev/null 2>&1; then
-                    echo "❌ Error: cargo-llvm-cov not found. Install with:"
-                    echo "  cargo install cargo-llvm-cov"
-                    echo "  # or"
-                    echo "  cargo binstall cargo-llvm-cov"
-                    exit 1
-                fi
-                cargo llvm-cov --workspace --all-features --fail-under-lines 60 --lcov --output-path lcov.info
-            else
-                cargo test --workspace --all-features {{args}}
-            fi
-            ;;
         ts)
             echo "Running TypeScript tests..."
             cd dashboard
@@ -659,7 +651,8 @@ lint target *args="":
                 --package fusillade \
                 --package fusillade-core \
                 --package fusillade-arsenal \
-                --package openai-reassembler
+                --package openai-reassembler \
+                --package dwctl-test-macros
             echo "Running cargo clippy..."
             cargo clippy \
                 --package dwctl \
@@ -667,6 +660,7 @@ lint target *args="":
                 --package fusillade-core \
                 --package fusillade-arsenal \
                 --package openai-reassembler \
+                --package dwctl-test-macros \
                 --all-features \
                 --no-deps \
                 {{args}}
@@ -681,6 +675,7 @@ lint target *args="":
             python3 -B scripts/check_query_projections.py
             echo "Checking SQLx prepared queries..."
             cargo sqlx prepare --check --workspace
+            python3 -B scripts/tests/test_rust_runner.py
             echo "Checking local Rust workspace topology..."
             bash .github/scripts/test-local-rust-workspace.sh
             .github/scripts/test-fusillade-migration-checksums.py
@@ -731,6 +726,7 @@ fmt target *args="":
                 --package fusillade-core \
                 --package fusillade-arsenal \
                 --package openai-reassembler \
+                --package dwctl-test-macros \
                 {{args}}
             ;;
         *)
@@ -1061,6 +1057,43 @@ db-stop *args="":
     else
         echo "ℹ️  test-postgres container does not exist"
     fi
+
+# Drop databases left behind by template-backed dwctl tests
+#
+# Lists, and with --yes drops, retained failed-test clones (dwctl_test_*),
+# interrupted template builds (dwctl_build_*) and cached templates
+# (dwctl_template_*, rebuilt on demand). Stop test runs in ALL worktrees using
+# this server first: a running test's database would be dropped from under it.
+#
+# Examples:
+#   just db-prune-tests        # List what would be dropped
+#   just db-prune-tests --yes  # Drop them
+db-prune-tests *args="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    DB_HOST="${DB_HOST:-localhost}"
+    DB_PORT="${DB_PORT:-5432}"
+    DB_USER="${DB_USER:-postgres}"
+    export PGPASSWORD="${DB_PASS:-password}"
+    psql_args=(-X -q -h "$DB_HOST" -p "$DB_PORT" -U "$DB_USER" -d postgres)
+    pattern='^dwctl_(template|test|build)_[0-9a-f]{32}$'
+
+    names=$(psql "${psql_args[@]}" -tAc "SELECT datname FROM pg_database WHERE datname ~ '$pattern' ORDER BY datname")
+    if [ -z "$names" ]; then
+        echo "✅ No test databases to prune"
+        exit 0
+    fi
+    psql "${psql_args[@]}" -c "SELECT count(*) AS databases, pg_size_pretty(sum(pg_database_size(oid))) AS size
+        FROM pg_database WHERE datname ~ '$pattern'"
+    if [[ "{{args}}" != *"--yes"* ]]; then
+        echo "Re-run with --yes to drop them, after stopping test runs in all worktrees using this server."
+        exit 0
+    fi
+    for name in $names; do
+        psql "${psql_args[@]}" -c "DROP DATABASE IF EXISTS $name WITH (FORCE)"
+    done
+    echo "✅ Dropped $(echo "$names" | wc -l | tr -d ' ') test databases"
 
 # Start a local Redis for the ZDR keystore (append-only on, named volume for
 # durability). Mirrors the prod keystore shape (single instance, AOF). Point

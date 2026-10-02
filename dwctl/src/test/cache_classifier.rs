@@ -210,7 +210,7 @@ fn plain_body() -> serde_json::Value {
 
 /// flag OFF (default): the cache layer isn't in the stack — upstream usage is
 /// forwarded byte-for-byte with no cache_* fields injected.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn cache_disabled_leaves_usage_untouched(pool: PgPool) {
     let usage = proxied_usage(
@@ -240,7 +240,7 @@ async fn cache_disabled_leaves_usage_untouched(pool: PgPool) {
 
 /// flag ON but the model hasn't opted in: the layer runs, the per-model gate
 /// returns all-zero stats, and injection is skipped — usage is still untouched.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn cache_enabled_but_model_not_opted_in_leaves_usage_untouched(pool: PgPool) {
     let usage = proxied_usage(
@@ -266,7 +266,7 @@ async fn cache_enabled_but_model_not_opted_in_leaves_usage_untouched(pool: PgPoo
 /// flag ON, model opted in, but a PLAIN prompt (no markers): the model is "active", so
 /// the response still carries a uniform, all-zero `cache_*` block — clients of a
 /// cache-enabled model always see the same usage shape, and billing always has stats.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn cache_enabled_opted_in_plain_prompt_injects_zeros(pool: PgPool) {
     let usage = proxied_usage(
@@ -291,7 +291,7 @@ async fn cache_enabled_opted_in_plain_prompt_injects_zeros(pool: PgPool) {
 /// flag ON, model opted in, cacheable prompt: the classifier tokenizes the marked
 /// prefix via the (mock) tokenizer-svc and the real `cache_creation_*` fields are
 /// injected into the proxied response usage — through the full app stack.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn cache_enabled_and_opted_in_injects_creation(pool: PgPool) {
     // Mock tokenizer-svc: the marked system prefix tokenizes to 1500 tokens

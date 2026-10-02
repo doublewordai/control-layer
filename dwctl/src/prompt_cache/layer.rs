@@ -702,7 +702,7 @@ mod tests {
         TierPolicy::from_config(&["5m".to_string(), "1h".to_string(), "24h".to_string()], "5m")
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn large_fragmented_tool_call_uses_configured_sse_limit(pool: PgPool) {
         use tower::ServiceExt;
 
@@ -813,7 +813,7 @@ mod tests {
         })
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn end_to_end_injects_then_reads(pool: PgPool) {
         let user = create_test_user(&pool, Role::StandardUser).await;
         let key = create_test_api_key_for_user(&pool, user.id).await;
@@ -926,7 +926,7 @@ mod tests {
         })
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn streaming_defers_classify_then_injects_and_commits(pool: PgPool) {
         let user = create_test_user(&pool, Role::StandardUser).await;
         let key = create_test_api_key_for_user(&pool, user.id).await;
@@ -1031,7 +1031,7 @@ mod tests {
             .unwrap()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn streaming_error_frame_vetoes_the_write(pool: PgPool) {
         let user = create_test_user(&pool, Role::StandardUser).await;
         let key = create_test_api_key_for_user(&pool, user.id).await;
@@ -1114,7 +1114,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn non_cacheable_path_passes_through(pool: PgPool) {
         // /v1/embeddings is not cacheable → no body editing, no cache fields.
         let classifier = Classifier::new(
@@ -1139,7 +1139,7 @@ mod tests {
         assert!(v["usage"].get("cache_read_input_tokens").is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn disabled_tier_marker_rejected_with_400(pool: PgPool) {
         // Policy enables only 5m; a request carrying a 24h marker must be rejected up front
         // (before forwarding) with a clear 400 — not silently un-cached.
@@ -1207,7 +1207,7 @@ mod tests {
         }))
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn inactive_model_scrubs_provider_cache_fields(pool: PgPool) {
         // No deployed model / cache tariff → classify resolves inactive. The provider's own
         // cache accounting must still be scrubbed: the customer is billed full price, so a
@@ -1261,7 +1261,7 @@ mod tests {
             .unwrap()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn inactive_model_scrubs_streaming_terminal_frame(pool: PgPool) {
         let user = create_test_user(&pool, Role::StandardUser).await;
         let key = create_test_api_key_for_user(&pool, user.id).await;
@@ -1316,7 +1316,7 @@ mod tests {
         .unwrap();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn tariffed_model_passes_engine_cache_through_for_unmarked_requests(pool: PgPool) {
         // A tariff row alone (no markers, tokenizer deliberately unreachable — the model
         // needn't be onboarded to tokenizer-svc) buys implicit caching: the engine's own
@@ -1358,7 +1358,7 @@ mod tests {
         assert_eq!(v["usage"]["cache_creation_input_tokens"], 0, "implicit caching never writes");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn tariffed_model_passes_engine_cache_through_on_streams(pool: PgPool) {
         let user = create_test_user(&pool, Role::StandardUser).await;
         let key = create_test_api_key_for_user(&pool, user.id).await;
@@ -1429,7 +1429,7 @@ mod tests {
         axum_test::TestServer::new(app).unwrap()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn tariffed_model_passes_engine_cache_through_on_plain_completions(pool: PgPool) {
         // A string prompt has no blocks for markers to bind to — /completions is
         // implicit-only, and a tariff row alone activates it.
@@ -1454,7 +1454,7 @@ mod tests {
         assert_eq!(v["usage"]["cache_creation_input_tokens"], 0, "implicit never writes");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn marked_plain_completions_stay_deterministically_zero(pool: PgPool) {
         // A top-level cache_control on a blockless body arms the request (one paradigm)
         // but the automatic marker no-ops with nothing to bind to — deterministic zeros,
@@ -1478,7 +1478,7 @@ mod tests {
         assert_eq!(v["usage"]["cache_read_input_tokens"], 0, "engine hit not billed when armed");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn chat_shaped_fields_in_completions_bodies_cannot_touch_the_module_cache(pool: PgPool) {
         // The router forwards arbitrary JSON, so a /completions body can carry chat-shaped
         // marked `messages` its engine ignores. The markers arm the request (one paradigm →
@@ -1522,7 +1522,7 @@ mod tests {
         assert_eq!(entries, 0, "nothing committed to the module index");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn untariffed_plain_completions_scrub_provider_cache_fields(pool: PgPool) {
         // The prod leak this closes: no tariff → inactive → the upstream's own
         // cached_tokens must be zeroed, not shown to a customer billed at full price.
@@ -1582,7 +1582,7 @@ mod tests {
         mock_upstream_completions_with_provider_cache().await
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn cache_breakpoint_param_is_ignored_on_plain_completions(pool: PgPool) {
         // The param is a Chat Completions feature: on /completions it must be stripped
         // (never forwarded) WITHOUT arming the request, so implicit billing still applies.
@@ -1651,17 +1651,17 @@ mod tests {
             .await;
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn query_param_end_to_end_creates_then_reads(pool: PgPool) {
         query_param_cache_round_trip(pool, "/v1/chat/completions", false).await;
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn responses_query_param_bills_cache_writes_and_reads(pool: PgPool) {
         query_param_cache_round_trip(pool, "/v1/responses", false).await;
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn responses_streaming_query_param_bills_cache_writes_and_reads(pool: PgPool) {
         query_param_cache_round_trip(pool, "/v1/responses", true).await;
     }
@@ -1876,7 +1876,7 @@ mod tests {
         }))
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn query_param_stripped_before_upstream_others_preserved(pool: PgPool) {
         // Neither the param (onwards forwards path_and_query verbatim) nor the injected marker
         // may leak upstream; unrelated query params must survive.
@@ -1909,7 +1909,7 @@ mod tests {
         assert_eq!(v["echo"]["body_has_cache_control"], false, "injected marker stripped from the body");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn query_param_invalid_value_rejected_400(pool: PgPool) {
         // Strict: a typo'd value is a 400 up front, never a silent no-cache.
         let classifier = Classifier::new(
@@ -1943,7 +1943,7 @@ mod tests {
         assert!(msg.contains("lastUserMessage"), "names the supported value: {msg}");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn query_param_composes_with_explicit_markers(pool: PgPool) {
         let classifier = Classifier::new(
             PrincipalResolver::new(pool.clone()),
@@ -2017,7 +2017,7 @@ mod tests {
         r.assert_status_ok();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn query_param_streaming_injects_terminal_frame(pool: PgPool) {
         // Streaming + param: the deferred classify path sees the injected marker and edits the
         // terminal usage frame, same as body-field automatic caching.

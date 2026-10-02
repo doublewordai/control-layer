@@ -147,7 +147,7 @@ impl Fixture {
     }
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn serving_classes_survive_strict_and_translated_ingress(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     f.post("chat/completions", "policy:interactive", false)
@@ -191,7 +191,7 @@ async fn serving_classes_survive_strict_and_translated_ingress(pool: PgPool) {
         .assert_status(StatusCode::BAD_REQUEST);
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn serving_classes_batch_upload_discards_suffixes(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     let headers = format!("Bearer {}", f.key);
@@ -262,7 +262,7 @@ async fn serving_classes_batch_upload_discards_suffixes(pool: PgPool) {
     }
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn model_override_cannot_split_routing_and_billing_identity(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     for path in ["chat/completions", "responses", "messages", "completions", "embeddings"] {
@@ -279,7 +279,7 @@ async fn model_override_cannot_split_routing_and_billing_identity(pool: PgPool) 
     assert!(f.upstream.received_requests().await.unwrap().is_empty());
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn dispatch_clears_stored_targets_but_preserves_deadline_priority(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     // Daemon loopback skips ingestion, as it does for an old stored template.
@@ -299,7 +299,7 @@ async fn dispatch_clears_stored_targets_but_preserves_deadline_priority(pool: Pg
     assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn resolved_class_selects_the_billed_organisation_price(pool: PgPool) {
     let f = Fixture::new(&pool).await;
     sqlx::query(

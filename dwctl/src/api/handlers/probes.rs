@@ -423,7 +423,7 @@ mod tests {
         .unwrap()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_probe(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -451,7 +451,7 @@ mod tests {
         assert!(probe.active);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_probe_unauthorized(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -474,7 +474,7 @@ mod tests {
         response.assert_status(axum::http::StatusCode::FORBIDDEN);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_probes(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -523,7 +523,7 @@ mod tests {
         assert_eq!(probes.len(), 2);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_probe(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -556,7 +556,7 @@ mod tests {
         assert_eq!(probe.name, "Test Probe");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_get_probe_after_create_with_lagging_replica(pool: PgPool) {
         use sqlx::Executor;
         let user = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -594,7 +594,7 @@ mod tests {
         assert_eq!(response.json::<Probe>().name, "New probe");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_probe_not_found(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -610,7 +610,7 @@ mod tests {
         response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_probe(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -648,7 +648,7 @@ mod tests {
         assert_eq!(probe.interval_seconds, 120);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_activate_probe(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -683,7 +683,7 @@ mod tests {
         assert!(probe.active);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_deactivate_probe(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -715,7 +715,7 @@ mod tests {
         assert!(!probe.active);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_probe(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -754,7 +754,7 @@ mod tests {
         get_response.assert_status_not_found();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_probe_results(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;
@@ -786,7 +786,7 @@ mod tests {
         assert!(results.is_empty()); // No results initially
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_statistics(pool: PgPool) {
         let (app, _bg_services) = create_test_app(pool.clone(), false).await;

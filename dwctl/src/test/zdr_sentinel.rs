@@ -15,8 +15,8 @@
 //! * **Logs (async/flex path)** — `zdr_sentinel_async_batch_failure_does_not_log_payload`
 //!   runs a batch end-to-end through the real fusillade daemon against a mock
 //!   upstream that returns a sentinel error body, capturing all tracing output
-//!   and asserting the sentinel does not appear. `#[sqlx::test]` runs on a
-//!   `current_thread` tokio runtime (sqlx `test_block_on`), so a thread-local
+//!   and asserting the sentinel does not appear. `#[dwctl_test_macros::test]` runs on a
+//!   `current_thread` tokio runtime (via `sqlx::test_block_on`), so a thread-local
 //!   subscriber reliably captures the daemon's spawned-task logs — the test
 //!   includes a positive control that proves capture works. The local fusillade
 //!   crate scrubs the provider error body before it reaches terminal-failure logs.
@@ -241,7 +241,7 @@ async fn all_rows_json(pool: &PgPool, table: &str) -> String {
 
 /// A ZDR realtime request must not persist prompt or response content into
 /// `http_analytics`, while still recording the allowed billing/ops metadata.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn zdr_sentinel_realtime_request_does_not_persist_to_analytics(pool: PgPool) {
     let fixture = setup_sentinel_fixture(&pool).await;
     send_sentinel_request(&fixture).await;
@@ -273,7 +273,7 @@ async fn zdr_sentinel_realtime_request_does_not_persist_to_analytics(pool: PgPoo
 /// this assertion is expected to fail and is `#[ignore]`d. Un-ignore it (and
 /// enable `enable_request_logging`) when the capture gate exists.
 #[ignore = "ZDR request-logging capture gate not yet implemented"]
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn zdr_sentinel_realtime_request_not_in_request_logs(pool: PgPool) {
     let fixture = setup_sentinel_fixture(&pool).await;
     send_sentinel_request(&fixture).await;
@@ -325,10 +325,10 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
 /// against a mock upstream that 400s with a sentinel body, capturing all tracing
 /// output and asserting neither the prompt nor the error-body sentinel appears.
 ///
-/// `#[sqlx::test]` uses a `current_thread` runtime (sqlx `test_block_on`), so the
+/// `#[dwctl_test_macros::test]` uses a `current_thread` runtime (via `sqlx::test_block_on`), so the
 /// thread-local subscriber installed here captures the daemon's spawned-task
 /// logs. A positive control (a marker logged from a spawned task) proves that.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn zdr_sentinel_async_batch_failure_does_not_log_payload(pool: PgPool) {
     // Capture every tracing event on this (single) test thread for the whole test.
     let log_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));

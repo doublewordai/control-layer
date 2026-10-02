@@ -126,7 +126,7 @@ cargo run
 ### Testing
 
 ```bash
-# Backend unit tests (requires database)
+# Backend tests via nextest, followed by doctests (requires database)
 just test rust
 just test rust --watch      # Watch mode
 just test rust --coverage   # With coverage
@@ -303,6 +303,8 @@ TAGS=v1.0.0 PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 
 ## Testing Philosophy
 
+- For Rust test changes, use the [test-efficiency skill](.claude/skills/rust-test-efficiency/SKILL.md)
+  for isolated template databases, permission matrices, and timing slow tests.
 - **Backend**: `cargo test` provides comprehensive API integration tests using `axum-test` to spin up the full API server and make ~real HTTP requests
 - **Frontend**: `pnpm test` in `dashboard/` runs Vitest unit tests for React components and utilities. Always scope queries using `within(container)` instead of `screen` to avoid querying multiple test instances in the DOM (see TypeScript/React Testing section for details)
 - Hurl and Playwright E2E tests exist but are currently minimal (not the main test suite)
@@ -393,7 +395,9 @@ Note: Even databases claiming "zero replication lag" (like Neon) can exhibit lag
 
 - Test incrementally: write one test, make it pass, write the next test (not all at once)
 - Prefer orthogonality and simplicity in test design - test one thing clearly per test
-- Use `#[sqlx::test]` attribute to get a fresh database per test (automatic setup/teardown)
+- Use `#[dwctl_test_macros::test]` for dwctl unit tests to clone an isolated migrated database.
+  Retain `#[sqlx::test]` for migration/schema-startup tests and other crates;
+  see the test-efficiency skill for choosing the required initial schema state.
 - Use `create_test_user()`, `create_test_app()` helpers from `test_utils` module
 - Integration tests use `axum_test::TestServer` to make real HTTP requests
 

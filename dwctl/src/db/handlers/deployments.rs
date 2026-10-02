@@ -1803,7 +1803,7 @@ mod tests {
         user_repo.create(&user_create).await.unwrap().into()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn searches_customer_visible_model_fields(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -1866,7 +1866,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn persists_and_clears_mixed_reasoning_translation_overrides(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -1912,7 +1912,7 @@ mod tests {
         assert_eq!(cleared.reasoning_translation_overrides, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn loads_effective_reasoning_policy_for_standard_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -1959,7 +1959,7 @@ mod tests {
         assert_eq!(supported.responses, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2007,7 +2007,7 @@ mod tests {
         assert_eq!(model.batch_capacity, Some(50));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_deployed_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2048,7 +2048,7 @@ mod tests {
         assert_eq!(found_model.alias, "get-test-deployment");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_deployed_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2105,7 +2105,7 @@ mod tests {
         assert_eq!(updated_model.batch_capacity, Some(75));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployed_model_with_null_fields(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2147,7 +2147,7 @@ mod tests {
         assert_eq!(model.batch_capacity, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_deployed_model_to_null_fields(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2206,7 +2206,7 @@ mod tests {
         assert_eq!(updated_model.batch_capacity, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_deployed_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2247,7 +2247,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_deployed_models(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2292,7 +2292,7 @@ mod tests {
         assert!(models[1].model_name == "list-test-model-2");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_endpoint_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2328,7 +2328,7 @@ mod tests {
         assert!(models.iter().all(|m| m.hosted_on == Some(endpoint_id)));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_status_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2368,7 +2368,7 @@ mod tests {
         assert!(models.iter().all(|m| m.status == ModelStatus::Active));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_deleted_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2414,7 +2414,7 @@ mod tests {
         assert!(models.iter().all(|m| !m.deleted));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_accessible_to_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2488,7 +2488,7 @@ mod tests {
         assert!(models.iter().any(|m| m.id == deployment2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_combined_filters(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2545,7 +2545,7 @@ mod tests {
         assert!(models.iter().all(|m| m.status == ModelStatus::Active));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_pagination(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2591,7 +2591,7 @@ mod tests {
         assert!(page1_ids.is_disjoint(&page2_ids));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_embeddings_deployment(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2629,7 +2629,7 @@ mod tests {
         assert_eq!(model.capabilities, Some(vec!["embeddings".to_string(), "similarity".to_string()]));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_by_id_with_embeddings_type(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2665,7 +2665,7 @@ mod tests {
         assert_eq!(found_model.model_type, Some(ModelType::Embeddings));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_with_mixed_model_types(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2728,7 +2728,7 @@ mod tests {
         assert_eq!(no_type_result.model_type, None);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_mixed_model_types(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2776,7 +2776,7 @@ mod tests {
         assert_eq!(embeddings_found.model_type, Some(ModelType::Embeddings));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_chat_to_embeddings(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2816,7 +2816,7 @@ mod tests {
         assert_eq!(updated_model.capabilities, Some(vec!["embeddings".to_string()]));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_embeddings_to_chat(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2859,7 +2859,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_bulk_empty_ids(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2880,7 +2880,7 @@ mod tests {
         assert!(result.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_check_user_access(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -2997,7 +2997,7 @@ mod tests {
         assert!(access_result.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_partial_downstream_per_token_pricing_updates(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3114,7 +3114,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_provider_hourly_pricing_updates(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3242,7 +3242,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_inactive_status_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3312,7 +3312,7 @@ mod tests {
         assert!(all_models.iter().any(|m| m.id == deployment2.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_combined_deleted_and_inactive_filters(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3362,7 +3362,7 @@ mod tests {
         assert!(models.iter().any(|m| m.id == deployment.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployment_alias_conflict(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -3411,7 +3411,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_deployment_alias_conflict(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -3463,7 +3463,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_deployment_with_empty_model_name_or_alias(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3508,7 +3508,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_deployment_with_empty_model_name_or_alias(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3552,7 +3552,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_group_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3660,7 +3660,7 @@ mod tests {
 
     // ===== Traffic Routing Rules Tests =====
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_resolve_alias_to_id(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3729,7 +3729,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_set_and_get_traffic_rules(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3816,7 +3816,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_set_traffic_rules_replaces_existing(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3899,7 +3899,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_set_traffic_rules_empty_clears(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -3967,7 +3967,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_traffic_rules_empty(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4013,7 +4013,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_traffic_rules_bulk(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4111,7 +4111,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_traffic_rules_bulk_empty_ids(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4131,7 +4131,7 @@ mod tests {
         tx.commit().await.unwrap();
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cascade_delete_source_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4210,7 +4210,7 @@ mod tests {
         assert_eq!(count, 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cascade_delete_redirect_target(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4289,7 +4289,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_unique_purpose_per_model(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4347,7 +4347,7 @@ mod tests {
         assert!(err_str.contains("unique_purpose_per_model") || err_str.contains("duplicate key"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_provider_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4406,7 +4406,7 @@ mod tests {
         assert!(!models.iter().any(|m| m.alias == "provider-filter-anthropic"));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_model_type_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4463,7 +4463,7 @@ mod tests {
         assert!(!models.iter().any(|m| m.id == chat_model.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_capability_filter(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4520,7 +4520,7 @@ mod tests {
         assert!(models.iter().any(|m| m.id == text_model.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_with_sort(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4580,7 +4580,7 @@ mod tests {
         assert!(pos_z < pos_a, "sort-zzz should come before sort-aaa in DESC order");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_facets(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4644,7 +4644,7 @@ mod tests {
         assert!(model_types.contains(&"EMBEDDINGS".to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_facets_respect_filters(pool: PgPool) {
         let base_url = url::Url::parse("http://localhost:8080").unwrap();
@@ -4783,7 +4783,7 @@ mod tests {
         assert_eq!(statuses, expected);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn database_fallback_status_default_remains_historical(pool: PgPool) {
         let column_default: String = sqlx::query_scalar(
@@ -4802,7 +4802,7 @@ mod tests {
         assert_eq!(column_default, "'{429,500,502,503,504}'::integer[]");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn reasoning_policy_includes_every_configured_composite_provider(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -4888,7 +4888,7 @@ mod tests {
         assert_eq!(orders, expected, "sort_order must be a dense, unique 0..n-1 sequence");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_next_sort_order_appends(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -4920,7 +4920,7 @@ mod tests {
         assert_eq!(ordered.iter().map(|(id, _)| *id).collect::<Vec<_>>(), components);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_renumber_by_weight(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -4957,7 +4957,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_move_component_reindexes_densely(pool: PgPool) {
         let user = create_test_user(&pool).await;
@@ -5031,7 +5031,7 @@ mod tests {
         assert_eq!(ordered_components(&pool, composite).await, order_before);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_remove_compacts_sort_order(pool: PgPool) {
         let user = create_test_user(&pool).await;

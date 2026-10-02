@@ -1358,7 +1358,7 @@ mod tests {
 
     // ── CRUD ──────────────────────────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_organization(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1397,7 +1397,7 @@ mod tests {
         assert_eq!(persisted_roles, vec!["BATCHAPIUSER", "STANDARDUSER"]);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_create_organization_adds_creator_as_owner(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1430,7 +1430,7 @@ mod tests {
         assert_eq!(members[0].role, "owner");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_organizations(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1472,7 +1472,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_organizations_with_search(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1524,7 +1524,7 @@ mod tests {
         assert!(list.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_count_organizations(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1551,7 +1551,7 @@ mod tests {
         assert_eq!(orgs.count(&filter).await.unwrap(), 1);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_organization(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1596,7 +1596,7 @@ mod tests {
         assert_eq!(updated.user_type, "organization");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_organization_partial(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1641,7 +1641,7 @@ mod tests {
         assert_eq!(updated.email, "new@acme.example.com");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_organization_notification_settings(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1758,7 +1758,7 @@ mod tests {
         assert!(updated.low_balance_threshold.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_organization(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1793,7 +1793,7 @@ mod tests {
         assert!(!deleted_again);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_delete_organization_scrubs_data(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1831,7 +1831,7 @@ mod tests {
 
     // ── Membership ────────────────────────────────────────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_add_member(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1865,7 +1865,7 @@ mod tests {
         assert_eq!(members.len(), 2);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_add_duplicate_member_fails(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1895,7 +1895,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_remove_member(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1933,7 +1933,7 @@ mod tests {
         assert!(!removed_again);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_member_role(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1965,7 +1965,7 @@ mod tests {
         assert_eq!(role, Some("admin".to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_member_role_nonexistent_returns_not_found(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -1993,7 +1993,7 @@ mod tests {
         assert!(result.is_err());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_user_organizations(pool: PgPool) {
         let alice = create_individual(&pool, "alice", "alice@example.com").await;
@@ -2042,7 +2042,7 @@ mod tests {
         assert_eq!(bob_orgs[0].organization_id, org1.id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_get_user_org_role_not_member(pool: PgPool) {
         let alice = create_individual(&pool, "alice", "alice@example.com").await;
@@ -2071,7 +2071,7 @@ mod tests {
 
     // ── Trigger: enforce_organization_membership_types ─────────────────────
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cannot_add_member_to_individual_user(pool: PgPool) {
         let alice = create_individual(&pool, "alice", "alice@example.com").await;
@@ -2085,7 +2085,7 @@ mod tests {
         assert!(result.is_err(), "Should not allow adding members to an individual user");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_deleted_org_excluded_from_list_user_organizations(pool: PgPool) {
         let alice = create_individual(&pool, "alice", "alice@example.com").await;
@@ -2113,7 +2113,7 @@ mod tests {
         assert!(alice_orgs.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_list_organizations_pagination(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -2147,7 +2147,7 @@ mod tests {
     }
 
     /// Organizations can share the same contact email (non-unique for org users).
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_orgs_can_share_contact_email(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -2190,7 +2190,7 @@ mod tests {
         assert_ne!(org1.id, org2.id);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_find_by_domain(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
@@ -2225,7 +2225,7 @@ mod tests {
     }
 
     /// Deleting an owner hands the workspace to the longest-standing admin.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_deleting_owner_promotes_earliest_admin(pool: PgPool) {
         let owner = create_individual(&pool, "owner", "owner@acme.com").await;
         let member = create_individual(&pool, "member", "member@acme.com").await;
@@ -2278,7 +2278,7 @@ mod tests {
 
     /// With no admins left, the longest-standing ordinary member takes over
     /// rather than the workspace being closed on people who are still using it.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_deleting_owner_promotes_earliest_member_when_no_admins(pool: PgPool) {
         let owner = create_individual(&pool, "owner", "owner@acme.com").await;
         let first = create_individual(&pool, "first", "first@acme.com").await;
@@ -2316,7 +2316,7 @@ mod tests {
     /// never saw it. API-key auth checks only `api_keys.is_deleted` and not
     /// whether the creator still exists, so the key kept working after the
     /// account it belonged to was gone.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_deleting_a_member_revokes_the_org_keys_they_hold(pool: PgPool) {
         let owner = create_individual(&pool, "owner", "owner@acme.com").await;
         let member = create_individual(&pool, "member", "member@acme.com").await;
@@ -2378,7 +2378,7 @@ mod tests {
     /// ACTION, so hard-deleting the workspace's keys raised a foreign-key
     /// violation and rolled back the entire account deletion - the account
     /// could not be deleted at all while the workspace had a connection.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_closing_a_workspace_with_a_connection_still_deletes_the_account(pool: PgPool) {
         let owner = create_individual(&pool, "owner", "owner@acme.com").await;
 
@@ -2434,7 +2434,7 @@ mod tests {
     }
 
     /// A co-owner keeps the workspace; nobody is promoted and nothing closes.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_deleting_one_of_two_owners_leaves_the_other(pool: PgPool) {
         let leaving = create_individual(&pool, "leaving", "leaving@acme.com").await;
         let staying = create_individual(&pool, "staying", "staying@acme.com").await;
@@ -2468,7 +2468,7 @@ mod tests {
     /// Nobody left to hand it to: the workspace is closed the same way the
     /// account is - scrubbed, flagged deleted, and stripped of the keys that
     /// authenticate as it.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_deleting_sole_owner_closes_the_workspace(pool: PgPool) {
         let owner = create_individual(&pool, "owner", "owner@acme.com").await;
         let departed = create_individual(&pool, "departed", "departed@acme.com").await;
@@ -2541,7 +2541,7 @@ mod tests {
     /// could file join requests into it that no one could ever approve - the
     /// same dead-end the `is_deleted = false` filter exists to prevent, one
     /// level down.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_find_by_domain_skips_orgs_with_no_live_admin(pool: PgPool) {
         let owner = create_individual(&pool, "owner", "owner@acme.com").await;
 
@@ -2595,7 +2595,7 @@ mod tests {
     /// `LIKE '%~%'`, which every suffixed username satisfies. Nothing upstream
     /// guarantees the domain is a DNS name: proxy-header auth stores whatever
     /// address it is handed.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_find_by_domain_ignores_sql_wildcards(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@example.com").await;
         let mut conn = pool.acquire().await.unwrap();
@@ -2629,7 +2629,7 @@ mod tests {
     /// cannot be a domain. If a single-label name reached the lookup it would
     /// match every personal-email workspace at once, which is the
     /// unauthorised-membership path the opaque username exists to close.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_find_by_domain_ignores_single_label_names(pool: PgPool) {
         let creator = create_individual(&pool, "alice", "alice@gmail.com").await;
         let mut conn = pool.acquire().await.unwrap();

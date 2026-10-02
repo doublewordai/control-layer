@@ -7,6 +7,7 @@ pub mod serving_classes;
 pub mod sigterm_drain;
 pub mod sla;
 pub mod strict_mode;
+pub mod template;
 pub mod utils;
 pub mod zdr_sentinel;
 
@@ -217,7 +218,7 @@ async fn create_standard_model_for_test(
     response.json()
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPool) {
     let mut config = crate::test::utils::create_test_config();
     config.background_services.onwards_sync.enabled = true;
@@ -343,7 +344,7 @@ async fn ai_models_lists_group_accessible_paid_models_without_credits(pool: PgPo
     );
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
     let config = crate::test::utils::create_test_config();
 
@@ -551,7 +552,7 @@ async fn ai_models_supports_optional_group_and_realtime_filters(pool: PgPool) {
     assert_eq!(invalid_capabilities_response.status_code(), 400);
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn ai_models_unknown_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
     let config = crate::test::utils::create_test_config();
     let app = crate::Application::new_with_pool(config, Some(pool.clone()), None)
@@ -662,7 +663,7 @@ async fn cleanup_fixture(fixture: StreamingFixture) {
 /// header it stamps on every inbound request, so a client's `stream: true` came
 /// back as one `chat.completion` object. Nothing at this level covered it - both
 /// streaming fixtures sent the daemon's headers, so both took the daemon's path.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_e2e_ai_proxy_client_stream_is_not_reassembled(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -711,7 +712,7 @@ async fn test_e2e_ai_proxy_client_stream_is_not_reassembled(pool: PgPool) {
     cleanup_fixture(fixture).await;
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -757,7 +758,7 @@ async fn test_e2e_ai_proxy_streaming_chat_completions_with_fusillade_header(pool
     cleanup_fixture(fixture).await;
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgPool) {
     let mock_server = wiremock::MockServer::start().await;
@@ -816,7 +817,7 @@ async fn test_e2e_ai_proxy_streaming_completions_with_fusillade_header(pool: PgP
 
 /// End-to-end test: Traffic routing rules are enforced by onwards after sync.
 /// Covers three scenarios: baseline allow, deny by purpose, and redirect by purpose.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_e2e_traffic_routing_rules(pool: PgPool) {
     // Setup wiremock server to mock inference endpoint
@@ -1120,7 +1121,7 @@ async fn test_e2e_traffic_routing_rules(pool: PgPool) {
     bg_services.shutdown().await;
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_database_seeding_behavior(pool: PgPool) {
     use crate::config::ModelSource;
@@ -1233,7 +1234,7 @@ async fn test_database_seeding_behavior(pool: PgPool) {
     assert_eq!(final_count, Some(2), "Should still have 2 endpoints");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_request_logging_enabled(pool: PgPool) {
     // Create test config with request logging enabled
@@ -1281,7 +1282,7 @@ async fn test_request_logging_enabled(pool: PgPool) {
 /// ones normally. Drives the handler directly against the real outlet tables so
 /// the assertion is at the DB layer, no Redis or proxy needed. Remove with
 /// `ZdrBodyScrubber`.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     use bytes::Bytes;
@@ -1289,11 +1290,12 @@ async fn test_outlet_suppresses_zdr_bodies(pool: PgPool) {
     use std::collections::HashMap;
     use std::time::{Duration, SystemTime};
 
-    // Create the outlet logging tables (http_requests / http_responses). Apply
-    // the DDL directly rather than via `.run()`: `#[sqlx::test]` already ran
-    // dwctl's migrations into this database's shared `_sqlx_migrations`, and
-    // outlet's migrator would reject that unknown history (in production outlet
-    // gets its own schema/DB with its own migration table).
+    // Create the outlet logging tables (http_requests / http_responses) in
+    // `public`, where this pool resolves unqualified names. The template's
+    // `outlet` schema is not on that search path. Apply the DDL directly rather
+    // than via `.run()`: `public._sqlx_migrations` already holds dwctl's
+    // history, which outlet's migrator would reject (in production outlet gets
+    // its own schema/DB with its own migration table).
     for migration in outlet_postgres::migrator().iter() {
         sqlx::raw_sql(migration.sql.as_ref())
             .execute(&pool)
@@ -1637,7 +1639,7 @@ async fn test_dedicated_databases_for_components(pool: PgPool) {
     test_dbs.cleanup().await.expect("Failed to cleanup test databases");
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_create_initial_admin_user_new_user(pool: PgPool) {
     let test_email = "new-admin@example.com";
 
@@ -1676,7 +1678,7 @@ async fn test_create_initial_admin_user_new_user(pool: PgPool) {
     assert!(created_user.roles.contains(&Role::PlatformManager));
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_create_initial_admin_user_existing_user(pool: PgPool) {
     let test_email = "existing-admin@example.com";
 
@@ -1827,7 +1829,7 @@ mod openapi_access_control {
         .secret
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_returns_404_when_disabled(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), false).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1849,7 +1851,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 404);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_rejects_unauthenticated(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool, true).await;
 
@@ -1860,7 +1862,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 401);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_rejects_inference_api_key(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -1878,7 +1880,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 403);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_rejects_standard_user_session(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -1894,7 +1896,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 403);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_rejects_request_viewer(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let user = crate::test::utils::create_test_user_with_roles(&pool, vec![Role::StandardUser, Role::RequestViewer]).await;
@@ -1909,7 +1911,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 403);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_allows_platform_manager_session(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1932,7 +1934,7 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 200);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn admin_spec_allows_platform_api_key(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let admin = create_test_admin_user(&pool, Role::PlatformManager).await;
@@ -1945,14 +1947,14 @@ mod openapi_access_control {
         assert_eq!(response.status_code().as_u16(), 200);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn ai_spec_rejects_unauthenticated(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool, true).await;
         let response = server.get("/ai/openapi.json").await;
         assert_eq!(response.status_code().as_u16(), 401);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn unknown_bearer_key_401_points_at_regional_endpoints_docs(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool, true).await;
 
@@ -1980,7 +1982,7 @@ mod openapi_access_control {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn ai_spec_error_example_matches_live_copy(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
         let user = create_test_user(&pool, Role::StandardUser).await;
@@ -2002,7 +2004,7 @@ mod openapi_access_control {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn ai_spec_allows_any_authenticated_identity(pool: PgPool) {
         let (server, _bg) = make_app_with_admin_docs(pool.clone(), true).await;
 
@@ -2036,7 +2038,7 @@ mod openapi_access_control {
     }
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     let mut config = create_test_config();
     config.enable_metrics = false;
@@ -2098,7 +2100,7 @@ async fn test_build_router_with_metrics_disabled(pool: PgPool) {
     assert!(!metrics_content.contains("# HELP") && !metrics_content.contains("# TYPE"));
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_build_router_with_metrics_enabled(pool: PgPool) {
     let mut config = create_test_config();
     config.enable_metrics = true;
@@ -2166,7 +2168,7 @@ async fn test_build_router_with_metrics_enabled(pool: PgPool) {
 // ===== Composite Model Tests =====
 
 /// Test creating a composite model
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_create_composite_model(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2196,7 +2198,7 @@ async fn test_create_composite_model(pool: PgPool) {
 }
 
 /// Test adding components to a composite model
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_add_component_to_composite_model(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2267,7 +2269,7 @@ async fn test_add_component_to_composite_model(pool: PgPool) {
 }
 
 /// Test that adding a composite model as a component fails
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_cannot_add_composite_as_component(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2316,7 +2318,7 @@ async fn test_cannot_add_composite_as_component(pool: PgPool) {
 }
 
 /// Test that adding components to a non-composite model fails
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_cannot_add_component_to_standard_model(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2384,7 +2386,7 @@ async fn test_cannot_add_component_to_standard_model(pool: PgPool) {
 }
 
 /// Test updating a component's weight and enabled status
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_update_component(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2464,7 +2466,7 @@ async fn test_update_component(pool: PgPool) {
 }
 
 /// Test removing a component from a composite model
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_remove_component(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2545,7 +2547,7 @@ async fn test_remove_component(pool: PgPool) {
 }
 
 /// Test weight validation (must be 1-100)
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_component_weight_validation(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;
@@ -2638,7 +2640,7 @@ async fn test_component_weight_validation(pool: PgPool) {
 /// This demonstrates sqlx_pool_router::TestDbPools' ability to catch pool routing violations.
 /// The replica pool is configured with `default_transaction_read_only = on`,
 /// so any write operations will fail with a PostgreSQL error.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_read_pool_enforces_readonly(pool: PgPool) {
     // Create test pools with read-only enforcement on replica using sqlx_pool_router
     let db_pools = sqlx_pool_router::TestDbPools::new(pool).await.unwrap();
@@ -2672,7 +2674,7 @@ async fn test_read_pool_enforces_readonly(pool: PgPool) {
 /// The components API round-trips a member's pool, and lets the SAME hosted
 /// model be a member of two pools with independent per-pool ordering — which is
 /// how the canary is wired (dynamo position 0 in both).
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_component_pool_round_trips_and_allows_dual_membership(pool: PgPool) {
     let (server, _bg) = utils::create_test_app(pool.clone(), false).await;

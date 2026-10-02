@@ -385,7 +385,7 @@ mod tests {
         crate::get_or_install_prometheus_handle()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn organization_prices_do_not_leak_into_global_model_metrics(pool: sqlx::PgPool) {
         let handle = ensure_recorder();
         let org = crate::test::utils::create_test_user(&pool, Role::StandardUser).await;
@@ -414,7 +414,7 @@ mod tests {
         assert!(!own.iter().any(|line| line.starts_with("dwctl_model_tariff{")));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_model_info_and_group_metrics(pool: sqlx::PgPool) {
         let handle = ensure_recorder();
         let mut state = super::CacheInfoState::new();
@@ -575,7 +575,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_composite_model_component_metrics(pool: sqlx::PgPool) {
         let handle = ensure_recorder();
         let mut state = super::CacheInfoState::new();
@@ -735,7 +735,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_no_gauges_for_missing_optional_fields(pool: sqlx::PgPool) {
         let handle = ensure_recorder();
         let mut state = super::CacheInfoState::new();
@@ -838,7 +838,7 @@ mod tests {
         output.lines().filter(|l| l.starts_with(metric) && l.contains(filter)).collect()
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_removed_group_is_zeroed(pool: sqlx::PgPool) {
         // When a group is removed from a model, the original series (with the
         // real group_name) should be zeroed. No phantom series with empty labels
@@ -994,7 +994,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_removed_component_is_zeroed(pool: sqlx::PgPool) {
         // When a component is removed from a composite model, the original
         // series (with real sort_order/enabled labels) should be zeroed.
@@ -1187,7 +1187,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_deleted_model_gauges_are_zeroed(pool: sqlx::PgPool) {
         // When a model is soft-deleted, all its gauges (info, rate limit,
         // concurrency, etc.) should be zeroed so dashboards reflect reality.
@@ -1323,7 +1323,7 @@ mod tests {
         );
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn test_metadata_change_preserves_single_label_gauges(pool: sqlx::PgPool) {
         // When a model's metadata changes (e.g., tariff added so is_metered
         // flips), the old info gauge series should be zeroed but single-label

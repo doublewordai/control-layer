@@ -641,7 +641,7 @@ mod tests {
         user_id
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_add_deployment_to_group(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -708,7 +708,7 @@ mod tests {
         assert!(deployment_groups.contains(&group.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_remove_deployment_from_group(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -788,7 +788,7 @@ mod tests {
         assert!(!deployment_groups.contains(&group.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multiple_groups_per_deployment(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -860,7 +860,7 @@ mod tests {
         assert!(deployment_groups.contains(&group_ids[2]));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_multiple_deployments_per_group(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -934,7 +934,7 @@ mod tests {
 
     // Tests for CASCADE delete behavior
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cascade_delete_user_removes_group_membership(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -992,7 +992,7 @@ mod tests {
         assert_eq!(user_group_count.unwrap(), 0);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cascade_delete_group_removes_all_memberships(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -1070,7 +1070,7 @@ mod tests {
         assert!(deleted_group.is_none());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cascade_delete_user_groups_removes_api_key_deployments(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -1208,7 +1208,7 @@ mod tests {
         assert!(!keys_for_deployment.iter().any(|k| k.secret == api_key.secret));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_cascade_delete_deployment_removes_access_entries(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -1288,7 +1288,7 @@ mod tests {
         assert!(!group_deployments.contains(&deployment.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_bulk_relationship_fetching_methods(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -1484,7 +1484,7 @@ mod tests {
         assert!(empty_result.is_empty());
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_everyone_group_virtual_membership(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -1557,7 +1557,7 @@ mod tests {
         assert!(everyone_users_bulk.contains(&user3_id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_everyone_group_with_regular_groups(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -1608,7 +1608,7 @@ mod tests {
         assert!(everyone_users.contains(&user_id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_everyone_group_excludes_system_user(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -1643,7 +1643,7 @@ mod tests {
         assert!(all_users.iter().any(|u| u.id == user_id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_everyone_group_cannot_be_deleted(pool: PgPool) {
         let mut conn = pool.acquire().await.unwrap();
@@ -1666,7 +1666,7 @@ mod tests {
         assert_eq!(everyone_group.name, "Everyone");
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_group_with_all_fields(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -1712,7 +1712,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_group_with_partial_fields_name_only(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -1742,7 +1742,7 @@ mod tests {
         assert!(updated_group.updated_at >= group.updated_at);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_group_with_partial_fields_description_only(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -1772,7 +1772,7 @@ mod tests {
         assert!(updated_group.updated_at >= group.updated_at);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_group_clear_description(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -1801,7 +1801,7 @@ mod tests {
         assert_eq!(updated_group.description, Some("".to_string()));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_group_with_no_changes(pool: PgPool) {
         let user_id = setup_test_environment(&pool).await;
@@ -1831,7 +1831,7 @@ mod tests {
         assert!(updated_group.updated_at >= group.updated_at);
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_nonexistent_group(pool: PgPool) {
         let _user_id = setup_test_environment(&pool).await;
@@ -1856,7 +1856,7 @@ mod tests {
         }
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     #[test_log::test]
     async fn test_update_everyone_group_fails(pool: PgPool) {
         let _user_id = setup_test_environment(&pool).await;

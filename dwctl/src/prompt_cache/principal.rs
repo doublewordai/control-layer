@@ -83,7 +83,7 @@ mod tests {
     use crate::api::models::users::Role;
     use crate::test::utils::{create_test_api_key_for_user, create_test_user};
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn resolves_validated_key_to_user(pool: sqlx::PgPool) {
         let user = create_test_user(&pool, Role::StandardUser).await;
         let key = create_test_api_key_for_user(&pool, user.id).await;
@@ -94,7 +94,7 @@ mod tests {
         assert_eq!(resolver.resolve(&key.secret).await.unwrap(), Some(user.id));
     }
 
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn unknown_token_resolves_none(pool: sqlx::PgPool) {
         let resolver = PrincipalResolver::new(pool);
         assert_eq!(resolver.resolve("not-a-real-secret").await.unwrap(), None);

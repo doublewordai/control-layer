@@ -241,7 +241,7 @@ mod tests {
     /// The permission gate: recompute output is request-log-grade data, so it takes the same
     /// analytics read permission as the rest of the requests surface — a standard user gets
     /// 403, a RequestViewer gets through.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn requires_analytics_read_permission(pool: PgPool) {
         setup_fusillade_pool(&pool).await;
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -272,7 +272,7 @@ mod tests {
 
     /// Every malformed predicate is refused rather than silently clamped: an inverted
     /// window, an unbounded window, a nonsense limit, an unknown tier.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn malformed_predicates_are_rejected(pool: PgPool) {
         setup_fusillade_pool(&pool).await;
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -318,7 +318,7 @@ mod tests {
     /// End to end over HTTP, on the August incident shape: the row is detected, the
     /// correction is positive, and the report round-trips as JSON with the row detail an
     /// operator (and the repair scripts) need.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn detects_the_anthropic_incident_over_http(pool: PgPool) {
         setup_fusillade_pool(&pool).await;
         let (app, _bg) = create_test_app(pool.clone(), false).await;
@@ -360,7 +360,7 @@ mod tests {
 
     /// End to end over HTTP, on the July shape: a usage-less body must come back
     /// not-replayable — the endpoint saying "healthy" here was the documented blindness.
-    #[sqlx::test]
+    #[dwctl_test_macros::test]
     async fn july_null_usage_surfaces_as_not_replayable_over_http(pool: PgPool) {
         setup_fusillade_pool(&pool).await;
         let (app, _bg) = create_test_app(pool.clone(), false).await;

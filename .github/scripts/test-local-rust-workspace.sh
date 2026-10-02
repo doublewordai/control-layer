@@ -26,6 +26,7 @@ expected_packages = {
     "fusillade",
     "fusillade-core",
     "fusillade-arsenal",
+    "dwctl-test-macros",
 }
 workspace_packages = {
     package["name"]

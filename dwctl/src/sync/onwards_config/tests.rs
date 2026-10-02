@@ -182,7 +182,7 @@ fn test_parse_notify_payload() {
     assert!(parse_notify_payload("too:many:colons").is_none());
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
         .await
@@ -228,7 +228,7 @@ async fn test_cache_shape_regular_public_and_private_access(pool: sqlx::PgPool) 
     );
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_endpoint_reasoning_default_reaches_standard_provider(pool: sqlx::PgPool) {
     let endpoint_config = serde_json::json!({
         "chat_completions": {
@@ -265,7 +265,7 @@ async fn test_endpoint_reasoning_default_reaches_standard_provider(pool: sqlx::P
     );
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_chat_override_preserves_endpoint_responses_default(pool: sqlx::PgPool) {
     let endpoint_config = serde_json::json!({
         "chat_completions": {
@@ -344,7 +344,7 @@ async fn test_chat_override_preserves_endpoint_responses_default(pool: sqlx::PgP
     );
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_disabling_one_reasoning_surface_preserves_the_other(pool: sqlx::PgPool) {
     let endpoint_config = serde_json::json!({
         "chat_completions": {
@@ -391,7 +391,7 @@ async fn test_disabling_one_reasoning_surface_preserves_the_other(pool: sqlx::Pg
     assert!(config.responses.is_some());
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_disabling_both_reasoning_surfaces_removes_provider_config(pool: sqlx::PgPool) {
     let endpoint_config = serde_json::json!({
         "chat_completions": {
@@ -436,7 +436,7 @@ async fn test_disabling_both_reasoning_surfaces_removes_provider_config(pool: sq
     assert!(provider.target.reasoning_translation.is_none());
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_token_budget_multi_write_survives_provider_sync(pool: sqlx::PgPool) {
     let endpoint_config = serde_json::json!({
         "chat_completions": {
@@ -477,7 +477,7 @@ async fn test_token_budget_multi_write_survives_provider_sync(pool: sqlx::PgPool
     );
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_composite_components_keep_distinct_effective_reasoning_translations(pool: sqlx::PgPool) {
     let endpoint_a = serde_json::json!({
         "chat_completions": {
@@ -552,7 +552,7 @@ async fn test_composite_components_keep_distinct_effective_reasoning_translation
     assert_eq!(paths["component-b-model"], "/thinking/type");
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_zero_data_retention_label_reflects_owner(pool: sqlx::PgPool) {
     // User A opts into zero data retention; User B does not. The onwards sync
     // must surface the owning user's flag as a per-key "zdr" label so onwards
@@ -586,7 +586,7 @@ async fn test_cache_shape_zero_data_retention_label_reflects_owner(pool: sqlx::P
     );
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
 async fn test_cache_shape_metered_model_requires_positive_balance(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
         .await
@@ -605,7 +605,7 @@ async fn test_cache_shape_metered_model_requires_positive_balance(pool: sqlx::Pg
     assert!(!pool_has_key(metered_pool, KEY_BATCH_SECRET));
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
 async fn test_balance_change_toggles_paid_access_on_reload(pool: sqlx::PgPool) {
     let user_a: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
     let tiers = RateLimitTiersConfig::default();
@@ -651,7 +651,7 @@ async fn test_balance_change_toggles_paid_access_on_reload(pool: sqlx::PgPool) {
 }
 
 // Contracted accounts retain paid access, but disabling the flag restores enforcement.
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
 async fn test_allow_negative_balance_toggles_paid_access(pool: sqlx::PgPool) {
     use crate::db::handlers::api_keys::ApiKeys;
 
@@ -700,7 +700,7 @@ async fn test_allow_negative_balance_toggles_paid_access(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
 async fn test_allow_negative_balance_preserves_access_restrictions(pool: sqlx::PgPool) {
     let tiers = RateLimitTiersConfig::default();
     sqlx::query("INSERT INTO user_feature_flags (user_id, feature_flag, enabled) SELECT id, 'ALLOW_NEGATIVE_BALANCE', true FROM users WHERE username = 'cache_user_b'")
@@ -752,7 +752,7 @@ async fn test_allow_negative_balance_preserves_access_restrictions(pool: sqlx::P
 /// caps never self-heal, and a windowed cap readmits at the calendar boundary
 /// with no fold or traffic required (the lazy-readmission path the fallback
 /// sync provides).
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered", "cache_balance_user_a_positive")))]
 async fn test_spend_cap_toggles_scope_access_on_reload(pool: sqlx::PgPool) {
     use crate::db::handlers::api_keys::ApiKeys;
 
@@ -821,7 +821,7 @@ async fn test_spend_cap_toggles_scope_access_on_reload(pool: sqlx::PgPool) {
     assert!(pool_has_key(metered.value(), &child_secret), "rolled window readmits the child");
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::PgPool) {
     let alias = "escalation-private".to_string();
 
@@ -851,7 +851,7 @@ async fn test_cache_shape_batch_escalation_access_for_private_alias(pool: sqlx::
 /// balance gates exempt it. Owned by anyone else it would be silently absent
 /// from prod-shaped (group-restricted, priced) models, and every resume leg on
 /// them would 403 at onwards key auth.
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_composite")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_composite")))]
 async fn test_continuation_key_reaches_gated_and_priced_composites(pool: sqlx::PgPool) {
     let secret = crate::continuation::provision_global_key(&pool).await.unwrap();
 
@@ -881,7 +881,7 @@ async fn test_continuation_key_reaches_gated_and_priced_composites(pool: sqlx::P
 /// each provider of every pool it hosts, so onwards can strip the dynamo-only
 /// `priority` field per member instead of per position. component-a is hosted
 /// on endpoint 0001 (unflagged), component-b on 0002 (flagged here).
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_endpoint_accepts_scheduling_priority_reaches_each_provider(pool: sqlx::PgPool) {
     sqlx::query("UPDATE inference_endpoints SET accepts_scheduling_priority = true WHERE id = '30000000-0000-0000-0000-000000000002'")
         .execute(&pool)
@@ -916,7 +916,7 @@ async fn test_endpoint_accepts_scheduling_priority_reaches_each_provider(pool: s
 /// harness-validated target behind it), never a load-balancing surface: under
 /// the composite's own strategy (DB default weighted_random) resume legs would
 /// split randomly between the free first hop and the paid provider.
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_completions_pool_forces_priority_strategy(pool: sqlx::PgPool) {
     sqlx::query("UPDATE deployed_models SET lb_strategy = 'weighted_random' WHERE alias = 'composite-priority'")
         .execute(&pool)
@@ -952,7 +952,7 @@ async fn test_completions_pool_forces_priority_strategy(pool: sqlx::PgPool) {
     assert!(composite.value().default_pool().fallback().unwrap().aimd.is_none());
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
         .await
@@ -1021,7 +1021,7 @@ async fn test_cache_shape_composite_pool_strategy_and_fallback(pool: sqlx::PgPoo
     assert!(fallback.max_total_backoff_ms.is_none());
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_null_composite_uses_application_fallback_status_default(pool: sqlx::PgPool) {
     sqlx::query("UPDATE deployed_models SET fallback_on_status = NULL WHERE alias = 'composite-priority'")
         .execute(&pool)
@@ -1041,7 +1041,7 @@ async fn test_cache_shape_null_composite_uses_application_fallback_status_defaul
 /// round-trip from the deployed_models row through the sync layer into the
 /// in-memory `onwards::FallbackConfig.backoff`. The migration's DB CHECK
 /// constraints reject silly values, so the conversion can trust them.
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_composite_backoff_round_trips(pool: sqlx::PgPool) {
     sqlx::query!(
         r#"
@@ -1073,7 +1073,7 @@ async fn test_cache_shape_composite_backoff_round_trips(pool: sqlx::PgPool) {
     assert_eq!(fallback.max_total_backoff_ms, Some(6_000));
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_balance_batch_owner_positive")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_balance_batch_owner_positive")))]
 async fn test_cache_shape_composite_batch_escalation_access(pool: sqlx::PgPool) {
     let alias = "composite-priority".to_string();
 
@@ -1090,7 +1090,7 @@ async fn test_cache_shape_composite_batch_escalation_access(pool: sqlx::PgPool) 
     assert!(pool_has_key(pool_with.value(), KEY_BATCH_SECRET));
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_components_all_disabled")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_components_all_disabled")))]
 async fn test_cache_shape_composite_with_all_components_disabled(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
         .await
@@ -1105,7 +1105,7 @@ async fn test_cache_shape_composite_with_all_components_disabled(pool: sqlx::PgP
     );
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_regular_public_extra_group_assignment")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_regular_public_extra_group_assignment")))]
 async fn test_cache_shape_duplicate_access_paths_do_not_duplicate_keys(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
         .await
@@ -1118,7 +1118,7 @@ async fn test_cache_shape_duplicate_access_paths_do_not_duplicate_keys(pool: sql
     );
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_strict_mode_flag_propagates(pool: sqlx::PgPool) {
     let strict_targets = super::load_targets_from_db(&pool, &[], true, &RateLimitTiersConfig::default())
         .await
@@ -1131,7 +1131,7 @@ async fn test_cache_shape_strict_mode_flag_propagates(pool: sqlx::PgPool) {
     assert!(!lax_targets.strict_mode, "strict_mode=false should propagate to Targets");
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_user_b_in_private_group")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_user_b_in_private_group")))]
 async fn test_cache_shape_overlapping_group_memberships_expand_access(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
         .await
@@ -1149,7 +1149,7 @@ async fn test_cache_shape_overlapping_group_memberships_expand_access(pool: sqlx
     assert!(pool_has_key(private_pool, KEY_B_SECRET));
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_delete_regular_public")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_delete_regular_public")))]
 async fn test_cache_shape_deleted_regular_model_is_excluded(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
         .await
@@ -1160,7 +1160,7 @@ async fn test_cache_shape_deleted_regular_model_is_excluded(pool: sqlx::PgPool) 
     );
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_delete_component_a_model")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_delete_component_a_model")))]
 async fn test_cache_shape_deleted_component_model_is_excluded_from_composite(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
         .await
@@ -1175,7 +1175,7 @@ async fn test_cache_shape_deleted_component_model_is_excluded_from_composite(poo
     assert_eq!(providers[0].target.onwards_model.as_deref(), Some("component-b-model"));
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
 async fn test_cache_shape_regular_model_routing_rules(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
         .await
@@ -1195,7 +1195,7 @@ async fn test_cache_shape_regular_model_routing_rules(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
 async fn test_cache_shape_composite_model_routing_rules(pool: sqlx::PgPool) {
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
         .await
@@ -1218,7 +1218,7 @@ async fn test_cache_shape_composite_model_routing_rules(pool: sqlx::PgPool) {
 /// deny half only: a redirect names another model alias, so following one out of
 /// the completions pool would serve a resume leg — a token-id prefix rendered
 /// against this model — from a different model entirely.
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_traffic_routing_rules")))]
 async fn test_cache_shape_named_pool_inherits_denies_not_redirects(pool: sqlx::PgPool) {
     // Give composite-priority a completions pool (it has batch → redirect and
     // realtime → deny from the fixture).
@@ -1256,7 +1256,7 @@ async fn test_cache_shape_named_pool_inherits_denies_not_redirects(pool: sqlx::P
     ));
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_component_b_invalid_endpoint")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_component_b_invalid_endpoint")))]
 #[ignore = "Known limitation: invalid component endpoint cannot be isolated because regular target loading panics on invalid endpoint URLs"]
 async fn test_known_issue_composite_invalid_component_endpoint_should_be_skipped(pool: sqlx::PgPool) {
     // Expected behavior:
@@ -1274,7 +1274,7 @@ async fn test_known_issue_composite_invalid_component_endpoint_should_be_skipped
         .unwrap();
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_composite_unmetered_access_matches_regular_model_policy(pool: sqlx::PgPool) {
     // For unmetered aliases (no active non-zero tariff), group-authorized keys are allowed
     // even when user balance is non-positive. Composite and regular aliases follow the same
@@ -1295,7 +1295,7 @@ async fn test_composite_unmetered_access_matches_regular_model_policy(pool: sqlx
 /// `Targets::from_config` building the governor limiter. We assert behaviour
 /// (burst enforcement) rather than the configured numbers because governor
 /// does not expose the quota once built.
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_unverified_key_gets_tier_limiter_verified_key_does_not(pool: sqlx::PgPool) {
     use crate::config::RateLimitTierConfig;
 
@@ -1343,7 +1343,7 @@ async fn test_unverified_key_gets_tier_limiter_verified_key_does_not(pool: sqlx:
 /// The system key (nil UUID) carries internal traffic (DB probes, deployment
 /// access) and must never be subject to a tier limit, even when both tiers are
 /// configured restrictively.
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_system_key_is_immune_to_rate_limit_tiers(pool: sqlx::PgPool) {
     use crate::config::RateLimitTierConfig;
 
@@ -1366,7 +1366,7 @@ async fn test_system_key_is_immune_to_rate_limit_tiers(pool: sqlx::PgPool) {
 
 /// Endpoint defaults are consumed directly by the Onwards provider cache, so
 /// changing one must wake the listener even when no deployment row changes.
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_endpoint_reasoning_update_notifies_onwards_config_listener(pool: sqlx::PgPool) {
     use crate::config::ONWARDS_CONFIG_CHANGED_CHANNEL;
     use sqlx::postgres::PgListener;
@@ -1402,7 +1402,7 @@ async fn test_endpoint_reasoning_update_notifies_onwards_config_listener(pool: s
 }
 
 /// Test that tariff changes trigger onwards config reload via Postgres NOTIFY
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
     use crate::Role;
     use crate::db::handlers::{Deployments, InferenceEndpoints, Repository, Tariffs};
@@ -1535,7 +1535,7 @@ async fn test_onwards_config_reloads_on_tariff_change(pool: sqlx::PgPool) {
 ///
 /// Covers: no-op upsert (silent), real insert (notify), metadata-only update
 /// (silent), auth-relevant update (notify).
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_api_keys_noop_upsert_does_not_trigger_notify(pool: sqlx::PgPool) {
     use sqlx::postgres::PgListener;
 
@@ -1619,7 +1619,7 @@ async fn test_api_keys_noop_upsert_does_not_trigger_notify(pool: sqlx::PgPool) {
 }
 
 /// Test that batch API keys get automatic access to composite escalation targets
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::PgPool) {
     use std::str::FromStr;
 
@@ -1817,7 +1817,7 @@ async fn test_batch_api_key_access_to_composite_escalation_target(pool: sqlx::Pg
 
 /// Regression test: onwards_config should reconnect after connection loss
 /// and successfully resume receiving notifications.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_onwards_config_reconnects_after_connection_loss(pool: sqlx::PgPool) {
     // Start the onwards config sync with status channel
@@ -1907,7 +1907,7 @@ async fn test_onwards_config_reconnects_after_connection_loss(pool: sqlx::PgPool
 }
 
 /// Test that fallback sync triggers periodic reloads even without LISTEN/NOTIFY activity
-#[sqlx::test]
+#[dwctl_test_macros::test]
 #[test_log::test]
 async fn test_fallback_sync_triggers_without_notifications(pool: sqlx::PgPool) {
     use tokio::sync::mpsc;
@@ -2024,7 +2024,7 @@ mod resolve_key_rate_limit_tests {
 /// The sync emits one named pool per composite pool: a composite nobody has
 /// given a second pool keeps the single-pool shape it always had, and attaching
 /// a completions member produces a second pool that chat traffic cannot reach.
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool) {
     // The fixture predates pools, so its components carry the column default.
     let targets = super::load_targets_from_db(&pool, &[], false, &RateLimitTiersConfig::default())
@@ -2099,7 +2099,7 @@ async fn test_cache_shape_component_pool_becomes_a_named_pool(pool: sqlx::PgPool
     assert!(regular.value().resolved_name(onwards::target::RequestClass::Completions).is_none());
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_serving_accounts_overlays_and_offered_classes(pool: sqlx::PgPool) {
     use onwards::{AccountServing, ProviderKind, ServingClass, ServingOverlay, ServingTargets};
 
@@ -2208,7 +2208,7 @@ async fn test_cache_shape_serving_accounts_overlays_and_offered_classes(pool: sq
     assert_eq!(private.value().default_pool().providers()[0].target.kind, ProviderKind::External);
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn test_cache_shape_composite_offered_classes_and_kinds_sit_on_the_default_pool(pool: sqlx::PgPool) {
     use onwards::{ProviderKind, ServingClass};
 
@@ -2237,7 +2237,7 @@ async fn test_cache_shape_composite_offered_classes_and_kinds_sit_on_the_default
     );
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn aimd_and_first_token_deadline_survive_database_sync(pool: sqlx::PgPool) {
     let config = serde_json::json!({"enabled":true,"latency_budget_ms":100,"breach_rate_target":0.1,"window_samples":20,
         "min_samples":5,"share_step":0.05,"share_decay":0.5,"share_floor":0.1,"dwell_ms":1000});
@@ -2271,7 +2271,7 @@ async fn aimd_and_first_token_deadline_survive_database_sync(pool: sqlx::PgPool)
     );
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn affinity_survives_database_sync(pool: sqlx::PgPool) {
     let config = serde_json::json!({"target_conversations": 40, "margin": 4});
     sqlx::query("UPDATE deployed_models SET affinity = $1, fallback_enabled = true WHERE alias = 'composite-priority'")
@@ -2292,7 +2292,7 @@ async fn affinity_survives_database_sync(pool: sqlx::PgPool) {
     assert!(standard.value().default_pool().fallback().is_none_or(|f| f.affinity.is_none()));
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_tariff_metered")))]
 async fn test_deleted_keys_excluded_from_deployment_lookup(pool: sqlx::PgPool) {
     use crate::db::handlers::api_keys::ApiKeys;
 
@@ -2324,7 +2324,7 @@ async fn test_deleted_keys_excluded_from_deployment_lookup(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_balance_user_a_positive")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_balance_user_a_positive")))]
 async fn organisation_prices_gate_balance_and_capped_root_and_child(pool: sqlx::PgPool) {
     use crate::db::handlers::api_keys::ApiKeys;
     let owner: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
@@ -2414,7 +2414,7 @@ async fn organisation_prices_gate_balance_and_capped_root_and_child(pool: sqlx::
     }
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn deleted_accounts_lose_free_and_unpriced_targets(pool: sqlx::PgPool) {
     let tiers = RateLimitTiersConfig::default();
     let before = super::load_targets_from_db(&pool, &[], false, &tiers).await.unwrap();
@@ -2433,7 +2433,7 @@ async fn deleted_accounts_lose_free_and_unpriced_targets(pool: sqlx::PgPool) {
     }
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_balance_user_a_positive")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_balance_user_a_positive")))]
 async fn zero_customer_deals_on_paid_models_do_not_bypass_credit_or_caps(pool: sqlx::PgPool) {
     use crate::db::handlers::api_keys::ApiKeys;
     let owner: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
@@ -2561,7 +2561,7 @@ async fn zero_customer_deals_on_paid_models_do_not_bypass_credit_or_caps(pool: s
     }
 }
 
-#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base", "cache_user_b_in_private_group")))]
+#[dwctl_test_macros::test(fixtures(path = "fixtures", scripts("cache_base", "cache_user_b_in_private_group")))]
 async fn generally_free_models_ignore_other_accounts_paid_deals(pool: sqlx::PgPool) {
     use crate::db::handlers::api_keys::ApiKeys;
     let owner: uuid::Uuid = "00000000-0000-0000-0000-0000000000a1".parse().unwrap();
@@ -2698,7 +2698,7 @@ fn later_notifications_and_fallbacks_schedule_new_reloads() {
 }
 
 /// Commit a new alias after the loader's snapshot, while publication is paused.
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn change_after_reload_snapshot_is_published_by_trailing_refresh(pool: sqlx::PgPool) {
     use crate::api::models::users::Role;
     use crate::test::utils::{create_test_endpoint, create_test_model, create_test_user};
@@ -2754,7 +2754,7 @@ async fn change_after_reload_snapshot_is_published_by_trailing_refresh(pool: sql
     timeout(Duration::from_secs(10), task).await.unwrap().unwrap().unwrap();
 }
 
-#[sqlx::test]
+#[dwctl_test_macros::test]
 async fn failed_reload_retries_without_another_notification_or_fallback(pool: sqlx::PgPool) {
     use crate::api::models::users::Role;
     use crate::test::utils::{create_test_endpoint, create_test_model, create_test_user};
