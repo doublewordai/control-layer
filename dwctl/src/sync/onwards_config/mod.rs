@@ -860,7 +860,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                     -- positive deal can require credit on an otherwise free model.
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
                           AND mt.valid_until IS NULL
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     ) AND NOT EXISTS (
@@ -896,7 +896,7 @@ async fn load_composite_models_from_db(db: &PgPool, escalation_models: &[String]
                       AND ck.window_spend >= root.spend_limit
                       AND (EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL
+                        WHERE mt.deployed_model_id = cm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
                           AND mt.valid_until IS NULL
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                       ) OR EXISTS (
@@ -1718,7 +1718,7 @@ pub async fn load_targets_from_db(
                     -- positive deal can require credit on an otherwise free model.
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
                           AND mt.valid_until IS NULL
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     ) AND NOT EXISTS (
@@ -1754,7 +1754,7 @@ pub async fn load_targets_from_db(
                       AND ck.window_spend >= root.spend_limit
                       AND (EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND mt.serving_class IS NULL
                           AND mt.valid_until IS NULL
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                       ) OR EXISTS (

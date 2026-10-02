@@ -1,9 +1,70 @@
 """Schema changes must preserve results on retained prepared server statements."""
 
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import psycopg
 import requests
+
+
+def verify_concurrent_model_name_writes(app, direct, pooled_dsn):
+    """An API writer must wait for a pooled catalog transaction, then see its names."""
+    app.start()
+    base = f"http://127.0.0.1:{app.config['port']}"
+    with requests.Session() as session:
+        response = session.post(base + "/authentication/login", json={
+            "email": "pool-test@example.invalid",
+            "password": "local-pool-test-password",
+        }, timeout=20)
+        response.raise_for_status()
+        endpoint = str(direct.execute("SELECT id FROM inference_endpoints LIMIT 1").fetchone()[0])
+        alias = "pooled-names-" + uuid.uuid4().hex
+        response = session.post(base + "/admin/api/v1/models", json={
+            "type": "standard", "model_name": alias, "alias": alias,
+            "hosted_on": endpoint,
+        }, timeout=20)
+        response.raise_for_status()
+        model_id = response.json()["id"]
+        for reserved in (alias + ":fast", alias + "-fast"):
+            # Reproduce catalog's transaction/lock protocol on a pooled connection.
+            # The Rust integration test separately exercises the actual reconciler.
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                with psycopg.connect(pooled_dsn) as catalog:
+                    catalog.execute("SELECT pg_advisory_xact_lock(%s)", (0x44574D4F44454C50,))
+                    pid = catalog.execute("SELECT pg_backend_pid()").fetchone()[0]
+                    class_id = catalog.execute(
+                        "INSERT INTO model_serving_classes "
+                        "(deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) "
+                        "VALUES (%s,'fast','Fast',%s,'pooled-fast-upstream') "
+                        "ON CONFLICT (deployed_model_id,class_key) DO UPDATE SET display_name=EXCLUDED.display_name "
+                        "RETURNING id", (model_id, endpoint),
+                    ).fetchone()[0]
+                    if reserved.endswith("-fast"):
+                        catalog.execute(
+                            "INSERT INTO model_aliases (alias,deployed_model_id,serving_class_id) VALUES (%s,%s,%s)",
+                            (reserved, model_id, class_id),
+                        )
+                    pending = executor.submit(session.post, base + "/admin/api/v1/models", json={
+                        "type": "standard", "model_name": reserved, "alias": reserved,
+                        "hosted_on": endpoint,
+                    }, timeout=20)
+                    deadline = time.monotonic() + 10
+                    while not direct.execute(
+                        "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                        "WHERE %s = ANY(pg_blocking_pids(pid)) AND wait_event = 'advisory')", (pid,),
+                    ).fetchone()[0]:
+                        assert not pending.done(), "model writer bypassed the catalog lock"
+                        assert time.monotonic() < deadline, "model writer never waited for the catalog lock"
+                        time.sleep(0.05)
+                    # Exiting commits the name reservation and releases the lock.
+                response = pending.result(timeout=20)
+                assert response.status_code == 409, (
+                    f"reserved name accepted after catalog commit: {response.status_code} {response.text[:300]}"
+                )
+    # The following schema-change phase starts its own application instance.
+    app.stop(strict=True)
+    print("PASS: concurrent pooled catalog/model writes serialize with DISCARD ALL enabled", flush=True)
 
 
 def characterize_stale_plans(direct, pooled_dsn):
@@ -110,6 +171,30 @@ def verify_models_schema_change(app, direct):
                 response.status_code == 200
             ), f"model update failed: {response.status_code} {response.text[:300]}"
             assert response.json()["description"] == "schema compatibility"
+
+            # Sequential collision checks across DDL/restart; concurrent locking
+            # under DISCARD ALL is exercised separately before this phase.
+            class_id = direct.execute(
+                "INSERT INTO model_serving_classes "
+                "(deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) "
+                "VALUES (%s,'fast','Fast',%s,'pooled-fast-upstream') RETURNING id",
+                (model["id"], endpoint),
+            ).fetchone()[0]
+            synonym = alias + "-fast"
+            direct.execute(
+                "INSERT INTO model_aliases (alias,deployed_model_id,serving_class_id) VALUES (%s,%s,%s)",
+                (synonym, model["id"], class_id),
+            )
+            for reserved in (synonym, alias + ":fast"):
+                response = session.post(
+                    base + "/admin/api/v1/models",
+                    json={"type": "standard", "model_name": reserved,
+                          "alias": reserved, "hosted_on": endpoint},
+                    timeout=20,
+                )
+                assert response.status_code == 409, (
+                    f"reserved class name accepted: {response.status_code} {response.text[:300]}"
+                )
 
     def aimd_settings():
         alias = "schema-aimd-" + uuid.uuid4().hex

@@ -1227,3 +1227,6 @@ mod tests {
 
 #[cfg(test)]
 mod tariff_indexes_tests;
+
+#[cfg(test)]
+mod public_class_tests;

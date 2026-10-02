@@ -105,6 +105,31 @@
         "factor"
       ]
     },
+    "CachePrices": {
+      "description": "Scoped cache tariffs change multipliers only. The model owns enablement and\nthe minimum prefix length used by the classifier.",
+      "type": "object",
+      "properties": {
+        "read_multiplier": {
+          "type": "string"
+        },
+        "write_multiplier_1h": {
+          "type": "string"
+        },
+        "write_multiplier_24h": {
+          "type": "string"
+        },
+        "write_multiplier_5m": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "write_multiplier_5m",
+        "write_multiplier_1h",
+        "write_multiplier_24h",
+        "read_multiplier"
+      ]
+    },
     "CacheTariff": {
       "type": "object",
       "properties": {
@@ -132,6 +157,54 @@
         "write_multiplier_1h",
         "write_multiplier_24h",
         "min_prefix_tokens"
+      ]
+    },
+    "ClassRoute": {
+      "description": "Complete catalog declaration for a stable class of the existing public model.",
+      "type": "object",
+      "properties": {
+        "aliases": {
+          "description": "Optional exact ingress spellings, never additional discovery entries.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "string"
+          }
+        },
+        "cache_tariff": {
+          "description": "Omit to inherit the model's all-class multipliers; does not enable caching.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CachePrices"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "display_name": {
+          "type": "string"
+        },
+        "endpoint": {
+          "type": "string"
+        },
+        "tariffs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Tariff"
+          }
+        },
+        "upstream_model_name": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "display_name",
+        "endpoint",
+        "upstream_model_name",
+        "tariffs"
       ]
     },
     "ClayModel": {
@@ -166,6 +239,17 @@
           "default": null,
           "items": {
             "type": "string"
+          }
+        },
+        "class_routes": {
+          "description": "Explicit class destinations and prices, staged independently of legacy routing.\nDeclaring these does not activate routes or advertise additional model names.",
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/ClassRoute"
+          },
+          "default": {},
+          "propertyNames": {
+            "pattern": "^[a-z][a-z0-9_-]*$"
           }
         },
         "deployments": {

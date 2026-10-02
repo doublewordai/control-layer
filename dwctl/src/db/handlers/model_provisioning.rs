@@ -1,5 +1,7 @@
 //! Transaction-scoped persistence for the declarative model catalog.
 
+pub(crate) mod classes;
+
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -58,6 +60,7 @@ impl<'c> ModelProvisioning<'c> {
             .context("read model provisioning effective timestamp")?;
 
         let (endpoints, groups) = self.preflight_named_references(catalog).await?;
+        self.preflight_class_names(catalog).await?;
         self.preflight_existing_model_types(catalog).await?;
         self.preflight_future_tariffs(catalog, effective_at).await?;
 
@@ -102,6 +105,7 @@ impl<'c> ModelProvisioning<'c> {
                 .await?;
             self.reconcile_cache_tariff(model_id, None, None, model.clay.cache_tariff.as_ref(), effective_at)
                 .await?;
+            self.reconcile_classes(model_id, model, &endpoints, effective_at).await?;
             self.reconcile_groups(model_id, &model.clay.access_groups, &groups).await?;
             self.reconcile_traffic_rules(model_id, &model.clay.traffic_rules, &redirect_ids)
                 .await?;
@@ -115,7 +119,14 @@ impl<'c> ModelProvisioning<'c> {
         let endpoint_names: HashSet<String> = catalog
             .models
             .iter()
-            .flat_map(|model| model.clay.deployments.iter().map(|deployment| deployment.endpoint.clone()))
+            .flat_map(|model| {
+                model
+                    .clay
+                    .deployments
+                    .iter()
+                    .map(|deployment| deployment.endpoint.clone())
+                    .chain(model.clay.class_routes.values().map(|class| class.endpoint.clone()))
+            })
             .collect();
         let group_names: HashSet<String> = catalog
             .models

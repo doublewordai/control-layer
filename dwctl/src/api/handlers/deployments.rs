@@ -1031,7 +1031,7 @@ pub async fn update_deployed_model<P: PoolProvider>(
             }
         }
         let scheduled: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM model_tariffs WHERE deployed_model_id=$1 AND user_id IS NULL
+            "SELECT EXISTS (SELECT 1 FROM model_tariffs WHERE deployed_model_id=$1 AND user_id IS NULL AND serving_class IS NULL
              AND valid_from>NOW() AND (valid_until IS NULL OR valid_until>valid_from))",
         )
         .bind(deployment_id)

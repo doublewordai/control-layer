@@ -24,13 +24,16 @@ export function resolveTokenPrice(
   purpose: TariffApiKeyPurpose,
   window: string | null = null,
   now = Date.now(),
+  publicClassPricesEnabled = false,
 ) {
   const resolvedClass = purpose === "batch" ? "standard" : servingClass;
   const candidates = currentTariffs(rows, now).filter(
     (row) =>
       (row.organization_id == null || row.organization_id === organization) &&
-      (row.serving_class == null ||
-        (organization !== undefined && row.serving_class === resolvedClass)) &&
+      (publicClassPricesEnabled ||
+        row.organization_id != null ||
+        row.serving_class == null) &&
+      (row.serving_class == null || row.serving_class === resolvedClass) &&
       (row.api_key_purpose === purpose ||
         ((purpose === "playground" || purpose === "batch") &&
           row.api_key_purpose === "realtime")) &&
@@ -38,7 +41,13 @@ export function resolveTokenPrice(
         (row.api_key_purpose === "batch" ? window : null),
   );
   const scope = (row: ModelTariff) =>
-    row.organization_id ? (row.serving_class ? 0 : 1) : 2;
+    row.organization_id
+      ? row.serving_class
+        ? 0
+        : 1
+      : row.serving_class
+        ? 2
+        : 3;
   // Exhaust exact batch prices in every scope before the realtime safety net.
   const phase = (row: ModelTariff) =>
     Number(purpose === "batch" && row.api_key_purpose === "realtime");
@@ -64,6 +73,7 @@ export function priceSource(
     return row.serving_class
       ? `Bespoke · ${row.serving_class}`
       : "Bespoke · all classes";
+  if (row.serving_class) return `Public · ${row.serving_class}`;
   return selected ? "Inherited · general model" : "General model";
 }
 
@@ -72,6 +82,7 @@ export function resolveCachePrice(
   rows: OrganizationCacheTariff[],
   servingClass: string,
   now = Date.now(),
+  publicClasses: OrganizationCacheTariff[] = [],
 ) {
   // An organisation multiplier cannot enable caching without a general cache tariff.
   if (!general?.enabled) return undefined;
@@ -81,5 +92,11 @@ export function resolveCachePrice(
   const own =
     current.find((row) => row.serving_class === servingClass) ??
     current.find((row) => !row.serving_class);
-  return { values: own ?? general, own };
+  const publicClass = publicClasses
+    .filter(
+      (row) =>
+        row.serving_class === servingClass && Date.parse(row.valid_from) <= now,
+    )
+    .sort((a, b) => Date.parse(b.valid_from) - Date.parse(a.valid_from))[0];
+  return { values: own ?? publicClass ?? general, own };
 }
