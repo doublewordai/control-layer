@@ -123,11 +123,17 @@ impl Fixture {
     }
 
     async fn post(&self, path: &str, model: &str, stream: bool) -> TestResponse {
-        let body = match path {
+        self.post_with(path, model, stream, json!({})).await
+    }
+
+    /// [`Self::post`] with `extra` merged into the top level of the body.
+    async fn post_with(&self, path: &str, model: &str, stream: bool, extra: Value) -> TestResponse {
+        let mut body = match path {
             "responses" => json!({"model":model,"input":"hi","max_output_tokens":16,"stream":stream}),
             "completions" => json!({"model":model,"prompt":"hi","max_tokens":16,"stream":stream}),
             _ => json!({"model":model,"messages":[{"role":"user","content":"hi"}],"max_tokens":16,"stream":stream}),
         };
+        body.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         self.server
             .post(&format!("/ai/v1/{path}"))
             .add_header("Authorization", format!("Bearer {}", self.key))
@@ -297,6 +303,41 @@ async fn dispatch_clears_stored_targets_but_preserves_deadline_priority(pool: Pg
     assert!(body["nvext"].get("router").is_none());
     assert_eq!(body["nvext"]["agent_hints"]["priority"], -1700000000);
     assert_eq!(body["nvext"]["cache_control"]["enabled"], true);
+}
+
+/// DW-841: OpenRouter acts on these fields (`plugins` runs web searches we pay
+/// for), so none may reach any upstream, from any entry point.
+#[sqlx::test]
+async fn openrouter_only_fields_never_reach_the_upstream(pool: PgPool) {
+    let f = Fixture::new(&pool).await;
+    let fields = json!({"plugins":[{"id":"web","max_results":2}],"provider":{"order":["x"]},
+        "models":["policy"],"transforms":["middle-out"]});
+    let assert_stripped = |body: Value, case: &str| {
+        for key in ["plugins", "provider", "models", "transforms"] {
+            assert!(body.get(key).is_none(), "{case}: {key} reached the upstream: {body}");
+        }
+    };
+    for (path, stream) in [
+        ("chat/completions", false),
+        ("chat/completions", true),
+        ("responses", false),
+        ("messages", false),
+        ("completions", false),
+    ] {
+        f.post_with(path, "policy", stream, fields.clone()).await.assert_status_ok();
+        assert_stripped(f.last_body().await, &format!("{path} stream={stream}"));
+    }
+    // Daemon loopback skips ingestion, as it does for a batch body stored before this change.
+    let mut body = json!({"model":"policy","messages":[{"role":"user","content":"hi"}]});
+    body.as_object_mut().unwrap().extend(fields.as_object().unwrap().clone());
+    f.server
+        .post("/ai/v1/chat/completions")
+        .add_header("Authorization", format!("Bearer {}", f.key))
+        .add_header("x-fusillade-request-id", Uuid::new_v4().to_string())
+        .json(&body)
+        .await
+        .assert_status_ok();
+    assert_stripped(f.last_body().await, "daemon dispatch");
 }
 
 #[sqlx::test]

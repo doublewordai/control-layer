@@ -14,6 +14,10 @@
 //! is not party to either: see [`should_force_stream`] for how its traffic is
 //! recognised.
 //!
+//! It also strips OpenRouter's routing and feature fields ([`OPENROUTER_ONLY_KEYS`])
+//! from every body, so which provider serves a request cannot change what it does
+//! or what it costs.
+//!
 //! This was dwctl's `stream_usage_transform`, previously wired through onwards'
 //! `BodyTransformFn` hook. It deliberately does NOT scrub caller id fields: the
 //! inference middleware already strips those in the single parse-and-shape it does
@@ -166,13 +170,32 @@ pub async fn outbound_request_middleware(State(cfg): State<OutboundConfig>, requ
     }
 }
 
-/// Inject the streaming usage flags into a JSON body, returning `Some(new_bytes)`
-/// only when something changed. A body that is not a JSON object (or fails to
-/// parse) is left untouched (`None`) - onwards still validates and rejects it.
+/// Top-level request fields that only OpenRouter acts on, removed from every body.
+///
+/// The gateway forwards fields it does not model, so without this a customer
+/// could reach OpenRouter's features through us whenever a composite routes to
+/// it: `plugins` runs web searches that we pay for but do not bill, `models`
+/// and `transforms` change which model runs and what it sees, and `provider`
+/// overrides OpenRouter's provider routing. Our Dynamo deployments reject
+/// `plugins` with a 400, so stripping it also stops the outcome depending on
+/// the provider. Decided on DW-821 (29 Sep 2026).
+const OPENROUTER_ONLY_KEYS: [&str; 4] = ["plugins", "provider", "models", "transforms"];
+
+/// Strip [`OPENROUTER_ONLY_KEYS`] and inject the streaming usage flags into a
+/// JSON body, returning `Some(new_bytes)` only when something changed. A body
+/// that is not a JSON object (or fails to parse) is left untouched (`None`) -
+/// onwards still validates and rejects it.
 fn transform(bytes: &Bytes, force_stream: bool, stream_usage: bool) -> Option<Vec<u8>> {
     let mut value = serde_json::from_slice::<Value>(bytes).ok()?;
     let obj = value.as_object_mut()?;
     let mut changed = false;
+
+    // Here rather than at ingress because this is the one layer every request
+    // crosses: realtime, flex and batch dispatch, and continuation resume legs.
+    // Batch bodies stored before this change still carry the fields.
+    for key in OPENROUTER_ONLY_KEYS {
+        changed |= obj.remove(key).is_some();
+    }
 
     // This is the last DWCTL boundary before Onwards resolves and stamps
     // trusted targets. Also covers previously stored batch bodies that skipped
@@ -468,6 +491,31 @@ mod tests {
         let body = serde_json::json!({"model": "gpt-4", "messages": [], "stream": true, "stream_options": null});
         assert!(run(&body, false).is_none());
     }
+
+    #[test]
+    fn strips_openrouter_only_fields_on_every_path() {
+        let body = serde_json::json!({
+            "model": "m",
+            "messages": [],
+            "plugins": [{"id": "web", "max_results": 2}],
+            "provider": {"order": ["x"]},
+            "models": ["a", "b"],
+            "transforms": ["middle-out"],
+            "metadata": {"provider": "kept"},
+        });
+        let bytes = Bytes::from(serde_json::to_vec(&body).unwrap());
+        // Non-streaming, and on a path that takes no stream flags (embeddings).
+        for stream_usage in [true, false] {
+            let out: serde_json::Value = serde_json::from_slice(&transform(&bytes, false, stream_usage).expect("fields removed")).unwrap();
+            for key in OPENROUTER_ONLY_KEYS {
+                assert!(out.get(key).is_none(), "{key} must not reach the upstream");
+            }
+            assert_eq!(out["metadata"]["provider"], "kept", "only top-level keys are stripped");
+            assert_eq!(out["model"], "m");
+            assert!(out.get("stream_options").is_none());
+        }
+    }
+
     fn timeouts(first_chunk_ms: u64, chunk_ms: u64, body_ms: u64) -> StreamTimeouts {
         StreamTimeouts {
             first_chunk: Duration::from_millis(first_chunk_ms),
