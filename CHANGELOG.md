@@ -1,5 +1,106 @@
 # Changelog
 
+## [12.10.1](https://github.com/doublewordai/control-layer/compare/v12.10.0...v12.10.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* **dwctl:** reap completed underway worker tasks ([#1867](https://github.com/doublewordai/control-layer/issues/1867)) ([3cd8524](https://github.com/doublewordai/control-layer/commit/3cd8524122b40a84ba155877beecd9ffdff6af81))
+
+## [12.10.0](https://github.com/doublewordai/control-layer/compare/v12.9.0...v12.10.0) (2026-10-01)
+
+
+### Features
+
+* **db:** add dormant model serving class and alias storage ([#1896](https://github.com/doublewordai/control-layer/issues/1896)) ([fc10154](https://github.com/doublewordai/control-layer/commit/fc1015429b53354d4b36929e3a30287c649150eb))
+
+
+### Performance Improvements
+
+* **onwards:** share a pool's key set between requests ([#1901](https://github.com/doublewordai/control-layer/issues/1901)) ([18cd38c](https://github.com/doublewordai/control-layer/commit/18cd38c64a5f6af25a85d29120a3ca186e382226))
+
+
+### Build System
+
+* keep clippy clean on Rust 1.99 ([#1900](https://github.com/doublewordai/control-layer/issues/1900)) ([9d14bee](https://github.com/doublewordai/control-layer/commit/9d14beec7ecadbba51a0e8e18ac3d3556d34bcd8))
+
+
+### Continuous Integration
+
+* run the test suite when a pull request changes dependencies ([#1899](https://github.com/doublewordai/control-layer/issues/1899)) ([eef7079](https://github.com/doublewordai/control-layer/commit/eef7079c064503342a0864423b2979c92e18996d))
+
+
+### Tests
+
+* **dwctl:** budget complete responses and use realistic payloads ([#1897](https://github.com/doublewordai/control-layer/issues/1897)) ([4307200](https://github.com/doublewordai/control-layer/commit/4307200c38c1a6a1f6948870804e402fe06d1b8b))
+
+## [12.9.0](https://github.com/doublewordai/control-layer/compare/v12.8.0...v12.9.0) (2026-10-01)
+
+
+### Features
+
+* **image-normalizer:** store each ingested image under its own key ([#1894](https://github.com/doublewordai/control-layer/issues/1894)) ([71dffe1](https://github.com/doublewordai/control-layer/commit/71dffe14df99fe457f834a5eef8a0af97464c2a4))
+
+
+### Bug Fixes
+
+* **files:** return 404 when a file delete loses the race ([#1887](https://github.com/doublewordai/control-layer/issues/1887)) ([5d41b2a](https://github.com/doublewordai/control-layer/commit/5d41b2ad86fc776751850fe9f9df6b1ebf04fee6))
+
+## [12.8.0](https://github.com/doublewordai/control-layer/compare/v12.7.4...v12.8.0) (2026-10-01)
+
+
+### Features
+
+* **onwards:** conversation affinity for priority pools ([#1892](https://github.com/doublewordai/control-layer/issues/1892)) ([b2ff624](https://github.com/doublewordai/control-layer/commit/b2ff624480cade3f985b1a02045304add2339705))
+
+## [12.7.4](https://github.com/doublewordai/control-layer/compare/v12.7.3...v12.7.4) (2026-09-30)
+
+
+### Bug Fixes
+
+* autovacuum large churning tables on a fixed row count ([#1883](https://github.com/doublewordai/control-layer/issues/1883)) ([43e1aae](https://github.com/doublewordai/control-layer/commit/43e1aae14904af4d333dd25e716f2d61462b74a4))
+* **fusillade:** bound maintenance transactions on the server ([#1878](https://github.com/doublewordai/control-layer/issues/1878)) ([e5b76af](https://github.com/doublewordai/control-layer/commit/e5b76af02688470048f6d56808ffdcc12b33ebb4))
+* **prompt-cache:** delete long-expired entries and vacuum on a fixed count ([#1881](https://github.com/doublewordai/control-layer/issues/1881)) ([a32b41a](https://github.com/doublewordai/control-layer/commit/a32b41af11040b6815677476cc37cd043245ff47))
+
+
+### Performance Improvements
+
+* **fusillade:** index deleted batches and files awaiting purge ([#1884](https://github.com/doublewordai/control-layer/issues/1884)) ([1a748c3](https://github.com/doublewordai/control-layer/commit/1a748c38ba7af880d5ecf7168ea7fb4f9c515859))
+* **fusillade:** index file-content expiry candidates ([#1882](https://github.com/doublewordai/control-layer/issues/1882)) ([7c2ce88](https://github.com/doublewordai/control-layer/commit/7c2ce8822f7a48dae7db5b899dd4c0ae945f172e))
+
+
+### Tests
+
+* **fusillade:** pin batch index plans to production statements ([#1886](https://github.com/doublewordai/control-layer/issues/1886)) ([301e131](https://github.com/doublewordai/control-layer/commit/301e131050ff46a77d6820a7c37f0a9325da75c1))
+
+## [12.7.3](https://github.com/doublewordai/control-layer/compare/v12.7.2...v12.7.3) (2026-09-30)
+
+
+### Performance Improvements
+
+* **fusillade:** probe live requests by id in trailing demand ([#1889](https://github.com/doublewordai/control-layer/issues/1889)) ([4e6209b](https://github.com/doublewordai/control-layer/commit/4e6209b50867dc2e54952f949b4c869f46e92b2f))
+* **fusillade:** skip batches with live requests before finalizer counts ([#1879](https://github.com/doublewordai/control-layer/issues/1879)) ([79193b3](https://github.com/doublewordai/control-layer/commit/79193b39dfe91ab68de8e832087e22f586ffab90))
+
+## [12.7.2](https://github.com/doublewordai/control-layer/compare/v12.7.1...v12.7.2) (2026-09-30)
+
+
+### Bug Fixes
+
+* **dwctl:** autovacuum underway.task on a fixed row count ([#1873](https://github.com/doublewordai/control-layer/issues/1873)) ([fc5e13b](https://github.com/doublewordai/control-layer/commit/fc5e13b90d1c7e1ae50126832b2d71fb9713f45c))
+* **dwctl:** bound dashboard analytics reads and keep outbox gauges live ([#1874](https://github.com/doublewordai/control-layer/issues/1874)) ([e08fa25](https://github.com/doublewordai/control-layer/commit/e08fa25fe8f78b66b28cc18b98347fea92a23714))
+* **dwctl:** drop realtime writer records instead of blocking outlet ([#1888](https://github.com/doublewordai/control-layer/issues/1888)) ([854c099](https://github.com/doublewordai/control-layer/commit/854c099e8051fe2258f96e11927fba9b49ca33dd))
+
+
+### Performance Improvements
+
+* **fusillade:** index cancelling batches for the cancellation poll ([#1877](https://github.com/doublewordai/control-layer/issues/1877)) ([04763b7](https://github.com/doublewordai/control-layer/commit/04763b7406743210a17bdff3ed928c4be83e50a9))
+* **fusillade:** index pending batch notifications ([#1876](https://github.com/doublewordai/control-layer/issues/1876)) ([57738ae](https://github.com/doublewordai/control-layer/commit/57738aea3abf9f5660b3ec8e91fbc449f57caf9a))
+
+
+### Tests
+
+* **dwctl:** heap budgets for requests in flight ([#1870](https://github.com/doublewordai/control-layer/issues/1870)) ([95715ca](https://github.com/doublewordai/control-layer/commit/95715ca7671a386f910ce39ebb773ebd7d4d41a5))
+
 ## [12.7.1](https://github.com/doublewordai/control-layer/compare/v12.7.0...v12.7.1) (2026-09-30)
 
 

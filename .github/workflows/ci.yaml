@@ -26,8 +26,27 @@ jobs:
           run_ci=true
           changed_files=$(git diff --name-only HEAD^1...HEAD) || changed_files=
 
+          # A release changes version numbers only: in Cargo files, `version`
+          # fields and the versions on path dependencies between workspace
+          # crates. Any other Cargo change adds, bumps or repoints a dependency,
+          # which changes what is built, so it runs the full suite.
+          versions_only() {
+            local lines normalize='s/"[0-9]+\.[0-9]+\.[0-9]+[^"]*"/"VERSION"/g'
+            lines=$(git diff -U0 HEAD^1...HEAD -- "$1" | grep -E '^[-+]' | grep -Ev '^(\+\+\+|---) ') || return 0
+            if grep -Evq '^[-+](version = |.*path = )' <<< "$lines"; then
+              return 1
+            fi
+            [[ "$(grep '^-' <<< "$lines" | cut -c2- | sed -E "$normalize" | sort)" == \
+               "$(grep '^+' <<< "$lines" | cut -c2- | sed -E "$normalize" | sort)" ]]
+          }
+
           if [[ -n "$changed_files" ]] && ! grep -Evq '^(\.release-please-manifest\.json|(.+/)?CHANGELOG\.md|(.+/)?Cargo\.(toml|lock))$' <<< "$changed_files"; then
             run_ci=false
+            while read -r file; do
+              if [[ "$file" =~ Cargo\.(toml|lock)$ ]] && ! versions_only "$file"; then
+                run_ci=true
+              fi
+            done <<< "$changed_files"
           fi
 
           echo "run-ci=$run_ci" >> "$GITHUB_OUTPUT"
@@ -159,7 +178,7 @@ jobs:
           done
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: llvm-tools-preview
 
@@ -296,7 +315,7 @@ jobs:
 
       - name: Install Rust
         if: env.RUN_CI == 'true'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
         with:
           components: llvm-tools-preview
 
@@ -376,7 +395,12 @@ jobs:
           done
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        # Every workflow pins this same Rust release (search for
+        # `rust-toolchain@`). A new stable can add lints that fail
+        # `-D warnings`, so upgrade them together, deliberately.
+        uses: dtolnay/rust-toolchain@1.99.0
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -976,7 +1000,7 @@ jobs:
 
       - name: Install Rust
         if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Build onwards
         if: env.RUN_COMPLIANCE == 'true' && matrix.surface == 'onwards-passthrough'
@@ -1424,7 +1448,7 @@ jobs:
       # the checked-out application locally without registry write privileges.
       - name: Install Rust for unpublished builds
         if: needs.build.result == 'skipped'
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.99.0
 
       - name: Cache unpublished application build
         if: needs.build.result == 'skipped'

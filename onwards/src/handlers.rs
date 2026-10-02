@@ -4,6 +4,7 @@
 //! route them to appropriate targets, and handle authentication and rate limiting.
 
 use crate::AppState;
+use crate::affinity;
 use crate::auth;
 use crate::client::HttpClient;
 use crate::errors::{ErrorResponseBody, OnwardsErrorResponse};
@@ -590,8 +591,7 @@ pub async fn target_message_handler<T: HttpClient>(
     // then run on the chosen pool exactly as they ran on the single pool
     // before. A composite with no pool for this class resolves to its default,
     // which is byte-identically today's behaviour. Resolution happens INSIDE
-    // the map guard so only the chosen pool is cloned: KeySets are owned, so a
-    // whole-TargetPools clone would deep-copy every pool's keys per request.
+    // the map guard so only the chosen pool is cloned, not every pool.
     let request_class = RequestClass::from_path(&canonical_request_path);
     // The alias's serving policy (presets, overlays) is declared on its
     // default pool and applies whichever pool serves this request's class.
@@ -1015,8 +1015,22 @@ pub async fn target_message_handler<T: HttpClient>(
         && state.targets.strict_mode
         && requests_stream(&body_bytes)
         && is_realtime;
+    // Conversation affinity decides preferred-first once per conversation;
+    // only realtime traffic on pools that opt in pays for the body parse.
+    let conversation = if pool.affinity_enabled() && is_realtime {
+        serde_json::from_slice::<serde_json::Value>(&body_bytes)
+            .ok()
+            .and_then(|body| {
+                let header = original_headers
+                    .get(affinity::SESSION_HEADER)
+                    .and_then(|v| v.to_str().ok());
+                affinity::conversation_key(header, &body)
+            })
+    } else {
+        None
+    };
     let mut providers = pool
-        .select_iter_aimd(aimd_eligible, &model_name, resolved_pool_name.unwrap_or("default"))
+        .select_iter_routed(aimd_eligible, conversation, &model_name, resolved_pool_name.unwrap_or("default"))
         .excluding_members(ineligible_members.iter().copied());
     while let Some((member_idx, target, connection_guard)) = providers.next() {
         any_attempted = true;

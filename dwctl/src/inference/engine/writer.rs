@@ -15,9 +15,15 @@
 //!
 //! # Failure modes (explicit)
 //!
-//! Records can be lost in two situations, and there is no dead-letter
+//! Records can be lost in three situations, and there is no dead-letter
 //! store — this is a deliberate trade-off:
 //!
+//!   * **Writer behind**: when the channel is full the outlet handler drops
+//!     the record instead of waiting, counted as
+//!     `dwctl_requests_writer_dropped_total{reason="channel_full"}`. Waiting
+//!     would keep the whole captured request and response alive in the outlet
+//!     task for as long as the writer stays behind, so a slow database would
+//!     grow memory without bound.
 //!   * **Process crash with records still in-channel**: anything sitting
 //!     in the mpsc buffer or pre-batch buffer when the process dies is
 //!     gone. Graceful shutdown drains and flushes; SIGKILL or panic does
@@ -44,7 +50,7 @@
 //!     |
 //!     | resolve created_by from api_key (one dwctl_pool lookup),
 //!     | drop records the api_key doesn't attribute, then
-//!     | send(RawCompletedRequest).await   (in-memory mpsc, backpressure to outlet)
+//!     | try_send(RawCompletedRequest)   (in-memory mpsc; dropped and counted when full)
 //!     v
 //! RequestsWriter::run
 //!     |
@@ -72,8 +78,9 @@ use tracing::{Instrument, debug, info, info_span, warn};
 use uuid::Uuid;
 
 /// Channel capacity. Records sit here when the writer can't keep up; once
-/// full, outlet handlers block on `send().await` rather than dropping
-/// records. Matches the analytics batcher capacity.
+/// full, the outlet handler drops new records (see the module docs) rather
+/// than holding their captured bodies while it waits. Matches the analytics
+/// batcher capacity.
 const CHANNEL_BUFFER_SIZE: usize = 10_000;
 
 /// Default maximum retry attempts on transient fusillade errors.
@@ -350,6 +357,37 @@ impl RequestsWriterSender {
             .send(accounted)
             .await
             .map_err(|error| mpsc::error::SendError(error.0.into_record()))
+    }
+
+    /// Queue one completed-response record without waiting.
+    ///
+    /// Fails immediately when the channel is full or closed, handing the record
+    /// back. The outlet handler uses this so a writer that has fallen behind
+    /// never holds the caller's captured request and response.
+    #[allow(clippy::result_large_err)]
+    pub fn try_send(&self, record: RawCompletedRequest) -> Result<(), mpsc::error::TrySendError<RawCompletedRequest>> {
+        let accounted = AccountedRecord::new_queued(record, self.accounting.clone());
+        self.sender.try_send(accounted).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(record) => mpsc::error::TrySendError::Full(record.into_record()),
+            mpsc::error::TrySendError::Closed(record) => mpsc::error::TrySendError::Closed(record.into_record()),
+        })
+    }
+
+    /// A sender whose single-slot channel already holds one record, standing in
+    /// for a writer that has fallen behind. The returned guard keeps the
+    /// receiver (and so the channel) alive; `queued_records()` reads the queue.
+    #[cfg(test)]
+    pub(crate) fn full_for_test(record: RawCompletedRequest) -> (Self, Box<dyn std::any::Any + Send>) {
+        let accounting = Arc::new(WriterAccounting::default());
+        let (sender, receiver) = mpsc::channel::<AccountedRecord>(1);
+        let sender = Self { sender, accounting };
+        sender.try_send(record).expect("an empty single-slot channel accepts one record");
+        (sender, Box::new(receiver))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queued_records(&self) -> i64 {
+        self.accounting.queued_records.load(Ordering::Relaxed)
     }
 }
 
@@ -790,6 +828,35 @@ mod tests {
         let _ = error.0;
 
         assert_accounting_zero(&accounting);
+    }
+
+    #[tokio::test]
+    async fn test_try_send_to_a_full_channel_fails_without_waiting() {
+        let accounting = Arc::new(WriterAccounting::default());
+        let (sender, mut receiver) = mpsc::channel::<AccountedRecord>(1);
+        let sender = RequestsWriterSender {
+            sender,
+            accounting: accounting.clone(),
+        };
+
+        sender
+            .try_send(test_record(Uuid::new_v4()))
+            .expect("an empty channel accepts one record");
+        let rejected = sender
+            .try_send(test_record(Uuid::new_v4()))
+            .expect_err("a full channel must reject the record immediately");
+        assert!(matches!(rejected, mpsc::error::TrySendError::Full(_)));
+        drop(rejected);
+        // Only the record that made it into the channel is counted as queued.
+        assert_eq!(accounting.queued_records.load(Ordering::Relaxed), 1);
+
+        // Once the writer takes a record there is room again.
+        let taken = receiver.recv().await.expect("the queued record is still there");
+        drop(taken);
+        sender
+            .try_send(test_record(Uuid::new_v4()))
+            .expect("a drained channel accepts a record");
+        assert_eq!(accounting.queued_records.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

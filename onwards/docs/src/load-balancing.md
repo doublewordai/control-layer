@@ -39,6 +39,7 @@ Controls automatic retry on other providers when requests fail:
 | `realtime_on_status` | int[] | `[]` | Extra statuses that trigger fallback for realtime requests only |
 | `on_rate_limit` | bool | `false` | Fallback when hitting local rate limits |
 | `first_token_timeout_ms` | int | -- | Failover deadline for the first token of a streamed response; `0` disables (see below) |
+| `affinity` | object | -- | Priority pools only: choose preferred-first once per conversation instead of per request (see below) |
 
 Status code wildcards:
 
@@ -225,6 +226,52 @@ The controller applies only to eligible strict-mode streams, and it preserves th
 preferred provider in subsequent failover attempts. See
 [load-aware failover](load-aware-failover.md) for configuration, eligibility,
 sampling limits, reload behavior and rollout.
+
+### Conversation affinity
+
+An agentic conversation sends many turns, each repeating the conversation so
+far. The provider that served the previous turn usually still holds that prefix
+in its cache; another provider has to process it again. When the preferred
+provider cannot take every request, choosing per request moves conversations
+back and forth and loses the cache on both sides.
+
+`fallback.affinity` makes the choice per conversation. Each realtime request is
+keyed by an explicit identifier when the client sends one (`x-session-id`
+header, or `session_id` / `prompt_cache_key` in the body), otherwise by the
+conversation's opening: its first system or developer message and its first
+other message. The key maps to a point in `[0, 1)`, and the preferred provider is
+tried first when the point is below the pool's affinity share. The share admits
+about `target_conversations` of the conversations active in the last
+`active_window_ms`, and moves only when the admitted count leaves
+`target_conversations ± margin`, so admitted conversations stay put while the
+population is steady.
+
+```json
+"fallback": {
+  "enabled": true,
+  "affinity": { "target_conversations": 50 }
+}
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `target_conversations` | required | Conversations to keep on the preferred provider |
+| `margin` | a tenth of the target | Drift allowed before the share moves; at most the target |
+| `active_window_ms` | `600000` | How long a conversation stays active after its last request |
+| `update_interval_ms` | `60000` | The share is recomputed at multiples of this wall-clock interval |
+| `max_tracked` | `100000` | Conversations tracked per process; when full, the tracker keeps the ones that decide the share |
+| `enabled` | `true` | Set `false` to keep per-request selection |
+
+Replicas share no state. Each records the conversations it sees and recomputes
+the share at the same wall-clock instants; because a conversation's requests are
+spread across replicas, they see the same conversations and reach the same
+share. The [load-aware share](#load-aware-priority-share) still caps the
+preferred side for eligible streams, so an overloaded preferred provider sheds
+conversations. Continuation pools and requests without a key keep ordinary
+priority selection.
+
+`target_conversations` does not adapt: set it to what the preferred provider can
+serve concurrently, and change it when that capacity changes.
 
 ### Realtime-only failover statuses
 

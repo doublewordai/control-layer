@@ -307,7 +307,7 @@ down *args="":
     docker compose down {{args}}
 
 
-# Run tests: 'just test' or 'just test [docker|rust|ts]'
+# Run tests: 'just test' or 'just test [docker|rust|ts|memory]'
 #
 # Test targets available:
 #
@@ -331,11 +331,16 @@ down *args="":
 # - Runs TypeScript compiler checks and ESLint
 # - Executes Vitest unit tests for React components
 #
+# memory: Heap budgets for requests in flight (dwctl/tests/memory_budget)
+# - Requires PostgreSQL database (run 'just db-setup' first)
+# - Prints the heap each request holds; also part of 'just test rust'
+#
 # Examples:
 #   just test                    # Test against running services
 #   just test docker             # Full docker integration test
 #   just test rust               # Backend unit tests
 #   just test ts                 # Frontend tests
+#   just test memory             # Request memory budgets
 test target="" *args="":
     #!/usr/bin/env bash
     set -euo pipefail
@@ -599,8 +604,12 @@ test target="" *args="":
                 pnpm test -- --run {{args}}
             fi
             ;;
+        memory)
+            echo "Running memory budget tests..."
+            cargo test --package dwctl --test memory_budget {{args}} -- --nocapture
+            ;;
         *)
-            echo "Usage: just test [docker|rust|ts]"
+            echo "Usage: just test [docker|rust|ts|memory]"
             exit 1
             ;;
     esac

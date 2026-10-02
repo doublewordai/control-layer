@@ -463,13 +463,13 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.89"
+version = "0.1.92"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9035ad2d096bed7955a320ee7e2230574d28fd3c3a0f186cbea1ff3c7eed5dbb"
+checksum = "82f6aeea286b8eb4dd3431a1be1b59d290ace00f5bfd8e2a159bc2a05e2c1667"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.117",
+ "syn 3.0.6",
 ]
 
 [[package]]
@@ -1891,7 +1891,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "dwctl"
-version = "12.7.1"
+version = "12.10.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1937,6 +1937,7 @@ dependencies = [
  "http-body-util",
  "humantime",
  "humantime-serde",
+ "hyper-util",
  "jemalloc_pprof",
  "jsonwebtoken 10.3.0",
  "lettre",
@@ -4422,6 +4423,7 @@ dependencies = [
  "rstest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "subtle",
  "tokio",
  "tokio-stream",
@@ -6763,6 +6765,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "syn"
+version = "3.0.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8593e8e72159ed2257d083c7a454a85cbf854f37a0966d8d483aff8c8a3ebcee"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "unicode-ident",
+]
+
+[[package]]
 name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7400,8 +7413,7 @@ dependencies = [
 [[package]]
 name = "underway"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23fb5ddbfb7aa972b046337c7392bd6c6f6571381bb57fb60632a1bd5573bb03"
+source = "git+https://github.com/doublewordai/underway?rev=d4899d5f0e2bfb341ba7886958d09b6665a848ea#d4899d5f0e2bfb341ba7886958d09b6665a848ea"
 dependencies = [
  "jiff 0.1.29",
  "jiff-cron",

@@ -443,7 +443,9 @@ mod tests {
 
     fn state_for_tests() -> ImageNormalizerMiddlewareState {
         let store = Arc::new(MemoryStore::new().with_base_url("http://test.local/dw-img"));
-        let normalizer = Arc::new(DefaultImageNormalizer::new(FetcherConfig::default(), store));
+        // Upload-ID tokens: the mode the cache / grant tests need to cover
+        // (a separately stored copy of the same image).
+        let normalizer = Arc::new(DefaultImageNormalizer::new(FetcherConfig::default(), store).with_unique_upload_keys(true));
         ImageNormalizerMiddlewareState {
             enabled: true,
             normalizer,
@@ -1025,6 +1027,10 @@ mod tests {
         // Same order as lib.rs: the cache layer is OUTSIDE (above) this layer.
         let state = state_with_pool(&pool);
         let token = ingest_for_key(&pool, &state, &batch_key).await;
+        // A separate submission of the same image: a separate stored copy.
+        let other_copy = ingest_for_key(&pool, &state, &batch_key).await;
+        assert_eq!(token.0, other_copy.0);
+        assert_ne!(token, other_copy);
         let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
         let app = Router::new()
             .route("/v1/chat/completions", post(recording_upstream).with_state(seen.clone()))
@@ -1037,20 +1043,24 @@ mod tests {
 
         // The stored body: a token, with a cache marker ON the image block so the
         // image is inside the hashed prefix.
-        let stored_body = json!({
-            "model": ALIAS,
-            "messages": [{ "role": "user", "content": [
-                { "type": "text", "text": "what is this?" },
-                { "type": "image_url", "image_url": { "url": token.to_dw_img_uri() },
-                  "cache_control": { "type": "ephemeral", "ttl": "1h" } }
-            ]}]
-        });
-        let dispatch = || {
+        let body_for = |t: crate::image_normalizer::ImageToken| {
+            json!({
+                "model": ALIAS,
+                "messages": [{ "role": "user", "content": [
+                    { "type": "text", "text": "what is this?" },
+                    { "type": "image_url", "image_url": { "url": t.to_dw_img_uri() },
+                      "cache_control": { "type": "ephemeral", "ttl": "1h" } }
+                ]}]
+            })
+        };
+        let stored_body = body_for(token);
+        let dispatch_body = |body: &Value| {
             server
                 .post("/v1/chat/completions")
                 .add_header("authorization", format!("Bearer {batch_key}"))
-                .json(&stored_body)
+                .json(body)
         };
+        let dispatch = || dispatch_body(&stored_body);
 
         // First dispatch attempt: writes the prefix.
         let r1 = dispatch().await;
@@ -1084,12 +1094,22 @@ mod tests {
         assert_eq!(v2["usage"]["cache_read_input_tokens"], 1500, "{v2}");
         assert_eq!(v2["usage"]["cache_creation_input_tokens"], 0);
 
-        // And upstream never saw the token: both attempts carried a signed URL.
+        // A different request carrying a separately stored copy of the same
+        // image also reads: the cache keys on the image's content hash, not on
+        // which stored copy the token points at.
+        let r3 = dispatch_body(&body_for(other_copy)).await;
+        r3.assert_status_ok();
+        let v3: Value = r3.json();
+        assert_eq!(v3["usage"]["cache_read_input_tokens"], 1500, "{v3}");
+        assert_eq!(v3["usage"]["cache_creation_input_tokens"], 0);
+
+        // And upstream never saw a token: every attempt carried a signed URL
+        // for the stored copy its token names.
         let seen = seen.lock().unwrap();
-        assert_eq!(seen.len(), 2);
-        for url in seen.iter() {
+        assert_eq!(seen.len(), 3);
+        for (url, t) in seen.iter().zip([token, token, other_copy]) {
             assert!(url.starts_with("http://test.local/dw-img/"), "{url}");
-            assert!(url.contains(&token.to_hex()), "{url}");
+            assert!(url.contains(&t.to_hex()), "{url}");
             assert!(!url.contains("dw-img://"), "{url}");
         }
     }

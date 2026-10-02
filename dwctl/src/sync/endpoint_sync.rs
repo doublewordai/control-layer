@@ -791,6 +791,7 @@ mod tests {
                 backoff_max_total_ms: None,
                 first_token_timeout_ms: None,
                 aimd: None,
+                affinity: None,
                 sanitize_responses: true,
                 trusted: false,
                 reasoning_translation_overrides: None,
