@@ -928,6 +928,7 @@ mod tests {
         );
         let targets = Targets {
             targets,
+            accounts: Arc::new(DashMap::new()),
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
@@ -1083,6 +1084,7 @@ mod tests {
                 );
                 map
             },
+            accounts: Arc::new(DashMap::new()),
             key_rate_limiters: Arc::new(DashMap::new()),
             key_concurrency_limiters: Arc::new(DashMap::new()),
             key_labels: Arc::new(DashMap::new()),
