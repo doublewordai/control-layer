@@ -42,6 +42,7 @@ fn single_target(alias: &str) -> Targets {
         key_rate_limiters: Arc::new(DashMap::new()),
         key_concurrency_limiters: Arc::new(DashMap::new()),
         key_labels: Arc::new(DashMap::new()),
+        accounts: Arc::new(DashMap::new()),
         strict_mode: false,
         http_pool_config: None,
     }
