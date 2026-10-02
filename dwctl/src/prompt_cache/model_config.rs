@@ -59,8 +59,8 @@ impl ModelConfigResolver {
         }
     }
 
-    /// A public class row overrides the all-class enablement/floor. Account
-    /// multipliers do not independently enable the billing prefix index.
+    /// An active public all-class row enables caching. A public class row may
+    /// override its floor; class/account rows cannot independently enable it.
     pub async fn resolve_class(&self, class: &onwards::serving::ClassRouteIdentity) -> CacheResult<ModelCacheConfig> {
         let key = ModelConfigKey::Class(class.model_id, class.class_id);
         if let Some(c) = self.cache.get(&key).await {
@@ -73,6 +73,12 @@ impl ModelConfigResolver {
                WHERE deployed_model_id=$1 AND user_id IS NULL
                  AND (serving_class=$2 OR serving_class IS NULL)
                  AND valid_from<=now() AND (valid_until IS NULL OR valid_until>now())
+                 AND EXISTS (
+                     SELECT 1 FROM model_cache_tariffs general
+                     WHERE general.deployed_model_id=$1 AND general.user_id IS NULL
+                       AND general.serving_class IS NULL AND general.valid_from<=now()
+                       AND (general.valid_until IS NULL OR general.valid_until>now())
+                 )
                ORDER BY (serving_class IS NOT NULL) DESC, valid_from DESC LIMIT 1"#,
             class.model_id,
             class.class_key,
@@ -204,5 +210,51 @@ mod tests {
         assert!(resolver.resolve_class(&class).await.unwrap().enabled);
         assert_eq!(resolver.resolve(&collision).await.unwrap(), ModelCacheConfig::DISABLED);
         assert!(resolver.resolve_class(&class).await.unwrap().enabled);
+    }
+    #[sqlx::test]
+    async fn class_cache_overrides_require_active_general_enablement(pool: sqlx::PgPool) {
+        use crate::db::handlers::model_class_routes::ModelClassRoutes;
+        let user = create_test_user(&pool, crate::api::models::users::Role::StandardUser).await;
+        let endpoint = create_test_endpoint(&pool, "gateway", user.id).await;
+        let model_id = create_test_model(&pool, "model", "example/model", endpoint, user.id).await;
+        let class_id = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO model_serving_classes (id,deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) VALUES ($1,$2,'fast','Fast',$3,'gateway/fast')")
+            .bind(class_id).bind(model_id).bind(endpoint).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,serving_class,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,min_prefix_tokens) VALUES ($1,'fast',1,1,1,4096)")
+            .bind(model_id).execute(&pool).await.unwrap();
+        let class = onwards::serving::ClassRouteIdentity {
+            model_id,
+            class_id,
+            canonical_alias: "example/model".into(),
+            class_key: "fast".into(),
+            endpoint_id: endpoint,
+            upstream_model_name: "gateway/fast".into(),
+        };
+        for (start, end, enabled) in [
+            (None, None, false),
+            (Some("-2 hours"), Some("-1 hour"), false),
+            (Some("1 hour"), None, false),
+            (Some("-1 hour"), Some("1 hour"), true),
+            (Some("-2 hours"), Some("-1 hour"), false),
+        ] {
+            if let Some(start) = start {
+                sqlx::query("DELETE FROM model_cache_tariffs WHERE deployed_model_id=$1 AND serving_class IS NULL")
+                    .bind(model_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO model_cache_tariffs (deployed_model_id,write_multiplier_5m,write_multiplier_1h,write_multiplier_24h,min_prefix_tokens,valid_from,valid_until) VALUES ($1,1,1,1,1024,now()+$2::interval,now()+$3::interval)")
+                    .bind(model_id).bind(start).bind(end).execute(&pool).await.unwrap();
+            }
+            let config = ModelConfigResolver::new(pool.clone()).resolve_class(&class).await.unwrap();
+            assert_eq!(config.enabled, enabled);
+            if enabled {
+                assert_eq!(config.min_prefix_tokens, 4096);
+            }
+            let mut conn = pool.acquire().await.unwrap();
+            let views = ModelClassRoutes::new(&mut conn).list_for_models(&[model_id]).await.unwrap();
+            assert_eq!(views[0].cache_pricing.enabled, enabled);
+            assert_eq!(views[0].cache_pricing.min_prefix_tokens, enabled.then_some(4096));
+        }
     }
 }

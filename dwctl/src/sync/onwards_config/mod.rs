@@ -1769,8 +1769,10 @@ async fn load_targets_from_snapshot(
                     -- positive deal can require credit on an otherwise free model.
                     NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND (mt.serving_class IS NULL OR mt.serving_class = c.class_key)
-                          AND mt.valid_until IS NULL
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                          AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL)
+                            OR (mt.serving_class = c.class_key AND mt.valid_from <= NOW()
+                                AND (mt.valid_until IS NULL OR mt.valid_until > NOW())))
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                     ) AND NOT EXISTS (
                         SELECT 1 FROM model_tariffs mt
@@ -1806,8 +1808,10 @@ async fn load_targets_from_snapshot(
                       AND ck.window_spend >= root.spend_limit
                       AND (EXISTS (
                         SELECT 1 FROM model_tariffs mt
-                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL AND (mt.serving_class IS NULL OR mt.serving_class = c.class_key)
-                          AND mt.valid_until IS NULL
+                        WHERE mt.deployed_model_id = dm.id AND mt.user_id IS NULL
+                          AND ((mt.serving_class IS NULL AND mt.valid_until IS NULL)
+                            OR (mt.serving_class = c.class_key AND mt.valid_from <= NOW()
+                                AND (mt.valid_until IS NULL OR mt.valid_until > NOW())))
                           AND (mt.input_price_per_token > 0 OR mt.output_price_per_token > 0)
                       ) OR EXISTS (
                         SELECT 1 FROM model_tariffs mt

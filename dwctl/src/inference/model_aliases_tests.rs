@@ -463,3 +463,68 @@ async fn activated_model_delete_returns_catalog_guard_without_removing_identity(
         .unwrap();
     assert!(exists);
 }
+
+#[sqlx::test]
+async fn class_activation_serializes_with_model_edits(pool: PgPool) {
+    use crate::db::handlers::{Deployments, Repository};
+    use crate::db::models::deployments::DeploymentUpdateDBRequest;
+    use std::time::Duration;
+    let (model, _) = active_model(&pool).await;
+    for alias in [None, Some("example/renamed".to_string())] {
+        sqlx::query("UPDATE deployed_models SET routing_mode='legacy' WHERE id=$1")
+            .bind(model)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut activation = pool.begin().await.unwrap();
+        sqlx::query("UPDATE deployed_models SET routing_mode='class_routes' WHERE id=$1")
+            .bind(model)
+            .execute(&mut *activation)
+            .await
+            .unwrap();
+        let mut editor = pool.acquire().await.unwrap();
+        let pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(&mut *editor).await.unwrap();
+        let task = tokio::spawn(async move {
+            Deployments::new(&mut editor)
+                .update(
+                    model,
+                    &DeploymentUpdateDBRequest::builder()
+                        .maybe_alias(alias)
+                        .description(Some("must not change".into()))
+                        .build(),
+                )
+                .await
+        });
+        // Observe the editor blocked on the activation transaction before releasing it.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar("SELECT cardinality(pg_blocking_pids($1))>0")
+                    .bind(pid)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+                if blocked {
+                    break;
+                }
+                assert!(!task.is_finished(), "edit bypassed the held model lock");
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        activation.commit().await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(matches!(error, crate::db::errors::DbError::InvalidModelField { .. }));
+        let (alias, description): (String, Option<String>) = sqlx::query_as("SELECT alias,description FROM deployed_models WHERE id=$1")
+            .bind(model)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(alias, "example/model");
+        assert_eq!(description, None);
+    }
+}

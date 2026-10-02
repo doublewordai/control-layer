@@ -36,6 +36,12 @@ impl<'c> ModelClassRoutes<'c> {
                    FROM model_cache_tariffs WHERE deployed_model_id=dm.id AND user_id IS NULL
                      AND (serving_class=c.class_key OR serving_class IS NULL)
                      AND valid_from<=now() AND (valid_until IS NULL OR valid_until>now())
+                     AND EXISTS (
+                         SELECT 1 FROM model_cache_tariffs general
+                         WHERE general.deployed_model_id=dm.id AND general.user_id IS NULL
+                           AND general.serving_class IS NULL AND general.valid_from<=now()
+                           AND (general.valid_until IS NULL OR general.valid_until>now())
+                     )
                    ORDER BY (serving_class IS NOT NULL) DESC,valid_from DESC LIMIT 1
                ) price ON true
                WHERE dm.id=ANY($1) ORDER BY dm.id, c.class_key"#, models

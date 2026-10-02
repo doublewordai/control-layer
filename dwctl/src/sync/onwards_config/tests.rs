@@ -2850,6 +2850,62 @@ async fn class_route_admission_checks_public_price_per_class_and_never_grants_pr
 }
 
 #[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
+async fn class_admission_validity_windows_agree_across_credit_and_spend_cap_gates(pool: sqlx::PgPool) {
+    use crate::db::handlers::api_keys::ApiKeys;
+    sqlx::query("INSERT INTO model_serving_classes (deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) SELECT id,k,k,hosted_on,'gateway/'||k FROM deployed_models CROSS JOIN unnest(ARRAY['standard','fast']) k WHERE alias='regular-public'")
+        .execute(&pool).await.unwrap();
+    let model: uuid::Uuid =
+        sqlx::query_scalar("UPDATE deployed_models SET routing_mode='class_routes' WHERE alias='regular-public' RETURNING id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let tariff: uuid::Uuid = sqlx::query_scalar("INSERT INTO model_tariffs (deployed_model_id,serving_class,name,api_key_purpose,input_price_per_token,output_price_per_token) VALUES ($1,'fast','Fast','realtime',0.01,0.01) RETURNING id")
+        .bind(model).fetch_one(&pool).await.unwrap();
+    // A has no credit; B has a credit exemption but has exhausted its spend cap.
+    sqlx::query("INSERT INTO user_feature_flags (user_id,feature_flag,enabled) SELECT id,'ALLOW_NEGATIVE_BALANCE',true FROM users WHERE username='cache_user_b'")
+        .execute(&pool).await.unwrap();
+    sqlx::query("UPDATE api_keys SET spend_limit=1 WHERE secret=$1")
+        .bind(KEY_B_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO api_key_spend_checkpoints (api_key_id,total_spend,window_spend) SELECT id,1,1 FROM api_keys WHERE secret=$1")
+        .bind(KEY_B_SECRET)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for (start, end, paid) in [
+        ("1 hour", None, false),
+        ("-2 hours", Some("1 hour"), true),
+        ("-2 hours", Some("-1 hour"), false),
+        ("-1 hour", None, true),
+    ] {
+        sqlx::query("UPDATE model_tariffs SET valid_from=now()+$2::interval,valid_until=now()+$3::interval WHERE id=$1")
+            .bind(tariff)
+            .bind(start)
+            .bind(end)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let targets = super::load_targets_from_db(&pool, &[], false, &Default::default()).await.unwrap();
+        for secret in [KEY_A_SECRET, KEY_B_SECRET] {
+            assert!(pool_has_key(&targets.targets.get("regular-public").unwrap(), secret));
+            assert_eq!(
+                pool_has_key(&targets.targets.get("regular-public:fast").unwrap(), secret),
+                !paid,
+                "{secret}: start={start}, end={end:?}"
+            );
+        }
+        let mut conn = pool.acquire().await.unwrap();
+        let keys = ApiKeys::new(&mut conn)
+            .get_api_keys_for_class_with_sufficient_credit(model, "fast")
+            .await
+            .unwrap();
+        assert_eq!(keys.iter().any(|key| key.secret == KEY_A_SECRET), !paid);
+    }
+}
+
+#[sqlx::test(fixtures(path = "fixtures", scripts("cache_base")))]
 async fn route_loader_snapshot_keeps_activation_atomic(pool: sqlx::PgPool) {
     sqlx::query("INSERT INTO model_serving_classes (deployed_model_id,class_key,display_name,inference_endpoint_id,upstream_model_name) SELECT id,k,k,hosted_on,'gateway/'||k FROM deployed_models CROSS JOIN unnest(ARRAY['standard','fast']) k WHERE alias='regular-public'")
         .execute(&pool).await.unwrap();

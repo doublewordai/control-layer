@@ -300,7 +300,7 @@ export function ModelPricing({
                   Retry
                 </button>
               </p>
-            ) : !cache.data?.enabled && !model.class_routes?.some((route) => classRoutesActive && route.cache_pricing.enabled) ? (
+            ) : !cache.data?.enabled ? (
               <p className="text-sm text-muted-foreground">
                 Cache pricing is disabled on this model. Organisation
                 multipliers do not enable it.

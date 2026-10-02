@@ -491,8 +491,12 @@ impl<'c> Repository for Deployments<'c> {
     #[instrument(skip(self, request), fields(deployment_id = %abbrev_uuid(&id)), err)]
     async fn update(&mut self, id: Self::Id, request: &Self::UpdateRequest) -> Result<Self::Response> {
         let mut tx = self.db.begin().await?;
+        // Catalog writers acquire the name lock before locking model rows.
+        if request.alias.is_some() {
+            lock_model_names(&mut tx).await?;
+        }
         let active = sqlx::query_scalar!(
-            r#"SELECT routing_mode='class_routes' AS "active!" FROM deployed_models WHERE id=$1"#,
+            r#"SELECT routing_mode='class_routes' AS "active!" FROM deployed_models WHERE id=$1 FOR UPDATE"#,
             id
         )
         .fetch_optional(&mut *tx)
@@ -504,7 +508,6 @@ impl<'c> Repository for Deployments<'c> {
             });
         }
         if let Some(alias) = &request.alias {
-            lock_model_names(&mut tx).await?;
             validate_model_name(&mut tx, Some(id), alias.trim()).await?;
         }
         if let Some(model_name) = &request.model_name
