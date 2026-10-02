@@ -931,23 +931,21 @@ fn to_payload<T: Serialize>(
     serde_json::to_value(value).map_err(|_| RetainedResponseSerializationError::EncodeFailure)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetainedResponseReadError {
-    DatabaseFailure,
-}
-
-impl fmt::Display for RetainedResponseReadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("Retained response read failed")
-    }
-}
-
-impl std::error::Error for RetainedResponseReadError {}
-
-fn read_database_failure<T>(_: T) -> FusilladeError {
-    FusilladeError::Other(anyhow::Error::new(
-        RetainedResponseReadError::DatabaseFailure,
-    ))
+/// Map a database failure in a retained read to `FusilladeError`.
+///
+/// The top line stays terse for log greppability, but the underlying database
+/// failure (SQLSTATE and PostgreSQL message, e.g. `57014: canceling statement
+/// due to statement timeout`) is embedded so server logs can distinguish a
+/// statement budget timeout from a connection or decode failure. The 2026-09-20
+/// ControlLayerSystemErrors investigation could only attribute the 500s to
+/// `PAGE_BUDGET` timeouts indirectly, by matching the 30s latencies, because
+/// this mapping previously discarded the cause.
+///
+/// Client-visible messages are unaffected: dwctl renders these errors as
+/// "Internal server error" / "Database error occurred"; the detail reaches
+/// server logs only.
+fn read_database_failure<T: fmt::Display>(error: T) -> FusilladeError {
+    FusilladeError::Other(anyhow::anyhow!("Retained response read failed: {error}"))
 }
 
 async fn begin_primary_read<P: PoolProvider>(
