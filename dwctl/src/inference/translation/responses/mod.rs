@@ -156,7 +156,8 @@ fn openai_error(status: StatusCode, message: &str) -> Bytes {
 /// Wraps the (dwctl-owned) [`streaming::StreamingState`] in the [`StreamReframer`]
 /// interface: each upstream Chat Completions chunk is fed through `process_chunk`
 /// and the resulting Responses SSE events are serialised out; `finish` flushes
-/// `finalize` (which emits `response.completed`).
+/// `finalize` (which emits `response.completed`, or `response.incomplete` if the
+/// upstream stream closed without a `finish_reason`).
 struct ResponsesStreamReframer {
     /// `None` only if the (already validated) request failed to re-parse; we then
     /// emit a single terminal error rather than a stream.
@@ -198,6 +199,22 @@ impl StreamReframer for ResponsesStreamReframer {
         if self.state.is_none() {
             return self.emit_error("could not initialise Responses stream");
         }
+        // Already terminated (in-band error): swallow whatever upstream sends next.
+        if self.errored {
+            return Vec::new();
+        }
+        // An in-band error chunk (`{"error": ...}`) is not a ChatCompletionChunk, so
+        // surface it as a terminal `response.failed` instead of dropping it.
+        if let Some(err) = chunk.get("error") {
+            let (error_type, message) = upstream_error_parts(err);
+            self.errored = true;
+            let state = self.state.as_mut().expect("state is Some");
+            return state
+                .fail(&error_type, &message)
+                .iter()
+                .flat_map(|e| e.to_sse().into_bytes())
+                .collect();
+        }
         // Backfill fields backends legally omit on chunks before the strict
         // parse (same relaxation as the blocking path); then skip a chunk we
         // still can't parse, mirroring the middleware's own tolerance of
@@ -220,11 +237,24 @@ impl StreamReframer for ResponsesStreamReframer {
     }
 
     fn finish(&mut self) -> Vec<u8> {
+        if self.errored {
+            return Vec::new();
+        }
         match self.state.as_mut() {
             Some(state) => state.finalize().iter().flat_map(|e| e.to_sse().into_bytes()).collect(),
             None => Vec::new(),
         }
     }
+}
+
+/// Pull `(type, message)` out of an upstream in-band `error` value, which
+/// backends send either as an object or as a bare string.
+fn upstream_error_parts(err: &Value) -> (String, String) {
+    let field = |name: &str| err.get(name).and_then(Value::as_str).map(str::to_string);
+    let message = field("message")
+        .or_else(|| err.as_str().map(str::to_string))
+        .unwrap_or_else(|| "upstream returned an error".to_string());
+    (field("type").unwrap_or_else(|| "server_error".to_string()), message)
 }
 
 /// Build a terminal OpenAI-shaped SSE error event.
@@ -425,6 +455,94 @@ mod tests {
             text.contains(r#""delta":"Hi""#) || text.contains("Hi"),
             "missing text delta in:\n{text}"
         );
+    }
+
+    /// Post a streamed `/responses` request whose upstream body is `sse` and
+    /// return the client-visible SSE text.
+    async fn streamed_text_for_upstream(sse: &'static str) -> String {
+        async fn fake_chat_sse(axum::extract::State(sse): axum::extract::State<&'static str>, _req: Request) -> Response {
+            let mut r = Response::new(Body::from(sse));
+            r.headers_mut()
+                .insert(header::CONTENT_TYPE, header::HeaderValue::from_static("text/event-stream"));
+            r
+        }
+
+        let registry = TranslationRegistry::new(vec![Arc::new(OpenResponses::new())]);
+        let inner = Router::new()
+            .route("/responses", post(fake_chat_sse).with_state(sse))
+            .layer(axum::middleware::from_fn_with_state(registry, translation_middleware));
+        let server = axum_test::TestServer::new(Router::new().nest("/ai/v1", inner)).expect("test server");
+        let response = server
+            .post("/ai/v1/responses")
+            .json(&serde_json::json!({ "model": "gpt-4o", "input": "hi", "stream": true }))
+            .await;
+        assert_eq!(response.status_code().as_u16(), 200);
+        response.text()
+    }
+
+    /// A clean close with no `finish_reason` is a cut-off generation, not a finished
+    /// one: it must end with `response.incomplete`, keeping the partial output.
+    #[tokio::test]
+    async fn stream_closed_without_finish_reason_is_incomplete() {
+        let text = streamed_text_for_upstream(concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Partial\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+
+        assert!(
+            text.contains("event: response.incomplete"),
+            "missing response.incomplete in:\n{text}"
+        );
+        assert!(!text.contains("event: response.completed"), "must not complete in:\n{text}");
+        assert!(text.contains(r#""status":"incomplete""#), "in:\n{text}");
+        assert!(
+            text.contains(r#""incomplete_details":{"reason":"upstream_stream_ended"}"#),
+            "in:\n{text}"
+        );
+        assert!(text.contains("Partial"), "partial output dropped in:\n{text}");
+    }
+
+    /// A stream that closes before any chunk arrived (e.g. a held-open call that
+    /// yields nothing) still opens with `response.created` before `incomplete`.
+    #[tokio::test]
+    async fn empty_stream_is_incomplete_after_created() {
+        let text = streamed_text_for_upstream("").await;
+
+        let created = text.find("event: response.created").expect("response.created");
+        let incomplete = text.find("event: response.incomplete").expect("response.incomplete");
+        assert!(created < incomplete, "in:\n{text}");
+        assert!(!text.contains("event: response.completed"), "in:\n{text}");
+    }
+
+    /// An in-band `{"error": ...}` chunk is surfaced as `response.failed` rather
+    /// than silently dropped, and nothing completes after it.
+    #[tokio::test]
+    async fn in_band_error_chunk_fails_the_response() {
+        let text = streamed_text_for_upstream(concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"}}]}\n\n",
+            "data: {\"error\":{\"message\":\"worker exploded\",\"type\":\"server_error\"}}\n\n",
+        ))
+        .await;
+
+        assert_eq!(text.matches("event: response.failed").count(), 1, "in:\n{text}");
+        assert!(text.contains(r#""status":"failed""#), "in:\n{text}");
+        assert!(text.contains("worker exploded"), "error message dropped in:\n{text}");
+        assert!(!text.contains("event: response.completed"), "in:\n{text}");
+        assert!(!text.contains("event: response.incomplete"), "in:\n{text}");
+    }
+
+    /// A normal `finish_reason` still completes.
+    #[tokio::test]
+    async fn stream_with_finish_reason_still_completes() {
+        let text = streamed_text_for_upstream(concat!(
+            "data: {\"id\":\"c1\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        ))
+        .await;
+
+        assert!(text.contains("event: response.completed"), "in:\n{text}");
+        assert!(!text.contains("event: response.incomplete"), "in:\n{text}");
     }
 
     /// A blocking reply whose message omits `role` (and other optional-per-spec
