@@ -1,5 +1,12 @@
 # Changelog
 
+## [12.11.3](https://github.com/doublewordai/control-layer/compare/v12.11.2...v12.11.3) (2026-10-03)
+
+
+### Bug Fixes
+
+* **onwards:** answer every capacity refusal with 529 and Retry-After ([#1913](https://github.com/doublewordai/control-layer/issues/1913)) ([8ca5e6d](https://github.com/doublewordai/control-layer/commit/8ca5e6d4802ebc0e3fe85802d35c7dffd06680d4))
+
 ## [12.11.2](https://github.com/doublewordai/control-layer/compare/v12.11.1...v12.11.2) (2026-10-03)
 
 
