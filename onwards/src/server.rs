@@ -145,19 +145,26 @@ pub async fn serve(
         info!("Gateway request drain complete");
     }
 
+    // The metrics listener exists only to serve scrapes and liveness probes
+    // alongside the proxy; a stalled connection there has no bearing on whether
+    // the gateway drained successfully. Stop it under a best-effort ceiling
+    // (mirroring the drain-timeout warning) without gating the exit code.
     let _ = stop_metrics.send(());
-    let metrics_result = if metrics_finished {
-        Ok(())
-    } else {
+    if !metrics_finished {
         match timeout(Duration::from_secs(5), &mut metrics).await {
-            Ok(result) => result
-                .context("metrics server task failed")
-                .and_then(|result| result.context("metrics server failed")),
+            Ok(result) => {
+                if let Err(e) = result
+                    .context("metrics server task failed")
+                    .and_then(|result| result.context("metrics server failed"))
+                {
+                    warn!("metrics server task ended unexpectedly: {e:#}");
+                }
+            }
             Err(_) => {
                 metrics.abort();
-                Err(anyhow!("metrics server shutdown deadline exceeded"))
+                warn!("metrics server shutdown deadline exceeded");
             }
         }
-    };
-    trigger.and(drained).and(metrics_result)
+    }
+    trigger.and(drained)
 }
