@@ -8,11 +8,19 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use bon::Builder;
-use hyper::StatusCode;
+use hyper::{
+    StatusCode,
+    header::{HeaderValue, RETRY_AFTER},
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::reasoning::ReasoningError;
+
+/// Error code for a request refused because every provider is full.
+const CONCURRENCY_LIMIT_CODE: &str = "concurrency_limit_exceeded";
+/// Seconds a caller is told to wait after [`CONCURRENCY_LIMIT_CODE`].
+const CONCURRENCY_RETRY_AFTER_SECS: &str = "1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponseBody {
@@ -102,7 +110,7 @@ impl OnwardsErrorResponse {
                 message: "Too many concurrent requests. Please wait for some requests to complete before sending more.".to_string(),
                 r#type: "rate_limit_error".to_string(),
                 param: None,
-                code: "concurrency_limit_exceeded".to_string(),
+                code: CONCURRENCY_LIMIT_CODE.to_string(),
             }),
             status: StatusCode::TOO_MANY_REQUESTS,
             serving_outcome: None,
@@ -262,6 +270,18 @@ impl IntoResponse for OnwardsErrorResponse {
             Some(ref body) => (self.status, Json(ErrorEnvelope { error: body })).into_response(),
             None => self.status.into_response(), // No body, just status
         };
+        // Capacity frees as in-flight requests finish, so a short wait is the
+        // right advice; SDKs that honour Retry-After wait this long.
+        if self
+            .body
+            .as_ref()
+            .is_some_and(|body| body.code == CONCURRENCY_LIMIT_CODE)
+        {
+            response.headers_mut().insert(
+                RETRY_AFTER,
+                HeaderValue::from_static(CONCURRENCY_RETRY_AFTER_SECS),
+            );
+        }
         // Let embedding middleware distinguish a specific policy rejection from
         // generic key admission without consuming or reparsing the response body.
         if let Some(body) = self.body {

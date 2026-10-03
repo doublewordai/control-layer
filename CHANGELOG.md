@@ -1,5 +1,24 @@
 # Changelog
 
+## [12.11.2](https://github.com/doublewordai/control-layer/compare/v12.11.1...v12.11.2) (2026-10-03)
+
+
+### Bug Fixes
+
+* **files:** ride out brief image-store outages during upload ([#1910](https://github.com/doublewordai/control-layer/issues/1910)) ([0468610](https://github.com/doublewordai/control-layer/commit/0468610f797dab33e388b5e6bc2c04f954de8969))
+
+## [12.11.1](https://github.com/doublewordai/control-layer/compare/v12.11.0...v12.11.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* **onwards:** stop re-asking overloaded providers and answer 429 when every provider is full ([#1911](https://github.com/doublewordai/control-layer/issues/1911)) ([ad19d05](https://github.com/doublewordai/control-layer/commit/ad19d05bcda37f50cbf258a79882b75df3efed39))
+
+
+### Tests
+
+* speed up the Rust test suite with migrated database templates ([#1907](https://github.com/doublewordai/control-layer/issues/1907)) ([db1fb7f](https://github.com/doublewordai/control-layer/commit/db1fb7f4f97134b1465627e3e0a9b3f12a73723e))
+
 ## [12.11.0](https://github.com/doublewordai/control-layer/compare/v12.10.1...v12.11.0) (2026-10-02)
 
 
