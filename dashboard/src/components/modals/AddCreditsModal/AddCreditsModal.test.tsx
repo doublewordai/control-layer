@@ -256,4 +256,36 @@ describe("AddFundsModal", () => {
       "true",
     );
   });
+
+  // Regression: the parent keeps the modal mounted and toggles `isOpen` via
+  // state. When it flips `isOpen` to false directly (not through a user action
+  // that calls `onClose`/`handleClose`), the close handler never runs, so the
+  // `useEffect` on `isOpen` is what must clear a stale error before reopen.
+  it("does not re-show the error banner after the parent closes and reopens without calling onClose", async () => {
+    const user = userEvent.setup();
+    const { setOpen } = renderModal();
+
+    // Trigger a validation error while the modal is open.
+    const amount = screen.getByLabelText("Amount (USD)");
+    await user.clear(amount);
+    await user.type(amount, "0");
+    await user.click(
+      screen.getByRole("button", { name: "Add to Credit Balance" }),
+    );
+    await waitFor(() =>
+      expect(dialog()).toHaveTextContent("Please enter a valid amount"),
+    );
+
+    // Parent flips `isOpen` to false directly — no user action, no `onClose`.
+    setOpen(false);
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+
+    // Parent reopens the modal for the same user.
+    setOpen(true);
+
+    // The stale validation error must not reappear on the freshly opened form.
+    await waitFor(() =>
+      expect(screen.queryByRole("alert")).not.toBeInTheDocument(),
+    );
+  });
 });
