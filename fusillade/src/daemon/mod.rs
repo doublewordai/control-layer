@@ -119,18 +119,18 @@ fn background_capacity(ordinary_limit: usize, background_limit: usize, in_flight
         .saturating_sub(in_flight)
 }
 
-/// The error code onwards returns from its own concurrency limiter, alongside a
-/// 429. Distinguishes "too many at once", which lowering concurrency fixes, from
-/// a provider's token-per-minute quota, which it does not.
+/// The error code onwards returns, alongside a 429, when the caller's own
+/// concurrency limit is reached. Distinguishes "too many at once", which
+/// lowering concurrency fixes, from a provider's token-per-minute quota, which
+/// it does not.
 const ONWARDS_CONCURRENCY_LIMIT_CODE: &str = "concurrency_limit_exceeded";
 
 /// Whether a failure means "the model had nowhere to put this request".
 ///
-/// Two shapes count. An exact 529 is the upstream provider saying it is
-/// overloaded. A 429 carrying `concurrency_limit_exceeded` is onwards' own
-/// limiter, which is the wall this daemon actually reaches first: onwards sits
-/// between fusillade and every provider and never emits 529 itself, so matching
-/// 529 alone leaves the controller with a brake that cannot fire.
+/// Two shapes count. A 529 is onwards refusing for capacity: the model's
+/// providers are full, at their caps, or not placed. A 429 carrying
+/// `concurrency_limit_exceeded` is the dispatching key's own concurrency limit
+/// in onwards, which lowering concurrency also relieves.
 ///
 /// That matters because the increase side grows on *demand* - a model that fills
 /// every slot it is offered is raised - so without a working decrease signal the

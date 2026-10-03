@@ -58,6 +58,13 @@ fn record_response_status(status_code: u16) {
     tracing::Span::current().record("http.response.status_code", status_code);
 }
 
+/// Whether an upstream status means the provider had no room for the request.
+/// A provider that is up answers 529 when its workers are busy and 503 when no
+/// worker can take the request; a provider that is down never answers at all.
+fn is_capacity_refusal(status: u16) -> bool {
+    matches!(status, 503 | 529)
+}
+
 /// Detect a provider error envelope embedded in an HTTP 200 body.
 ///
 /// Some upstreams return `200 OK` with the real error in
@@ -837,18 +844,18 @@ pub async fn target_message_handler<T: HttpClient>(
     if pool.is_empty() {
         debug!("Pool for model '{}' has no providers", model_name);
         // Counted, not just logged: this is a debug line on a hot path, so under
-        // load it is exactly the signal a log pipeline sheds, and the 503 it
-        // produces is indistinguishable downstream from every other 503.
+        // load it is exactly the signal a log pipeline sheds. Nothing is
+        // serving the model, which is a capacity refusal, not an outage.
         metrics::counter!(
             "onwards_upstream_failed_total",
             "reason" => "no_providers",
-            "status" => "503",
+            "status" => "529",
             "model" => model_name.to_string(),
             "traffic" => traffic,
         )
         .increment(1);
-        record_response_status(503);
-        return Err(OnwardsErrorResponse::service_unavailable());
+        record_response_status(529);
+        return Err(OnwardsErrorResponse::no_capacity());
     }
 
     // Check pool-level rate limit before selecting a provider
@@ -884,7 +891,17 @@ pub async fn target_message_handler<T: HttpClient>(
                         "Pool-level concurrency limit exceeded for model: {}",
                         model_name
                     );
-                    return Err(OnwardsErrorResponse::concurrency_limited());
+                    // The model's own cap is capacity, not the caller's limit.
+                    metrics::counter!(
+                        "onwards_upstream_failed_total",
+                        "reason" => "model_at_capacity",
+                        "status" => "529",
+                        "model" => model_name.to_string(),
+                        "traffic" => traffic,
+                    )
+                    .increment(1);
+                    record_response_status(529);
+                    return Err(OnwardsErrorResponse::overloaded());
                 }
             }
         } else {
@@ -1008,12 +1025,18 @@ pub async fn target_message_handler<T: HttpClient>(
     } else {
         pool_max_attempts.min(eligible_member_count)
     };
+    // An upstream with no room answers 503 or 529 depending on what sits in
+    // front of its workers, so a pool that fails over on either refusal fails
+    // over on both.
+    let listed = |lists: &dyn Fn(u16) -> bool, status: u16| {
+        lists(status) || (is_capacity_refusal(status) && (lists(503) || lists(529)))
+    };
     let fails_over_on = |status: u16, attempt_number: u32| {
-        pool.should_fallback_on_status(status)
+        listed(&|s| pool.should_fallback_on_status(s), status)
             || (is_realtime
                 && eligible_member_count > 1
                 && (attempt_number as usize) < realtime_failover_attempts
-                && pool.should_fallback_on_realtime_status(status))
+                && listed(&|s| pool.should_fallback_on_realtime_status(s), status))
     };
 
     // Unsupported traffic keeps ordinary routing and contributes no observations.
@@ -1459,18 +1482,22 @@ pub async fn target_message_handler<T: HttpClient>(
                 status, target.url
             );
             tracing::Span::current().record("onwards.fallback", "status_fallback");
-            // A 529 means the provider is full, not broken. If it is the last
-            // word, answer as this gateway does when every member is at its
-            // concurrency limit, so callers back off rather than reading a
-            // 502 as an outage.
+            // A 503 or 529 means the provider is full, not broken. If it is
+            // the last word, the caller is told to retry shortly rather than
+            // handed a 502 that reads as an outage.
             let error = if status == 429 {
                 OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
-            } else if status == 529 {
-                OnwardsErrorResponse::concurrency_limited()
+            } else if is_capacity_refusal(status) {
+                OnwardsErrorResponse::overloaded()
             } else {
                 OnwardsErrorResponse::bad_gateway()
             };
             return LoopAction::Continue(Some(error));
+        }
+
+        if is_capacity_refusal(status) {
+            record_response_status(529);
+            return LoopAction::Done(Err(OnwardsErrorResponse::overloaded()));
         }
 
         if status == 429
@@ -1782,17 +1809,21 @@ pub async fn target_message_handler<T: HttpClient>(
                     // are exhausted.
                     let error = if embedded == 429 {
                         OnwardsErrorResponse::upstream_rate_limited(state.upstream_rate_limit_message.as_deref())
-                    } else if embedded == 529 {
-                        OnwardsErrorResponse::concurrency_limited()
+                    } else if is_capacity_refusal(embedded) {
+                        OnwardsErrorResponse::overloaded()
                     } else {
                         OnwardsErrorResponse::service_unavailable()
                     };
                     return LoopAction::Continue(Some(error));
                 }
 
+                if is_capacity_refusal(embedded) {
+                    record_response_status(529);
+                    return LoopAction::Done(Err(OnwardsErrorResponse::overloaded()));
+                }
                 record_response_status(embedded);
                 // Keep upstream details private while preserving rate-limit semantics.
-                // Embedded server errors still collapse to a generic 503.
+                // Other embedded server errors still collapse to a generic 503.
                 // For trusted providers, retain the standard client-error fields
                 // so the caller can fix the request. Never log the body: even
                 // validation errors can echo request content.
@@ -2065,7 +2096,7 @@ pub async fn target_message_handler<T: HttpClient>(
                 // A member that refused for overload is full right now: trying
                 // it again within this request cannot succeed, so it sits out
                 // the rest of the request.
-                if matches!(attempt_upstream_status, Some(429 | 529)) {
+                if attempt_upstream_status.is_some_and(|s| s == 429 || is_capacity_refusal(s)) {
                     providers.mark_refused(member_idx);
                 }
                 // Sleep here — *after* the current connection_guard has gone
@@ -2126,9 +2157,9 @@ pub async fn target_message_handler<T: HttpClient>(
             "onwards_upstream_failed_total",
             "reason" => "retries_exhausted",
             // The upstream's own status on the final attempt, NOT the gateway
-            // response above: both a 529 and a 500 sanitize to 503, and only
-            // the former is backpressure. Falls back to the response status
-            // when no attempt got far enough to see one.
+            // response above, which collapses several upstream statuses into
+            // one. Falls back to the response status when no attempt got far
+            // enough to see one.
             "status" => last_upstream_status.unwrap_or(status).to_string(),
             "model" => model_name.to_string(),
             "traffic" => traffic,
@@ -2167,13 +2198,13 @@ pub async fn target_message_handler<T: HttpClient>(
         metrics::counter!(
             "onwards_upstream_failed_total",
             "reason" => "all_at_capacity",
-            "status" => "429",
+            "status" => "529",
             "model" => model_name.to_string(),
             "traffic" => traffic,
         )
         .increment(1);
-        record_response_status(429);
-        Err(OnwardsErrorResponse::concurrency_limited())
+        record_response_status(529);
+        Err(OnwardsErrorResponse::overloaded())
     } else {
         // Empty pool (shouldn't normally happen, targets resolved earlier)
         let err = OnwardsErrorResponse::model_not_found(model_name.as_str());

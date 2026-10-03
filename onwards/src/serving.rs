@@ -1149,10 +1149,8 @@ mod handler_tests {
                 s.account = granted.then(|| holds(&BOTH_CLASSES));
                 // An upstream failure avoids coupling this forwarding test to
                 // four different success-response schemas.
-                let mock = MockHttpClient::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    r#"{"error":"unavailable"}"#,
-                );
+                let mock =
+                    MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, r#"{"error":"failed"}"#);
                 let router = build_strict_router(AppState::with_client(targets(&s), mock.clone()))
                     .layer(Extension(RequestedServingClass(ServingClass::Interactive)));
                 let srv = TestServer::new(router).unwrap();
@@ -1162,7 +1160,7 @@ mod handler_tests {
                     .json(&payload)
                     .await;
                 if granted {
-                    assert_eq!(response.status_code(), 503, "{path}");
+                    assert_eq!(response.status_code(), 502, "{path}");
                     assert_eq!(
                         sent(&mock.get_requests()[0]),
                         Some((500, 20, Some(200))),

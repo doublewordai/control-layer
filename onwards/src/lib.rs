@@ -1745,7 +1745,13 @@ mod tests {
                         "messages":[{"role":"user","content":"hello"}]
                     }))
                     .await;
-                assert_eq!(response.status_code(), if code == 429 { 429 } else { 503 });
+                let expected = match code {
+                    429 => 429,
+                    // A provider with no room is a capacity refusal.
+                    503 => 529,
+                    _ => 503,
+                };
+                assert_eq!(response.status_code(), expected);
                 assert!(!response.text().contains("private upstream failure"));
             }
         }
@@ -2365,10 +2371,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_overloaded_members_are_asked_once_and_caller_gets_429() {
+    async fn test_overloaded_members_are_asked_once_and_caller_gets_529() {
         // Every member is full. A budget of six attempts must not be spent
         // re-asking members that have just refused: each is asked once, and
-        // the caller is told to back off rather than handed a 502.
+        // the caller is told the model is at capacity rather than handed a 502.
         let mock = overloaded_mock();
         let app_state = AppState::with_client(
             fallback_targets_with("gpt-4", 2, retrying_fallback(vec![529], 6)),
@@ -2384,10 +2390,10 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(response.status_code(), 429);
+        assert_eq!(response.status_code(), 529);
         assert_eq!(response.header("retry-after"), "1");
         let body: serde_json::Value = response.json();
-        assert_eq!(body["error"]["code"], "concurrency_limit_exceeded");
+        assert_eq!(body["error"]["code"], "overloaded");
         assert_eq!(
             mock.get_requests().len(),
             2,
@@ -2412,17 +2418,76 @@ mod tests {
             }))
             .await;
 
-        assert_eq!(response.status_code(), 429);
+        assert_eq!(response.status_code(), 529);
         assert_eq!(mock.get_requests().len(), 1);
+    }
+
+    async fn chat(app_state: AppState<MockHttpClient>) -> axum_test::TestResponse {
+        TestServer::new(build_router(app_state))
+            .unwrap()
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await
+    }
+
+    #[tokio::test]
+    async fn test_members_answering_503_are_asked_once_and_caller_gets_529() {
+        // A provider that is up but has no worker free answers 503: the same
+        // refusal as a 529, so it too sits out the rest of the request.
+        let mock = MockHttpClient::new(StatusCode::SERVICE_UNAVAILABLE, "{}");
+        let response = chat(AppState::with_client(
+            fallback_targets_with("gpt-4", 2, retrying_fallback(vec![503], 6)),
+            mock.clone(),
+        ))
+        .await;
+
+        assert_eq!(response.status_code(), 529);
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "overloaded");
+        assert_eq!(mock.get_requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_capacity_refusal_without_failover_reaches_caller_as_529() {
+        let mock = MockHttpClient::new(StatusCode::SERVICE_UNAVAILABLE, "{}");
+        let response = chat(AppState::with_client(
+            fallback_targets("gpt-4", 1, vec![]),
+            mock.clone(),
+        ))
+        .await;
+
+        assert_eq!(response.status_code(), 529);
+        assert_eq!(response.header("retry-after"), "1");
+    }
+
+    #[tokio::test]
+    async fn test_model_with_no_provider_answers_529_no_capacity() {
+        // Nothing is serving the model: a capacity refusal with a longer wait,
+        // since a provider has to be placed and start first.
+        let mock = MockHttpClient::new(StatusCode::OK, "{}");
+        let response = chat(AppState::with_client(
+            fallback_targets_with("gpt-4", 0, retrying_fallback(vec![529], 1)),
+            mock.clone(),
+        ))
+        .await;
+
+        assert_eq!(response.status_code(), 529);
+        assert_eq!(response.header("retry-after"), "30");
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "no_capacity");
+        assert!(mock.get_requests().is_empty());
     }
 
     #[tokio::test]
     async fn test_non_overload_failures_still_spend_the_retry_budget() {
         // Only an overload refusal takes a member out of the request; a member
         // that failed for another reason is retried in later passes as before.
-        let mock = MockHttpClient::new(StatusCode::SERVICE_UNAVAILABLE, "{}");
+        let mock = MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, "{}");
         let app_state = AppState::with_client(
-            fallback_targets_with("gpt-4", 1, retrying_fallback(vec![503], 3)),
+            fallback_targets_with("gpt-4", 1, retrying_fallback(vec![500], 3)),
             mock.clone(),
         );
         let server = TestServer::new(build_router(app_state)).unwrap();
@@ -3214,10 +3279,11 @@ mod tests {
                     .json(&json!({"model": "limited-model", "messages": []}))
                     .await;
 
-                // Second request should be rejected (concurrency limit exceeded)
-                assert_eq!(response2.status_code(), 429);
+                // Second request should be rejected: the model's own cap is
+                // capacity, not the caller's limit
+                assert_eq!(response2.status_code(), 529);
                 let body: serde_json::Value = response2.json();
-                assert_eq!(body["error"]["code"], "concurrency_limit_exceeded");
+                assert_eq!(body["error"]["code"], "overloaded");
 
                 // Complete the first request
                 mock_client.complete_request(0);
@@ -5065,10 +5131,11 @@ mod tests {
                 http_pool_config: None,
             };
 
-            // Upstream returns 503 with internal details
-            let upstream_error = r#"{"error": "GPU cluster overloaded", "retry_after": 30}"#;
+            // Upstream returns 500 with internal details
+            let upstream_error = r#"{"error": "worker crashed on gpu-12", "retry_after": 30}"#;
 
-            let mock_client = MockHttpClient::new(StatusCode::SERVICE_UNAVAILABLE, upstream_error);
+            let mock_client =
+                MockHttpClient::new(StatusCode::INTERNAL_SERVER_ERROR, upstream_error);
             let app_state = AppState::with_client(targets, mock_client)
                 .with_response_transform(create_openai_sanitizer());
             let router = build_router(app_state);
@@ -5082,8 +5149,8 @@ mod tests {
                 }))
                 .await;
 
-            // Original 503 status should be preserved
-            assert_eq!(response.status_code(), 503);
+            // Original 500 status should be preserved
+            assert_eq!(response.status_code(), 500);
 
             let body: serde_json::Value = response.json();
             // Should have generic error body, not upstream details
