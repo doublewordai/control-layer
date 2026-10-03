@@ -2347,6 +2347,98 @@ mod tests {
         );
     }
 
+    /// Upstream overload status (529) that every member of a pool returns.
+    fn overloaded_mock() -> MockHttpClient {
+        MockHttpClient::new(
+            StatusCode::from_u16(529).unwrap(),
+            r#"{"error":{"message":"overloaded"}}"#,
+        )
+    }
+
+    fn retrying_fallback(on_status: Vec<u16>, max_attempts: usize) -> target::FallbackConfig {
+        target::FallbackConfig {
+            enabled: true,
+            on_status,
+            max_attempts: Some(max_attempts),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_overloaded_members_are_asked_once_and_caller_gets_429() {
+        // Every member is full. A budget of six attempts must not be spent
+        // re-asking members that have just refused: each is asked once, and
+        // the caller is told to back off rather than handed a 502.
+        let mock = overloaded_mock();
+        let app_state = AppState::with_client(
+            fallback_targets_with("gpt-4", 2, retrying_fallback(vec![529], 6)),
+            mock.clone(),
+        );
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 429);
+        assert_eq!(response.header("retry-after"), "1");
+        let body: serde_json::Value = response.json();
+        assert_eq!(body["error"]["code"], "concurrency_limit_exceeded");
+        assert_eq!(
+            mock.get_requests().len(),
+            2,
+            "each overloaded member is asked once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_single_overloaded_member_is_not_reasked() {
+        let mock = overloaded_mock();
+        let app_state = AppState::with_client(
+            fallback_targets_with("gpt-4", 1, retrying_fallback(vec![529], 3)),
+            mock.clone(),
+        );
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 429);
+        assert_eq!(mock.get_requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_non_overload_failures_still_spend_the_retry_budget() {
+        // Only an overload refusal takes a member out of the request; a member
+        // that failed for another reason is retried in later passes as before.
+        let mock = MockHttpClient::new(StatusCode::SERVICE_UNAVAILABLE, "{}");
+        let app_state = AppState::with_client(
+            fallback_targets_with("gpt-4", 1, retrying_fallback(vec![503], 3)),
+            mock.clone(),
+        );
+        let server = TestServer::new(build_router(app_state)).unwrap();
+
+        let response = server
+            .post("/v1/chat/completions")
+            .json(&json!({
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "Hello"}]
+            }))
+            .await;
+
+        assert_eq!(response.status_code(), 502);
+        assert_eq!(mock.get_requests().len(), 3);
+    }
+
     #[tokio::test]
     async fn test_streaming_keepalive_then_token_is_forwarded_not_retried() {
         // A valid stream that leads with a keep-alive comment and only *then*
