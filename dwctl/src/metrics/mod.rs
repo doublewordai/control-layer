@@ -8,6 +8,7 @@
 
 pub mod allocator;
 mod cache_info;
+pub mod error_series;
 pub mod errors;
 mod gen_ai;
 mod recorder;

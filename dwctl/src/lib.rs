@@ -2692,6 +2692,8 @@ pub async fn build_router(
                 .0
         };
 
+        crate::metrics::error_series::register_documented_routes();
+
         // Get the GenAI registry from the metrics recorder (already initialized earlier)
         let gen_ai_registry = if let Some(ref recorder) = state.metrics_recorder {
             recorder.registry().clone()
@@ -2724,7 +2726,8 @@ pub async fn build_router(
                     axum_metrics
                 }),
             )
-            .layer(prometheus_layer);
+            .layer(prometheus_layer)
+            .layer(middleware::from_fn(crate::metrics::error_series::register_error_series));
     }
 
     // Add tracing layer with OTel-compatible span names and HTTP semantic conventions.

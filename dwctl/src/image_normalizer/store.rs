@@ -19,6 +19,8 @@
 //! in-memory store is meant for `cargo test` and local `cargo run`
 //! workflows where no bucket is configured.
 use async_trait::async_trait;
+use aws_sdk_s3::config::retry::RetryConfig;
+use aws_sdk_s3::config::timeout::TimeoutConfig;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use metrics::counter;
@@ -351,6 +353,15 @@ fn head_last_modified_secs(head: &aws_sdk_s3::operation::head_object::HeadObject
 /// fail at runtime.
 const S3_MAX_PRESIGN: Duration = Duration::from_secs(7 * 24 * 60 * 60 - 60);
 
+/// Attempts per S3 call. Ingest runs inside the upload request, so a failed
+/// call fails the upload; five attempts with the SDK's jittered exponential
+/// backoff (1s base) ride out object-store blips of several seconds.
+const S3_MAX_ATTEMPTS: u32 = 5;
+
+/// Bound on one S3 call including retries, so a sustained outage returns a
+/// 503 instead of holding the upload open.
+const S3_OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// S3-compatible object store backend (Cloudflare R2, MinIO, Backblaze B2,
 /// AWS S3) reached via a custom endpoint.
 ///
@@ -395,6 +406,8 @@ impl S3CompatStore {
             .endpoint_url(endpoint.clone())
             .force_path_style(force_path_style)
             .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .retry_config(RetryConfig::standard().with_max_attempts(S3_MAX_ATTEMPTS))
+            .timeout_config(TimeoutConfig::builder().operation_timeout(S3_OPERATION_TIMEOUT).build())
             .build();
         Self {
             bucket: bucket.into(),

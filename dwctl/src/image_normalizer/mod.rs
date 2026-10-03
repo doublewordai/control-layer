@@ -257,7 +257,16 @@ impl<S: ImageStore + 'static> ImageNormalizer for DefaultImageNormalizer<S> {
             // expire as absent, so the re-upload here resets its age before a
             // batch signs a reference to it.
             let token = ImageToken(sha, None);
-            if !self.store.exists(token).await? {
+            // The check only saves a write: if it fails, the PUT below stores
+            // the same bytes under the same key anyway.
+            let exists = match self.store.exists(token).await {
+                Ok(exists) => exists,
+                Err(e) => {
+                    tracing::warn!(error = %e, "image existence check failed, uploading instead");
+                    false
+                }
+            };
+            if !exists {
                 self.store.put(token, &mime, bytes).await?;
             }
             token
@@ -408,6 +417,33 @@ mod tests {
             .unwrap()
             .token;
         assert_eq!(t, ImageToken(a.0, None));
+    }
+
+    /// A store whose existence check always fails, as during a brief object-store outage.
+    struct FailingExistsStore(MemoryStore);
+
+    #[async_trait]
+    impl ImageStore for FailingExistsStore {
+        async fn put(&self, token: ImageToken, mime: &str, bytes: Bytes) -> Result<bool, StoreError> {
+            self.0.put(token, mime, bytes).await
+        }
+        async fn sign(&self, token: ImageToken, ttl: Duration) -> Result<SignedImageUrl, StoreError> {
+            self.0.sign(token, ttl).await
+        }
+        async fn read(&self, token: ImageToken) -> Result<(String, Bytes), StoreError> {
+            self.0.read(token).await
+        }
+        async fn exists(&self, _token: ImageToken) -> Result<bool, StoreError> {
+            Err(StoreError::Backend("HEAD: service unavailable".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn ingest_uploads_when_existence_check_fails() {
+        let n = DefaultImageNormalizer::new(FetcherConfig::default(), Arc::new(FailingExistsStore(MemoryStore::new())));
+        let token = n.ingest(ImageInput::DataUri(TINY_PNG_DATA_URI.to_string())).await.unwrap().token;
+        assert_eq!(token.1, None);
+        assert_eq!(n.read(token).await.unwrap().0, "image/png");
     }
 
     #[tokio::test]
